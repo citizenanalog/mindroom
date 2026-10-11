@@ -333,8 +333,9 @@ class TlsInterceptor:
         """Send one request over the tunnel's upstream connection; return whether the tunnel stays open."""
         if await self._relay.refuse_large_body(client, entry, request):
             return False
-        if tunnel.upstream is not None and tunnel.upstream.reader.at_eof():
-            # The upstream closed its idle connection since the last response.
+        if tunnel.upstream is not None and await tunnel.upstream.sent_unprompted():
+            # The upstream closed its idle connection, or sent bytes after its last response that this request's
+            # response must not be read from.
             tunnel.drop_upstream()
         if tunnel.upstream is None:
             tunnel.upstream = await self._relay.open_upstream(

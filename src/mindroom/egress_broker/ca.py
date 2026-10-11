@@ -12,6 +12,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import certifi
 from cryptography import x509
@@ -20,6 +21,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from mindroom.atomic_file import atomic_write_bytes_at
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 __all__ = [
     "BrokerCA",
@@ -226,6 +230,7 @@ class BrokerCA:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.set_alpn_protocols(["http/1.1"])
+            ctx.sni_callback = _sni_guard(host)
 
             # Load certificate chain into context via temp file
             self._load_cert_chain_to_context(ctx, leaf_cert)
@@ -332,6 +337,22 @@ class BrokerCA:
             # Unlink temp file
             with contextlib.suppress(Exception):
                 tmp_path.unlink()
+
+
+def _sni_guard(host: str) -> Callable[[ssl.SSLObject, str | None, ssl.SSLContext], int | None]:
+    """Return an SNI callback that aborts the handshake when the client names a host other than `host`.
+
+    The leaf is for the CONNECT host, so a client claiming another name gets no tunnel at all. A client
+    without SNI, as for IP literals, is served. Names compare without case or a trailing dot.
+    """
+    expected = host.lower().removesuffix(".")
+
+    def check(_connection: ssl.SSLObject, server_name: str | None, _context: ssl.SSLContext) -> int | None:
+        if server_name is None or server_name.lower().removesuffix(".") == expected:
+            return None
+        return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+
+    return check
 
 
 def _publish_unless_current(directory_fd: int, filename: str, content: bytes) -> None:

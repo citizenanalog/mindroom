@@ -108,6 +108,23 @@ class Peer:
                 self.writer.write(data)
         await self.writer.drain()
 
+    async def sent_unprompted(self) -> bool:
+        """Return, without waiting, whether the peer closed or sent bytes after the last message h11 read.
+
+        An idle upstream answers nothing yet, so such bytes would be taken as the next request's response.
+        """
+        if self.conn.trailing_data[0]:
+            return True
+        try:
+            # A read that cannot complete at once is cancelled on the next loop iteration.
+            async with asyncio.timeout(0):
+                await self.reader.read(1)
+        except TimeoutError:
+            return False
+        except OSError:
+            return True
+        return True
+
 
 async def send_json(
     client: Peer,
@@ -210,17 +227,22 @@ def normalize_host(host: str) -> str:
 def upstream_request_headers(received: list[tuple[bytes, bytes]], *, host: bytes) -> list[tuple[bytes, bytes]]:
     """Return the headers to send upstream: Host set to `host`, hop-by-hop removed, framing rebuilt.
 
-    The broker answers ``Expect: 100-continue`` itself. A chunked body is re-chunked, so a client
-    Content-Length beside it is dropped rather than forwarded next to the new Transfer-Encoding.
+    The broker answers ``Expect: 100-continue`` itself. Framing follows what h11 read, whatever the client's
+    Connection header lists: a chunked body is re-chunked, so a client Content-Length beside it is dropped
+    rather than forwarded next to the new Transfer-Encoding; otherwise the Content-Length is kept.
     """
     chunked = any(name == b"transfer-encoding" for name, _ in received)
-    dropped = {b"host", b"expect", b"content-length"} if chunked else {b"host", b"expect"}
+    length = next((value for name, value in received if name == b"content-length"), None)
     headers = [(b"host", host)]
     headers += [
-        (name, value) for name, value in strip_request_headers(received, keep_upgrade=False) if name not in dropped
+        (name, value)
+        for name, value in strip_request_headers(received, keep_upgrade=False)
+        if name not in {b"host", b"expect", b"content-length"}
     ]
     if chunked:
         headers.append((b"transfer-encoding", b"chunked"))
+    elif length is not None:
+        headers.append((b"content-length", length))
     return headers
 
 
