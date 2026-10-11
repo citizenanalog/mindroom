@@ -1694,7 +1694,7 @@ depends_on = [
     "mindroom.api.config_lifecycle",
     "mindroom.api.oauth",
     "mindroom.api.connection_agents",
-    "mindroom.api.egress_credentials",
+    "mindroom.api.egress_listing",
     "mindroom.constants",
     "mindroom.oauth",
     "mindroom.oauth.credential_lifecycle",
@@ -1717,15 +1717,73 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.egress_credentials"
 depends_on = [
+    "mindroom.api.egress_accounts",
+    "mindroom.api.egress_keys",
+    "mindroom.api.egress_listing",
+    "mindroom.api.egress_logs",
+    "mindroom.api.egress_services",
+]
+
+[[modules]]
+path = "mindroom.api.egress_access"
+depends_on = [
     "mindroom.api.config_lifecycle",
     "mindroom.api.auth",
     "mindroom.api.connection_agents",
     "mindroom.api.egress_status",
-    "mindroom.api.oauth",
     "mindroom.authorization",
     "mindroom.credentials.manager",
-    "mindroom.egress_broker.secrets",
     "mindroom.requester_identity",
+]
+
+[[modules]]
+path = "mindroom.api.egress_accounts"
+depends_on = [
+    "mindroom.api.connection_agents",
+    "mindroom.api.egress_access",
+    "mindroom.api.egress_status",
+    "mindroom.api.oauth",
+]
+
+[[modules]]
+path = "mindroom.api.egress_keys"
+depends_on = [
+    "mindroom.api.connection_agents",
+    "mindroom.api.egress_access",
+    "mindroom.api.egress_status",
+    "mindroom.credentials.manager",
+    "mindroom.egress_broker.secrets",
+]
+
+[[modules]]
+path = "mindroom.api.egress_listing"
+depends_on = [
+    "mindroom.api.config_lifecycle",
+    "mindroom.api.connection_agents",
+    "mindroom.api.egress_access",
+    "mindroom.api.egress_status",
+    "mindroom.api.oauth",
+    "mindroom.credentials.manager",
+    "mindroom.requester_identity",
+]
+
+[[modules]]
+path = "mindroom.api.egress_logs"
+depends_on = [
+    "mindroom.api.config_lifecycle",
+    "mindroom.api.connection_agents",
+    "mindroom.api.egress_access",
+    "mindroom.api.egress_status",
+    "mindroom.requester_identity",
+]
+
+[[modules]]
+path = "mindroom.api.egress_services"
+depends_on = [
+    "mindroom.api.connection_agents",
+    "mindroom.api.egress_access",
+    "mindroom.api.egress_status",
+    "mindroom.credentials.manager",
 ]
 
 [[modules]]

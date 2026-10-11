@@ -19,7 +19,7 @@ from mindroom.api.connection_agents import (
     resolve_connection_agent,
     resolve_connection_user,
 )
-from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
+from mindroom.api.egress_listing import EgressCredentialService, egress_services_for_agent
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.logging_config import get_logger
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri

@@ -20,7 +20,16 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
-from mindroom.api import config_lifecycle, connections, egress_credentials, egress_status, main, oauth
+from mindroom.api import (
+    config_lifecycle,
+    connections,
+    egress_listing,
+    egress_logs,
+    egress_services,
+    egress_status,
+    main,
+    oauth,
+)
 from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.main import Config
 from mindroom.credentials.manager import get_runtime_credentials_manager
@@ -1610,7 +1619,7 @@ def test_user_service_body_over_16_kib_is_413_before_validation(
 ) -> None:
     """An oversized body, such as a huge rules list, is refused before the service model validates any of it."""
     parsed: list[object] = []
-    monkeypatch.setattr(egress_credentials, "_parse_user_service", parsed.append)
+    monkeypatch.setattr(egress_services, "_parse_user_service", parsed.append)
     huge_rules = {"rules": [{"host": f"h{i}.example.com", "auth": {"type": "bearer"}} for i in range(2000)]}
     for body in (huge_rules, {**_NOTES, "description": "x" * 17_000}):
         response = _put_service(egress_portal, "alice", "personal", "notes", body)
@@ -2027,7 +2036,7 @@ def test_user_services_are_loaded_off_the_event_loop(
 def audit_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[AuditLog]:
     """Serve the personal log from a real audit log, as if the broker were running."""
     log = AuditLog(tmp_path / "audit.sqlite3")
-    monkeypatch.setattr(egress_credentials, "active_audit_log", lambda: log)
+    monkeypatch.setattr(egress_logs, "active_audit_log", lambda: log)
     yield log
     log.close()
 
@@ -2192,7 +2201,7 @@ def test_personal_log_is_unavailable_while_the_broker_is_stopped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Like the administrator's log, the personal log answers 409 when no broker runs."""
-    monkeypatch.setattr(egress_credentials, "active_audit_log", lambda: None)
+    monkeypatch.setattr(egress_logs, "active_audit_log", lambda: None)
     response = _get_logs(egress_portal, "alice")
     assert response.status_code == 409, response.text
     assert "not running" in response.json()["detail"]
@@ -2522,7 +2531,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
     if failure == "unsupported backend":
         _use_worker_backend(portal, "no-such-backend")
     else:
-        real = egress_credentials.shared_worker_oauth
+        real = egress_listing.shared_worker_oauth
 
         def broken(provider: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
             if provider.requester_scoped_credentials:
@@ -2530,7 +2539,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
                 raise RuntimeError(msg)
             return real(provider, *args, **kwargs)
 
-        monkeypatch.setattr(egress_credentials, "shared_worker_oauth", broken)
+        monkeypatch.setattr(egress_listing, "shared_worker_oauth", broken)
 
     listing = portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"])
     catalog = portal["client"].get("/api/connections", headers=portal["headers"]["alice"])
