@@ -294,7 +294,6 @@ class _BrokerService:
         signer = TokenSigner.load_or_create(state_dir / "token.key", ttl_seconds=self._settings.token_ttl_seconds)
         self._audit = audit = AuditLog(state_dir / "requests.sqlite3")
         credentials_manager = self._credentials_manager
-        link = manage_url(self._runtime_paths)
         config = _LastGoodConfig(self._config_provider, credentials_manager)
         self._oauth_executor = oauth_executor = ThreadPoolExecutor(
             max_workers=_OAUTH_LOOKUP_WORKERS,
@@ -315,7 +314,7 @@ class _BrokerService:
             dial_policy=dial_policy,
             # None selects the broker's verifying context: system roots plus certifi.
             upstream_ssl_context=None,
-            manage_url=lambda _claims: link,
+            manage_url=manage_url(self._runtime_paths),
             scope_info=config.scope_info,
         )
         self._thread = threading.Thread(target=self._run, args=(broker,), name=_THREAD_NAME, daemon=True)

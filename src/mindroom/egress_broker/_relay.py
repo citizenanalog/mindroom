@@ -47,6 +47,8 @@ _CHUNK = 64 * 1024
 # A client's request head, request line through the blank line, whether it arrives in one read or many.
 _MAX_REQUEST_HEAD = 64 * 1024
 _CLOSE_TIMEOUT = 5.0
+# How long a peer may send nothing, while the broker waits on it or splices, before the connection ends.
+_IDLE_TIMEOUT = 1800.0
 _PROXY_AUTHENTICATE = (b"proxy-authenticate", b'Basic realm="mindroom-egress-broker"')
 _HOSTNAME = re.compile(r"[a-z0-9_][a-z0-9_.-]*")
 # A refusal's reason phrase repeats its message for clients that print only the status line.
@@ -89,14 +91,7 @@ class AuditEntry:
 class Peer:
     """One HTTP/1.1 side of a brokered connection, driven by an h11 state machine."""
 
-    def __init__(
-        self,
-        conn: h11.Connection,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        *,
-        idle_timeout: float,
-    ) -> None:
+    def __init__(self, conn: h11.Connection, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.conn = conn
         self.reader = reader
         self.writer = writer
@@ -106,13 +101,12 @@ class Peer:
         self.request_from_git = False
         # Whether the connection must close after the response (RFC 9112 section 6.1).
         self.close_after_response = False
-        self._idle_timeout = idle_timeout
 
     @classmethod
-    def serving(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, idle_timeout: float) -> Peer:
+    def serving(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Peer:
         """Return the broker's side of a client connection, which reads request heads of up to 64 KiB."""
         conn = h11.Connection(h11.SERVER, max_incomplete_event_size=_MAX_REQUEST_HEAD)
-        return cls(conn, reader, writer, idle_timeout=idle_timeout)
+        return cls(conn, reader, writer)
 
     async def next_event(self) -> h11.Event | type[h11.NEED_DATA | h11.PAUSED]:
         """Return the next event, reading from the stream until h11 has one (never NEED_DATA).
@@ -126,7 +120,7 @@ class Peer:
         # Bytes h11 holds or receives while it parses the head, minus what it holds afterwards, are the head.
         consumed = len(self.conn.trailing_data[0]) if awaiting_head else 0
         while (event := self.conn.next_event()) is h11.NEED_DATA:
-            async with asyncio.timeout(self._idle_timeout):
+            async with asyncio.timeout(_IDLE_TIMEOUT):
                 data = await self.reader.read(_CHUNK)
             consumed += len(data)
             self.conn.receive_data(data)
@@ -395,17 +389,16 @@ def _downstream_response_headers(
 class Relay:
     """Per-request work both listener paths share: reading rules, dialing, streaming, answering, and auditing.
 
-    `manage_url` returns where the verified requester changes their egress keys and services, and `scope_info` who
+    `manage_url` is where the verified requester changes their egress keys and services, and `scope_info` returns who
     else can change them on a shared agent, for refusal bodies.
     """
 
     audit: AuditLog
     rules_provider: Callable[[WorkerClaims], EgressRules]
-    manage_url: Callable[[WorkerClaims], str | None]
+    manage_url: str | None
     scope_info: Callable[[WorkerClaims], ScopeInfo]
     dial_policy: DialPolicy
     max_body_bytes: int
-    idle_timeout: float
 
     async def read_rules(self, client: Peer, entry: AuditEntry) -> EgressRules | None:
         """Return the rules for the entry's requester; when the provider fails, answer 502, audit, and return None.
@@ -427,14 +420,13 @@ class Relay:
         """
         entry.service = route.restricted_by
         try:
-            link = self.manage_url(entry.claims) if route.refusal == "path_not_allowed" else None
             scope = self.scope_info(entry.claims)
         except Exception as exc:
-            # Both are callbacks the broker's owner supplies, which can raise anything.
+            # A callback the broker's owner supplies, which can raise anything.
             logger.warning("egress_broker_refusal_context_failed", error_type=type(exc).__name__)
             await self.reject(client, entry, 502, refusal_body("broker_error"))
             return
-        body = route.refusal_body(host=entry.host, path=entry.path, manage_url=link, scope=scope)
+        body = route.refusal_body(host=entry.host, path=entry.path, manage_url=self.manage_url, scope=scope)
         await self.deny(client, entry, body, status=route.refusal_status)
 
     async def open_upstream(
@@ -455,7 +447,7 @@ class Relay:
         except _RequestFailedError as exc:
             await self.reject(client, entry, exc.status, refusal_body(exc.code, host=entry.host))
         else:
-            return Peer(h11.Connection(h11.CLIENT), reader, writer, idle_timeout=self.idle_timeout)
+            return Peer(h11.Connection(h11.CLIENT), reader, writer)
         return None
 
     async def refuse_large_body(self, client: Peer, entry: AuditEntry, request: h11.Request) -> bool:
@@ -516,7 +508,7 @@ class Relay:
         async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, upload: bool) -> None:
             try:
                 while data := await reader.read(_CHUNK):
-                    idle.reschedule(loop.time() + self.idle_timeout)
+                    idle.reschedule(loop.time() + _IDLE_TIMEOUT)
                     if upload:
                         entry.bytes_up += len(data)
                     else:
@@ -531,7 +523,7 @@ class Relay:
                 writer.transport.abort()
 
         with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(self.idle_timeout) as idle, asyncio.TaskGroup() as group:
+            async with asyncio.timeout(_IDLE_TIMEOUT) as idle, asyncio.TaskGroup() as group:
                 group.create_task(pump(client.reader, upstream.writer, upload=True))
                 group.create_task(pump(upstream.reader, client.writer, upload=False))
 

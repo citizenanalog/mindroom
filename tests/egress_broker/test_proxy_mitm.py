@@ -325,7 +325,7 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
     await broker(
         EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}),
         secrets={"svc": SECRET},
-        manage_url=lambda _claims: MANAGE_URL,
+        manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
 
@@ -371,7 +371,7 @@ async def test_user_restriction_refuses_operator_paths_in_tunnel(
     await broker(
         rules_provider=lambda _claims: with_user_services(operator, limited=limited),
         secrets={"op": "operator-key", "limited": "user-key"},
-        manage_url=lambda _claims: MANAGE_URL,
+        manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
 
@@ -424,7 +424,7 @@ async def test_limit_in_place_on_a_shared_agent_keeps_the_operator_key_and_names
     await broker(
         rules_provider=lambda _claims: with_user_services(operator, limited=limited),
         secrets={"op": "operator-key", "limited": "never-sent"},
-        manage_url=lambda _claims: MANAGE_URL,
+        manage_url=MANAGE_URL,
         scope_info=lambda _claims: ScopeInfo(shared=True, managers=managers),
     )
     client = proxy_client(broker.token())
@@ -508,7 +508,7 @@ async def test_missing_secret_returns_403_with_manage_url(
     audit: AuditLog,
 ) -> None:
     """A matched service without a secret in the worker's scope tells the agent where to set one."""
-    await broker(single_rule_config(), manage_url=lambda _claims: MANAGE_URL)
+    await broker(single_rule_config(), manage_url=MANAGE_URL)
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo"))
@@ -552,7 +552,7 @@ async def test_missing_secret_offers_oauth_connect_link(
     await broker(
         single_rule_config(),
         resolve_secret=lambda _claims, _service: SecretMissing(provider="github", connect_url=CONNECT_URL),
-        manage_url=lambda _claims: MANAGE_URL,
+        manage_url=MANAGE_URL,
         scope_info=scope_info,
     )
     client = proxy_client(broker.token())
@@ -587,7 +587,7 @@ async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
         asked.append(claims)
         return ScopeInfo(shared=True, managers=("@alice:example.org",))
 
-    await broker(single_rule_config(), manage_url=lambda _claims: MANAGE_URL, scope_info=shared_scope)
+    await broker(single_rule_config(), manage_url=MANAGE_URL, scope_info=shared_scope)
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo?page=2"))
@@ -645,7 +645,7 @@ async def test_oauth_reconnect_required_gets_403_without_reaching_upstream(
     await broker(
         single_rule_config(),
         resolve_secret=lambda _claims, _service: result,
-        manage_url=lambda _claims: MANAGE_URL,
+        manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
 
@@ -677,7 +677,7 @@ async def test_oauth_refresh_outage_gets_retryable_503(
     await broker(
         single_rule_config(),
         resolve_secret=lambda _claims, _service: SecretUnavailable(provider="github"),
-        manage_url=lambda _claims: MANAGE_URL,
+        manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
 
@@ -697,7 +697,7 @@ async def test_oauth_refresh_outage_gets_retryable_503(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failing", ["resolve_secret", "manage_url"])
+@pytest.mark.parametrize("failing", ["resolve_secret", "scope_info"])
 async def test_resolve_secret_failure_gets_502_and_audit_row(
     broker: BrokerFactory,
     tls_upstream: Upstream,
@@ -705,7 +705,7 @@ async def test_resolve_secret_failure_gets_502_and_audit_row(
     audit: AuditLog,
     failing: str,
 ) -> None:
-    """A failing secret store or manage-link callback fails the request with 502, never the tunnel listener."""
+    """A failing secret store or scope callback fails the request with 502, never the tunnel listener."""
 
     def fail(*_args: object) -> str:
         msg = "store unavailable"

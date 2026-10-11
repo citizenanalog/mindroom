@@ -267,7 +267,7 @@ async def test_operator_restriction_refuses_paths_only_a_user_rule_lists(
     await broker(
         rules_provider=lambda _claims: with_user_services(operator, mine=mine),
         secrets={"op": "operator-key", "mine": "user-key"},
-        manage_url=lambda _claims: "https://m.test/connections/egress",
+        manage_url="https://m.test/connections/egress",
     )
     client = proxy_client(broker.token())
 
@@ -504,7 +504,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
     rule = EgressRule(host="localhost", path_prefix="/private", auth=EgressAuth(type="bearer"))
     await broker(
         EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}),
-        manage_url=lambda _claims: "https://m.test/connections/egress",
+        manage_url="https://m.test/connections/egress",
     )
     client = proxy_client(broker.token())
 

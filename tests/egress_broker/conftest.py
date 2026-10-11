@@ -27,7 +27,8 @@ from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, Egress
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.ca import BrokerCA, materialize_ca_bundle
 from mindroom.egress_broker.dial import DialPolicy
-from mindroom.egress_broker.proxy import EgressBroker, ManageUrl
+from mindroom.egress_broker.messages import ScopeInfo
+from mindroom.egress_broker.proxy import EgressBroker
 from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import Secret, SecretMissing
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
@@ -38,7 +39,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.egress_broker.audit import AuditRecord
-    from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.secrets import SecretResult
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, WorkerScope
     from tests.egress_broker.raw_http import Script, UpstreamFactory
@@ -480,7 +480,7 @@ class BrokerFactory:
         secrets: dict[str, str] | None = None,
         resolve_secret: Callable[[WorkerClaims, str], SecretResult] | None = None,
         dial_policy: DialPolicy | None = None,
-        manage_url: ManageUrl | None = None,
+        manage_url: str | None = None,
         scope_info: Callable[[WorkerClaims], ScopeInfo] | None = None,
         max_body_bytes: int = 1 << 30,
         head_timeout: float = 30.0,
@@ -491,7 +491,7 @@ class BrokerFactory:
         `resolve_secret` replaces the `secrets` lookup, and `rules_provider` replaces the fixed `config`,
         when a test needs a callback that changes, fails, or depends on the requester's claims. It returns a config,
         or `EgressRules` to add user services. Both are plain functions; the broker awaits the lookup.
-        Without `scope_info` the broker's default applies: a personal scope.
+        Without `scope_info` the requester's scope is personal.
         """
         current = config or EgressBrokerConfig()
         provider = rules_provider or (lambda _claims: current)
@@ -517,10 +517,10 @@ class BrokerFactory:
             audit=self.audit,
             dial_policy=dial_policy or DialPolicy(allow_loopback=True),
             upstream_ssl_context=self.upstream_ssl_context,
-            manage_url=manage_url or (lambda _claims: None),
+            manage_url=manage_url,
             max_body_bytes=max_body_bytes,
             head_timeout=head_timeout,
-            **({} if scope_info is None else {"scope_info": scope_info}),
+            scope_info=scope_info or (lambda _claims: ScopeInfo(shared=False, managers=())),
         )
         await broker.start("127.0.0.1", 0)
         self.brokers.append(broker)

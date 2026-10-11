@@ -156,7 +156,7 @@ class TlsInterceptor:
             logger.debug("egress_broker_client_tls_failed", error_type=type(exc).__name__)
             return
         tunnel = _Tunnel(token=token, claims=claims, host=host, port=port)
-        tls_client = Peer.serving(client.reader, client.writer, idle_timeout=self._relay.idle_timeout)
+        tls_client = Peer.serving(client.reader, client.writer)
         try:
             await serve_peer(tls_client, functools.partial(self._serve_request, tunnel=tunnel))
         finally:
@@ -268,7 +268,7 @@ class TlsInterceptor:
                 return result.value
             status, body = self._refusal(entry.claims, service, result)
         except Exception as exc:
-            # The resolver runs store and OAuth provider code, and `_refusal` the manage-link callback.
+            # The resolver runs store and OAuth provider code, and `_refusal` the scope callback.
             logger.warning("egress_broker_secret_lookup_failed", error_type=type(exc).__name__)
             await self._relay.reject(client, entry, 502, refusal_body("broker_error"))
             return None
@@ -283,7 +283,7 @@ class TlsInterceptor:
 
         Each body carries `manage_url`, which its message names, and a connect link only in `connect_url`.
         """
-        manage_url = self._relay.manage_url(claims)
+        manage_url = self._relay.manage_url
         if isinstance(result, SecretUnavailable):
             # The provider may recover, so this is a retryable failure, not a prompt to reconnect.
             return 503, refusal_body(

@@ -190,7 +190,7 @@ async def test_bytes_already_in_the_socket_count_as_sent_unprompted() -> None:
     ours, theirs = socket.socketpair()
     reader, writer = await asyncio.open_connection(sock=ours)
     try:
-        upstream = Peer(h11.Connection(h11.CLIENT), reader, writer, idle_timeout=5.0)
+        upstream = Peer(h11.Connection(h11.CLIENT), reader, writer)
         assert await upstream.sent_unprompted() is False
         # Written synchronously, so the bytes sit in the socket until the loop next polls it.
         theirs.sendall(STRAY_RESPONSE)
