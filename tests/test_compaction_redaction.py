@@ -546,6 +546,40 @@ def test_removing_a_turn_whose_mid_turn_compaction_was_undone_keeps_earlier_runs
     assert _summary(stored) == "r1"
 
 
+def test_redacting_a_turn_compacted_again_after_an_undone_compaction_keeps_runs_before_it(storage: SqliteDb) -> None:
+    """The turn's later archived rows, not its undone snapshot, decide which generation redaction rolls back."""
+    live = _live_run_with(["$x"], reply="$reply")
+    session = seed_session(
+        storage,
+        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), _run("r2"), live]),
+    )
+    snapshot = _snapshot_of(live, ["$x"])
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), snapshot],
+    )
+    roll_back_running_turn(storage, session, _SCOPE, [snapshot.run_id or ""])
+    session = _stored(storage)
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="r1, r2, and x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=list(session.runs or []),
+    )
+
+    assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$x") is True
+
+    stored = _stored(storage)
+    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
+    assert stored.summary is None
+
+
 def _team_run(run_id: str, *, parent_run_id: str | None = None) -> TeamRunOutput:
     return TeamRunOutput(
         run_id=run_id,
