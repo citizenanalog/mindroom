@@ -94,7 +94,10 @@ if TYPE_CHECKING:
 
 router = APIRouter(prefix="/api/oauth", tags=["oauth"])
 logger = get_logger(__name__)
-_OAUTH_COMPLETE_MESSAGE_TYPE = "mindroom:oauth-complete"
+# What a popup's OAuth page posts to the page that opened it, which then stops waiting.
+_OAUTH_OPENER_MESSAGE_TYPE = "mindroom-oauth"
+_OAUTH_POPUP_CLOSE_DELAY_MS = 1500
+_OAUTH_CANCELLED_MESSAGE = "You cancelled. Nothing was connected."
 _OAUTH_STALE_CONNECTION_MESSAGE = (
     "This OAuth connection changed before the request completed. Start the connection again from the dashboard "
     "or request a fresh connection link from the conversation."
@@ -643,35 +646,92 @@ def _oauth_browser_page(
     )
 
 
-def _oauth_browser_error_response(message: str, *, status_code: int, title: str | None = None) -> HTMLResponse:
+def _opener_notice_script(provider_id: str, status: Literal["connected", "cancelled", "error"]) -> str:
+    """Return page script that tells the popup's opener how the flow ended, then closes the popup after a moment.
+
+    The message goes only to the page's own origin, MindRoom's, so only a MindRoom page that opened the popup
+    (the Connections page or the dashboard) can read it. A page without such an opener, for example one opened from
+    a chat link, stays open so its text can be read.
+    """
+    message = {"type": _OAUTH_OPENER_MESSAGE_TYPE, "status": status, "provider": provider_id}
+    return f"""
+      let mindroomOpener = null;
+      try {{
+        if (window.opener && !window.opener.closed && window.opener.location.origin === window.location.origin) {{
+          mindroomOpener = window.opener;
+        }}
+      }} catch (error) {{
+        // Another site opened this window; it can neither read the message nor show the outcome.
+      }}
+      if (mindroomOpener) {{
+        mindroomOpener.postMessage({_script_json(message)}, window.location.origin);
+        window.setTimeout(() => window.close(), {_OAUTH_POPUP_CLOSE_DELAY_MS});
+      }}"""
+
+
+def _oauth_browser_error_response(
+    message: str,
+    *,
+    status_code: int,
+    title: str | None = None,
+    provider_id: str | None = None,
+    outcome: Literal["cancelled", "error"] = "error",
+) -> HTMLResponse:
     """Render a browser-readable OAuth error without exposing a raw API payload.
 
     Without a `title`, the page is a reset or conflict page: 409 means the connection changed under the request.
+    With a registered `provider_id`, the page also tells its MindRoom opener the `outcome` (`_opener_notice_script`).
     """
     if title is None:
         title = "OAuth connection changed" if status_code == 409 else "OAuth reset unavailable"
-    return _oauth_browser_page(title, message, tone="error", status_code=status_code)
+    script = "" if provider_id is None else _opener_notice_script(provider_id, outcome)
+    return _oauth_browser_page(title, message, tone="error", status_code=status_code, script=script)
 
 
-def _oauth_flow_error_response(exc: HTTPException) -> HTMLResponse:
+def _registered_provider_id(request: Request, provider_id: str) -> str | None:
+    """Return `provider_id` when the registry has it, so a page names only a real provider, never other URL text."""
+    try:
+        provider, _runtime_paths = _load_provider(request, provider_id)
+    except _UnknownOAuthProviderError:
+        return None
+    return provider.id
+
+
+def _oauth_flow_error_response(exc: HTTPException, *, provider_id: str | None) -> HTMLResponse:
     """Show a refusal of the browser's own OAuth step (authorize or callback) as a page for the popup.
 
-    An unknown provider in the URL gets a fixed text, so the page never repeats text from the URL.
+    An unknown provider in the URL gets a fixed text, so the page never repeats text from the URL. `provider_id` is
+    the registered provider whose opener hears of the error, if any.
     """
     title = "OAuth connection changed" if exc.status_code == 409 else "Account connection failed"
     message = "Unknown OAuth provider." if isinstance(exc, _UnknownOAuthProviderError) else str(exc.detail)
-    return _oauth_browser_error_response(message, status_code=exc.status_code, title=title)
+    return _oauth_browser_error_response(message, status_code=exc.status_code, title=title, provider_id=provider_id)
 
 
 _OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,64}")
 
 
-def _oauth_provider_error_response(error: str) -> HTMLResponse:
-    """Show the provider's own `error` for the callback; only a plain OAuth error code is repeated, never free text."""
+def _oauth_provider_error_response(error: str, *, provider_id: str | None) -> HTMLResponse:
+    """Show the provider's own `error` for the callback; only a plain OAuth error code is repeated, never free text.
+
+    `access_denied` means the user declined at the provider, so the page and its opener hear that they cancelled.
+    """
     code = error if _OAUTH_ERROR_CODE.fullmatch(error) else None
+    if code == "access_denied":
+        return _oauth_browser_error_response(
+            _OAUTH_CANCELLED_MESSAGE,
+            status_code=400,
+            title="Authorization cancelled",
+            provider_id=provider_id,
+            outcome="cancelled",
+        )
     message = "OAuth provider returned an error" + (f": {code}" if code else "") + ". Nothing was connected."
-    title = "Authorization cancelled" if code == "access_denied" else "Account connection failed"
-    return _oauth_browser_error_response(message, status_code=400, title=title)
+    return _oauth_browser_error_response(
+        message,
+        status_code=400,
+        title="Account connection failed",
+        provider_id=provider_id,
+    )
 
 
 def _oauth_success_origin(provider: OAuthProvider, runtime_paths: RuntimePaths) -> str:
@@ -703,7 +763,7 @@ async def authorize(
     try:
         return await _authorize(provider_id, request, agent_name=agent_name, connect_token=connect_token)
     except HTTPException as exc:
-        return _oauth_flow_error_response(exc)
+        return _oauth_flow_error_response(exc, provider_id=_registered_provider_id(request, provider_id))
 
 
 async def _authorize(
@@ -887,21 +947,11 @@ async def success(provider_id: str, request: Request) -> HTMLResponse:
 
 def _oauth_success_response(provider: OAuthProvider) -> HTMLResponse:
     """Render a browser-readable OAuth completion response that also tells the popup's opener."""
-    message = {
-        "type": _OAUTH_COMPLETE_MESSAGE_TYPE,
-        "provider": provider.id,
-        "status": "connected",
-    }
     return _oauth_browser_page(
         f"{provider.display_name} connected",
         f"{provider.display_name} is connected. You can close this window.",
         tone="success",
-        script=f"""
-      const message = {_script_json(message)};
-      if (window.opener && !window.opener.closed) {{
-        window.opener.postMessage(message, "*");
-      }}
-      window.close();""",
+        script=_opener_notice_script(provider.id, "connected"),
     )
 
 
@@ -1004,11 +1054,11 @@ async def callback(provider_id: str, request: Request) -> Response:
     """
     error = request.query_params.get("error")
     if error:
-        return _oauth_provider_error_response(error)
+        return _oauth_provider_error_response(error, provider_id=_registered_provider_id(request, provider_id))
     try:
         return await _handle_callback(provider_id, request)
     except HTTPException as exc:
-        return _oauth_flow_error_response(exc)
+        return _oauth_flow_error_response(exc, provider_id=_registered_provider_id(request, provider_id))
 
 
 async def _handle_callback(provider_id: str, request: Request) -> Response:
@@ -1033,7 +1083,7 @@ async def _handle_callback(provider_id: str, request: Request) -> Response:
             state=state,
         )
     except OAuthCredentialConflictError:
-        return _oauth_browser_error_response(_OAUTH_STALE_CONNECTION_MESSAGE, status_code=409)
+        return _oauth_browser_error_response(_OAUTH_STALE_CONNECTION_MESSAGE, status_code=409, provider_id=provider.id)
 
     if not dashboard_flow:
         return _oauth_success_response(provider)

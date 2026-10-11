@@ -2322,12 +2322,16 @@ def test_success_page_signals_oauth_completion_to_popup_opener(tmp_path: Path) -
             response = client.get(f"/api/oauth/{provider.id}/success")
 
     assert response.status_code == 200
-    assert "mindroom:oauth-complete" in response.text
-    assert f'"provider": "{provider.id}"' in response.text
-    assert '"status": "connected"' in response.text
-    assert "window.opener.postMessage" in response.text
-    assert 'postMessage(message, "*")' in response.text
-    assert "window.close()" in response.text
+    _expect_opener_notice(response, provider_id=provider.id, status="connected")
+
+
+def _expect_opener_notice(response: Any, *, provider_id: str, status: str) -> None:  # noqa: ANN401
+    """The page posts its outcome to a MindRoom opener on its own origin only, then closes after a short delay."""
+    message = json.dumps({"type": "mindroom-oauth", "status": status, "provider": provider_id})
+    assert f"mindroomOpener.postMessage({message}, window.location.origin);" in response.text
+    assert "window.opener.location.origin === window.location.origin" in response.text
+    assert "window.setTimeout(() => window.close(), 1500);" in response.text
+    assert '"*"' not in response.text
 
 
 def _expect_styled_oauth_page(response: Any, *, status: int, message: str) -> None:  # noqa: ANN401
@@ -2390,7 +2394,7 @@ def test_oauth_browser_errors_are_html(tmp_path: Path, scenario: str) -> None:
         "unknown_provider": ("/api/oauth/no_such_provider/callback?code=test-code&state=missing", 404),
     }
     messages = {
-        "provider_error": "OAuth provider returned an error: access_denied",
+        "provider_error": "You cancelled. Nothing was connected.",
         "stale_state": "OAuth state is invalid or expired",
         "foreign_connect_token": "OAuth link does not belong to the current user",
         "unknown_provider": "Unknown OAuth provider.",
@@ -2403,6 +2407,15 @@ def test_oauth_browser_errors_are_html(tmp_path: Path, scenario: str) -> None:
 
     _expect_styled_oauth_page(response, status=status, message=messages[scenario])
     assert "no_such_provider" not in response.text
+    if scenario == "unknown_provider":
+        # Only a registered provider is named to the opener, so no URL text reaches the page.
+        assert "postMessage" not in response.text
+    else:
+        _expect_opener_notice(
+            response,
+            provider_id=provider.id,
+            status="cancelled" if scenario == "provider_error" else "error",
+        )
     # The foreign link stays redeemable for its owner: the page changes the presentation, never the decision.
     assert oauth_service.lookup_oauth_connect_token(provider, runtime_paths, connect_token) is not None
 
@@ -2438,7 +2451,29 @@ def test_cancelled_authorization_page_says_so(tmp_path: Path) -> None:
         with TestClient(api_app) as client:
             response = client.get(f"/api/oauth/{provider.id}/callback?error=access_denied")
 
+    _expect_styled_oauth_page(response, status=400, message="You cancelled. Nothing was connected.")
     assert "<h1>Authorization cancelled</h1>" in response.text
+    assert "access_denied" not in response.text
+    _expect_opener_notice(response, provider_id=provider.id, status="cancelled")
+
+
+def test_other_provider_errors_tell_the_opener_the_connection_failed(tmp_path: Path) -> None:
+    """A provider error other than a cancel keeps its code on the page and posts an error to the opener."""
+    runtime_paths = _runtime_paths(tmp_path)
+    api_app = _make_test_app(runtime_paths, _config_payload())
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            response = client.get(f"/api/oauth/{provider.id}/callback?error=server_error")
+
+    _expect_styled_oauth_page(
+        response,
+        status=400,
+        message="OAuth provider returned an error: server_error. Nothing was connected.",
+    )
+    assert "<h1>Account connection failed</h1>" in response.text
+    _expect_opener_notice(response, provider_id=provider.id, status="error")
 
 
 @pytest.mark.parametrize(
@@ -3342,6 +3377,7 @@ async def test_callback_maps_locked_connection_generation_race_to_conflict(
     assert response.status_code == 409
     assert response.media_type == "text/html"
     assert "Start the connection again from the dashboard" in response.body.decode()
+    _expect_opener_notice(SimpleNamespace(text=response.body.decode()), provider_id=provider.id, status="error")
 
 
 @pytest.mark.asyncio

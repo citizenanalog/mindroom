@@ -418,7 +418,7 @@ def test_non_admin_html_get_redirects_to_connections(
     headers = {**signed_connections_headers("alice"), **_BROWSER_ACCEPT}
     response = connections_auth_client().get(path, headers=headers, follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/connections"
+    assert response.headers["location"] == "/connections?notice=admin-only"
 
 
 @pytest.mark.parametrize(
@@ -537,4 +537,4 @@ def test_unsigned_html_get_still_gets_its_login_response(
     """The redirect is for signed non-administrators only; an anonymous browser is not sent to Connections."""
     response = connections_auth_client().get("/", headers=_BROWSER_ACCEPT, follow_redirects=False)
     assert response.status_code in {401, 403}
-    assert response.headers.get("location") != "/connections"
+    assert not response.headers.get("location", "").startswith("/connections")

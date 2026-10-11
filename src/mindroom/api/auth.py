@@ -949,11 +949,11 @@ def _require_connections_route_authorized(
     if is_administrator(auth_user.get("matrix_user_id"), snapshot):
         return
     if _is_browser_page_request(request):
-        # A user who opens a dashboard page lands on their own page instead of a JSON refusal.
+        # A user who opens a dashboard page lands on their own page, which says why, instead of a JSON refusal.
         raise HTTPException(
             status_code=303,
             detail="Administrator access required",
-            headers={"Location": "/connections"},
+            headers={"Location": "/connections?notice=admin-only"},
         )
     raise HTTPException(status_code=403, detail="Administrator access required")
 
