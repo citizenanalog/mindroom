@@ -21,8 +21,8 @@ from openai.types.responses import (
     ResponseOutputItemDoneEvent,
 )
 
-from mindroom.agno_compat_openai_custom_tools import record_streamed_custom_tool_call
 from mindroom.error_handling import IncompleteResponsesStreamError
+from mindroom.providers.agno_compat_openai_custom_tools import record_streamed_custom_tool_call
 from mindroom.usage.storage import has_token_usage
 
 if TYPE_CHECKING:

@@ -18,7 +18,6 @@ from agno.models.openrouter import OpenRouter
 from agno.utils.media import get_image_type
 from agno.utils.tokens import _parse_image_dimensions_from_bytes
 
-from mindroom.agno_compat_openai_custom_tools import replay_custom_tool_items, tool_calls_with_custom
 from mindroom.history.message_content import image_content_for_token_estimation
 from mindroom.model_defaults import OPENAI_IMAGE_ORIGINAL_NO_PATCH_BUDGET_PREFIXES, OPENAI_IMAGE_PATCH_MODEL_PREFIXES
 from mindroom.native_compaction import (
@@ -29,6 +28,7 @@ from mindroom.native_compaction import (
     recorded_native_settings,
 )
 from mindroom.providers.agno_compat_openai_chat import OpenAIChatProviderCompat as AgnoOpenAIChatProviderCompat
+from mindroom.providers.agno_compat_openai_custom_tools import replay_custom_tool_items, tool_calls_with_custom
 from mindroom.providers.agno_compat_openai_responses import OpenAIResponsesProviderCompat
 from mindroom.providers.agno_compat_openai_responses_items import record_response_output, record_tool_search_items
 from mindroom.providers.legacy_openai_tool_replay import repair_legacy_openai_tool_replay

@@ -125,7 +125,7 @@ Matrix sync callback
 | `tool_dialects/types.py` | Tool dialect and wire-function types and argument helpers shared by the dialect tables |
 | `tool_dialects/claude.py` | Claude Code tool names and argument shapes for the canonical shell and coding functions |
 | `tool_dialects/codex.py` | Codex CLI tool names, argument shapes, and the apply_patch grammar for the canonical shell and coding functions |
-| `agno_compat_openai_custom_tools.py` | Parses and replays OpenAI Responses freeform custom tool calls that Agno ignores |
+| `providers/agno_compat_openai_custom_tools.py` | Parses and replays OpenAI Responses freeform custom tool calls that Agno ignores |
 | `tool_dialects/agno_compat_model.py` | Binds one tool dialect to an Agno model's tool formatting, call dispatch, and request messages |
 | `tool_system/tool_access.py` | Shared qualified tool identities, discovery, schemas, and local argument validation |
 | `memory/` | Mem0 memory: agent and team-scoped |

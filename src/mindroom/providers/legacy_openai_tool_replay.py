@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from mindroom.agno_compat_openai_custom_tools import CUSTOM_TOOL_CALL
+from mindroom.providers.agno_compat_openai_custom_tools import CUSTOM_TOOL_CALL
 
 if TYPE_CHECKING:
     from agno.models.message import Message

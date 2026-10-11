@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from mindroom.agno_compat_openai_custom_tools import CUSTOM_TOOL_CALL
 from mindroom.native_compaction import checkpoint_items
+from mindroom.providers.agno_compat_openai_custom_tools import CUSTOM_TOOL_CALL
 from mindroom.providers.agno_compat_openai_responses_items import RESPONSE_OUTPUT_KEY, TOOL_SEARCH_ITEMS_KEY
 from mindroom.providers.legacy_openai_tool_replay import repair_legacy_responses_span
 

@@ -13,8 +13,8 @@ from agno.tools.function import Function
 from openai import AsyncOpenAI
 
 from mindroom.agents import set_toolkit_owner
-from mindroom.agno_compat_openai_custom_tools import replay_custom_tool_items
 from mindroom.custom_tools.coding import CodingTools
+from mindroom.providers.agno_compat_openai_custom_tools import replay_custom_tool_items
 from mindroom.providers.codex_model import CodexResponses
 from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.providers.openai_tool_search import request_params_with_deferred_tool_search
