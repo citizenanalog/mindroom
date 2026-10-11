@@ -1,4 +1,11 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -17,6 +24,7 @@ import {
   emptyRule,
   formFromService,
   presetOf,
+  serializeService,
   suggestedName,
   usesMoreOptions,
   usesOwnRules,
@@ -26,7 +34,13 @@ import {
   presetPlaceholderWarnings,
   scopeNote,
 } from "./egressServiceNotes";
-import { type RuleFieldPart, ruleField } from "./egressServiceValidation";
+import {
+  type RuleFieldPart,
+  type ServiceProblem,
+  isBasicField,
+  ruleField,
+  validateService,
+} from "./egressServiceValidation";
 import { looksLikeGithub } from "./githubLimits";
 import {
   githubLimitRules,
@@ -49,7 +63,6 @@ import {
   selectClass,
   warningClass,
 } from "./EgressRuleFields";
-import { useServiceSubmit } from "./useServiceSubmit";
 import type {
   AuthoredEgressService,
   EgressCredentialService,
@@ -61,6 +74,16 @@ import type {
   EgressRuleSummary,
   EgressScope,
 } from "./types";
+
+/** The message of a rejection, or `fallback` when it has none. */
+function reasonOf(cause: unknown, fallback: string): string {
+  return cause instanceof Error && cause.message ? cause.message : fallback;
+}
+
+/** A problem with no field to show it, or with a field the basic form does not have. */
+function needsMoreOptions(problem: ServiceProblem): boolean {
+  return problem.field !== "form" && !isBasicField(problem.field);
+}
 
 /** A rule as a short host and path, such as `www.googleapis.com/drive/`. */
 function ruleCoverage(rule: EgressRuleSummary): string {
@@ -241,32 +264,18 @@ export function EgressServiceEditor({
     return result.errors.length > 0 ? null : applyGithubRules(result);
   };
 
-  const {
-    formRef,
-    problems,
-    busy,
-    serverError,
-    confirmingSave,
-    setConfirmingSave,
-    confirmingDelete,
-    setConfirmingDelete,
-    saved,
-    submit,
-    remove,
-  } = useServiceSubmit({
-    form,
-    options,
-    settings,
-    service,
-    apiKey,
-    saveWarning,
-    onSave,
-    saveKey: limiting ? undefined : saveKey,
-    onSaved,
-    onDelete,
-    openMoreOptions: () => setMoreOpen(true),
-    prepareForm,
-  });
+  const formRef = useRef<HTMLFormElement>(null);
+  const [attempted, setAttempted] = useState(false);
+  const [focusRequest, setFocusRequest] = useState(0);
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"save" | "delete" | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingSave, setConfirmingSave] = useState(false);
+  // The service as last written, so a retry after a failed key does not write
+  // it again; once set, its name can no longer change.
+  const [savedSignature, setSavedSignature] = useState<string | null>(null);
+  // The form's problems, empty until the user has tried to save.
+  const problems = attempted ? validateService(form, options, settings) : [];
   const dirty = useMemo(
     () =>
       JSON.stringify(form) !== JSON.stringify(openedWith.current) ||
@@ -276,7 +285,7 @@ export function EgressServiceEditor({
         helperSignature(helperInput) !== helperSignature(restored.input)),
     [form, apiKey, helperInput, restored, showGithubHelper],
   );
-  const nameLocked = editing || saved;
+  const nameLocked = editing || savedSignature !== null;
   const disabled = busy !== null;
 
   useEffect(() => {
@@ -300,6 +309,16 @@ export function EgressServiceEditor({
   useEffect(() => {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
+  // After a failed save, the first invalid field in page order gets focus; a
+  // problem that no field holds marks its message for focus instead.
+  useEffect(() => {
+    if (focusRequest === 0) return;
+    formRef.current
+      ?.querySelector<HTMLElement>(
+        '[aria-invalid="true"], [data-problem-focus]',
+      )
+      ?.focus();
+  }, [focusRequest]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
 
   const set = (changes: Partial<EgressServiceForm>) => {
@@ -387,6 +406,74 @@ export function EgressServiceEditor({
     const result = githubRepositoryRules(helperInput.repositories, helperInput);
     setHelperErrors(result.errors);
     if (result.errors.length === 0) applyGithubRules(result);
+  };
+
+  // A key never goes out for a service whose save failed. When only the key
+  // fails, the service stays saved and a retry writes the key alone, unless the
+  // service changed meanwhile.
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (busy) return;
+    setAttempted(true);
+    setServerError(null);
+    const current = prepareForm();
+    if (current === null) {
+      setFocusRequest((count) => count + 1);
+      return;
+    }
+    const found = validateService(current, options, settings);
+    if (found.length > 0) {
+      if (found.some(needsMoreOptions)) setMoreOpen(true);
+      setFocusRequest((count) => count + 1);
+      return;
+    }
+    if (saveWarning && !confirmingSave) {
+      setConfirmingSave(true);
+      return;
+    }
+    setConfirmingSave(false);
+    setBusy("save");
+    const authored = serializeService(current, options, service);
+    const signature = JSON.stringify([current.name, authored]);
+    try {
+      // The service goes first, and the key only after it is written.
+      if (signature !== savedSignature) {
+        await onSave(current.name, authored);
+        setSavedSignature(signature);
+      }
+    } catch (cause) {
+      setServerError(reasonOf(cause, "Could not save the service. Try again."));
+      setBusy(null);
+      return;
+    }
+    if (!limiting && saveKey && apiKey.trim() !== "") {
+      try {
+        await saveKey(apiKey, current.name);
+      } catch (cause) {
+        const reason = reasonOf(cause, "Could not save the key.");
+        setServerError(
+          `The service was saved, but its key was not: ${reason}${reason.endsWith(".") ? "" : "."} Paste the key again and save to retry.`,
+        );
+        setBusy(null);
+        return;
+      }
+    }
+    onSaved?.();
+  };
+
+  const remove = async () => {
+    if (!onDelete) return;
+    setBusy("delete");
+    setServerError(null);
+    try {
+      await onDelete();
+    } catch (cause) {
+      setServerError(
+        reasonOf(cause, "Could not delete the service. Try again."),
+      );
+      setBusy(null);
+      setConfirmingDelete(false);
+    }
   };
 
   return (
