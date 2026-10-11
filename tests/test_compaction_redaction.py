@@ -769,6 +769,65 @@ def test_editing_a_run_an_older_resumed_run_folded_rolls_the_fold_back(
     assert "$b" not in archive.redactable_compacted_event_ids(storage, session_id="session", scope_key=_SCOPE.key)
 
 
+def _answering(run_id: str, event_id: str) -> RunOutput:
+    run = _run(run_id)
+    run.metadata = {**(run.metadata or {}), constants.MATRIX_EVENT_ID_METADATA_KEY: event_id}
+    return run
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_editing_a_retried_turn_whose_second_attempt_folded_the_first_removes_both(
+    storage: SqliteDb,
+    *,
+    materialized: bool,
+) -> None:
+    """Both attempts answered the edited message, so neither the first attempt nor the fold survives."""
+    session = _seed_runs(storage, _run("c"), _answering("p1", "$u"), _answering("p2", "$u"))
+    _fold(storage, session, "p2", ["c", "p1"])
+    if materialized:
+        reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$u",)) is True
+
+    assert _live(storage) == ["c"]
+    assert _summary(_stored(storage)) is None
+
+
+def test_editing_a_message_a_later_bot_triggered_turn_folded_removes_that_turn(storage: SqliteDb) -> None:
+    """A later turn's fold covered the edited turn, so the edit undoes the fold and removes the later turn."""
+    session = _seed_runs(storage, _answering("p", "$u"), _answering("q", "$bot"))
+    _fold(storage, session, "q", ["p"])
+    reconcile_compaction_state(storage, session, _SCOPE)
+    assert _live(storage) == ["q"]
+
+    assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$u",)) is True
+
+    assert _live(storage) == []
+    assert _summary(_stored(storage)) is None
+
+
+@pytest.mark.parametrize("removal", ["edit", "redaction"])
+def test_removing_an_archived_run_keeps_an_older_pending_approval(storage: SqliteDb, removal: str) -> None:
+    """Only runs after the removed one go; an older run compaction skipped, such as a pending approval, stays."""
+    session = _seed_runs(storage, _paused("p"), _run("r1"), _run("r2"))
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="r1", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[run for run in session.runs or [] if run.run_id == "r1"],
+    )
+
+    if removal == "edit":
+        assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$r1",)) is True
+    else:
+        assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$r1") is True
+
+    assert _live(storage) == ["p"]
+    assert _summary(_stored(storage)) is None
+
+
 def test_a_fold_a_crash_kept_out_of_its_run_is_resolved_before_redaction(storage: SqliteDb) -> None:
     """Redacting a run an unapplied fold covered keeps the run that fold would have shortened."""
     session = _seed_runs(storage, _run("r1"), _paused("p"), _run("b"))

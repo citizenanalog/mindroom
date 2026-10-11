@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal
 
 from agno.db.sqlite import SqliteDb
 from agno.db.utils import deserialize_run, get_run_type
+from sqlalchemy import select
 
 from mindroom import agno_compat_sqlite
 from mindroom.agent_storage import delete_run_subtrees, runs_without
@@ -38,7 +39,8 @@ if TYPE_CHECKING:
     from agno.db.base import BaseDb
     from agno.run.agent import RunOutput
     from agno.run.team import TeamRunOutput
-    from sqlalchemy import Connection
+    from sqlalchemy import Connection, Table
+    from sqlalchemy.orm import Session
 
 _ID_CHUNK_SIZE = 500
 
@@ -57,7 +59,6 @@ class PositionedGeneration:
     id: int
     through_run_id: str
     covered_run_ids: tuple[str, ...]
-    has_summary: bool
 
 
 @dataclass(frozen=True)
@@ -79,12 +80,8 @@ def archive_runs(
     runs: Sequence[RunOutput | TeamRunOutput],
     event_ids: Mapping[str, Collection[str]],
     seen_event_ids: Mapping[str, Collection[str]],
-    generation_id: int | None = None,
 ) -> None:
     """Record one generation and move ``runs`` from the live table into the archive atomically.
-
-    With ``generation_id``, the runs join that existing generation instead, which is how a positioned
-    generation receives the stored runs it covers.
 
     ``runs`` is the complete removed subtree in stored order, member runs included.
     ``event_ids`` names every event redaction matches a run by; ``seen_event_ids`` the
@@ -93,50 +90,98 @@ def archive_runs(
     summary is the one that first folded it, so redaction must roll back to it.
     """
     db = _sqlite(storage)
-    compactions, compacted_runs = _table_names(db)
-    archived = [(run.run_id, run) for run in runs if run.run_id]
+    compactions, _ = _table_names(db)
     with agno_compat_sqlite.run_deletion_transaction(db) as (transaction, runs_table, sessions_table):
         connection = transaction.connection()
         _ensure_tables(connection, db)
-        compaction_id = (
-            generation_id
-            if generation_id is not None
-            else connection.exec_driver_sql(
-                f"INSERT INTO {compactions} (session_id, scope_key, summary, summary_model, created_at) "  # noqa: S608
-                "VALUES (?, ?, ?, ?, ?)",
-                (session_id, scope_key, summary, summary_model, int(time.time())),
-            ).lastrowid
+        compaction_id = connection.exec_driver_sql(
+            f"INSERT INTO {compactions} (session_id, scope_key, summary, summary_model, created_at) "  # noqa: S608
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, scope_key, summary, summary_model, int(time.time())),
+        ).lastrowid
+        _move_runs(
+            transaction,
+            db,
+            runs_table,
+            sessions_table,
+            compaction_id,
+            session_id,
+            runs,
+            event_ids,
+            seen_event_ids,
         )
-        if archived:
-            indexes = (
-                agno_compat_sqlite.stored_run_indexes(
-                    transaction,
-                    runs_table,
-                    [run_id for run_id, _ in archived],
-                    session_id=session_id,
+
+
+def add_runs_to_generation(
+    storage: BaseDb,
+    *,
+    session_id: str,
+    generation_id: int,
+    runs: Sequence[RunOutput | TeamRunOutput],
+    event_ids: Mapping[str, Collection[str]],
+    seen_event_ids: Mapping[str, Collection[str]],
+) -> None:
+    """Move ``runs`` into an existing generation, which is how a positioned generation receives its covered runs."""
+    db = _sqlite(storage)
+    with agno_compat_sqlite.run_deletion_transaction(db) as (transaction, runs_table, sessions_table):
+        _ensure_tables(transaction.connection(), db)
+        _move_runs(
+            transaction,
+            db,
+            runs_table,
+            sessions_table,
+            generation_id,
+            session_id,
+            runs,
+            event_ids,
+            seen_event_ids,
+        )
+
+
+def _move_runs(
+    transaction: Session,
+    db: SqliteDb,
+    runs_table: Table | None,
+    sessions_table: Table | None,
+    compaction_id: int,
+    session_id: str,
+    runs: Sequence[RunOutput | TeamRunOutput],
+    event_ids: Mapping[str, Collection[str]],
+    seen_event_ids: Mapping[str, Collection[str]],
+) -> None:
+    """Archive ``runs`` under ``compaction_id`` with their live-table indexes, then delete their live rows."""
+    _, compacted_runs = _table_names(db)
+    archived = [(run.run_id, run) for run in runs if run.run_id]
+    if archived:
+        indexes = (
+            agno_compat_sqlite.stored_run_indexes(
+                transaction,
+                runs_table,
+                [run_id for run_id, _ in archived],
+                session_id=session_id,
+            )
+            if runs_table is not None
+            else {}
+        )
+        transaction.connection().exec_driver_sql(
+            f"INSERT INTO {compacted_runs} "  # noqa: S608
+            "(compaction_id, session_id, run_id, run_type, event_ids, seen_event_ids, run_index, run_data) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, run_id) DO NOTHING",
+            [
+                (
+                    compaction_id,
+                    session_id,
+                    run_id,
+                    get_run_type(run),
+                    json.dumps(sorted(event_ids.get(run_id, ()))),
+                    json.dumps(sorted(seen_event_ids.get(run_id, ()))),
+                    indexes.get(run_id),
+                    json.dumps(run.to_dict()),
                 )
-                if runs_table is not None
-                else {}
-            )
-            connection.exec_driver_sql(
-                f"INSERT INTO {compacted_runs} "  # noqa: S608
-                "(compaction_id, session_id, run_id, run_type, event_ids, seen_event_ids, run_index, run_data) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, run_id) DO NOTHING",
-                [
-                    (
-                        compaction_id,
-                        session_id,
-                        run_id,
-                        get_run_type(run),
-                        json.dumps(sorted(event_ids.get(run_id, ()))),
-                        json.dumps(sorted(seen_event_ids.get(run_id, ()))),
-                        indexes.get(run_id),
-                        json.dumps(run.to_dict()),
-                    )
-                    for run_id, run in archived
-                ],
-            )
-        delete_run_subtrees(transaction, runs_table, sessions_table, [run_id for run_id, _ in archived])
+                for run_id, run in archived
+            ],
+        )
+    delete_run_subtrees(transaction, runs_table, sessions_table, [run_id for run_id, _ in archived])
 
 
 def record_positioned_generation(
@@ -184,7 +229,7 @@ def positioned_generations(storage: BaseDb, *, session_id: str, scope_key: str) 
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
         rows = connection.exec_driver_sql(
-            f"SELECT id, through_run_id, covered_run_ids, summary IS NOT NULL FROM {compactions} "  # noqa: S608
+            f"SELECT id, through_run_id, covered_run_ids FROM {compactions} "  # noqa: S608
             "WHERE session_id = ? AND scope_key = ? AND through_run_id IS NOT NULL ORDER BY id",
             (session_id, scope_key),
         ).fetchall()
@@ -193,7 +238,6 @@ def positioned_generations(storage: BaseDb, *, session_id: str, scope_key: str) 
             id=row[0],
             through_run_id=row[1],
             covered_run_ids=tuple(json.loads(row[2] or "[]")),
-            has_summary=bool(row[3]),
         )
         for row in rows
     ]
@@ -282,7 +326,9 @@ def clear_to_legacy(
 def retire_summaries(storage: BaseDb, *, session_id: str, scope_key: str) -> None:
     """Stop replaying every summary of the scope while its live and archived runs stay stored.
 
-    Archived runs of retired generations no longer count as compacted history.
+    Archived runs of retired generations no longer count as compacted history. A mid-turn fold's position run is
+    the exception: its record lacks the messages the retired summary replaced, so it is deleted when live and
+    turned into a tombstone when archived.
     """
     db = _sqlite(storage)
     compactions, _ = _table_names(db)
@@ -451,6 +497,29 @@ def _replayed_archive_event_ids(
     return {row[0] for row in rows}
 
 
+def live_runs_after(storage: BaseDb, *, session_id: str, run_id: str) -> list[str] | None:
+    """Return the live runs stored after the archived ``run_id``, or None when its index was not recorded."""
+    db = _sqlite(storage)
+    _, compacted_runs = _table_names(db)
+    runs = agno_compat_sqlite.owned_table(db, "runs")
+    with db.db_engine.begin() as connection:
+        _ensure_tables(connection, db)
+        row = connection.exec_driver_sql(
+            f"SELECT run_index FROM {compacted_runs} WHERE session_id = ? AND run_id = ?",  # noqa: S608
+            (session_id, run_id),
+        ).first()
+        if row is None or row[0] is None:
+            return None
+        return [
+            live_run_id
+            for (live_run_id,) in connection.execute(
+                select(runs.c.run_id)
+                .where(runs.c.session_id == session_id, runs.c.run_index > row[0])
+                .order_by(runs.c.run_index),
+            )
+        ]
+
+
 def find_archived_event(
     storage: BaseDb,
     *,
@@ -592,8 +661,10 @@ def roll_back_to(
             # the run's index in the live table.
             # Last legacy release: v2026.10.253; replacement: the next release records ``run_index`` on every row.
             # Handling: The run is appended after the live runs in archive order, as before, so it can follow an
-            # older live run that compaction skipped; rows with an index return to it.
-            # Coverage: tests/test_history_archive.py::test_runs_archived_without_an_index_are_appended_in_archive_order.
+            # older live run that compaction skipped; rows with an index return to it. Removing such a run also
+            # removes every live run, as before, since none can be placed after it (``live_runs_after``).
+            # Coverage: tests/test_history_archive.py::test_runs_archived_without_an_index_are_appended_in_archive_order;
+            # tests/test_compaction_redaction.py::test_removing_an_archived_run_keeps_an_older_pending_approval.
             agno_compat_sqlite.insert_run_row(
                 transaction,
                 runs,

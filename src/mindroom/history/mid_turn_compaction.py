@@ -25,7 +25,6 @@ from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 from agno.run.team import TeamRunOutput
 from agno.session.summary import SessionSummary
-from agno.team import Team
 
 from mindroom.agent_storage import run_session_storage_operation, save_compaction_usage
 from mindroom.agno_compat_model_hooks import install_request_preparation
@@ -50,7 +49,7 @@ from mindroom.history.runtime import (
     resolve_entity_preparation_inputs,
     summarize_run_locally,
 )
-from mindroom.history.session_context import resolve_history_scope
+from mindroom.history.session_context import resolve_target_history_scope
 from mindroom.history.storage import new_scope_session
 from mindroom.history.types import HistoryScope
 from mindroom.logging_config import get_logger
@@ -68,6 +67,7 @@ if TYPE_CHECKING:
     from agno.models.response import ModelResponse
     from agno.session.agent import AgentSession
     from agno.session.team import TeamSession
+    from agno.team import Team
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -309,11 +309,7 @@ async def _compact_scope(
     """
     storage = binding.target.db
     assert isinstance(storage, BaseDb)
-    scope = (
-        HistoryScope(kind="team", scope_id=binding.target.id or "")
-        if isinstance(binding.target, Team)
-        else resolve_history_scope(binding.target)
-    )
+    scope = resolve_target_history_scope(binding.target)
     assert scope is not None
     covered_runs = await asyncio.to_thread(_uncovered_runs, storage, session, scope, run_response.run_id or "")
     commit = await compact_scope_mid_turn(

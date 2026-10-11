@@ -34,9 +34,8 @@ from agno.utils.log import log_warning
 from mindroom.history.legacy_summary_system_prompt import system_message_embeds_summary
 from mindroom.history.message_content import project_history_media_for_replay
 from mindroom.history.replay import compaction_summary_message, current_summary_text, is_scope_summary
-from mindroom.history.session_context import resolve_history_scope
+from mindroom.history.session_context import resolve_target_history_scope
 from mindroom.history.storage import reconcile_compaction_state
-from mindroom.history.types import HistoryScope
 
 if TYPE_CHECKING:
     from agno.agent import Agent
@@ -230,11 +229,7 @@ def _reconcile_continuation(target: object, kwargs: dict[str, object]) -> None:
     replays_history = kwargs.get("add_history_to_context")
     if not (replays_history if replays_history is not None else entity.add_history_to_context):
         return
-    scope = (
-        HistoryScope(kind="team", scope_id=entity.id or "")
-        if isinstance(entity, Team)
-        else resolve_history_scope(entity)
-    )
+    scope = resolve_target_history_scope(entity)
     if scope is not None:
         reconcile_compaction_state(entity.db, session, scope)
 

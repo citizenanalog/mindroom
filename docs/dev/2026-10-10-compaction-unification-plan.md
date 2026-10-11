@@ -1,5 +1,7 @@
 # Compaction Unification Implementation Plan
 
+> **Superseded in part:** its mid-turn snapshot tasks were replaced by positioned generations; see [the positioned mid-turn compaction plan](2026-10-11-compaction-position-plan.md) and section 5 of the design spec.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: implement this plan task-by-task with the skill named in **Execution**.
 > Steps use checkbox (`- [ ]`) syntax.
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from agno.db.base import SessionType
 from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.run.agent import RunOutput
@@ -34,6 +35,7 @@ from mindroom.history.storage import (
     read_scope_seen_event_ids,
     reconcile_compaction_state,
     record_mid_turn_generation,
+    remove_runs_for_sources,
 )
 from mindroom.history.types import HistoryScope
 from tests.conftest import seed_session
@@ -109,7 +111,10 @@ class _Runner:
             "reopen": self._reopen,
         }
         for action in actions:
-            redacted_event_id = self._redact(action) if action.kind == "redact" else operations[action.kind](action)
+            if action.kind in {"redact", "edit"}:
+                redacted_event_id = self._redact(action, edit=action.kind == "edit")
+            else:
+                redacted_event_id = operations[action.kind](action)
             self._check(redacted_event_id)
 
     def close(self) -> None:
@@ -291,11 +296,17 @@ class _Runner:
             run = copies[action.index % len(copies)]
             self._storage.upsert_run(run=run, session_id=_SESSION, user_id=None)
 
-    def _redact(self, action: Action) -> str | None:
-        if not self._events:
+    def _redact(self, action: Action, *, edit: bool = False) -> str | None:
+        """Redact an event, or edit the message whose run answered it; either way its content must leave history."""
+        # An edit regenerates a reply, so it targets a message whose run this conversation created.
+        candidates = [_event(run_id) for run_id in self._created] if edit else self._events
+        if not candidates:
             return None
-        event_id = self._events[action.index % len(self._events)]
-        _remove_redacted_event_from_history(self._storage, self._load(), _SCOPE, event_id=event_id)
+        event_id = candidates[action.index % len(candidates)]
+        if edit:
+            remove_runs_for_sources(self._storage, _SESSION, SessionType.AGENT, _SCOPE, (event_id,))
+        else:
+            _remove_redacted_event_from_history(self._storage, self._load(), _SCOPE, event_id=event_id)
         self._redacted.add(event_id)
         return event_id
 
@@ -377,6 +388,7 @@ _ACTIONS = st.builds(
             "stale_write",
             "resurrect",
             "redact",
+            "edit",
             "reopen",
         ),
     ),
@@ -485,6 +497,11 @@ _ACTIONS = st.builds(
         Action("compact", count=3),
         Action("redact", index=1),
     ],
+    legacy=False,
+)
+@example(
+    # An edit of a message whose run a later fold covered and a reconcile archived.
+    actions=[Action("add"), Action("add"), Action("midturn", index=1), Action("add"), Action("edit", index=0)],
     legacy=False,
 )
 def test_generated_compaction_histories_keep_the_archive_invariants(actions: list[Action], *, legacy: bool) -> None:

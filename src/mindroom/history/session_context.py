@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from agno.team import Team
+
 from mindroom.agent_storage import (
     create_session_storage,
     create_state_storage,
@@ -70,6 +72,13 @@ def resolve_history_scope(agent: Agent) -> HistoryScope | None:
     if isinstance(agent_id, str) and agent_id:
         return HistoryScope(kind="agent", scope_id=agent_id)
     return None
+
+
+def resolve_target_history_scope(target: Agent | Team) -> HistoryScope | None:
+    """Return the persisted history scope a live agent or team replays."""
+    if isinstance(target, Team):
+        return HistoryScope(kind="team", scope_id=target.id or "")
+    return resolve_history_scope(target)
 
 
 def resolve_bound_history_owner(agents: list[Agent]) -> tuple[Agent | None, str | None]:

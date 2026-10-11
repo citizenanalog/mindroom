@@ -232,16 +232,13 @@ def _position(storage: SqliteDb, through_run_id: str, covered: list[str], summar
 def _materialize(storage: SqliteDb, generation_id: int, run_ids: list[str]) -> None:
     session = get_agent_session(storage, "session")
     assert session is not None
-    archive.archive_runs(
+    archive.add_runs_to_generation(
         storage,
         session_id="session",
-        scope_key=_SCOPE,
-        summary="",
-        summary_model="",
+        generation_id=generation_id,
         runs=[run for run in session.runs or [] if run.run_id in run_ids],
         event_ids={run_id: {f"${run_id}"} for run_id in run_ids},
         seen_event_ids={run_id: {f"${run_id}"} for run_id in run_ids},
-        generation_id=generation_id,
     )
 
 

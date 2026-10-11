@@ -543,7 +543,9 @@ def _remove_redacted_event_from_compaction(
             scope_key=scope.key,
             hit=hit,
             # A fold depending on a removed run is undone with it; the live runs left are older ones compaction skipped.
-            live_run_ids=() if hit.run_id in removed_run_ids else live_run_ids,
+            live_run_ids=()
+            if hit.run_id in removed_run_ids
+            else _live_runs_after(storage, session.session_id, hit, live_run_ids),
         )
     elif not removed_live_run:
         return False
@@ -613,10 +615,21 @@ def remove_runs_for_sources(
             # pending approval; an archived hit has every live run after it.
             live_run_ids=()
             if hit.run_id in removed_run_ids
-            else [run.run_id for run in session.runs or [] if run.run_id],
+            else _live_runs_after(storage, session_id, hit, [run.run_id for run in session.runs or [] if run.run_id]),
         )
         _sync_after_history_removal(storage, session, scope)
     return True
+
+
+def _live_runs_after(
+    storage: BaseDb,
+    session_id: str,
+    hit: archive.ArchiveHit,
+    live_run_ids: list[str],
+) -> list[str]:
+    """Return the live runs an archived hit removes: those stored after it, so an older pending approval stays."""
+    after = archive.live_runs_after(storage, session_id=session_id, run_id=hit.run_id)
+    return live_run_ids if after is None else after
 
 
 def _sync_after_history_removal(
@@ -791,8 +804,7 @@ def _resolve_positioned_generations(
         archive.roll_back_to(storage, session_id=session.session_id, scope_key=scope.key, hit=hit, live_run_ids=())
         applied = [generation for generation in applied if generation.id < hit.generation_id]
     for generation in applied if materialize else ():
-        if generation.has_summary:
-            _materialize(storage, target_session, scope, generation)
+        _materialize(storage, target_session, generation)
     if unapplied or orphaned:
         # Agno writes the session row before the run row, so the cached summary may name a discarded fold.
         _sync_after_history_removal(storage, target_session, scope)
@@ -811,7 +823,6 @@ def _recorded_generation(run: RunOutput | TeamRunOutput) -> int:
 def _materialize(
     storage: BaseDb,
     session: AgentSession | TeamSession,
-    scope: HistoryScope,
     generation: archive.PositionedGeneration,
 ) -> None:
     """Move the live runs an applied fold covered, with their member runs, into its generation."""
@@ -820,18 +831,15 @@ def _materialize(
     covered = [run for run in runs if id(run) not in kept]
     if not covered:
         return
-    archive.archive_runs(
+    archive.add_runs_to_generation(
         storage,
         session_id=session.session_id,
-        scope_key=scope.key,
-        summary="",
-        summary_model="",
+        generation_id=generation.id,
         runs=covered,
         event_ids={run.run_id: _run_event_ids(run) for run in covered if run.run_id},
         seen_event_ids={
             run.run_id: _run_seen_event_ids(run) for run in covered if run.run_id and is_model_history_visible_run(run)
         },
-        generation_id=generation.id,
     )
     session.runs = [run for run in runs if id(run) in kept]
 

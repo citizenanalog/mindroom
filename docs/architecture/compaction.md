@@ -80,9 +80,9 @@ Mantle currently needs its existing HTTP transport passed explicitly when copyin
 - Archived runs keep the seen ids they counted while live apart from the wider set redaction matches, so compaction never changes which messages count as seen.
 - Metadata seen ids have no archive counterpart, so a stale whole-row session write can restore ids a redaction dropped; that only withholds those messages from unseen thread context.
 - Earlier committed chunks survive later failure or cancellation; compacted runs cannot silently reappear.
-- Redacting an event represented by an archived run removes that run and everything after it, returns the generation's earlier runs to replay, and replays the previous generation's summary.
+- Redacting an event represented by an archived run removes that run and everything after it, returns the generation's earlier runs to replay, and replays the previous generation's summary; older live runs compaction skipped, such as a pending approval, stay.
 - Content-free legacy generations cannot be split: while one still replays its summary, an event it may contain (its captured seen ids or retained source ownership) clears it together with every later generation, their archived runs, and all live runs, as before the archive existed.
-- A live run removed for any other event only retires the scope's summaries, because legacy provenance may be incomplete; live runs stay, and archived runs stay stored without counting as compacted history.
+- A live run removed for any other event only retires the scope's summaries, because legacy provenance may be incomplete; live runs stay, except a mid-turn fold's shortened position run, and archived runs stay stored without counting as compacted history.
 - Legacy provenance takes precedence over an archive hit, because every later generation was built on the legacy summary.
 - After any redaction change, the scope's metadata seen ids are dropped and the derived ids follow the remaining history, so removed messages return as unseen thread context unless a stale whole-row write restores those metadata ids (see above).
 - Redaction keeps the archived runs it removes as content-free tombstones, so a stale save of such a run is pruned like any other archived run; only conversation deletion removes archive rows.
