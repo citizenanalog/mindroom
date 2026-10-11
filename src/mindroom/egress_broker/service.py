@@ -386,7 +386,8 @@ class _BrokerService:
         try:
             asyncio.run(self._serve(broker))
         except Exception as exc:
-            # Last-resort guard of the broker thread: start() reraises it, later it is logged.
+            # Last-resort guard of the broker thread. A failure before listening is re-raised by start(); a later one
+            # is logged.
             if self._listening.is_set():
                 logger.exception("egress_broker_thread_failed")
             else:
@@ -465,7 +466,8 @@ def execution_env_for_worker(
     try:
         services = effective_config(config.egress_broker, runtime.credentials_manager, scope_target).services
     except Exception as exc:
-        # As broad as `read_rules`, which reads the same store and answers 502 meanwhile; the call still gets the env.
+        # The credential store's backends can raise anything; the broker answers 502 for this scope while the call
+        # still gets the proxy env.
         logger.warning("egress_broker_user_services_failed", error_type=type(exc).__name__)
         services = config.egress_broker.services
     config_placeholders: dict[str, str] = {}

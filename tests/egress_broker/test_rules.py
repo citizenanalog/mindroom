@@ -447,6 +447,7 @@ def test_operator_restriction_is_decided_by_operator_rules_alone() -> None:
     assert operator.match is not None
     assert operator.match.service == "op"
     assert route_request(rules, "api.github.com", 443, "/repos/o/a/../../x").refusal == "bad_request"
+    assert route_request(rules, "api.github.com", 443, "/graphql/../repos/o/a").refusal == "bad_request"
 
 
 def test_user_restriction_still_narrows_its_scope() -> None:
@@ -727,9 +728,19 @@ _ROUTE_DECISION_CASES = [
         {},
         False,
         _HOST,
-        "/a/../b",
+        "/b/../a",
         (True, "bad_request", None, False, None),
         id="2-ambiguous-path-is-refused-before-any-restriction",
+    ),
+    pytest.param(
+        2,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {},
+        False,
+        _HOST,
+        "/a/../b",
+        (True, "bad_request", None, False, None),
+        id="2-ambiguous-path-is-refused-even-where-a-rule-matches",
     ),
     pytest.param(
         3,
