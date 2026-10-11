@@ -19,13 +19,15 @@ from agno.models.message import Message
 from agno.models.response import ModelResponse
 from agno.run.agent import RunInput, RunOutput
 from agno.run.base import RunStatus
+from agno.run.team import TeamRunOutput
 from agno.session.summary import SessionSummary
 from agno.team import Team
 from agno.tools.function import Function
 
-from mindroom.agent_storage import create_session_storage, get_agent_session
+from mindroom.agent_storage import create_session_storage, get_agent_session, get_team_session
 from mindroom.agents import create_agent
 from mindroom.agno_compat_model_hooks import install_request_preparation
+from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
 from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY as _NOTICE_KEY
 from mindroom.history import agno_compat_message_builder, mid_turn_compaction
@@ -41,8 +43,10 @@ from tests.conftest import FakeModel, seed_session
 from tests.history_helpers import (
     RecordingCompactionLifecycle,
     _completed_run,
+    _completed_team_run,
     _make_config,
     _session,
+    _team_session,
     archived_run_ids,
     compaction_generations,
 )
@@ -161,9 +165,11 @@ def _config(
     *,
     enabled: bool = True,
     context_window: int | None = 4000,
+    teams: dict[str, TeamConfig] | None = None,
 ) -> tuple[Config, RuntimePaths]:
     return _make_config(
         tmp_path,
+        teams=teams,
         defaults_compaction=CompactionConfig(enabled=enabled, model="summary", reserve_tokens=500),
         models={
             "default": ModelConfig(provider="openai", id="test-model", context_window=context_window),
@@ -756,6 +762,70 @@ async def test_long_single_turn_compacts_mid_turn_and_continues(
     assert stored.summary is not None
     assert stored.summary.summary == generations[-1].summary
     assert any(run.run_id == output.run_id for run in stored.runs or [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("summary_calls")
+@pytest.mark.parametrize("stream", [False, True])
+async def test_long_single_team_turn_compacts_mid_turn_and_continues(
+    tmp_path: Path,
+    *,
+    stream: bool,
+) -> None:
+    config, paths = _config(
+        tmp_path,
+        teams={"test_team": TeamConfig(display_name="Test Team", role="Test team", agents=["test_agent"])},
+    )
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(
+        storage,
+        _team_session(
+            "session-1",
+            team_id="test_team",
+            runs=[_completed_team_run("run-1", team_id="test_team"), _completed_team_run("run-2", team_id="test_team")],
+        ),
+    )
+    model = _ToolLoopModel(tool_rounds=5)
+    team = Team(
+        id="test_team",
+        name="test_team",
+        model=model,
+        members=[],
+        tools=[probe],
+        db=storage,
+        add_history_to_context=True,
+        store_history_messages=False,
+        add_session_summary_to_context=False,
+        telemetry=False,
+    )
+    install_mid_turn_compaction(team, config=config, runtime_paths=paths, entity_name="test_team", model_name="default")
+
+    if stream:
+        outputs = [
+            event
+            async for event in team.arun("Do the task", session_id="session-1", stream=True, yield_run_output=True)
+            if isinstance(event, TeamRunOutput)
+        ]
+        output = outputs[-1]
+    else:
+        output = await team.arun("Do the task", session_id="session-1")
+    assert isinstance(output, TeamRunOutput)
+
+    assert str(output.content).endswith("done")
+    compacted = _first_compacted(model)
+    summaries = [message for message in compacted.messages if is_compaction_summary(message)]
+    assert len(summaries) == 1
+    assert summaries[0].from_history is True
+    assert compacted.contents[-1] == "Do the task"
+    assert not any("team question" in content or "team answer" in content for content in compacted.contents)
+    archived = archived_run_ids(storage)
+    assert archived[:2] == ["run-1", "run-2"]
+    assert archived[2].startswith(f"{output.run_id}:compaction-snapshot:")
+    generations = compaction_generations(storage, HistoryScope(kind="team", scope_id="test_team").key)
+    stored = get_team_session(storage, "session-1")
+    assert stored is not None
+    assert stored.summary is not None
+    assert stored.summary.summary == generations[-1].summary
 
 
 @pytest.mark.asyncio

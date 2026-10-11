@@ -25,7 +25,7 @@ from agno.session.summary import SessionSummary
 from agno.session.team import TeamSession
 
 from mindroom.agent_storage import create_session_storage
-from mindroom.config.agent import AgentConfig
+from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import CompactionConfig, CompactionOverrideConfig, DefaultsConfig, ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
@@ -161,6 +161,7 @@ def _make_config(
     defaults_compaction: CompactionConfig | None = _DEFAULT_TEST_COMPACTION,
     context_window: int | None = 48_000,
     models: dict[str, ModelConfig] | None = None,
+    teams: dict[str, TeamConfig] | None = None,
 ) -> tuple[Config, RuntimePaths]:
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(
@@ -173,6 +174,7 @@ def _make_config(
                     compaction=compaction,
                 ),
             },
+            teams=teams or {},
             defaults=DefaultsConfig(tools=[], compaction=defaults_compaction),
             models=(
                 models
