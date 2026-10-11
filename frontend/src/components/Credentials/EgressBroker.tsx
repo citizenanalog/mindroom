@@ -385,7 +385,6 @@ function ServiceSection({ agentName }: { agentName: string | null }) {
               ...Object.keys(authoredServices),
               ...(services ?? []).map((service) => service.name),
             ]}
-            otherServices={services ?? []}
             loadPresets={loadPresets}
             saveWarning={saveWarning}
             onDirtyChange={setEditorDirty}

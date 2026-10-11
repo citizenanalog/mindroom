@@ -46,6 +46,9 @@ const agents: EgressCredentialAgent[] = [
     agent_name: "personal",
     agent_display_name: "Personal Mind",
     shared: false,
+    scope: "user_agent",
+    scope_agents: [],
+    managers: [],
     can_manage: true,
     services: [service],
   },
@@ -53,6 +56,9 @@ const agents: EgressCredentialAgent[] = [
     agent_name: "shared_dev",
     agent_display_name: "Shared Dev",
     shared: true,
+    scope: "shared",
+    scope_agents: [],
+    managers: [],
     can_manage: false,
     services: [{ ...service, is_shared: true, can_manage: false }],
   },
@@ -60,6 +66,9 @@ const agents: EgressCredentialAgent[] = [
     agent_name: "bare",
     agent_display_name: "Bare Agent",
     shared: false,
+    scope: "user_agent",
+    scope_agents: [],
+    managers: [],
     can_manage: true,
     services: [],
   },
@@ -258,6 +267,7 @@ const configService: EgressCredentialService = {
 };
 
 const SERVICES = "/api/connections/egress/agents/personal/services";
+const KEYS = "/api/connections/egress/agents/personal";
 const PRESETS = "/api/connections/egress/presets";
 const presetsReady = () =>
   waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
@@ -280,6 +290,9 @@ describe("egress services on the personal page", () => {
         agent_name: "personal",
         agent_display_name: "Personal Mind",
         shared: false,
+        scope: "user_agent",
+        scope_agents: [],
+        managers: [],
         can_manage: true,
         services: [configService, userService],
       },
@@ -296,7 +309,8 @@ describe("egress services on the personal page", () => {
       if (path === PRESETS) return presets();
       if (method === "GET" && path.startsWith(`${SERVICES}/`))
         return json(authored[decodeURIComponent(path.split("/").pop() ?? "")]);
-      if (path.startsWith(SERVICES)) return mutation(method, path, body);
+      if (path.startsWith(SERVICES) || path.startsWith(`${KEYS}/`))
+        return mutation(method, path, body);
       throw new Error(`Unexpected request: ${method} ${path}`);
     });
   });
@@ -335,6 +349,196 @@ describe("egress services on the personal page", () => {
     ).toHaveLength(2);
   });
 
+  describe("with the key in the same step", () => {
+    const openAdd = async () => {
+      fireEvent.click(
+        within(await personal()).getByRole("button", {
+          name: "Add service for Personal Mind",
+        }),
+      );
+      await presetsReady();
+    };
+    const fillOpenAi = (key: string) => {
+      fireEvent.change(screen.getByLabelText("Name"), {
+        target: { value: "ai" },
+      });
+      fireEvent.change(screen.getByLabelText("Preset"), {
+        target: { value: "openai" },
+      });
+      if (key)
+        fireEvent.change(screen.getByLabelText("API key"), {
+          target: { value: key },
+        });
+      fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    };
+    const loads = () =>
+      calls.filter((call) => call.path === "/api/connections/egress").length;
+
+    it("saves the service, then the key, then closes the editor", async () => {
+      render(<EgressCredentials />);
+      await openAdd();
+      fillOpenAi("sk-secret");
+      await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
+      expect(writes()).toEqual([
+        { method: "PUT", path: `${SERVICES}/ai`, body: { preset: "openai" } },
+        { method: "PUT", path: `${KEYS}/ai`, body: { secret: "sk-secret" } },
+      ]);
+      // The page reloaded after each write, so the row shows the key.
+      expect(loads()).toBe(3);
+    });
+
+    it("saves only the service when no key is typed", async () => {
+      render(<EgressCredentials />);
+      await openAdd();
+      fillOpenAi("");
+      await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
+      expect(writes()).toEqual([
+        { method: "PUT", path: `${SERVICES}/ai`, body: { preset: "openai" } },
+      ]);
+      expect(loads()).toBe(2);
+    });
+
+    it("never writes the key when the service is refused", async () => {
+      mutation = () =>
+        json({ detail: "service name 'ai' is already used" }, 409);
+      render(<EgressCredentials />);
+      await openAdd();
+      fillOpenAi("sk-secret");
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "service name 'ai' is already used",
+      );
+      expect(writes().map((write) => write.path)).toEqual([`${SERVICES}/ai`]);
+      expect(screen.getByRole("form", { name: "Add service" })).toBeVisible();
+    });
+
+    it("says when only the key failed, and keeps the saved service open for a retry", async () => {
+      let keyAttempts = 0;
+      mutation = (_method, path) => {
+        if (!path.startsWith(SERVICES) && keyAttempts++ === 0)
+          return json({ detail: "The key vault is read-only" }, 409);
+        return new Response(null, { status: 204 });
+      };
+      render(<EgressCredentials />);
+      await openAdd();
+      listing[0].services = [
+        ...listing[0].services,
+        { ...userService, name: "ai", display_name: "OpenAI" },
+      ];
+      fillOpenAi("sk-secret");
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "The service was saved, but its key was not: The key vault is read-only.",
+      );
+      // The service is listed already, and the editor stays for the retry.
+      expect(await screen.findByLabelText("OpenAI")).toBeInTheDocument();
+      expect(screen.getByLabelText("Name")).toBeDisabled();
+      expect(screen.getByLabelText("API key")).toHaveValue("sk-secret");
+
+      fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+      await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
+      // The service was not written twice.
+      expect(writes().map((write) => write.path)).toEqual([
+        `${SERVICES}/ai`,
+        `${KEYS}/ai`,
+        `${KEYS}/ai`,
+      ]);
+    });
+
+    it("sets a key while editing a service", async () => {
+      render(<EgressCredentials />);
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Edit My API service" }),
+      );
+      await presetsReady();
+      fireEvent.change(screen.getByLabelText("API key"), {
+        target: { value: "sk-new" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+      await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
+      expect(writes().map((write) => write.path)).toEqual([
+        `${SERVICES}/mine`,
+        `${KEYS}/mine`,
+      ]);
+      expect(writes()[1].body).toEqual({ secret: "sk-new" });
+    });
+  });
+
+  describe("the editor's notes", () => {
+    const openAdd = async () => {
+      fireEvent.click(
+        within(await personal()).getByRole("button", {
+          name: "Add service for Personal Mind",
+        }),
+      );
+      await presetsReady();
+    };
+
+    it("warns about a placeholder an administrator's service also sets", async () => {
+      listing[0].services = [
+        {
+          ...configService,
+          placeholder_names: ["GH_TOKEN", "GITHUB_TOKEN"],
+        },
+        userService,
+      ];
+      render(<EgressCredentials />);
+      await openAdd();
+      fireEvent.click(screen.getByRole("button", { name: "More options" }));
+      fireEvent.click(screen.getByRole("button", { name: "Add placeholder" }));
+      fireEvent.change(screen.getByLabelText("Placeholder 1 name"), {
+        target: { value: "GITHUB_TOKEN" },
+      });
+      expect(
+        screen.getByText(
+          "GITHUB_TOKEN is also set by GitHub from your administrator; when both are set, theirs is used.",
+        ),
+      ).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("Placeholder 1 name"), {
+        target: { value: "MY_API_KEY" },
+      });
+      expect(
+        screen.queryByText(/from your administrator; when both/),
+      ).toBeNull();
+    });
+
+    it("does not count the user's own services as the administrator's", async () => {
+      listing[0].services = [
+        { ...userService, placeholder_names: ["GH_TOKEN"] },
+      ];
+      render(<EgressCredentials />);
+      await openAdd();
+      fireEvent.click(screen.getByRole("button", { name: "More options" }));
+      fireEvent.click(screen.getByRole("button", { name: "Add placeholder" }));
+      fireEvent.change(screen.getByLabelText("Placeholder 1 name"), {
+        target: { value: "GH_TOKEN" },
+      });
+      expect(
+        screen.queryByText(/from your administrator; when both/),
+      ).toBeNull();
+    });
+
+    it("says only this agent uses a user_agent service", async () => {
+      render(<EgressCredentials />);
+      await openAdd();
+      expect(
+        screen.getByText(
+          "Only your Personal Mind uses this service and its key.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("lists the agents that share a user's store", async () => {
+      listing[0].scope = "user";
+      listing[0].scope_agents = ["Personal Mind", "Research Mind"];
+      render(<EgressCredentials />);
+      await openAdd();
+      expect(
+        screen.getByText(
+          "All your agents that share your personal workspace use this service and its key: Personal Mind, Research Mind.",
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
   it("refuses a name that is already listed before asking the server", async () => {
     render(<EgressCredentials />);
     fireEvent.click(
@@ -350,8 +554,8 @@ describe("egress services on the personal page", () => {
       target: { value: "openai" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "A service named mine already exists",
+    expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
+      /A service named mine already exists/,
     );
     expect(writes()).toEqual([]);
   });
@@ -474,6 +678,9 @@ describe("egress services on the personal page", () => {
         agent_name: "readonly",
         agent_display_name: "Read Only",
         shared: true,
+        scope: "shared",
+        scope_agents: [],
+        managers: [],
         can_manage: false,
         services: [{ ...configService, is_shared: true, can_manage: false }],
       },
@@ -481,6 +688,9 @@ describe("egress services on the personal page", () => {
         agent_name: "readonly_empty",
         agent_display_name: "Read Only Empty",
         shared: true,
+        scope: "shared",
+        scope_agents: [],
+        managers: [],
         can_manage: false,
         services: [],
       },
@@ -488,6 +698,9 @@ describe("egress services on the personal page", () => {
         agent_name: "managed",
         agent_display_name: "Managed",
         shared: true,
+        scope: "shared",
+        scope_agents: [],
+        managers: [],
         can_manage: true,
         services: [{ ...userService, is_shared: true, can_manage: true }],
       },
@@ -495,6 +708,9 @@ describe("egress services on the personal page", () => {
         agent_name: "empty",
         agent_display_name: "Empty",
         shared: false,
+        scope: "user_agent",
+        scope_agents: [],
+        managers: [],
         can_manage: true,
         services: [],
       },
@@ -535,6 +751,9 @@ describe("egress services on the personal page", () => {
         agent_name: "personal",
         agent_display_name: "Personal Mind",
         shared: true,
+        scope: "shared",
+        scope_agents: [],
+        managers: [],
         can_manage: true,
         services: [{ ...userService, is_shared: true, can_manage: true }],
       },
@@ -581,7 +800,7 @@ describe("egress services on the personal page", () => {
     );
   };
 
-  it("warns when a listed service already covers the limited paths more widely", async () => {
+  it("says a limit also limits the administrator's services on those hosts", async () => {
     listing[0].services = [
       {
         ...configService,
@@ -594,48 +813,15 @@ describe("egress services on the personal page", () => {
     render(<EgressCredentials />);
     await limitToRepository();
 
-    expect(screen.getByRole("note")).toHaveTextContent(
-      "A broader rule of GitHub on the same host already covers some of these paths",
-    );
-  });
-
-  it("warns by the real rules, so a config service under another name counts", async () => {
-    listing[0].services = [
-      {
-        ...configService,
-        name: "code-host",
-        display_name: "Code host",
-        rules: [
-          { host: "api.github.com", port: null, path_prefix: "/repos/o/" },
-        ],
-      },
-    ];
-    render(<EgressCredentials />);
-    await limitToRepository();
-
-    expect(screen.getByRole("note")).toHaveTextContent(
-      "A broader rule of Code host",
-    );
-  });
-
-  it("does not warn about a service that covers other hosts or narrower paths", async () => {
-    listing[0].services = [
-      {
-        ...configService,
-        name: "github",
-        rules: [
-          {
-            host: "api.github.com",
-            port: null,
-            path_prefix: "/repos/o/r/issues",
-          },
-          { host: "uploads.github.com", port: null, path_prefix: "/" },
-        ],
-      },
-    ];
-    render(<EgressCredentials />);
-    await limitToRepository();
-
+    // The helper opened More options, where the restriction and its help are.
+    expect(
+      screen.getByLabelText("Refuse other paths on these hosts"),
+    ).toBeChecked();
+    expect(
+      screen.getByText(
+        /This also limits services from your administrator on these hosts, for this agent only\./,
+      ),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("note")).toBeNull();
   });
 
@@ -805,6 +991,9 @@ describe("presets and unsaved edits on the personal page", () => {
         agent_name: "personal",
         agent_display_name: "Personal Mind",
         shared: false,
+        scope: "user_agent",
+        scope_agents: [],
+        managers: [],
         can_manage: true,
         services: [
           { ...userService, name: "one", display_name: "One" },
@@ -825,6 +1014,11 @@ describe("presets and unsaved edits on the personal page", () => {
     });
   });
 
+  const description = () => {
+    const more = screen.getByRole("button", { name: "More options" });
+    if (more.getAttribute("aria-expanded") === "false") fireEvent.click(more);
+    return screen.getByLabelText("Description");
+  };
   const edit = async (name: string) => {
     fireEvent.click(
       await screen.findByRole("button", { name: `Edit ${name} service` }),
@@ -883,7 +1077,7 @@ describe("presets and unsaved edits on the personal page", () => {
   it("asks before replacing an editor that has unsaved changes", async () => {
     render(<EgressCredentials />);
     await edit("One");
-    fireEvent.change(screen.getByLabelText("Description"), {
+    fireEvent.change(description(), {
       target: { value: "typed but not saved" },
     });
 
@@ -898,16 +1092,14 @@ describe("presets and unsaved edits on the personal page", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
     expect(screen.queryByText(/unsaved changes in the open editor/)).toBeNull();
-    expect(screen.getByLabelText("Description")).toHaveValue(
-      "typed but not saved",
-    );
+    expect(description()).toHaveValue("typed but not saved");
 
     fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(
       await screen.findByRole("form", { name: "Edit two" }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("Description")).toHaveValue("");
+    expect(description()).toHaveValue("");
     expect(screen.queryByText(/unsaved changes in the open editor/)).toBeNull();
   });
 
@@ -930,7 +1122,7 @@ describe("presets and unsaved edits on the personal page", () => {
   it("drops the question about another service when the editor is cancelled", async () => {
     render(<EgressCredentials />);
     await edit("One");
-    fireEvent.change(screen.getByLabelText("Description"), {
+    fireEvent.change(description(), {
       target: { value: "typed but not saved" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
@@ -950,7 +1142,7 @@ describe("presets and unsaved edits on the personal page", () => {
   it("drops the question about another service when the editor's service is deleted", async () => {
     render(<EgressCredentials />);
     await edit("One");
-    fireEvent.change(screen.getByLabelText("Description"), {
+    fireEvent.change(description(), {
       target: { value: "typed but not saved" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
@@ -974,9 +1166,9 @@ describe("presets and unsaved edits on the personal page", () => {
   it("does not ask again once the changes are undone", async () => {
     render(<EgressCredentials />);
     await edit("One");
-    const description = screen.getByLabelText("Description");
-    fireEvent.change(description, { target: { value: "x" } });
-    fireEvent.change(description, { target: { value: "" } });
+    const field = description();
+    fireEvent.change(field, { target: { value: "x" } });
+    fireEvent.change(field, { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
     expect(
       await screen.findByRole("form", { name: "Edit two" }),
@@ -994,6 +1186,9 @@ describe("what deleting a service says about its scope", () => {
               agent_name: "personal",
               agent_display_name: "Personal Mind",
               shared: false,
+              scope: "user_agent",
+              scope_agents: [],
+              managers: [],
               can_manage: true,
               services: [userService],
               ...agent,
@@ -1018,6 +1213,9 @@ describe("what deleting a service says about its scope", () => {
   it("does not on a shared agent, where everyone shares the service", async () => {
     const text = await open({
       shared: true,
+      scope: "shared",
+      scope_agents: [],
+      managers: [],
       services: [{ ...userService, is_shared: true }],
     });
     expect(text).toContain("Everyone who relies on it loses access");
@@ -1041,6 +1239,9 @@ describe("inactive services on the personal page", () => {
         agent_name: "personal",
         agent_display_name: "Personal Mind",
         shared: false,
+        scope: "user_agent",
+        scope_agents: [],
+        managers: [],
         can_manage: true,
         services: [configService, userService],
         inactive_services: inactive,
@@ -1097,6 +1298,9 @@ describe("inactive services on the personal page", () => {
       agent_name: "other",
       agent_display_name: "Other Mind",
       shared: false,
+      scope: "user_agent",
+      scope_agents: [],
+      managers: [],
       can_manage: true,
       services: [],
     });
@@ -1209,6 +1413,9 @@ describe("inactive services on the personal page", () => {
         agent_name: "personal",
         agent_display_name: "Personal Mind",
         shared: true,
+        scope: "shared",
+        scope_agents: [],
+        managers: [],
         can_manage: false,
         services: [{ ...configService, is_shared: true, can_manage: false }],
         inactive_services: inactive,
@@ -1316,7 +1523,9 @@ describe("recent requests on the personal page", () => {
   const toggle = async (agentName = "Personal Mind") =>
     within(await screen.findByRole("region", { name: agentName })).getByRole(
       "button",
-      { name: "Recent requests" },
+      {
+        name: "Recent requests",
+      },
     );
 
   it("starts collapsed and does not load anything until it is opened", async () => {

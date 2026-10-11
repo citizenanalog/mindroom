@@ -5,13 +5,14 @@ import type {
   EgressCredentialService,
   EgressPreset,
   EgressRule,
-  EgressRuleSummary,
+  EgressScope,
 } from "./types";
 
 /**
  * The editor's data model, apart from any rendering: the form state, how it
- * maps to and from a service as authored, what stops it from being saved, the
- * GitHub repository rules, and whether another service already covers a rule.
+ * maps to and from a service as authored, what stops it from being saved and
+ * which field shows each problem, the GitHub repository rules, and the small
+ * texts that depend on the form.
  */
 
 /** Where the editor runs: the personal page, or the dashboard writing config.yaml. */
@@ -65,30 +66,30 @@ const RESERVED_PLACEHOLDER_NAMES = new Set([
 const RESERVED_PLACEHOLDER_PREFIXES = ["MINDROOM_", "GIT_CONFIG_"];
 // Services of a personal scope may only set credential-like placeholders with
 // plain values. These mirror `_placeholder_error` in
-// src/mindroom/egress_broker/user_services.py, in the server's sorted order.
+// src/mindroom/egress_broker/user_services.py, with its words in its order.
 const PERSONAL_PLACEHOLDER_NAME = /^[A-Z][A-Z0-9_]*$/;
 const PERSONAL_PLACEHOLDER_VALUE = /^[A-Za-z0-9._:-]{1,256}$/;
 const PERSONAL_PLACEHOLDER_WORDS = [
-  "AUTH",
-  "CREDENTIAL",
+  "TOKEN",
   "KEY",
+  "SECRET",
   "PASSWORD",
   "PAT",
-  "SECRET",
-  "TOKEN",
+  "AUTH",
+  "CREDENTIAL",
 ];
 // Tools read variables with these words, or starting with SSH_, as programs or
 // paths to run or load, so a service of one's own cannot set them.
 const PERSONAL_PLACEHOLDER_REFUSED_WORDS = [
-  "CMD",
   "COMMAND",
-  "DIR",
-  "EXTENSIONS",
+  "CMD",
   "FILE",
-  "HELPER",
-  "OPTIONS",
-  "OPTS",
+  "DIR",
   "PROVIDER",
+  "HELPER",
+  "OPTS",
+  "OPTIONS",
+  "EXTENSIONS",
 ];
 const PERSONAL_PLACEHOLDER_REFUSED_PREFIX = "SSH_";
 
@@ -101,11 +102,26 @@ const GITHUB_REPOSITORY_LINE =
 const GITHUB_MAX_OWNER_LENGTH = 39;
 const GITHUB_MAX_REPOSITORY_LENGTH = 100;
 
+/**
+ * How a rule sends the key, as the form offers it. A custom template is header
+ * auth with a value template, which the wire format does not tell apart.
+ */
+export type RuleAuthChoice = EgressAuthType | "template";
+
+export const AUTH_CHOICES: readonly { value: RuleAuthChoice; label: string }[] =
+  [
+    { value: "bearer", label: "Bearer token" },
+    { value: "header", label: "Header" },
+    { value: "basic", label: "Basic" },
+    { value: "query", label: "Query parameter" },
+    { value: "template", label: "Custom template" },
+  ];
+
 export interface RuleForm {
   host: string;
   port: string;
   pathPrefix: string;
-  authType: EgressAuthType;
+  authType: RuleAuthChoice;
   username: string;
   headerOrParam: string;
   template: string;
@@ -162,12 +178,21 @@ export function emptyRule(): RuleForm {
   };
 }
 
+function hasCustomTemplate(template: string | undefined): boolean {
+  return (
+    template !== undefined && template !== "" && template !== DEFAULT_TEMPLATE
+  );
+}
+
 export function ruleFormFrom(rule: EgressRule): RuleForm {
   return {
     host: rule.host,
     port: rule.port === undefined ? "" : String(rule.port),
     pathPrefix: rule.path_prefix ?? "",
-    authType: rule.auth.type,
+    authType:
+      rule.auth.type === "header" && hasCustomTemplate(rule.auth.template)
+        ? "template"
+        : rule.auth.type,
     username: rule.auth.username ?? "",
     headerOrParam: rule.auth.name ?? "",
     template: rule.auth.template ?? "",
@@ -217,13 +242,25 @@ export function usesOwnRules(form: EgressServiceForm): boolean {
   return form.preset === "" || form.replacePresetRules;
 }
 
+/** Switch how a rule sends the key; plain Header sends the key as it is, so it drops a custom template. */
+export function applyAuthChoice(
+  rule: RuleForm,
+  authType: RuleAuthChoice,
+): RuleForm {
+  return {
+    ...rule,
+    authType,
+    template: authType === "header" ? "" : rule.template,
+  };
+}
+
 function ruleToAuthored(rule: RuleForm): EgressRule {
-  const auth: EgressAuth = { type: rule.authType };
-  if (rule.authType === "basic") auth.username = rule.username.trim();
-  if (rule.authType === "header" || rule.authType === "query") {
+  const type = rule.authType === "template" ? "header" : rule.authType;
+  const auth: EgressAuth = { type };
+  if (type === "basic") auth.username = rule.username.trim();
+  if (type === "header" || type === "query") {
     auth.name = rule.headerOrParam.trim();
-    if (rule.template !== "" && rule.template !== DEFAULT_TEMPLATE)
-      auth.template = rule.template;
+    if (hasCustomTemplate(rule.template)) auth.template = rule.template;
   }
   const authored: EgressRule = { host: rule.host.trim().toLowerCase(), auth };
   if (rule.port.trim() !== "") authored.port = Number(rule.port);
@@ -300,61 +337,92 @@ export function presetHasLogin(
 
 function hostError(host: string): string | null {
   const value = host.trim().toLowerCase();
-  if (!value) return "host is required";
-  if (value.includes("://")) return "host must not contain a scheme";
+  if (!value) return "Host is required";
+  if (value.includes("://")) return "Host must not contain a scheme";
   if (value.includes(":"))
-    return "host must not contain a port (use the port field)";
+    return "Host must not contain a port (use the port field)";
   if (value.includes("/"))
-    return "host must not contain a path (use the path prefix field)";
+    return "Host must not contain a path (use the path prefix field)";
   if (value.startsWith("*.")) {
     const parts = value.split(".");
     if (parts.filter((part) => part === "*").length > 1)
-      return "host can only have one wildcard label";
+      return "Host can only have one wildcard label";
     if (parts.length < 3)
-      return "wildcard host must have at least one domain part after *.";
+      return "Wildcard host must have at least one domain part after *.";
   } else if (value.includes("*")) {
-    return "wildcard must be a single leading *. label";
+    return "Wildcard must be a single leading *. label";
   }
   return null;
 }
 
-function templateError(template: string): string | null {
-  if (template === "") return null;
+function templateError(template: string, required: boolean): string | null {
+  if (template === "" && !required) return null;
   return template.split(DEFAULT_TEMPLATE).length - 1 === 1
     ? null
-    : "template must contain {secret} exactly once";
+    : "Template must contain {secret} exactly once";
 }
 
-function ruleErrors(rule: RuleForm): string[] {
-  const errors: string[] = [];
-  const hostProblem = hostError(rule.host);
-  if (hostProblem) errors.push(hostProblem);
+/** The part of a rule a problem belongs to, so the editor can show it by that field. */
+export type RuleFieldPart =
+  "host" | "pathPrefix" | "port" | "username" | "authName" | "template";
+
+/** The id of the field that shows a problem with a rule. */
+export function ruleField(index: number, part: RuleFieldPart): string {
+  return `rule:${index}:${part}`;
+}
+
+/** The id of the field that shows a problem with a placeholder row. */
+export function placeholderField(
+  index: number,
+  part: "name" | "value",
+): string {
+  return `placeholder:${index}:${part}`;
+}
+
+/**
+ * What stops a form from being saved, and where to say so. `field` is `name`,
+ * `rules`, `oauthProvider`, a `ruleField`, or a `placeholderField`; `form`
+ * means the service as a whole, which no single field shows.
+ */
+export interface ServiceProblem {
+  field: string;
+  message: string;
+}
+
+function ruleProblems(rule: RuleForm, index: number): ServiceProblem[] {
+  const problems: ServiceProblem[] = [];
+  const add = (part: RuleFieldPart, message: string | null) => {
+    if (message) problems.push({ field: ruleField(index, part), message });
+  };
+  add("host", hostError(rule.host));
   const pathPrefix = rule.pathPrefix.trim();
   if (pathPrefix !== "" && !pathPrefix.startsWith("/"))
-    errors.push("path prefix must start with /");
+    add("pathPrefix", "Path prefix must start with /");
   const port = rule.port.trim();
   if (port !== "") {
     const number = Number(port);
     if (!Number.isInteger(number) || number < 1 || number > 65535)
-      errors.push("port must be a number from 1 to 65535");
+      add("port", "Port must be a number from 1 to 65535");
   }
   if (rule.authType === "basic" && !rule.username.trim())
-    errors.push("basic auth needs a username");
-  if (rule.authType === "header") {
+    add("username", "Basic auth needs a username");
+  if (rule.authType === "header" || rule.authType === "template") {
     const name = rule.headerOrParam.trim();
-    if (!name) errors.push("header auth needs a header name");
+    if (!name) add("authName", "Header auth needs a header name");
     else if (!HEADER_NAME_PATTERN.test(name))
-      errors.push("header name must be a valid HTTP header name");
+      add("authName", "Header name must be a valid HTTP header name");
     else if (RESERVED_HEADERS.has(name.toLowerCase()))
-      errors.push(`header name ${name} is reserved for the broker`);
+      add("authName", `Header name ${name} is reserved for the broker`);
   }
   if (rule.authType === "query" && !rule.headerOrParam.trim())
-    errors.push("query auth needs a parameter name");
-  if (rule.authType === "header" || rule.authType === "query") {
-    const problem = templateError(rule.template);
-    if (problem) errors.push(problem);
-  }
-  return errors;
+    add("authName", "Query auth needs a parameter name");
+  if (
+    rule.authType === "header" ||
+    rule.authType === "query" ||
+    rule.authType === "template"
+  )
+    add("template", templateError(rule.template, rule.authType === "template"));
+  return problems;
 }
 
 /** Why no service may use this valid placeholder name, or null; the server refuses these in every scope. */
@@ -369,20 +437,39 @@ function reservedPlaceholderError(name: string): string | null {
     : null;
 }
 
-function personalPlaceholderError(name: string, value: string): string | null {
+/** Join words as `A, B, or C`. */
+function wordList(words: readonly string[]): string {
+  return `${words.slice(0, -1).join(", ")}, or ${words[words.length - 1]}`;
+}
+
+function personalPlaceholderNameError(name: string): string {
+  return `${name} is not allowed as a placeholder: name a credential, such as MY_API_KEY, with ${wordList(PERSONAL_PLACEHOLDER_WORDS)} as one of its words.`;
+}
+
+/** The texts mirror the server's, which never quotes a value. */
+function personalPlaceholderError(
+  name: string,
+  value: string,
+): { part: "name" | "value"; message: string } | null {
   const words = name.split("_");
   if (
     !PERSONAL_PLACEHOLDER_NAME.test(name) ||
     !PERSONAL_PLACEHOLDER_WORDS.some((word) => words.includes(word))
   )
-    return `placeholder name ${name} must match ^[A-Z][A-Z0-9_]*$ and have one of ${PERSONAL_PLACEHOLDER_WORDS.join(", ")} between underscores`;
+    return { part: "name", message: personalPlaceholderNameError(name) };
   if (
     name.startsWith(PERSONAL_PLACEHOLDER_REFUSED_PREFIX) ||
     PERSONAL_PLACEHOLDER_REFUSED_WORDS.some((word) => words.includes(word))
   )
-    return `placeholder name ${name} may not start with ${PERSONAL_PLACEHOLDER_REFUSED_PREFIX} or have any of these words between underscores, which tools read as programs or paths: ${PERSONAL_PLACEHOLDER_REFUSED_WORDS.join(", ")}`;
+    return {
+      part: "name",
+      message: `${name} is not allowed: tools read names with ${wordList(PERSONAL_PLACEHOLDER_REFUSED_WORDS)}, or starting with ${PERSONAL_PLACEHOLDER_REFUSED_PREFIX}, as programs or paths.`,
+    };
   if (!PERSONAL_PLACEHOLDER_VALUE.test(value))
-    return `placeholder value of ${name} must be 1 to 256 characters from A-Z, a-z, 0-9, and . _ : -`;
+    return {
+      part: "value",
+      message: `The value of ${name} must be 1 to 256 letters, digits, or . _ : -`,
+    };
   return null;
 }
 
@@ -396,23 +483,30 @@ function serverJsonSize(value: unknown): number {
   return JSON.stringify(value).replace(/[\u007f-\uffff]/g, "\\u0000").length;
 }
 
+function nameProblem(
+  name: string,
+  settings: { takenNames: readonly string[] },
+): string | null {
+  if (name === "") return "Name is required";
+  if (!NAME_PATTERN.test(name))
+    return "Name must start with a lowercase letter or digit and use only lowercase letters, digits, - and _ (63 characters at most)";
+  if (/_oauth(_client)?$/.test(name))
+    return "Name must not end in _oauth or _oauth_client";
+  if (settings.takenNames.includes(name))
+    return `A service named ${name} already exists`;
+  return null;
+}
+
 /** Return what stops the form from being saved, in reading order; empty when it can be. */
 export function validateService(
   form: EgressServiceForm,
   options: EditorOptions,
   settings: { editing: boolean; takenNames: readonly string[] },
-): string[] {
-  const errors: string[] = [];
+): ServiceProblem[] {
+  const problems: ServiceProblem[] = [];
   if (!settings.editing) {
-    const name = form.name;
-    if (!NAME_PATTERN.test(name))
-      errors.push(
-        "Name must start with a lowercase letter or digit and use only lowercase letters, digits, - and _ (63 characters at most)",
-      );
-    else if (/_oauth(_client)?$/.test(name))
-      errors.push("Name must not end in _oauth or _oauth_client");
-    else if (settings.takenNames.includes(name))
-      errors.push(`A service named ${name} already exists`);
+    const message = nameProblem(form.name, settings);
+    if (message) problems.push({ field: "name", message });
   }
   if (
     form.preset === "" &&
@@ -420,47 +514,63 @@ export function validateService(
     form.oauthProvider.trim() &&
     !PROVIDER_PATTERN.test(form.oauthProvider.trim())
   )
-    errors.push(
-      "Account login must be a provider id such as github or google_drive (lowercase letters, digits, - and _)",
-    );
-  if (usesOwnRules(form)) {
-    if (form.rules.length === 0) errors.push("Add at least one rule");
-    if (options.context === "personal" && form.rules.length > MAX_RULES)
-      errors.push(`A service can have at most ${MAX_RULES} rules`);
-    form.rules.forEach((rule, index) => {
-      for (const problem of ruleErrors(rule))
-        errors.push(`Rule ${index + 1}: ${problem}`);
+    problems.push({
+      field: "oauthProvider",
+      message:
+        "Account login must be a provider id such as github or google_drive (lowercase letters, digits, - and _)",
     });
+  if (usesOwnRules(form)) {
+    if (form.rules.length === 0)
+      problems.push({ field: "rules", message: "Add at least one rule" });
+    if (options.context === "personal" && form.rules.length > MAX_RULES)
+      problems.push({
+        field: "rules",
+        message: `A service can have at most ${MAX_RULES} rules`,
+      });
+    form.rules.forEach((rule, index) =>
+      problems.push(...ruleProblems(rule, index)),
+    );
   }
   const seen = new Set<string>();
-  for (const placeholder of form.placeholders) {
+  form.placeholders.forEach((placeholder, index) => {
     const name = placeholder.name.trim();
     // A row without a name is an unused row, whatever its value.
-    if (name === "") continue;
+    if (name === "") return;
+    const add = (part: "name" | "value", message: string) =>
+      problems.push({ field: placeholderField(index, part), message });
     if (!PLACEHOLDER_NAME_PATTERN.test(name)) {
-      errors.push(`Placeholder name ${name} must match ^[A-Z_][A-Z0-9_]*$`);
-      continue;
+      // A personal user hears what the server would say, not a pattern.
+      add(
+        "name",
+        options.context === "personal"
+          ? personalPlaceholderNameError(name)
+          : `Placeholder name ${name} must match ^[A-Z_][A-Z0-9_]*$`,
+      );
+      return;
     }
     const reservedProblem = reservedPlaceholderError(name);
     if (reservedProblem) {
-      errors.push(reservedProblem);
-      continue;
+      add("name", reservedProblem);
+      return;
     }
-    if (seen.has(name)) errors.push(`Placeholder ${name} is listed twice`);
+    if (seen.has(name)) add("name", `Placeholder ${name} is listed twice`);
     seen.add(name);
     const personalProblem =
       options.context === "personal"
         ? personalPlaceholderError(name, placeholder.value)
         : null;
-    if (personalProblem) errors.push(personalProblem);
-  }
+    if (personalProblem) add(personalProblem.part, personalProblem.message);
+  });
   if (
     options.context === "personal" &&
-    errors.length === 0 &&
+    problems.length === 0 &&
     serverJsonSize(serializeService(form, options)) > MAX_SERVICE_BYTES
   )
-    errors.push(`A service can take at most ${MAX_SERVICE_BYTES / 1024} KiB`);
-  return errors;
+    problems.push({
+      field: "form",
+      message: `A service can take at most ${MAX_SERVICE_BYTES / 1024} KiB`,
+    });
+  return problems;
 }
 
 /**
@@ -476,7 +586,7 @@ export function validateService(
 export function githubRepositoryRules(
   input: string,
   options: { uploads: boolean; graphql: boolean },
-): { rules: EgressRule[]; errors: string[] } {
+): { rules: EgressRule[]; errors: string[]; repositories: string[] } {
   const bearer: EgressAuth = { type: "bearer" };
   const git: EgressAuth = { type: "basic", username: "x-access-token" };
   const errors: string[] = [];
@@ -504,7 +614,7 @@ export function githubRepositoryRules(
   }
   if (targets.size === 0 && errors.length === 0)
     errors.push("Enter at least one repository, such as owner/repo");
-  if (errors.length > 0) return { rules: [], errors };
+  if (errors.length > 0) return { rules: [], errors, repositories: [] };
   const rules: EgressRule[] = [];
   for (const { owner, repo } of targets.values()) {
     if (repo === "*") {
@@ -550,81 +660,100 @@ export function githubRepositoryRules(
       path_prefix: "/graphql",
       auth: bearer,
     });
-  return { rules, errors };
+  return { rules, errors, repositories: [...targets.keys()] };
 }
 
-/** The part of a listed service that decides whether it covers another rule. */
-export type ServiceCoverage = Pick<
-  EgressCredentialService,
-  "name" | "display_name" | "rules"
->;
-
-/**
- * Whether `broader` matches every path `narrower` does, as the broker matches
- * them: a prefix ending in `/` covers by plain prefix, any other covers the
- * exact path and what follows a `/`.
- */
-function prefixCovers(broader: string, narrower: string): boolean {
-  if (broader.endsWith("/")) return narrower.startsWith(broader);
-  return narrower === broader || narrower.startsWith(`${broader}/`);
+/** The display name and description for a service limited to these repositories. */
+export function githubLimitLabels(repositories: readonly string[]): {
+  displayName: string;
+  description: string;
+} {
+  const repos = repositories.join(", ");
+  return {
+    displayName: `GitHub (${repos})`,
+    description: `Limited to ${repos}`,
+  };
 }
 
-/**
- * Name the other services that already cover one of `rules` with a shorter prefix.
- *
- * Limiting a service to some paths cannot narrow what another service on the
- * same host and port covers more widely: the broker still sends a request that
- * matches that service's rule with its credentials. A rule covers another when
- * it has the same host, the same port or none, and a shorter path prefix that
- * covers the other's. Services come in listing order and each is named once.
- */
-export function findBroaderServices(
-  rules: readonly EgressRuleSummary[],
-  others: readonly ServiceCoverage[],
-): string[] {
-  const names: string[] = [];
-  for (const other of others) {
-    const covers = (other.rules ?? []).some((broader) =>
-      rules.some(
-        (rule) =>
-          broader.host.toLowerCase() === rule.host.toLowerCase() &&
-          (broader.port === null || broader.port === rule.port) &&
-          broader.path_prefix.length < rule.path_prefix.length &&
-          prefixCovers(broader.path_prefix, rule.path_prefix),
-      ),
-    );
-    if (covers && !names.includes(other.display_name))
-      names.push(other.display_name);
-  }
-  return names;
-}
-
-/** Where the form's service would apply: its own rules, or the preset's when it keeps them. */
-export function formRuleSummaries(
-  form: EgressServiceForm,
-  presets: readonly EgressPreset[] | null,
-): EgressRuleSummary[] {
-  if (!usesOwnRules(form)) return presetOf(presets, form.preset)?.rules ?? [];
-  return form.rules
-    .filter((rule) => rule.host.trim() !== "")
-    .map((rule) => {
-      const port = Number(rule.port.trim());
-      return {
-        host: rule.host.trim().toLowerCase(),
-        port: rule.port.trim() !== "" && Number.isInteger(port) ? port : null,
-        path_prefix: rule.pathPrefix.trim() || "/",
-      };
-    });
-}
-
-/** Whether to offer the GitHub helper: a GitHub service, rules on GitHub hosts, or a service with no host yet. */
+/** Whether to offer the GitHub helper: the GitHub preset, or the service's own rules on a GitHub host. */
 export function looksLikeGithub(form: EgressServiceForm): boolean {
   if (form.preset === "github") return true;
   if (!usesOwnRules(form)) return false;
-  const onGithub = form.rules.some((rule) =>
-    GITHUB_HOSTS.includes(rule.host.trim()),
+  return form.rules.some((rule) =>
+    GITHUB_HOSTS.includes(rule.host.trim().toLowerCase()),
   );
-  if (form.preset === "")
-    return onGithub || form.rules.every((rule) => rule.host.trim() === "");
-  return onGithub;
+}
+
+/**
+ * The name a new service gets until the user types one: the preset's id, or
+ * the first label of the first rule's host (`httpbin.org` gives `httpbin`).
+ */
+export function suggestedName(form: EgressServiceForm): string {
+  if (form.preset) return form.preset;
+  const host = (form.rules[0]?.host ?? "").trim().toLowerCase();
+  const label = host.replace(/^\*\./, "").split(/[.:/]/)[0];
+  return label
+    .replace(/[^a-z0-9_-]/g, "")
+    .replace(/^[-_]+/, "")
+    .slice(0, 63);
+}
+
+/** What to tell the user about a placeholder that an administrator's service also sets, or null. */
+export function configPlaceholderWarning(
+  name: string,
+  configPlaceholders: Readonly<Record<string, string>>,
+): string | null {
+  const variable = name.trim();
+  if (!Object.prototype.hasOwnProperty.call(configPlaceholders, variable))
+    return null;
+  return `${variable} is also set by ${configPlaceholders[variable]} from your administrator; when both are set, theirs is used.`;
+}
+
+/** Map each variable to the display name of the administrator's service that sets it, from a listing. */
+export function configPlaceholderOwners(
+  services: readonly Pick<
+    EgressCredentialService,
+    "source" | "display_name" | "placeholder_names"
+  >[],
+): Record<string, string> {
+  const owners: Record<string, string> = {};
+  for (const service of services) {
+    if (service.source !== "config") continue;
+    for (const name of service.placeholder_names ?? [])
+      if (!Object.prototype.hasOwnProperty.call(owners, name))
+        owners[name] = service.display_name;
+  }
+  return owners;
+}
+
+/** Who uses a personal service, for the note under the form's title; null where nothing needs saying. */
+export function scopeNote(
+  scope: EgressScope | undefined,
+  agent: string,
+  scopeAgents: readonly string[],
+): string | null {
+  if (scope === "user_agent")
+    return `Only your ${agent} uses this service and its key.`;
+  if (scope === "user") {
+    const agents = scopeAgents.length > 0 ? scopeAgents : [agent];
+    return `All your agents that share your personal workspace use this service and its key: ${agents.join(", ")}.`;
+  }
+  return null;
+}
+
+/** Whether the form sets anything the basic fields do not show, so the editor opens More options. */
+export function usesMoreOptions(form: EgressServiceForm): boolean {
+  const first = form.rules[0];
+  return (
+    form.displayName.trim() !== "" ||
+    form.description.trim() !== "" ||
+    form.replacePresetRules ||
+    form.rules.length > 1 ||
+    (usesOwnRules(form) &&
+      first !== undefined &&
+      (first.pathPrefix.trim() !== "" || first.port.trim() !== "")) ||
+    form.restrictToRules ||
+    form.oauthProvider.trim() !== "" ||
+    form.placeholders.length > 0
+  );
 }

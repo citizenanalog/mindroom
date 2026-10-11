@@ -900,6 +900,12 @@ describe("egress broker service editor", () => {
 
   const fill = (label: string, value: string) =>
     fireEvent.change(screen.getByLabelText(label), { target: { value } });
+  // Everything but the basic fields sits under More options.
+  const openMoreOptions = () => {
+    const toggle = screen.getByRole("button", { name: "More options" });
+    if (toggle.getAttribute("aria-expanded") === "false")
+      fireEvent.click(toggle);
+  };
   const save = () =>
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
   const presetsReady = () =>
@@ -971,7 +977,8 @@ describe("egress broker service editor", () => {
     await openEdit("GitHub");
     const form = screen.getByRole("form", { name: "Edit github" });
     expect(within(form).getByLabelText("Preset")).toHaveValue("github");
-    expect(within(form).queryByLabelText("Rule 1 host")).toBeNull();
+    expect(within(form).queryByLabelText("Website")).toBeNull();
+    openMoreOptions();
     fireEvent.click(
       within(form).getByLabelText("Refuse other paths on these hosts"),
     );
@@ -1015,6 +1022,7 @@ describe("egress broker service editor", () => {
 
   it("keeps the operator-only opt-in when editing a service that has it", async () => {
     await openEdit("OpenAI");
+    openMoreOptions();
     fill("Display name", "OpenAI direct");
     save();
 
@@ -1029,7 +1037,7 @@ describe("egress broker service editor", () => {
     );
   });
 
-  it("warns when another configured service already covers a limited repository", async () => {
+  it("words the help for refusing other paths for the operator", async () => {
     await openAdd();
     fill("Name", "limited");
     fireEvent.change(screen.getByLabelText("Preset"), {
@@ -1040,9 +1048,13 @@ describe("egress broker service editor", () => {
       screen.getByRole("button", { name: "Use these repositories" }),
     );
 
-    expect(screen.getByRole("note")).toHaveTextContent(
-      "A broader rule of GitHub on the same host already covers some of these paths",
-    );
+    // The sentence about the administrator's services is for a user's own editor.
+    const help = screen
+      .getByLabelText("Refuse other paths on these hosts")
+      .closest("div") as HTMLElement;
+    expect(help).toHaveTextContent("are refused (path_not_allowed)");
+    expect(help).not.toHaveTextContent("from your administrator");
+    expect(screen.queryByRole("note")).toBeNull();
   });
 
   it("shows the config validation message and puts the draft back", async () => {
@@ -1140,6 +1152,7 @@ describe("egress broker service editor", () => {
       diagnostics: [],
     });
     await openEdit("GitHub");
+    openMoreOptions();
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     save();
 
@@ -1302,6 +1315,7 @@ describe("egress broker service editor", () => {
         }),
     );
     await openEdit("GitHub");
+    openMoreOptions();
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     save();
 
@@ -1327,6 +1341,7 @@ describe("egress broker service editor", () => {
 
   it("asks before replacing an editor that has unsaved changes", async () => {
     await openEdit("GitHub");
+    openMoreOptions();
     fill("Description", "typed but not saved");
 
     fireEvent.click(
@@ -1380,6 +1395,7 @@ describe("egress broker service editor", () => {
 
   it("drops the question about another service when the editor is cancelled", async () => {
     await openEdit("GitHub");
+    openMoreOptions();
     fill("Description", "typed but not saved");
     fireEvent.click(
       screen.getByRole("button", { name: "Edit OpenAI service" }),
@@ -1483,8 +1499,8 @@ describe("egress broker service editor", () => {
       target: { value: "github" },
     });
     save();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "A service named github already exists",
+    expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
+      /A service named github already exists/,
     );
     expect(saveConfig).not.toHaveBeenCalled();
   });

@@ -114,6 +114,7 @@ describe("egress broker panel with the real config store", () => {
       await screen.findByRole("button", { name: "Edit GitHub service" }),
     );
     await presetsReady();
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
 
@@ -192,7 +193,7 @@ describe("egress broker panel with the real config store", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "bad" },
     });
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "api.example.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
@@ -228,7 +229,7 @@ describe("egress broker panel with the real config store", () => {
       fireEvent.change(screen.getByLabelText("Name"), {
         target: { value: "bad" },
       });
-      fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+      fireEvent.change(screen.getByLabelText("Website"), {
         target: { value: "api.example.com" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Save service" }));
@@ -348,6 +349,7 @@ describe("egress broker panel with the real config store", () => {
       await screen.findByRole("button", { name: "Edit GitHub service" }),
     );
     await presetsReady();
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
 

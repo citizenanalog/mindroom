@@ -39,6 +39,10 @@ async function renderEditor(props: Partial<EgressServiceEditorProps> = {}) {
   return { onSave: merged.onSave, onCancel: merged.onCancel };
 }
 
+/** Open the section that holds everything but the basic fields. */
+const openMoreOptions = () =>
+  fireEvent.click(screen.getByRole("button", { name: "More options" }));
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -53,14 +57,14 @@ describe("the editor form", () => {
   it("saves a custom service in its authored form", async () => {
     const { onSave } = await renderEditor();
     type("Name", "example");
-    type("Display name", "Example");
-    type("Rule 1 host", "API.example.com");
-    type("Rule 1 path prefix", "/v1/");
-    fireEvent.change(screen.getByLabelText("Rule 1 auth type"), {
+    type("Website", "API.example.com");
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
       target: { value: "header" },
     });
-    type("Rule 1 header name", "x-api-key");
-    type("Rule 1 template", "Key {secret}");
+    type("Header name", "X-Api-Key");
+    openMoreOptions();
+    type("Display name", "Example");
+    type("Path prefix", "/v1/");
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("example", {
@@ -69,27 +73,111 @@ describe("the editor form", () => {
         {
           host: "api.example.com",
           path_prefix: "/v1/",
-          auth: { type: "header", name: "x-api-key", template: "Key {secret}" },
+          auth: { type: "header", name: "X-Api-Key" },
         },
       ],
     });
   });
 
-  it("adds, fills, and removes rules", async () => {
+  it.each<[string, string, Record<string, string>, object]>([
+    [
+      "template",
+      "Custom template",
+      { "Header name": "Authorization", "Value template": "Token {secret}" },
+      {
+        type: "header",
+        name: "Authorization",
+        template: "Token {secret}",
+      },
+    ],
+    [
+      "query",
+      "Query parameter",
+      { "Parameter name": "api_key" },
+      { type: "query", name: "api_key" },
+    ],
+    ["basic", "Basic", { Username: "bot" }, { type: "basic", username: "bot" }],
+  ])(
+    "sends the key as %s with its own fields",
+    async (choice, _label, fields, auth) => {
+      const { onSave } = await renderEditor();
+      type("Name", "example");
+      type("Website", "api.example.com");
+      fireEvent.change(screen.getByLabelText("Send the key as"), {
+        target: { value: choice },
+      });
+      for (const [label, value] of Object.entries(fields)) type(label, value);
+      save();
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave).toHaveBeenCalledWith("example", {
+        rules: [{ host: "api.example.com", auth }],
+      });
+    },
+  );
+
+  it("offers the five ways to send the key", async () => {
+    await renderEditor();
+    expect(
+      within(screen.getByLabelText("Send the key as"))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([
+      "Bearer token",
+      "Header",
+      "Basic",
+      "Query parameter",
+      "Custom template",
+    ]);
+  });
+
+  it("drops a custom template when the user chooses plain Header", async () => {
+    const { onSave } = await renderEditor({
+      name: "svc",
+      service: {
+        rules: [
+          {
+            host: "api.example.com",
+            auth: { type: "header", name: "X-Key", template: "Key {secret}" },
+          },
+        ],
+      },
+    });
+    expect(screen.getByLabelText("Send the key as")).toHaveValue("template");
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
+      target: { value: "header" },
+    });
+    expect(screen.queryByLabelText("Value template")).toBeNull();
+    save();
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(vi.mocked(onSave).mock.calls[0][1].rules?.[0].auth).toEqual({
+      type: "header",
+      name: "X-Key",
+    });
+  });
+
+  it("adds, fills, and removes extra rules", async () => {
     const { onSave } = await renderEditor();
     type("Name", "two");
-    type("Rule 1 host", "a.example.com");
+    type("Website", "a.example.com");
+    openMoreOptions();
+    // The first rule is the basic fields, so it has no Remove button.
+    expect(screen.queryByRole("button", { name: "Remove Rule 1" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
     type("Rule 2 host", "b.example.com");
     fireEvent.change(screen.getByLabelText("Rule 2 auth type"), {
       target: { value: "basic" },
     });
     type("Rule 2 username", "bot");
-    fireEvent.click(screen.getByRole("button", { name: "Remove Rule 1" }));
+    type("Rule 3 host", "c.example.com");
+    type("Rule 3 path prefix", "/v1");
+    type("Rule 3 port", "8443");
+    fireEvent.click(screen.getByRole("button", { name: "Remove Rule 3" }));
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("two", {
       rules: [
+        { host: "a.example.com", auth: { type: "bearer" } },
         { host: "b.example.com", auth: { type: "basic", username: "bot" } },
       ],
     });
@@ -107,7 +195,8 @@ describe("the editor form", () => {
       ),
     ).toBeInTheDocument();
     // The preset supplies the rules, so no rule fields are shown.
-    expect(screen.queryByLabelText("Rule 1 host")).toBeNull();
+    expect(screen.queryByLabelText("Website")).toBeNull();
+    expect(screen.queryByLabelText("Send the key as")).toBeNull();
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("github", { preset: "github" });
@@ -119,6 +208,7 @@ describe("the editor form", () => {
     fireEvent.change(screen.getByLabelText("Preset"), {
       target: { value: "github" },
     });
+    openMoreOptions();
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
@@ -134,10 +224,11 @@ describe("the editor form", () => {
     fireEvent.change(screen.getByLabelText("Preset"), {
       target: { value: "openai" },
     });
+    openMoreOptions();
     fireEvent.click(
       screen.getByLabelText("Replace the preset's rules with my own"),
     );
-    type("Rule 1 host", "proxy.example.com");
+    type("Website", "proxy.example.com");
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("ai", {
@@ -146,39 +237,15 @@ describe("the editor form", () => {
     });
   });
 
-  it("explains the GraphQL caveat next to the toggle", async () => {
-    await renderEditor();
-    expect(
-      screen.getByText(
-        /a listed GraphQL rule reaches every repository the key can\s+reach/,
-      ),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/fine-grained token/)).toBeInTheDocument();
-  });
-
-  it("shows what is wrong instead of saving an invalid form", async () => {
-    const { onSave } = await renderEditor();
-    type("Name", "Bad Name");
-    save();
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("Name must start with a lowercase");
-    expect(alert).toHaveTextContent("Rule 1: host is required");
-    expect(onSave).not.toHaveBeenCalled();
-    // The messages follow the form once the user has tried to save.
-    type("Name", "good");
-    type("Rule 1 host", "a.example.com");
-    expect(screen.queryByRole("alert")).toBeNull();
-  });
-
-  it("rejects a name that is already taken", async () => {
+  it("rejects a name that is already taken, beside the name", async () => {
     const { onSave } = await renderEditor({ takenNames: ["github"] });
     type("Name", "github");
     fireEvent.change(screen.getByLabelText("Preset"), {
       target: { value: "github" },
     });
     save();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "A service named github already exists",
+    expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
+      /A service named github already exists/,
     );
     expect(onSave).not.toHaveBeenCalled();
   });
@@ -214,10 +281,10 @@ describe("the editor form", () => {
     expect(screen.getByLabelText("Preset")).toHaveValue("future_api");
   });
 
-  it("shows the placeholder rules as hints in the advanced section", async () => {
+  it("shows the placeholder rules as hints under More options", async () => {
     await renderEditor();
     expect(screen.queryByText(/must be TOKEN, KEY/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    openMoreOptions();
     expect(
       screen.getByText(
         /one word between underscores must be TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL/,
@@ -230,7 +297,7 @@ describe("the editor form", () => {
 
   it("lists the words and prefixes a personal placeholder name cannot use", async () => {
     await renderEditor();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    openMoreOptions();
     const hint = screen.getByText(/one word between underscores must be/);
     expect(hint).toHaveTextContent(
       "No word may be COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS",
@@ -246,25 +313,44 @@ describe("the editor form", () => {
   it("refuses a placeholder the server would, and says why", async () => {
     const { onSave } = await renderEditor();
     type("Name", "svc");
-    type("Rule 1 host", "a.example.com");
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    type("Website", "a.example.com");
+    openMoreOptions();
     fireEvent.click(screen.getByRole("button", { name: "Add placeholder" }));
     type("Placeholder 1 name", "SSH_AUTH_SOCK");
     save();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "placeholder name SSH_AUTH_SOCK may not start with SSH_",
+    expect(
+      screen.getByLabelText("Placeholder 1 name"),
+    ).toHaveAccessibleDescription(
+      "SSH_AUTH_SOCK is not allowed: tools read names with COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS, or starting with SSH_, as programs or paths.",
+    );
+    type("Placeholder 1 name", "my_key");
+    expect(
+      screen.getByLabelText("Placeholder 1 name"),
+    ).toHaveAccessibleDescription(
+      "my_key is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
     );
     type("Placeholder 1 name", "MINDROOM_API_KEY");
-    save();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    expect(
+      screen.getByLabelText("Placeholder 1 name"),
+    ).toHaveAccessibleDescription(
       "Placeholder name MINDROOM_API_KEY starts with reserved prefix MINDROOM_",
+    );
+    type("Placeholder 1 name", "MY_API_KEY");
+    type("Placeholder 1 value", "has space");
+    expect(
+      screen.getByLabelText("Placeholder 1 value"),
+    ).toHaveAccessibleDescription(
+      "The value of MY_API_KEY must be 1 to 256 letters, digits, or . _ : -",
+    );
+    expect(screen.getByLabelText("Placeholder 1 name")).not.toHaveAttribute(
+      "aria-invalid",
     );
     expect(onSave).not.toHaveBeenCalled();
   });
 
   it("shows the operator's placeholder rules instead on the dashboard", async () => {
     await renderEditor({ context: "operator" });
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    openMoreOptions();
     expect(
       screen.getByText(/MINDROOM_ or GIT_CONFIG_ are reserved/),
     ).toBeInTheDocument();
@@ -274,8 +360,8 @@ describe("the editor form", () => {
   it("adds a placeholder with the brokered value and saves it", async () => {
     const { onSave } = await renderEditor();
     type("Name", "svc");
-    type("Rule 1 host", "a.example.com");
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    type("Website", "a.example.com");
+    openMoreOptions();
     fireEvent.click(screen.getByRole("button", { name: "Add placeholder" }));
     expect(screen.getByLabelText("Placeholder 1 value")).toHaveValue(
       "mindroom-brokered",
@@ -289,28 +375,33 @@ describe("the editor form", () => {
     });
   });
 
-  it("opens the advanced section when the service already has placeholders", async () => {
+  it("opens More options when the service already uses one", async () => {
     await renderEditor({
       name: "svc",
       service: { preset: "github", placeholder_env: { GH_TOKEN: "x" } },
     });
     expect(screen.getByLabelText("Placeholder 1 name")).toHaveValue("GH_TOKEN");
-  });
-
-  it("says a personal service applies to all personal agents of the same scope", async () => {
-    const { rerender } = render(<EgressServiceEditor {...baseProps()} />);
-    const note =
-      "This service applies to all of your personal agents that share this scope.";
-    expect(screen.getByText(note)).toBeInTheDocument();
-    // A shared agent's service is everyone's, and the dashboard edits config.yaml.
-    rerender(<EgressServiceEditor {...baseProps()} sharedTarget />);
-    expect(screen.queryByText(note)).toBeNull();
-    rerender(<EgressServiceEditor {...baseProps()} context="operator" />);
-    expect(screen.queryByText(note)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "More options" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    cleanup();
+    await renderEditor({
+      name: "svc",
+      service: { preset: "github", restrict_to_rules: true },
+    });
+    expect(
+      screen.getByLabelText("Refuse other paths on these hosts"),
+    ).toBeChecked();
+    cleanup();
+    await renderEditor({ name: "svc", service: { preset: "github" } });
+    expect(
+      screen.getByRole("button", { name: "More options" }),
+    ).toHaveAttribute("aria-expanded", "false");
   });
 
   it("disables the account login on a shared agent", async () => {
     const { onSave } = await renderEditor({ sharedTarget: true });
+    openMoreOptions();
     expect(screen.getByLabelText("Account login (optional)")).toBeDisabled();
     expect(
       screen.getByText(
@@ -337,7 +428,8 @@ describe("the editor form", () => {
   it("offers the account login on a personal agent", async () => {
     const { onSave } = await renderEditor();
     type("Name", "svc");
-    type("Rule 1 host", "a.example.com");
+    type("Website", "a.example.com");
+    openMoreOptions();
     type("Account login (optional)", "atlassian");
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
@@ -419,8 +511,10 @@ describe("the GitHub helper in the editor", () => {
     const { onSave } = await renderGithub();
     enter("basnijholt/agent-cli");
     apply();
-    expect(screen.getByLabelText("Rule 1 host")).toHaveValue("api.github.com");
-    expect(screen.getByLabelText("Rule 1 path prefix")).toHaveValue(
+    // The generated rules show: the first in the basic fields, the rest under More options.
+    expect(screen.getByLabelText("Website")).toHaveValue("api.github.com");
+    // The extra rules have a path prefix too: the first one in page order is rule 1's.
+    expect(screen.getAllByLabelText("Path prefix")[0]).toHaveValue(
       "/repos/basnijholt/agent-cli",
     );
     expect(screen.getByLabelText("Rule 3 path prefix")).toHaveValue(
@@ -437,6 +531,8 @@ describe("the GitHub helper in the editor", () => {
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("github", {
       preset: "github",
+      display_name: "GitHub (basnijholt/agent-cli)",
+      description: "Limited to basnijholt/agent-cli",
       restrict_to_rules: true,
       rules: [
         {
@@ -466,7 +562,7 @@ describe("the GitHub helper in the editor", () => {
     expect(screen.getByLabelText(/Also allow GraphQL/)).not.toBeChecked();
     enter("mindroom-ai/*");
     apply();
-    expect(screen.getByLabelText("Rule 1 path prefix")).toHaveValue(
+    expect(screen.getAllByLabelText("Path prefix")[0]).toHaveValue(
       "/repos/mindroom-ai/",
     );
     expect(screen.getByLabelText("Rule 2 path prefix")).toHaveValue(
@@ -497,159 +593,156 @@ describe("the GitHub helper in the editor", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "not a repo is not owner/repo or owner/*",
     );
-    expect(screen.queryByLabelText("Rule 1 host")).toBeNull();
+    expect(screen.queryByLabelText("Website")).toBeNull();
   });
 
-  it("is offered for a new custom service and for rules on GitHub hosts only", async () => {
-    cleanup();
+  it("only appears for the GitHub preset or a GitHub host", async () => {
+    const helper = () => screen.queryByText("Limit to repositories");
+    // A new custom service has no host yet.
     await renderEditor({ name: undefined, service: null });
-    expect(screen.getByText("Limit to repositories")).toBeInTheDocument();
-    cleanup();
-    await renderEditor({ name: "openai", service: { preset: "openai" } });
-    expect(screen.queryByText("Limit to repositories")).toBeNull();
+    expect(helper()).toBeNull();
+    fireEvent.change(screen.getByLabelText("Website"), {
+      target: { value: "httpbin.org" },
+    });
+    expect(helper()).toBeNull();
+    for (const host of ["github.com", "api.github.com", "uploads.github.com"]) {
+      fireEvent.change(screen.getByLabelText("Website"), {
+        target: { value: host },
+      });
+      expect(helper()).toBeInTheDocument();
+    }
+    fireEvent.change(screen.getByLabelText("Website"), {
+      target: { value: "" },
+    });
+    expect(helper()).toBeNull();
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "github" },
+    });
+    expect(helper()).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "openai" },
+    });
+    expect(helper()).toBeNull();
     cleanup();
     await renderEditor({ name: "code", service: { rules: [bearerRule] } });
-    expect(screen.queryByText("Limit to repositories")).toBeNull();
+    expect(helper()).toBeNull();
+  });
+
+  it("sits with the basic fields, not under More options", async () => {
+    await renderGithub();
+    expect(screen.getByText("Limit to repositories")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "More options" }),
+    ).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("fills the display name and the description when they are empty", async () => {
+    const { onSave } = await renderGithub({ name: undefined, service: null });
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "github" },
+    });
+    enter("o/a");
+    apply();
+    expect(screen.getByLabelText("Display name")).toHaveValue("GitHub (o/a)");
+    expect(screen.getByLabelText("Description")).toHaveValue("Limited to o/a");
+    save();
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(vi.mocked(onSave).mock.calls[0][1]).toMatchObject({
+      display_name: "GitHub (o/a)",
+      description: "Limited to o/a",
+    });
+  });
+
+  it("lists every repository in the labels and keeps what the user already typed", async () => {
+    await renderGithub();
+    openMoreOptions();
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Work GitHub" },
+    });
+    enter("o/a\no/b\np/*");
+    apply();
+    expect(screen.getByLabelText("Display name")).toHaveValue("Work GitHub");
+    expect(screen.getByLabelText("Description")).toHaveValue(
+      "Limited to o/a, o/b, p/*",
+    );
+  });
+
+  it("leaves the labels alone when the repositories are not valid", async () => {
+    await renderGithub();
+    enter("not a repo");
+    apply();
+    openMoreOptions();
+    expect(screen.getByLabelText("Display name")).toHaveValue("");
+    expect(screen.getByLabelText("Description")).toHaveValue("");
+  });
+});
+
+describe("the help beside refusing other paths", () => {
+  const HELP =
+    "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key. This also limits services from your administrator on these hosts, for this agent only. The real boundary is the key itself, so scope it as narrowly as the website allows.";
+  const GITHUB_HELP =
+    "GraphQL (/graphql) is refused unless listed, and a listed GraphQL rule reaches every repository the key can reach. Use a fine-grained token or a GitHub App installed on selected repositories.";
+  const restrictHelp = () =>
+    screen
+      .getByLabelText("Refuse other paths on these hosts")
+      .closest("div") as HTMLElement;
+
+  it("is generic for a service on any other host", async () => {
+    await renderEditor({
+      name: "web",
+      service: { rules: [{ host: "httpbin.org", auth: { type: "bearer" } }] },
+    });
+    openMoreOptions();
+    expect(restrictHelp()).toHaveTextContent(HELP);
+    expect(restrictHelp()).not.toHaveTextContent("GraphQL");
+    expect(restrictHelp()).not.toHaveTextContent("fine-grained");
+  });
+
+  it("adds the GraphQL sentence on a GitHub host", async () => {
+    await renderEditor({ name: "code", service: { preset: "github" } });
+    openMoreOptions();
+    expect(restrictHelp()).toHaveTextContent(`${HELP} ${GITHUB_HELP}`);
     cleanup();
     await renderEditor({
       name: "code",
       service: {
-        rules: [{ host: "github.com", auth: { type: "bearer" } }],
+        rules: [{ host: "api.github.com", auth: { type: "bearer" } }],
       },
     });
-    expect(screen.getByText("Limit to repositories")).toBeInTheDocument();
+    openMoreOptions();
+    expect(restrictHelp()).toHaveTextContent(GITHUB_HELP);
   });
-});
 
-describe("the broader-rule warning", () => {
-  const covering = (
-    display_name: string,
-    path_prefix: string,
-    host = "api.github.com",
-  ) => ({
-    name: display_name.toLowerCase(),
-    display_name,
-    rules: [{ host, port: null, path_prefix }],
+  it("follows the host as it is typed", async () => {
+    await renderEditor();
+    openMoreOptions();
+    expect(restrictHelp()).not.toHaveTextContent("GraphQL");
+    fireEvent.change(screen.getByLabelText("Website"), {
+      target: { value: "api.github.com" },
+    });
+    expect(restrictHelp()).toHaveTextContent("GraphQL");
   });
-  const restrict = () =>
-    fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
-  const note = () => screen.queryByRole("note");
 
-  it("names a service that covers a limited repository more widely", async () => {
-    await renderEditor({
-      service: { preset: "github" },
-      name: "limited",
-      otherServices: [covering("GitHub", "/")],
-    });
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value: "o/r" },
-    });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
-
-    expect(note()).toHaveTextContent(
-      "A broader rule of GitHub on the same host already covers some of these paths. Refusing other paths cannot narrow it",
-    );
-    // It sits by the restriction it is about.
+  it("says this also limits the administrator's services, for this agent only", async () => {
+    await renderEditor();
+    openMoreOptions();
     expect(
-      within(
-        screen
-          .getByLabelText("Refuse other paths on these hosts")
-          .closest("div") as HTMLElement,
-      ).getByRole("note"),
-    ).toBe(note());
+      screen.getByText(
+        /This also limits services from your administrator on these hosts, for this agent only\./,
+      ),
+    ).toBeInTheDocument();
+    // The old note about a broader rule of another service is gone.
+    expect(screen.queryByRole("note")).toBeNull();
+    expect(screen.queryByText(/A broader rule of/)).toBeNull();
   });
 
-  it("appears only while the restriction is on", async () => {
-    await renderEditor({
-      service: {
-        rules: [
-          {
-            host: "api.github.com",
-            path_prefix: "/repos/o/r",
-            auth: { type: "bearer" },
-          },
-        ],
-      },
-      name: "limited",
-      otherServices: [covering("GitHub", "/")],
-    });
-    expect(note()).toBeNull();
-    restrict();
-    expect(note()).not.toBeNull();
-    restrict();
-    expect(note()).toBeNull();
-  });
-
-  it("stays quiet without a shorter covering rule on the same host", async () => {
-    await renderEditor({
-      service: {
-        restrict_to_rules: true,
-        rules: [
-          {
-            host: "api.github.com",
-            path_prefix: "/repos/o/r",
-            auth: { type: "bearer" },
-          },
-        ],
-      },
-      name: "limited",
-      otherServices: [
-        covering("Same", "/repos/o/r"),
-        covering("Longer", "/repos/o/r/issues"),
-        covering("Elsewhere", "/", "github.com"),
-        covering("Sibling", "/repos/other/"),
-        { name: "old", display_name: "Old" },
-      ],
-    });
-    expect(note()).toBeNull();
-  });
-
-  it("ignores the service being edited", async () => {
-    await renderEditor({
-      service: {
-        restrict_to_rules: true,
-        rules: [
-          {
-            host: "api.github.com",
-            path_prefix: "/repos/o/r",
-            auth: { type: "bearer" },
-          },
-        ],
-      },
-      name: "github",
-      otherServices: [covering("GitHub", "/")],
-    });
-    expect(note()).toBeNull();
-  });
-
-  it("uses the preset's own rules while it keeps them", async () => {
-    await renderEditor({
-      service: { preset: "google_drive", restrict_to_rules: true },
-      name: "drive",
-      otherServices: [covering("Google", "/", "www.googleapis.com")],
-    });
-    // The preset's `/drive/` is narrower than the other service's `/`.
-    expect(note()).toHaveTextContent("A broader rule of Google");
-  });
-
-  it("names several services together", async () => {
-    await renderEditor({
-      service: {
-        restrict_to_rules: true,
-        rules: [
-          {
-            host: "api.github.com",
-            path_prefix: "/repos/o/r",
-            auth: { type: "bearer" },
-          },
-        ],
-      },
-      name: "limited",
-      otherServices: [covering("GitHub", "/"), covering("Owner", "/repos/o/")],
-    });
-    expect(note()).toHaveTextContent("A broader rule of GitHub and Owner");
+  it("leaves that sentence out on the dashboard, where the administrator edits config.yaml", async () => {
+    await renderEditor({ context: "operator" });
+    openMoreOptions();
+    expect(restrictHelp()).toHaveTextContent(
+      "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key. The real boundary is the key itself, so scope it as narrowly as the website allows.",
+    );
+    expect(restrictHelp()).not.toHaveTextContent("from your administrator");
   });
 });
 
@@ -719,7 +812,7 @@ describe("loading the presets", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "own" },
     });
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "a.example.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
@@ -776,6 +869,7 @@ describe("saving with a wider effect", () => {
   it("asks again after the form changes", async () => {
     const { onSave } = await filled();
     save();
+    openMoreOptions();
     fireEvent.change(screen.getByLabelText("Description"), {
       target: { value: "changed" },
     });
@@ -788,7 +882,9 @@ describe("saving with a wider effect", () => {
   it("does not ask for an invalid form", async () => {
     await renderEditor({ saveWarning });
     save();
-    expect(screen.getByRole("alert")).toHaveTextContent("Name must start");
+    expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
+      /Name is required/,
+    );
     expect(screen.queryByText(saveWarning)).toBeNull();
   });
 
@@ -822,6 +918,7 @@ describe("reporting unsaved changes", () => {
     });
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
 
+    openMoreOptions();
     fireEvent.change(screen.getByLabelText("Description"), {
       target: { value: "x" },
     });
@@ -849,7 +946,7 @@ describe("a service with values emptied on purpose", () => {
       service: { preset: "github", placeholder_env: {}, description: "" },
     });
     expect(screen.queryByLabelText("Placeholder 1 name")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    openMoreOptions();
     expect(
       screen.getByText(
         /This service sets none, which drops the placeholders of the GitHub preset/,
@@ -866,7 +963,7 @@ describe("a service with values emptied on purpose", () => {
 
   it("offers the preset's placeholders when the service has not set any", async () => {
     await renderEditor({ name: "github", service: { preset: "github" } });
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    openMoreOptions();
     expect(
       screen.getByText(
         /Leave the list empty to use the placeholders of the GitHub preset/,
@@ -889,7 +986,7 @@ describe("choosing another preset", () => {
     fireEvent.change(screen.getByLabelText("Preset"), {
       target: { value: "github" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    openMoreOptions();
     // The GitHub preset has placeholders of its own, so the list is not "none".
     expect(
       screen.getByText(
@@ -934,11 +1031,14 @@ describe("the GitHub helper on a custom service", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "code" },
     });
+    fireEvent.change(screen.getByLabelText("Website"), {
+      target: { value: "api.github.com" },
+    });
     expect(screen.queryByLabelText("Placeholder 1 name")).toBeNull();
     enter("o/r");
     apply();
 
-    // The advanced section opens so the user sees what was added.
+    // More options opens so the user sees what was added.
     expect(screen.getByLabelText("Placeholder 1 name")).toHaveValue("GH_TOKEN");
     expect(screen.getByLabelText("Placeholder 1 value")).toHaveValue(
       "mindroom-brokered",
@@ -952,6 +1052,8 @@ describe("the GitHub helper on a custom service", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("code", {
+      display_name: "GitHub (o/r)",
+      description: "Limited to o/r",
       rules: rulesFor("o/r"),
       restrict_to_rules: true,
       placeholder_env: {
@@ -978,6 +1080,8 @@ describe("the GitHub helper on a custom service", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("code", {
+      display_name: "GitHub (o/r)",
+      description: "Limited to o/r",
       rules: rulesFor("o/r"),
       restrict_to_rules: true,
       placeholder_env: { MY_GITHUB_TOKEN: "mindroom-brokered" },
@@ -986,6 +1090,9 @@ describe("the GitHub helper on a custom service", () => {
 
   it("adds them only once when the repositories are applied again", async () => {
     await renderEditor();
+    fireEvent.change(screen.getByLabelText("Website"), {
+      target: { value: "api.github.com" },
+    });
     enter("o/r");
     apply();
     enter("o/other");
@@ -994,6 +1101,32 @@ describe("the GitHub helper on a custom service", () => {
       "GITHUB_TOKEN",
     );
     expect(screen.queryByLabelText("Placeholder 3 name")).toBeNull();
+  });
+
+  it("renames the labels it filled when applied again, but never ones the user typed", async () => {
+    await renderEditor();
+    fireEvent.change(screen.getByLabelText("Website"), {
+      target: { value: "api.github.com" },
+    });
+    enter("o/r");
+    apply();
+    enter("o/other");
+    apply();
+    expect(screen.getByLabelText("Display name")).toHaveValue(
+      "GitHub (o/other)",
+    );
+    expect(screen.getByLabelText("Description")).toHaveValue(
+      "Limited to o/other",
+    );
+    fireEvent.change(screen.getByLabelText("Description"), {
+      target: { value: "My own words" },
+    });
+    enter("o/third");
+    apply();
+    expect(screen.getByLabelText("Display name")).toHaveValue(
+      "GitHub (o/third)",
+    );
+    expect(screen.getByLabelText("Description")).toHaveValue("My own words");
   });
 
   it("adds none to a preset service, which brings its own", async () => {
@@ -1022,7 +1155,7 @@ describe("a form after a failed save", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "svc" },
     });
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "a.example.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
@@ -1030,12 +1163,13 @@ describe("a form after a failed save", () => {
       "The server said no",
     );
     expect(screen.getByLabelText("Name")).toHaveValue("svc");
-    expect(screen.getByLabelText("Rule 1 host")).toHaveValue("a.example.com");
+    expect(screen.getByLabelText("Website")).toHaveValue("a.example.com");
     expect(screen.getByRole("button", { name: "Save service" })).toBeEnabled();
 
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "b.example.com" },
     });
+    openMoreOptions();
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
     fireEvent.change(screen.getByLabelText("Rule 2 host"), {
       target: { value: "c.example.com" },
@@ -1060,18 +1194,20 @@ describe("a form after a failed save", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "svc" },
     });
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "a.example.com" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     await screen.findByText("The server said no");
 
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "https://a.example.com" },
     });
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Rule 1: host must not contain a scheme",
+    expect(screen.getByLabelText("Website")).toHaveAccessibleDescription(
+      /Host must not contain a scheme/,
     );
+    // The server's answer gives way to what the form itself can see.
+    expect(screen.queryByText("The server said no")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     expect(onSave).toHaveBeenCalledTimes(1);
   });
@@ -1083,17 +1219,599 @@ describe("the account login field", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "svc" },
     });
-    fireEvent.change(screen.getByLabelText("Rule 1 host"), {
+    fireEvent.change(screen.getByLabelText("Website"), {
       target: { value: "a.example.com" },
     });
+    openMoreOptions();
     fireEvent.change(screen.getByLabelText("Account login (optional)"), {
       target: { value: "Git Hub" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Account login must be a provider id",
-    );
+    expect(
+      screen.getByLabelText("Account login (optional)"),
+    ).toHaveAccessibleDescription(/Account login must be a provider id/);
     expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+describe("the basic form", () => {
+  const before = (first: HTMLElement, second: HTMLElement) =>
+    Boolean(
+      first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  const MORE_FIELDS = [
+    "Display name",
+    "Description",
+    "Path prefix",
+    "Port",
+    "Refuse other paths on these hosts",
+    "Account login (optional)",
+  ];
+
+  it("shows the basic fields first and the others under More options", async () => {
+    await renderEditor({ saveKey: vi.fn(async () => undefined) });
+    const basic = ["Name", "Preset", "Website", "Send the key as", "API key"];
+    const fields = basic.map((label) => screen.getByLabelText(label));
+    fields.slice(1).forEach((field, index) => {
+      expect(before(fields[index], field)).toBe(true);
+    });
+    const more = screen.getByRole("button", { name: "More options" });
+    for (const field of fields) expect(before(field, more)).toBe(true);
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    for (const label of MORE_FIELDS)
+      expect(screen.queryByLabelText(label)).toBeNull();
+    expect(screen.queryByText("Placeholder variables")).toBeNull();
+
+    fireEvent.click(more);
+    expect(more).toHaveAttribute("aria-expanded", "true");
+    for (const label of MORE_FIELDS)
+      expect(screen.getByLabelText(label)).toBeInTheDocument();
+    expect(screen.getByText("Placeholder variables")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Add rule" }),
+    ).toBeInTheDocument();
+    // Everything under More options comes after the toggle.
+    for (const label of MORE_FIELDS)
+      expect(before(more, screen.getByLabelText(label))).toBe(true);
+
+    fireEvent.click(more);
+    expect(screen.queryByLabelText("Display name")).toBeNull();
+  });
+
+  it("asks for a header name only when the key goes in a header", async () => {
+    await renderEditor();
+    expect(screen.queryByLabelText("Header name")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
+      target: { value: "header" },
+    });
+    expect(screen.getByLabelText("Header name")).toBeInTheDocument();
+  });
+
+  it("explains the header name with an example and does not prefill one", async () => {
+    await renderEditor();
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
+      target: { value: "header" },
+    });
+    const field = screen.getByLabelText("Header name");
+    expect(field).toHaveAccessibleDescription("For example X-Api-Key");
+    expect(field).not.toHaveAttribute("placeholder");
+    expect(field).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
+      target: { value: "query" },
+    });
+    expect(screen.getByLabelText("Parameter name")).not.toHaveAttribute(
+      "placeholder",
+    );
+  });
+
+  it("keeps the first rule's host, path, port, and way of sending in step", async () => {
+    await renderEditor({
+      name: "svc",
+      service: {
+        rules: [
+          {
+            host: "api.example.com",
+            port: 8443,
+            path_prefix: "/v1/",
+            auth: { type: "basic", username: "bot" },
+          },
+        ],
+      },
+    });
+    expect(screen.getByLabelText("Website")).toHaveValue("api.example.com");
+    expect(screen.getByLabelText("Send the key as")).toHaveValue("basic");
+    expect(screen.getByLabelText("Username")).toHaveValue("bot");
+    // It has path and port, so More options is already open.
+    expect(screen.getByLabelText("Path prefix")).toHaveValue("/v1/");
+    expect(screen.getByLabelText("Port")).toHaveValue("8443");
+  });
+});
+
+describe("the name of a new service", () => {
+  const type = (label: string, value: string) =>
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+
+  it("follows the preset id and then the host's first label until the user types one", async () => {
+    await renderEditor();
+    type("Website", "httpbin.org");
+    expect(screen.getByLabelText("Name")).toHaveValue("httpbin");
+    type("Website", "api.example.com");
+    expect(screen.getByLabelText("Name")).toHaveValue("api");
+    type("Preset", "github");
+    expect(screen.getByLabelText("Name")).toHaveValue("github");
+    type("Preset", "");
+    expect(screen.getByLabelText("Name")).toHaveValue("api");
+    type("Preset", "google_drive");
+    expect(screen.getByLabelText("Name")).toHaveValue("google_drive");
+
+    type("Name", "mine");
+    type("Preset", "openai");
+    expect(screen.getByLabelText("Name")).toHaveValue("mine");
+    type("Preset", "");
+    type("Website", "other.example.com");
+    expect(screen.getByLabelText("Name")).toHaveValue("mine");
+  });
+
+  it("follows again after the user empties the name", async () => {
+    await renderEditor();
+    type("Name", "mine");
+    type("Name", "");
+    type("Website", "httpbin.org");
+    expect(screen.getByLabelText("Name")).toHaveValue("httpbin");
+  });
+
+  it("saves the suggested name", async () => {
+    const { onSave } = await renderEditor();
+    type("Website", "httpbin.org");
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave).toHaveBeenCalledWith("httpbin", {
+      rules: [{ host: "httpbin.org", auth: { type: "bearer" } }],
+    });
+  });
+
+  it("never renames a service that is being edited", async () => {
+    await renderEditor({
+      name: "mine",
+      service: { rules: [{ host: "a.example.com", auth: { type: "bearer" } }] },
+    });
+    type("Website", "b.example.com");
+    expect(screen.getByLabelText("Name")).toHaveValue("mine");
+  });
+
+  it("starts with the name it was opened with and keeps it", async () => {
+    await renderEditor({
+      initialName: "github-limited",
+      initialPreset: "github",
+    });
+    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
+    expect(screen.getByLabelText("Preset")).toHaveValue("github");
+    type("Preset", "openai");
+    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
+  });
+
+  it("says Name is required, beside the name, and focuses it", async () => {
+    const { onSave } = await renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
+      /Name is required/,
+    );
+    expect(screen.getByLabelText("Name")).toHaveFocus();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+describe("prefilling a new service", () => {
+  it("opens Add mode with the preset and the name it was given", async () => {
+    const { onSave } = await renderEditor({
+      initialPreset: "github",
+      initialName: "github-limited",
+    });
+    expect(
+      screen.getByRole("form", { name: "Add service" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Name")).toBeEnabled();
+    expect(screen.getByLabelText("Preset")).toHaveValue("github");
+    // The GitHub helper comes with the GitHub preset.
+    expect(screen.getByText("Limit to repositories")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave).toHaveBeenCalledWith("github-limited", { preset: "github" });
+  });
+
+  it("names the service after the preset when only the preset is given", async () => {
+    await renderEditor({ initialPreset: "github" });
+    expect(screen.getByLabelText("Name")).toHaveValue("github");
+  });
+
+  it("is not unsaved changes until the user changes something", async () => {
+    const onDirtyChange = vi.fn();
+    await renderEditor({
+      initialPreset: "github",
+      initialName: "github-limited",
+      onDirtyChange,
+    });
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("ignores them when editing a service", async () => {
+    await renderEditor({
+      name: "mine",
+      service: { preset: "openai" },
+      initialPreset: "github",
+      initialName: "other",
+    });
+    expect(screen.getByLabelText("Name")).toHaveValue("mine");
+    expect(screen.getByLabelText("Preset")).toHaveValue("openai");
+  });
+});
+
+describe("errors beside their fields", () => {
+  const type = (label: string, value: string) =>
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+  const save = () =>
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+
+  it("shows each problem next to its field and focuses the first invalid one", async () => {
+    const { onSave } = await renderEditor();
+    save();
+    const name = screen.getByLabelText("Name");
+    const website = screen.getByLabelText("Website");
+    expect(name).toHaveAttribute("aria-invalid", "true");
+    expect(name).toHaveAccessibleDescription(/Name is required/);
+    expect(website).toHaveAttribute("aria-invalid", "true");
+    expect(website).toHaveAccessibleDescription(/Host is required/);
+    expect(name).toHaveFocus();
+    expect(onSave).not.toHaveBeenCalled();
+    // Fields without a problem are not marked.
+    expect(screen.getByLabelText("Preset")).not.toHaveAttribute("aria-invalid");
+
+    type("Name", "svc");
+    // The messages follow the form once the user has tried to save.
+    expect(name).not.toHaveAttribute("aria-invalid");
+    expect(website).toHaveAttribute("aria-invalid", "true");
+    save();
+    expect(website).toHaveFocus();
+    type("Website", "a.example.com");
+    expect(website).not.toHaveAttribute("aria-invalid");
+  });
+
+  it("opens More options for a problem in it, and focuses that field", async () => {
+    const { onSave } = await renderEditor();
+    type("Website", "a.example.com");
+    openMoreOptions();
+    type("Path prefix", "v1");
+    openMoreOptions();
+    expect(screen.queryByLabelText("Path prefix")).toBeNull();
+    save();
+    const path = screen.getByLabelText("Path prefix");
+    expect(path).toHaveAccessibleDescription(/Path prefix must start with \//);
+    expect(path).toHaveFocus();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("shows a problem of an extra rule inside that rule", async () => {
+    await renderEditor();
+    type("Website", "a.example.com");
+    openMoreOptions();
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    save();
+    const host = screen.getByLabelText("Rule 2 host");
+    expect(host).toHaveAccessibleDescription(/Host is required/);
+    expect(host).toHaveFocus();
+  });
+
+  it("shows the field of a header, a template, or a port", async () => {
+    await renderEditor();
+    type("Name", "svc");
+    type("Website", "a.example.com");
+    type("Send the key as", "template");
+    openMoreOptions();
+    type("Port", "99999");
+    save();
+    expect(screen.getByLabelText("Header name")).toHaveAccessibleDescription(
+      /Header auth needs a header name/,
+    );
+    expect(screen.getByLabelText("Value template")).toHaveAccessibleDescription(
+      /Template must contain \{secret\} exactly once/,
+    );
+    expect(screen.getByLabelText("Port")).toHaveAccessibleDescription(
+      /Port must be a number from 1 to 65535/,
+    );
+    // The header name comes first on the page.
+    expect(screen.getByLabelText("Header name")).toHaveFocus();
+  });
+
+  it("keeps showing the server's own error in an alert", async () => {
+    const onSave = vi.fn(async () => {
+      throw new Error("Could not save the service.");
+    });
+    await renderEditor({ onSave });
+    type("Website", "a.example.com");
+    save();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not save the service.",
+    );
+    expect(screen.getByLabelText("Name")).not.toHaveAttribute("aria-invalid");
+  });
+
+  it("states a size problem for the whole form in an alert", async () => {
+    await renderEditor();
+    type("Website", "a.example.com");
+    openMoreOptions();
+    type("Description", "x".repeat(17 * 1024));
+    save();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "A service can take at most 16 KiB",
+    );
+  });
+});
+
+describe("saving the API key with the service", () => {
+  const type = (label: string, value: string) =>
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+  const save = () =>
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+  const fill = () => {
+    type("Name", "httpbin");
+    type("Website", "httpbin.org");
+  };
+
+  it("offers an optional password field for the key", async () => {
+    await renderEditor({ saveKey: vi.fn(async () => undefined) });
+    const field = screen.getByLabelText("API key");
+    expect(field).toHaveAttribute("type", "password");
+    expect(field).toHaveAccessibleDescription("Paste the key now or later");
+    expect(field).toHaveAttribute("autocomplete", "new-password");
+  });
+
+  it("leaves the key field out when the page cannot save keys", async () => {
+    await renderEditor();
+    expect(screen.queryByLabelText("API key")).toBeNull();
+  });
+
+  it("writes the service first and the key second, then reports it saved", async () => {
+    const calls: string[] = [];
+    const onSave = vi.fn(async () => {
+      calls.push("service");
+    });
+    const saveKey = vi.fn(async () => {
+      calls.push("key");
+    });
+    const onSaved = vi.fn(() => {
+      calls.push("saved");
+    });
+    await renderEditor({ onSave, saveKey, onSaved });
+    fill();
+    type("API key", "sk-123");
+    save();
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(calls).toEqual(["service", "key", "saved"]);
+    expect(saveKey).toHaveBeenCalledWith("sk-123", "httpbin");
+    expect(onSave).toHaveBeenCalledWith("httpbin", {
+      rules: [{ host: "httpbin.org", auth: { type: "bearer" } }],
+    });
+  });
+
+  it("saves only the service when no key was typed", async () => {
+    const saveKey = vi.fn(async () => undefined);
+    const onSaved = vi.fn();
+    const { onSave } = await renderEditor({ saveKey, onSaved });
+    fill();
+    type("API key", "   ");
+    save();
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(saveKey).not.toHaveBeenCalled();
+  });
+
+  it("never saves a key for a service whose save failed", async () => {
+    const onSave = vi.fn(async () => {
+      throw new Error("The server said no");
+    });
+    const saveKey = vi.fn(async () => undefined);
+    const onSaved = vi.fn();
+    await renderEditor({ onSave, saveKey, onSaved });
+    fill();
+    type("API key", "sk-123");
+    save();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The server said no",
+    );
+    expect(saveKey).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
+    // The key stays typed for the next try.
+    expect(screen.getByLabelText("API key")).toHaveValue("sk-123");
+    expect(screen.getByLabelText("Name")).toBeEnabled();
+  });
+
+  it("says when the key failed, keeps the service, and retries only the key", async () => {
+    const onSave = vi.fn(async () => undefined);
+    const saveKey = vi
+      .fn<(key: string, name: string) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("The vault is read-only"))
+      .mockResolvedValue(undefined);
+    const onSaved = vi.fn();
+    await renderEditor({ onSave, saveKey, onSaved });
+    fill();
+    type("API key", "sk-123");
+    save();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The service was saved, but its key was not: The vault is read-only",
+    );
+    expect(alert).toHaveTextContent("Paste the key again and save to retry.");
+    expect(onSaved).not.toHaveBeenCalled();
+    // The saved service stays: it keeps its name, and the form stays open.
+    expect(screen.getByLabelText("Name")).toBeDisabled();
+    expect(
+      screen.getByRole("form", { name: "Add service" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("API key")).toHaveValue("sk-123");
+
+    save();
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(saveKey).toHaveBeenCalledTimes(2);
+    expect(saveKey).toHaveBeenLastCalledWith("sk-123", "httpbin");
+    // Nothing changed in the service, so it is not written again.
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("writes the service again when it changed after the key failed", async () => {
+    const onSave = vi.fn(async () => undefined);
+    const saveKey = vi
+      .fn<(key: string, name: string) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("The vault is read-only"))
+      .mockResolvedValue(undefined);
+    await renderEditor({ onSave, saveKey });
+    fill();
+    type("API key", "sk-123");
+    save();
+    await screen.findByRole("alert");
+    type("Website", "other.example.com");
+    save();
+    await waitFor(() => expect(saveKey).toHaveBeenCalledTimes(2));
+    expect(onSave).toHaveBeenCalledTimes(2);
+    expect(onSave).toHaveBeenLastCalledWith("httpbin", {
+      rules: [{ host: "other.example.com", auth: { type: "bearer" } }],
+    });
+  });
+
+  it("counts a typed key as unsaved changes", async () => {
+    const onDirtyChange = vi.fn();
+    await renderEditor({
+      name: "github",
+      service: { preset: "github" },
+      saveKey: vi.fn(async () => undefined),
+      onDirtyChange,
+    });
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    type("API key", "sk-1");
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("can set a key while editing a service", async () => {
+    const saveKey = vi.fn(async () => undefined);
+    const onSaved = vi.fn();
+    await renderEditor({
+      name: "github",
+      service: { preset: "github" },
+      saveKey,
+      onSaved,
+    });
+    type("API key", "ghp_x");
+    save();
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect(saveKey).toHaveBeenCalledWith("ghp_x", "github");
+  });
+});
+
+describe("a placeholder an administrator's service also sets", () => {
+  const configPlaceholders = { GH_TOKEN: "GitHub" };
+  const warning =
+    "GH_TOKEN is also set by GitHub from your administrator; when both are set, theirs is used.";
+  const type = (label: string, value: string) =>
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+
+  it("warns with the service's display name, and only for that variable", async () => {
+    const { onSave } = await renderEditor({ configPlaceholders });
+    type("Name", "svc");
+    type("Website", "a.example.com");
+    openMoreOptions();
+    fireEvent.click(screen.getByRole("button", { name: "Add placeholder" }));
+    type("Placeholder 1 name", "MY_API_KEY");
+    expect(screen.queryByText(warning)).toBeNull();
+    type("Placeholder 1 name", "GH_TOKEN");
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Placeholder 1 name"),
+    ).toHaveAccessibleDescription(warning);
+    // It is a warning: the service still saves.
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave).toHaveBeenCalledWith("svc", {
+      rules: [{ host: "a.example.com", auth: { type: "bearer" } }],
+      placeholder_env: { GH_TOKEN: "mindroom-brokered" },
+    });
+  });
+
+  it("does not mark the field as invalid", async () => {
+    await renderEditor({
+      configPlaceholders,
+      name: "svc",
+      service: { preset: "github", placeholder_env: { GH_TOKEN: "x" } },
+    });
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(screen.getByLabelText("Placeholder 1 name")).not.toHaveAttribute(
+      "aria-invalid",
+    );
+  });
+
+  it("warns for the placeholders the GitHub helper adds", async () => {
+    await renderEditor({ configPlaceholders });
+    type("Website", "api.github.com");
+    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
+      target: { value: "o/r" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use these repositories" }),
+    );
+    expect(screen.getByText(warning)).toBeInTheDocument();
+  });
+
+  it("says nothing without any", async () => {
+    await renderEditor({
+      name: "svc",
+      service: { preset: "github", placeholder_env: { GH_TOKEN: "x" } },
+    });
+    expect(screen.queryByText(/from your administrator; when both/)).toBeNull();
+  });
+});
+
+describe("the note on whose service this is", () => {
+  it("names the agent for a user_agent service", async () => {
+    await renderEditor({
+      scope: "user_agent",
+      agentName: "Code Helper",
+      scopeAgents: [],
+    });
+    expect(
+      screen.getByText("Only your Code Helper uses this service and its key."),
+    ).toBeInTheDocument();
+  });
+
+  it("lists the agents that share a user's workspace", async () => {
+    await renderEditor({
+      scope: "user",
+      agentName: "Code Helper",
+      scopeAgents: ["Code Helper", "Research"],
+    });
+    expect(
+      screen.getByText(
+        "All your agents that share your personal workspace use this service and its key: Code Helper, Research.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says nothing for a shared agent or the dashboard, and drops the old note", async () => {
+    const oldNote =
+      "This service applies to all of your personal agents that share this scope.";
+    await renderEditor({
+      scope: "shared",
+      agentName: "Team",
+      sharedTarget: true,
+    });
+    expect(screen.queryByText(/uses this service and its key/)).toBeNull();
+    expect(screen.queryByText(/use this service and its key/)).toBeNull();
+    expect(screen.queryByText(oldNote)).toBeNull();
+    cleanup();
+    await renderEditor({ context: "operator" });
+    expect(screen.queryByText(/service and its key/)).toBeNull();
+    expect(screen.queryByText(oldNote)).toBeNull();
+    cleanup();
+    await renderEditor();
+    expect(screen.queryByText(oldNote)).toBeNull();
   });
 });
 

@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { InactiveServices } from "./EgressInactiveServices";
 import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
+import { configPlaceholderOwners } from "./egressServiceModel";
 import { EgressServiceRows, type ServiceEditing } from "./EgressServiceRows";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import type {
@@ -52,6 +53,11 @@ async function loadPresets(signal: AbortSignal): Promise<EgressPreset[]> {
 
 function servicePath(agentName: string, serviceName: string): string {
   return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/services/${encodeURIComponent(serviceName)}`;
+}
+
+/** Where a service's API key is written; the rows write the same one. */
+function keyPath(agentName: string, serviceName: string): string {
+  return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
 }
 
 function deleteWarning(service: EgressCredentialService): string {
@@ -272,6 +278,8 @@ function AgentSection({
   };
 
   // Writes are not interrupted by another action: the rows stay disabled meanwhile.
+  // The editor stays open after the service is written: it saves the key next
+  // and closes through `onSaved`, so a key that fails can be reported there.
   const save = async (name: string, service: AuthoredEgressService) => {
     const controller = newOperation();
     setSaving(true);
@@ -287,8 +295,24 @@ function AgentSection({
       setSaving(false);
     }
     if (controller.signal.aborted) return;
-    setEditor(null);
     onChanged();
+  };
+
+  const saveKey = async (secret: string, name: string) => {
+    const controller = newOperation();
+    setSaving(true);
+    try {
+      await requestConnection<void>(
+        keyPath(agent.agent_name, name),
+        controller.signal,
+        "PUT",
+        { secret },
+        SERVICE_ERROR_MESSAGES,
+      );
+    } finally {
+      setSaving(false);
+    }
+    if (!controller.signal.aborted) onChanged();
   };
 
   const remove = async (name: string) => {
@@ -379,10 +403,15 @@ function AgentSection({
             name={editor.kind === "edit" ? editor.name : undefined}
             service={editor.kind === "edit" ? editor.service : null}
             takenNames={agent.services.map((service) => service.name)}
-            otherServices={agent.services}
+            configPlaceholders={configPlaceholderOwners(agent.services)}
+            scope={agent.scope}
+            agentName={agent.agent_display_name}
+            scopeAgents={agent.scope_agents}
             loadPresets={loadPresets}
             onDirtyChange={setEditorDirty}
             onSave={save}
+            saveKey={saveKey}
+            onSaved={() => setEditor(null)}
             onDelete={
               editor.kind === "edit" ? () => remove(editor.name) : undefined
             }

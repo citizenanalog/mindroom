@@ -3,20 +3,23 @@ import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
   type EditorOptions,
   type EgressServiceForm,
-  type ServiceCoverage,
-  findBroaderServices,
+  applyAuthChoice,
+  configPlaceholderOwners,
+  configPlaceholderWarning,
+  emptyRule,
   formFromService,
-  formRuleSummaries,
+  githubLimitLabels,
   githubRepositoryRules,
+  looksLikeGithub,
+  placeholderField,
+  ruleField,
+  scopeNote,
   serializeService,
+  suggestedName,
+  usesMoreOptions,
   validateService,
 } from "./egressServiceModel";
-import type {
-  AuthoredEgressService,
-  EgressPreset,
-  EgressRule,
-  EgressRuleSummary,
-} from "./types";
+import type { AuthoredEgressService, EgressPreset, EgressRule } from "./types";
 
 type Options = EditorOptions;
 
@@ -41,7 +44,7 @@ const serialize = (
   name = "svc",
 ) => serializeService(formFromService(name, service), options, service);
 
-const errorsFor = (
+const problemsFor = (
   service: AuthoredEgressService | null,
   changes: Partial<EgressServiceForm> = {},
   options: Options = personal,
@@ -51,6 +54,16 @@ const errorsFor = (
     { ...formFromService("svc", service), ...changes },
     options,
     settings,
+  );
+
+const errorsFor = (
+  service: AuthoredEgressService | null,
+  changes: Partial<EgressServiceForm> = {},
+  options: Options = personal,
+  settings: { editing: boolean; takenNames: string[] } = newService,
+) =>
+  problemsFor(service, changes, options, settings).map(
+    (problem) => problem.message,
   );
 
 describe("serializing a service", () => {
@@ -115,7 +128,10 @@ describe("serializing a service", () => {
     });
     expect(
       serialize({ preset: "github", display_name: "GitHub work" }),
-    ).toEqual({ preset: "github", display_name: "GitHub work" });
+    ).toEqual({
+      preset: "github",
+      display_name: "GitHub work",
+    });
     expect(serialize({ preset: "github", rules: [bearerRule] })).toEqual({
       preset: "github",
       rules: [bearerRule],
@@ -125,7 +141,9 @@ describe("serializing a service", () => {
   it("never writes restrict_to_rules false", () => {
     expect(
       serialize({ rules: [bearerRule], restrict_to_rules: false }),
-    ).toEqual({ rules: [bearerRule] });
+    ).toEqual({
+      rules: [bearerRule],
+    });
   });
 
   it("drops the preset's account login on a shared agent", () => {
@@ -146,7 +164,9 @@ describe("serializing a service", () => {
         { rules: [bearerRule], oauth_provider: "github" },
         sharedPersonal,
       ),
-    ).toEqual({ rules: [bearerRule] });
+    ).toEqual({
+      rules: [bearerRule],
+    });
   });
 
   it("keeps an operator's oauth_on_shared_workers and never sends it from the personal page", () => {
@@ -161,7 +181,10 @@ describe("serializing a service", () => {
   it("keeps an explicit OAuth override of a preset", () => {
     expect(
       serialize({ preset: "github", oauth_provider: null }, operator),
-    ).toEqual({ preset: "github", oauth_provider: null });
+    ).toEqual({
+      preset: "github",
+      oauth_provider: null,
+    });
   });
 
   it("round-trips an authored service through the form", () => {
@@ -192,7 +215,10 @@ describe("validating a service", () => {
   });
 
   it("checks the name of a new service only", () => {
-    expect(errorsFor({ preset: "github" }, { name: "" })[0]).toContain(
+    expect(errorsFor({ preset: "github" }, { name: "" })).toEqual([
+      "Name is required",
+    ]);
+    expect(errorsFor({ preset: "github" }, { name: "  " })[0]).toContain(
       "Name must start",
     );
     expect(errorsFor({ preset: "github" }, { name: "Has Caps" })[0]).toContain(
@@ -228,13 +254,13 @@ describe("validating a service", () => {
   });
 
   it.each([
-    ["", "Rule 1: host is required"],
-    ["https://api.example.com", "Rule 1: host must not contain a scheme"],
-    ["api.example.com:8443", "Rule 1: host must not contain a port"],
-    ["api.example.com/v1", "Rule 1: host must not contain a path"],
-    ["*.*.example.com", "Rule 1: host can only have one wildcard label"],
-    ["*.com", "Rule 1: wildcard host must have at least one domain part"],
-    ["api.*.com", "Rule 1: wildcard must be a single leading *. label"],
+    ["", "Host is required"],
+    ["https://api.example.com", "Host must not contain a scheme"],
+    ["api.example.com:8443", "Host must not contain a port"],
+    ["api.example.com/v1", "Host must not contain a path"],
+    ["*.*.example.com", "Host can only have one wildcard label"],
+    ["*.com", "Wildcard host must have at least one domain part"],
+    ["api.*.com", "Wildcard must be a single leading *. label"],
   ])("rejects the host %j", (host, message) => {
     const errors = errorsFor(null, { rules: [{ ...validRule(), host }] });
     expect(errors).toHaveLength(1);
@@ -250,10 +276,10 @@ describe("validating a service", () => {
   it("checks path prefix and port", () => {
     expect(
       errorsFor(null, { rules: [{ ...validRule(), pathPrefix: "v1" }] }),
-    ).toEqual(["Rule 1: path prefix must start with /"]);
+    ).toEqual(["Path prefix must start with /"]);
     for (const port of ["0", "70000", "abc", "1.5"])
       expect(errorsFor(null, { rules: [{ ...validRule(), port }] })).toEqual([
-        "Rule 1: port must be a number from 1 to 65535",
+        "Port must be a number from 1 to 65535",
       ]);
     expect(
       errorsFor(null, { rules: [{ ...validRule(), port: "8443" }] }),
@@ -264,27 +290,27 @@ describe("validating a service", () => {
     const check = (changes: object) =>
       errorsFor(null, { rules: [{ ...validRule(), ...changes }] });
     expect(check({ authType: "basic", username: " " })).toEqual([
-      "Rule 1: basic auth needs a username",
+      "Basic auth needs a username",
     ]);
     expect(check({ authType: "header" })).toEqual([
-      "Rule 1: header auth needs a header name",
+      "Header auth needs a header name",
     ]);
     expect(check({ authType: "header", headerOrParam: "bad header" })).toEqual([
-      "Rule 1: header name must be a valid HTTP header name",
+      "Header name must be a valid HTTP header name",
     ]);
     expect(check({ authType: "query" })).toEqual([
-      "Rule 1: query auth needs a parameter name",
+      "Query auth needs a parameter name",
     ]);
     expect(
       check({ authType: "header", headerOrParam: "x-key", template: "token" }),
-    ).toEqual(["Rule 1: template must contain {secret} exactly once"]);
+    ).toEqual(["Template must contain {secret} exactly once"]);
     expect(
       check({
         authType: "query",
         headerOrParam: "key",
         template: "{secret}{secret}",
       }),
-    ).toEqual(["Rule 1: template must contain {secret} exactly once"]);
+    ).toEqual(["Template must contain {secret} exactly once"]);
     expect(
       check({
         authType: "header",
@@ -297,7 +323,7 @@ describe("validating a service", () => {
   it("numbers the rule that has the problem", () => {
     expect(
       errorsFor(null, { rules: [validRule(), { ...validRule(), host: "" }] }),
-    ).toEqual(["Rule 2: host is required"]);
+    ).toEqual(["Host is required"]);
   });
 
   it("limits a personal service to 50 rules but not an operator service", () => {
@@ -325,10 +351,8 @@ describe("validating a service", () => {
     expect(errorsFor({ preset: "github" }, placeholders("MY_API_KEY"))).toEqual(
       [],
     );
-    expect(
-      errorsFor({ preset: "github" }, placeholders("LD_PRELOAD"))[0],
-    ).toContain(
-      "must match ^[A-Z][A-Z0-9_]*$ and have one of AUTH, CREDENTIAL, KEY",
+    expect(errorsFor({ preset: "github" }, placeholders("LD_PRELOAD"))[0]).toBe(
+      "LD_PRELOAD is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
     );
     // A credential word has to be a whole part: PYTHONPATH only contains PAT.
     expect(
@@ -340,7 +364,9 @@ describe("validating a service", () => {
         { preset: "github" },
         placeholders("MY_API_KEY", "has space"),
       )[0],
-    ).toContain("placeholder value of MY_API_KEY must be 1 to 256 characters");
+    ).toBe(
+      "The value of MY_API_KEY must be 1 to 256 letters, digits, or . _ : -",
+    );
     expect(
       errorsFor({ preset: "github" }, placeholders("MY_API_KEY", "")),
     ).toHaveLength(1);
@@ -411,7 +437,7 @@ describe("validating a service", () => {
       const errors = personalErrors(name);
       expect(errors).toHaveLength(1);
       expect(errors[0]).toBe(
-        `placeholder name ${name} may not start with SSH_ or have any of these words between underscores, which tools read as programs or paths: CMD, COMMAND, DIR, EXTENSIONS, FILE, HELPER, OPTIONS, OPTS, PROVIDER`,
+        `${name} is not allowed: tools read names with COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS, or starting with SSH_, as programs or paths.`,
       );
       expect(operatorErrors(name)).toEqual([]);
     });
@@ -430,8 +456,8 @@ describe("validating a service", () => {
 
     it("keeps the credential word rule ahead of the refused words", () => {
       // LD_PRELOAD has no credential word, so that is what the user hears.
-      expect(personalErrors("LD_PRELOAD")[0]).toContain("have one of AUTH");
-      expect(personalErrors("SSH_AGENT_PID")[0]).toContain("have one of AUTH");
+      expect(personalErrors("LD_PRELOAD")[0]).toContain("name a credential");
+      expect(personalErrors("SSH_AGENT_PID")[0]).toContain("name a credential");
     });
   });
 
@@ -452,7 +478,9 @@ describe("validating a service", () => {
     const sizeWith = (description: string) =>
       serverSize(serializeService(form(description), personal));
     const fits = (description: string) =>
-      validateService(form(description), personal, newService);
+      validateService(form(description), personal, newService).map(
+        (problem) => problem.message,
+      );
     // How many of `char`, each costing `cost` bytes, make the service exactly 16 KiB or just over.
     const largest = (char: string, cost: number) =>
       Math.floor((limit - (sizeWith(char) - cost)) / cost);
@@ -540,6 +568,7 @@ describe("GitHub repository rules", () => {
   it("generates the API and git rules for one repository", () => {
     expect(githubRepositoryRules("basnijholt/agent-cli", none)).toEqual({
       errors: [],
+      repositories: ["basnijholt/agent-cli"],
       rules: [
         {
           host: "api.github.com",
@@ -563,6 +592,7 @@ describe("GitHub repository rules", () => {
   it("makes an owner-wide rule with a trailing slash for owner/*", () => {
     expect(githubRepositoryRules("mindroom-ai/*", none)).toEqual({
       errors: [],
+      repositories: ["mindroom-ai/*"],
       rules: [
         {
           host: "api.github.com",
@@ -634,13 +664,14 @@ describe("GitHub repository rules", () => {
   });
 
   it("ignores blank lines and repeats, trims, and drops a .git suffix", () => {
-    const { rules, errors } = githubRepositoryRules(
+    const { rules, errors, repositories } = githubRepositoryRules(
       "\n  o/r  \r\no/r\no/r.git\n\n",
       none,
     );
     expect(errors).toEqual([]);
     expect(rules).toHaveLength(3);
     expect(rules[0].path_prefix).toBe("/repos/o/r");
+    expect(repositories).toEqual(["o/r"]);
   });
 
   it("names each line that is not owner/repo or owner/*", () => {
@@ -651,6 +682,7 @@ describe("GitHub repository rules", () => {
       ),
     ).toEqual({
       rules: [],
+      repositories: [],
       errors: [
         "https://github.com/o/r is not owner/repo or owner/*",
         "owner is not owner/repo or owner/*",
@@ -817,7 +849,10 @@ describe("the account login a preset service keeps", () => {
   it("keeps an override written for the same preset", () => {
     expect(
       serialize({ preset: "github", oauth_provider: null }, operator),
-    ).toEqual({ preset: "github", oauth_provider: null });
+    ).toEqual({
+      preset: "github",
+      oauth_provider: null,
+    });
   });
 
   it("does not carry it over to another preset", () => {
@@ -893,7 +928,7 @@ describe("rows and fields the model ignores or checks", () => {
       errorsFor(null, {
         rules: [{ ...validRule(), authType: "header", headerOrParam: name }],
       }),
-    ).toEqual([`Rule 1: header name ${name} is reserved for the broker`]);
+    ).toEqual([`Header name ${name} is reserved for the broker`]);
   });
 
   it("caps GitHub owner and repository names", () => {
@@ -912,126 +947,355 @@ describe("rows and fields the model ignores or checks", () => {
   });
 });
 
-describe("finding services that already cover a rule", () => {
-  const rule = (
-    host: string,
-    path_prefix: string,
-    port: number | null = null,
-  ): EgressRuleSummary => ({ host, port, path_prefix });
-  const service = (display_name: string, ...rules: EgressRuleSummary[]) => ({
-    name: display_name.toLowerCase(),
-    display_name,
-    rules,
-  });
-  const covered = (mine: EgressRuleSummary[], ...others: ServiceCoverage[]) =>
-    findBroaderServices(mine, others);
+describe("where each problem is shown", () => {
+  const rule = (changes: object) => ({ ...validRule(), ...changes });
+  const fields = (changes: Partial<EgressServiceForm>) =>
+    problemsFor(null, changes).map((problem) => problem.field);
 
-  it("names a service with a shorter prefix on the same host", () => {
-    expect(
-      covered(
-        [rule("api.github.com", "/repos/o/r")],
-        service("GitHub", rule("api.github.com", "/")),
-      ),
-    ).toEqual(["GitHub"]);
+  it("builds one id per rule field and placeholder field", () => {
+    expect(ruleField(2, "host")).toBe("rule:2:host");
+    expect(placeholderField(0, "value")).toBe("placeholder:0:value");
   });
 
-  it("covers a trailing-slash prefix by plain prefix and others by whole segment", () => {
-    const mine = [rule("api.github.com", "/repos/o/r")];
+  it("ties a problem to the field that shows it", () => {
+    expect(problemsFor({ preset: "github" }, { name: "" })).toEqual([
+      { field: "name", message: "Name is required" },
+    ]);
+    expect(fields({ rules: [rule({ host: "" })] })).toEqual(["rule:0:host"]);
+    expect(fields({ rules: [validRule(), rule({ host: "" })] })).toEqual([
+      "rule:1:host",
+    ]);
+    expect(fields({ rules: [rule({ pathPrefix: "v1" })] })).toEqual([
+      "rule:0:pathPrefix",
+    ]);
+    expect(fields({ rules: [rule({ port: "0" })] })).toEqual(["rule:0:port"]);
+    expect(fields({ rules: [rule({ authType: "basic" })] })).toEqual([
+      "rule:0:username",
+    ]);
+    expect(fields({ rules: [rule({ authType: "header" })] })).toEqual([
+      "rule:0:authName",
+    ]);
+    expect(fields({ rules: [rule({ authType: "query" })] })).toEqual([
+      "rule:0:authName",
+    ]);
     expect(
-      covered(mine, service("Owner", rule("api.github.com", "/repos/o/"))),
-    ).toEqual(["Owner"]);
-    expect(
-      covered(mine, service("Owner", rule("api.github.com", "/repos/o"))),
-    ).toEqual(["Owner"]);
-    // Not the same segment: `/repos/o` never matches `/repos/other`.
-    expect(
-      covered(
-        [rule("api.github.com", "/repos/other/r")],
-        service("Owner", rule("api.github.com", "/repos/o")),
-      ),
-    ).toEqual([]);
-    expect(
-      covered(
-        [rule("api.github.com", "/repos/other/r")],
-        service("Owner", rule("api.github.com", "/repos/o/")),
-      ),
-    ).toEqual([]);
+      fields({
+        rules: [
+          rule({ authType: "header", headerOrParam: "x", template: "none" }),
+        ],
+      }),
+    ).toEqual(["rule:0:template"]);
+    expect(fields({ rules: [] })).toEqual(["rules"]);
+    expect(fields({ rules: [validRule()], oauthProvider: "Git Hub" })).toEqual([
+      "oauthProvider",
+    ]);
   });
 
-  it("ignores equal or longer prefixes, other hosts, and other ports", () => {
-    const mine = [rule("api.github.com", "/repos/o/r")];
+  it("ties a placeholder problem to its name or its value", () => {
+    const rows = (...placeholders: [string, string][]) => ({
+      rules: [validRule()],
+      placeholders: placeholders.map(([name, value]) => ({ name, value })),
+    });
+    expect(fields(rows(["LD_PRELOAD", "x"]))).toEqual(["placeholder:0:name"]);
+    expect(fields(rows(["MY_API_KEY", "has space"]))).toEqual([
+      "placeholder:0:value",
+    ]);
     expect(
-      covered(mine, service("Same", rule("api.github.com", "/repos/o/r"))),
-    ).toEqual([]);
+      fields(rows(["MY_API_KEY", "a"], ["MY_API_KEY", "b"], ["x", "y"])),
+    ).toEqual(["placeholder:1:name", "placeholder:2:name"]);
+  });
+
+  it("keeps the size problem for the form as a whole", () => {
     expect(
-      covered(
-        mine,
-        service("Longer", rule("api.github.com", "/repos/o/r/issues")),
+      problemsFor(null, {
+        rules: [validRule()],
+        description: "x".repeat(17 * 1024),
+      }),
+    ).toEqual([
+      { field: "form", message: "A service can take at most 16 KiB" },
+    ]);
+  });
+
+  it("gives a lowercase personal placeholder the server's wording, not a pattern", () => {
+    expect(
+      errorsFor(
+        { preset: "github" },
+        {
+          placeholders: [{ name: "my_key", value: "x" }],
+        },
       ),
-    ).toEqual([]);
-    expect(covered(mine, service("Other", rule("github.com", "/")))).toEqual(
-      [],
+    ).toEqual([
+      "my_key is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
+    ]);
+  });
+});
+
+describe("the way the key is sent", () => {
+  const header = (template?: string): AuthoredEgressService => ({
+    rules: [
+      {
+        host: "api.example.com",
+        auth: { type: "header", name: "Authorization", template },
+      },
+    ],
+  });
+
+  it("shows a header with a custom template as a custom template", () => {
+    expect(
+      formFromService("svc", header("Token {secret}")).rules[0],
+    ).toMatchObject({
+      authType: "template",
+      headerOrParam: "Authorization",
+    });
+    expect(formFromService("svc", header()).rules[0].authType).toBe("header");
+    expect(formFromService("svc", header("{secret}")).rules[0].authType).toBe(
+      "header",
     );
-    expect(
-      covered(mine, service("Port", rule("api.github.com", "/", 8443))),
-    ).toEqual([]);
-    expect(covered(mine, service("None"))).toEqual([]);
   });
 
-  it("matches the port, or any port, and ignores host case", () => {
-    expect(
-      covered(
-        [rule("Api.Example.com", "/v1/x", 8443)],
-        service("Any", rule("api.example.com", "/")),
-        service("Same", rule("api.example.com", "/v1/", 8443)),
-        service("Different", rule("api.example.com", "/", 9000)),
-      ),
-    ).toEqual(["Any", "Same"]);
-    // A rule for any port is not covered by one that names a port.
-    expect(
-      covered(
-        [rule("api.example.com", "/v1/x")],
-        service("Port", rule("api.example.com", "/", 8443)),
-      ),
-    ).toEqual([]);
+  it("writes a custom template as header auth with its template", () => {
+    const service = header("Token {secret}");
+    expect(serialize(service)).toEqual(service);
   });
 
-  it("names each service once, in listing order, and tolerates missing rules", () => {
-    expect(
-      covered(
-        [rule("a.example.com", "/x/y"), rule("b.example.com", "/x/y")],
-        service("Both", rule("a.example.com", "/"), rule("b.example.com", "/")),
-        service("First", rule("a.example.com", "/x")),
-        { name: "old", display_name: "Old" },
-      ),
-    ).toEqual(["Both", "First"]);
+  it("drops a custom template when the user chooses Header", () => {
+    const custom = formFromService("svc", header("Token {secret}")).rules[0];
+    expect(applyAuthChoice(custom, "header")).toMatchObject({
+      authType: "header",
+      template: "",
+    });
+    expect(applyAuthChoice(custom, "bearer").authType).toBe("bearer");
+    expect(applyAuthChoice(emptyRule(), "template").authType).toBe("template");
   });
 
-  it("reads the form's own rules, or the preset's when it keeps them", () => {
-    const own = formFromService("svc", {
+  it("asks a custom template for its template, with the key once", () => {
+    const custom = (template: string) => ({
       rules: [
-        { host: " API.Example.com ", port: 8443, auth: { type: "bearer" } },
-        { host: "b.example.com", path_prefix: "/v1", auth: { type: "bearer" } },
+        {
+          ...validRule(),
+          authType: "template" as const,
+          headerOrParam: "Authorization",
+          template,
+        },
       ],
     });
-    expect(formRuleSummaries(own, presets)).toEqual([
-      rule("api.example.com", "/", 8443),
-      rule("b.example.com", "/v1"),
+    expect(errorsFor(null, custom(""))).toEqual([
+      "Template must contain {secret} exactly once",
     ]);
-    const blank = { ...own, rules: [{ ...own.rules[0], host: "  " }] };
-    expect(formRuleSummaries(blank, presets)).toEqual([]);
-    const preset = formFromService("svc", { preset: "google_drive" });
-    expect(formRuleSummaries(preset, presets)).toEqual([
-      rule("www.googleapis.com", "/drive/"),
-      rule("www.googleapis.com", "/upload/drive/"),
+    expect(errorsFor(null, custom("Token"))).toEqual([
+      "Template must contain {secret} exactly once",
     ]);
-    expect(formRuleSummaries(preset, null)).toEqual([]);
-    const replaced = formFromService("svc", {
-      preset: "google_drive",
-      rules: [{ host: "x.example.com", auth: { type: "bearer" } }],
+    expect(errorsFor(null, custom("Token {secret}"))).toEqual([]);
+    expect(
+      problemsFor(null, custom("")).map((problem) => problem.field),
+    ).toEqual(["rule:0:template"]);
+  });
+
+  it("needs a header name for a custom template too", () => {
+    expect(
+      errorsFor(null, {
+        rules: [
+          { ...validRule(), authType: "template", template: "Token {secret}" },
+        ],
+      }),
+    ).toEqual(["Header auth needs a header name"]);
+  });
+});
+
+describe("suggesting a name", () => {
+  const form = (
+    preset: string,
+    host: string,
+    changes: Partial<EgressServiceForm> = {},
+  ) => ({
+    ...formFromService("", null),
+    preset,
+    rules: [{ ...validRule(), host }],
+    ...changes,
+  });
+
+  it("uses the preset id, then the host's first label", () => {
+    expect(suggestedName(form("github", ""))).toBe("github");
+    expect(suggestedName(form("google_drive", "ignored.example.com"))).toBe(
+      "google_drive",
+    );
+    expect(suggestedName(form("", "httpbin.org"))).toBe("httpbin");
+    expect(suggestedName(form("", " API.Example.com "))).toBe("api");
+  });
+
+  it("skips a wildcard and drops what a name cannot hold", () => {
+    expect(suggestedName(form("", "*.example.com"))).toBe("example");
+    expect(suggestedName(form("", "my_host-1.example.com"))).toBe("my_host-1");
+    expect(suggestedName(form("", "localhost:8080"))).toBe("localhost");
+    expect(suggestedName(form("", "-odd.example.com"))).toBe("odd");
+    expect(suggestedName(form("", "*"))).toBe("");
+  });
+
+  it("suggests nothing without a preset or a host", () => {
+    expect(suggestedName(form("", ""))).toBe("");
+    expect(suggestedName({ ...form("", ""), rules: [] })).toBe("");
+  });
+});
+
+describe("a placeholder the administrator also sets", () => {
+  const config = { GH_TOKEN: "GitHub" };
+
+  it("warns with the service's display name", () => {
+    expect(configPlaceholderWarning("GH_TOKEN", config)).toBe(
+      "GH_TOKEN is also set by GitHub from your administrator; when both are set, theirs is used.",
+    );
+    expect(configPlaceholderWarning(" GH_TOKEN ", config)).toContain(
+      "GH_TOKEN is also set by GitHub",
+    );
+  });
+
+  it("stays quiet for any other name, including inherited object keys", () => {
+    expect(configPlaceholderWarning("MY_API_KEY", config)).toBeNull();
+    expect(configPlaceholderWarning("", config)).toBeNull();
+    expect(configPlaceholderWarning("constructor", config)).toBeNull();
+  });
+});
+
+describe("finding who sets a placeholder in a listing", () => {
+  const listed = (
+    source: "config" | "user" | undefined,
+    display_name: string,
+    placeholder_names?: string[],
+  ) => ({ source, display_name, placeholder_names });
+
+  it("maps each variable to the administrator's service that sets it", () => {
+    expect(
+      configPlaceholderOwners([
+        listed("config", "GitHub", ["GH_TOKEN", "GITHUB_TOKEN"]),
+        listed("config", "Other", ["GH_TOKEN", "OTHER_KEY"]),
+      ]),
+    ).toEqual({
+      GH_TOKEN: "GitHub",
+      GITHUB_TOKEN: "GitHub",
+      OTHER_KEY: "Other",
     });
-    expect(formRuleSummaries(replaced, presets)).toEqual([
-      rule("x.example.com", "/"),
-    ]);
+  });
+
+  it("ignores the user's own services and services that list none", () => {
+    expect(
+      configPlaceholderOwners([
+        listed("user", "Mine", ["MY_KEY"]),
+        listed(undefined, "Old", ["OLD_KEY"]),
+        listed("config", "Plain"),
+      ]),
+    ).toEqual({});
+  });
+
+  it("keeps a variable named like an inherited object key", () => {
+    expect(
+      configPlaceholderOwners([listed("config", "Odd", ["constructor"])]),
+    ).toEqual({
+      constructor: "Odd",
+    });
+  });
+});
+
+describe("the note on whose service this is", () => {
+  it("names the agent that owns a user_agent service", () => {
+    expect(scopeNote("user_agent", "Code", ["Code"])).toBe(
+      "Only your Code uses this service and its key.",
+    );
+  });
+
+  it("lists the agents that share a user's workspace", () => {
+    expect(scopeNote("user", "Code", ["Code", "Research", "Notes"])).toBe(
+      "All your agents that share your personal workspace use this service and its key: Code, Research, Notes.",
+    );
+    expect(scopeNote("user", "Code", [])).toBe(
+      "All your agents that share your personal workspace use this service and its key: Code.",
+    );
+  });
+
+  it("says nothing for shared, unscoped, or unknown scopes", () => {
+    expect(scopeNote("shared", "Team", [])).toBeNull();
+    expect(scopeNote("unscoped", "Team", [])).toBeNull();
+    expect(scopeNote(undefined, "Team", [])).toBeNull();
+  });
+});
+
+describe("offering the GitHub helper", () => {
+  const withHost = (
+    host: string,
+    changes: Partial<EgressServiceForm> = {},
+  ) => ({
+    ...formFromService("svc", null),
+    rules: [{ ...validRule(), host }],
+    ...changes,
+  });
+
+  it("is for the GitHub preset and for rules on a GitHub host", () => {
+    expect(looksLikeGithub(formFromService("svc", { preset: "github" }))).toBe(
+      true,
+    );
+    for (const host of ["github.com", "api.github.com", "uploads.github.com"])
+      expect(looksLikeGithub(withHost(host))).toBe(true);
+    expect(looksLikeGithub(withHost(" API.GitHub.com "))).toBe(true);
+  });
+
+  it("is hidden for other hosts and for an empty host", () => {
+    expect(looksLikeGithub(withHost("httpbin.org"))).toBe(false);
+    expect(looksLikeGithub(withHost(""))).toBe(false);
+    expect(looksLikeGithub(withHost("gist.github.com"))).toBe(false);
+  });
+
+  it("looks at the rules only while the service uses its own", () => {
+    const kept = withHost("github.com", { preset: "openai" });
+    expect(looksLikeGithub(kept)).toBe(false);
+    expect(looksLikeGithub({ ...kept, replacePresetRules: true })).toBe(true);
+    expect(
+      looksLikeGithub({ ...withHost("httpbin.org"), preset: "github" }),
+    ).toBe(true);
+  });
+});
+
+describe("labels from the repositories a service is limited to", () => {
+  it("names them in the display name and the description", () => {
+    expect(githubLimitLabels(["o/a"])).toEqual({
+      displayName: "GitHub (o/a)",
+      description: "Limited to o/a",
+    });
+    expect(githubLimitLabels(["o/a", "o/b", "p/*"])).toEqual({
+      displayName: "GitHub (o/a, o/b, p/*)",
+      description: "Limited to o/a, o/b, p/*",
+    });
+  });
+
+  it("collects each repository once, without a .git suffix", () => {
+    expect(
+      githubRepositoryRules("o/a\no/b.git\no/a\np/*", {
+        uploads: false,
+        graphql: false,
+      }).repositories,
+    ).toEqual(["o/a", "o/b", "p/*"]);
+  });
+});
+
+describe("knowing when the form uses more than the basic fields", () => {
+  const blank = formFromService("svc", null);
+
+  it("is false for a new service and for a bare preset", () => {
+    expect(usesMoreOptions(blank)).toBe(false);
+    expect(usesMoreOptions(formFromService("svc", { preset: "github" }))).toBe(
+      false,
+    );
+  });
+
+  it.each<[string, Partial<EgressServiceForm>]>([
+    ["a display name", { displayName: "Mine" }],
+    ["a description", { description: "Mine" }],
+    ["a path prefix", { rules: [{ ...validRule(), pathPrefix: "/v1" }] }],
+    ["a port", { rules: [{ ...validRule(), port: "8443" }] }],
+    ["a second rule", { rules: [validRule(), validRule()] }],
+    ["replaced preset rules", { preset: "openai", replacePresetRules: true }],
+    ["the restriction", { restrictToRules: true }],
+    ["an account login", { oauthProvider: "github" }],
+    ["a placeholder", { placeholders: [{ name: "A_KEY", value: "x" }] }],
+  ])("is true with %s", (_name, changes) => {
+    expect(usesMoreOptions({ ...blank, ...changes })).toBe(true);
   });
 });

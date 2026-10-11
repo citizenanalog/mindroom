@@ -81,6 +81,12 @@ export interface EgressCredentialService {
   source?: EgressServiceSource;
   /** Where the service applies, in rule order. Absent in responses from before the server sent it. */
   rules?: EgressRuleSummary[];
+  /**
+   * The placeholder variables an administrator's service sets in the sandbox,
+   * so a service of one's own that sets the same one can be warned. Absent for
+   * a service of one's own, and in responses from before the server sent it.
+   */
+  placeholder_names?: string[];
   /** `null` when the caller cannot tell whether the key is shared. */
   is_shared: boolean | null;
   /** Set by the dashboard for the global key that every agent without a worker scope shares. */
@@ -105,11 +111,23 @@ export interface EgressInactiveService {
   reason: EgressInactiveReason;
 }
 
+/**
+ * Whose store an agent's services and keys live in: one `user_agent` agent's
+ * own, every `user` agent's of the caller, everyone's on a `shared` agent, or
+ * the global store of an `unscoped` one.
+ */
+export type EgressScope = "user" | "user_agent" | "shared" | "unscoped";
+
 export interface EgressCredentialAgent {
   agent_name: string;
   agent_display_name: string;
   /** A shared or unscoped agent: everyone using it shares its services and keys, and personal accounts are off. */
   shared: boolean;
+  scope: EgressScope;
+  /** For a `user` agent, the display names of the caller's agents that share its store, this one included; empty otherwise. */
+  scope_agents: string[];
+  /** The Matrix IDs of a shared or unscoped agent's credential managers; empty for any other, and for an agent with none only administrators manage it. */
+  managers: string[];
   /** The caller may add, change, and delete services of this agent, even when it has none yet. */
   can_manage: boolean;
   services: EgressCredentialService[];
