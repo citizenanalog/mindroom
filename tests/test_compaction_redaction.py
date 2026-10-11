@@ -11,11 +11,13 @@ from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
+from agno.run.team import TeamRunOutput
 from agno.session.agent import AgentSession
 from agno.session.summary import SessionSummary
+from agno.session.team import TeamSession
 
 from mindroom import constants
-from mindroom.agent_storage import create_state_storage, get_agent_session
+from mindroom.agent_storage import create_state_storage, get_agent_session, get_team_session
 from mindroom.history import archive
 from mindroom.history.storage import (
     _read_scope_history_event_ids,
@@ -498,6 +500,49 @@ def test_removing_an_edited_turn_rolls_back_its_mid_turn_compaction(storage: Sql
     assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
 
     stored = _stored(storage)
+    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
+    assert stored.summary is None
+
+
+def _team_run(run_id: str, *, parent_run_id: str | None = None) -> TeamRunOutput:
+    return TeamRunOutput(
+        run_id=run_id,
+        team_id="crew",
+        session_id="session",
+        parent_run_id=parent_run_id,
+        content=f"answer {run_id}",
+        messages=[Message(role="user", content=f"question {run_id}")],
+        metadata={
+            constants.MATRIX_EVENT_ID_METADATA_KEY: f"${run_id}",
+            constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [f"${run_id}"],
+        },
+    )
+
+
+def test_redacting_a_team_turn_that_compacted_mid_turn_removes_its_member_runs(storage: SqliteDb) -> None:
+    """A team turn's snapshots roll back with the turn, and its delegated member runs go with it."""
+    scope = HistoryScope(kind="team", scope_id="crew")
+    live = _team_run("x")
+    member = RunOutput(run_id="m", agent_id="helper", session_id="session", parent_run_id="x")
+    session = seed_session(
+        storage,
+        TeamSession(session_id="session", team_id="crew", runs=[_team_run("r1"), _team_run("r2"), live, member]),
+    )
+    snapshot = _team_run("x")
+    snapshot.run_id = archive.snapshot_run_id("x")
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=scope,
+        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), snapshot],
+    )
+
+    assert _remove_redacted_event_from_history(storage, session, scope, event_id="$x") is True
+
+    stored = get_team_session(storage, "session")
+    assert stored is not None
     assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
     assert stored.summary is None
 

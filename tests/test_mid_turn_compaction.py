@@ -565,6 +565,69 @@ async def test_folded_request_usage_stays_in_the_usage_projection(
 
 
 @pytest.mark.asyncio
+async def test_folded_request_usage_survives_approval_resume(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
+    config, paths = _config(tmp_path)
+
+    class _PausingLoop(_ToolLoopModel):
+        async def ainvoke(self, messages: list[Message], **kwargs: object) -> ModelResponse:
+            response = await super().ainvoke(messages, **kwargs)
+            if len(self.requests) == 5 and response.tool_calls:
+                response.tool_calls[0]["function"]["name"] = "approve_me"
+            return response
+
+    model = _PausingLoop(
+        tool_rounds=9,
+        usage=lambda number: MessageMetrics(input_tokens=1001 * number, output_tokens=1),
+    )
+    agent = _agent(model, config, paths, db=SqliteDb(db_file=str(tmp_path / "runs.db")))
+    agent.tools = [probe, Function(name="approve_me", entrypoint=lambda: "approved", requires_confirmation=True)]
+    paused = await agent.arun("Do the task", session_id="session")
+    for requirement in paused.requirements or []:
+        requirement.confirm()
+
+    output = await agent.acontinue_run(run_id=paused.run_id, requirements=paused.requirements, session_id="session")
+
+    assert len(summary_calls.inputs) >= 2
+    requests = project_usage(output.to_dict())["requests"]
+    assert [request["metrics"]["input_tokens"] for request in requests] == [
+        1001 * number for number in range(1, len(model.requests) + 1)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("summary_calls")
+async def test_folded_request_usage_stays_on_a_run_cancelled_after_compaction(tmp_path: Path) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    model = _ToolLoopModel(
+        tool_rounds=5,
+        usage=lambda number: MessageMetrics(input_tokens=1001 * number, output_tokens=1),
+    )
+    agent = _scoped_agent(model, config, paths, storage)
+
+    class _CancelOnSuccess(RecordingCompactionLifecycle):
+        async def complete_success(self, outcome: CompactionOutcome) -> None:  # noqa: ARG002
+            raise asyncio.CancelledError
+
+    bind_compaction_lifecycle(agent, _CancelOnSuccess())
+    runs: list[RunOutput] = []
+
+    async def capture(_messages: list[Message], _tools: object, run_response: RunOutput | None) -> None:
+        if run_response is not None:
+            runs.append(run_response)
+
+    install_request_preparation(model, marker="_test_capture", prepare=capture)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_in_session(agent, "Do the task")
+
+    requests = project_usage(runs[-1].to_dict())["requests"]
+    assert [request["metrics"]["input_tokens"] for request in requests] == [
+        1001 * number for number in range(1, len(model.requests) + 1)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_queued_notice_survives_mid_turn_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     model = _ToolLoopModel(tool_rounds=5)
