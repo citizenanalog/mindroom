@@ -424,7 +424,18 @@ def _current_prompt(messages: Sequence[Message], run_response: RunOutput | TeamR
         match = next((message for message in reversed(messages) if last_id and message.id == last_id), None)
         if match is not None:
             return match
-    return next((message for message in messages if not message.from_history and message.role == "user"), None)
+    return next(
+        (
+            message
+            for message in messages
+            if message.role == "user"
+            and not message.from_history
+            and message.add_to_agent_memory
+            and not is_compaction_summary(message)
+            and not _is_queued_notice(message)
+        ),
+        None,
+    )
 
 
 def _is_queued_notice(message: Message) -> bool:

@@ -237,6 +237,27 @@ async def test_run_local_tool_loop_compacts_and_finishes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_repeated_run_local_compaction_keeps_a_string_prompt(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    *,
+    stream: bool,
+) -> None:
+    config, paths = _config(tmp_path)
+    model = _ToolLoopModel(tool_rounds=12)
+
+    output = await _run(_agent(model, config, paths), "Do the task", stream=stream)
+
+    assert str(output.content).endswith("done")
+    assert len(summary_calls.inputs) >= 2
+    compacted = [request for request in model.requests if any(is_compaction_summary(m) for m in request.messages)]
+    for request in compacted:
+        assert request.contents.count("Do the task") == 1
+        assert sum(is_compaction_summary(message) for message in request.messages) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("enabled", "context_window"),
     [(False, 4000), (True, None)],
