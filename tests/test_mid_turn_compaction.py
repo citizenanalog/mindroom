@@ -828,6 +828,60 @@ async def test_long_single_team_turn_compacts_mid_turn_and_continues(
     assert stored.summary.summary == generations[-1].summary
 
 
+class _DelegateThenLoop(_ToolLoopModel):
+    """Delegate to the member first, then run the tool loop."""
+
+    async def ainvoke(self, messages: list[Message], **kwargs: object) -> ModelResponse:
+        response = await super().ainvoke(messages, **kwargs)
+        if len(self.requests) == 1:
+            response.tool_calls = [
+                {
+                    "id": "delegate_1",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task_to_member",
+                        "arguments": '{"member_id": "helper", "task": "Do the subtask"}',
+                    },
+                },
+            ]
+        return response
+
+
+@pytest.mark.asyncio
+async def test_scoped_team_compaction_keeps_the_turns_member_runs(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(
+        tmp_path,
+        teams={"test_team": TeamConfig(display_name="Test Team", role="Test team", agents=["test_agent"])},
+    )
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    member = Agent(id="helper", name="helper", model=_ToolLoopModel(tool_rounds=0), telemetry=False)
+    team = Team(
+        id="test_team",
+        name="test_team",
+        model=_DelegateThenLoop(tool_rounds=6),
+        members=[member],
+        tools=[probe],
+        db=storage,
+        add_history_to_context=True,
+        store_history_messages=False,
+        add_session_summary_to_context=False,
+        telemetry=False,
+    )
+    install_mid_turn_compaction(team, config=config, runtime_paths=paths, entity_name="test_team", model_name="default")
+
+    output = await team.arun("Do the task", session_id="session-1")
+
+    assert isinstance(output, TeamRunOutput)
+    assert str(output.content).endswith("done")
+    assert summary_calls.inputs
+    stored = get_team_session(storage, "session-1")
+    assert stored is not None
+    assert any(run.parent_run_id == output.run_id for run in stored.runs or [])
+
+
 @pytest.mark.asyncio
 async def test_next_turn_reuses_the_post_compaction_prefix(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)

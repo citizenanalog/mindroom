@@ -257,28 +257,34 @@ async def _compact_scope(
         else resolve_history_scope(binding.target)
     )
     assert scope is not None
-    await run_blocking_until_complete(partial(_prepare_scope_session, storage, session, scope))
-    snapshot = _snapshot(run_response, layout, messages)
-    snapshot.run_id = archive.snapshot_run_id(run_response.run_id or "")
-    snapshot.metadata = deepcopy(run_response.metadata)
-    snapshot.created_at = run_response.created_at
+    # Members' runs of this turn exist only in memory until the turn ends, and loading the stored row drops them.
+    member_runs = [run for run in session.runs or [] if run.parent_run_id == run_response.run_id]
     try:
-        await compact_scope_mid_turn(
-            storage=storage,
-            session=session,
-            scope=scope,
-            resolved_inputs=policy.inputs,
-            snapshot=snapshot,
-            before_tokens=estimate_request_messages_tokens(messages, replay_model=policy.replay_model),
-            config=binding.config,
-            runtime_paths=binding.runtime_paths,
-            compaction_lifecycle=binding.lifecycle,
-        )
-    except asyncio.CancelledError:
-        # A snapshot that committed has archived this turn's folded messages; the request must not resend them.
-        if await _archived(storage, session, snapshot):
-            _finish(messages, layout, _scope_summary_message(session), run_response)
-        raise
+        await run_blocking_until_complete(partial(_prepare_scope_session, storage, session, scope))
+        snapshot = _snapshot(run_response, layout, messages)
+        snapshot.run_id = archive.snapshot_run_id(run_response.run_id or "")
+        snapshot.metadata = deepcopy(run_response.metadata)
+        snapshot.created_at = run_response.created_at
+        try:
+            await compact_scope_mid_turn(
+                storage=storage,
+                session=session,
+                scope=scope,
+                resolved_inputs=policy.inputs,
+                snapshot=snapshot,
+                before_tokens=estimate_request_messages_tokens(messages, replay_model=policy.replay_model),
+                config=binding.config,
+                runtime_paths=binding.runtime_paths,
+                compaction_lifecycle=binding.lifecycle,
+            )
+        except asyncio.CancelledError:
+            # A snapshot that committed has archived this turn's folded messages; the request must not resend them.
+            if await _archived(storage, session, snapshot):
+                _finish(messages, layout, _scope_summary_message(session), run_response)
+            raise
+    finally:
+        kept = {run.run_id for run in session.runs or []}
+        session.runs = [*(session.runs or []), *(run for run in member_runs if run.run_id not in kept)]
     if not await _archived(storage, session, snapshot):
         return None
     return _scope_summary_message(session)
