@@ -1249,6 +1249,33 @@ async def test_failure_after_part_of_the_turn_committed_rolls_the_turn_back(
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_part_of_the_turn_committed_rolls_the_turn_back(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, paths = _config(tmp_path, summary_context_window=6_000)
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(storage, _session("session-1"))
+
+    async def cancel_second(**kwargs: Any) -> SessionSummary:  # noqa: ANN401
+        if summary_calls.inputs:
+            raise asyncio.CancelledError
+        return await summary_calls(**kwargs)
+
+    monkeypatch.setattr("mindroom.history.compaction.generate_compaction_summary", cancel_second)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_in_session(_scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage), "Do the task")
+
+    assert len(summary_calls.inputs) == 1
+    # The first chunk archived part of the turn before the cancel; the rollback retired it.
+    assert any(":compaction-snapshot:" in run_id for run_id in archived_run_ids(storage))
+    generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert generation is None or generation.summary is None
+
+
+@pytest.mark.asyncio
 async def test_force_flag_survives_mid_turn_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     storage = _seeded_storage(config, paths)
