@@ -20,6 +20,7 @@ from mindroom.egress_broker._relay import (
     send_json,
     send_proxy_challenge,
     serve_peer,
+    split_authority,
     upstream_request_headers,
 )
 from mindroom.egress_broker.messages import refusal_body
@@ -47,27 +48,13 @@ type SecretResolver = Callable[[WorkerClaims, str], Awaitable[SecretResult]]
 type ScopeInfoProvider = Callable[[WorkerClaims], ScopeInfo]
 
 
-def _parse_port(text: str) -> int:
-    if not (text.isdigit() and len(text) <= 5 and 0 < int(text) < 65536):
-        msg = "Invalid port."
-        raise ValueError(msg)
-    return int(text)
-
-
 def _parse_connect_target(target: bytes) -> tuple[str, int]:
     """Split a CONNECT authority such as ``host:443`` or ``[::1]:443``; the port is required."""
-    text = target.decode("ascii")
-    if text.startswith("["):
-        host, separator, port = text[1:].partition("]:")
-        if not separator or ":" not in host:
-            msg = "Invalid IPv6 CONNECT target."
-            raise ValueError(msg)
-    else:
-        host, separator, port = text.rpartition(":")
-        if not separator or ":" in host:
-            msg = "CONNECT target needs host:port."
-            raise ValueError(msg)
-    return normalize_host(host), _parse_port(port)
+    host, port = split_authority(target.decode("ascii"))
+    if not port or not 0 < int(port) < 65536:
+        msg = "CONNECT target needs a port from 1 to 65535."
+        raise ValueError(msg)
+    return host, int(port)
 
 
 def _parse_absolute_http(target: bytes) -> tuple[str, int, bytes, bytes]:

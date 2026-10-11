@@ -15,10 +15,10 @@ import h11
 from mindroom.egress_broker._relay import (
     AuditEntry,
     Peer,
-    normalize_host,
     send_json,
     send_proxy_challenge,
     serve_peer,
+    split_authority,
     upstream_request_headers,
 )
 from mindroom.egress_broker.messages import refusal_body
@@ -74,19 +74,8 @@ def _injected_request(
 
 def _host_header_name(value: bytes) -> str | None:
     """Return the normalized hostname a Host header names, ignoring an ASCII-digit port; None when malformed."""
-    text = value.decode("latin-1")
-    if text.startswith("["):
-        name, bracket, port = text[1:].partition("]")
-        if not bracket or ":" not in name or (port and not port.startswith(":")):
-            return None
-        port = port.removeprefix(":")
-    else:
-        name, _, port = text.partition(":")
-    # str.isdigit alone would accept Latin-1 digits such as a superscript two.
-    if port and not (port.isascii() and port.isdigit() and len(port) <= 5):
-        return None
     try:
-        return normalize_host(name)
+        return split_authority(value.decode("latin-1"))[0]
     except ValueError:
         return None
 

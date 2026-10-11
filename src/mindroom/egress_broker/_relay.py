@@ -40,6 +40,7 @@ __all__ = [
     "send_json",
     "send_proxy_challenge",
     "serve_peer",
+    "split_authority",
     "upstream_request_headers",
 ]
 
@@ -333,6 +334,26 @@ def normalize_host(host: str) -> str:
         msg = "Invalid host."
         raise ValueError(msg)
     return host
+
+
+def split_authority(text: str) -> tuple[str, str]:
+    """Split ``host[:port]`` or ``[v6][:port]`` into the normalized host and the port text, which may be empty.
+
+    Raises ValueError for a malformed host, bracket, or port; a port is at most five ASCII digits.
+    """
+    if text.startswith("["):
+        host, bracket, port = text[1:].partition("]")
+        if not bracket or ":" not in host or (port and not port.startswith(":")):
+            msg = "Invalid IPv6 authority."
+            raise ValueError(msg)
+        port = port.removeprefix(":")
+    else:
+        host, _, port = text.partition(":")
+    # str.isdigit alone would accept Latin-1 digits such as a superscript two.
+    if port and not (port.isascii() and port.isdigit() and len(port) <= 5):
+        msg = "Invalid port."
+        raise ValueError(msg)
+    return normalize_host(host), port
 
 
 def upstream_request_headers(received: list[tuple[bytes, bytes]], *, host: bytes) -> list[tuple[bytes, bytes]]:
