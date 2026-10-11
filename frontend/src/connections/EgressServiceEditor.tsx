@@ -546,6 +546,7 @@ export function EgressServiceEditor({
               onGithub={showGithubHelper}
               configPlaceholders={configPlaceholders}
               ruleEditing={ruleEditing}
+              newService={service === null}
             />
           )}
         </section>

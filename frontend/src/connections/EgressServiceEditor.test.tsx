@@ -3000,6 +3000,21 @@ describe("the display name of a new service", () => {
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("web", { rules: [bearerRule] });
   });
+
+  it("offers the host only while the service is new: an edited one keeps no display name", async () => {
+    await renderEditor({ name: "web", service: { rules: [bearerRule] } });
+    openMoreOptions();
+    expect(
+      screen.getByLabelText("Display name"),
+    ).not.toHaveAccessibleDescription(/Leave empty/);
+    cleanup();
+    // A preset service is still named after its preset when the field is empty.
+    await renderEditor({ name: "gh", service: { preset: "github" } });
+    openMoreOptions();
+    expect(screen.getByLabelText("Display name")).toHaveAccessibleDescription(
+      "Leave empty to use GitHub.",
+    );
+  });
 });
 
 describe("a website another service of the agent already sends a key to", () => {

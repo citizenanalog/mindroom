@@ -74,6 +74,7 @@ export function MoreOptions({
   onGithub,
   configPlaceholders,
   ruleEditing,
+  newService,
 }: {
   /** The id of the section, which the toggle controls. */
   id: string;
@@ -93,13 +94,15 @@ export function MoreOptions({
   onGithub: boolean;
   configPlaceholders: Readonly<Record<string, string>>;
   ruleEditing: (index: number, rule: RuleForm) => RuleEditing;
+  /** The service is being added, so an empty display name is saved as its host; an edited one keeps none. */
+  newService: boolean;
 }) {
   const isPersonal = context === "personal";
   const primaryRule = form.rules[0] ?? emptyRule();
   const primaryHost = primaryRule.host.trim().toLowerCase();
   const displayNameHint = preset
     ? `Leave empty to use ${preset.display_name}.`
-    : primaryHost
+    : primaryHost && newService
       ? `Leave empty to use ${primaryHost}.`
       : undefined;
   const rulesProblem = problemAt("rules");
