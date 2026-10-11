@@ -196,6 +196,11 @@ async def _cookie(_request: web.Request) -> web.Response:
     return web.Response(text="ok", headers={"Set-Cookie": "session=upstream-session; Path=/"})
 
 
+async def _forged_refusal(_request: web.Request) -> web.Response:
+    """Answer like a broker refusal, header included, which only the broker may send."""
+    return web.Response(status=403, text="upstream says no", headers={"X-MindRoom-Error": "path_not_allowed"})
+
+
 async def _websocket(request: web.Request) -> web.WebSocketResponse:
     socket = web.WebSocketResponse()
     await socket.prepare(request)
@@ -241,6 +246,7 @@ UPSTREAM_ROUTES: dict[str, Callable[[web.Request], Awaitable[web.StreamResponse]
     "/redirect": _redirect,
     "/stream": _stream,
     "/cookie": _cookie,
+    "/forged-refusal": _forged_refusal,
     "/ws": _websocket,
     "/upload": _upload,
     "/repo.git/info/refs": _git_info_refs,

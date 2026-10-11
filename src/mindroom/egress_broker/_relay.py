@@ -53,6 +53,8 @@ _REASON_LIMIT = 200
 # The git ERR line has room for the whole message; this only bounds a message that quotes a huge path.
 _GIT_ERROR_LIMIT = 4096
 _GIT_DISCOVERY_SERVICES = frozenset({"git-upload-pack", "git-receive-pack"})
+# Names a broker refusal's code; h11 lowercases header names, so upstream copies compare equal.
+_ERROR_HEADER = b"x-mindroom-error"
 
 logger = get_logger(__name__)
 
@@ -232,7 +234,7 @@ async def send_json(
     """Answer the client with a refusal body from `refusal_body` and close, unless a response is already under way.
 
     Every refusal carries `X-MindRoom-Error: <code>`, and its reason phrase is the body's message (printable ASCII, at
-    most 200 characters), so clients that print only the status line, such as urllib or `curl -f`, still show it.
+    most 200 characters), so clients that print the status line's reason, such as Python's urllib, still show it.
     A git client's (`User-Agent: git/...` or a `Git-Protocol` header) refused smart-HTTP discovery request
     (`GET .../info/refs?service=git-upload-pack` or `git-receive-pack`) gets a 200 advertisement whose pkt-lines end
     in `ERR <message>`, the message naming the manage link itself, so git prints `remote error: <message>` instead of
@@ -262,7 +264,7 @@ async def send_json(
             (b"content-type", content_type),
             (b"content-length", str(len(payload)).encode()),
             (b"connection", b"close"),
-            (b"x-mindroom-error", code.encode()),
+            (_ERROR_HEADER, code.encode()),
             *headers,
         ],
     )
@@ -374,7 +376,8 @@ def _downstream_response_headers(
     """Return the upstream response headers to relay: hop-by-hop removed, Set-Cookie only for hosts with rules.
 
     A chunked upstream body is re-framed for the client, so a Content-Length beside it is dropped
-    rather than kept as the only (wrong) framing header.
+    rather than kept as the only (wrong) framing header. `X-MindRoom-Error` is dropped too, so only the broker's own
+    refusals carry it and an upstream cannot pass its response off as one.
     """
     # Hop-by-hop removal is the same in both directions; only the response variant also drops Set-Cookie.
     strip = strip_response_headers if strip_cookies else strip_request_headers
@@ -382,7 +385,7 @@ def _downstream_response_headers(
     return [
         (name, value)
         for name, value in strip(received, keep_upgrade=keep_upgrade)
-        if not (chunked and name == b"content-length")
+        if not (chunked and name == b"content-length") and name != _ERROR_HEADER
     ]
 
 

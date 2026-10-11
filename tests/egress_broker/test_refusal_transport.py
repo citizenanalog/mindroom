@@ -109,6 +109,27 @@ async def test_tunnel_refusal_carries_the_code_header_and_the_message_as_reason(
 
 
 @pytest.mark.asyncio
+async def test_an_upstream_cannot_pass_its_response_off_as_a_broker_refusal(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    http_upstream: Upstream,
+    proxy_client: ProxyClient,
+) -> None:
+    """X-MindRoom-Error is removed from relayed responses, in a tunnel and on plain HTTP, so only refusals carry it."""
+    await broker(_config(), secrets={"svc": "s3cret"})
+    client = proxy_client(broker.token())
+
+    tunneled = await client.get(tls_upstream.url("/forged-refusal"))
+    plain = await client.get(http_upstream.url("/forged-refusal").replace("localhost", "127.0.0.1"))
+
+    for response in (tunneled, plain):
+        assert response.status_code == 403
+        assert response.text == "upstream says no"
+        assert "x-mindroom-error" not in response.headers
+    assert tls_upstream.hits == http_upstream.hits == ["/forged-refusal"]
+
+
+@pytest.mark.asyncio
 async def test_reason_phrase_is_printable_ascii_without_line_breaks_and_at_most_200_characters(
     broker: BrokerFactory,
     tls_upstream: Upstream,
