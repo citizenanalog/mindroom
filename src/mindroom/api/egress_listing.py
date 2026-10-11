@@ -181,48 +181,6 @@ async def _personal_oauth_status(
     return replace(status, shared_worker_opt_in=access == "allowed")
 
 
-async def _build_service_for_agent(
-    request: Request,
-    name: str,
-    service: EgressService,
-    source: ServiceSource,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    target: ResolvedWorkerTarget,
-    manager: CredentialsManager,
-    eligibility: tuple[bool, bool],
-) -> EgressCredentialService:
-    """Build one service row from the eligibility result and the key and OAuth statuses."""
-    is_shared, can_manage = eligibility
-    oauth_part = (
-        await _personal_oauth_status(
-            request,
-            config,
-            runtime_paths,
-            manager,
-            target,
-            name,
-            service,
-            can_manage=can_manage,
-        )
-        if service.oauth_provider is not None
-        else None
-    )
-    sources = await egress_service_status(manager, target, service, name, oauth_part)
-    return EgressCredentialService(
-        name=name,
-        display_name=service.display_name or name.replace("_", " ").title(),
-        description=service.description,
-        is_shared=is_shared,
-        can_manage=can_manage,
-        source=source,
-        rules=rule_summaries(service),
-        placeholder_names=list(service.placeholder_env),
-        restrict_only=service.restrict_only,
-        **sources.model_dump(),
-    )
-
-
 async def egress_services_for_agent(
     request: Request,
     agent_name: str,
@@ -244,37 +202,42 @@ async def egress_services_for_agent(
         eligibility = check_agent_eligibility(agent_name, requester_id, config, runtime_paths, membership_index)
     if eligibility is None:
         return None
+    is_shared, can_manage = eligibility
     target = build_connection_agent_target(config, runtime_paths, requester_id, agent_name)
     # Reading the scope's own services touches the credential store, so it stays off the event loop.
     services = await asyncio.to_thread(effective_services, config, manager, target)
-    return [
-        await _build_service_for_agent(
-            request,
-            name,
-            service,
-            service_source(config.egress_broker, name),
-            config,
-            runtime_paths,
-            target,
-            manager,
-            eligibility,
+    rows = []
+    for name, service in services.items():
+        oauth_part = (
+            await _personal_oauth_status(
+                request,
+                config,
+                runtime_paths,
+                manager,
+                target,
+                name,
+                service,
+                can_manage=can_manage,
+            )
+            if service.oauth_provider is not None
+            else None
         )
-        for name, service in services.items()
-    ]
-
-
-async def _inactive_services_for_agent(
-    agent_name: str,
-    requester_id: str,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    manager: CredentialsManager,
-) -> list[EgressInactiveService]:
-    """List the entries stored in the requester's scope for one agent that the broker ignores."""
-    target = build_connection_agent_target(config, runtime_paths, requester_id, agent_name)
-    # Reading the scope's own services touches the credential store, so it stays off the event loop.
-    inactive = await asyncio.to_thread(inactive_user_services, config.egress_broker, manager, target)
-    return [EgressInactiveService(name=entry.name, reason=entry.reason) for entry in inactive]
+        sources = await egress_service_status(manager, target, service, name, oauth_part)
+        rows.append(
+            EgressCredentialService(
+                name=name,
+                display_name=service.display_name or name.replace("_", " ").title(),
+                description=service.description,
+                is_shared=is_shared,
+                can_manage=can_manage,
+                source=service_source(config.egress_broker, name),
+                rules=rule_summaries(service),
+                placeholder_names=list(service.placeholder_env),
+                restrict_only=service.restrict_only,
+                **sources.model_dump(),
+            ),
+        )
+    return rows
 
 
 def _agent_scope(config: Config, agent_name: str) -> _AgentScope:
@@ -326,6 +289,9 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
         )
         if services is None:
             continue
+        target = build_connection_agent_target(config, runtime_paths, human_requester, agent_name)
+        # Reading the scope's own services touches the credential store, so it stays off the event loop.
+        inactive = await asyncio.to_thread(inactive_user_services, config.egress_broker, manager, target)
         agents.append(
             EgressCredentialAgent(
                 agent_name=agent_name,
@@ -336,13 +302,7 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
                 scope_agents=list(user_store_agents) if scope == "user" else [],
                 managers=list(agent.credential_managers) if is_shared else [],
                 services=services,
-                inactive_services=await _inactive_services_for_agent(
-                    agent_name,
-                    human_requester,
-                    config,
-                    runtime_paths,
-                    manager,
-                ),
+                inactive_services=[EgressInactiveService(name=entry.name, reason=entry.reason) for entry in inactive],
             ),
         )
     return agents
