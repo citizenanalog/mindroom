@@ -536,6 +536,36 @@ def test_limit_in_place_keeps_the_admin_services_credential_for_allowed_paths_an
     assert route_request(_merged(operator, {}), "api.github.com", 443, "/repos/o/b").match is not None
 
 
+def test_limit_in_place_also_narrows_uploads_github_com_with_its_rules_for_the_repositories() -> None:
+    """The limit editor writes uploads.github.com rules too, so the operator's `/` rule there stops reaching every repo."""
+    operator = {
+        "github": EgressService(rules=[_rule("api.github.com"), _rule("uploads.github.com"), _rule("github.com")]),
+    }
+    limited = _limit(
+        _rule("api.github.com", "/repos/o/r"),
+        _rule("github.com", "/o/r"),
+        _rule("github.com", "/o/r.git"),
+        _rule("uploads.github.com", "/repos/o/r"),
+        display_name="GitHub (o/r)",
+    )
+    rules = _merged(operator, {"github-limited": limited})
+
+    assert route_request(rules, "uploads.github.com", 443, "/repos/x/y/releases/1/assets") == Route(
+        host_has_rules=True,
+        refusal="path_not_allowed",
+        restricted_by="github-limited",
+        restricted_by_label="GitHub (o/r)",
+    )
+    allowed = route_request(rules, "uploads.github.com", 443, "/repos/o/r/releases/1/assets")
+    assert allowed.refusal is None
+    assert allowed.match is not None
+    assert (allowed.match.service, allowed.match.rule.host, allowed.match.rule.path_prefix) == (
+        "github",
+        "uploads.github.com",
+        "/",
+    )
+
+
 def test_a_restrict_only_service_never_injects() -> None:
     """Paths a restrict-only service allows go out without credentials when no other service on the host matches."""
     rules = _merged(

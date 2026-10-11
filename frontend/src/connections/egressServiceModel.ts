@@ -761,6 +761,22 @@ export function githubRepositoryRules(
   return { rules, errors, repositories: [...targets.keys()] };
 }
 
+/**
+ * Rules for a limit in place on the listed GitHub repositories. They always
+ * cover `uploads.github.com` too: a limit narrows only the hosts it has rules
+ * for, so without them the administrator's `uploads.github.com` rule would
+ * keep reaching every repository with the user's key or account.
+ */
+export function githubLimitRules(
+  input: string,
+  options: { graphql: boolean },
+): { rules: EgressRule[]; errors: string[]; repositories: string[] } {
+  return githubRepositoryRules(input, {
+    uploads: true,
+    graphql: options.graphql,
+  });
+}
+
 /** The display name and description for a service limited to these repositories. */
 export function githubLimitLabels(repositories: readonly string[]): {
   displayName: string;

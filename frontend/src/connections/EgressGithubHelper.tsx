@@ -34,21 +34,29 @@ export const EMPTY_HELPER_INPUT: HelperInput = {
 
 /**
  * The choices behind a limit service's rules, for opening it again, whether the
- * helper can write exactly those rules back, and the labels it wrote, which
- * the next apply may rewrite. When it cannot write the rules back, changing
+ * helper can write exactly those rules back, the labels it wrote, which the
+ * next apply may rewrite, and the signature of the choices the rules count as
+ * written from (`applied`), so a save writes them anew only when it is null or
+ * the choices change. When the helper cannot write the rules back, changing
  * the repositories replaces rules the list does not show. Labels the person
  * wrote themselves are not the helper's, so they stay.
+ *
+ * A limit always covers uploads.github.com (`githubLimitRules`). An older one
+ * the helper wrote without it has nothing the list does not show, so its next
+ * save writes it anew with those rules.
  */
 export function restoredHelperInput(service: AuthoredEgressService | null): {
   input: HelperInput;
   exact: boolean;
   labels: HelperLabels;
+  applied: string | null;
 } {
   if (service?.restrict_only !== true)
     return {
       input: EMPTY_HELPER_INPUT,
       exact: true,
       labels: { displayName: "", description: "" },
+      applied: null,
     };
   const limit = parseGithubLimit(
     (service.rules ?? []).map((rule) => ({
@@ -58,13 +66,17 @@ export function restoredHelperInput(service: AuthoredEgressService | null): {
     })),
   );
   const written = githubLimitLabels(limit.repositories);
+  const input = {
+    repositories: limit.repositories.join("\n"),
+    uploads: true,
+    graphql: limit.graphql,
+  };
+  const rewrite = limit.exact && !limit.uploads;
   return {
-    input: {
-      repositories: limit.repositories.join("\n"),
-      uploads: limit.uploads,
-      graphql: limit.graphql,
-    },
+    input,
     exact: limit.exact,
+    applied:
+      input.repositories === "" || rewrite ? null : helperSignature(input),
     labels: {
       displayName:
         service.display_name === written.displayName ? written.displayName : "",
@@ -161,7 +173,7 @@ export function GithubHelper({
           One repository per line, as owner/repo, or owner/* for everything an
           owner has.{" "}
           {limit
-            ? "Requests to api.github.com and github.com (API and git over HTTPS) for any other repository are refused, and so are other API paths, such as /user or search. Your key or connected account stays the same."
+            ? "Requests to api.github.com, uploads.github.com, and github.com (API, release assets, and git over HTTPS) for any other repository are refused, and so are other API paths, such as /user or search. Your key or connected account stays the same."
             : "Applying replaces the rules above with rules for just those repositories (API and git over HTTPS) and refuses every other path on api.github.com and github.com. Other API paths, such as /user or search, stop working."}{" "}
           Matching is case sensitive, so write names as they appear in GitHub
           URLs.
@@ -178,19 +190,23 @@ export function GithubHelper({
           onInput({ ...input, repositories: event.target.value })
         }
       />
-      <label className="flex items-start gap-2 text-xs">
-        <input
-          type="checkbox"
-          className="mt-0.5 h-4 w-4"
-          checked={input.uploads}
-          onChange={(event) =>
-            onInput({ ...input, uploads: event.target.checked })
-          }
-        />
-        <span>
-          Also allow uploads.github.com for these repositories (release assets)
-        </span>
-      </label>
+      {/* A limit always covers uploads.github.com, or that host would stay open. */}
+      {!limit && (
+        <label className="flex items-start gap-2 text-xs">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4"
+            checked={input.uploads}
+            onChange={(event) =>
+              onInput({ ...input, uploads: event.target.checked })
+            }
+          />
+          <span>
+            Also allow uploads.github.com for these repositories (release
+            assets)
+          </span>
+        </label>
+      )}
       <label className="flex items-start gap-2 text-xs">
         <input
           type="checkbox"

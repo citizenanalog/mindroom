@@ -2556,9 +2556,10 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     fireEvent.change(screen.getByLabelText("GitHub repositories"), {
       target: { value },
     });
-  // The rules of a limit send nothing, so the server keeps them without auth.
-  const limitRules = (input: string, uploads = false, graphql = false) =>
-    githubRepositoryRules(input, { uploads, graphql }).rules.map(
+  // The rules of a limit send nothing, so the server keeps them without auth,
+  // and always cover uploads.github.com.
+  const limitRules = (input: string, graphql = false) =>
+    githubRepositoryRules(input, { uploads: true, graphql }).rules.map(
       ({ auth: _auth, ...rule }) => rule,
     );
   const storedLimit = (
@@ -2603,13 +2604,14 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
       onSaved,
     });
     enter("octocat/Hello-World");
-    fireEvent.click(screen.getByLabelText(/Also allow uploads.github.com/));
+    // Its uploads.github.com rules are not a choice: without them that host would stay open.
+    expect(screen.queryByLabelText(/Also allow uploads.github.com/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("github-limited", {
       display_name: "GitHub (octocat/Hello-World)",
       description: "Limited to octocat/Hello-World",
-      rules: limitRules("octocat/Hello-World", true),
+      rules: limitRules("octocat/Hello-World"),
       restrict_to_rules: true,
       restrict_only: true,
     });
@@ -2658,7 +2660,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("opens with its repositories and options when it is edited, and keeps them unless they change", async () => {
     const stored: AuthoredEgressService = {
       ...storedLimit("a/b"),
-      rules: limitRules("a/b\nc/*", true, true),
+      rules: limitRules("a/b\nc/*", true),
     };
     const { onSave } = await renderEditor({
       name: "github-limited",
@@ -2672,15 +2674,29 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     expect(screen.getByLabelText("GitHub repositories")).toHaveValue(
       "a/b\nc/*",
     );
-    expect(
-      screen.getByLabelText(/Also allow uploads.github.com/),
-    ).toBeChecked();
+    expect(screen.queryByLabelText(/Also allow uploads.github.com/)).toBeNull();
     expect(screen.getByLabelText(/Also allow GraphQL/)).toBeChecked();
     expect(screen.queryByText(/Changing the list replaces them/)).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("github-limited", stored);
+  });
+
+  it("adds uploads.github.com rules to an older limit without them when it is saved", async () => {
+    const older = storedLimit("a/b", {
+      rules: limitRules("a/b").filter(
+        (rule) => rule.host !== "uploads.github.com",
+      ),
+    });
+    const { onSave } = await renderEditor({
+      name: "github-limited",
+      service: older,
+    });
+    expect(screen.queryByText(/Changing the list replaces them/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith("github-limited", storedLimit("a/b"));
   });
 
   it("warns that changing the list replaces rules it cannot show, and keeps them until then", async () => {
@@ -2748,7 +2764,7 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
     rules.map(({ auth: _auth, ...rule }) => rule);
   const rulesFor = (input: string) =>
     noAuth(
-      githubRepositoryRules(input, { uploads: false, graphql: false }).rules,
+      githubRepositoryRules(input, { uploads: true, graphql: false }).rules,
     );
   const enter = (value: string) =>
     fireEvent.change(screen.getByLabelText("GitHub repositories"), {

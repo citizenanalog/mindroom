@@ -17,6 +17,7 @@ import {
   NOT_EXPLICITLY_EMPTY,
   emptyRule,
   formFromService,
+  githubLimitRules,
   githubRepositoryRules,
   looksLikeGithub,
   overlapWarnings,
@@ -192,9 +193,7 @@ export function EgressServiceEditor({
   const [helperErrors, setHelperErrors] = useState<string[]>([]);
   // The choices the form's rules were last written from, so a save writes
   // them anew only after they change and keeps rules edited by hand until then.
-  const appliedHelper = useRef<string | null>(
-    restored.input.repositories === "" ? null : helperSignature(restored.input),
-  );
+  const appliedHelper = useRef<string | null>(restored.applied);
   const showGithubHelper = limiting || looksLikeGithub(form);
   const settings = { editing, takenNames: openedWithNames };
 
@@ -224,7 +223,9 @@ export function EgressServiceEditor({
     if (!showGithubHelper || (!typed && !limiting)) return form;
     if (typed && helperSignature(helperInput) === appliedHelper.current)
       return form;
-    const result = githubRepositoryRules(helperInput.repositories, helperInput);
+    const result = limiting
+      ? githubLimitRules(helperInput.repositories, helperInput)
+      : githubRepositoryRules(helperInput.repositories, helperInput);
     setHelperErrors(result.errors);
     return result.errors.length > 0 ? null : applyGithubRules(result);
   };

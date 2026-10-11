@@ -10,6 +10,7 @@ import {
   emptyRule,
   formFromService,
   githubLimitLabels,
+  githubLimitRules,
   githubRepositoryRules,
   isBasicField,
   looksLikeGithub,
@@ -633,6 +634,26 @@ describe("GitHub repository rules", () => {
         auth: { type: "bearer" },
       },
     ]);
+  });
+
+  it("always covers uploads.github.com in a limit in place, which narrows only the hosts it has rules for", () => {
+    const written = (graphql: boolean) =>
+      githubLimitRules("a/b\nc/*", { graphql }).rules.map(
+        (rule) => `${rule.host}${rule.path_prefix}`,
+      );
+    expect(written(false)).toEqual([
+      "api.github.com/repos/a/b",
+      "github.com/a/b",
+      "github.com/a/b.git",
+      "uploads.github.com/repos/a/b",
+      "api.github.com/repos/c/",
+      "github.com/c/",
+      "uploads.github.com/repos/c/",
+    ]);
+    expect(written(true).slice(-1)).toEqual(["api.github.com/graphql"]);
+    expect(githubLimitRules("not a repository", { graphql: false })).toEqual(
+      githubRepositoryRules("not a repository", none),
+    );
   });
 
   it("adds /graphql once, only when ticked", () => {

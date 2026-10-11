@@ -17639,7 +17639,7 @@ The helper writes:
 
 - `owner/repo` gives `api.github.com` `/repos/owner/repo` (bearer), plus `github.com` `/owner/repo` and `/owner/repo.git` (basic auth with username `x-access-token`, which git over HTTPS uses).
 - `owner/*` gives the owner-wide prefixes `/repos/owner/` and `/owner/`.
-- `uploads.github.com` (release assets) and `/graphql` stay off unless you tick them.
+- On a service's own rules, `uploads.github.com` (release assets, `/repos/owner/repo` or `/repos/owner/`) and `/graphql` stay off unless you tick them. A [limit in place](#limiting-in-place) always gets the `uploads.github.com` rules and has no such choice, because leaving that host out would leave the administrator's `uploads.github.com` rule reaching every repository.
 - Other API paths, such as `/user` or search, stop working while the restriction is on.
 - On a **Custom** service that has no placeholder variables, it also adds `GH_TOKEN` and `GITHUB_TOKEN` with the value `mindroom-brokered`, so `gh` and other GitHub tooling in the worker find a token to send. A service that already has placeholders keeps them.
 - When the display name and description are empty (or still the text the helper wrote last), it sets them to "GitHub ({repos})" and "Limited to {repos}". Text you wrote stays.
@@ -17654,7 +17654,7 @@ A row whose rules on GitHub hosts all name repositories reads "Limited to {repos
 
 **What it cannot do:**
 
-- It limits only the hosts the service has rules for. `api.github.com` and `github.com` are covered, and `uploads.github.com` only when you tick it, so the administrator's `uploads.github.com` rule keeps working unchanged otherwise.
+- It limits only the hosts the service has rules for. A limit in place covers `api.github.com`, `uploads.github.com`, and `github.com`. On a service's own rules `uploads.github.com` is covered only when you tick it, so otherwise the administrator's `uploads.github.com` rule keeps reaching every repository.
 - Under `unmatched_hosts: passthrough` it is not a network boundary. A worker can open a tunnel to the server's IP address, which the broker does not intercept. The tunnel carries no credential, but paths you did not list stay reachable through it. `unmatched_hosts: deny` refuses that tunnel.
 - The real boundary is the credential. Use a fine-grained personal access token limited to the repositories you want, or a GitHub App installed on selected repositories, so GitHub itself refuses everything else. The rules only decide what the broker injects and forwards.
 
@@ -17672,12 +17672,13 @@ The personal page's [limit editor](#the-limit-editor) saves one of these. As the
   "rules": [
     {"host": "api.github.com", "path_prefix": "/repos/basnijholt/agent-cli"},
     {"host": "github.com", "path_prefix": "/basnijholt/agent-cli"},
-    {"host": "github.com", "path_prefix": "/basnijholt/agent-cli.git"}
+    {"host": "github.com", "path_prefix": "/basnijholt/agent-cli.git"},
+    {"host": "uploads.github.com", "path_prefix": "/repos/basnijholt/agent-cli"}
   ]
 }
 ```
 
-With the administrator's `github: {preset: github}`, a request to `api.github.com/repos/basnijholt/agent-cli/pulls` passes the user's check and still gets the administrator's `github` credential, while `api.github.com/user` gets 403 `path_not_allowed` naming this limit. `uploads.github.com` has no rule here, so it is not limited.
+With the administrator's `github: {preset: github}`, a request to `api.github.com/repos/basnijholt/agent-cli/pulls` passes the user's check and still gets the administrator's `github` credential, while `api.github.com/user` gets 403 `path_not_allowed` naming this limit. The same holds on `uploads.github.com`: release assets of `basnijholt/agent-cli` get the administrator's credential, and any other repository's get 403. A limit with no rule on `uploads.github.com` would leave that host unlimited, which is why the limit editor always writes one.
 
 - **Config.** Only a user service may set `restrict_only`, and it must be a real boolean. The service may not set `oauth_provider`, a non-empty `placeholder_env`, or `oauth_on_shared_workers`, because it never sends a credential. Its rules need no `auth`; one that is written is ignored. With a `preset`, only the preset's `display_name`, `description`, and `rules` apply, so `{preset: github, restrict_only: true}` is valid and takes no login or placeholders from the preset. Setting `restrict_to_rules: true` beside it, which the services editor does, is valid too.
 - **Routing.** The rules are a path check only. They count in the requester's check like the rules of a user service with `restrict_to_rules`, so a path that none of the requester's rules on the host list is refused with `path_not_allowed`. They are never considered when the credential is chosen, so a path they allow still gets the credential of the most specific matching rule of the other services on the host, usually the administrator's GitHub rule. With no such rule the request is forwarded without credentials, as for any path that no rule matches. Everything under [Limiting paths and repositories](#limiting-paths-and-repositories) about scope and the administrator's services holds for it.
@@ -18060,12 +18061,12 @@ The hint also says "Placeholders are set only while this service has a key or a 
 The same editor opens in limit mode for a [`restrict_only` service](#limiting-in-place), from **Limit to repositories** (new) or **Change limit** (an existing limit). It is titled "Limit to repositories" or "Change limit", and has:
 
 - **Name**: `github-limited` (or the first free `github-limited-N`) for a new limit, fixed when changing one.
-- **Repositories**: the GitHub helper with its **uploads.github.com** and **GraphQL** choices, and no **Use these repositories** button, because **Save limit** applies the list. An empty list says "Enter at least one repository, such as owner/repo", and the usual limits on a service's rules (50) and size (16 KiB) apply.
+- **Repositories**: the GitHub helper with its **GraphQL** choice, and no **Use these repositories** button, because **Save limit** applies the list. It has no **uploads.github.com** choice: a limit always limits that host to the same repositories. An empty list says "Enter at least one repository, such as owner/repo", and the usual limits on a service's rules (50) and size (16 KiB) apply, so a limit holds at most 12 `owner/repo` lines (4 rules each) or 16 `owner/*` lines (3 rules each).
 - On a personal agent, the sentence that says whose services the limit also narrows: "This also limits services from your administrator on these hosts, {scope}."
 
 It has no preset, website, send, key, or **More options** fields: a limit never has a key, and **Save limit** never sends one.
 Saving writes `{display_name, description, rules, restrict_to_rules: true, restrict_only: true}` with rules that carry no `auth`, and the labels "GitHub ({repos})" and "Limited to {repos}" follow the list unless you wrote your own.
-Changing a limit reads the repositories, uploads, and GraphQL choices back from its rules. When the stored rules are not exactly what the helper writes, the editor warns "Some rules of this limit are not repositories from the list. Changing the list replaces them.", and saving without changing anything writes the stored rules back untouched.
+Changing a limit reads the repositories and the GraphQL choice back from its rules. When the stored rules are not exactly what the helper writes, the editor warns "Some rules of this limit are not repositories from the list. Changing the list replaces them.", and saving without changing anything writes the stored rules back untouched. An older limit that the helper wrote without `uploads.github.com` rules gets them on its next save.
 **Remove limit** asks first and says what it gives back, by scope: "This removes the limit. {who} can then reach every repository the key or connected account allows." Here `{who}` is "Your {agent}" for `user_agent`, "All your agents that share your personal workspace ({agents})" for `user`, "Everyone using {agent}" for a shared agent, and "Every agent without a scope" for an unscoped one.
 
 On the personal page's rows:

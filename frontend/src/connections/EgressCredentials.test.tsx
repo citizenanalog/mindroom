@@ -2013,9 +2013,10 @@ describe("limiting a GitHub service to repositories", () => {
     { host: "api.github.com", port: null, path_prefix: "/" },
     { host: "github.com", port: null, path_prefix: "/" },
   ];
-  // A limit's rules send nothing, so the server keeps them without auth.
+  // A limit's rules send nothing, so the server keeps them without auth, and
+  // always cover uploads.github.com.
   const limitRules = (repositories: string, graphql = false) =>
-    githubRepositoryRules(repositories, { uploads: false, graphql }).rules.map(
+    githubRepositoryRules(repositories, { uploads: true, graphql }).rules.map(
       ({ auth: _auth, ...rule }) => rule,
     );
   const limited = (
