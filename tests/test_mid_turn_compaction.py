@@ -15,7 +15,7 @@ import pytest
 from agno.agent import Agent
 from agno.db.in_memory import InMemoryDb
 from agno.db.sqlite import SqliteDb
-from agno.media import Image
+from agno.media import File, Image
 from agno.metrics import MessageMetrics
 from agno.models.anthropic import Claude
 from agno.models.message import Message
@@ -38,10 +38,12 @@ from mindroom.helper_usage import HelperUsageOwner
 from mindroom.history import agno_compat_message_builder, archive, mid_turn_compaction
 from mindroom.history.agno_compat_message_builder import built_request_session
 from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
-from mindroom.history.replay import compaction_summary_message, is_compaction_summary
+from mindroom.history.replay import compaction_summary_message, estimate_request_messages_tokens, is_compaction_summary
 from mindroom.history.storage import new_scope_session, read_scope_state, set_force_compaction_state
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState
+from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
+from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.usage.storage import project_usage
 from tests.conftest import FakeModel, runtime_paths_for, seed_session
@@ -396,6 +398,31 @@ async def test_request_sizing_runs_off_the_event_loop(
 
     assert sizing_threads
     assert loop_thread not in sizing_threads
+
+
+def test_request_sizing_never_counts_attached_file_bytes() -> None:
+    """A provider estimator must not count an attachment's encoded bytes as prompt text."""
+    model = MindRoomOpenAIResponses(id="gpt-6-luna", store=False)
+    pdf = File(content=b"%PDF-1.7\n" + b"x" * 300_000, mime_type="application/pdf", filename="report.pdf")
+    message = Message(role="user", content="Summarize the attached report.", files=[pdf])
+
+    tokens = estimate_request_messages_tokens([message], replay_model=model)
+
+    assert tokens < 10_000
+
+
+def test_aggregate_usage_of_retried_requests_never_anchors_sizing() -> None:
+    """A response whose counters sum several retried attempts describes no single request's context."""
+    message = Message(
+        role="assistant",
+        content="done",
+        metrics=MessageMetrics(input_tokens=90_000),
+        provider_data={"mindroom_aggregate_usage": True},
+    )
+
+    assert (
+        response_context_tokens(message, provider="openai", configured_provider="openai", model_id="gpt-6-luna") is None
+    )
 
 
 @pytest.mark.asyncio

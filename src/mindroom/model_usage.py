@@ -60,6 +60,9 @@ def response_context_tokens(
     A native compaction iteration's final ``context_usage`` describes the active context; billed counters can
     include the transcript the checkpoint replaced.
     """
+    if isinstance(message.provider_data, dict) and message.provider_data.get("mindroom_aggregate_usage") is True:
+        # The counters sum several retried attempts, so they describe no single request's context.
+        return None
     metrics = message.metrics
     usage = (metrics.provider_metrics or {}).get("context_usage")
     counts = (

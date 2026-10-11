@@ -106,6 +106,8 @@ def _estimate_messages_tokens(
     native_route: str | None,
 ) -> int:
     uses_visual_tokens = replay_model is not None and replay_model.portable_replay_uses_visual_tokens()
+    attachment_tokens = _attachment_fallback_tokens(history_messages)
+    history_messages = [_without_attachments(message) for message in history_messages]
     estimation_messages = (
         history_messages
         if uses_visual_tokens
@@ -127,7 +129,23 @@ def _estimate_messages_tokens(
         else sum((_estimated_message_chars(message) + 3) // 4 for message in canonical_messages)
     )
     image_fallback_tokens = 0 if provider_accounts_for_images else _image_fallback_tokens(history_messages)
-    return max(canonical_tokens, provider_estimate or 0) + image_fallback_tokens
+    return max(canonical_tokens, provider_estimate or 0) + image_fallback_tokens + attachment_tokens
+
+
+def _without_attachments(message: Message) -> Message:
+    """Drop attached files, audio, and video for estimation; formatting them would count encoded bytes as text."""
+    updates = {
+        field: None
+        for field, value in (("files", message.files), ("audio", message.audio), ("videos", message.videos))
+        if value
+    }
+    return message.model_copy(update=updates) if updates else message
+
+
+def _attachment_fallback_tokens(messages: list[Message]) -> int:
+    """Charge each attached file, audio, or video a bounded allowance instead of its encoded size."""
+    count = sum(len(message.files or []) + len(message.audio or []) + len(message.videos or []) for message in messages)
+    return count * HISTORY_VIEWED_IMAGE_FALLBACK_TOKENS
 
 
 def _without_image_transport(message: Message, *, strip_content_blocks: bool) -> Message:
