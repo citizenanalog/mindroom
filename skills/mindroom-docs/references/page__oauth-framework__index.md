@@ -86,6 +86,9 @@ The API routes are:
 | `POST` | `/api/oauth/{provider}/disconnect` | Remove the stored token; the tool's editable settings stay |
 | `GET`, `POST` | `/api/oauth/{provider}/reset` | Browser-confirmed reset (see [`oauth_connections`](#oauth_connections)) |
 
+The authorize and callback routes are opened by the browser, so their success and error pages are styled HTML with a **Close window** button, not JSON, and keep the status the JSON error would have had.
+The provider's own `error` is shown only when it is a plain code (lowercase letters and underscores), and `access_denied` reads "Authorization cancelled".
+
 Add `agent_name` to target a connection for one agent's credential scope.
 The dashboard connects to the agent's saved scope, so save a `worker_scope` change before connecting.
 

@@ -193,14 +193,14 @@ It requires `workers.backend: kubernetes` and cannot be combined with `workers.k
 
 Users who have no dashboard access still manage their own egress on the personal Connections page at `/connections/egress`:
 
-- Their own services, which can narrow the administrator's egress policy but never widen it, including a GitHub "Limit to repositories" helper. On shared and unscoped agents only administrators and credential managers change services.
-- Their own keys, and their Google, GitHub, and Atlassian account connections.
+- Their own services, which can narrow the administrator's egress policy but never widen it, including a GitHub "Limit to repositories" helper. A service that sets "Refuse other paths on these hosts" also limits the administrator's services on those hosts, for the agents that share its scope only. On shared and unscoped agents only administrators and credential managers change services.
+- Their own keys, set in the same step as the service, and their Google, GitHub, and Atlassian account connections. On a shared agent, Connect first asks for confirmation, because everyone who uses the agent acts as the account, and every user sees which account is connected.
 - Their own request log, a **Recent requests** table per agent.
 
 This needs [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/) with JWT, set through `env.extra` because the runtime chart has no values for it, an HTTPS `MINDROOM_PUBLIC_URL`, and a gateway that forwards `/connections`, `/api/connections`, and `/api/oauth` to the runtime.
 `MINDROOM_CONNECTIONS_AGENT` is required whenever more than one user can sign in through the gateway; set it to a private agent (`private.per: user` or `user_agent`).
 The egress page itself works without it, but without it every user the gateway admits gets full dashboard access, whatever `administrators` lists: they can edit the configuration, set shared keys, and read every requester's request log.
-With it, a user outside `administrators` reaches only the Connections routes and the OAuth callback pages.
+With it, a user outside `administrators` reaches only the Connections routes and the OAuth callback pages, and a dashboard page they open in a browser redirects (303) to `/connections`.
 Personal GitHub and Atlassian accounts also need agents with worker scope `user` or `user_agent` (`worker_scope`, or `private.per` for private agents) on the Kubernetes worker backend.
 The runtime chart's [Self-service for users](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#self-service-for-users) section has the variables and an example.
 

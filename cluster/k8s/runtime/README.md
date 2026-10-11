@@ -893,13 +893,15 @@ In a full Kubernetes deployment with this chart, most users have no dashboard ac
 With the broker on, each of them still gets the personal Connections page at `/connections/egress`:
 
 - The egress services of every agent they may use, with the state of their own keys and accounts.
-- Their own services: add, edit, and delete them on `user` and `user_agent` agents, including a GitHub "Limit to repositories" helper. On shared and unscoped agents only administrators and the agent's `credential_managers` change services.
-- Their own keys, and **Connect** and **Disconnect** for their Google, GitHub, and Atlassian accounts.
+- Their own services: add, edit, and delete them on `user` and `user_agent` agents, including a GitHub "Limit to repositories" helper. The editor saves the service and its API key in one step. On shared and unscoped agents only administrators and the agent's `credential_managers` change services.
+- Their own keys, and **Connect** and **Disconnect** for their Google, GitHub, and Atlassian accounts. On a shared agent, **Connect** first asks "Connect a shared account?", and every user of the agent sees the connected account.
 - Their own request log, a **Recent requests** table per agent.
 
+Both Connections pages show "Signed in as {matrix_user_id}" and link to each other as "Agents" and "API keys and accounts"; administrators also get a "Dashboard" link.
+A user outside `administrators` who opens a dashboard page in a browser is redirected (303) to `/connections`; API calls keep the 403.
 The Connections portal links every agent the user may use for egress to its section on this page with **Manage services**, even an agent that has no services yet.
-Services from `config.yaml` appear read-only as "Added by your administrator".
-Users' services can narrow what the administrator allows but never widen it; see [User services](../../../docs/deployment/egress-broker.md#user-services).
+Services from `config.yaml` appear read-only under "From your administrator".
+Users' services can narrow what the administrator allows but never widen it, and a user's "Refuse other paths on these hosts" also limits the administrator's services on those hosts for that scope; see [User services](../../../docs/deployment/egress-broker.md#user-services) and [Limiting paths and repositories](../../../docs/deployment/egress-broker.md#limiting-paths-and-repositories).
 
 The page needs these settings, which the chart does not render for you:
 
@@ -931,7 +933,7 @@ See [Trusted Upstream Browser Auth](../../../docs/deployment/trusted-upstream-au
 Required for multi-user self-service: also set `MINDROOM_CONNECTIONS_AGENT` to a private agent (`private.per: user` or `user_agent`), as in the example.
 The egress page itself works without it, and only the portal's catalog needs it, but without it `_require_connections_route_authorized` returns early, so nothing keeps trusted users outside the administrator routes and every user the gateway admits gets full dashboard access: configuration edits, shared keys, and the full admin request log, whatever `administrators` lists.
 With it, a user outside `administrators` reaches only the Connections routes and the OAuth callback pages.
-Without trusted upstream auth with JWT, only administrators can manage keys and accounts, on the dashboard Credentials tab, and users cannot add services or see their requests.
+Without trusted upstream auth with JWT, only administrators can manage keys and accounts, in the **Agent API keys and accounts** panel on the dashboard's Credentials page, and users cannot add services or see their requests.
 
 ## Matrix Managed Account Authentication
 
