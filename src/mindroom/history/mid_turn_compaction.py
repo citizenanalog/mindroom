@@ -205,14 +205,17 @@ async def _prepare_request(
         return
     loaded_ids = state.start_ids
     policy = _policy(binding)
-    if policy is None or _request_tokens(binding, policy, messages, tools, loaded_ids) <= policy.limit:
+    if policy is None:
+        return
+    request_tokens = _request_tokens(binding, policy, messages, tools, loaded_ids)
+    if request_tokens <= policy.limit:
         return
     session = _scoped_session(binding, built_session, run_response)
     layout = _layout(messages, run_response, scoped=session is not None)
     if not layout.exchanges and all(is_compaction_summary(message) for message in layout.history):
         # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
         return
-    summary_message = await _summarize(binding, policy, layout, messages, run_response, session)
+    summary_message = await _summarize(binding, policy, layout, messages, run_response, session, request_tokens)
     if summary_message is None:
         state.stopped = True
         return
@@ -242,12 +245,13 @@ async def _summarize(
     messages: list[Message],
     run_response: RunOutput | TeamRunOutput,
     session: AgentSession | TeamSession | None,
+    request_tokens: int,
 ) -> Message | None:
     """Summarize the folded history and every exchange of the turn, or return None when compaction failed."""
     try:
         if session is None:
             return await _summarize_run_locally(binding, policy.inputs, layout, run_response)
-        return await _compact_scope(binding, policy, layout, messages, run_response, session)
+        return await _compact_scope(binding, policy, layout, messages, run_response, session, request_tokens)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -284,6 +288,7 @@ async def _compact_scope(
     messages: list[Message],
     run_response: RunOutput | TeamRunOutput,
     session: AgentSession | TeamSession,
+    request_tokens: int,
 ) -> Message | None:
     """Archive the scope's visible runs and this run's exchanges behind a new summary, on Agno's own session.
 
@@ -304,23 +309,26 @@ async def _compact_scope(
     try:
         await run_blocking_until_complete(partial(_prepare_scope_session, storage, session, scope))
         try:
-            await compact_scope_mid_turn(
+            outcome = await compact_scope_mid_turn(
                 storage=storage,
                 session=session,
                 scope=scope,
                 resolved_inputs=policy.inputs,
                 snapshots=snapshots,
-                before_tokens=estimate_request_messages_tokens(messages, replay_model=policy.replay_model),
+                # The size that triggered this compaction, so the history budget sees what the request needs.
+                before_tokens=request_tokens,
                 config=binding.config,
                 runtime_paths=binding.runtime_paths,
                 compaction_lifecycle=binding.lifecycle,
             )
         except asyncio.CancelledError:
             # A fully committed turn archived its exchanges, so the request must not resend them.
-            if await _turn_committed(storage, session, scope, snapshots):
+            if snapshots and await _turn_committed(storage, session, scope, snapshots):
                 _finish(messages, layout, _scope_summary_message(session), run_response)
             raise
-        committed = await _turn_committed(storage, session, scope, snapshots)
+        turn_committed = await _turn_committed(storage, session, scope, snapshots)
+        # Without exchanges of its own, only an outcome shows that the replayed history was archived.
+        committed = turn_committed if snapshots else outcome is not None
     finally:
         kept = {run.run_id for run in session.runs or []}
         session.runs = [*(session.runs or []), *(run for run in member_runs if run.run_id not in kept)]

@@ -1122,6 +1122,43 @@ async def test_the_turns_metadata_reaches_the_archive_and_summary_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_summary", [None, "OLD-SUMMARY"])
+async def test_first_request_over_the_limit_from_tools_compacts_history_before_dropping_it(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    earlier_summary: str | None,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    history = [
+        _completed_run(
+            f"run-{index}",
+            messages=[
+                Message(role="user", content=f"q{index} " + "h" * 1200),
+                Message(role="assistant", content=f"a{index}"),
+            ],
+        )
+        for index in range(4)
+    ]
+    summary = SessionSummary(summary=earlier_summary) if earlier_summary is not None else None
+    seed_session(storage, _session("session-1", runs=history, summary=summary))
+    model = _ToolLoopModel(tool_rounds=0)
+    agent = _scoped_agent(model, config, paths, storage)
+    # Tool definitions alone push the first request, which has no exchanges of its own yet, over the limit.
+    agent.tools = [Function(name="lookup", description="d" * 10_000, entrypoint=lambda: "ok")]
+
+    output = await _run_in_session(agent, "Do the task")
+
+    assert str(output.content) == "done"
+    first = model.requests[0]
+    assert not any(content.startswith("q0 ") for content in first.contents)
+    # The history left the request only because it was summarized and archived.
+    assert summary_calls.inputs
+    assert any(is_compaction_summary(message) for message in first.messages)
+    assert archived_run_ids(storage)[:4] == [f"run-{index}" for index in range(4)]
+
+
+@pytest.mark.asyncio
 async def test_next_turn_reuses_the_post_compaction_prefix(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     storage = _seeded_storage(config, paths)
