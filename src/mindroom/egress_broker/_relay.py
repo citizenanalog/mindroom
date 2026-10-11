@@ -95,10 +95,8 @@ class Peer:
         self.conn = conn
         self.reader = reader
         self.writer = writer
-        # The request being answered, for the shape of a refusal; empty until one is read in this cycle.
-        self.request_method = b""
-        self.request_target = b""
-        self.request_from_git = False
+        # The request being answered, for the shape of a refusal; None until one is read in this cycle.
+        self.request: h11.Request | None = None
         # Whether the connection must close after the response (RFC 9112 section 6.1).
         self.close_after_response = False
 
@@ -125,12 +123,7 @@ class Peer:
             consumed += len(data)
             self.conn.receive_data(data)
         if isinstance(event, h11.Request):
-            self.request_method = event.method
-            self.request_target = event.target
-            self.request_from_git = any(
-                name == b"git-protocol" or (name == b"user-agent" and value.startswith(b"git/"))
-                for name, value in event.headers
-            )
+            self.request = event
             if consumed - len(self.conn.trailing_data[0]) > _MAX_REQUEST_HEAD:
                 msg = "Request head too large."
                 raise h11.RemoteProtocolError(msg, error_status_hint=431)
@@ -141,9 +134,7 @@ class Peer:
     def start_next_cycle(self) -> None:
         """Get ready for the next request on this connection, forgetting the one just answered."""
         self.conn.start_next_cycle()
-        self.request_method = b""
-        self.request_target = b""
-        self.request_from_git = False
+        self.request = None
         self.close_after_response = False
 
     async def send(self, *events: h11.Event) -> None:
@@ -183,15 +174,20 @@ def _printable(text: str, *, limit: int) -> str:
     return "".join(char if " " <= char <= "~" else "?" for char in text[:limit])
 
 
-def _git_discovery_service(method: bytes, target: bytes) -> str | None:
+def _git_discovery_service(request: h11.Request) -> str | None:
     """Return the service a git smart-HTTP discovery request names (`GET .../info/refs?service=git-upload-pack`).
 
-    Any target that does not parse as a URL is not one, since refusing a malformed request must never fail.
+    Only a git client's request (`User-Agent: git/...` or a `Git-Protocol` header) counts. Any target that does not
+    parse as a URL is not one, since refusing a malformed request must never fail.
     """
-    if method != b"GET":
+    from_git = any(
+        name == b"git-protocol" or (name == b"user-agent" and value.startswith(b"git/"))
+        for name, value in request.headers
+    )
+    if request.method != b"GET" or not from_git:
         return None
     try:
-        parts = urlsplit(target.decode("latin-1"))
+        parts = urlsplit(request.target.decode("latin-1"))
     except ValueError:
         return None
     services = parse_qs(parts.query).get("service", [])
@@ -239,11 +235,8 @@ async def send_json(
     if client.conn.our_state not in {h11.IDLE, h11.SEND_RESPONSE}:
         return
     code, message = str(body["error"]), str(body["message"])
-    git_service = (
-        _git_discovery_service(client.request_method, client.request_target)
-        if status != 407 and client.request_from_git
-        else None
-    )
+    request = client.request
+    git_service = _git_discovery_service(request) if status != 407 and request is not None else None
     if git_service is None:
         content_type = b"application/json"
         payload = json.dumps(body).encode()
@@ -264,7 +257,7 @@ async def send_json(
         ],
     )
     events: list[h11.Event] = [response]
-    if client.request_method != b"HEAD":
+    if request is None or request.method != b"HEAD":
         events.append(h11.Data(data=payload))
     await client.send(*events, h11.EndOfMessage())
 
