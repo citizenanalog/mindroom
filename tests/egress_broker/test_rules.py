@@ -13,6 +13,7 @@ from mindroom.config.egress_broker import (
     EgressRule,
     EgressService,
 )
+from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.rules import (
     EgressRules,
     Route,
@@ -323,6 +324,7 @@ def test_restrict_to_rules_refuses_unmatched_paths() -> None:
             refusal="path_not_allowed",
             restricted_by="github",
             restricted_by_label="github",
+            restricted_by_operator=True,
         )
         assert refused.refusal_status == 403
     allowed = _route(config, "api.github.com", 443, "/repos/basnijholt/agent-cli/issues")
@@ -556,6 +558,35 @@ def test_a_restrict_only_service_never_injects() -> None:
     assert EgressRules.from_config(alone).intercepts("api.example.com", 443)
 
 
+def test_shared_agent_refusal_names_an_administrator_for_an_operator_limit_and_managers_for_their_own() -> None:
+    """Managers can change a shared agent's own limit, but only an administrator the operator's restricting service."""
+    rules = _merged(
+        {"op": EgressService(restrict_to_rules=True, display_name="Ops API", rules=[_rule("api.example.com", "/op")])},
+        {"mine": _limit(_rule("api.example.com", "/op/mine"), display_name="My limit")},
+    )
+    shared = ScopeInfo(shared=True, managers=("@alice:example.org",))
+    personal = ScopeInfo(shared=False, managers=())
+
+    by_operator = route_request(rules, "api.example.com", 443, "/other")
+    by_user = route_request(rules, "api.example.com", 443, "/op/else")
+
+    assert (by_operator.restricted_by, by_operator.restricted_by_operator) == ("op", True)
+    assert (by_user.restricted_by, by_user.restricted_by_operator) == ("mine", False)
+    body = by_operator.refusal_body(host="api.example.com", path="/other", manage_url=None, scope=shared)
+    assert body["message"] == (
+        "api.example.com/other is outside the paths Ops API allows for this agent. "
+        "Only an administrator can change this, at manage_url."
+    )
+    body = by_user.refusal_body(host="api.example.com", path="/op/else", manage_url=None, scope=shared)
+    assert body["message"] == (
+        "api.example.com/op/else is outside the paths My limit allows for this agent. "
+        "Only its credential managers (@alice:example.org) can change this, at manage_url."
+    )
+    # A personal agent's user is asked either way, as before.
+    body = by_operator.refusal_body(host="api.example.com", path="/other", manage_url=None, scope=personal)
+    assert body["message"].endswith("Ask the user to add it at manage_url if the agent needs it.")
+
+
 def test_restricted_by_label_falls_back_to_the_service_name() -> None:
     """The refusal's message names the restricting service's display name, or its name when it has none."""
     named = _merged({}, {"mine": _limit(_rule("api.example.com", "/a"), display_name="My API")})
@@ -577,6 +608,7 @@ def test_user_restriction_cannot_open_an_operator_restricted_path() -> None:
         refusal="path_not_allowed",
         restricted_by="op",
         restricted_by_label="op",
+        restricted_by_operator=True,
     )
     allowed = route_request(rules, "api.github.com", 443, "/repos/o/a")
     assert allowed.match is not None

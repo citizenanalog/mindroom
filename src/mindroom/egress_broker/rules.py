@@ -75,7 +75,8 @@ class Route:
     `match` names the rule whose service secret is injected. `refusal` is the error code when the request
     is refused instead: `bad_request` (400) for an ambiguous path, `path_not_allowed` (403) for a path that a
     restricted host's rules do not list (see `route_request`), and then `restricted_by` names the service whose
-    restriction refused it and `restricted_by_label` its display name (its name without one), for the message.
+    restriction refused it, `restricted_by_label` its display name (its name without one), for the message, and
+    `restricted_by_operator` whether it is the operator's service, which only an administrator can change.
     With neither, the request is forwarded without credentials; when `host_has_rules` is false no applicable rule
     names the host, so `unmatched_hosts` decides.
     """
@@ -85,6 +86,7 @@ class Route:
     refusal: Literal["bad_request", "path_not_allowed"] | None = None
     restricted_by: str | None = None
     restricted_by_label: str | None = None
+    restricted_by_operator: bool = False
 
     def __post_init__(self) -> None:
         """Refuse a `path_not_allowed` route that names no restricting service, which its message and audit row need."""
@@ -103,7 +105,8 @@ class Route:
     def refusal_body(self, *, host: str, path: str, manage_url: str | None, scope: ScopeInfo) -> dict[str, object]:
         """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it.
 
-        On a shared or unscoped agent (`scope`), its message names who can change the limit instead of the user.
+        On a shared or unscoped agent (`scope`), its message names who can change the limit instead of the user: the
+        agent's credential managers for one of the scope's own services, an administrator for the operator's.
         """
         if self.refusal is None:
             msg = "Route is not refused."
@@ -117,7 +120,8 @@ class Route:
             service=self.restricted_by,
             service_label=self.restricted_by_label,
             shared=scope.shared,
-            managers=scope.managers,
+            # Without managers the shared text names an administrator, the only one who edits the operator's config.
+            managers=() if self.restricted_by_operator else scope.managers,
             manage_url=manage_url,
         )
 
@@ -375,6 +379,7 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
                 refusal="path_not_allowed",
                 restricted_by=restricted_by,
                 restricted_by_label=party[restricted_by].display_name or restricted_by,
+                restricted_by_operator=party is operator,
             )
     return Route(host_has_rules=True, match=_best_match(_credential_services(config.services), host, port, path))
 
