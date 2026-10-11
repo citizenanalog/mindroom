@@ -3133,6 +3133,31 @@ describe("the display name of a new service", () => {
     expect(onSave).toHaveBeenCalledWith("web", { rules: [bearerRule] });
   });
 
+  it("measures an edited service by what its save sends, without the host as display name", async () => {
+    const stored = (length: number) => ({
+      rules: [bearerRule],
+      description: "x".repeat(length),
+    });
+    // Exactly the server's cap, counting only what the save writes.
+    const fits =
+      validation.max_service_bytes - JSON.stringify(stored(0)).length;
+    const { onSave } = await renderEditor({
+      name: "web",
+      service: stored(fits),
+    });
+    save();
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave).toHaveBeenCalledWith("web", stored(fits));
+    cleanup();
+    // One byte more is still refused.
+    const over = await renderEditor({ name: "web", service: stored(fits + 1) });
+    save();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "A service can take at most 16 KiB",
+    );
+    expect(over.onSave).not.toHaveBeenCalled();
+  });
+
   it("offers the host only while the service is new: an edited one keeps no display name", async () => {
     await renderEditor({ name: "web", service: { rules: [bearerRule] } });
     openMoreOptions();

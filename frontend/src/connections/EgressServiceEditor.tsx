@@ -229,7 +229,7 @@ export function EgressServiceEditor({
   // them anew only after they change and keeps rules edited by hand until then.
   const appliedHelper = useRef<string | null>(restored.applied);
   const showGithubHelper = limiting || looksLikeGithub(form);
-  const settings = { editing, takenNames: openedWithNames };
+  const settings = { editing, takenNames: openedWithNames, service };
 
   const applyGithubRules = (result: {
     rules: EgressRule[];

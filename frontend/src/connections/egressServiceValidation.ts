@@ -14,6 +14,7 @@ import {
   personalPlaceholderNameError,
   reservedPlaceholderError,
 } from "./egressPlaceholderRules";
+import type { AuthoredEgressService } from "./types";
 
 /**
  * What stops a form from being saved, and which field shows each problem.
@@ -189,7 +190,12 @@ function placeholderProblems(
 export function validateService(
   form: EgressServiceForm,
   options: EditorOptions,
-  settings: { editing: boolean; takenNames: readonly string[] },
+  settings: {
+    editing: boolean;
+    takenNames: readonly string[];
+    /** The service the form opened with, which the save serializes the form against. */
+    service?: AuthoredEgressService | null;
+  },
 ): ServiceProblem[] {
   const problems: ServiceProblem[] = [];
   if (!settings.editing) {
@@ -208,7 +214,7 @@ export function validateService(
       });
     const tooManyRules = tooManyRulesProblem(form, options);
     if (tooManyRules) problems.push({ field: "form", message: tooManyRules });
-    problems.push(...sizeProblems(form, options, problems));
+    problems.push(...sizeProblems(form, options, settings.service, problems));
     return problems;
   }
   if (
@@ -232,7 +238,7 @@ export function validateService(
     );
   }
   problems.push(...placeholderProblems(form.placeholders, options));
-  problems.push(...sizeProblems(form, options, problems));
+  problems.push(...sizeProblems(form, options, settings.service, problems));
   return problems;
 }
 
@@ -249,17 +255,18 @@ function tooManyRulesProblem(
     : null;
 }
 
-/** The size problem of a personal service, measured only once nothing else is wrong with it. */
+/** The size problem of a personal service, measured only once nothing else is wrong with it, as the save serializes it. */
 function sizeProblems(
   form: EgressServiceForm,
   options: EditorOptions,
+  service: AuthoredEgressService | null | undefined,
   found: readonly ServiceProblem[],
 ): ServiceProblem[] {
   const max = options.validation?.max_service_bytes;
   return options.context === "personal" &&
     max !== undefined &&
     found.length === 0 &&
-    serverJsonSize(serializeService(form, options)) > max
+    serverJsonSize(serializeService(form, options, service)) > max
     ? [
         {
           field: "form",
