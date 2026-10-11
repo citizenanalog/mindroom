@@ -20,7 +20,6 @@ _.fetch_images  # Newspaper4k Article.parse step overridden to skip image downlo
 _._save_file_to_disk  # FileGenerationTools save step overridden to write inside the workspace (src/mindroom/tools/agno_compat_file_generation.py)
 _._run_context  # Agno reads the run context bound on a prepared Function (src/mindroom/agno_compat_prepared_tools.py)
 _.resolve_in_context  # Agno reads it before formatting a string system_message (src/mindroom/agents.py)
-check_research  # Plugin hook discovered by the plugin loader (src/mindroom/research_check/hooks.py)
 # Regenerate with:
 #   uv run vulture --make-whitelist src/mindroom --min-confidence 60 --sort-by-size | perl -pe 's/\.py:\d+/.py/g' > vulture_whitelist.py
 dashboard_credentials_supported  # unused variable (src/mindroom/agent_policy.py)
@@ -142,7 +141,7 @@ _._handle_vector_db_insert  # Agno insertion callback override (src/mindroom/kno
 _.generate_image  # Agno toolkit override (src/mindroom/custom_tools/gemini_media.py)
 DEEPSEEK_V4_PRO  # used by scripts/utilities/rewrite_git_commits_ai.py
 EXPIRED  # dynamically restored ApprovalDecision enum value (src/mindroom/approval_continuation.py)
-_.confirmation_note  # Set by Agno requirement rejection (approval_execution.py, teams.py)
+_.confirmation_note  # Set by Agno requirement rejection (approval/execution.py, teams.py)
 _.cache_results  # Script broker disables Agno's pre-hook result cache for durable calls
 SAAS_MODEL_PRESETS  # used by scripts/sync_config.py
 _.to_config_dict  # used by scripts/sync_config.py
