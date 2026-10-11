@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
 import shutil
 import sqlite3
 import ssl
@@ -36,9 +35,12 @@ from tests.egress_broker.conftest import (
     PROXY_AUTHENTICATION_REQUIRED,
     audit_records,
     connect_request,
+    env_without_proxies,
     free_port,
+    git_ls_remote,
     proxy_authorization,
     read_raw_response,
+    run_command,
     single_rule_config,
     with_user_services,
 )
@@ -58,7 +60,6 @@ if TYPE_CHECKING:
 MANAGE_URL = "https://m.test/connections/egress"
 CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
 SECRET = "s3cret"  # noqa: S105 - test credential the fake upstream expects
-_PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "git_askpass", "ssh_askpass"}
 AMBIGUOUS_PATH = {
     "error": "bad_request",
     "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
@@ -106,25 +107,6 @@ def _websocket_handshake(port: int, *, connection: str = "Upgrade", upgrade: str
         f"Upgrade: {upgrade}\r\nConnection: {connection}\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     ).encode()
-
-
-async def _run(*command: str, env: dict[str, str]) -> tuple[int, str, str]:
-    """Run a command line tool while the broker keeps serving on this event loop."""
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    async with asyncio.timeout(30):
-        stdout, stderr = await process.communicate()
-    assert process.returncode is not None
-    return process.returncode, stdout.decode(), stderr.decode()
-
-
-def _env_without_proxies(**extra: str) -> dict[str, str]:
-    """Return this process's environment without proxy or askpass settings that would bypass the broker."""
-    return {name: value for name, value in os.environ.items() if name.lower() not in _PROXY_ENV} | extra
 
 
 @pytest.mark.asyncio
@@ -1110,7 +1092,7 @@ async def test_curl_through_broker(broker: BrokerFactory, tls_upstream: Upstream
     started = await broker(single_rule_config(), secrets={"svc": SECRET})
     bundle, _ca_only = materialize_ca_bundle(broker.ca.cert_pem, tmp_path / "trust")
 
-    returncode, stdout, stderr = await _run(
+    returncode, stdout, stderr = await run_command(
         "curl",
         "-q",
         "-sS",
@@ -1120,7 +1102,7 @@ async def test_curl_through_broker(broker: BrokerFactory, tls_upstream: Upstream
         "--cacert",
         str(bundle),
         tls_upstream.url("/echo"),
-        env=_env_without_proxies(),
+        env=env_without_proxies(),
     )
 
     assert returncode == 0, stderr
@@ -1131,29 +1113,9 @@ async def test_curl_through_broker(broker: BrokerFactory, tls_upstream: Upstream
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 async def test_git_ls_remote_basic_auth(broker: BrokerFactory, tls_upstream: Upstream, tmp_path: Path) -> None:
     """git, with no credentials configured anywhere, authenticates through the injected Basic header."""
-    started = await broker(
-        single_rule_config(auth=EgressAuth(type="basic", username="x-access-token")),
-        secrets={"svc": SECRET},
-    )
-    bundle, _ca_only = materialize_ca_bundle(broker.ca.cert_pem, tmp_path / "trust")
+    await broker(single_rule_config(auth=EgressAuth(type="basic", username="x-access-token")), secrets={"svc": SECRET})
 
-    returncode, stdout, stderr = await _run(
-        "git",
-        "-c",
-        f"http.proxy=http://{broker.token()}:@127.0.0.1:{started.port}",
-        "-c",
-        f"http.sslCAInfo={bundle}",
-        "-c",
-        "credential.helper=",
-        "ls-remote",
-        tls_upstream.url("/repo.git"),
-        env=_env_without_proxies(
-            HOME=str(tmp_path),
-            GIT_CONFIG_NOSYSTEM="1",
-            GIT_CONFIG_GLOBAL=os.devnull,
-            GIT_TERMINAL_PROMPT="0",
-        ),
-    )
+    returncode, stdout, stderr = await git_ls_remote(broker, tls_upstream.url("/repo.git"), tmp_path)
 
     assert returncode == 0, stderr
     assert f"{'1' * 40}\trefs/heads/main" in stdout

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import ipaddress
 import json
+import os
 import socket
 import ssl
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from cryptography.x509.oid import NameOID
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.audit import AuditLog
-from mindroom.egress_broker.ca import BrokerCA
+from mindroom.egress_broker.ca import BrokerCA, materialize_ca_bundle
 from mindroom.egress_broker.dial import DialPolicy
 from mindroom.egress_broker.proxy import EgressBroker, ManageUrl
 from mindroom.egress_broker.rules import EgressRules
@@ -665,3 +666,50 @@ async def _raw_proxy_request(port: int, request: bytes) -> RawResponse:
 def raw_proxy() -> Callable[[int, bytes], Awaitable[RawResponse]]:
     """Return ``send(port, request_bytes)`` for proxy requests that httpx cannot express or inspect."""
     return _raw_proxy_request
+
+
+_PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "git_askpass", "ssh_askpass"}
+
+
+def env_without_proxies(**extra: str) -> dict[str, str]:
+    """Return this process's environment without proxy or askpass settings that would bypass the broker."""
+    return {name: value for name, value in os.environ.items() if name.lower() not in _PROXY_ENV} | extra
+
+
+async def run_command(*command: str, env: dict[str, str]) -> tuple[int, str, str]:
+    """Run a command line tool while the broker keeps serving on this event loop; return its status, stdout, stderr."""
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    async with asyncio.timeout(30):
+        stdout, stderr = await process.communicate()
+    assert process.returncode is not None
+    return process.returncode, stdout.decode(), stderr.decode()
+
+
+async def git_ls_remote(broker: BrokerFactory, url: str, tmp_path: Path) -> tuple[int, str, str]:
+    """Run ``git ls-remote url`` through the latest broker with only its proxy URL and trust bundle configured.
+
+    No credentials are set anywhere, and the broker CA bundle is written under `tmp_path`.
+    """
+    bundle, _ca_only = materialize_ca_bundle(broker.ca.cert_pem, tmp_path / "trust")
+    return await run_command(
+        "git",
+        "-c",
+        f"http.proxy=http://{broker.token()}:@127.0.0.1:{broker.latest.port}",
+        "-c",
+        f"http.sslCAInfo={bundle}",
+        "-c",
+        "credential.helper=",
+        "ls-remote",
+        url,
+        env=env_without_proxies(
+            HOME=str(tmp_path),
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_TERMINAL_PROMPT="0",
+        ),
+    )

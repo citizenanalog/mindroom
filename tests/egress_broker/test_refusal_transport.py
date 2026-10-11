@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
-import os
 import shutil
 from typing import TYPE_CHECKING
 
 import pytest
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
-from mindroom.egress_broker.ca import materialize_ca_bundle
 from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import SecretMissing, SecretNeedsReconnect
-from tests.egress_broker.conftest import audit_records, proxy_authorization
+from tests.egress_broker.conftest import audit_records, git_ls_remote, proxy_authorization
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -33,7 +30,6 @@ TLS_REQUIRED = "Credentials are only added over HTTPS. Use https:// for localhos
 MANAGE_URL = "https://m.test/connections/egress"
 CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
 GIT_USER_AGENT = {"User-Agent": "git/2.55.0"}
-_PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "git_askpass", "ssh_askpass"}
 
 
 def _config(*, unmatched_hosts: str = "passthrough") -> EgressBrokerConfig:
@@ -348,20 +344,6 @@ async def test_a_target_that_does_not_parse_as_a_url_keeps_the_json_refusal(
     assert response.json() == {"error": "bad_request", "message": "The request is malformed and was refused."}
 
 
-async def _run(*command: str, env: dict[str, str]) -> tuple[int, str, str]:
-    """Run a command line tool while the broker keeps serving on this event loop."""
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    async with asyncio.timeout(30):
-        stdout, stderr = await process.communicate()
-    assert process.returncode is not None
-    return process.returncode, stdout.decode(), stderr.decode()
-
-
 @pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 async def test_git_ls_remote_prints_the_refusal_message(
@@ -371,28 +353,9 @@ async def test_git_ls_remote_prints_the_refusal_message(
     audit: AuditLog,
 ) -> None:
     """A real git client shows `remote error: <message>` instead of a bare 403 when the broker refuses."""
-    started = await broker(_config())
-    bundle, _ca_only = materialize_ca_bundle(broker.ca.cert_pem, tmp_path / "trust")
-    env = {name: value for name, value in os.environ.items() if name.lower() not in _PROXY_ENV}
+    await broker(_config())
 
-    returncode, _stdout, stderr = await _run(
-        "git",
-        "-c",
-        f"http.proxy=http://{broker.token()}:@127.0.0.1:{started.port}",
-        "-c",
-        f"http.sslCAInfo={bundle}",
-        "-c",
-        "credential.helper=",
-        "ls-remote",
-        tls_upstream.url("/repo.git"),
-        env=env
-        | {
-            "HOME": str(tmp_path),
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-        },
-    )
+    returncode, _stdout, stderr = await git_ls_remote(broker, tls_upstream.url("/repo.git"), tmp_path)
 
     assert returncode != 0
     assert f"remote error: {MISSING_KEY}" in stderr
