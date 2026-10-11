@@ -197,13 +197,6 @@ async def _prepare_request(
     if all(is_compaction_summary(message) for message in layout.folded):
         # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
         return
-    if policy.native_route is not None and policy.replay_model is not None:
-        # The provider's own compaction could not keep this request within the window.
-        logger.warning(
-            "Native compaction left the request over its limit; compacting as text",
-            run_id=run_response.run_id,
-        )
-        policy.replay_model.configure_native_compaction(threshold=None)
     try:
         if session is None:
             summary_message = await _summarize_run_locally(binding, policy.inputs, layout, run_response, messages)
@@ -217,6 +210,13 @@ async def _prepare_request(
     if summary_message is None:
         binding.failed_run_id = run_response.run_id
         return
+    if policy.native_route is not None and policy.replay_model is not None:
+        # The provider's own compaction could not keep this request within the window.
+        logger.warning(
+            "Native compaction left the request over its limit; compacted as text",
+            run_id=run_response.run_id,
+        )
+        policy.replay_model.configure_native_compaction(threshold=None)
     _finish(messages, layout, summary_message, run_response)
     _require_fit(policy, messages, tools, summary_message)
 

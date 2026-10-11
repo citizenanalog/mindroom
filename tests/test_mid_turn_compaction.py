@@ -1181,3 +1181,16 @@ async def test_oversized_native_request_turns_native_off_and_compacts_as_text(
     compacted = _first_compacted(model)
     assert compacted.contents[-1] == "Do the task"
     assert "tool" not in compacted.roles
+
+
+@pytest.mark.asyncio
+async def test_failed_text_fallback_keeps_native_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
+    config, paths = _config(tmp_path)
+    summary_calls.fail = True
+    model = _NativeToolLoopModel(tool_rounds=5)
+    model.configure_native_compaction(threshold=2000)
+
+    await _run(_agent(model, config, paths), "Do the task")
+
+    assert summary_calls.inputs
+    assert model.native_compaction is not None
