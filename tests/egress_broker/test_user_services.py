@@ -460,6 +460,27 @@ def test_hosts_outside_deny_are_reported_for_a_save_check() -> None:
     assert user_service_hosts_not_allowed(passthrough, service) == []
 
 
+def test_a_limit_under_deny_may_name_hosts_the_operator_does_not_cover() -> None:
+    """A restrict-only limit opens nothing, so its uploads.github.com rule is fine next to a GitHub service without it."""
+    limit = EgressService.model_validate(
+        {
+            "restrict_only": True,
+            "rules": [
+                {"host": "api.github.com", "path_prefix": "/repos/o/r"},
+                {"host": "uploads.github.com", "path_prefix": "/repos/o/r"},
+            ],
+        },
+    )
+    config = EgressBrokerConfig.model_validate(
+        {
+            "unmatched_hosts": "deny",
+            "services": {"github": {"rules": [{"host": "api.github.com", "auth": {"type": "bearer"}}]}},
+        },
+    )
+
+    assert user_service_hosts_not_allowed(config, limit) == []
+
+
 def test_a_new_service_never_inherits_a_stored_key(manager: CredentialsManager) -> None:
     """Saving a new name clears a key left under it; replacing the service keeps its key; deleting removes it."""
     for target in (_target(), _target(scope="shared")):

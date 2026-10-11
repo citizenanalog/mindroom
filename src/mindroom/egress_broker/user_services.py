@@ -285,9 +285,10 @@ def user_service_hosts_not_allowed(config: EgressBrokerConfig, service: EgressSe
 
     Under `unmatched_hosts: deny` the broker applies a user rule only on hosts and ports a config rule names. This
     lists, in rule order without repeats, each rule host that config does not cover for every host and port the rule
-    can match. Under `passthrough` every host is allowed, so the list is empty.
+    can match. Under `passthrough` every host is allowed, so the list is empty. A `restrict_only` service grants no
+    access, and a host deny keeps closed stays closed whatever it lists, so its rules never count.
     """
-    if config.unmatched_hosts != "deny":
+    if config.unmatched_hosts != "deny" or service.restrict_only:
         return []
     hosts = [rule.host for rule in service.rules if not config_covers_rule(config, rule)]
     return list(dict.fromkeys(hosts))
