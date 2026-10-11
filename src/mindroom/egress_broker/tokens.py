@@ -9,12 +9,12 @@ import json
 import os
 import secrets
 import time
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path  # noqa: TC003 - Required at runtime for load_or_create parameter
-from typing import Any, Literal, get_args, get_origin, get_type_hints
+from typing import Any, Literal, get_args, get_type_hints
 
 from mindroom.atomic_file import atomic_write_bytes_at
-from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
+from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity, WorkerScope
 
 _TOKEN_PREFIX = "mrb1"  # noqa: S105
 _TOKEN_VERSION_TAG = b"mindroom-egress-broker-token-v1"
@@ -27,7 +27,7 @@ class WorkerClaims:
     """Worker claims embedded in proxy tokens."""
 
     worker_key: str
-    worker_scope: Literal["shared", "user", "user_agent"] | None
+    worker_scope: WorkerScope | None
     routing_agent_name: str | None
     tenant_id: str | None
     account_id: str | None
@@ -88,25 +88,11 @@ class WorkerClaims:
         return self.worker_scope if self.worker_scope is not None else "unscoped"
 
 
-def _literal_values(annotation: object) -> tuple[object, ...]:
-    """Return the values a `Literal[...]` or `Literal[...] | None` annotation allows."""
-    if get_origin(annotation) is Literal:
-        return get_args(annotation)
-    # `Literal[...] | None`: the Literal's values, then None.
-    values: list[object] = []
-    for member in get_args(annotation):
-        if member is type(None):
-            values.append(None)
-        else:
-            values.extend(get_args(member))
-    return tuple(values)
-
-
 # What a token's claims must hold, read from `WorkerClaims` so the check follows the dataclass.
 _CLAIM_KEYS = frozenset(field.name for field in fields(WorkerClaims))
 _CLAIM_TYPES = get_type_hints(WorkerClaims)
-_WORKER_SCOPES = _literal_values(_CLAIM_TYPES["worker_scope"])
-_CHANNELS = _literal_values(_CLAIM_TYPES["channel"])
+_WORKER_SCOPES = (*get_args(WorkerScope), None)
+_CHANNELS = get_args(_CLAIM_TYPES["channel"])
 _OPTIONAL_STR_CLAIMS = tuple(name for name, hint in _CLAIM_TYPES.items() if hint == str | None)
 
 
@@ -164,19 +150,7 @@ class TokenSigner:
         exp = int(now + self._ttl_seconds)
 
         # Build payload with sorted keys and compact separators
-        payload_dict = {
-            "claims": {
-                "worker_key": claims.worker_key,
-                "worker_scope": claims.worker_scope,
-                "routing_agent_name": claims.routing_agent_name,
-                "tenant_id": claims.tenant_id,
-                "account_id": claims.account_id,
-                "channel": claims.channel,
-                "agent_name": claims.agent_name,
-                "requester_id": claims.requester_id,
-            },
-            "exp": exp,
-        }
+        payload_dict = {"claims": asdict(claims), "exp": exp}
         payload_bytes = json.dumps(payload_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
         mac = self._mac(payload_bytes)
