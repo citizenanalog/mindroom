@@ -133,7 +133,6 @@ export interface EgressCredentialService {
   can_manage: boolean;
   /** True when either an API key or a connected account is available. */
   configured: boolean;
-  updated_at: string | null;
   /** Which source the broker uses; an explicit key wins over a connected account. */
   active_source: "key" | "oauth" | null;
   key_configured: boolean;

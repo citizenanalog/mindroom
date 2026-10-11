@@ -161,7 +161,6 @@ async def egress_services_for_agent(
                 rules=rule_summaries(service),
                 placeholder_names=list(service.placeholder_env),
                 restrict_only=service.restrict_only,
-                updated_at=sources.key_updated_at,
                 **asdict(sources),
             ),
         )

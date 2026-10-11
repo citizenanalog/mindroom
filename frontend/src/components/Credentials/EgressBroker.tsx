@@ -79,7 +79,6 @@ interface BrokerService {
   /** The service only limits paths: it has no key or account. Absent from older servers. */
   restrict_only?: boolean;
   configured: boolean;
-  updated_at: string | null;
   active_source: "key" | "oauth" | null;
   key_configured: boolean;
   key_updated_at: string | null;

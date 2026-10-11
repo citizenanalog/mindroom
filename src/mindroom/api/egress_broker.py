@@ -112,7 +112,6 @@ async def _load_service_statuses_for_target(
                 source=service_source(config.egress_broker, name),
                 rules=rule_summaries(service_config),
                 restrict_only=service_config.restrict_only,
-                updated_at=sources.key_updated_at,
                 **asdict(sources),
             ),
         )

@@ -3159,7 +3159,6 @@ describe("a website another service of the agent already sends a key to", () => 
     is_shared: false,
     can_manage: true,
     configured: true,
-    updated_at: null,
     active_source: "key",
     key_configured: true,
     key_updated_at: null,

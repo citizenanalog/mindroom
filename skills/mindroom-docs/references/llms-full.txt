@@ -18103,7 +18103,7 @@ The status API returns, for each service and scope, whether a key is set and whe
 }
 ```
 
-The example is abbreviated: each service also has `display_name`, `description`, and `updated_at` (the key's timestamp, kept for older clients), and `source`, which is `config` for a service in `config.yaml` and `user` for a [user service](#user-services).
+The example is abbreviated: each service also has `display_name`, `description`, and `source`, which is `config` for a service in `config.yaml` and `user` for a [user service](#user-services).
 Both listings add `restrict_only` (`true` for a service that only [limits paths](#limiting-in-place)) and `rules`, which clients use to warn about overlapping rules and to say how a service sends its key. Each rule has:
 
 - `host`, `port`, and `path_prefix`.

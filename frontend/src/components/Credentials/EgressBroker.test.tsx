@@ -57,7 +57,6 @@ const github = {
   display_name: "GitHub",
   description: "GitHub API and git over HTTPS",
   configured: false,
-  updated_at: null,
   active_source: null,
   key_configured: false,
   key_updated_at: null,
@@ -68,7 +67,6 @@ const openai = {
   display_name: null,
   description: "OpenAI API",
   configured: true,
-  updated_at: "2026-10-05T12:00:00+00:00",
   active_source: "key",
   key_configured: true,
   key_updated_at: "2026-10-05T12:00:00+00:00",
@@ -246,7 +244,7 @@ describe("egress broker panel", () => {
     // A service without a display name falls back to its key.
     expect(
       within(row("openai")).getByText(
-        `Key saved ${new Date(openai.updated_at).toLocaleDateString()}`,
+        `Key saved ${new Date(openai.key_updated_at).toLocaleDateString()}`,
       ),
     ).toBeInTheDocument();
     expect(

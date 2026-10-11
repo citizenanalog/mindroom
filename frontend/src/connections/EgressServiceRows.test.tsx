@@ -46,7 +46,6 @@ const github: EgressCredentialService = {
   is_shared: false,
   can_manage: true,
   configured: false,
-  updated_at: null,
   active_source: null,
   key_configured: false,
   key_updated_at: null,
@@ -132,9 +131,7 @@ describe("egress service rows", () => {
     render(
       <EgressServiceRows
         agentName="personal"
-        services={[
-          { ...openai, updated_at: updatedAt, key_updated_at: updatedAt },
-        ]}
+        services={[{ ...openai, key_updated_at: updatedAt }]}
         onChanged={vi.fn()}
       />,
     );
@@ -1237,7 +1234,6 @@ describe("rows with an agent's wording", () => {
     overrides: Partial<EgressCredentialService> = {},
   ): EgressCredentialService => ({
     ...openai,
-    updated_at: "2026-10-05T12:00:00+00:00",
     key_updated_at: "2026-10-05T12:00:00+00:00",
     ...overrides,
   });
@@ -1279,7 +1275,7 @@ describe("rows with an agent's wording", () => {
   });
 
   it("says Key saved without a date when the server sends none", () => {
-    renderRows([keyed({ updated_at: null, key_updated_at: null })]);
+    renderRows([keyed({ key_updated_at: null })]);
     expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
   });
 
@@ -2271,7 +2267,6 @@ describe("a shared agent's key where a personal account is refused", () => {
         active_source: "key",
         key_configured: true,
         key_updated_at: "2026-10-05T12:00:00+00:00",
-        updated_at: "2026-10-05T12:00:00+00:00",
       }),
     );
     expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();

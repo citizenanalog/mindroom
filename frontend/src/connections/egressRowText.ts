@@ -90,7 +90,7 @@ export function statusLabel(
     if (service.active_source === "key")
       return oauth.unavailable_reason === null
         ? "Using API key"
-        : keySavedLabel(service.key_updated_at ?? service.updated_at);
+        : keySavedLabel(service.key_updated_at);
     if (service.active_source === "oauth")
       return sharesAccount(agent, oauth)
         ? sharedAccountStatus(oauth.account_label, agent.displayName)
@@ -100,7 +100,7 @@ export function statusLabel(
     return oauth.reset_required ? "Reset required" : "Not set";
   }
   if (!service.configured) return "Not set";
-  return keySavedLabel(service.updated_at);
+  return keySavedLabel(service.key_updated_at);
 }
 
 export function removeWarning(service: EgressCredentialService): string {

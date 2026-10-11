@@ -628,7 +628,7 @@ def test_connect_stores_the_account_and_a_key_takes_precedence(
     assert drive["active_source"] == "oauth"
     assert drive["configured"] is True
     assert drive["key_configured"] is False
-    assert drive["updated_at"] is None
+    assert drive["key_updated_at"] is None
     assert drive["oauth"]["connected"] is True
     assert drive["oauth"]["account_label"] == "alice@example.com"
     if agent_name is not None:
@@ -639,7 +639,7 @@ def test_connect_stores_the_account_and_a_key_takes_precedence(
     drive = _service(oauth_broker_client, "drive", agent_name)
     assert drive["active_source"] == "key"
     assert drive["key_configured"] is True
-    assert drive["updated_at"] == drive["key_updated_at"]
+    assert drive["key_updated_at"] is not None
     assert drive["oauth"]["connected"] is True
 
 

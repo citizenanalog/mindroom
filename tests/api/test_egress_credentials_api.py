@@ -428,13 +428,13 @@ def test_requester_sets_own_user_agent_secret(egress_portal: dict[str, Any]) -> 
     listing = _listing(portal, "alice")
     github_service = _service_row(listing, "personal", "github")
     assert github_service["configured"] is True
-    assert github_service["updated_at"] is not None
+    assert github_service["key_updated_at"] is not None
     assert "alice-token" not in listing.text
 
     # Bob sees it unconfigured (his own scope)
     github_service_bob = _egress_row(portal, "bob", "personal", "github")
     assert github_service_bob["configured"] is False
-    assert github_service_bob["updated_at"] is None
+    assert github_service_bob["key_updated_at"] is None
 
 
 def test_shared_agent_requires_credential_manager(egress_portal: dict[str, Any]) -> None:
@@ -649,7 +649,6 @@ def test_status_shows_the_oauth_connection_and_a_stored_key_wins(oauth_egress_po
     assert row["configured"] is True
     assert row["key_configured"] is False
     assert row["key_updated_at"] is None
-    assert row["updated_at"] is None
     assert row["oauth"]["connected"] is True
     assert row["oauth"]["account_label"] == "alice@example.com"
     assert _egress_row(portal, "bob", "personal", "drive")["oauth"]["connected"] is False
@@ -660,7 +659,7 @@ def test_status_shows_the_oauth_connection_and_a_stored_key_wins(oauth_egress_po
     assert row["active_source"] == "key"
     assert row["key_configured"] is True
     assert row["key_updated_at"] is not None
-    assert row["updated_at"] == row["key_updated_at"]
+    assert "updated_at" not in row
     assert row["oauth"]["connected"] is True
 
     delete = portal["client"].delete(

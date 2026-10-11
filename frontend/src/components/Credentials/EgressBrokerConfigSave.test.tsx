@@ -51,7 +51,6 @@ const row = (name: string, display_name: string) => ({
   source: "config",
   rules: [],
   configured: false,
-  updated_at: null,
   active_source: null,
   key_configured: false,
   key_updated_at: null,

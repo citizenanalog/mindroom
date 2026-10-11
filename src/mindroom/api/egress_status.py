@@ -258,12 +258,11 @@ def audit_logs_response(records: Iterable[AuditRecord]) -> AuditLogsResponse:
 class EgressSourceStatus(BaseModel):
     """Which secret sources a service has in one scope.
 
-    `configured` is true when either source is available and `updated_at` is the API key's timestamp, both kept for
-    older clients. `active_source` says which source the broker uses: an explicit key wins over OAuth.
+    `configured` is true when either source is available. `active_source` says which source the broker uses: an
+    explicit key wins over OAuth.
     """
 
     configured: bool
-    updated_at: str | None
     active_source: Literal["key", "oauth"] | None
     key_configured: bool
     key_updated_at: str | None

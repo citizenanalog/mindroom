@@ -25,7 +25,6 @@ const service = {
   is_shared: false,
   can_manage: true,
   configured: false,
-  updated_at: null,
   active_source: null,
   key_configured: false,
   key_updated_at: null,
