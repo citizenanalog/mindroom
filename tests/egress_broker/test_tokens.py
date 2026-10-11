@@ -88,6 +88,7 @@ def test_other_key_rejected(claims: WorkerClaims) -> None:
         "mrb1.a.b.c",
         "mrb1." + "a" * 5000 + ".b",
         "mrb1.!!!.b",
+        "mrb1.\u00e9.b",
     ],
 )
 def test_malformed_rejected(signer: TokenSigner, token: str) -> None:

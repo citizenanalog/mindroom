@@ -106,8 +106,8 @@ def primary_callback_hosts(runtime_paths: RuntimePaths) -> list[str]:
             if hostname and hostname not in seen:
                 seen.add(hostname)
                 hosts.append(hostname)
-        except Exception:  # noqa: S112
-            # Unparsable URL, skip
+        except ValueError:
+            # Unparsable URL, such as an unclosed IPv6 bracket, skip
             continue
 
     return hosts

@@ -209,7 +209,7 @@ def _b64decode_unpadded(segment: str) -> bytes | None:
     """Decode an unpadded base64url token segment, or return None when it is not base64."""
     try:
         return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
-    except Exception:
+    except ValueError:  # binascii.Error for bad padding, plain ValueError for non-ASCII text
         return None
 
 
@@ -239,7 +239,7 @@ def _unexpired_claims(payload_bytes: bytes, *, now: float) -> dict[str, Any] | N
     """Return the claims object of a signed payload whose integer `exp` is after `now`, or None."""
     try:
         payload_dict = json.loads(payload_bytes)
-    except Exception:
+    except ValueError:  # JSONDecodeError, or UnicodeDecodeError for bytes that are not UTF-8, -16, or -32
         return None
 
     if not isinstance(payload_dict, dict):
@@ -259,15 +259,12 @@ def _unexpired_claims(payload_bytes: bytes, *, now: float) -> dict[str, Any] | N
 
 def _claims_from_dict(claims_dict: dict[str, Any]) -> WorkerClaims | None:
     """Return the claims when exactly the expected keys are present, each with its expected type, or None."""
-    try:
-        if set(claims_dict) != _CLAIM_KEYS:
-            return None
-        if not isinstance(claims_dict["worker_key"], str) or not isinstance(claims_dict["agent_name"], str):
-            return None
-        if claims_dict["worker_scope"] not in _WORKER_SCOPES or claims_dict["channel"] not in _CHANNELS:
-            return None
-        if any(claims_dict[key] is not None and not isinstance(claims_dict[key], str) for key in _OPTIONAL_STR_CLAIMS):
-            return None
-        return WorkerClaims(**claims_dict)
-    except Exception:
+    if set(claims_dict) != _CLAIM_KEYS:
         return None
+    if not isinstance(claims_dict["worker_key"], str) or not isinstance(claims_dict["agent_name"], str):
+        return None
+    if claims_dict["worker_scope"] not in _WORKER_SCOPES or claims_dict["channel"] not in _CHANNELS:
+        return None
+    if any(claims_dict[key] is not None and not isinstance(claims_dict[key], str) for key in _OPTIONAL_STR_CLAIMS):
+        return None
+    return WorkerClaims(**claims_dict)

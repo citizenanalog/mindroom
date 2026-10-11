@@ -268,6 +268,7 @@ class TlsInterceptor:
                 return result.value
             status, body = self._refusal(entry.claims, service, result)
         except Exception as exc:
+            # The resolver runs store and OAuth provider code, and `_refusal` the manage-link callback.
             logger.warning("egress_broker_secret_lookup_failed", error_type=type(exc).__name__)
             await self._relay.reject(client, entry, 502, refusal_body("broker_error"))
             return None

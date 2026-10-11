@@ -18,6 +18,7 @@ from mindroom.egress_broker.user_services import ServiceSource, effective_config
 from mindroom.egress_broker.user_services import service_source as config_service_source
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.oauth.service import oauth_provider_service_account_configured
+from mindroom.workers.backend import WorkerBackendError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -381,7 +382,7 @@ def oauth_provider_of_service(
             opted_in=service.oauth_on_shared_workers,
             runtime_paths=snapshot.runtime_paths,
         )
-    except Exception as exc:
+    except WorkerBackendError as exc:
         # An unreadable worker backend leaves the sandbox kind unknown, so neither action can be judged safe.
         raise HTTPException(503, "Account connection is unavailable right now", headers=headers) from exc
     if access == "refused":

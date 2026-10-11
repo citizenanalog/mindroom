@@ -7,6 +7,7 @@ import contextlib
 import ipaddress
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -291,8 +292,9 @@ async def serve_peer(peer: Peer, serve_one: Callable[[Peer], Awaitable[bool]]) -
         # Peers disconnect and time out (TimeoutError is an OSError); exception text can echo header bytes.
         logger.debug("egress_broker_connection_failed", error_type=type(exc).__name__)
     except Exception as exc:
-        # Anything else is a broker fault: it fails this connection only, never the listener.
+        # Last-resort guard of one connection: anything else is a broker fault that fails it, never the listener.
         logger.warning("egress_broker_connection_error", error_type=type(exc).__name__)
+        # The fault left the connection in an unknown state, so this answer is best effort whatever stops it.
         with contextlib.suppress(Exception):
             await send_json(peer, 502, refusal_body("broker_error"))
 
@@ -301,6 +303,7 @@ async def close_stream(writer: asyncio.StreamWriter) -> None:
     """Close a stream after flushing what was written, aborting a peer that stops reading."""
     writer.close()
     try:
+        # wait_closed re-raises whatever closed the transport, which asyncio does not limit to OSError; abort follows.
         with contextlib.suppress(Exception):
             async with asyncio.timeout(_CLOSE_TIMEOUT):
                 await writer.wait_closed()
@@ -413,6 +416,7 @@ class Relay:
         try:
             return await asyncio.to_thread(self.rules_provider, entry.claims)
         except Exception as exc:
+            # The provider runs the owner's config loader and reads the credential store; either can raise anything.
             logger.warning("egress_broker_config_unavailable", error_type=type(exc).__name__)
             await self.reject(client, entry, 502, refusal_body("broker_error"))
             return None
@@ -427,6 +431,7 @@ class Relay:
             link = self.manage_url(entry.claims) if route.refusal == "path_not_allowed" else None
             scope = self.scope_info(entry.claims)
         except Exception as exc:
+            # Both are callbacks the broker's owner supplies, which can raise anything.
             logger.warning("egress_broker_refusal_context_failed", error_type=type(exc).__name__)
             await self.reject(client, entry, 502, refusal_body("broker_error"))
             return
@@ -492,7 +497,7 @@ class Relay:
         )
         try:
             await asyncio.to_thread(self.audit.record, record)
-        except Exception as exc:
+        except sqlite3.Error as exc:
             logger.warning("egress_broker_audit_write_failed", error_type=type(exc).__name__)
 
     async def splice(self, client: Peer, upstream: Peer, entry: AuditEntry) -> None:

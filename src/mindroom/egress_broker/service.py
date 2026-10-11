@@ -206,6 +206,7 @@ class _LastGoodConfig:
         try:
             config = self._config_provider()
         except Exception:
+            # The owner's config loader can raise anything mid-reload; the last good config stays.
             return self._config
         if config is not None:
             self._config = config
@@ -385,6 +386,7 @@ class _BrokerService:
         try:
             asyncio.run(self._serve(broker))
         except Exception as exc:
+            # Last-resort guard of the broker thread: start() reraises it, later it is logged.
             if self._listening.is_set():
                 logger.exception("egress_broker_thread_failed")
             else:
@@ -463,7 +465,7 @@ def execution_env_for_worker(
     try:
         services = effective_config(config.egress_broker, runtime.credentials_manager, scope_target).services
     except Exception as exc:
-        # The broker answers this scope's requests with 502 meanwhile; the call still gets the proxy env.
+        # As broad as `read_rules`, which reads the same store and answers 502 meanwhile; the call still gets the env.
         logger.warning("egress_broker_user_services_failed", error_type=type(exc).__name__)
         services = config.egress_broker.services
     config_placeholders: dict[str, str] = {}
@@ -487,7 +489,7 @@ def execution_env_for_worker(
                 oauth_status=read_oauth_status,
             ).configured
         except Exception as exc:
-            # One unreadable secret must not fail the call; the broker reports it if the service is used.
+            # Store and OAuth provider code; one unreadable secret must not fail the call (the broker reports it).
             logger.warning("egress_broker_secret_status_failed", service=name, error_type=type(exc).__name__)
             continue
         if configured:

@@ -251,7 +251,7 @@ class BrokerCA:
             if fd != -1:
                 os.close(fd)
             # Unlink temp file
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError):
                 tmp_path.unlink()
 
 

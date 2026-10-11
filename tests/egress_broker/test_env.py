@@ -176,6 +176,20 @@ def test_primary_callback_hosts_skips_unset_and_unparsable(tmp_path: Path) -> No
     assert hosts == ["broker.local"]
 
 
+def test_primary_callback_hosts_skips_urls_that_urlsplit_rejects(tmp_path: Path) -> None:
+    """A URL that urlsplit raises ValueError for, such as an unclosed IPv6 bracket, is skipped like other bad ones."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={
+            "MINDROOM_EGRESS_BROKER_URL": "http://[::1",
+            "MINDROOM_SCRIPT_GATEWAY_URL": "http://gateway.local:9000",
+        },
+    )
+
+    assert primary_callback_hosts(runtime_paths) == ["gateway.local"]
+
+
 def test_primary_callback_hosts_deduplicates_preserving_order(tmp_path: Path) -> None:
     """primary_callback_hosts removes duplicates while preserving first occurrence order."""
     runtime_paths = resolve_runtime_paths(

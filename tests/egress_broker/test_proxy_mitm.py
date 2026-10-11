@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import ssl
 import threading
 import time
@@ -765,6 +766,35 @@ async def test_resolve_secret_failure_gets_502_and_audit_row(
         ("request", 502, "svc", "/echo"),
     }
     assert {record.code for record in records} == {"broker_error"}
+
+
+@pytest.mark.asyncio
+async def test_audit_write_failure_is_logged_and_the_request_still_succeeds(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+    audit: AuditLog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database error writing the audit row is logged by type only; the client still gets the upstream's answer."""
+
+    def failing_record(_record: object) -> None:
+        msg = "database or disk is full"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(audit, "record", failing_record)
+    await broker(_config(), secrets={"svc": SECRET})
+    client = proxy_client(broker.token())
+
+    with capture_logs() as logs:
+        response = await client.get(tls_upstream.url("/ok"))
+        following = await client.get(tls_upstream.url("/ok"))
+
+    assert (response.status_code, following.status_code) == (200, 200)
+    assert len(tls_upstream.requests) == 2
+    failures = [log for log in logs if log["event"] == "egress_broker_audit_write_failed"]
+    assert failures
+    assert {log["error_type"] for log in failures} == {"OperationalError"}
 
 
 @pytest.mark.asyncio

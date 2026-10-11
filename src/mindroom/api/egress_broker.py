@@ -131,6 +131,7 @@ async def _admin_oauth_status(
             ),
         )
     except Exception as exc:
+        # OAuth provider code, plugin providers included, can raise anything.
         logger.warning(
             "egress_oauth_status_unavailable",
             service=name,
