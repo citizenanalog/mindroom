@@ -181,9 +181,9 @@ def test_catalog_uses_mcp_display_metadata_without_exposing_model_instructions(
     ("content_type", "body", "expected"),
     [
         ("image/png", b"thumbnail", 200),
-        ("image/svg+xml", b"thumbnail", 404),
-        ("image/png", b"", 404),
-        ("image/png", b"x" * (1024 * 1024 + 1), 404),
+        ("image/svg+xml", b"thumbnail", 204),
+        ("image/png", b"", 204),
+        ("image/png", b"x" * (1024 * 1024 + 1), 204),
     ],
     ids=["raster", "svg", "empty", "oversized"],
 )
@@ -229,8 +229,8 @@ def test_avatar_serves_current_matrix_thumbnail(
 
 
 @pytest.mark.parametrize("avatar_url", [None, "https://example.org/picture.png", "mxc://example.org/"])
-def test_avatar_unavailable_for_missing_or_invalid_profile(portal: dict[str, Any], avatar_url: str | None) -> None:
-    """An absent or non-Matrix picture cannot turn the endpoint into an arbitrary URL proxy."""
+def test_avatar_without_image_is_204(portal: dict[str, Any], avatar_url: str | None) -> None:
+    """An absent or non-Matrix picture is "no avatar", never an arbitrary URL proxy, and never a 404 in the console."""
     state = MatrixState()
     state.add_account("agent_personal", "personal", None, domain="example.org", access_token="avatar-token")  # noqa: S106
     state.save(runtime_paths=portal["paths"])
@@ -240,7 +240,17 @@ def test_avatar_unavailable_for_missing_or_invalid_profile(portal: dict[str, Any
             payload={"avatar_url": avatar_url},
         )
         response = portal["client"].get("/api/connections/agents/personal/avatar", headers=portal["headers"]["alice"])
-    assert response.status_code == 404
+        assert not any("thumbnail" in str(key) for key in matrix.requests)
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "no-store" in response.headers["cache-control"]
+
+
+def test_avatar_of_an_agent_without_a_matrix_account_is_204(portal: dict[str, Any]) -> None:
+    """An agent that has not logged into Matrix yet has no avatar either."""
+    response = portal["client"].get("/api/connections/agents/personal/avatar", headers=portal["headers"]["alice"])
+    assert response.status_code == 204
+    assert response.content == b""
 
 
 @pytest.mark.parametrize("stage", ["profile", "thumbnail"])
@@ -287,6 +297,29 @@ def test_avatar_requires_visible_agent(
         )
         assert not matrix.requests
     assert response.status_code == expected
+
+
+@pytest.mark.parametrize(
+    ("user", "is_administrator"),
+    [("admin", True), ("bob", False), ("mallory", False)],
+)
+def test_me_returns_identity_and_admin_flag(portal: dict[str, Any], user: str, is_administrator: bool) -> None:
+    """Every signed user, even one with no agents, learns who they are and whether the dashboard is open to them."""
+    response = portal["client"].get("/api/connections/me", headers=portal["headers"][user])
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "matrix_user_id": f"@{user}:example.org",
+        "email": f"{user}@example.org",
+        "is_administrator": is_administrator,
+    }
+    assert "no-store" in response.headers["cache-control"]
+
+
+def test_me_needs_a_signed_identity_and_takes_no_target(portal: dict[str, Any]) -> None:
+    """The identity route is not an anonymous or target-selecting route."""
+    client = portal["client"]
+    assert client.get("/api/connections/me").status_code == 401
+    assert client.get("/api/connections/me?agent_name=other", headers=portal["headers"]["alice"]).status_code == 400
 
 
 @pytest.mark.parametrize("query", ["agent_name=other", "worker_key=other", "user_id=bob", "execution_scope=user"])
@@ -596,7 +629,7 @@ def test_catalog_lists_only_authorized_agents(shared_portal: dict[str, Any], use
 
 
 def test_agent_user_sees_shared_connection_without_management(shared_portal: dict[str, Any]) -> None:
-    """Using a shared agent reveals availability without shared-account mutation authority."""
+    """Using a shared agent reveals the connected account without shared-account mutation authority."""
     shared_portal["payload"]["agents"]["research"]["access"] = {"users": ["@bob:example.org"]}
     _publish_config(main.app, shared_portal["paths"], shared_portal["payload"])
     _use_runtime_auth_settings(main.app)
@@ -620,7 +653,7 @@ def test_agent_user_sees_shared_connection_without_management(shared_portal: dic
     status = client.get(f"{base}/status", headers=headers["bob"])
     assert status.status_code == 200, status.text
     assert status.json()["connected"] is True
-    assert status.json()["account_label"] is None
+    assert status.json()["account_label"] == "alice@example.com"
     assert status.json()["can_connect"] is False
     for action in ("connect", "disconnect"):
         assert client.post(f"{base}/{action}", headers=headers["bob"], json={}).status_code == 403

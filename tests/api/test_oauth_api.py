@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import HTTPError, HTTPStatusError, Request, Response
 from starlette.requests import Request as StarletteRequest
@@ -338,6 +338,14 @@ def _login(client: TestClient) -> None:
     client.headers["Origin"] = str(client.base_url).rstrip("/")
     response = client.post("/api/auth/session", json={"api_key": "test-key"})
     assert response.status_code == 200
+
+
+def _error_detail(response: Any) -> str:  # noqa: ANN401
+    """Return a refusal's text, whether the route answered JSON (an API call) or a page (a browser step)."""
+    if response.headers["content-type"].startswith("application/json"):
+        return response.json()["detail"]
+    assert response.headers["content-type"].startswith("text/html")
+    return response.text
 
 
 def _state_from_auth_url(auth_url: str) -> str:
@@ -1046,7 +1054,7 @@ def test_oauth_entrypoints_reject_paired_client_from_remote_request(
             response = client.request(method, path)
 
     assert response.status_code == 503
-    assert "available only when MindRoom is opened on localhost" in response.json()["detail"]
+    assert "available only when MindRoom is opened on localhost" in _error_detail(response)
 
 
 @pytest.mark.parametrize(
@@ -1219,7 +1227,7 @@ def test_oauth_entrypoints_reject_dynamic_client_without_exact_https_redirect(
             response = client.request(method, path)
 
     assert response.status_code == 503
-    assert "available only when MindRoom is opened on localhost" in response.json()["detail"]
+    assert "available only when MindRoom is opened on localhost" in _error_detail(response)
 
 
 @pytest.mark.parametrize("response_scope", [None, "scope.write"])
@@ -2322,6 +2330,118 @@ def test_success_page_signals_oauth_completion_to_popup_opener(tmp_path: Path) -
     assert "window.close()" in response.text
 
 
+def _expect_styled_oauth_page(response: Any, *, status: int, message: str) -> None:  # noqa: ANN401
+    """A browser-facing OAuth page: HTML, the readable message, a close button, and no raw API payload."""
+    assert response.status_code == status, response.text
+    assert response.headers["content-type"].startswith("text/html")
+    assert "no-store" in response.headers["cache-control"]
+    assert message in response.text
+    assert '"detail"' not in response.text
+    assert "<style>" in response.text
+    assert '<button type="button" id="close-window">Close window</button>' in response.text
+    assert "window.close()" in response.text
+
+
+def test_success_page_is_styled_with_a_close_button(tmp_path: Path) -> None:
+    runtime_paths = _runtime_paths(tmp_path)
+    api_app = _make_test_app(runtime_paths, _config_payload())
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            _login(client)
+            response = client.get(f"/api/oauth/{provider.id}/success")
+
+    _expect_styled_oauth_page(response, status=200, message=f"{provider.display_name} is connected.")
+    assert "You can close this window." in response.text
+
+
+@pytest.mark.parametrize("scenario", ["provider_error", "stale_state", "foreign_connect_token", "unknown_provider"])
+def test_oauth_browser_errors_are_html(tmp_path: Path, scenario: str) -> None:
+    """The popup shows a styled page with the message and a close button, never raw JSON, and keeps its status."""
+    runtime_paths = _runtime_paths(tmp_path, _trusted_upstream_oauth_env())
+    api_app = _make_test_app(runtime_paths, _config_payload(worker_scope="user_agent"))
+    _use_runtime_auth_settings(api_app)
+    provider = _fake_provider()
+    bob = trusted_upstream_headers(user_id="bob", email="bob@example.com", matrix_user_id="@bob:example.org")
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id=None,
+    )
+    connect_token = oauth_service._issue_oauth_connect_token(
+        provider,
+        runtime_paths,
+        resolve_worker_target("user_agent", "general", execution_identity=identity),
+    )
+    assert connect_token is not None
+    requests = {
+        "provider_error": (f"/api/oauth/{provider.id}/callback?error=access_denied", 400),
+        "stale_state": (f"/api/oauth/{provider.id}/callback?code=test-code&state=missing", 400),
+        "foreign_connect_token": (
+            f"/api/oauth/{provider.id}/authorize?agent_name=general&execution_scope=user_agent"
+            f"&connect_token={connect_token}",
+            403,
+        ),
+        "unknown_provider": ("/api/oauth/no_such_provider/callback?code=test-code&state=missing", 404),
+    }
+    messages = {
+        "provider_error": "OAuth provider returned an error: access_denied",
+        "stale_state": "OAuth state is invalid or expired",
+        "foreign_connect_token": "OAuth link does not belong to the current user",
+        "unknown_provider": "Unknown OAuth provider.",
+    }
+    url, status = requests[scenario]
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            response = client.get(url, headers=bob, follow_redirects=False)
+
+    _expect_styled_oauth_page(response, status=status, message=messages[scenario])
+    assert "no_such_provider" not in response.text
+    # The foreign link stays redeemable for its owner: the page changes the presentation, never the decision.
+    assert oauth_service.lookup_oauth_connect_token(provider, runtime_paths, connect_token) is not None
+
+
+def test_cancelled_authorization_page_says_so(tmp_path: Path) -> None:
+    runtime_paths = _runtime_paths(tmp_path)
+    api_app = _make_test_app(runtime_paths, _config_payload())
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            response = client.get(f"/api/oauth/{provider.id}/callback?error=access_denied")
+
+    assert "<h1>Authorization cancelled</h1>" in response.text
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    ["Call+555-0100+to+fix+your+account", "%3Cscript%3Ealert(1)%3C/script%3E", "access_denied%0Aextra", "A" * 80],
+)
+def test_provider_error_text_is_never_echoed_into_the_page(tmp_path: Path, provider_error: str) -> None:
+    """Only a plain OAuth error code appears on the page, so a crafted callback link cannot show its own text."""
+    runtime_paths = _runtime_paths(tmp_path)
+    api_app = _make_test_app(runtime_paths, _config_payload())
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            response = client.get(f"/api/oauth/{provider.id}/callback?error={provider_error}")
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("text/html")
+    assert "555-0100" not in response.text
+    assert "alert(1)" not in response.text
+    assert "extra" not in response.text
+    assert "A" * 80 not in response.text
+    assert "OAuth provider returned an error" in response.text
+
+
 def test_callback_stores_credentials_in_scoped_target(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths(
         tmp_path,
@@ -3246,12 +3366,11 @@ async def test_callback_hides_provider_controlled_exchange_error(
         },
     )
 
-    with pytest.raises(HTTPException) as raised:
-        await oauth_api.callback(provider.id, request)
+    response = await oauth_api.callback(provider.id, request)
 
-    assert raised.value.status_code == 400
-    assert raised.value.detail == "OAuth callback could not be completed"
-    assert "provider-controlled-callback-secret" not in str(raised.value.detail)
+    assert response.status_code == 400
+    assert "OAuth callback could not be completed" in bytes(response.body).decode()
+    assert "provider-controlled-callback-secret" not in bytes(response.body).decode()
 
 
 @pytest.mark.parametrize(
@@ -4683,7 +4802,7 @@ def test_agent_connect_token_rejects_generation_changed_after_link_issuance(tmp_
             )
 
     assert response.status_code == 409
-    assert "fresh connection link from the conversation" in response.json()["detail"]
+    assert "fresh connection link from the conversation" in _error_detail(response)
 
 
 def test_agent_connect_token_callback_rejects_generation_changed_after_authorize(tmp_path: Path) -> None:
@@ -5389,7 +5508,7 @@ def test_connect_token_binding_setup_error_returns_503(
             )
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "OAuth authorization could not be started"}
+    assert "OAuth authorization could not be started" in _error_detail(response)
     assert "provider-controlled-connect-secret" not in response.text
 
 
@@ -5416,7 +5535,7 @@ def test_connect_token_rejects_tampered_agent_name(tmp_path: Path) -> None:
             )
 
     assert response.status_code == 400
-    assert "target" in response.json()["detail"]
+    assert "target" in _error_detail(response)
 
 
 def test_connect_token_rejects_tampered_execution_scope(tmp_path: Path) -> None:
@@ -5442,7 +5561,7 @@ def test_connect_token_rejects_tampered_execution_scope(tmp_path: Path) -> None:
             )
 
     assert response.status_code == 400
-    assert "target" in response.json()["detail"]
+    assert "target" in _error_detail(response)
 
 
 def test_connect_token_rejects_omitted_target_params(tmp_path: Path) -> None:
@@ -5467,7 +5586,7 @@ def test_connect_token_rejects_omitted_target_params(tmp_path: Path) -> None:
             )
 
     assert response.status_code == 400
-    assert "target" in response.json()["detail"]
+    assert "target" in _error_detail(response)
 
 
 def test_agent_connect_token_rejects_different_authenticated_requester(tmp_path: Path) -> None:
@@ -5583,7 +5702,7 @@ def test_callback_rejects_wrong_provider_state(tmp_path: Path) -> None:
             )
 
     assert callback_response.status_code == 400
-    assert "does not match" in callback_response.json()["detail"]
+    assert "does not match" in _error_detail(callback_response)
 
 
 @pytest.mark.parametrize("binding", ["changed", "missing"])
@@ -5623,7 +5742,7 @@ def test_callback_exchanges_code_only_at_token_endpoint_bound_during_connect(tmp
         callback_response = client.get(f"/api/oauth/{provider.id}/callback?code=test-code&state={state}")
 
     assert callback_response.status_code == 400
-    assert callback_response.json()["detail"] == "OAuth callback could not be completed"
+    assert "OAuth callback could not be completed" in _error_detail(callback_response)
     assert _stored_oauth_credentials(provider, runtime_paths, worker_scope="shared") is None
 
 
@@ -5717,7 +5836,7 @@ def test_callback_rejects_unverified_email_domain_claim(tmp_path: Path) -> None:
             )
 
     assert callback_response.status_code == 400
-    assert "email ownership" in callback_response.json()["detail"]
+    assert "email ownership" in _error_detail(callback_response)
 
 
 def test_status_and_disconnect_use_same_scoped_target(tmp_path: Path) -> None:

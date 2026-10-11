@@ -330,6 +330,7 @@ _OAuthTokenExchanger = Callable[
     OAuthTokenResult | Awaitable[OAuthTokenResult],
 ]
 _OAuthClaimValidator = Callable[[_OAuthClaimValidationContext], None]
+_OAuthAccountClaimsReader = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 _OAuthRuntimeBootstrapper = Callable[["OAuthProvider", "RuntimePaths"], Awaitable[OAuthRuntimeEndpoints]]
 
 
@@ -597,6 +598,11 @@ class OAuthProvider:
     token_exchanger: _OAuthTokenExchanger | None = None
     claim_validator: _OAuthClaimValidator | None = None
     runtime_bootstrapper: _OAuthRuntimeBootstrapper | None = None
+    # Reads verified account claims with the token a standard code exchange just returned, for a provider whose
+    # token response carries none (GitHub's login). It runs once per connection and never on refresh, which keeps
+    # the claims already stored. It is best effort: it returns no claims instead of raising, and a failed read
+    # leaves the connection without them.
+    account_claims_reader: _OAuthAccountClaimsReader | None = None
 
     def __post_init__(self) -> None:
         """Validate provider identifiers and redirect path shape."""
@@ -923,6 +929,14 @@ class OAuthProvider:
         parser = self.token_parser or _default_token_parser
         token_response = dict(token_response)
         result = await asyncio.to_thread(parser, self, token_response, client_config, runtime_paths)
+        if self.account_claims_reader is not None and not result.claims:
+            account_claims = await asyncio.to_thread(self.account_claims_reader, result.token_data)
+            if account_claims:
+                result = OAuthTokenResult(
+                    token_data=result.token_data,
+                    claims=dict(account_claims),
+                    claims_verified=True,
+                )
         return _token_result_with_core_metadata(
             self,
             result,

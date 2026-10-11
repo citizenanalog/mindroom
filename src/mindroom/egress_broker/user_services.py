@@ -75,10 +75,9 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 # command, file, directory, helper, provider, or options setting, and no name may start with SSH_, because tools read
 # such variables as programs or paths to run or load (RESTIC_PASSWORD_COMMAND, SOPS_AGE_KEY_CMD, SSH_AUTH_SOCK).
 _PLACEHOLDER_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
-_PLACEHOLDER_NAME_WORDS = frozenset({"TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL"})
-_PLACEHOLDER_REFUSED_WORDS = frozenset(
-    {"COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS"},
-)
+# Tuples keep the order the error messages list the words in.
+_PLACEHOLDER_NAME_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL")
+_PLACEHOLDER_REFUSED_WORDS = ("COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS")
 _PLACEHOLDER_REFUSED_PREFIX = "SSH_"
 _PLACEHOLDER_VALUE = re.compile(r"[A-Za-z0-9._:-]{1,256}")
 
@@ -298,23 +297,29 @@ def _personal_scope(target: ResolvedWorkerTarget | None) -> bool:
     return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
 
 
+def _word_list(words: tuple[str, ...]) -> str:
+    """Join words as `A, B, or C`."""
+    return f"{', '.join(words[:-1])}, or {words[-1]}"
+
+
 def _placeholder_error(variable: str, value: str) -> str | None:
-    """Return why a user service may not set this placeholder, never quoting the value; None when it may."""
-    words = variable.split("_")
-    if not _PLACEHOLDER_NAME.fullmatch(variable) or _PLACEHOLDER_NAME_WORDS.isdisjoint(words):
-        allowed = ", ".join(sorted(_PLACEHOLDER_NAME_WORDS))
+    """Return why a user service may not set this placeholder, never quoting the value; None when it may.
+
+    The texts are the ones the Connections editor shows beside the field.
+    """
+    words = set(variable.split("_"))
+    if not _PLACEHOLDER_NAME.fullmatch(variable) or words.isdisjoint(_PLACEHOLDER_NAME_WORDS):
         return (
-            f"placeholder_env name '{variable}' must match ^[A-Z][A-Z0-9_]*$ and have one of these words "
-            f"between underscores: {allowed}"
+            f"{variable} is not allowed as a placeholder: name a credential, such as MY_API_KEY, "
+            f"with {_word_list(_PLACEHOLDER_NAME_WORDS)} as one of its words."
         )
-    if variable.startswith(_PLACEHOLDER_REFUSED_PREFIX) or not _PLACEHOLDER_REFUSED_WORDS.isdisjoint(words):
-        refused = ", ".join(sorted(_PLACEHOLDER_REFUSED_WORDS))
+    if variable.startswith(_PLACEHOLDER_REFUSED_PREFIX) or not words.isdisjoint(_PLACEHOLDER_REFUSED_WORDS):
         return (
-            f"placeholder_env name '{variable}' may not start with {_PLACEHOLDER_REFUSED_PREFIX} or have any of "
-            f"these words between underscores, which tools read as programs or paths: {refused}"
+            f"{variable} is not allowed: tools read names with {_word_list(_PLACEHOLDER_REFUSED_WORDS)}, "
+            f"or starting with {_PLACEHOLDER_REFUSED_PREFIX}, as programs or paths."
         )
     if not _PLACEHOLDER_VALUE.fullmatch(value):
-        return f"placeholder_env value of '{variable}' must be 1 to 256 characters from A-Z, a-z, 0-9, and . _ : -"
+        return f"The value of {variable} must be 1 to 256 letters, digits, or . _ : -"
     return None
 
 

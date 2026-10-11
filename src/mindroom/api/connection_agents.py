@@ -70,10 +70,9 @@ class ConnectionUserContext:
 
     @property
     def visible_agent_names(self) -> tuple[str, ...]:
-        """Show agents the user can execute or whose credentials they can manage."""
+        """Show agents the user can execute or whose credentials they can manage, in config declaration order."""
         eligible = set(self.agent_names) | set(self.credential_agent_names)
-        personal = (self.personal_agent_name,) if self.personal_agent_name is not None else ()
-        return personal + tuple(name for name in self.config.agents if name in eligible and name not in personal)
+        return tuple(name for name in self.config.agents if name in eligible)
 
 
 def resolve_connection_user(

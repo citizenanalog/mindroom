@@ -164,6 +164,9 @@ These rules apply to built-in providers and to providers that plugins register (
 - `pkce_code_challenge_method="S256"` enables PKCE; a custom `token_exchanger` receives `(provider, code, client_config, runtime_paths, code_verifier)` so it can send the verifier.
 - `allowed_email_domains`, `allowed_hosted_domains`, and a custom `claim_validator` restrict which accounts may connect.
   If a restriction cannot be checked from the provider's verified claims, the connection fails and nothing is saved.
+- `account_claims_reader` (callable, default `None`) takes the token data of a finished code exchange and returns verified account claims, such as `{"login": "octo"}`, for a provider whose token response names no account.
+  It runs once per connection and never on refresh, which keeps the stored claims, and it must return `{}` instead of raising: a failed read still connects the account, without a label.
+  The Connections pages show the claim `email`, else `login`, as the connected account; the built-in GitHub provider reads its login this way.
 
 ### Troubleshooting OAuth Connections
 

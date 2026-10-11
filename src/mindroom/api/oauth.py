@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, replace
 from html import escape
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -54,6 +55,7 @@ from mindroom.oauth.credential_lifecycle import (
     exchange_and_store_oauth_credentials,
     load_oauth_credentials_snapshot,
     load_oauth_credentials_status,
+    oauth_account_label,
     oauth_credentials_usable,
     oauth_verified_claim,
     refresh_oauth_credentials,
@@ -131,6 +133,7 @@ class OAuthStatusResponse(BaseModel):
     has_service_account_config: bool = False
     reset_required: bool = False
     email: str | None = None
+    account_label: str | None = None
     hosted_domain: str | None = None
     capabilities: list[str] = Field(default_factory=list)
 
@@ -558,22 +561,113 @@ def _script_json(value: object) -> str:
     return json.dumps(value).replace("</", "<\\/")
 
 
-def _oauth_browser_error_response(message: str, *, status_code: int) -> HTMLResponse:
-    """Render a browser-readable OAuth error without exposing a raw API payload."""
-    title = "OAuth connection changed" if status_code == 409 else "OAuth reset unavailable"
-    escaped_message = escape(message)
+_OAUTH_PAGE_STYLE = """
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f4f5f7;
+        color: #1b1f24;
+        font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      main {
+        box-sizing: border-box;
+        width: min(26rem, calc(100% - 2rem));
+        padding: 1.5rem;
+        border: 1px solid #d8dce1;
+        border-top: 4px solid var(--accent);
+        border-radius: 0.75rem;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+      }
+      main.success { --accent: #1a7f37; }
+      main.error { --accent: #c62828; }
+      h1 { margin: 0 0 0.5rem; font-size: 1.25rem; }
+      p { margin: 0 0 1.25rem; overflow-wrap: anywhere; }
+      button {
+        padding: 0.5rem 1rem;
+        border: 0;
+        border-radius: 0.5rem;
+        background: #1b1f24;
+        color: #fff;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      @media (prefers-color-scheme: dark) {
+        body { background: #14171a; color: #e8eaed; }
+        main { border-color: #333a42; background: #1e2227; box-shadow: none; }
+        button { background: #e8eaed; color: #14171a; }
+      }
+"""
+
+
+def _oauth_browser_page(
+    title: str,
+    message: str,
+    *,
+    tone: Literal["success", "error"],
+    status_code: int = 200,
+    script: str = "",
+) -> HTMLResponse:
+    """Render one browser-facing OAuth page: a titled message and a button that closes the popup."""
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en">
-  <head><meta charset="utf-8"><title>{title}</title></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{escape(title)}</title>
+    <style>{_OAUTH_PAGE_STYLE}    </style>
+  </head>
   <body>
-    <h1>{title}</h1>
-    <p>{escaped_message}</p>
+    <main class="{tone}">
+      <h1>{escape(title)}</h1>
+      <p>{escape(message)}</p>
+      <button type="button" id="close-window">Close window</button>
+    </main>
+    <script>
+      document.getElementById("close-window").addEventListener("click", () => window.close());{script}
+    </script>
   </body>
 </html>""",
         status_code=status_code,
         headers=_OAUTH_BROWSER_SECURITY_HEADERS,
     )
+
+
+def _oauth_browser_error_response(message: str, *, status_code: int, title: str | None = None) -> HTMLResponse:
+    """Render a browser-readable OAuth error without exposing a raw API payload.
+
+    Without a `title`, the page is a reset or conflict page: 409 means the connection changed under the request.
+    """
+    if title is None:
+        title = "OAuth connection changed" if status_code == 409 else "OAuth reset unavailable"
+    return _oauth_browser_page(title, message, tone="error", status_code=status_code)
+
+
+def _oauth_flow_error_response(exc: HTTPException) -> HTMLResponse:
+    """Show a refusal of the browser's own OAuth step (authorize or callback) as a page for the popup.
+
+    A 404 means the provider in the URL is unknown, and the page never repeats text from the URL.
+    """
+    title = "OAuth connection changed" if exc.status_code == 409 else "Account connection failed"
+    message = "Unknown OAuth provider." if exc.status_code == 404 else str(exc.detail)
+    return _oauth_browser_error_response(message, status_code=exc.status_code, title=title)
+
+
+_OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,64}")
+
+
+def _oauth_provider_error_response(error: str) -> HTMLResponse:
+    """Show the provider's own `error` for the callback; only a plain OAuth error code is repeated, never free text."""
+    code = error if _OAUTH_ERROR_CODE.fullmatch(error) else None
+    message = "OAuth provider returned an error" + (f": {code}" if code else "") + ". Nothing was connected."
+    title = "Authorization cancelled" if code == "access_denied" else "Account connection failed"
+    return _oauth_browser_error_response(message, status_code=400, title=title)
 
 
 def _oauth_success_origin(provider: OAuthProvider, runtime_paths: RuntimePaths) -> str:
@@ -596,8 +690,25 @@ async def authorize(
     request: Request,
     agent_name: str | None = None,
     connect_token: str | None = None,
-) -> RedirectResponse:
-    """Start a provider OAuth flow from a browser-openable MindRoom URL."""
+) -> Response:
+    """Start a provider OAuth flow from a browser-openable MindRoom URL.
+
+    The browser opens this URL, so a refusal (an unknown, expired, or foreign connect link) is a page it can show,
+    with the same status as the JSON error would have had.
+    """
+    try:
+        return await _authorize(provider_id, request, agent_name=agent_name, connect_token=connect_token)
+    except HTTPException as exc:
+        return _oauth_flow_error_response(exc)
+
+
+async def _authorize(
+    provider_id: str,
+    request: Request,
+    *,
+    agent_name: str | None,
+    connect_token: str | None,
+) -> Response:
     provider, runtime_paths = _load_provider(request, provider_id)
     connect_target = None
     if connect_token:
@@ -771,31 +882,23 @@ async def success(provider_id: str, request: Request) -> HTMLResponse:
 
 
 def _oauth_success_response(provider: OAuthProvider) -> HTMLResponse:
-    """Render a browser-readable OAuth completion response."""
+    """Render a browser-readable OAuth completion response that also tells the popup's opener."""
     message = {
         "type": _OAUTH_COMPLETE_MESSAGE_TYPE,
         "provider": provider.id,
         "status": "connected",
     }
-    escaped_display_name = escape(provider.display_name)
-    html = f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <title>{escaped_display_name} connected</title>
-  </head>
-  <body>
-    <p>{escaped_display_name} is connected. You can close this window.</p>
-    <script>
+    return _oauth_browser_page(
+        f"{provider.display_name} connected",
+        f"{provider.display_name} is connected. You can close this window.",
+        tone="success",
+        script=f"""
       const message = {_script_json(message)};
       if (window.opener && !window.opener.closed) {{
         window.opener.postMessage(message, "*");
       }}
-      window.close();
-    </script>
-  </body>
-</html>"""
-    return HTMLResponse(html)
+      window.close();""",
+    )
 
 
 async def _store_callback_credentials(
@@ -890,11 +993,21 @@ async def _complete_oauth_callback(
 
 @router.get("/{provider_id}/callback")
 async def callback(provider_id: str, request: Request) -> Response:
-    """Handle a provider OAuth callback and store scoped credentials."""
+    """Handle a provider OAuth callback and store scoped credentials.
+
+    The provider sends the browser here, so every refusal, a cancelled authorization included, is a page the popup
+    can show, with the same status as the JSON error would have had.
+    """
     error = request.query_params.get("error")
     if error:
-        raise HTTPException(status_code=400, detail=f"OAuth provider returned an error: {error}")
+        return _oauth_provider_error_response(error)
+    try:
+        return await _handle_callback(provider_id, request)
+    except HTTPException as exc:
+        return _oauth_flow_error_response(exc)
 
+
+async def _handle_callback(provider_id: str, request: Request) -> Response:
     code = request.query_params.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="No authorization code received")
@@ -966,14 +1079,16 @@ def personal_connection_view(result: OAuthStatusResponse, *, can_manage: bool) -
     """Mask a provider status for a viewer; the Connections portal and the egress pages share this view.
 
     Shared service accounts are runtime configuration, never a personal account: managers see no connection to
-    manage and users see the service as connected. Only managers may connect and see the account.
+    manage and users see the service as connected. Only managers may connect. Everyone who uses the agent sees the
+    connected account, since they all act as it; a requester-scoped account is only ever read from the viewer's
+    own connection, and the broker refuses it on shared agents.
     """
     personal = not result.has_service_account_config
     return PersonalConnectionView(
         connected=result.connected and (personal or not can_manage),
         can_connect=result.has_client_config and personal and can_manage,
         reset_required=result.reset_required,
-        account_label=result.email if personal and can_manage else None,
+        account_label=result.account_label if personal else None,
     )
 
 
@@ -1040,6 +1155,7 @@ async def connection_status(
         has_service_account_config=has_service_account_config,
         reset_required=credential_status.reset_required,
         email=oauth_verified_claim(credentials, "email"),
+        account_label=oauth_account_label(credentials),
         hosted_domain=oauth_verified_claim(credentials, "hd"),
         capabilities=list(provider.status_capabilities),
     )

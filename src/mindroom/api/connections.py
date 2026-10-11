@@ -20,6 +20,7 @@ from mindroom.api.connection_agents import (
     resolve_connection_user,
 )
 from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
+from mindroom.authorization import is_platform_administrator
 from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
 from mindroom.matrix.users import create_agent_http_client
@@ -89,6 +90,14 @@ class ConnectionStatus(BaseModel):
     can_connect: bool
     reset_required: bool
     account_label: str | None
+
+
+class ConnectionsIdentity(BaseModel):
+    """Who the Connections pages are open for, and whether the administrator dashboard is open to them too."""
+
+    matrix_user_id: str
+    email: str | None
+    is_administrator: bool
 
 
 class _EmptyMutation(BaseModel):
@@ -218,6 +227,28 @@ def _require_same_origin(request: Request, context: _Connections) -> None:
     require_connections_same_origin(request, context.runtime_paths)
 
 
+@router.get("/me")
+async def me(request: Request, response: Response) -> ConnectionsIdentity:
+    """Return the signed-in identity for the Connections pages' header.
+
+    Any signed user gets an answer, with or without agents or the portal agent setting, so both pages can show
+    "Signed in as" and link the dashboard to administrators.
+    """
+    response.headers.update(CONNECTIONS_HEADERS)
+    auth_user = await require_connections_user(request)
+    if request.query_params:
+        raise HTTPException(400, "Query parameters are not accepted", headers=CONNECTIONS_HEADERS)
+    snapshot = config_lifecycle.bind_current_request_snapshot(request)
+    matrix_user_id = cast("str", auth_user["matrix_user_id"])
+    email = auth_user.get("email")
+    return ConnectionsIdentity(
+        matrix_user_id=matrix_user_id,
+        email=email if isinstance(email, str) and email else None,
+        is_administrator=snapshot.runtime_config is not None
+        and is_platform_administrator(matrix_user_id, snapshot.runtime_config, snapshot.runtime_paths),
+    )
+
+
 @router.get("")
 async def catalog(request: Request, context: _ConnectionsContext) -> ConnectionsCatalog:
     """List allowed services; the status of their accounts is loaded per card, not here.
@@ -250,24 +281,33 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
     return ConnectionsCatalog(agents=agents)
 
 
+def _no_avatar() -> Response:
+    """Answer 204 for an agent without a usable avatar, so the browser logs no failed image request."""
+    return Response(status_code=204, headers=CONNECTIONS_HEADERS)
+
+
 @router.get("/agents/{agent_name}/avatar")
 async def avatar(agent_name: str, user: _ConnectionUserContext) -> Response:
-    """Serve a visible agent's current Matrix thumbnail without exposing its token."""
+    """Serve a visible agent's current Matrix thumbnail without exposing its token.
+
+    An agent with no avatar to show gets 204: it has no Matrix account yet, no profile picture, or one that is
+    not a usable raster image. Matrix failing to answer is a 502.
+    """
     if agent_name not in user.visible_agent_names:
         raise HTTPException(404, "Agent is not available", headers=CONNECTIONS_HEADERS)
     try:
         client = create_agent_http_client(agent_name, user.runtime_paths)
-    except ValueError as exc:
-        raise HTTPException(404, "Avatar is not available", headers=CONNECTIONS_HEADERS) from exc
+    except ValueError:
+        return _no_avatar()
     try:
         async with asyncio.timeout(5):
             profile = await client.get_profile(client.user_id)
             avatar_url = matrix_profile_avatar_uri(profile)
             if not avatar_url:
-                raise HTTPException(404, "Avatar is not available", headers=CONNECTIONS_HEADERS)
+                return _no_avatar()
             thumbnail = await fetch_matrix_thumbnail(client, avatar_url)
             if thumbnail is None:
-                raise HTTPException(404, "Avatar is not available", headers=CONNECTIONS_HEADERS)
+                return _no_avatar()
             body, content_type = thumbnail
             return Response(
                 body,
@@ -276,8 +316,8 @@ async def avatar(agent_name: str, user: _ConnectionUserContext) -> Response:
             )
     except (ClientError, MatrixMediaUpstreamError, TimeoutError) as exc:
         raise HTTPException(502, "Avatar is temporarily unavailable", headers=CONNECTIONS_HEADERS) from exc
-    except ValueError as exc:
-        raise HTTPException(404, "Avatar is not available", headers=CONNECTIONS_HEADERS) from exc
+    except ValueError:
+        return _no_avatar()
     finally:
         await client.close()
 

@@ -944,7 +944,25 @@ def _require_connections_route_authorized(
         and is_platform_administrator(matrix_user_id, snapshot.runtime_config, snapshot.runtime_paths)
     ):
         return
+    if _is_browser_page_request(request):
+        # A user who opens a dashboard page lands on their own page instead of a JSON refusal.
+        raise HTTPException(
+            status_code=303,
+            detail="Administrator access required",
+            headers={"Location": "/connections"},
+        )
     raise HTTPException(status_code=403, detail="Administrator access required")
+
+
+def _is_browser_page_request(request: Request) -> bool:
+    """Recognize a browser loading a page: a GET that accepts HTML, outside the API."""
+    path = request.scope["path"]
+    return (
+        request.method == "GET"
+        and "text/html" in request.headers.get("accept", "").lower()
+        and path != "/api"
+        and not path.startswith("/api/")
+    )
 
 
 async def require_connections_user(request: Request) -> dict[str, Any]:

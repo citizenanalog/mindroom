@@ -19,8 +19,8 @@ from mindroom.logging_config import get_logger
 from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialUnreadableError,
     load_oauth_credentials_snapshot_sync,
+    oauth_account_label,
     oauth_credentials_usable,
-    oauth_verified_claim,
     refresh_oauth_credentials_blocking,
     resolve_oauth_credential_context,
 )
@@ -197,7 +197,7 @@ def oauth_status(
         provider=provider.id,
         display_name=provider.display_name,
         connected=connected,
-        account_label=oauth_verified_claim(credentials, "email") if connected and credentials else None,
+        account_label=oauth_account_label(credentials) if connected and credentials else None,
         can_connect=_connectable(provider, runtime_paths),
         reset_required=reset_required,
         service_account=oauth_provider_service_account_configured(provider, runtime_paths),

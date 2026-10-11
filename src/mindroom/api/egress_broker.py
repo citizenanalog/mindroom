@@ -288,12 +288,14 @@ async def disconnect_service_account(
 @router.get("/logs", response_model=AuditLogsResponse)
 def get_logs(
     agent_name: Annotated[str | None, Query()] = None,
+    requester: Annotated[str | None, Query()] = None,
     host: Annotated[str | None, Query()] = None,
     service: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
 ) -> AuditLogsResponse:
     """Query egress broker request audit logs.
 
+    Every row carries `requester_id`, the requester the worker token named, and `requester` matches it exactly.
     Returns 409 if the broker is not running.
     """
     audit = active_audit_log()
@@ -302,6 +304,7 @@ def get_logs(
 
     records = audit.query(
         agent_name=agent_name,
+        requester_id=requester,
         host=host,
         service=service,
         limit=limit,

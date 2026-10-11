@@ -6439,6 +6439,7 @@ expose = [
     "load_oauth_credentials_snapshot_sync",
     "load_oauth_credentials_status",
     "load_oauth_reset_connection_generation",
+    "oauth_account_label",
     "oauth_credential_generation",
     "oauth_credentials_have_required_scopes",
     "oauth_credentials_have_scopes",

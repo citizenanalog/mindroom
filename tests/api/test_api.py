@@ -5681,7 +5681,9 @@ def test_api_key_keeps_oauth_callbacks_open(
 
     response = api_key_client.get(path)
     assert response.status_code == 400
-    assert "OAuth state is invalid or expired" in response.json()["detail"]
+    # The generic OAuth callback answers the popup with a page; the older integration callbacks answer JSON.
+    body = response.text if path.startswith("/api/oauth/") else response.json()["detail"]
+    assert "OAuth state is invalid or expired" in body
 
 
 _PLATFORM_SSO_SECRET = "instance-platform-sso-secret-for-tests-0001"  # noqa: S105

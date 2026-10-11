@@ -514,10 +514,53 @@ def test_stored_oauth_provider_is_ignored_outside_personal_scopes(manager: Crede
 )
 def test_placeholder_names_must_be_credential_words(manager: CredentialsManager, variable: str) -> None:
     """A user placeholder needs a credential word between underscores, so loader and shell variables are refused."""
-    with pytest.raises(ValueError, match="placeholder_env name"):
+    with pytest.raises(ValueError, match=f"^{variable} is not allowed as a placeholder: name a credential"):
         _save(manager, _target(), "mine", _service(placeholder_env={variable: "mindroom-brokered"}))
 
     assert load_user_services(manager, _target()) == {}
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    [
+        (
+            "LD_PRELOAD",
+            "mindroom-brokered",
+            "LD_PRELOAD is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, "
+            "SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
+        ),
+        (
+            "_GH_TOKEN",
+            "mindroom-brokered",
+            "_GH_TOKEN is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, "
+            "SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
+        ),
+        (
+            "SSH_AUTH_SOCK",
+            "mindroom-brokered",
+            "SSH_AUTH_SOCK is not allowed: tools read names with COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, "
+            "OPTIONS, or EXTENSIONS, or starting with SSH_, as programs or paths.",
+        ),
+        (
+            "RESTIC_PASSWORD_COMMAND",
+            "mindroom-brokered",
+            "RESTIC_PASSWORD_COMMAND is not allowed: tools read names with COMMAND, CMD, FILE, DIR, PROVIDER, "
+            "HELPER, OPTS, OPTIONS, or EXTENSIONS, or starting with SSH_, as programs or paths.",
+        ),
+        ("GH_TOKEN", "two words", "The value of GH_TOKEN must be 1 to 256 letters, digits, or . _ : -"),
+    ],
+)
+def test_placeholder_messages_follow_the_spec(
+    manager: CredentialsManager,
+    variable: str,
+    value: str,
+    message: str,
+) -> None:
+    """The three refusals read exactly as spec 12.4 words them, and never quote the value."""
+    with pytest.raises(ValueError) as raised:  # noqa: PT011
+        _save(manager, _target(), "mine", _service(placeholder_env={variable: value}))
+
+    assert str(raised.value) == message
 
 
 def test_credential_placeholder_names_are_accepted(manager: CredentialsManager) -> None:
@@ -531,7 +574,7 @@ def test_credential_placeholder_names_are_accepted(manager: CredentialsManager) 
 @pytest.mark.parametrize("value", ["", "two words", "a/b", "x" * 257, "$(id)", "semi;colon", "pa\tss"])
 def test_placeholder_values_must_be_plain(manager: CredentialsManager, value: str) -> None:
     """A user placeholder value is 1 to 256 plain characters; the error never quotes it."""
-    with pytest.raises(ValueError, match="placeholder_env value of 'GH_TOKEN'") as raised:
+    with pytest.raises(ValueError, match=r"^The value of GH_TOKEN must be 1 to 256 letters") as raised:
         _save(manager, _target(), "mine", _service(placeholder_env={"GH_TOKEN": value}))
 
     if value:
@@ -658,7 +701,7 @@ def test_reordered_config_is_merged_again_so_ties_follow_the_new_order(manager: 
 )
 def test_placeholder_names_that_tools_run_or_load_are_refused(manager: CredentialsManager, variable: str) -> None:
     """Credential-looking names that tools read as a program, path, or options are refused, and so is SSH_*."""
-    with pytest.raises(ValueError, match=f"placeholder_env name '{variable}' may not"):
+    with pytest.raises(ValueError, match=f"^{variable} is not allowed: tools read names with"):
         _save(manager, _target(), "mine", _service(placeholder_env={variable: "mindroom-brokered"}))
 
     assert load_user_services(manager, _target()) == {}

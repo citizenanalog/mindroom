@@ -8,12 +8,15 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import jwt
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from structlog.testing import capture_logs
 
 from mindroom.api import connections, egress_credentials, egress_status, main, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
@@ -24,7 +27,9 @@ from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.oauth_source import Token, resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.oauth import credential_store as oauth_credential_store
+from mindroom.oauth import github as github_oauth
 from mindroom.oauth import registry as oauth_registry
+from mindroom.oauth.github import LOGIN_LOOKUP_TIMEOUT_SECONDS, github_oauth_provider
 from tests.api.test_api import (
     _trusted_upstream_jwks,
     _trusted_upstream_jwt,
@@ -207,6 +212,111 @@ def test_lists_only_usable_shell_or_python_agents(egress_portal: dict[str, Any])
     assert agent_names == {"personal", "shared_dev"}
     assert all(len(a["services"]) == 2 for a in response.json()["agents"])
     assert all(s["name"] in ("github", "openai") for a in response.json()["agents"] for s in a["services"])
+
+
+def _agent_rows(response: Any, key: str = "agent_name") -> list[str]:  # noqa: ANN401
+    assert response.status_code == 200, response.text
+    return [agent[key] for agent in response.json()["agents"]]
+
+
+def test_listing_reports_scope_scope_agents_and_managers(egress_portal: dict[str, Any]) -> None:
+    """Every listed agent says how its keys are shared: its scope, the agents of the same store, and who manages it."""
+    portal = egress_portal
+    agents = portal["payload"]["agents"]
+    for name, display_name in (("notes", "Notes"), ("journal", "Journal")):
+        agents[name] = {
+            "display_name": display_name,
+            "role": "Private helper",
+            "tools": ["shell"],
+            "private": {"per": "user"},
+            "access": {"users": ["@alice:example.org"]},
+        }
+    agents["team"] = {
+        "display_name": "Team",
+        "role": "Team agent without a worker scope",
+        "tools": ["shell"],
+        "credential_managers": ["@alice:example.org"],
+        "access": {"users": ["@alice:example.org", "@bob:example.org"]},
+    }
+    _publish_config(main.app, portal["paths"], portal["payload"])
+    _use_runtime_auth_settings(main.app)
+
+    response = portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"])
+
+    assert response.status_code == 200, response.text
+    rows = {agent["agent_name"]: agent for agent in response.json()["agents"]}
+    assert {name: (row["scope"], row["scope_agents"], row["managers"]) for name, row in rows.items()} == {
+        "personal": ("user_agent", [], []),
+        "notes": ("user", ["Notes", "Journal"], []),
+        "journal": ("user", ["Notes", "Journal"], []),
+        "shared_dev": ("shared", [], ["@bob:example.org", "@carol:example.org"]),
+        "team": ("unscoped", [], ["@alice:example.org"]),
+    }
+    assert rows["team"]["shared"] is True
+    bob_rows = {
+        agent["agent_name"]: agent
+        for agent in portal["client"].get("/api/connections/egress", headers=portal["headers"]["bob"]).json()["agents"]
+    }
+    # Another user's personal agents are neither listed nor named, and a manager list is the same for every user.
+    assert "notes" not in bob_rows
+    assert bob_rows["team"]["managers"] == ["@alice:example.org"]
+    assert bob_rows["personal"]["scope_agents"] == []
+
+
+def test_scope_agents_name_only_the_requesters_agents_that_can_use_the_store(egress_portal: dict[str, Any]) -> None:
+    """An agent without a shell never uses brokered keys, and one the requester may not use is not theirs."""
+    portal = egress_portal
+    agents = portal["payload"]["agents"]
+    agents["notes"] = {
+        "display_name": "Notes",
+        "role": "Private helper",
+        "tools": ["shell"],
+        "private": {"per": "user"},
+        "access": {"users": ["@alice:example.org"]},
+    }
+    agents["calc"] = {
+        "display_name": "Calc",
+        "role": "Private helper without a shell",
+        "tools": ["calculator"],
+        "private": {"per": "user"},
+        "access": {"users": ["@alice:example.org"]},
+    }
+    agents["bobs"] = {
+        "display_name": "Bobs",
+        "role": "Private helper of Bob",
+        "tools": ["shell"],
+        "private": {"per": "user"},
+        "access": {"users": ["@bob:example.org"]},
+    }
+    _publish_config(main.app, portal["paths"], portal["payload"])
+    _use_runtime_auth_settings(main.app)
+
+    response = portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"])
+
+    notes = next(agent for agent in response.json()["agents"] if agent["agent_name"] == "notes")
+    assert notes["scope_agents"] == ["Notes"]
+
+
+def test_agents_keep_config_order(egress_portal: dict[str, Any]) -> None:
+    """Both pages list agents in the order the config declares them, whatever keys are set."""
+    portal = egress_portal
+    agents = portal["payload"]["agents"]
+    portal["payload"]["agents"] = {"shared_dev": agents["shared_dev"], **agents}
+    _publish_config(main.app, portal["paths"], portal["payload"])
+    _use_runtime_auth_settings(main.app)
+    client, alice, bob = portal["client"], portal["headers"]["alice"], portal["headers"]["bob"]
+
+    listed = _agent_rows(client.get("/api/connections/egress", headers=alice))
+    catalog = _agent_rows(client.get("/api/connections", headers=alice))
+    assert listed == ["shared_dev", "personal"]
+    assert catalog == ["shared_dev", "personal"]
+
+    # Setting a key on the agent declared second, then on the first, never reorders either page.
+    for agent in ("personal", "shared_dev"):
+        put = client.put(f"/api/connections/egress/agents/{agent}/github", json={"secret": "k"}, headers=bob)
+        assert put.status_code == 204, put.text
+        assert _agent_rows(client.get("/api/connections/egress", headers=alice)) == listed
+        assert _agent_rows(client.get("/api/connections", headers=alice)) == catalog
 
 
 def test_requester_sets_own_user_agent_secret(egress_portal: dict[str, Any]) -> None:
@@ -638,7 +748,7 @@ def test_disconnect_clears_only_the_callers_connection(oauth_egress_portal: dict
 
 
 def test_shared_agent_connection_is_managed_but_visible_to_users(oauth_egress_portal: dict[str, Any]) -> None:
-    """Users of a shared agent see that it is connected, while its account and connect action stay with managers."""
+    """Users of a shared agent see that it is connected and as whom, while the connect action stays with managers."""
     portal = oauth_egress_portal
     _connect_account(portal, "bob", "shared_dev", "drive", "google_drive")
 
@@ -648,8 +758,132 @@ def test_shared_agent_connection_is_managed_but_visible_to_users(oauth_egress_po
     assert manager["can_connect"] is True
     user = _egress_row(portal, "alice", "shared_dev", "drive")["oauth"]
     assert user["connected"] is True
-    assert user["account_label"] is None
+    assert user["account_label"] == "alice@example.com"
     assert user["can_connect"] is False
+
+
+def test_shared_agent_account_label_is_visible_to_every_user(oauth_egress_portal: dict[str, Any]) -> None:
+    """Everyone who uses a shared agent sees which account they act as, on both pages."""
+    portal = oauth_egress_portal
+    _connect_account(portal, "bob", "shared_dev", "drive", "google_drive")
+
+    for user in ("alice", "bob"):
+        assert _egress_row(portal, user, "shared_dev", "drive")["oauth"]["account_label"] == "alice@example.com"
+        assert _portal_oauth_view(portal, user, "shared_dev")["account_label"] == "alice@example.com"
+    # The label belongs to the agent's own store: nobody's other agent shows it.
+    assert _egress_row(portal, "alice", "personal", "drive")["oauth"]["account_label"] is None
+
+
+def test_personal_account_label_never_reaches_a_shared_agent(oauth_egress_portal: dict[str, Any]) -> None:
+    """A requester-scoped account is refused on a shared agent, so showing labels there never reveals it."""
+    portal = oauth_egress_portal
+    _connect_account(portal, "bob", "personal", "gh", "github")
+    assert _egress_row(portal, "bob", "personal", "gh")["oauth"]["account_label"] == "alice@example.com"
+
+    for user in ("alice", "bob"):
+        shared = _egress_row(portal, user, "shared_dev", "gh")["oauth"]
+        assert shared["account_label"] is None
+        assert shared["connected"] is False
+        assert shared["unavailable_reason"] == "shared_sandbox"
+    assert _egress_row(portal, "alice", "personal", "gh")["oauth"]["account_label"] is None
+
+
+_GITHUB_TOKEN_RESPONSE = {
+    "access_token": "gho-user-access",
+    "refresh_token": "ghr-user-refresh",
+    "expires_in": 28_800,
+    "scope": "",
+    "token_type": "bearer",
+}
+
+
+def _use_real_github_provider(
+    portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Any,  # noqa: ANN401
+) -> list[httpx.Request]:
+    """Serve the real GitHub provider, answering its login lookup with `handler`, and record the lookups."""
+    drive = portal["providers"]["google_drive"]
+    monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (drive, github_oauth_provider()))
+    oauth_registry.clear_oauth_provider_cache()
+    lookups: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        lookups.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        github_oauth,
+        "_login_lookup_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
+    )
+    return lookups
+
+
+@pytest.mark.parametrize(
+    ("answer", "label"),
+    [
+        (lambda _request: httpx.Response(200, json={"login": "octo", "id": 1, "email": None}), "octo"),
+        (lambda _request: httpx.Response(401, json={"message": "Bad credentials"}), None),
+        (lambda _request: httpx.Response(200, text="not json"), None),
+        (lambda _request: httpx.Response(200, json={"login": "bad login\n<script>"}), None),
+        (lambda _request: httpx.Response(200, json=["octo"]), None),
+    ],
+    ids=["login", "refused", "not_json", "unsafe_login", "not_an_object"],
+)
+def test_github_connection_label_is_the_login(
+    oauth_egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    answer: Any,  # noqa: ANN401
+    label: str | None,
+) -> None:
+    """After connecting, GitHub shows the account login; a lookup that fails shows no label and still connects."""
+    portal = oauth_egress_portal
+    lookups = _use_real_github_provider(portal, monkeypatch, answer)
+
+    with patch(
+        "authlib.integrations.httpx_client.AsyncOAuth2Client.fetch_token",
+        new=AsyncMock(return_value=_GITHUB_TOKEN_RESPONSE),
+    ):
+        _connect_account(portal, "bob", "personal", "gh", "github")
+
+    oauth_view = _egress_row(portal, "bob", "personal", "gh")["oauth"]
+    assert oauth_view["connected"] is True
+    assert oauth_view["account_label"] == label
+    assert [(str(request.url), request.headers["authorization"]) for request in lookups] == [
+        ("https://api.github.com/user", "Bearer gho-user-access"),
+    ]
+    assert _egress_row(portal, "alice", "personal", "gh")["oauth"]["account_label"] is None
+
+
+def test_github_login_lookup_failure_never_leaks_the_token(
+    oauth_egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lookup that cannot even connect still connects the account, and neither responses nor logs carry the token."""
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        message = "api.github.com unreachable"
+        raise httpx.ConnectError(message, request=request)
+
+    portal = oauth_egress_portal
+    _use_real_github_provider(portal, monkeypatch, unreachable)
+    with (
+        capture_logs() as logs,
+        patch(
+            "authlib.integrations.httpx_client.AsyncOAuth2Client.fetch_token",
+            new=AsyncMock(return_value=_GITHUB_TOKEN_RESPONSE),
+        ),
+    ):
+        _connect_account(portal, "bob", "personal", "gh", "github")
+
+    row = _egress_row(portal, "bob", "personal", "gh")
+    assert row["oauth"]["connected"] is True
+    assert row["oauth"]["account_label"] is None
+    failures = [entry for entry in logs if entry["event"] == "github_login_lookup_failed"]
+    assert [entry["error_type"] for entry in failures] == ["ConnectError"]
+    assert "gho-user-access" not in json.dumps(logs, default=str)
+    assert "gho-user-access" not in json.dumps(row)
 
 
 def _opt_in_to_shared_workers(portal: dict[str, Any]) -> None:
@@ -835,7 +1069,7 @@ def test_egress_oauth_status_agrees_with_the_portal_status(oauth_egress_portal: 
     }
     assert bob["connected"] is False
     assert alice_shared["connected"] is True
-    assert alice_shared["account_label"] is None
+    assert alice_shared["account_label"] == "alice@example.com"
     assert alice_shared["can_connect"] is False
     assert bob_shared["account_label"] == "alice@example.com"
 
@@ -1302,8 +1536,11 @@ def test_user_service_limits_are_422(egress_portal: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     ("body", "fragment"),
     [
-        ({**_NOTES, "placeholder_env": {"LD_PRELOAD": "evil"}}, "placeholder_env name 'LD_PRELOAD'"),
-        ({**_NOTES, "placeholder_env": {"NOTES_TOKEN": "two words"}}, "placeholder_env value of 'NOTES_TOKEN'"),
+        ({**_NOTES, "placeholder_env": {"LD_PRELOAD": "evil"}}, "LD_PRELOAD is not allowed as a placeholder"),
+        (
+            {**_NOTES, "placeholder_env": {"NOTES_TOKEN": "two words"}},
+            "The value of NOTES_TOKEN must be 1 to 256 letters",
+        ),
         ({**_NOTES, "oauth_provider": "no_such_provider"}, "unknown oauth_provider 'no_such_provider'"),
     ],
 )

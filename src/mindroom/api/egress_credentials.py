@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -98,6 +98,9 @@ class EgressInactiveService(BaseModel):
     reason: InactiveReason
 
 
+type _AgentScope = Literal["user", "user_agent", "shared", "unscoped"]
+
+
 class EgressCredentialAgent(BaseModel):
     """One agent with its egress services.
 
@@ -105,12 +108,21 @@ class EgressCredentialAgent(BaseModel):
     `can_manage` says whether the caller may change them: their own agent, or a shared one they manage. Both are
     known even when the agent has no services yet. `inactive_services` lists the stored entries of the agent's
     scope that are not in `services`.
+
+    `scope` says whose store the services and keys live in: one `user_agent` agent's own, every `user` agent's
+    of the caller, everyone's on a `shared` agent, or the global store of an `unscoped` one. `scope_agents` names
+    the caller's agents that share a `user` store, this one included, and is empty for any other scope.
+    `managers` is a shared or unscoped agent's credential managers, as Matrix IDs; it is empty for the rest, and
+    for an agent with none only administrators manage it.
     """
 
     agent_name: str
     agent_display_name: str
     shared: bool
     can_manage: bool
+    scope: _AgentScope
+    scope_agents: list[str]
+    managers: list[str]
     services: list[EgressCredentialService]
     inactive_services: list[EgressInactiveService]
 
@@ -325,8 +337,14 @@ async def _inactive_services_for_agent(
     return [EgressInactiveService(name=entry.name, reason=entry.reason) for entry in inactive]
 
 
+def _agent_scope(config: Config, agent_name: str) -> _AgentScope:
+    """Return whose store an agent's egress services and keys live in."""
+    scope = config.resolve_entity(agent_name).execution_scope
+    return "unscoped" if scope is None else scope
+
+
 async def _load_egress_agents(request: Request, requester_id: str) -> list[EgressCredentialAgent]:
-    """List every agent the requester may use, with its egress services."""
+    """List every agent the requester may use, with its egress services, in config declaration order."""
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
     config = snapshot.runtime_config
     if config is None:
@@ -337,12 +355,25 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
     memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
     manager = get_runtime_credentials_manager(runtime_paths)
 
+    eligible: dict[str, tuple[bool, bool]] = {}
+    for agent_name in config.agents:
+        eligibility = _check_agent_eligibility(agent_name, human_requester, config, runtime_paths, memberships)
+        if eligibility is not None:
+            eligible[agent_name] = eligibility
+    # Every `user` agent of the requester reads and writes one store, so each of them names all of them.
+    user_store_agents = [
+        agent.display_name
+        for agent_name, agent in config.agents.items()
+        if agent_name in eligible and _agent_scope(config, agent_name) == "user"
+    ]
+
     agents: list[EgressCredentialAgent] = []
     for agent_name, agent in config.agents.items():
-        eligibility = _check_agent_eligibility(agent_name, human_requester, config, runtime_paths, memberships)
+        eligibility = eligible.get(agent_name)
         if eligibility is None:
             continue
         is_shared, can_manage = eligibility
+        scope = _agent_scope(config, agent_name)
         services = await egress_services_for_agent(
             request,
             agent_name,
@@ -361,6 +392,9 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
                 agent_display_name=agent.display_name,
                 shared=is_shared,
                 can_manage=can_manage,
+                scope=scope,
+                scope_agents=list(user_store_agents) if scope == "user" else [],
+                managers=list(agent.credential_managers) if is_shared else [],
                 services=services,
                 inactive_services=await _inactive_services_for_agent(
                     agent_name,

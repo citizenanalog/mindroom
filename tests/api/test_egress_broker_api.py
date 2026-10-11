@@ -426,6 +426,58 @@ def test_logs_filtering_with_real_audit_log(
     audit.close()
 
 
+def test_admin_logs_carry_requester_and_filter_by_it(broker_test_client: TestClient, tmp_path: Path) -> None:
+    """Each row names the requester whose worker token made it, and the filter matches that ID exactly."""
+    audit = AuditLog(tmp_path / "requesters.sqlite3")
+    for requester_id, path in (
+        ("@alice:example.org", "/a"),
+        ("@bob:example.org", "/b"),
+        ("@alice:example.org", "/c"),
+        (None, "/d"),
+    ):
+        audit.record(
+            AuditRecord(
+                at=datetime.now(UTC),
+                kind="request",
+                scope="shared",
+                agent_name="test_agent",
+                requester_id=requester_id,
+                method="GET",
+                host="api.github.com",
+                path=path,
+                service="github",
+                status=200,
+                bytes_up=1,
+                bytes_down=1,
+                duration_ms=1,
+            ),
+        )
+
+    with patch("mindroom.api.egress_broker.active_audit_log", return_value=audit):
+        everyone = broker_test_client.get("/api/egress-broker/logs").json()["records"]
+        alice = broker_test_client.get("/api/egress-broker/logs", params={"requester": "@alice:example.org"})
+        nobody = broker_test_client.get("/api/egress-broker/logs", params={"requester": "@ali"})
+        both = broker_test_client.get(
+            "/api/egress-broker/logs",
+            params={"requester": "@alice:example.org", "agent_name": "test_agent", "host": "api.github.com"},
+        )
+
+    assert sorted((row["path"], row["requester_id"]) for row in everyone) == [
+        ("/a", "@alice:example.org"),
+        ("/b", "@bob:example.org"),
+        ("/c", "@alice:example.org"),
+        ("/d", None),
+    ]
+    assert alice.status_code == 200, alice.text
+    assert [(row["path"], row["requester_id"]) for row in alice.json()["records"]] == [
+        ("/c", "@alice:example.org"),
+        ("/a", "@alice:example.org"),
+    ]
+    assert nobody.json()["records"] == []
+    assert [row["path"] for row in both.json()["records"]] == ["/c", "/a"]
+    audit.close()
+
+
 @pytest.mark.parametrize("agent_name", [None, "test_agent"])
 def test_credentials_list_omits_egress_secrets(broker_test_client: TestClient, agent_name: str | None) -> None:
     """The Credentials tab lists only services its status route serves, so egress secrets stay out."""
