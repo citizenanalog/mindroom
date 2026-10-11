@@ -386,7 +386,6 @@ export function EgressServiceEditor({
     onChange: (next) => setRule(index, next),
     errorFor: (part: RuleFieldPart) => problemAt(ruleField(index, part)),
     disabled,
-    extra: index > 0,
   });
 
   // Another preset has its own defaults, so what the loaded service emptied on

@@ -76,15 +76,17 @@ export function Field({
   );
 }
 
-/** How a rule is edited: the first rule in the basic fields, the others in full under More options. */
+/**
+ * How a rule is edited: the first rule in the basic fields, the others in full
+ * under More options. The fields of an extra rule (index above 0) say which
+ * rule they belong to.
+ */
 export interface RuleEditing {
   index: number;
   rule: RuleForm;
   onChange: (rule: RuleForm) => void;
   errorFor: (part: RuleFieldPart) => string | undefined;
   disabled: boolean;
-  /** An extra rule, whose fields say which rule they belong to. */
-  extra: boolean;
 }
 
 export function RuleHostField({
@@ -93,9 +95,9 @@ export function RuleHostField({
   onChange,
   errorFor,
   disabled,
-  extra,
 }: RuleEditing) {
   const id = useId();
+  const extra = index > 0;
   // The path a pasted address carried into the Path prefix, until the next change.
   const [moved, setMoved] = useState<string | null>(null);
   return (
@@ -143,9 +145,9 @@ export function RulePathAndPortFields({
   onChange,
   errorFor,
   disabled,
-  extra,
 }: RuleEditing) {
   const id = useId();
+  const extra = index > 0;
   return (
     <>
       <Field
@@ -194,12 +196,11 @@ export function RuleSendFields({
   onChange,
   errorFor,
   disabled,
-  extra,
 }: RuleEditing) {
   const id = useId();
   const named = ["header", "template", "query"].includes(rule.authType);
   const ariaLabel = (part: string) =>
-    extra ? `Rule ${index + 1} ${part}` : undefined;
+    index > 0 ? `Rule ${index + 1} ${part}` : undefined;
   return (
     <>
       <Field id={`${id}-auth`} label="Send the key as">
@@ -298,12 +299,9 @@ export function RuleSendFields({
 }
 
 /** A rule beyond the first, with all its fields. */
-export function ExtraRule(
-  props: Omit<RuleEditing, "extra"> & { onRemove: () => void },
-) {
+export function ExtraRule(props: RuleEditing & { onRemove: () => void }) {
   const { onRemove, ...editing } = props;
   const label = `Rule ${editing.index + 1}`;
-  const shown = { ...editing, extra: true };
   return (
     <li
       aria-label={label}
@@ -323,11 +321,11 @@ export function ExtraRule(
         </Button>
       </div>
       <div className="grid gap-3 sm:grid-cols-3">
-        <RuleHostField {...shown} />
-        <RulePathAndPortFields {...shown} />
+        <RuleHostField {...editing} />
+        <RulePathAndPortFields {...editing} />
       </div>
       <div className="grid gap-3 sm:grid-cols-3">
-        <RuleSendFields {...shown} />
+        <RuleSendFields {...editing} />
       </div>
     </li>
   );
