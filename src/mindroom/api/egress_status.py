@@ -10,11 +10,22 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from mindroom.api import config_lifecycle, oauth
-from mindroom.config.egress_broker import EgressService
+from mindroom.config.egress_broker import RESERVED_PLACEHOLDER_NAMES, RESERVED_PLACEHOLDER_PREFIXES, EgressService
 from mindroom.egress_broker.oauth_source import shared_worker_oauth
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.secrets import EgressServiceStatus, OAuthStatus, service_status
-from mindroom.egress_broker.user_services import ServiceSource, effective_config
+from mindroom.egress_broker.user_services import (
+    MAX_DOCUMENT_BYTES,
+    MAX_RULES_PER_SERVICE,
+    MAX_SERVICE_BYTES,
+    MAX_USER_SERVICES,
+    PLACEHOLDER_NAME_WORDS,
+    PLACEHOLDER_REFUSED_PREFIX,
+    PLACEHOLDER_REFUSED_WORDS,
+    PLACEHOLDER_VALUE,
+    ServiceSource,
+    effective_config,
+)
 from mindroom.egress_broker.user_services import service_source as config_service_source
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.oauth.service import oauth_provider_service_account_configured
@@ -125,18 +136,69 @@ class EgressOAuthProviderOption(BaseModel):
     display_name: str
 
 
+class PlaceholderLimits(BaseModel):
+    """The placeholder rules of a service a user defines, as the server checks them on save.
+
+    A name needs one of the `credential_words` as an underscore-separated word and none of the `refused_words`,
+    must not start with `refused_prefix`, and may be none of the `reserved_names` or start with a
+    `reserved_prefixes` entry, which the config model reserves for every service. A value must match
+    `value_pattern` completely. Both word lists keep the order the server's error messages list them in; the other
+    lists are sorted.
+    """
+
+    credential_words: list[str]
+    refused_words: list[str]
+    refused_prefix: str
+    reserved_names: list[str]
+    reserved_prefixes: list[str]
+    value_pattern: str
+
+
+class EgressLimits(BaseModel):
+    """What a service a user defines may hold, so the editor can refuse a service the server would refuse.
+
+    `max_services` counts the services of one scope, `max_rules_per_service` the rules of one service,
+    `max_service_bytes` one service's authored JSON, and `max_document_bytes` the scope's whole stored document.
+    """
+
+    max_services: int
+    max_rules_per_service: int
+    max_service_bytes: int
+    max_document_bytes: int
+    placeholder: PlaceholderLimits
+
+
 class PresetsResponse(BaseModel):
-    """The built-in service presets, and the OAuth providers an account login can name."""
+    """The built-in service presets, the OAuth providers an account login can name, and the limits of user services."""
 
     presets: list[EgressPresetResponse]
     oauth_providers: list[EgressOAuthProviderOption]
+    limits: EgressLimits
+
+
+def _egress_limits() -> EgressLimits:
+    """Describe the limits of a user's service from the constants the broker and the config model enforce."""
+    return EgressLimits(
+        max_services=MAX_USER_SERVICES,
+        max_rules_per_service=MAX_RULES_PER_SERVICE,
+        max_service_bytes=MAX_SERVICE_BYTES,
+        max_document_bytes=MAX_DOCUMENT_BYTES,
+        placeholder=PlaceholderLimits(
+            credential_words=list(PLACEHOLDER_NAME_WORDS),
+            refused_words=list(PLACEHOLDER_REFUSED_WORDS),
+            refused_prefix=PLACEHOLDER_REFUSED_PREFIX,
+            reserved_names=sorted(RESERVED_PLACEHOLDER_NAMES),
+            reserved_prefixes=sorted(RESERVED_PLACEHOLDER_PREFIXES),
+            value_pattern=PLACEHOLDER_VALUE.pattern,
+        ),
+    )
 
 
 def presets_response(oauth_providers: Mapping[str, OAuthProvider]) -> PresetsResponse:
     """List the presets as the config model expands them, so the editor shows what a `preset:` entry resolves to.
 
     `oauth_providers` is the registry (`oauth.registry`), the same one a saved service's `oauth_provider` is checked
-    against, listed in registry order.
+    against, listed in registry order. `limits` is the same for every caller.
     """
     presets = []
     for preset_id in EGRESS_PRESETS:
@@ -158,7 +220,7 @@ def presets_response(oauth_providers: Mapping[str, OAuthProvider]) -> PresetsRes
         EgressOAuthProviderOption(id=provider_id, display_name=provider.display_name)
         for provider_id, provider in oauth_providers.items()
     ]
-    return PresetsResponse(presets=presets, oauth_providers=providers)
+    return PresetsResponse(presets=presets, oauth_providers=providers, limits=_egress_limits())
 
 
 class AuditRecordResponse(BaseModel):

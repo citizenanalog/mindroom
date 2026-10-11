@@ -47,6 +47,10 @@ __all__ = [
     "MAX_RULES_PER_SERVICE",
     "MAX_SERVICE_BYTES",
     "MAX_USER_SERVICES",
+    "PLACEHOLDER_NAME_WORDS",
+    "PLACEHOLDER_REFUSED_PREFIX",
+    "PLACEHOLDER_REFUSED_WORDS",
+    "PLACEHOLDER_VALUE",
     "USER_SERVICES_CREDENTIAL_SERVICE",
     "InactiveReason",
     "InactiveUserService",
@@ -75,11 +79,12 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 # command, file, directory, helper, provider, or options setting, and no name may start with SSH_, because tools read
 # such variables as programs or paths to run or load (RESTIC_PASSWORD_COMMAND, SOPS_AGE_KEY_CMD, SSH_AUTH_SOCK).
 _PLACEHOLDER_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
-# Tuples keep the order the error messages list the words in.
-_PLACEHOLDER_NAME_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL")
-_PLACEHOLDER_REFUSED_WORDS = ("COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS")
-_PLACEHOLDER_REFUSED_PREFIX = "SSH_"
-_PLACEHOLDER_VALUE = re.compile(r"[A-Za-z0-9._:-]{1,256}")
+# Tuples keep the order the error messages list the words in. The presets routes serve these constants and the
+# limits above as `limits`, so the editor checks the same rules before it saves.
+PLACEHOLDER_NAME_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL")
+PLACEHOLDER_REFUSED_WORDS = ("COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS")
+PLACEHOLDER_REFUSED_PREFIX = "SSH_"
+PLACEHOLDER_VALUE = re.compile(r"[A-Za-z0-9._:-]{1,256}")
 
 type _ScopeKey = tuple[object, ...]
 type ServiceSource = Literal["config", "user"]
@@ -309,17 +314,17 @@ def _placeholder_error(variable: str, value: str) -> str | None:
     The texts are the ones the Connections editor shows beside the field.
     """
     words = set(variable.split("_"))
-    if not _PLACEHOLDER_NAME.fullmatch(variable) or words.isdisjoint(_PLACEHOLDER_NAME_WORDS):
+    if not _PLACEHOLDER_NAME.fullmatch(variable) or words.isdisjoint(PLACEHOLDER_NAME_WORDS):
         return (
             f"{variable} is not allowed as a placeholder: name a credential, such as MY_API_KEY, "
-            f"with {_word_list(_PLACEHOLDER_NAME_WORDS)} as one of its words."
+            f"with {_word_list(PLACEHOLDER_NAME_WORDS)} as one of its words."
         )
-    if variable.startswith(_PLACEHOLDER_REFUSED_PREFIX) or not words.isdisjoint(_PLACEHOLDER_REFUSED_WORDS):
+    if variable.startswith(PLACEHOLDER_REFUSED_PREFIX) or not words.isdisjoint(PLACEHOLDER_REFUSED_WORDS):
         return (
-            f"{variable} is not allowed: tools read names with {_word_list(_PLACEHOLDER_REFUSED_WORDS)}, "
-            f"or starting with {_PLACEHOLDER_REFUSED_PREFIX}, as programs or paths."
+            f"{variable} is not allowed: tools read names with {_word_list(PLACEHOLDER_REFUSED_WORDS)}, "
+            f"or starting with {PLACEHOLDER_REFUSED_PREFIX}, as programs or paths."
         )
-    if not _PLACEHOLDER_VALUE.fullmatch(value):
+    if not PLACEHOLDER_VALUE.fullmatch(value):
         return f"The value of {variable} must be 1 to 256 letters, digits, or . _ : -"
     return None
 

@@ -31,6 +31,7 @@ from mindroom.api import (
     oauth,
 )
 from mindroom.api.connection_agents import build_connection_agent_target
+from mindroom.config.egress_broker import RESERVED_PLACEHOLDER_NAMES, RESERVED_PLACEHOLDER_PREFIXES
 from mindroom.config.main import Config
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
@@ -38,7 +39,17 @@ from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.oauth_source import Token, resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import EgressRules, route_request
-from mindroom.egress_broker.user_services import effective_config
+from mindroom.egress_broker.user_services import (
+    MAX_DOCUMENT_BYTES,
+    MAX_RULES_PER_SERVICE,
+    MAX_SERVICE_BYTES,
+    MAX_USER_SERVICES,
+    PLACEHOLDER_NAME_WORDS,
+    PLACEHOLDER_REFUSED_PREFIX,
+    PLACEHOLDER_REFUSED_WORDS,
+    PLACEHOLDER_VALUE,
+    effective_config,
+)
 from mindroom.oauth import credential_store as oauth_credential_store
 from mindroom.oauth import github as github_oauth
 from mindroom.oauth import registry as oauth_registry
@@ -2428,6 +2439,28 @@ def test_presets_are_served_as_the_config_model_expands_them(egress_portal: dict
     assert {"id": "github", "display_name": "GitHub"} in providers
     assert {"google_drive", "google_gmail", "atlassian"} <= {provider["id"] for provider in providers}
     assert all(set(provider) == {"id", "display_name"} for provider in providers)
+
+
+def test_presets_serve_the_user_service_limits_the_server_enforces(egress_portal: dict[str, Any]) -> None:
+    """The limits the editor validates against are the constants the server enforces, with no copy of them."""
+    response = egress_portal["client"].get("/api/connections/egress/presets", headers=egress_portal["headers"]["alice"])
+
+    assert response.status_code == 200, response.text
+    assert response.json()["limits"] == {
+        "max_services": MAX_USER_SERVICES,
+        "max_rules_per_service": MAX_RULES_PER_SERVICE,
+        "max_service_bytes": MAX_SERVICE_BYTES,
+        "max_document_bytes": MAX_DOCUMENT_BYTES,
+        "placeholder": {
+            # The word lists keep the order of the server's messages; the sets are sorted.
+            "credential_words": list(PLACEHOLDER_NAME_WORDS),
+            "refused_words": list(PLACEHOLDER_REFUSED_WORDS),
+            "refused_prefix": PLACEHOLDER_REFUSED_PREFIX,
+            "reserved_names": sorted(RESERVED_PLACEHOLDER_NAMES),
+            "reserved_prefixes": sorted(RESERVED_PLACEHOLDER_PREFIXES),
+            "value_pattern": PLACEHOLDER_VALUE.pattern,
+        },
+    }
 
 
 def test_frontend_preset_fixture_matches_the_served_presets() -> None:

@@ -233,6 +233,22 @@ def test_presets_are_listed_with_their_rules_and_login(broker_test_client: TestC
     assert {"google_drive", "google_gmail", "atlassian"} <= set(providers)
 
 
+def test_presets_carry_the_same_user_service_limits_as_the_personal_page(broker_test_client: TestClient) -> None:
+    """The dashboard editor validates a user service against the limits the server enforces, like the personal one."""
+    response = broker_test_client.get("/api/egress-broker/presets")
+
+    assert response.status_code == 200, response.text
+    limits = response.json()["limits"]
+    assert limits == egress_status.presets_response({}).limits.model_dump(mode="json")
+    assert set(limits) == {
+        "max_services",
+        "max_rules_per_service",
+        "max_service_bytes",
+        "max_document_bytes",
+        "placeholder",
+    }
+
+
 def test_presets_route_sits_behind_the_dashboard_auth() -> None:
     """The presets route is mounted with the dashboard's `verify_user` like every other egress-broker route."""
     from mindroom.api import main  # noqa: PLC0415

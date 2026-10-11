@@ -36,7 +36,7 @@ _RESERVED_AUTH_HEADERS = frozenset(
 
 # Reserved env names that cannot be used as placeholder names
 _RESERVED_EXACT = {"PATH", "HOME"}
-_RESERVED_PREFIXES = {"MINDROOM_", "GIT_CONFIG_"}
+RESERVED_PLACEHOLDER_PREFIXES = frozenset({"MINDROOM_", "GIT_CONFIG_"})
 _RESERVED_PROXY_VARS = {
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -55,6 +55,8 @@ _RESERVED_CA_VARS = {
     "GIT_SSL_CAINFO",
     "NODE_EXTRA_CA_CERTS",
 }
+# Every exact name a placeholder cannot take; the prefixes above are refused on top of these.
+RESERVED_PLACEHOLDER_NAMES = frozenset(_RESERVED_EXACT | _RESERVED_PROXY_VARS | _RESERVED_CA_VARS)
 
 
 class EgressAuth(BaseModel):
@@ -315,7 +317,6 @@ class EgressService(BaseModel):
     def validate_placeholder_env(cls, value: dict[str, str]) -> dict[str, str]:
         """Validate placeholder env names."""
         pattern = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-        reserved_all = _RESERVED_EXACT | _RESERVED_PROXY_VARS | _RESERVED_CA_VARS
 
         for name in value:
             # Must match pattern
@@ -324,12 +325,12 @@ class EgressService(BaseModel):
                 raise ValueError(msg)
 
             # Check exact reserved names
-            if name in reserved_all:
+            if name in RESERVED_PLACEHOLDER_NAMES:
                 msg = f"placeholder_env name '{name}' is reserved"
                 raise ValueError(msg)
 
             # Check reserved prefixes
-            for prefix in _RESERVED_PREFIXES:
+            for prefix in RESERVED_PLACEHOLDER_PREFIXES:
                 if name.startswith(prefix):
                     msg = f"placeholder_env name '{name}' starts with reserved prefix {prefix}"
                     raise ValueError(msg)
