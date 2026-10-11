@@ -263,13 +263,7 @@ def test_presets_carry_the_same_user_service_validation_as_the_personal_page(bro
     assert response.status_code == 200, response.text
     validation = response.json()["validation"]
     assert validation == egress_status.presets_response({}).validation.model_dump(mode="json")
-    assert set(validation) == {
-        "max_services",
-        "max_rules_per_service",
-        "max_service_bytes",
-        "max_document_bytes",
-        "placeholder",
-    }
+    assert set(validation) == {"max_rules_per_service", "max_service_bytes", "placeholder"}
 
 
 def test_presets_route_sits_behind_the_dashboard_auth() -> None:

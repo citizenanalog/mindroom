@@ -18347,10 +18347,8 @@ Both return the presets as the config model expands them:
   ],
   "oauth_providers": [{"id": "github", "display_name": "GitHub"}],
   "validation": {
-    "max_services": 50,
     "max_rules_per_service": 50,
     "max_service_bytes": 16384,
-    "max_document_bytes": 262144,
     "placeholder": {
       "name_pattern": "[A-Z][A-Z0-9_]*",
       "credential_words": ["TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL"],
@@ -18368,7 +18366,7 @@ Both return the presets as the config model expands them:
 The example is abbreviated to one preset, one rule, one provider, and a few of the `reserved_names`.
 Rules carry no auth settings, and `display_name` falls back to the preset id.
 `oauth_providers` lists the OAuth providers a service's account login can name, in registry order: the registry that a saved service's `oauth_provider` is checked against.
-`validation` is the one source of the [user service](#user-services) caps and placeholder rules the server enforces: the counts and sizes of a scope's services, and for placeholders the pattern a name must match completely, the credential words it needs, the words and prefix it may not have, the reserved names and prefixes, and the pattern a value must match completely.
+`validation` is the one source of the [user service](#user-services) caps and placeholder rules the server enforces: the number of rules and the size of one service, and for placeholders the pattern a name must match completely, the credential words it needs, the words and prefix it may not have, the reserved names and prefixes, and the pattern a value must match completely.
 The word lists keep the order the server's messages list them in, and the other lists are sorted, so an editor can show the server's own texts without a copy of the rules.
 The editor checks what it can before saving, and shows the server's message for the rest (a name that is taken, a cap, or a rule the server refuses).
 On the personal page the placeholder fields check the user-service rules from [User services](#user-services) (the name and value patterns and the refused words) after the first save attempt, and live from then on, and the hint under them lists those rules, so a placeholder the server would reject is flagged before saving.

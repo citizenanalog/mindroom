@@ -249,11 +249,9 @@ export interface EgressPlaceholderValidation {
 
 /** What the server checks when a service is saved; the editor checks the same before it asks. */
 export interface EgressValidation {
-  max_services: number;
   max_rules_per_service: number;
   /** The most one personal service takes, as the server counts its serialized JSON. */
   max_service_bytes: number;
-  max_document_bytes: number;
   placeholder: EgressPlaceholderValidation;
 }
 

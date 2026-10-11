@@ -15,10 +15,8 @@ from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oaut
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.secrets import EgressServiceStatus, OAuthStatus, service_status
 from mindroom.egress_broker.user_services import (
-    MAX_DOCUMENT_BYTES,
     MAX_RULES_PER_SERVICE,
     MAX_SERVICE_BYTES,
-    MAX_USER_SERVICES,
     PLACEHOLDER_NAME,
     PLACEHOLDER_NAME_WORDS,
     PLACEHOLDER_REFUSED_PREFIX,
@@ -155,14 +153,11 @@ class PlaceholderValidation(BaseModel):
 class EgressValidation(BaseModel):
     """What a service a user defines may hold, so the editor can refuse a service the server would refuse.
 
-    `max_services` counts the services of one scope, `max_rules_per_service` the rules of one service,
-    `max_service_bytes` one service's authored JSON, and `max_document_bytes` the scope's whole stored document.
+    `max_rules_per_service` counts the rules of one service and `max_service_bytes` one service's authored JSON.
     """
 
-    max_services: int
     max_rules_per_service: int
     max_service_bytes: int
-    max_document_bytes: int
     placeholder: PlaceholderValidation
 
 
@@ -177,10 +172,8 @@ class PresetsResponse(BaseModel):
 def _egress_validation() -> EgressValidation:
     """Describe how a user's service is validated, from the constants the broker and the config model enforce."""
     return EgressValidation(
-        max_services=MAX_USER_SERVICES,
         max_rules_per_service=MAX_RULES_PER_SERVICE,
         max_service_bytes=MAX_SERVICE_BYTES,
-        max_document_bytes=MAX_DOCUMENT_BYTES,
         placeholder=PlaceholderValidation(
             name_pattern=PLACEHOLDER_NAME.pattern,
             credential_words=list(PLACEHOLDER_NAME_WORDS),

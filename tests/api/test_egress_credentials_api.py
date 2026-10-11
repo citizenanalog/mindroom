@@ -40,10 +40,8 @@ from mindroom.egress_broker.oauth_source import resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import EgressRules, route_request
 from mindroom.egress_broker.user_services import (
-    MAX_DOCUMENT_BYTES,
     MAX_RULES_PER_SERVICE,
     MAX_SERVICE_BYTES,
-    MAX_USER_SERVICES,
     PLACEHOLDER_NAME,
     PLACEHOLDER_NAME_WORDS,
     PLACEHOLDER_REFUSED_PREFIX,
@@ -2258,10 +2256,8 @@ def test_presets_serve_the_user_service_validation_the_server_enforces(egress_po
 
     assert response.status_code == 200, response.text
     assert response.json()["validation"] == {
-        "max_services": MAX_USER_SERVICES,
         "max_rules_per_service": MAX_RULES_PER_SERVICE,
         "max_service_bytes": MAX_SERVICE_BYTES,
-        "max_document_bytes": MAX_DOCUMENT_BYTES,
         "placeholder": {
             "name_pattern": PLACEHOLDER_NAME.pattern,
             # The word lists keep the order of the server's messages; the sets are sorted.

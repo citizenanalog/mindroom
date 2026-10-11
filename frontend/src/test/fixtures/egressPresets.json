@@ -208,10 +208,8 @@
     }
   ],
   "validation": {
-    "max_document_bytes": 262144,
     "max_rules_per_service": 50,
     "max_service_bytes": 16384,
-    "max_services": 50,
     "placeholder": {
       "credential_words": [
         "TOKEN",
