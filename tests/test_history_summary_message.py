@@ -223,15 +223,29 @@ def test_replay_estimate_counts_the_rendered_summary_once() -> None:
         history_settings=settings,
     )
 
-    rendered = str(compaction_summary_message(_SUMMARY, from_history=True).content)
+    rendered = str(compaction_summary_message(_SUMMARY, run_local=False).content)
     assert with_summary - without == len(rendered) // 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["agent", "team"])
+async def test_replayed_run_local_summary_does_not_suppress_the_scope_summary(kind: str) -> None:
+    session = _session(kind, _SUMMARY)
+    session.runs[0].messages.insert(1, compaction_summary_message("local work so far", run_local=True))
+
+    run_messages = await _build(kind, _entity(kind), session)
+
+    summaries = _summaries(run_messages.messages)
+    assert len(summaries) == 2
+    assert _SUMMARY in str(summaries[0].content)
+    assert "local work so far" in str(summaries[1].content)
 
 
 @pytest.mark.asyncio
 async def test_stored_run_local_summary_does_not_suppress_the_scope_summary() -> None:
     agent = _entity("agent")
     assert isinstance(agent, Agent)
-    stored_local = compaction_summary_message("local work so far", from_history=False)
+    stored_local = compaction_summary_message("local work so far", run_local=True)
 
     run_messages = await agent_messages.aget_continue_run_messages(
         agent,
@@ -378,7 +392,7 @@ def test_scheduled_history_limits_keep_or_drop_the_summary() -> None:
 async def test_in_memory_continuation_keeps_its_one_summary() -> None:
     agent = _entity("agent")
     assert isinstance(agent, Agent)
-    carried = compaction_summary_message("carried summary", from_history=True)
+    carried = compaction_summary_message("carried summary", run_local=False)
 
     run_messages = await agent_messages.aget_continue_run_messages(
         agent,

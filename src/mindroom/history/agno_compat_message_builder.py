@@ -28,7 +28,7 @@ from agno.utils.log import log_warning
 
 from mindroom.history.legacy_summary_system_prompt import system_message_embeds_summary
 from mindroom.history.message_content import project_history_media_for_replay
-from mindroom.history.replay import compaction_summary_message, current_summary_text, is_compaction_summary
+from mindroom.history.replay import compaction_summary_message, current_summary_text, is_scope_summary
 
 if TYPE_CHECKING:
     from agno.agent import Agent
@@ -142,13 +142,13 @@ def _record_request_session(target: object, session: AgentSession | TeamSession)
 def _insert_session_summary(run_messages: RunMessages, session: AgentSession | TeamSession) -> None:
     """Place the scope's summary directly after the leading prompt messages, once."""
     summary = current_summary_text(session)
-    if summary is None or any(is_compaction_summary(m) and m.from_history for m in run_messages.messages):
+    if summary is None or any(is_scope_summary(m) for m in run_messages.messages):
         return
     index = next(
         (i for i, message in enumerate(run_messages.messages) if message.role not in {"system", "developer"}),
         len(run_messages.messages),
     )
-    run_messages.messages.insert(index, compaction_summary_message(summary, from_history=True))
+    run_messages.messages.insert(index, compaction_summary_message(summary, run_local=False))
 
 
 def _prepare_history(

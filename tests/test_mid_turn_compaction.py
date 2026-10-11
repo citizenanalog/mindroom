@@ -893,7 +893,7 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
     layout = mid_turn_compaction._layout(messages, run_response)
-    mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", from_history=True))
+    mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
 
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"
     assert [is_compaction_summary(message) for message in messages] == [False, True, False]

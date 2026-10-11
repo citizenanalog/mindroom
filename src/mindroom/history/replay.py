@@ -141,10 +141,16 @@ def _without_image_transport(message: Message, *, strip_content_blocks: bool) ->
 
 
 _COMPACTION_SUMMARY_MARKER = "mindroom_compaction_summary"
+_SCOPE_SUMMARY = "scope"
+_RUN_LOCAL_SUMMARY = "run"
 
 
-def compaction_summary_message(summary: str, *, from_history: bool) -> Message:
-    """Render one compaction summary as the user message that replaces the history it covers."""
+def compaction_summary_message(summary: str, *, run_local: bool) -> Message:
+    """Render one compaction summary as the user message that replaces the history it covers.
+
+    The scope's summary is rebuilt from the archive for every request, so it is history; a run-local summary is
+    stored with its run. The marker keeps that kind when Agno later replays the run and marks its messages history.
+    """
     return Message(
         role="user",
         content=(
@@ -153,8 +159,8 @@ def compaction_summary_message(summary: str, *, from_history: bool) -> Message:
             "The conversation continues after this summary. If it records progress on the request that follows, "
             "continue that work from its next steps instead of starting over."
         ),
-        provider_data={_COMPACTION_SUMMARY_MARKER: True},
-        from_history=from_history,
+        provider_data={_COMPACTION_SUMMARY_MARKER: _RUN_LOCAL_SUMMARY if run_local else _SCOPE_SUMMARY},
+        from_history=not run_local,
     )
 
 
@@ -167,7 +173,16 @@ def compaction_summary_text(message: Message) -> str:
 
 def is_compaction_summary(message: Message) -> bool:
     """Return whether one message is a rendered compaction summary."""
-    return isinstance(message.provider_data, dict) and message.provider_data.get(_COMPACTION_SUMMARY_MARKER) is True
+    return _summary_kind(message) in {_SCOPE_SUMMARY, _RUN_LOCAL_SUMMARY}
+
+
+def is_scope_summary(message: Message) -> bool:
+    """Return whether one message is the scope's summary, as opposed to one run's own."""
+    return _summary_kind(message) == _SCOPE_SUMMARY
+
+
+def _summary_kind(message: Message) -> object:
+    return message.provider_data.get(_COMPACTION_SUMMARY_MARKER) if isinstance(message.provider_data, dict) else None
 
 
 def _estimate_session_summary_tokens(summary_text: str | None) -> int:
@@ -177,7 +192,7 @@ def _estimate_session_summary_tokens(summary_text: str | None) -> int:
     normalized_summary = summary_text.strip()
     if not normalized_summary:
         return 0
-    return estimate_text_tokens(str(compaction_summary_message(normalized_summary, from_history=True).content))
+    return estimate_text_tokens(str(compaction_summary_message(normalized_summary, run_local=False).content))
 
 
 def _estimate_history_messages_tokens(messages: list[Message]) -> int:

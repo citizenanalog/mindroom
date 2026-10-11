@@ -308,7 +308,7 @@ async def _archived(storage: BaseDb, session: AgentSession | TeamSession, snapsh
 def _scope_summary_message(session: AgentSession | TeamSession) -> Message:
     summary = current_summary_text(session)
     assert summary is not None
-    return compaction_summary_message(summary, from_history=True)
+    return compaction_summary_message(summary, run_local=False)
 
 
 def _policy(binding: _MidTurnCompaction) -> _Policy | None:
@@ -489,7 +489,7 @@ async def _summarize_run_locally(
         runtime_paths=binding.runtime_paths,
         on_response=_summary_usage_recorder(binding, run_response),
     )
-    return compaction_summary_message(summary, from_history=False)
+    return compaction_summary_message(summary, run_local=True)
 
 
 def _summary_usage_recorder(

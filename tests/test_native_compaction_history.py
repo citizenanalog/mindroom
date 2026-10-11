@@ -1037,7 +1037,7 @@ def test_native_route_identity_hashes_the_rendered_summary(tmp_path: Path, summa
 
     assert configured is not None
     assert configured.native_compaction is not None
-    rendered = str(compaction_summary_message(summary, from_history=True).content) if summary else ""
+    rendered = str(compaction_summary_message(summary, run_local=False).content) if summary else ""
     assert configured.native_compaction.route == route_for(rendered)
     if summary:
         assert configured.native_compaction.route != route_for(summary)

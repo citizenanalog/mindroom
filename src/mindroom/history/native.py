@@ -74,7 +74,7 @@ def restore_native_history(
 def _history_generation(session: AgentSession | TeamSession | None) -> str:
     """Bind checkpoints to the exact summary message their requests carried."""
     summary = current_summary_text(session) if session is not None else None
-    return str(compaction_summary_message(summary, from_history=True).content) if summary is not None else ""
+    return str(compaction_summary_message(summary, run_local=False).content) if summary is not None else ""
 
 
 def native_history_route(model: NativeCompactionModel | None) -> str | None:

@@ -356,7 +356,7 @@ def test_estimate_prompt_visible_history_tokens_counts_summary_after_compaction_
         history_settings=history_settings,
     )
 
-    expected_wrapper = str(compaction_summary_message("merged summary", from_history=True).content)
+    expected_wrapper = str(compaction_summary_message("merged summary", run_local=False).content)
 
     assert _estimate_session_summary_tokens("merged summary") == estimate_text_tokens(expected_wrapper)
     assert estimated_tokens == estimate_text_tokens(expected_wrapper)
