@@ -47,7 +47,6 @@ const SERVICE_ERROR_MESSAGES: RequestErrorMessages = {
 type EditorState = (
   | {
       kind: "add";
-      initialName?: string;
       /** Add a limit on GitHub repositories, which has no key of its own. */
       restrictOnly?: boolean;
     }
@@ -74,15 +73,6 @@ function loadPresets(signal: AbortSignal): Promise<EgressPresetCatalog> {
 
 function servicePath(agentName: string, serviceName: string): string {
   return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/services/${encodeURIComponent(serviceName)}`;
-}
-
-/** The name a service limited to repositories starts with: `github-limited`, or the first of `-2`, `-3`... that is free. */
-function limitedServiceName(taken: readonly string[]): string {
-  const base = "github-limited";
-  for (let n = 1; ; n += 1) {
-    const name = n === 1 ? base : `${base}-${n}`;
-    if (!taken.includes(name)) return name;
-  }
 }
 
 /** The caller's own recent brokered requests for one agent, loaded when the table is opened. */
@@ -399,13 +389,7 @@ function AgentSection({
       ),
     onLimitToRepositories: () => {
       setError(null);
-      setEditor({
-        kind: "add",
-        restrictOnly: true,
-        initialName: limitedServiceName(
-          agent.services.map((service) => service.name),
-        ),
-      });
+      setEditor({ kind: "add", restrictOnly: true });
     },
     limitDisabled: editor !== null,
   };
@@ -483,7 +467,6 @@ function AgentSection({
             sharedTarget={agent.shared}
             name={editor.kind === "edit" ? editor.name : undefined}
             service={editor.kind === "edit" ? editor.service : null}
-            initialName={editor.kind === "add" ? editor.initialName : undefined}
             initialRestrictOnly={
               editor.kind === "add" && editor.restrictOnly === true
             }

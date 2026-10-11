@@ -1715,16 +1715,6 @@ describe("the name of a new service", () => {
     expect(screen.getByLabelText("Name")).toHaveValue("mine");
   });
 
-  it("starts with the name it was opened with and keeps it", async () => {
-    await renderEditor({ initialName: "github-limited" });
-    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
-    type("Preset", "github");
-    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
-    type("Preset", "");
-    type("Website", "other.example.com");
-    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
-  });
-
   it("says Name is required, beside the name, and focuses the website first", async () => {
     const { onSave } = await renderEditor();
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
@@ -1734,42 +1724,6 @@ describe("the name of a new service", () => {
     // The website is the first field on the page, and the name follows from it.
     expect(screen.getByLabelText("Website")).toHaveFocus();
     expect(onSave).not.toHaveBeenCalled();
-  });
-});
-
-describe("prefilling a new service", () => {
-  it("opens Add mode with the name it was given", async () => {
-    const { onSave } = await renderEditor({
-      initialName: "my-service",
-    });
-    expect(
-      screen.getByRole("form", { name: "Add service" }),
-    ).toBeInTheDocument();
-    expect(screen.getByLabelText("Name")).toBeEnabled();
-    expect(screen.getByLabelText("Name")).toHaveValue("my-service");
-    expect(screen.getByLabelText("Preset")).toHaveValue("");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-    await waitFor(() => expect(onSave).toHaveBeenCalled());
-    expect(onSave).toHaveBeenCalledWith("my-service", { preset: "github" });
-  });
-
-  it("is not unsaved changes until the user changes something", async () => {
-    const onDirtyChange = vi.fn();
-    await renderEditor({ initialName: "my-service", onDirtyChange });
-    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
-  });
-
-  it("ignores it when editing a service", async () => {
-    await renderEditor({
-      name: "mine",
-      service: { preset: "openai" },
-      initialName: "other",
-    });
-    expect(screen.getByLabelText("Name")).toHaveValue("mine");
-    expect(screen.getByLabelText("Preset")).toHaveValue("openai");
   });
 });
 
@@ -2192,13 +2146,10 @@ describe("a free name for a new service", () => {
     expect(onSave).toHaveBeenCalledWith("github-2", { preset: "github" });
   });
 
-  it("never changes a name the user typed or was given", async () => {
+  it("never changes a name the user typed", async () => {
     await renderEditor({ takenNames: ["github"] });
     type("Name", "github");
     type("Preset", "github");
-    expect(nameField()).toHaveValue("github");
-    cleanup();
-    await renderEditor({ initialName: "github", takenNames: ["github"] });
     expect(nameField()).toHaveValue("github");
   });
 });
@@ -2715,7 +2666,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("is added with its own title, no preset, website, key, or More options, and a name given", async () => {
     await renderEditor({
       initialRestrictOnly: true,
-      initialName: "github-limited",
       saveKey: vi.fn(async () => undefined),
     });
     expect(
@@ -2732,12 +2682,25 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     expect(screen.getByRole("button", { name: "Save limit" })).toBeEnabled();
   });
 
+  it("is not unsaved changes until the user changes something", async () => {
+    const onDirtyChange = vi.fn();
+    await renderEditor({ initialRestrictOnly: true, onDirtyChange });
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("takes the first github-limited name that is free", async () => {
+    await renderEditor({
+      initialRestrictOnly: true,
+      takenNames: ["github-limited", "github-limited-2"],
+    });
+    expect(screen.getByLabelText("Name")).toHaveValue("github-limited-3");
+  });
+
   it("saves restrict-only rules for the repositories, with no key, login, or placeholders", async () => {
     const saveKey = vi.fn(async () => undefined);
     const onSaved = vi.fn();
     const { onSave } = await renderEditor({
       initialRestrictOnly: true,
-      initialName: "github-limited",
       saveKey,
       onSaved,
     });
@@ -2759,7 +2722,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("asks for a repository when there is none", async () => {
     const { onSave } = await renderEditor({
       initialRestrictOnly: true,
-      initialName: "github-limited",
     });
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     expect(screen.getByRole("alert")).toHaveTextContent(
@@ -2775,7 +2737,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
       <EgressServiceEditor
         {...baseProps()}
         initialRestrictOnly
-        initialName="github-limited"
         loadPresets={loadPresets}
       />,
     );
@@ -2785,7 +2746,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("can be saved once the presets fail to load", async () => {
     const { onSave } = await renderEditor({
       initialRestrictOnly: true,
-      initialName: "github-limited",
       loadPresets: vi.fn(async () => {
         throw new Error("offline");
       }),
@@ -2798,7 +2758,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("says for whom it also limits the administrator's services", async () => {
     await renderEditor({
       initialRestrictOnly: true,
-      initialName: "github-limited",
       scope: "shared",
     });
     expect(
@@ -2972,7 +2931,6 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
   it("tells a list that makes more than 50 rules in the alert, and does not save", async () => {
     const { onSave } = await renderLimit({
       initialRestrictOnly: true,
-      initialName: "github-limited",
     });
     enter(Array.from({ length: 17 }, (_, i) => `o/r${i}`).join("\n"));
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));

@@ -82,6 +82,15 @@ function needsMoreOptions(problem: ServiceProblem): boolean {
   return problem.field !== "form" && !isBasicField(problem.field);
 }
 
+/** The name a new limit starts with: `github-limited`, or the first of `-2`, `-3`... that is free. */
+function limitedServiceName(taken: readonly string[]): string {
+  const base = "github-limited";
+  for (let n = 1; ; n += 1) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    if (!taken.includes(name)) return name;
+  }
+}
+
 /** A rule as a short host and path, such as `www.googleapis.com/drive/`. */
 function ruleCoverage(rule: EgressRuleSummary): string {
   const path = rule.path_prefix === "/" ? "" : rule.path_prefix;
@@ -93,12 +102,11 @@ export interface EgressServiceEditorProps {
   service: AuthoredEgressService | null;
   /** The name of the service being edited; it cannot change. Omit it to add one. */
   name?: string;
-  /** Add mode only: start with this name; it counts as typed, so it is never replaced by a suggestion. */
-  initialName?: string;
   /**
    * Add mode only: add a service that only limits GitHub repositories, which
-   * has no key or account of its own. Editing a service that is restrict-only
-   * opens the same form.
+   * has no key or account of its own, named after the first free
+   * `github-limited` name. Editing a service that is restrict-only opens the
+   * same form.
    */
   initialRestrictOnly?: boolean;
   context: EditorContext;
@@ -161,7 +169,6 @@ export interface EgressServiceEditorProps {
 export function EgressServiceEditor({
   service,
   name,
-  initialName,
   initialRestrictOnly = false,
   context,
   sharedTarget = false,
@@ -197,15 +204,19 @@ export function EgressServiceEditor({
   // Checked against the names the editor opened with: a save that is still
   // running may already have written this name into the page's own list.
   const [openedWithNames] = useState(takenNames);
-  // A new service is named after its preset or host until the user types a name.
-  const [nameTyped, setNameTyped] = useState(
-    !editing && initialName !== undefined && initialName !== "",
-  );
+  const addingLimit = initialRestrictOnly && !editing;
+  // A new service is named after its preset or host until the user types a
+  // name; a new limit's name counts as typed.
+  const [nameTyped, setNameTyped] = useState(addingLimit);
   const [form, setForm] = useState(() => {
-    const limiting = initialRestrictOnly && !editing;
-    const opened = formFromService(name ?? initialName ?? "", service);
-    if (limiting) return { ...opened, restrictOnly: true, rules: [] };
-    return editing || nameTyped
+    if (addingLimit)
+      return {
+        ...formFromService(limitedServiceName(openedWithNames), service),
+        restrictOnly: true,
+        rules: [],
+      };
+    const opened = formFromService(name ?? "", service);
+    return editing
       ? opened
       : { ...opened, name: suggestedName(opened, openedWithNames) };
   });
