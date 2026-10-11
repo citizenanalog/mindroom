@@ -1173,6 +1173,59 @@ async def test_approval_resume_after_mid_turn_compaction(tmp_path: Path, summary
 
 
 @pytest.mark.asyncio
+async def test_team_approval_resume_after_mid_turn_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
+    config, paths = _config(
+        tmp_path,
+        teams={"test_team": TeamConfig(display_name="Test Team", role="Test team", agents=["test_agent"])},
+    )
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(
+        storage,
+        _team_session(
+            "session-1",
+            team_id="test_team",
+            runs=[_completed_team_run("run-1", team_id="test_team"), _completed_team_run("run-2", team_id="test_team")],
+        ),
+    )
+
+    class _PausingLoop(_ToolLoopModel):
+        async def ainvoke(self, messages: list[Message], **kwargs: object) -> ModelResponse:
+            response = await super().ainvoke(messages, **kwargs)
+            if len(self.requests) == 5 and response.tool_calls:
+                response.tool_calls[0]["function"]["name"] = "approve_me"
+            return response
+
+    model = _PausingLoop(tool_rounds=6)
+    team = Team(
+        id="test_team",
+        name="test_team",
+        model=model,
+        members=[],
+        tools=[probe, Function(name="approve_me", entrypoint=lambda: "approved", requires_confirmation=True)],
+        db=storage,
+        add_history_to_context=True,
+        store_history_messages=False,
+        add_session_summary_to_context=False,
+        telemetry=False,
+    )
+    install_mid_turn_compaction(team, config=config, runtime_paths=paths, entity_name="test_team", model_name="default")
+
+    paused = await team.arun("Do the task", session_id="session-1")
+    assert paused.status == RunStatus.paused
+    assert summary_calls.inputs
+    paused_request = model.requests[-1]
+    for requirement in paused.requirements or []:
+        requirement.confirm()
+    model.requests.clear()
+    await team.acontinue_run(run_id=paused.run_id, requirements=paused.requirements, session_id="session-1")
+
+    resumed = model.requests[0]
+    summaries = [message for message in resumed.messages if is_compaction_summary(message)]
+    assert len(summaries) == 1
+    assert summaries[0].content == next(m.content for m in paused_request.messages if is_compaction_summary(m))
+
+
+@pytest.mark.asyncio
 async def test_partial_commit_then_failure_leaves_the_request_unchanged(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
