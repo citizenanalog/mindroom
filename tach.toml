@@ -8324,6 +8324,8 @@ depends_on = [
     "mindroom.logging_config",
     "mindroom.model_usage",
     "mindroom.native_compaction",
+    "mindroom.providers.claude_prompt_cache",
+    "mindroom.providers.openai_tool_search",
     "mindroom.token_budget",
     "mindroom.usage.storage",
 ]

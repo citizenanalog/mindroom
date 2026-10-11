@@ -25,7 +25,7 @@ When the active model has a known `context_window`, MindRoom fits replayed histo
 Your configured `num_history_runs` stays unchanged; the reduction applies only to the run that needs it.
 Without a known `context_window` (and without `compaction.replay_window_tokens`), history is not fitted and automatic text compaction is unavailable.
 
-With compaction enabled, a known `context_window` also bounds every model request of a reply, including the requests after tool results; see [Compaction during a reply](#compaction-during-a-reply).
+With compaction enabled, MindRoom also checks every model request of a reply against a known `context_window`, including the requests after tool results, and compacts when one would not fit; see [Compaction during a reply](#compaction-during-a-reply).
 
 ```yaml
 models:
