@@ -1,11 +1,8 @@
 """Shared Matrix OpenID verification and exact browser origins."""
 
-import ipaddress
 import json
-from contextlib import suppress
 from time import monotonic
 from typing import Literal
-from urllib.parse import urlsplit
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
 from mindroom.constants import RuntimePaths, runtime_matrix_homeserver
 from mindroom.logging_config import get_logger
+from mindroom.origins import normalized_origin, parse_browser_origin
 from mindroom.requester_identity import runtime_matrix_domain
 
 logger = get_logger(__name__)
@@ -21,7 +19,6 @@ _AUDIENCE_FEATURE = "io.mindroom.openid_audience"
 _AUDIENCE_PARAM = "io.mindroom.audience"
 _CAPABILITY_TTL_SECONDS = 600.0
 _VERSIONS_TIMEOUT = aiohttp.ClientTimeout(total=5)
-_DEFAULT_PORTS = {"http": 80, "https": 443}
 # Homeserver URL to (expiry on the monotonic clock, whether it binds OpenID tokens to an audience).
 _audience_support: dict[str, tuple[float, bool]] = {}
 
@@ -51,55 +48,15 @@ def allowed_client_origins(paths: RuntimePaths, env_name: str) -> tuple[str, ...
         origins = json.loads(paths.env_value(env_name, default="[]") or "[]")
         if not isinstance(origins, list):
             return ()
-        for origin in origins:
-            if not isinstance(origin, str) or any(character.isspace() or ord(character) < 32 for character in origin):
-                return ()
-            # The bundled iOS app has a fixed custom-scheme origin. Accept only
-            # this literal, never arbitrary capacitor origins or opaque "null".
-            if origin == "capacitor://localhost":
-                continue
-            parsed = urlsplit(origin)
-            hostname = parsed.hostname
-            port = parsed.port  # Validate malformed and out-of-range ports.
-            loopback = hostname == "localhost"
-            if hostname and not loopback:
-                with suppress(ValueError):
-                    loopback = ipaddress.ip_address(hostname).is_loopback
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.netloc
-                or not hostname
-                or (parsed.scheme == "http" and not loopback)
-                or (port is None and parsed.netloc.endswith(":"))
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.path
-                or parsed.query
-                or parsed.fragment
-                or "*" in origin
-            ):
-                return ()
+        # The bundled iOS app has a fixed custom-scheme origin. Accept only
+        # this literal, never arbitrary capacitor origins or opaque "null".
+        if not all(isinstance(origin, str) for origin in origins):
+            return ()
+        return tuple(
+            origin if origin == "capacitor://localhost" else parse_browser_origin(origin) for origin in origins
+        )
     except (ValueError, TypeError):
         return ()
-    return tuple(origins)
-
-
-def _bound_audience(paths: RuntimePaths) -> str | None:
-    """Return `MINDROOM_PUBLIC_URL` as a browser `URL.origin` (lowercase, default port dropped, no path), or None.
-
-    urlsplit already lowercases the scheme and host.
-    """
-    try:
-        parsed = urlsplit((paths.env_value("MINDROOM_PUBLIC_URL") or "").strip())
-        scheme = parsed.scheme
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        return None
-    if scheme not in _DEFAULT_PORTS or not host:
-        return None
-    host = f"[{host}]" if ":" in host else host
-    return f"{scheme}://{host}" + (f":{port}" if port not in {None, _DEFAULT_PORTS[scheme]} else "")
 
 
 async def _homeserver_binds_audience(client: aiohttp.ClientSession, homeserver: str) -> bool:
@@ -140,7 +97,7 @@ async def _userinfo_params(
 ) -> dict[str, str]:
     params = {"access_token": token.access_token}
     if await _homeserver_binds_audience(client, homeserver):
-        audience = _bound_audience(paths)
+        audience = normalized_origin(paths.env_value("MINDROOM_PUBLIC_URL"))
         if audience is None:
             raise MatrixOpenIDError(503, "Set MINDROOM_PUBLIC_URL to verify bound Matrix OpenID tokens.")
         params[_AUDIENCE_PARAM] = audience

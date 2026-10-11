@@ -167,4 +167,23 @@ Do not report or "fix" these; they are deliberate.
 - After an upgrade from workers that mounted whole state roots, startup stops those workers before serving, failing until none remain, and warns; it does not scan for or repair links they may have planted above workspaces, because a scan on every start is costly and an automatic repair could itself follow a planted entry, so an operator runs the [upgrade check](https://docs.mindroom.chat/deployment/upgrades/#workspace-only-worker-mounts).
 - Conversation OAuth connect and reset links for shared-scope credentials work without a dashboard login; the short-lived single-use link and the recheck of the issuing requester's credential-management permission authorize them, because some deployments give users no dashboard access.
 - Anyone who can use an agent may connect or reset their own requester-owned OAuth connection (user or user-agent credential scope) through its chat links, as on the Connections portal; the browser must authenticate as the link's requester, and shared-scope connections still require an administrator or credential manager.
+- The Connections portal signs users in either through trusted upstream strict JWT auth or, when `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS` lists MindRoom Chat origins, through a Matrix OpenID token that Chat hands to the portal window.
+  The session cookie is bound to the verified Matrix user and a one-hour in-memory lifetime, and it authenticates only the portal and its APIs, the OAuth callback for flows it started, and the OAuth success page; it never grants dashboard or administrator access, even to an administrator.
+  An allowlisted origin can sign a browser in as any Matrix user whose OpenID token it holds, so list only Chat origins you operate or trust.
+  When the homeserver advertises `io.mindroom.openid_audience` (MindRoom's Tuwunel fork), MindRoom requires `MINDROOM_PUBLIC_URL` and binds tokens to its normalized origin, so a backend that Chat opens cannot replay a token to another deployment on the same homeserver.
+  MindRoom never takes that audience from the request, because a replaying backend controls the `Host` header; without a valid `MINDROOM_PUBLIC_URL` it answers 503.
+  Without binding support tokens are not bound, so keep the OpenID token lifetime short (`openid_token_ttl` on Tuwunel).
+  The `/connections` page shell is served without authentication, while every API stays protected.
 - The MCP gateway runs an agent's tools without its instructions, so it withholds agents whose worker scope is `shared` or unset unless `mcp_gateway_shared_credentials` opts one in; an opted-in agent's users can call its tools directly with its shared accounts and worker, and the shared workspace and browser profiles of a non-private `user` or `user_agent` agent stay reachable through the gateway as they are in chat.
+
+## Reviewing security findings
+
+Classify every finding before proposing a change.
+
+1. Name the boundary it crosses: worker to primary, tenant to tenant, Matrix user to agent, or none.
+2. Check whether the agent involved is trusted under the trust model above.
+3. Check the intentional behaviors list.
+4. Only a finding that crosses a real boundary and matches no intentional behavior is a bug.
+
+A fix that restricts a trusted setup, or that blocks workspace and attachment flows an agent legitimately needs, is not a security fix.
+When a maintainer rejects a finding as intended behavior, add it to the list above in the same change so the next reviewer does not rediscover it.

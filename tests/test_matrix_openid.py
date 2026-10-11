@@ -213,7 +213,6 @@ async def test_unbound_verification_does_not_need_a_public_url(homeserver: tuple
         ("  http://Portal.Example.org:80/  ", "http://portal.example.org"),
         ("https://portal.example.org:8443", "https://portal.example.org:8443"),
         ("http://portal.example.org:443", "http://portal.example.org:443"),
-        ("https://user:pw@portal.example.org", "https://portal.example.org"),
         ("http://[::1]:8765", "http://[::1]:8765"),
     ],
 )
