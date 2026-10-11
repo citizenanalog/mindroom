@@ -17,8 +17,7 @@ from mindroom.origins import normalized_origin, parse_browser_origin
         ("https://[::1]:443", "https://[::1]"),
         ("http://127.0.0.1:80", "http://127.0.0.1"),
         ("http://[0:0:0:0:0:0:0:1]:8080", "http://[::1]:8080"),
-        ("https://bücher.example", "https://xn--bcher-kva.example"),
-        ("https://BÜCHER.Example:443/x", "https://xn--bcher-kva.example"),
+        ("https://xn--fa-hia.de", "https://xn--fa-hia.de"),
     ],
 )
 def test_normalized_origin(url: str, expected: str) -> None:
@@ -40,6 +39,8 @@ def test_normalized_origin(url: str, expected: str) -> None:
         "https://host.example:abc",
         "https://host.example:99999",
         "https://host.example:",
+        "https://bücher.example",
+        "https://faß.de",
     ],
 )
 def test_normalized_origin_none(url: str | None) -> None:
