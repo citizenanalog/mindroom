@@ -291,9 +291,9 @@ def test_lists_only_usable_shell_or_python_agents(egress_portal: dict[str, Any])
     assert all(s["name"] in ("github", "openai") for a in response.json()["agents"] for s in a["services"])
 
 
-def _agent_rows(response: Any, key: str = "agent_name") -> list[str]:  # noqa: ANN401
+def _agent_rows(response: Any) -> list[str]:  # noqa: ANN401
     assert response.status_code == 200, response.text
-    return [agent[key] for agent in response.json()["agents"]]
+    return [agent["agent_name"] for agent in response.json()["agents"]]
 
 
 def test_listing_reports_scope_scope_agents_and_managers(egress_portal: dict[str, Any]) -> None:
