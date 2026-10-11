@@ -2,6 +2,7 @@ import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
   type EditorOptions,
   type EgressServiceForm,
+  emptyRule,
   formFromService,
   serializeService,
 } from "@/connections/egressServiceForm";
@@ -15,29 +16,20 @@ import type {
 
 /** What the editor model's tests share: the server's presets, the options of each context, and helpers that run a service through the form. */
 
-type Options = EditorOptions;
-
 export const presets = egressPresets.presets as EgressPreset[];
 // What the server sends with the presets; typing it checks the fixture has the shape the editor reads.
 export const validation: EgressValidation = egressPresets.validation;
-export const personal: Options = {
+export const personal: EditorOptions = {
   context: "personal",
   sharedTarget: false,
   presets,
   validation,
 };
-export const sharedPersonal: Options = {
-  context: "personal",
+export const sharedPersonal: EditorOptions = {
+  ...personal,
   sharedTarget: true,
-  presets,
-  validation,
 };
-export const operator: Options = {
-  context: "operator",
-  sharedTarget: false,
-  presets,
-  validation,
-};
+export const operator: EditorOptions = { ...personal, context: "operator" };
 export const newService = { editing: false, takenNames: [] as string[] };
 
 export const bearerRule: EgressRule = {
@@ -47,14 +39,14 @@ export const bearerRule: EgressRule = {
 
 export const serialize = (
   service: AuthoredEgressService,
-  options: Options = personal,
+  options: EditorOptions = personal,
   name = "svc",
 ) => serializeService(formFromService(name, service), options, service);
 
 export const problemsFor = (
   service: AuthoredEgressService | null,
   changes: Partial<EgressServiceForm> = {},
-  options: Options = personal,
+  options: EditorOptions = personal,
   settings: { editing: boolean; takenNames: string[] } = newService,
 ) =>
   validateService(
@@ -66,7 +58,7 @@ export const problemsFor = (
 export const errorsFor = (
   service: AuthoredEgressService | null,
   changes: Partial<EgressServiceForm> = {},
-  options: Options = personal,
+  options: EditorOptions = personal,
   settings: { editing: boolean; takenNames: string[] } = newService,
 ) =>
   problemsFor(service, changes, options, settings).map(
@@ -78,13 +70,5 @@ export function basicAuth(username: string) {
 }
 
 export function validRule() {
-  return {
-    host: "api.example.com",
-    port: "",
-    pathPrefix: "",
-    authType: "bearer" as const,
-    username: "",
-    headerOrParam: "",
-    template: "",
-  };
+  return { ...emptyRule(), host: "api.example.com" };
 }
