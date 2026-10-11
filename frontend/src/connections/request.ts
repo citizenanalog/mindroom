@@ -1,3 +1,10 @@
+let signedInUser: string | null = null;
+
+/** Remember the Matrix ID the portal rendered so every request can prove which account the page shows. */
+export function setSignedInUser(user: string | null) {
+  signedInUser = user;
+}
+
 /**
  * Send a same-origin Connections API request and parse its JSON response.
  *
@@ -19,12 +26,13 @@ export async function requestConnection<T>(
       method,
       signal,
       credentials: "same-origin",
-      ...(method === "POST"
-        ? {
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          }
-        : {}),
+      headers: {
+        ...(signedInUser
+          ? { "X-MindRoom-Connections-User": signedInUser }
+          : {}),
+        ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
     });
   } catch {
     throw new Error("Could not reach the server. Try again.");

@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionsSignIn } from "./ConnectionsSignIn";
+import { requestConnection } from "./request";
 
 const SESSION = "/api/connections/session";
 const OPEN_FROM_CHAT =
@@ -121,6 +122,32 @@ describe("ConnectionsSignIn with an opener", () => {
     await act(() => Promise.resolve());
     expect(sessionCalls("POST")).toHaveLength(1);
     expect(screen.queryByText(/@bob/)).not.toBeInTheDocument();
+  });
+
+  it("sends the signed-in user on every request after sign-in", async () => {
+    installBackend();
+    renderGate();
+    answerFromOpener("alice");
+    expect(await screen.findByText("Portal content")).toBeInTheDocument();
+    vi.mocked(fetch).mockClear();
+    vi.mocked(fetch).mockImplementation(async () => json({}));
+    const signal = new AbortController().signal;
+    await requestConnection("/api/connections", signal);
+    await requestConnection("/api/connections/agents/a/p/status", signal);
+    await requestConnection(
+      "/api/connections/agents/a/p/connect",
+      signal,
+      "POST",
+    );
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls).toHaveLength(3);
+    for (const [, init] of calls)
+      expect(init?.headers).toMatchObject({
+        "X-MindRoom-Connections-User": "@alice:example.org",
+      });
+    expect(calls[2][1]?.headers).toMatchObject({
+      "Content-Type": "application/json",
+    });
   });
 
   it("ignores an existing session and shows only the account Chat signs in", async () => {

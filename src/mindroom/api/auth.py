@@ -935,6 +935,9 @@ def _connections_session_path_honored(request: Request) -> bool:
     return _is_connections_path(path) or _is_oauth_popup_path(path, frozenset({"success"}))
 
 
+_CONNECTIONS_USER_HEADER = "X-MindRoom-Connections-User"
+
+
 def _connections_session_auth_user(request: Request) -> dict[str, Any] | None:
     """Return the Connections session identity, honored only on portal paths while the portal is enabled."""
     snapshot = _bind_authenticated_request_snapshot(request)
@@ -946,6 +949,10 @@ def _connections_session_auth_user(request: Request) -> dict[str, Any] | None:
     matrix_user_id = config_lifecycle.app_state(request.app).connections_sessions.resolve(token) if token else None
     if matrix_user_id is None:
         return None
+    portal_user = request.headers.get(_CONNECTIONS_USER_HEADER)
+    if portal_user is not None and portal_user != matrix_user_id:
+        # The session cookie is browser-wide, so a tab signed in as another account must reload.
+        raise HTTPException(status_code=401, detail="Connections session belongs to another account. Reload this page.")
     return {"user_id": matrix_user_id, "email": None, "matrix_user_id": matrix_user_id, "auth_source": "matrix_openid"}
 
 

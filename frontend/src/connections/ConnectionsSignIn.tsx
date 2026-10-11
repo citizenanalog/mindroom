@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { setSignedInUser } from "./request";
 
 const SESSION_PATH = "/api/connections/session";
 const READY_MESSAGE = "mindroom:connections-ready";
@@ -31,9 +32,9 @@ async function readBody(response: Response): Promise<Record<string, unknown>> {
 
 async function signedIn(response: Response): Promise<Gate> {
   const { matrix_user_id: user } = await readBody(response);
-  return typeof user === "string" && user
-    ? { state: "signed-in", user }
-    : blocked(RELOAD);
+  if (typeof user !== "string" || !user) return blocked(RELOAD);
+  setSignedInUser(user);
+  return { state: "signed-in", user };
 }
 
 /** Ask the window that opened the portal for a Matrix OpenID token; `null` means no answer in time or aborted. */

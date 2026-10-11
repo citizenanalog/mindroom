@@ -317,6 +317,39 @@ def test_two_session_users_connect_under_their_own_ids_not_owner(signin: dict[st
     assert alice.get(status_url).json()["connected"] is False
 
 
+def test_session_refuses_requests_from_a_tab_signed_in_as_another_account(signin: dict[str, Any]) -> None:
+    """The cookie is browser-wide, so a stale tab naming another account is refused and acts on nothing."""
+    client = signin["client"]
+    assert sign_in(client, "alice").status_code == 200
+    status_url = "/api/connections/agents/personal/google_drive/status"
+    disconnect_url = "/api/connections/agents/personal/google_drive/disconnect"
+    state = _connect_state(client)
+    callback = client.get(
+        "/api/oauth/google_drive/callback",
+        params={"code": "test-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code in {302, 303, 307}, callback.text
+    stored = partial(_stored_oauth_credentials, signin["provider"], signin["paths"], agent_name="personal")
+    assert stored(requester_id="@alice:example.org") is not None
+
+    stale = {"X-MindRoom-Connections-User": "@bob:example.org"}
+    for response in (
+        client.get("/api/connections", headers=stale),
+        client.get(status_url, headers=stale),
+        client.post(disconnect_url, headers={"Origin": PORTAL_ORIGIN, **stale}, json={}),
+    ):
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Connections session belongs to another account. Reload this page."}
+    assert stored(requester_id="@alice:example.org") is not None
+
+    matching = {"X-MindRoom-Connections-User": "@alice:example.org"}
+    assert client.get(status_url, headers=matching).json()["connected"] is True
+    assert client.get(status_url).json()["connected"] is True
+    assert client.post(disconnect_url, headers={"Origin": PORTAL_ORIGIN, **matching}, json={}).status_code == 200
+    assert stored(requester_id="@alice:example.org") is None
+
+
 def test_session_ignored_on_dashboard_routes(signin: dict[str, Any]) -> None:
     """A portal session is not a dashboard credential; the API key still is."""
     client = signin["client"]
