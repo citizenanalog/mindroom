@@ -11,7 +11,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003 - Required at runtime for load_or_create parameter
-from typing import Literal
+from typing import Any, Literal
 
 from mindroom.atomic_file import atomic_write_bytes_at
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
@@ -20,6 +20,21 @@ _TOKEN_PREFIX = "mrb1"  # noqa: S105
 _TOKEN_VERSION_TAG = b"mindroom-egress-broker-token-v1"
 _MAX_TOKEN_LENGTH = 4096
 _KEY_SIZE = 32
+_CLAIM_KEYS = frozenset(
+    {
+        "worker_key",
+        "worker_scope",
+        "routing_agent_name",
+        "tenant_id",
+        "account_id",
+        "channel",
+        "agent_name",
+        "requester_id",
+    },
+)
+_WORKER_SCOPES = (None, "shared", "user", "user_agent")
+_CHANNELS = ("matrix", "openai_compat", "mcp")
+_OPTIONAL_STR_CLAIMS = ("routing_agent_name", "tenant_id", "account_id", "requester_id")
 
 
 @dataclass(frozen=True)
@@ -157,9 +172,7 @@ class TokenSigner:
         }
         payload_bytes = json.dumps(payload_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
-        # Compute MAC over version tag + payload
-        mac_input = _TOKEN_VERSION_TAG + payload_bytes
-        mac = hmac.new(self._key, mac_input, hashlib.sha256).digest()
+        mac = self._mac(payload_bytes)
 
         # Encode without padding
         payload_b64 = base64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode("ascii")
@@ -167,125 +180,94 @@ class TokenSigner:
 
         return f"{_TOKEN_PREFIX}.{payload_b64}.{mac_b64}"
 
-    def verify(self, token: str, *, now: float | None = None) -> WorkerClaims | None:  # noqa: C901, PLR0911, PLR0912
-        """Verify a token and return claims, or None if invalid/expired."""
+    def verify(self, token: str, *, now: float | None = None) -> WorkerClaims | None:
+        """Verify a token and return claims, or None if invalid/expired.
+
+        Three steps, each of which returns None on failure: parse the token into its payload and MAC, check the MAC
+        over the payload, then check the payload's expiry and claims.
+        """
         if now is None:
             now = time.time()
 
-        # Reject oversized tokens immediately
-        if len(token) > _MAX_TOKEN_LENGTH:
+        parsed = _parse_token(token)
+        if parsed is None:
             return None
-
-        # Split and validate structure
-        parts = token.split(".")
-        if len(parts) != 3:
+        payload_bytes, received_mac = parsed
+        if not hmac.compare_digest(received_mac, self._mac(payload_bytes)):
             return None
-
-        prefix, payload_b64, mac_b64 = parts
-        if prefix != _TOKEN_PREFIX:
+        claims_dict = _unexpired_claims(payload_bytes, now=now)
+        if claims_dict is None:
             return None
+        return _claims_from_dict(claims_dict)
 
-        # Decode payload
-        try:
-            # Add padding if needed
-            payload_b64_padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-            payload_bytes = base64.urlsafe_b64decode(payload_b64_padded)
-        except Exception:
+    def _mac(self, payload_bytes: bytes) -> bytes:
+        """Return the HMAC-SHA256 of the version tag followed by the payload."""
+        return hmac.new(self._key, _TOKEN_VERSION_TAG + payload_bytes, hashlib.sha256).digest()
+
+
+def _b64decode_unpadded(segment: str) -> bytes | None:
+    """Decode an unpadded base64url token segment, or return None when it is not base64."""
+    try:
+        return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+    except Exception:
+        return None
+
+
+def _parse_token(token: str) -> tuple[bytes, bytes] | None:
+    """Return the decoded payload and MAC of a token with the expected size, prefix, and segments, or None."""
+    if len(token) > _MAX_TOKEN_LENGTH:
+        return None
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+
+    prefix, payload_b64, mac_b64 = parts
+    if prefix != _TOKEN_PREFIX:
+        return None
+
+    payload_bytes = _b64decode_unpadded(payload_b64)
+    if payload_bytes is None:
+        return None
+    received_mac = _b64decode_unpadded(mac_b64)
+    if received_mac is None:
+        return None
+    return payload_bytes, received_mac
+
+
+def _unexpired_claims(payload_bytes: bytes, *, now: float) -> dict[str, Any] | None:
+    """Return the claims object of a signed payload whose integer `exp` is after `now`, or None."""
+    try:
+        payload_dict = json.loads(payload_bytes)
+    except Exception:
+        return None
+
+    if not isinstance(payload_dict, dict):
+        return None
+
+    exp = payload_dict.get("exp")
+    if not isinstance(exp, int):
+        return None
+    if now >= exp:
+        return None
+
+    claims_dict = payload_dict.get("claims")
+    if not isinstance(claims_dict, dict):
+        return None
+    return claims_dict
+
+
+def _claims_from_dict(claims_dict: dict[str, Any]) -> WorkerClaims | None:
+    """Return the claims when exactly the expected keys are present, each with its expected type, or None."""
+    try:
+        if set(claims_dict) != _CLAIM_KEYS:
             return None
-
-        # Recompute MAC and compare
-        try:
-            mac_b64_padded = mac_b64 + "=" * (-len(mac_b64) % 4)
-            received_mac = base64.urlsafe_b64decode(mac_b64_padded)
-        except Exception:
+        if not isinstance(claims_dict["worker_key"], str) or not isinstance(claims_dict["agent_name"], str):
             return None
-
-        mac_input = _TOKEN_VERSION_TAG + payload_bytes
-        expected_mac = hmac.new(self._key, mac_input, hashlib.sha256).digest()
-
-        if not hmac.compare_digest(received_mac, expected_mac):
+        if claims_dict["worker_scope"] not in _WORKER_SCOPES or claims_dict["channel"] not in _CHANNELS:
             return None
-
-        # Parse payload JSON
-        try:
-            payload_dict = json.loads(payload_bytes)
-        except Exception:
+        if any(claims_dict[key] is not None and not isinstance(claims_dict[key], str) for key in _OPTIONAL_STR_CLAIMS):
             return None
-
-        if not isinstance(payload_dict, dict):
-            return None
-
-        # Validate and extract exp
-        exp = payload_dict.get("exp")
-        if not isinstance(exp, int):
-            return None
-
-        # Check expiration
-        if now >= exp:
-            return None
-
-        # Validate and extract claims
-        claims_dict = payload_dict.get("claims")
-        if not isinstance(claims_dict, dict):
-            return None
-
-        # Parse claims with strict type checking
-        try:
-            worker_key = claims_dict.get("worker_key")
-            if not isinstance(worker_key, str):
-                return None
-
-            worker_scope = claims_dict.get("worker_scope")
-            if worker_scope is not None and worker_scope not in ("shared", "user", "user_agent"):
-                return None
-
-            routing_agent_name = claims_dict.get("routing_agent_name")
-            if routing_agent_name is not None and not isinstance(routing_agent_name, str):
-                return None
-
-            tenant_id = claims_dict.get("tenant_id")
-            if tenant_id is not None and not isinstance(tenant_id, str):
-                return None
-
-            account_id = claims_dict.get("account_id")
-            if account_id is not None and not isinstance(account_id, str):
-                return None
-
-            channel = claims_dict.get("channel")
-            if channel not in ("matrix", "openai_compat", "mcp"):
-                return None
-
-            agent_name = claims_dict.get("agent_name")
-            if not isinstance(agent_name, str):
-                return None
-
-            requester_id = claims_dict.get("requester_id")
-            if requester_id is not None and not isinstance(requester_id, str):
-                return None
-
-            # Reject unknown keys
-            expected_keys = {
-                "worker_key",
-                "worker_scope",
-                "routing_agent_name",
-                "tenant_id",
-                "account_id",
-                "channel",
-                "agent_name",
-                "requester_id",
-            }
-            if set(claims_dict.keys()) != expected_keys:
-                return None
-
-            return WorkerClaims(
-                worker_key=worker_key,
-                worker_scope=worker_scope,  # type: ignore[arg-type]
-                routing_agent_name=routing_agent_name,
-                tenant_id=tenant_id,
-                account_id=account_id,
-                channel=channel,  # type: ignore[arg-type]
-                agent_name=agent_name,
-                requester_id=requester_id,
-            )
-        except Exception:
-            return None
+        return WorkerClaims(**claims_dict)
+    except Exception:
+        return None

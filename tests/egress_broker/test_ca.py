@@ -5,9 +5,14 @@ from __future__ import annotations
 import socket
 import ssl
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path  # noqa: TC003 - Required at runtime for test fixtures
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import NameOID
 
 from mindroom.egress_broker.ca import BrokerCA, materialize_ca_bundle
 
@@ -40,6 +45,67 @@ def test_key_file_mode_and_encryption(tmp_path: Path) -> None:
     wrong_password = b"wrong"
     with pytest.raises(ValueError, match=r"Incorrect password|Could not deserialize|Bad decrypt"):
         BrokerCA.load_or_create(ca_dir, key_password=wrong_password)
+
+
+def _write_ca_without_subject_key_identifier(ca_dir: Path) -> ec.EllipticCurvePrivateKey:
+    """Write a CA as versions before the SubjectKeyIdentifier fix did, and return its key."""
+    ca_dir.mkdir(mode=0o700)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MindRoom Egress Broker CA")])
+    now = datetime.now(UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    (ca_dir / "ca.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (ca_dir / "ca.key").write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+    )
+    return key
+
+
+def test_ca_without_subject_key_identifier_is_reissued_for_the_same_key(tmp_path: Path) -> None:
+    """A CA from before the SubjectKeyIdentifier fix gets a new certificate for its existing key, written to disk."""
+    ca_dir = tmp_path / "ca"
+    key = _write_ca_without_subject_key_identifier(ca_dir)
+
+    ca = BrokerCA.load_or_create(ca_dir, key_password=None)
+
+    cert = x509.load_pem_x509_certificate(ca.cert_pem.encode())
+    cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    assert cert.public_key() == key.public_key()
+    assert (ca_dir / "ca.pem").read_text() == ca.cert_pem
+    assert (ca_dir / "ca.pem").stat().st_mode & 0o777 == 0o644
+    assert (ca_dir / "ca.key").stat().st_mode & 0o777 == 0o600
+    assert BrokerCA.load_or_create(ca_dir, key_password=None).cert_pem == ca.cert_pem
+
+
+def test_ca_key_that_is_not_ecdsa_is_refused(tmp_path: Path) -> None:
+    """An existing CA key of another type raises TypeError instead of being used."""
+    ca_dir = tmp_path / "ca"
+    BrokerCA.load_or_create(ca_dir, key_password=None)
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    (ca_dir / "ca.key").write_bytes(
+        rsa_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+    )
+
+    with pytest.raises(TypeError, match="CA key is not an ECDSA key"):
+        BrokerCA.load_or_create(ca_dir, key_password=None)
 
 
 def test_leaf_verifies_against_ca_for_dns_and_ip(tmp_path: Path) -> None:

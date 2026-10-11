@@ -88,6 +88,8 @@ class BrokerCA:
 
         CA files: ca.pem (0644) and ca.key (0600, PKCS8, encrypted when key_password is given).
         Parent directory is created with mode 0700 if it does not exist.
+        An existing CA certificate without a SubjectKeyIdentifier, which strict TLS clients require, is reissued
+        for the same key and both files are rewritten.
         """
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -95,109 +97,23 @@ class BrokerCA:
         key_path = directory / "ca.key"
 
         if cert_path.exists() and key_path.exists():
-            # Load existing CA
             cert_pem = cert_path.read_bytes()
             ca_cert = x509.load_pem_x509_certificate(cert_pem)
-
-            # Check if CA has SubjectKeyIdentifier (required for strict TLS clients)
-            try:
-                ca_cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
-                has_ski = True
-            except x509.ExtensionNotFound:
-                has_ski = False
-
-            # If CA lacks SKI, regenerate it (old CA created before this fix)
-            if not has_ski:
-                # Load the key and fall through to regeneration
-                key_pem = key_path.read_bytes()
-                ca_key = serialization.load_pem_private_key(
-                    key_pem,
-                    password=key_password,
-                )
-                if not isinstance(ca_key, ec.EllipticCurvePrivateKey):
-                    msg = "CA key is not an ECDSA key"
-                    raise TypeError(msg)
-                # Fall through to regenerate CA with SKI below
-            else:
-                # Load key and return existing CA
-                key_pem = key_path.read_bytes()
-                ca_key = serialization.load_pem_private_key(
-                    key_pem,
-                    password=key_password,
-                )
-                if not isinstance(ca_key, ec.EllipticCurvePrivateKey):
-                    msg = "CA key is not an ECDSA key"
-                    raise TypeError(msg)
-
+            has_ski = _has_subject_key_identifier(ca_cert)
+            ca_key = _load_ca_key(key_path, key_password)
+            if has_ski:
                 return BrokerCA(
                     ca_cert=ca_cert,
                     ca_key=ca_key,
                     cert_pem=cert_pem.decode("utf-8"),
                     directory=directory,
                 )
+            # Created before the SubjectKeyIdentifier fix: reissue the certificate below for the same key.
         else:
-            # Generate new key if files don't exist
             ca_key = ec.generate_private_key(ec.SECP256R1())
 
-        # Generate CA certificate (new or regenerated with SKI)
-        subject = issuer = x509.Name(
-            [
-                x509.NameAttribute(NameOID.COMMON_NAME, "MindRoom Egress Broker CA"),
-            ],
-        )
-
-        now = datetime.now(UTC)
-        ca_cert = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(issuer)
-            .public_key(ca_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(now)
-            .not_valid_after(now + timedelta(days=_CA_VALIDITY_YEARS * 365))
-            .add_extension(
-                x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
-                critical=False,
-            )
-            .add_extension(
-                x509.BasicConstraints(ca=True, path_length=0),
-                critical=True,
-            )
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=False,
-                    content_commitment=False,
-                    key_encipherment=False,
-                    data_encipherment=False,
-                    key_agreement=False,
-                    key_cert_sign=True,
-                    crl_sign=True,
-                    encipher_only=False,
-                    decipher_only=False,
-                ),
-                critical=True,
-            )
-            .sign(ca_key, hashes.SHA256())
-        )
-
-        # Write certificate with mode 0644
-        cert_pem_bytes = ca_cert.public_bytes(serialization.Encoding.PEM)
-        cert_path.write_bytes(cert_pem_bytes)
-        cert_path.chmod(0o644)
-
-        # Write private key with mode 0600
-        encryption = (
-            serialization.BestAvailableEncryption(key_password) if key_password else serialization.NoEncryption()
-        )
-        key_pem_bytes = ca_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=encryption,
-        )
-        key_path.touch(mode=0o600)
-        key_path.write_bytes(key_pem_bytes)
-        key_path.chmod(0o600)
-
+        ca_cert = _issue_ca_certificate(ca_key)
+        cert_pem_bytes = _write_ca_files(cert_path, key_path, ca_cert=ca_cert, ca_key=ca_key, key_password=key_password)
         return BrokerCA(
             ca_cert=ca_cert,
             ca_key=ca_key,
@@ -337,6 +253,92 @@ class BrokerCA:
             # Unlink temp file
             with contextlib.suppress(Exception):
                 tmp_path.unlink()
+
+
+def _has_subject_key_identifier(ca_cert: x509.Certificate) -> bool:
+    """Return whether the CA certificate has the SubjectKeyIdentifier that strict TLS clients require."""
+    try:
+        ca_cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
+    except x509.ExtensionNotFound:
+        return False
+    return True
+
+
+def _load_ca_key(key_path: Path, key_password: bytes | None) -> ec.EllipticCurvePrivateKey:
+    """Read the CA's private key; raise TypeError when it is not an ECDSA key."""
+    ca_key = serialization.load_pem_private_key(key_path.read_bytes(), password=key_password)
+    if not isinstance(ca_key, ec.EllipticCurvePrivateKey):
+        msg = "CA key is not an ECDSA key"
+        raise TypeError(msg)
+    return ca_key
+
+
+def _issue_ca_certificate(ca_key: ec.EllipticCurvePrivateKey) -> x509.Certificate:
+    """Return a new self-signed CA certificate for `ca_key`, valid for `_CA_VALIDITY_YEARS`."""
+    subject = issuer = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, "MindRoom Egress Broker CA"),
+        ],
+    )
+
+    now = datetime.now(UTC)
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=_CA_VALIDITY_YEARS * 365))
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=0),
+            critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+
+def _write_ca_files(
+    cert_path: Path,
+    key_path: Path,
+    *,
+    ca_cert: x509.Certificate,
+    ca_key: ec.EllipticCurvePrivateKey,
+    key_password: bytes | None,
+) -> bytes:
+    """Write the certificate with mode 0644 and the PKCS8 key with mode 0600; return the certificate PEM."""
+    cert_pem_bytes = ca_cert.public_bytes(serialization.Encoding.PEM)
+    cert_path.write_bytes(cert_pem_bytes)
+    cert_path.chmod(0o644)
+
+    encryption = serialization.BestAvailableEncryption(key_password) if key_password else serialization.NoEncryption()
+    key_pem_bytes = ca_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=encryption,
+    )
+    key_path.touch(mode=0o600)
+    key_path.write_bytes(key_pem_bytes)
+    key_path.chmod(0o600)
+    return cert_pem_bytes
 
 
 def _sni_guard(host: str) -> Callable[[ssl.SSLObject, str | None, ssl.SSLContext], int | None]:

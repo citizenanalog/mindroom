@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 from pathlib import Path  # noqa: TC003 - Required at runtime for test fixtures
 
 import pytest
@@ -89,6 +93,63 @@ def test_other_key_rejected(claims: WorkerClaims) -> None:
 def test_malformed_rejected(signer: TokenSigner, token: str) -> None:
     """Malformed tokens are rejected."""
     assert signer.verify(token) is None
+
+
+def _signed_token(payload: bytes) -> str:
+    """Return a token for raw payload bytes with a valid MAC under the `signer` fixture's key."""
+    mac = hmac.new(b"k" * 32, b"mindroom-egress-broker-token-v1" + payload, hashlib.sha256).digest()
+
+    def encode(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    return f"mrb1.{encode(payload)}.{encode(mac)}"
+
+
+_VALID_CLAIMS: dict[str, object] = {
+    "worker_key": "worker_abc123",
+    "worker_scope": "user",
+    "routing_agent_name": "router",
+    "tenant_id": "tenant_1",
+    "account_id": "account_1",
+    "channel": "matrix",
+    "agent_name": "agent_1",
+    "requester_id": "@user:example.com",
+}
+
+
+def _payload(claims: object = None, *, exp: object = 2000) -> bytes:
+    return json.dumps({"claims": _VALID_CLAIMS if claims is None else claims, "exp": exp}).encode()
+
+
+def test_signed_payload_with_valid_claims_is_accepted(signer: TokenSigner, claims: WorkerClaims) -> None:
+    """The hand-signed payload helper produces a token `verify` accepts, so the rejections below test the claims."""
+    assert signer.verify(_signed_token(_payload()), now=1000) == claims
+    unscoped = {**_VALID_CLAIMS, "worker_scope": None, "routing_agent_name": None, "requester_id": None}
+    assert signer.verify(_signed_token(_payload(unscoped)), now=1000) is not None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"not json", id="not-json"),
+        pytest.param(b"\xff\xfe\xfa", id="not-utf8"),
+        pytest.param(b"[]", id="not-an-object"),
+        pytest.param(_payload(exp="2000"), id="exp-not-int"),
+        pytest.param(_payload(exp=1000), id="expired"),
+        pytest.param(_payload([]), id="claims-not-an-object"),
+        pytest.param(_payload({**_VALID_CLAIMS, "extra": "x"}), id="unknown-claim"),
+        pytest.param(_payload({k: v for k, v in _VALID_CLAIMS.items() if k != "tenant_id"}), id="missing-claim"),
+        pytest.param(_payload({**_VALID_CLAIMS, "worker_key": 1}), id="worker-key-not-str"),
+        pytest.param(_payload({**_VALID_CLAIMS, "agent_name": None}), id="agent-name-none"),
+        pytest.param(_payload({**_VALID_CLAIMS, "worker_scope": "global"}), id="unknown-scope"),
+        pytest.param(_payload({**_VALID_CLAIMS, "channel": None}), id="channel-none"),
+        pytest.param(_payload({**_VALID_CLAIMS, "requester_id": 7}), id="requester-not-str"),
+        pytest.param(_payload({**_VALID_CLAIMS, "tenant_id": ["t"]}), id="tenant-not-str"),
+    ],
+)
+def test_signed_payload_with_invalid_content_is_rejected(signer: TokenSigner, payload: bytes) -> None:
+    """A correctly signed payload is still rejected when its JSON, expiry, or claims are malformed."""
+    assert signer.verify(_signed_token(payload), now=1000) is None
 
 
 def test_load_or_create_persists_key_with_0600(tmp_path: Path) -> None:
