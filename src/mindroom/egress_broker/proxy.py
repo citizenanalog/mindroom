@@ -264,24 +264,19 @@ class EgressBroker:
             return False
         headers = upstream_request_headers(list(request.headers), host=authority)
         upstream_request = h11.Request(method=request.method, target=target, headers=headers)
-        return await self._forward(client, entry, port, upstream_request, strip_cookies=route.host_has_rules)
-
-    async def _forward(
-        self,
-        client: Peer,
-        entry: AuditEntry,
-        port: int,
-        request: h11.Request,
-        *,
-        strip_cookies: bool,
-    ) -> bool:
-        """Send one request over a fresh upstream connection; return whether the client connection stays open."""
-        if await self._relay.refuse_large_body(client, entry, request):
+        if await self._relay.refuse_large_body(client, entry, upstream_request):
             return False
+        # Each plain request goes over a fresh upstream connection.
         upstream = await self._relay.open_upstream(client, entry, port, ssl_context=None)
         if upstream is None:
             return False
         try:
-            return await self._relay.forward(client, upstream, request, entry, strip_cookies=strip_cookies)
+            return await self._relay.forward(
+                client,
+                upstream,
+                upstream_request,
+                entry,
+                strip_cookies=route.host_has_rules,
+            )
         finally:
             upstream.writer.transport.abort()
