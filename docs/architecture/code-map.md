@@ -153,6 +153,10 @@ Matrix sync callback
 | `ai_runtime.py` | Agent-run input preparation and queued-notice hooks |
 | `providers/media_fallback.py` | Provider-boundary inline-media retry and process-local capability learning per model route |
 | `providers/model_stream_output.py` | Shared policy for streamed output that makes provider retries unsafe |
+| `budgets/pricing.py` | Per-model USD pricing of token counters, keyed by the provider and model ID usage records |
+| `budgets/spend.py` | Month-to-date per-requester spend derived from retained usage |
+| `budgets/monitor.py` | Background spend refresh and the per-reply decision to use the fallback model |
+| `config/budgets.py` | Opt-in per-user monthly caps and fallback model |
 | `agent_storage.py` | Agent session and learning SQLite storage helpers |
 | `history/` | History replay planning, compaction, and the compaction archive; [compaction.md](compaction.md) maps its modules |
 | `history/mid_turn_compaction.py` | Compaction between the model requests of one reply: request sizing, folding, and the scoped or run-local summary |
@@ -218,6 +222,7 @@ Matrix sync callback
 | `api/` | FastAPI REST API (dashboard, credentials, OpenAI-compatible endpoint) |
 | `api/open_access.py` | Host allow-list and browser-origin guard for requests served without a credential (open dashboard auth, unauthenticated `/v1`) |
 | `api/request_body_limit.py` | Pure ASGI middleware answering 413 for dashboard API request bodies over 16 MiB, except knowledge uploads |
+| `api/budgets.py` | Dashboard route reporting budget settings and month-to-date spend from the runtime's budget monitor |
 | `api/usage_export.py` | Application-scoped usage-export preparation: one background scan, a bounded cache for daily/request-detail variants, committed-generation validation, and non-blocking shutdown cleanup |
 | `custom_tools/` | Built-in custom tool implementations (gmail, calendar, scheduler, etc.) |
 | `custom_tools/todo_state.py` | Leaf storage and actionability primitives for native per-thread todo state |
