@@ -25,10 +25,8 @@ from mindroom.egress_broker.user_services import (
     PLACEHOLDER_REFUSED_WORDS,
     PLACEHOLDER_VALUE,
     PLACEHOLDER_VALUE_MAX_LENGTH,
-    ServiceSource,
     effective_config,
 )
-from mindroom.egress_broker.user_services import service_source as config_service_source
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.oauth.service import oauth_provider_service_account_configured
 from mindroom.workers.backend import WorkerBackendError
@@ -47,8 +45,6 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 
-type EgressServiceSource = ServiceSource
-
 RESTRICT_ONLY_KEY_REFUSAL = "This service only limits paths and never sends a key, so it cannot store one"
 
 
@@ -63,11 +59,6 @@ def effective_services(
     reads the credential store, so async callers run this in a thread.
     """
     return effective_config(config.egress_broker, manager, target).services
-
-
-def service_source(config: Config, name: str) -> EgressServiceSource:
-    """Say whether a service of an effective config is the administrator's (`config`) or the scope's own (`user`)."""
-    return config_service_source(config.egress_broker, name)
 
 
 class EgressRuleLocation(BaseModel):

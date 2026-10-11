@@ -20,7 +20,6 @@ from mindroom.api.egress_status import (
     RESTRICT_ONLY_KEY_REFUSAL,
     AuditLogsResponse,
     EgressRuleSummary,
-    EgressServiceSource,
     EgressSourceStatus,
     PresetsResponse,
     audit_logs_response,
@@ -30,12 +29,12 @@ from mindroom.api.egress_status import (
     egress_service_status,
     presets_response,
     rule_summaries,
-    service_source,
     unavailable_egress_oauth_status,
 )
 from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
 from mindroom.egress_broker.secrets import delete_secret, save_secret
 from mindroom.egress_broker.service import active_audit_log, active_ca_pem
+from mindroom.egress_broker.user_services import ServiceSource, service_source
 from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 
@@ -61,7 +60,7 @@ class _ServiceStatus(EgressSourceStatus):
     name: str
     display_name: str | None
     description: str
-    source: EgressServiceSource
+    source: ServiceSource
     rules: list[EgressRuleSummary]
     restrict_only: bool
 
@@ -166,7 +165,7 @@ async def _load_service_statuses_for_target(
                 name=name,
                 display_name=service_config.display_name,
                 description=service_config.description,
-                source=service_source(config, name),
+                source=service_source(config.egress_broker, name),
                 rules=rule_summaries(service_config),
                 restrict_only=service_config.restrict_only,
                 **sources.model_dump(),

@@ -18,7 +18,6 @@ from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.api.egress_access import EgressUser, check_agent_eligibility
 from mindroom.api.egress_status import (
     EgressRuleSummary,
-    EgressServiceSource,
     EgressSourceStatus,
     PresetsResponse,
     effective_services,
@@ -27,12 +26,11 @@ from mindroom.api.egress_status import (
     presets_response,
     rule_summaries,
     service_oauth_provider,
-    service_source,
     unavailable_egress_oauth_status,
 )
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
-from mindroom.egress_broker.user_services import InactiveReason, inactive_user_services
+from mindroom.egress_broker.user_services import InactiveReason, ServiceSource, inactive_user_services, service_source
 from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
@@ -66,7 +64,7 @@ class EgressCredentialService(EgressSourceStatus):
     description: str
     is_shared: bool
     can_manage: bool
-    source: EgressServiceSource
+    source: ServiceSource
     rules: list[EgressRuleSummary]
     placeholder_names: list[str]
     restrict_only: bool
@@ -187,7 +185,7 @@ async def _build_service_for_agent(
     request: Request,
     name: str,
     service: EgressService,
-    source: EgressServiceSource,
+    source: ServiceSource,
     config: Config,
     runtime_paths: RuntimePaths,
     target: ResolvedWorkerTarget,
@@ -254,7 +252,7 @@ async def egress_services_for_agent(
             request,
             name,
             service,
-            service_source(config, name),
+            service_source(config.egress_broker, name),
             config,
             runtime_paths,
             target,
