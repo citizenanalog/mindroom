@@ -1,6 +1,7 @@
 """Test configuration and fixtures for MindRoom tests."""
 
 import asyncio
+import gc
 import os
 import re
 import shutil
@@ -3008,6 +3009,18 @@ def _never_download_stock_avatars(monkeypatch: pytest.MonkeyPatch) -> None:
         raise httpx.ConnectError(message, request=httpx.Request("GET", url))
 
     monkeypatch.setattr(managed_avatars_module, "_download_stock_avatar", offline)
+
+
+@pytest.fixture(autouse=True)
+def _never_freeze_the_test_heap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep orchestrator initialization from freezing the pytest worker's heap.
+
+    Cycles among frozen objects are never collected, so every test that
+    initializes an orchestrator would pin its own fixtures, mocks, and
+    orchestrator for the rest of the worker's life.
+    `tests/test_heap_probe.py` covers the real freeze against a fake `gc`.
+    """
+    monkeypatch.setattr(gc, "freeze", lambda: None)
 
 
 @pytest.fixture(scope="session")

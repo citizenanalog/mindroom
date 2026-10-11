@@ -1483,6 +1483,7 @@ depends_on = [
     "mindroom.tool_system",
     "mindroom.tool_system.catalog",
     "mindroom.tool_system.runtime_context",
+    "mindroom.tool_system.skills",
 ]
 
 [[modules]]
@@ -4172,7 +4173,9 @@ path = "mindroom.matrix_rtc.live_voice_agent"
 depends_on = [
     "mindroom.background_tasks",
     "mindroom.logging_config",
+    "mindroom.matrix_rtc.transcript",
     "mindroom.matrix_rtc.voice_agent",
+    "mindroom.timing",
 ]
 
 [[modules]]
@@ -6735,6 +6738,8 @@ expose = [
     "MAX_WORKSPACE_SKILL_FILE_BYTES",
     "MAX_WORKSPACE_SKILL_NAME_CHARS",
     "SKILL_FILENAME",
+    "SKILL_FUNCTION_NAMES",
+    "SKILL_READ_FUNCTION_NAMES",
     "SkillMarkdownError",
     "agent_workspace_skills_root",
     "build_agent_skills",
