@@ -19,25 +19,10 @@ from mindroom.egress_broker.ca import BrokerCA
 from mindroom.egress_broker.dial import DialPolicy
 from mindroom.egress_broker.env import broker_execution_env, primary_callback_hosts
 from mindroom.egress_broker.messages import ScopeInfo
-from mindroom.egress_broker.oauth_source import (
-    Missing,
-    NeedsReconnect,
-    OAuthTokenResult,
-    Token,
-    oauth_status,
-    resolve_oauth_token,
-)
+from mindroom.egress_broker.oauth_source import oauth_status, resolve_oauth_token
 from mindroom.egress_broker.proxy import EgressBroker
 from mindroom.egress_broker.rules import EgressRules
-from mindroom.egress_broker.secrets import (
-    Secret,
-    SecretMissing,
-    SecretNeedsReconnect,
-    SecretResult,
-    SecretUnavailable,
-    load_secret,
-    service_status,
-)
+from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretResult, load_secret, service_status
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 from mindroom.egress_broker.user_services import effective_config
 from mindroom.logging_config import get_logger
@@ -260,35 +245,16 @@ async def _resolve_secret(
     egress_service = egress.services.get(name)
     if egress_service is None or egress_service.oauth_provider is None:
         return SecretMissing()
-    provider_id = egress_service.oauth_provider
     lookup = functools.partial(
         resolve_oauth_token,
         service=name,
-        provider_id=provider_id,
+        provider_id=egress_service.oauth_provider,
         config=current,
         runtime_paths=runtime_paths,
         credentials_manager=credentials_manager,
         worker_target=target,
     )
-    result = await asyncio.get_running_loop().run_in_executor(oauth_executor, lookup)
-    return _oauth_secret_result(provider_id, result)
-
-
-def _oauth_secret_result(provider_id: str, result: OAuthTokenResult) -> SecretResult:
-    if isinstance(result, Token):
-        return Secret(result.value)
-    if isinstance(result, Missing):
-        # Only a connectable provider outside a shared scope has a connect link, and only then is it worth naming.
-        if result.connect_url is None:
-            return SecretMissing()
-        return SecretMissing(provider=provider_id, connect_url=result.connect_url)
-    if isinstance(result, NeedsReconnect):
-        return SecretNeedsReconnect(
-            provider=provider_id,
-            connect_url=result.connect_url,
-            reset_required=result.reset_required,
-        )
-    return SecretUnavailable(provider=provider_id)
+    return await asyncio.get_running_loop().run_in_executor(oauth_executor, lookup)
 
 
 class _BrokerService:

@@ -17,15 +17,15 @@ from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import oauth_source
-from mindroom.egress_broker.oauth_source import (
-    Missing,
-    NeedsReconnect,
-    Token,
-    Unavailable,
-    oauth_status,
-    resolve_oauth_token,
+from mindroom.egress_broker.oauth_source import oauth_status, resolve_oauth_token
+from mindroom.egress_broker.secrets import (
+    OAuthStatus,
+    Secret,
+    SecretMissing,
+    SecretNeedsReconnect,
+    SecretResult,
+    SecretUnavailable,
 )
-from mindroom.egress_broker.secrets import OAuthStatus
 from mindroom.egress_broker.tokens import WorkerClaims
 from mindroom.oauth.credential_lifecycle import load_oauth_credentials_snapshot_sync, resolve_oauth_credential_context
 from mindroom.oauth.credential_store import _oauth_credential_database_path
@@ -195,7 +195,7 @@ def _resolve(
     *,
     provider_id: str = "github",
     service: str = "github",
-) -> Token | Missing | NeedsReconnect | Unavailable:
+) -> SecretResult:
     return resolve_oauth_token(
         service=service,
         provider_id=provider_id,
@@ -235,7 +235,7 @@ def test_connected_account_yields_its_token(
 
     result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
-    assert result == Token("alice-access")
+    assert result == Secret("alice-access")
     assert "alice-access" not in repr(result)
 
 
@@ -263,7 +263,7 @@ def test_requester_scoped_provider_is_unavailable_on_workers_requesters_share(
     result = _resolve(config, runtime_paths, manager, alice)
     status = _status(config, runtime_paths, manager, alice)
 
-    assert result == Missing(None)
+    assert result == SecretMissing()
     assert status == OAuthStatus(
         provider="github",
         display_name="GitHub",
@@ -293,7 +293,7 @@ def test_requester_scoped_provider_is_unavailable_on_the_static_runner(
     result = _resolve(config, static, manager, alice)
     status = _status(config, static, manager, alice)
 
-    assert result == Missing(None)
+    assert result == SecretMissing()
     assert status is not None
     assert (status.connected, status.can_connect, status.unavailable_reason) == (False, False, "shared_sandbox")
     assert status.shared_worker_opt_in is False
@@ -310,7 +310,7 @@ def test_unset_worker_backend_is_the_static_runner(
 
     result = _resolve(config, replace(runtime_paths, process_env=env), manager, _broker_target("@alice:example.org"))
 
-    assert result == Missing(None)
+    assert result == SecretMissing()
 
 
 @pytest.mark.parametrize("backend", ["docker", "kubernetes"])
@@ -330,7 +330,7 @@ def test_requester_scoped_provider_is_used_on_a_dedicated_backend(
     result = _resolve(config, dedicated, manager, alice)
     status = _status(config, dedicated, manager, alice)
 
-    assert result == Token("alice-access")
+    assert result == Secret("alice-access")
     assert status is not None
     assert (status.connected, status.unavailable_reason, status.shared_worker_opt_in) == (True, None, False)
 
@@ -353,7 +353,7 @@ def test_opt_in_uses_the_requesters_account_on_every_backend(
     status = _status(opted_in_config, runtime, manager, target)
 
     private = backend != "static_runner" and scope == "user_agent"
-    assert result == Token("alice-access")
+    assert result == Secret("alice-access")
     assert status is not None
     assert (status.connected, status.unavailable_reason, status.shared_worker_opt_in) == (True, None, not private)
 
@@ -393,11 +393,11 @@ def test_opt_in_uses_the_callers_account_on_a_shared_worker(
     bob_connected = _resolve(opted_in_config, runtime_paths, manager, _broker_target("@bob:example.org", "shared"))
     status = _status(opted_in_config, runtime_paths, manager, _broker_target("@alice:example.org", "shared"))
 
-    assert alice == Token("alice-access")
-    assert isinstance(bob, Missing)
+    assert alice == Secret("alice-access")
+    assert isinstance(bob, SecretMissing)
     assert bob.connect_url is not None
     assert bob.connect_url.startswith(GITHUB_CONNECT_PREFIX)
-    assert bob_connected == Token("bob-access")
+    assert bob_connected == Secret("bob-access")
     assert status is not None
     assert (status.connected, status.unavailable_reason, status.shared_worker_opt_in) == (True, None, True)
 
@@ -427,7 +427,7 @@ def test_requester_scoped_provider_without_requester_has_no_token(
     result = _resolve(opted_in_config, runtime_paths, manager, _broker_target(None, "shared"))
 
     # Without a requester there is no one to bind a connect token to, so the link is the generic authorize page.
-    assert result == Missing(f"{PUBLIC_URL}/api/oauth/github/authorize")
+    assert result == SecretMissing(provider="github", connect_url=f"{PUBLIC_URL}/api/oauth/github/authorize")
 
 
 def test_missing_connection_offers_a_connect_link(
@@ -438,7 +438,7 @@ def test_missing_connection_offers_a_connect_link(
     """Without a connection the result carries a MindRoom link that connects one for this scope."""
     result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
-    assert isinstance(result, Missing)
+    assert isinstance(result, SecretMissing)
     assert result.connect_url is not None
     assert result.connect_url.startswith(GITHUB_CONNECT_PREFIX)
     assert "connect_token=" in urlsplit(result.connect_url).query
@@ -461,9 +461,9 @@ def test_repeated_misses_reuse_one_connect_link(
 
     assert len(links) == 1
     assert None not in links
-    assert isinstance(bob, Missing)
+    assert isinstance(bob, SecretMissing)
     assert bob.connect_url not in links
-    assert isinstance(expired, Missing)
+    assert isinstance(expired, SecretMissing)
     assert expired.connect_url not in links
     state = json.loads((runtime_paths.storage_root / "oauth_state" / "oauth_state.json").read_text())
     assert len(state["states"]) == 3
@@ -480,7 +480,7 @@ def test_provider_without_client_config_offers_no_link(
     result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
     status = _status(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
-    assert result == Missing(None)
+    assert result == SecretMissing()
     assert status is not None
     assert (status.connected, status.can_connect) == (False, False)
 
@@ -497,7 +497,7 @@ def test_unknown_provider_warns_once_naming_the_service(
         second = _resolve(config, runtime_paths, manager, target, provider_id="nope", service="custom")
         status = _status(config, runtime_paths, manager, target, provider_id="nope", service="custom")
 
-    assert first == second == Missing(None)
+    assert first == second == SecretMissing()
     assert status is None
     warnings = [entry for entry in logs if entry["event"] == "egress_broker_oauth_provider_unknown"]
     assert warnings == [
@@ -523,7 +523,7 @@ def test_expired_token_is_refreshed_through_the_lifecycle(
 
     result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
-    assert result == Token("rotated-access-token")
+    assert result == Secret("rotated-access-token")
     assert presented == [REFRESH_TOKEN]
     stored = load_oauth_credentials_snapshot_sync(_store_context(runtime_paths, manager, store)).credentials
     assert stored is not None
@@ -544,7 +544,7 @@ def test_concurrent_lookups_refresh_once(
     with ThreadPoolExecutor(max_workers=8) as executor:
         results = list(executor.map(lambda _: _resolve(config, runtime_paths, manager, target), range(8)))
 
-    assert results == [Token("rotated-access-token")] * 8
+    assert results == [Secret("rotated-access-token")] * 8
     assert presented == [REFRESH_TOKEN]
 
 
@@ -561,7 +561,7 @@ def test_revoked_grant_needs_reconnect_without_leaking(
     with capture_logs() as logs:
         result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
-    assert isinstance(result, NeedsReconnect)
+    assert isinstance(result, SecretNeedsReconnect)
     assert not result.reset_required
     assert result.connect_url is not None
     assert result.connect_url.startswith(GITHUB_CONNECT_PREFIX)
@@ -596,7 +596,7 @@ def test_transient_refresh_failure_is_retryable_and_backs_off(
     monkeypatch: pytest.MonkeyPatch,
     outcome: httpx.Response | Callable[[httpx.Request], Exception],
 ) -> None:
-    """An outage is `Unavailable`, never a reconnect prompt, and the scope skips the grant until the backoff ends."""
+    """An outage answers `SecretUnavailable`, not a reconnect, and the scope skips the grant until the backoff ends."""
     store = _github_store("@alice:example.org")
     _connect(manager, store, "stale-access", expires_at=1.0)
     outcomes: list[TokenEndpointOutcome] = [outcome]
@@ -610,8 +610,8 @@ def test_transient_refresh_failure_is_retryable_and_backs_off(
     outcomes.append(rotated_token_response())
     recovered = _resolve(config, runtime_paths, manager, target)
 
-    assert first == backing_off == Unavailable()
-    assert recovered == Token("rotated-access-token")
+    assert first == backing_off == SecretUnavailable(provider="github")
+    assert recovered == Secret("rotated-access-token")
     assert presented == [REFRESH_TOKEN, REFRESH_TOKEN]
     unavailable = [entry for entry in logs if entry["event"] == "egress_broker_oauth_token_unavailable"]
     assert unavailable == [
@@ -635,7 +635,7 @@ def test_lookups_queued_behind_a_stalled_refresh_do_not_repeat_it(
     manager: CredentialsManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Lookups waiting while a refresh stalls and then fails answer `Unavailable` without sending another grant."""
+    """Lookups waiting while a refresh stalls and then fails answer `SecretUnavailable` without another grant."""
     _connect(manager, _github_store("@alice:example.org"), "stale-access", expires_at=1.0)
     stalled_failure = DelayedTokenEndpointOutcome(0.5, httpx.Response(503, json={"error": "temporarily_unavailable"}))
     presented = serve_token_endpoint(monkeypatch, [stalled_failure])
@@ -644,7 +644,7 @@ def test_lookups_queued_behind_a_stalled_refresh_do_not_repeat_it(
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(lambda _: _resolve(config, runtime_paths, manager, target), range(4)))
 
-    assert results == [Unavailable()] * 4
+    assert results == [SecretUnavailable(provider="github")] * 4
     assert presented == [REFRESH_TOKEN]
 
 
@@ -665,7 +665,7 @@ def test_unreadable_connection_requires_reset(
     result = _resolve(config, runtime_paths, manager, target)
     status = _status(config, runtime_paths, manager, target)
 
-    assert result == NeedsReconnect(connect_url=None, reset_required=True)
+    assert result == SecretNeedsReconnect(provider="github", connect_url=None, reset_required=True)
     assert status is not None
     assert (status.connected, status.reset_required) == (False, True)
 
@@ -683,8 +683,8 @@ def test_agent_scoped_provider_follows_the_worker_scope(
     bob = _resolve(config, runtime_paths, manager, _broker_target("@bob:example.org", "shared"), provider_id="demo")
     private = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"), provider_id="demo")
 
-    assert alice == bob == Token("shared-access")
-    assert isinstance(private, Missing)
+    assert alice == bob == Secret("shared-access")
+    assert isinstance(private, SecretMissing)
 
 
 @pytest.mark.usefixtures("demo_registry")
@@ -718,9 +718,9 @@ def test_shared_scope_connect_links_are_never_handed_out(
     revoked = _resolve(config, runtime_paths, manager, shared, provider_id="demo")
     private = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"), provider_id="demo")
 
-    assert revoked == NeedsReconnect(connect_url=None)
-    assert missing == Missing(None)
-    assert isinstance(private, Missing)
+    assert revoked == SecretNeedsReconnect(provider="demo", connect_url=None)
+    assert missing == SecretMissing()
+    assert isinstance(private, SecretMissing)
     assert private.connect_url is not None
     assert "connect_token=" in urlsplit(private.connect_url).query
 
@@ -739,7 +739,7 @@ def test_scoped_worker_never_reads_the_unscoped_store(
         for scope in ("shared", "user", "user_agent")
     ]
 
-    assert all(isinstance(result, Missing) for result in results)
+    assert all(isinstance(result, SecretMissing) for result in results)
 
 
 @pytest.mark.usefixtures("demo_registry")
@@ -757,7 +757,7 @@ def test_unscoped_worker_reads_the_store_its_tools_use(
 
     result = _resolve(config, runtime_paths, manager, claims.to_worker_target(), provider_id="demo")
 
-    assert result == Token("unscoped-access")
+    assert result == Secret("unscoped-access")
 
 
 def test_status_reports_connection_without_refreshing(
@@ -816,5 +816,5 @@ def test_status_with_a_service_account_matches_what_the_broker_injects(
     assert (alice.service_account, alice.connected, alice.can_connect) == (True, True, False)
     assert bob is not None
     assert (bob.service_account, bob.connected, bob.can_connect) == (True, False, False)
-    assert _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org")) == Token("alice-access")
-    assert _resolve(config, runtime_paths, manager, _broker_target("@bob:example.org")) == Missing(None)
+    assert _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org")) == Secret("alice-access")
+    assert _resolve(config, runtime_paths, manager, _broker_target("@bob:example.org")) == SecretMissing()

@@ -14,7 +14,15 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from mindroom.egress_broker.secrets import PERSONAL_WORKER_SCOPES, OAuthStatus
+from mindroom.egress_broker.secrets import (
+    PERSONAL_WORKER_SCOPES,
+    OAuthStatus,
+    Secret,
+    SecretMissing,
+    SecretNeedsReconnect,
+    SecretResult,
+    SecretUnavailable,
+)
 from mindroom.logging_config import get_logger
 from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialUnreadableError,
@@ -42,12 +50,7 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 __all__ = [
-    "Missing",
-    "NeedsReconnect",
-    "OAuthTokenResult",
     "SharedWorkerOAuth",
-    "Token",
-    "Unavailable",
     "oauth_status",
     "resolve_oauth_token",
     "shared_worker_oauth",
@@ -70,34 +73,6 @@ _connect_urls_lock = threading.Lock()
 _TRANSIENT_FAILURE_BACKOFF_SECONDS = 30.0
 
 
-@dataclass(frozen=True)
-class Token:
-    """A usable access token for the scope's connection; its value never appears in a repr."""
-
-    value: str = field(repr=False)
-
-
-@dataclass(frozen=True)
-class Missing:
-    """The scope has no usable connection; `connect_url` is set when the user can connect one."""
-
-    connect_url: str | None = field(default=None, repr=False)
-
-
-@dataclass(frozen=True)
-class NeedsReconnect:
-    """The scope's connection cannot supply a token until the user acts: the grant was revoked or is unreadable."""
-
-    connect_url: str | None = field(default=None, repr=False)
-    reset_required: bool = False
-
-
-@dataclass(frozen=True)
-class Unavailable:
-    """Refreshing the scope's token failed for a reason that may pass, such as a provider outage; retry later."""
-
-
-type OAuthTokenResult = Token | Missing | NeedsReconnect | Unavailable
 type SharedWorkerOAuth = Literal["refused", "allowed"]
 
 
@@ -124,18 +99,18 @@ def resolve_oauth_token(
     runtime_paths: RuntimePaths,
     credentials_manager: CredentialsManager,
     worker_target: ResolvedWorkerTarget,
-) -> OAuthTokenResult:
+) -> SecretResult:
     """Return a fresh access token from the scope's connection to `provider_id`, refreshing it when near expiry.
 
-    Only a rejected grant or an unreadable credential asks the user to act (`NeedsReconnect`); any other refresh
-    failure is `Unavailable`, as the tools treat it, and the scope then answers `Unavailable` without another grant
+    Only a rejected grant or an unreadable credential asks the user to act (`SecretNeedsReconnect`); any other refresh
+    failure is `SecretUnavailable`, as the tools treat it, and the scope then answers that without another grant
     for `_TRANSIENT_FAILURE_BACKOFF_SECONDS`. `service` names the egress service in the one warning logged for a
     provider id the registry does not know. Blocks on the OAuth transaction owner, and on another lookup refreshing
     the same scope, so callers on an event loop run it in a thread.
     """
     provider = _registered_provider(service, provider_id, config, runtime_paths)
     if provider is None:
-        return Missing()
+        return SecretMissing()
     access = shared_worker_oauth(
         provider,
         worker_target,
@@ -144,18 +119,18 @@ def resolve_oauth_token(
     )
     if access == "refused":
         # Connecting an account would not change that, so there is no link either.
-        return Missing()
+        return SecretMissing()
     context = _credential_context(provider, config, runtime_paths, credentials_manager, worker_target)
     if provider.requester_scoped_credentials and context.worker_target is None:
         # No requester to bind the connection to, so there is no stored token to use.
-        return Missing(_connect_url(context))
+        return _missing(context)
     credentials = _refreshed_credentials(service, context)
-    if isinstance(credentials, NeedsReconnect | Unavailable):
+    if isinstance(credentials, SecretNeedsReconnect | SecretUnavailable):
         return credentials
     token = (credentials or {}).get("token") or (credentials or {}).get("access_token")
     if not oauth_credentials_usable(provider, runtime_paths, credentials) or not isinstance(token, str) or not token:
-        return Missing(_connect_url(context))
-    return Token(token)
+        return _missing(context)
+    return Secret(token)
 
 
 def oauth_status(
@@ -275,13 +250,13 @@ def _registered_provider(
 def _refreshed_credentials(
     service: str,
     context: OAuthCredentialContext,
-) -> dict[str, Any] | NeedsReconnect | Unavailable | None:
+) -> dict[str, Any] | SecretNeedsReconnect | SecretUnavailable | None:
     """Refresh the scope's credentials through its gate; a failed refresh becomes the result to return."""
     gate = _refresh_gate(context)
     with gate.lock:
         # Lookups queued behind a failed refresh answer here instead of each repeating the grant.
         if gate.backing_off():
-            return Unavailable()
+            return SecretUnavailable(provider=context.provider.id)
         try:
             credentials = refresh_oauth_credentials_blocking(context)
         except (OAuthCredentialUnreadableError, OAuthRefreshRejectedError) as exc:
@@ -289,15 +264,18 @@ def _refreshed_credentials(
         except OAuthProviderError as exc:
             gate.failed_at = time.monotonic()
             _log_token_unavailable(service, context.provider, exc)
-            return Unavailable()
+            return SecretUnavailable(provider=context.provider.id)
         else:
             gate.failed_at = None
             return credentials
     _log_token_unavailable(service, context.provider, terminal)
     if isinstance(terminal, OAuthCredentialUnreadableError):
         # Unreadable state must be reset from the dashboard before a new connection can be stored.
-        return NeedsReconnect(reset_required=True)
-    return NeedsReconnect(_connect_url(context, OAUTH_REFRESH_REJECTED_REASON))
+        return SecretNeedsReconnect(provider=context.provider.id, reset_required=True)
+    return SecretNeedsReconnect(
+        provider=context.provider.id,
+        connect_url=_connect_url(context, OAUTH_REFRESH_REJECTED_REASON),
+    )
 
 
 def _log_token_unavailable(service: str, provider: OAuthProvider, exc: OAuthProviderError) -> None:
@@ -347,6 +325,12 @@ def _connectable(provider: OAuthProvider, runtime_paths: RuntimePaths) -> bool:
         provider,
         runtime_paths,
     )
+
+
+def _missing(context: OAuthCredentialContext) -> SecretMissing:
+    """Return the missing result, naming the provider only when the caller gets a link to connect an account."""
+    url = _connect_url(context)
+    return SecretMissing() if url is None else SecretMissing(provider=context.provider.id, connect_url=url)
 
 
 def _connect_url(context: OAuthCredentialContext, reason: str | None = None) -> str | None:

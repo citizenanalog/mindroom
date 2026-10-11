@@ -37,7 +37,7 @@ from mindroom.config.main import Config
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
-from mindroom.egress_broker.oauth_source import Token, resolve_oauth_token
+from mindroom.egress_broker.oauth_source import resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import EgressRules, route_request
 from mindroom.egress_broker.user_services import (
@@ -1123,7 +1123,7 @@ def test_service_account_keeps_reporting_a_personal_connection_the_broker_still_
         credentials_manager=get_runtime_credentials_manager(portal["paths"]),
         worker_target=build_connection_agent_target(config, portal["paths"], "@alice:example.org", "personal"),
     )
-    assert isinstance(token, Token)
+    assert isinstance(token, secrets.Secret)
 
 
 def test_listing_never_refreshes_tokens(oauth_egress_portal: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
