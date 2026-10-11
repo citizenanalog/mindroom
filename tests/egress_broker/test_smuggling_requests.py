@@ -10,6 +10,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import h11
 import pytest
 
 from tests.egress_broker.conftest import connect_request, proxy_authorization
@@ -423,6 +424,34 @@ async def test_expect_continue_forwards_one_request_after_the_body(
     await assert_listener_serves(broker, probe)
 
 
+class _ServerReads:
+    """Count the bytes each of the broker's client-side h11 connections receives, to wait for a part to be read.
+
+    The broker feeds h11 and asks it for the next event in one step, so once the bytes are counted, h11 has already
+    judged the incomplete head they leave.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._received: dict[int, int] = {}
+        self._changed = asyncio.Event()
+        receive_data = h11.Connection.receive_data
+
+        def counting_receive_data(conn: h11.Connection, data: bytes) -> None:
+            receive_data(conn, data)
+            if conn.our_role is h11.SERVER:
+                self._received[id(conn)] = self._received.get(id(conn), 0) + len(data)
+                self._changed.set()
+
+        monkeypatch.setattr(h11.Connection, "receive_data", counting_receive_data)
+
+    async def wait_for(self, size: int) -> None:
+        """Wait until one connection has received at least `size` bytes."""
+        async with asyncio.timeout(5):
+            while max(self._received.values(), default=0) < size:
+                self._changed.clear()
+                await self._changed.wait()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tunnel", [False, True], ids=["plain", "tunnel"])
 @pytest.mark.parametrize(
@@ -433,6 +462,7 @@ async def test_expect_continue_forwards_one_request_after_the_body(
 async def test_head_limit_holds_however_the_head_is_split(
     broker: BrokerFactory,
     upstreams: UpstreamFactory,
+    monkeypatch: pytest.MonkeyPatch,
     tunnel: bool,
     first_part: int,
     total: int,
@@ -443,12 +473,14 @@ async def test_head_limit_holds_however_the_head_is_split(
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
     client, target = await client_for(broker, upstream, tunnel=tunnel)
+    # Counted only from here on: the CONNECT head is far shorter than either first part anyway.
+    reads = _ServerReads(monkeypatch)
     try:
         raw = _padded_to(total)(target.render(_GET + "X-Pad: \r\n\r\n"))
         client.send(raw[:first_part])
         await client.writer.drain()
-        # Let the broker read the first part on its own before the rest arrives.
-        await asyncio.sleep(0.1)
+        # The broker has read the whole first part, and h11 has judged it, before the rest is sent.
+        await reads.wait_for(first_part)
         client.send(raw[first_part:])
         reply = await client.reply()
     finally:
