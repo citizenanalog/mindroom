@@ -248,7 +248,9 @@ describe("egress credentials page", () => {
         ),
     ).toHaveLength(2);
 
-    fireEvent.click(screen.getByRole("button", { name: "Disconnect GitHub" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Disconnect for GitHub" }),
+    );
     fireEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", {
         name: "Disconnect",
@@ -454,7 +456,7 @@ describe("egress services on the personal page", () => {
     it("sets a key while editing a service", async () => {
       render(<EgressCredentials />);
       fireEvent.click(
-        await screen.findByRole("button", { name: "Edit My API service" }),
+        await screen.findByRole("button", { name: "Edit service for My API" }),
       );
       await presetsReady();
       fireEvent.change(screen.getByLabelText("API key"), {
@@ -587,7 +589,7 @@ describe("egress services on the personal page", () => {
   it("edits a user service from its authored form and keeps the name", async () => {
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Edit My API service" }),
+      await screen.findByRole("button", { name: "Edit service for My API" }),
     );
     const form = await screen.findByRole("form", { name: "Edit mine" });
     expect(within(form).getByLabelText("Name")).toBeDisabled();
@@ -616,7 +618,7 @@ describe("egress services on the personal page", () => {
   it("deletes a user service after confirmation", async () => {
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Delete My API service" }),
+      await screen.findByRole("button", { name: "Delete service for My API" }),
     );
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("deletes the service and its saved key");
@@ -632,7 +634,7 @@ describe("egress services on the personal page", () => {
   it("deletes from inside the editor too", async () => {
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Edit My API service" }),
+      await screen.findByRole("button", { name: "Edit service for My API" }),
     );
     await screen.findByRole("form", { name: "Edit mine" });
     listing[0].services = [configService];
@@ -647,7 +649,7 @@ describe("egress services on the personal page", () => {
       json({ detail: "Service is not a service of your own" }, 404);
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Delete My API service" }),
+      await screen.findByRole("button", { name: "Delete service for My API" }),
     );
     fireEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", {
@@ -738,7 +740,7 @@ describe("egress services on the personal page", () => {
       within(managed).getByRole("button", { name: "Add service for Managed" }),
     ).toBeInTheDocument();
     expect(
-      within(managed).getByRole("button", { name: "Edit My API service" }),
+      within(managed).getByRole("button", { name: "Edit service for My API" }),
     ).toBeInTheDocument();
     expect(within(managed).getByText("Shared")).toBeInTheDocument();
     expect(
@@ -828,6 +830,36 @@ describe("egress services on the personal page", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("note")).toBeNull();
   });
+
+  it.each<[Partial<EgressCredentialAgent>, string]>([
+    [{}, "for this agent only."],
+    [
+      { scope: "user", scope_agents: ["Personal Mind", "Writer"] },
+      "for all your agents that share your personal workspace.",
+    ],
+    [{ shared: true, scope: "shared" }, "for everyone using this agent."],
+    [{ shared: true, scope: "unscoped" }, "for everyone using this agent."],
+  ])(
+    "tells whom the restriction reaches for the agent's scope (%j)",
+    async (change, audience) => {
+      listing[0] = { ...listing[0], ...change };
+      render(<EgressCredentials />);
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Add service for Personal Mind",
+        }),
+      );
+      await presetsReady();
+      fireEvent.click(screen.getByRole("button", { name: "More options" }));
+      expect(
+        screen
+          .getByLabelText("Refuse other paths on these hosts")
+          .closest("div"),
+      ).toHaveTextContent(
+        `This also limits services from your administrator on these hosts, ${audience}`,
+      );
+    },
+  );
 
   it("shows a name conflict from the server", async () => {
     mutation = () =>
@@ -975,7 +1007,7 @@ describe("egress services on the personal page", () => {
     );
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Edit My API service" }),
+      await screen.findByRole("button", { name: "Edit service for My API" }),
     );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "no longer available",
@@ -1025,7 +1057,7 @@ describe("presets and unsaved edits on the personal page", () => {
   };
   const edit = async (name: string) => {
     fireEvent.click(
-      await screen.findByRole("button", { name: `Edit ${name} service` }),
+      await screen.findByRole("button", { name: `Edit service for ${name}` }),
     );
     await screen.findByRole("form", { name: `Edit ${name.toLowerCase()}` });
     await presetsReady();
@@ -1035,7 +1067,7 @@ describe("presets and unsaved edits on the personal page", () => {
 
   it("fetches the presets from the personal API only when an editor opens", async () => {
     render(<EgressCredentials />);
-    await screen.findByRole("button", { name: "Edit One service" });
+    await screen.findByRole("button", { name: "Edit service for One" });
     expect(presetRequests()).toBe(0);
 
     await edit("One");
@@ -1059,20 +1091,20 @@ describe("presets and unsaved edits on the personal page", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "Edit Two service" }),
+        screen.getByRole("button", { name: "Edit service for Two" }),
       ).toBeDisabled(),
     );
     expect(
-      screen.getByRole("button", { name: "Delete One service" }),
+      screen.getByRole("button", { name: "Delete service for One" }),
     ).toBeDisabled();
     expect(
-      screen.getByRole("button", { name: "Delete Two service" }),
+      screen.getByRole("button", { name: "Delete service for Two" }),
     ).toBeDisabled();
 
     finish(new Response(null, { status: 204 }));
     await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
     expect(
-      screen.getByRole("button", { name: "Edit Two service" }),
+      screen.getByRole("button", { name: "Edit service for Two" }),
     ).toBeEnabled();
     // The write ran to the end: nothing started after it replaced or aborted it.
     expect(calls.filter((call) => call.method === "PUT")).toHaveLength(1);
@@ -1085,7 +1117,9 @@ describe("presets and unsaved edits on the personal page", () => {
       target: { value: "typed but not saved" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit service for Two" }),
+    );
     expect(screen.getByRole("alert")).toHaveTextContent(
       "You have unsaved changes in the open editor.",
     );
@@ -1098,7 +1132,9 @@ describe("presets and unsaved edits on the personal page", () => {
     expect(screen.queryByText(/unsaved changes in the open editor/)).toBeNull();
     expect(description()).toHaveValue("typed but not saved");
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit service for Two" }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(
       await screen.findByRole("form", { name: "Edit two" }),
@@ -1112,14 +1148,14 @@ describe("presets and unsaved edits on the personal page", () => {
     await edit("One");
     // Opening it again would only offer to throw away what is typed.
     expect(
-      screen.getByRole("button", { name: "Edit One service" }),
+      screen.getByRole("button", { name: "Edit service for One" }),
     ).toBeDisabled();
     expect(
-      screen.getByRole("button", { name: "Edit Two service" }),
+      screen.getByRole("button", { name: "Edit service for Two" }),
     ).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(
-      screen.getByRole("button", { name: "Edit One service" }),
+      screen.getByRole("button", { name: "Edit service for One" }),
     ).toBeEnabled();
   });
 
@@ -1129,7 +1165,9 @@ describe("presets and unsaved edits on the personal page", () => {
     fireEvent.change(description(), {
       target: { value: "typed but not saved" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit service for Two" }),
+    );
     expect(
       screen.getByText(/unsaved changes in the open editor/),
     ).toBeInTheDocument();
@@ -1149,7 +1187,9 @@ describe("presets and unsaved edits on the personal page", () => {
     fireEvent.change(description(), {
       target: { value: "typed but not saved" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit service for Two" }),
+    );
     listing[0].services = [listing[0].services[1]];
     fireEvent.click(screen.getByRole("button", { name: "Delete service" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
@@ -1160,7 +1200,9 @@ describe("presets and unsaved edits on the personal page", () => {
   it("opens another service straight away when nothing was changed", async () => {
     render(<EgressCredentials />);
     await edit("One");
-    fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit service for Two" }),
+    );
     expect(
       await screen.findByRole("form", { name: "Edit two" }),
     ).toBeInTheDocument();
@@ -1173,7 +1215,9 @@ describe("presets and unsaved edits on the personal page", () => {
     const field = description();
     fireEvent.change(field, { target: { value: "x" } });
     fireEvent.change(field, { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: "Edit Two service" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit service for Two" }),
+    );
     expect(
       await screen.findByRole("form", { name: "Edit two" }),
     ).toBeInTheDocument();
@@ -1203,28 +1247,45 @@ describe("what deleting a service says about its scope", () => {
     });
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Delete My API service" }),
+      await screen.findByRole("button", { name: "Delete service for My API" }),
     );
     return (await screen.findByRole("dialog")).textContent;
   };
 
-  it("names the other personal agents that share the scope", async () => {
+  it("says the agent alone loses access on a user_agent scope", async () => {
     expect(await open({})).toContain(
-      "along with any other personal agent of yours that shares this scope",
+      "This deletes the service and its saved key. Your Personal Mind loses access through it.",
     );
   });
 
-  it("does not on a shared agent, where everyone shares the service", async () => {
-    const text = await open({
-      shared: true,
-      scope: "shared",
-      scope_agents: [],
-      managers: [],
-      services: [{ ...userService, is_shared: true }],
-    });
-    expect(text).toContain("Everyone who relies on it loses access");
-    expect(text).not.toContain("personal agent");
+  it("names every agent that shares a user scope's workspace", async () => {
+    expect(
+      await open({
+        scope: "user",
+        scope_agents: ["Personal Mind", "Writer", "Scripter"],
+      }),
+    ).toContain(
+      "This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Personal Mind, Writer, Scripter.",
+    );
   });
+
+  it.each(["shared", "unscoped"] as const)(
+    "says everyone using the agent loses access on a %s scope",
+    async (scope) => {
+      const text = await open({
+        shared: true,
+        scope,
+        scope_agents: [],
+        managers: [],
+        can_manage: true,
+        services: [{ ...userService, is_shared: true }],
+      });
+      expect(text).toContain(
+        "This deletes the service and its shared key. Everyone using Personal Mind loses access through it.",
+      );
+      expect(text).not.toContain("personal workspace");
+    },
+  );
 });
 
 describe("inactive services on the personal page", () => {
@@ -1441,7 +1502,7 @@ describe("inactive services on the personal page", () => {
       });
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Edit My API service" }),
+      await screen.findByRole("button", { name: "Edit service for My API" }),
     );
     await screen.findByRole("form", { name: "Edit mine" });
     await presetsReady();
@@ -2094,11 +2155,11 @@ describe("recent requests: wording and wrapping", () => {
     );
   });
 
-  it("explains in a caption that other sites pass straight through", async () => {
+  it("explains in a caption that other sites pass straight through and that administrators can see the requests", async () => {
     render(<EgressCredentials />);
     const table = await openLog();
     expect(table.querySelector("caption")).toHaveTextContent(
-      "Requests to sites without a service pass straight through; MindRoom sees only the host.",
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).",
     );
   });
 

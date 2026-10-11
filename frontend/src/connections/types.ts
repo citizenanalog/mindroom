@@ -102,9 +102,11 @@ export interface EgressCredentialService {
   /** Where the service applies, in rule order. Absent in responses from before the server sent it. */
   rules?: EgressRuleSummary[];
   /**
-   * The placeholder variables an administrator's service sets in the sandbox,
-   * so a service of one's own that sets the same one can be warned. Absent for
-   * a service of one's own, and in responses from before the server sent it.
+   * The names of the variables the service sets in the sandbox, a preset's
+   * included, so a service of one's own that sets the same one can be warned
+   * about those of an administrator's. Sent for every service in the personal
+   * listing; absent on the dashboard and in responses from before the server
+   * sent it.
    */
   placeholder_names?: string[];
   /** `null` when the caller cannot tell whether the key is shared. */

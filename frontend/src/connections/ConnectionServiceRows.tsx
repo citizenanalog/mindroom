@@ -258,7 +258,7 @@ export function ConnectionServiceRows({
                         size="sm"
                         variant="outline"
                         disabled={busy !== null}
-                        aria-label={`Reset ${service.display_name} connection`}
+                        aria-label={`Reset connection for ${service.display_name}`}
                         onClick={() => setConfirmOpen(true)}
                       >
                         Reset connection
@@ -268,7 +268,7 @@ export function ConnectionServiceRows({
                         size="sm"
                         variant="outline"
                         disabled={busy !== null}
-                        aria-label={`Disconnect ${service.display_name}`}
+                        aria-label={`Disconnect for ${service.display_name}`}
                         onClick={() => setConfirmOpen(true)}
                       >
                         Disconnect

@@ -130,6 +130,33 @@ describe("the editor form", () => {
     ]);
   });
 
+  it("says that an empty value template sends the key as is", async () => {
+    await renderEditor();
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
+      target: { value: "template" },
+    });
+    expect(screen.getByLabelText("Value template")).toHaveAccessibleDescription(
+      "Leave empty to send the key as is.",
+    );
+    // A query parameter has the same optional template.
+    fireEvent.change(screen.getByLabelText("Send the key as"), {
+      target: { value: "query" },
+    });
+    expect(screen.getByLabelText("Value template")).toHaveAccessibleDescription(
+      "Leave empty to send the key as is.",
+    );
+  });
+
+  it("says that placeholders are only set while the service has a key or account", async () => {
+    await renderEditor();
+    openMoreOptions();
+    expect(
+      screen.getByText(
+        /Placeholders are set only while this service has a key or a connected account\./,
+      ),
+    ).toBeVisible();
+  });
+
   it("drops a custom template when the user chooses plain Header", async () => {
     const { onSave } = await renderEditor({
       name: "svc",
@@ -554,6 +581,15 @@ describe("the GitHub helper in the editor", () => {
     });
   });
 
+  it("says what applying does to the rules, in the words of the spec", async () => {
+    await renderGithub();
+    expect(
+      screen.getByText(
+        "One repository per line, as owner/repo, or owner/* for everything an owner has. Applying replaces the rules above with rules for just those repositories (API and git over HTTPS) and refuses every other path on api.github.com and github.com. Other API paths, such as /user or search, stop working. Matching is case sensitive, so write names as they appear in GitHub URLs.",
+      ),
+    ).toBeVisible();
+  });
+
   it("makes owner-wide rules and leaves uploads and GraphQL off by default", async () => {
     await renderGithub();
     expect(
@@ -678,8 +714,21 @@ describe("the GitHub helper in the editor", () => {
 });
 
 describe("the help beside refusing other paths", () => {
-  const HELP =
-    "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key. This also limits services from your administrator on these hosts, for this agent only. The real boundary is the key itself, so scope it as narrowly as the website allows.";
+  const REFUSAL =
+    "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key.";
+  const BOUNDARY =
+    "The real boundary is the key itself, so scope it as narrowly as the website allows.";
+  const LIMIT_FOR = {
+    user_agent: "this agent only",
+    user: "all your agents that share your personal workspace",
+    shared: "everyone using this agent",
+    unscoped: "everyone using this agent",
+  } as const;
+  const limit = (scope: keyof typeof LIMIT_FOR) =>
+    `This also limits services from your administrator on these hosts, for ${LIMIT_FOR[scope]}.`;
+  const helpFor = (scope: keyof typeof LIMIT_FOR) =>
+    `${REFUSAL} ${limit(scope)} ${BOUNDARY}`;
+  const HELP = helpFor("user_agent");
   const GITHUB_HELP =
     "GraphQL (/graphql) is refused unless listed, and a listed GraphQL rule reaches every repository the key can reach. Use a fine-grained token or a GitHub App installed on selected repositories.";
   const restrictHelp = () =>
@@ -689,6 +738,7 @@ describe("the help beside refusing other paths", () => {
 
   it("is generic for a service on any other host", async () => {
     await renderEditor({
+      scope: "user_agent",
       name: "web",
       service: { rules: [{ host: "httpbin.org", auth: { type: "bearer" } }] },
     });
@@ -699,11 +749,16 @@ describe("the help beside refusing other paths", () => {
   });
 
   it("adds the GraphQL sentence on a GitHub host", async () => {
-    await renderEditor({ name: "code", service: { preset: "github" } });
+    await renderEditor({
+      scope: "user_agent",
+      name: "code",
+      service: { preset: "github" },
+    });
     openMoreOptions();
     expect(restrictHelp()).toHaveTextContent(`${HELP} ${GITHUB_HELP}`);
     cleanup();
     await renderEditor({
+      scope: "user_agent",
       name: "code",
       service: {
         rules: [{ host: "api.github.com", auth: { type: "bearer" } }],
@@ -723,17 +778,31 @@ describe("the help beside refusing other paths", () => {
     expect(restrictHelp()).toHaveTextContent("GraphQL");
   });
 
-  it("says this also limits the administrator's services, for this agent only", async () => {
+  it.each(Object.keys(LIMIT_FOR) as (keyof typeof LIMIT_FOR)[])(
+    "says whom the limit on the administrator's services reaches on a %s scope",
+    async (scope) => {
+      await renderEditor({ scope });
+      openMoreOptions();
+      expect(restrictHelp()).toHaveTextContent(helpFor(scope));
+      // The old note about a broader rule of another service is gone.
+      expect(screen.queryByRole("note")).toBeNull();
+      expect(screen.queryByText(/A broader rule of/)).toBeNull();
+    },
+  );
+
+  it("names only the agent for a user_agent scope, never the whole workspace", async () => {
+    await renderEditor({ scope: "user_agent" });
+    openMoreOptions();
+    expect(restrictHelp()).toHaveTextContent("for this agent only.");
+    expect(restrictHelp()).not.toHaveTextContent("personal workspace");
+    expect(restrictHelp()).not.toHaveTextContent("everyone");
+  });
+
+  it("makes no claim about whom the limit reaches when the scope is not known", async () => {
     await renderEditor();
     openMoreOptions();
-    expect(
-      screen.getByText(
-        /This also limits services from your administrator on these hosts, for this agent only\./,
-      ),
-    ).toBeInTheDocument();
-    // The old note about a broader rule of another service is gone.
-    expect(screen.queryByRole("note")).toBeNull();
-    expect(screen.queryByText(/A broader rule of/)).toBeNull();
+    expect(restrictHelp()).toHaveTextContent(`${REFUSAL} ${BOUNDARY}`);
+    expect(restrictHelp()).not.toHaveTextContent("from your administrator");
   });
 
   it("leaves that sentence out on the dashboard, where the administrator edits config.yaml", async () => {
@@ -1916,21 +1985,42 @@ describe("a preset's placeholders an administrator's service also sets", () => {
   const warning =
     "GH_TOKEN is also set by GitHub from your administrator; when both are set, theirs is used.";
 
-  it("warns under the placeholder variables when the preset brings them", async () => {
+  it("warns in the basic form, beside the preset, when the preset brings them", async () => {
+    await renderEditor({
+      name: "mine",
+      service: { preset: "github" },
+      configPlaceholders,
+    });
+    // More options is still collapsed, and the warning is already there.
+    expect(screen.queryByLabelText("Display name")).toBeNull();
+    expect(screen.getByText(warning)).toBeVisible();
+    // GITHUB_TOKEN is not set by the administrator's service.
+    expect(screen.queryByText(/GITHUB_TOKEN is also set/)).toBeNull();
+  });
+
+  it("shows it once, not again under the placeholder variables", async () => {
     await renderEditor({
       name: "mine",
       service: { preset: "github" },
       configPlaceholders,
     });
     openMoreOptions();
-    expect(screen.getByText(warning)).toBeInTheDocument();
-    // GITHUB_TOKEN is not set by the administrator's service.
-    expect(screen.queryByText(/GITHUB_TOKEN is also set/)).toBeNull();
+    expect(screen.getByLabelText("Display name")).toBeVisible();
+    expect(screen.getAllByText(warning)).toHaveLength(1);
+  });
+
+  it("warns on choosing the preset without opening More options", async () => {
+    await renderEditor({ configPlaceholders });
+    expect(screen.queryByText(warning)).toBeNull();
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "github" },
+    });
+    expect(screen.queryByLabelText("Display name")).toBeNull();
+    expect(screen.getByText(warning)).toBeVisible();
   });
 
   it("follows the chosen preset", async () => {
     await renderEditor({ configPlaceholders });
-    openMoreOptions();
     expect(screen.queryByText(warning)).toBeNull();
     fireEvent.change(screen.getByLabelText("Preset"), {
       target: { value: "github" },
@@ -1957,7 +2047,6 @@ describe("a preset's placeholders an administrator's service also sets", () => {
       service: { preset: "github", placeholder_env: {} },
       configPlaceholders,
     });
-    openMoreOptions();
     expect(screen.queryByText(warning)).toBeNull();
   });
 });
@@ -2077,7 +2166,7 @@ describe("what a collapsed or failed form keeps and shows", () => {
         },
       ],
     });
-    // Opened again, the field still holds it.
+    // The save does not reopen the section.
     expect(screen.queryByLabelText("Display name")).toBeNull();
   });
 

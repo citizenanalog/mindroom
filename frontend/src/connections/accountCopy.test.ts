@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  PASS_THROUGH_CAPTION,
+  deleteServiceWarning,
   disconnectDescription,
   formatList,
   personalAccountRefusal,
+  personalSandboxRefusal,
   sharedAccountBody,
   sharedAccountStatus,
   sharedAgentNote,
@@ -68,6 +71,36 @@ describe("account copy", () => {
     );
     expect(personalAccountRefusal("GitHub", false, undefined)).toBe(
       "Personal GitHub accounts can't be used by shared agents. Ask its credential managers to add a team API key.",
+    );
+  });
+
+  it("tells a personal agent's user the sandbox is shared, not the agent", () => {
+    expect(personalSandboxRefusal("GitHub")).toBe(
+      "Personal GitHub accounts can't be used in this sandbox, which other users' commands share. Add an API key instead.",
+    );
+  });
+
+  it("says who loses access when a service is deleted, by scope", () => {
+    expect(deleteServiceWarning("user_agent", "Coder", [])).toBe(
+      "This deletes the service and its saved key. Your Coder loses access through it.",
+    );
+    expect(
+      deleteServiceWarning("user", "Coder", ["Coder", "Writer", "Scripter"]),
+    ).toBe(
+      "This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Coder, Writer, Scripter.",
+    );
+    expect(deleteServiceWarning("user", "Coder", [])).toBe(
+      "This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Coder.",
+    );
+    for (const scope of ["shared", "unscoped"] as const)
+      expect(deleteServiceWarning(scope, "Team Bot", [])).toBe(
+        "This deletes the service and its shared key. Everyone using Team Bot loses access through it.",
+      );
+  });
+
+  it("tells the viewer that administrators can see the requests too", () => {
+    expect(PASS_THROUGH_CAPTION).toBe(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).",
     );
   });
 });

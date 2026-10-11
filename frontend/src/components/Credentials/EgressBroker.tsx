@@ -1,6 +1,5 @@
 import {
   type FormEvent,
-  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -8,6 +7,7 @@ import {
   useState,
 } from "react";
 import { Download, Plus, RefreshCw } from "lucide-react";
+import { breakAfterUnderscores } from "@/connections/breakAfterUnderscores";
 import {
   DiscardEditsNotice,
   EgressServiceEditor,
@@ -208,10 +208,13 @@ function keyScope(agent: Agent, defaults: Config["defaults"]): KeyScope {
 function ServiceSection({
   agentName,
   agentLabel,
+  keysUnused,
 }: {
   agentName: string | null;
   /** How the agent, or the agents without a scope, reads in a sentence. */
   agentLabel: string;
+  /** No agent uses these keys, so there is nothing to set or connect them for. */
+  keysUnused: boolean;
 }) {
   const config = useConfigStore((state) => state.config);
   const dirtyRoots = useConfigStore((state) => state.dirtyRoots);
@@ -244,14 +247,14 @@ function ServiceSection({
         withAgentName(API_ENDPOINTS.egressBroker.services, agentName),
       );
       if (request !== latest.current) return;
-      // The dashboard operator manages every service. Without an agent the
-      // keys are the global ones; for a selected agent the API does not report
-      // its scope, so the wording stays neutral.
+      // The dashboard operator manages every service. Only shared agents and
+      // the global store are offered, so every key here is shared, and the
+      // global one is the one that agents without a worker scope share.
       setServices(
         payload.services.map((service) => ({
           ...service,
           display_name: service.display_name ?? service.name,
-          is_shared: agentName === null ? true : null,
+          is_shared: true,
           is_global: agentName === null,
           can_manage: true,
         })),
@@ -382,6 +385,11 @@ function ServiceSection({
         </a>
         .
       </p>
+      {keysUnused && (
+        <p className="text-xs text-muted-foreground">
+          No agent uses these keys.
+        </p>
+      )}
       {error && (
         <Alert variant="destructive" className="p-2">
           <AlertDescription>{error}</AlertDescription>
@@ -454,6 +462,7 @@ function ServiceSection({
             onChanged={() => void load()}
             errorMessages={SECRET_ERROR_MESSAGES}
             serviceEditing={serviceEditing}
+            hideKeyActions={keysUnused}
             // Only shared agents and the global store are offered here, so every key is shared.
             agent={{ displayName: agentLabel, shared: true, services }}
           />
@@ -461,18 +470,6 @@ function ServiceSection({
       )}
     </section>
   );
-}
-
-// A long refusal code wraps after an underscore, so it shows in full, never
-// clipped and never split inside a word.
-function breakAfterUnderscores(code: string) {
-  const parts = code.match(/[^_]*_|[^_]+/g) ?? [];
-  return parts.map((part, index) => (
-    <Fragment key={index}>
-      {part}
-      {index < parts.length - 1 && <wbr />}
-    </Fragment>
-  ));
 }
 
 function LogTable({ records }: { records: AuditRecord[] }) {
@@ -661,7 +658,8 @@ function LogSection() {
 /** The keys and accounts of the shared agents and of the agents without a scope, plus the request log. */
 export function EgressBroker() {
   const agents = useConfigStore((state) => state.agents);
-  const defaults = useConfigStore((state) => state.config?.defaults);
+  const config = useConfigStore((state) => state.config);
+  const defaults = config?.defaults;
   const [selected, setSelected] = useState<string | null>(null);
 
   // Brokered traffic only exists for agents that can run commands. Shared
@@ -729,6 +727,7 @@ export function EgressBroker() {
           agentLabel={
             agentName === null ? UNSCOPED_AGENTS : (target?.label ?? agentName)
           }
+          keysUnused={target === undefined && config !== null}
         />
         <LogSection />
       </CardContent>

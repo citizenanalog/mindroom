@@ -117,3 +117,15 @@ export function limitedNote(service: EgressCredentialService): string | null {
   const text = `Limited to ${repositories.join(", ")}`;
   return service.description === text ? null : text;
 }
+
+/** "Sends to a.com, b.com:8443" for the hosts a service's rules cover, each once; null where the listing gives no rules. */
+export function hostsNote(service: EgressCredentialService): string | null {
+  const hosts = [
+    ...new Set(
+      (service.rules ?? []).map(
+        (rule) => `${rule.host}${rule.port === null ? "" : `:${rule.port}`}`,
+      ),
+    ),
+  ];
+  return hosts.length > 0 ? `Sends to ${hosts.join(", ")}` : null;
+}

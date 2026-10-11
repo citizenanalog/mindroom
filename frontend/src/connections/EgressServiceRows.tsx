@@ -4,9 +4,14 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { disconnectDescription, personalAccountRefusal } from "./accountCopy";
+import {
+  disconnectDescription,
+  personalAccountRefusal,
+  personalSandboxRefusal,
+} from "./accountCopy";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
+  hostsNote,
   limitedNote,
   removeWarning,
   type RowAgent,
@@ -39,6 +44,7 @@ function EgressServiceRow({
   errorMessages,
   serviceEditing,
   agent,
+  hideKeyActions,
 }: {
   paths: ServicePaths;
   service: EgressCredentialService;
@@ -46,6 +52,7 @@ function EgressServiceRow({
   errorMessages?: RequestErrorMessages;
   serviceEditing?: ServiceEditing;
   agent: RowAgent;
+  hideKeyActions: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [secret, setSecret] = useState("");
@@ -61,10 +68,12 @@ function EgressServiceRow({
   const oauth = service.oauth;
   // Rows with an account keep the key behind a toggle until a key is set.
   const showKeyControls = !oauth || service.key_configured || editing;
+  const canManageKey = service.can_manage && !hideKeyActions;
   // Requester-scoped accounts belong to the requester, so the server lets any
   // eligible user manage them even without key rights.
   const canResetAccount =
     oauth !== null &&
+    !hideKeyActions &&
     (oauth.connected || oauth.reset_required) &&
     (service.can_manage || oauth.can_connect);
 
@@ -82,6 +91,7 @@ function EgressServiceRow({
     service.can_manage &&
     coversGithub(service.rules);
   const limitedText = limitedNote(service);
+  const hostsText = hostsNote(service);
   // Everyone using a shared agent acts as the account connected there.
   const asksAboutSharedAccount = sharesAccount(agent, oauth);
   // The page names a shared agent's managers once, and a refused personal
@@ -246,6 +256,11 @@ function EgressServiceRow({
           >
             {service.description}
           </p>
+          {hostsText && (
+            <p className="break-words text-xs text-muted-foreground">
+              {hostsText}
+            </p>
+          )}
           {limitedText && (
             <p className="text-xs text-muted-foreground">{limitedText}</p>
           )}
@@ -275,11 +290,13 @@ function EgressServiceRow({
           )}
           {oauth?.unavailable_reason === "shared_sandbox" && (
             <span className="text-xs text-muted-foreground">
-              {personalAccountRefusal(
-                oauth.display_name,
-                service.can_manage,
-                agent.managers,
-              )}
+              {agent.shared
+                ? personalAccountRefusal(
+                    oauth.display_name,
+                    service.can_manage,
+                    agent.managers,
+                  )
+                : personalSandboxRefusal(oauth.display_name)}
             </span>
           )}
           {oauth?.shared_worker_opt_in && (
@@ -296,20 +313,24 @@ function EgressServiceRow({
             </span>
           )}
           {/* Connecting reads the saved connection first, so an unreadable one needs a reset before. */}
-          {oauth?.can_connect && !oauth.connected && !oauth.reset_required && (
-            <Button
-              size="sm"
-              disabled={busy !== null}
-              aria-label={`Connect ${oauth.display_name}`}
-              onClick={() =>
-                asksAboutSharedAccount ? setConfirm("shared") : void connect()
-              }
-            >
-              {busy === "connect"
-                ? "Connecting…"
-                : `Connect ${oauth.display_name}`}
-            </Button>
-          )}
+          {oauth &&
+            !hideKeyActions &&
+            oauth.can_connect &&
+            !oauth.connected &&
+            !oauth.reset_required && (
+              <Button
+                size="sm"
+                disabled={busy !== null}
+                aria-label={`Connect ${oauth.display_name}`}
+                onClick={() =>
+                  asksAboutSharedAccount ? setConfirm("shared") : void connect()
+                }
+              >
+                {busy === "connect"
+                  ? "Connecting…"
+                  : `Connect ${oauth.display_name}`}
+              </Button>
+            )}
           {busy === "connect" && (
             <Button
               size="sm"
@@ -327,11 +348,7 @@ function EgressServiceRow({
               size="sm"
               variant="outline"
               disabled={busy !== null}
-              aria-label={
-                oauth.connected
-                  ? `Disconnect ${oauth.display_name}`
-                  : `Reset ${oauth.display_name} connection`
-              }
+              aria-label={`${oauth.connected ? "Disconnect" : "Reset connection"} for ${service.display_name}`}
               onClick={() => setConfirm("account")}
             >
               {busy === "disconnect"
@@ -341,7 +358,7 @@ function EgressServiceRow({
                   : "Reset connection"}
             </Button>
           )}
-          {oauth && service.can_manage && !showKeyControls && (
+          {oauth && canManageKey && !showKeyControls && (
             <Button
               size="sm"
               variant="ghost"
@@ -354,7 +371,7 @@ function EgressServiceRow({
               Use an API key instead
             </Button>
           )}
-          {service.can_manage && showKeyControls && !editing && (
+          {canManageKey && showKeyControls && !editing && (
             <>
               <Button
                 size="sm"
@@ -406,7 +423,7 @@ function EgressServiceRow({
                   serviceEditing.disabled ||
                   serviceEditing.editingName === service.name
                 }
-                aria-label={`Edit ${service.display_name} service`}
+                aria-label={`Edit service for ${service.display_name}`}
                 onClick={() => serviceEditing.onEdit(service)}
               >
                 Edit service
@@ -415,7 +432,7 @@ function EgressServiceRow({
                 size="sm"
                 variant="outline"
                 disabled={busy !== null || serviceEditing.disabled}
-                aria-label={`Delete ${service.display_name} service`}
+                aria-label={`Delete service for ${service.display_name}`}
                 onClick={() => setConfirm("service")}
               >
                 {busy === "delete" ? "Deleting…" : "Delete service"}
@@ -424,7 +441,7 @@ function EgressServiceRow({
           )}
         </div>
       </div>
-      {service.can_manage && editing && (
+      {canManageKey && editing && (
         <form
           className="mt-3 flex flex-wrap items-center gap-2"
           onSubmit={(event) => void save(event)}
@@ -564,6 +581,7 @@ export function EgressServiceRows({
   errorMessages,
   serviceEditing,
   agent,
+  hideKeyActions = false,
   ...target
 }: ServiceTarget & {
   services: EgressCredentialService[];
@@ -574,6 +592,8 @@ export function EgressServiceRows({
   serviceEditing?: ServiceEditing;
   /** The agent the rows belong to, for the wording that depends on it. */
   agent: RowAgent;
+  /** Leaves out what sets, removes, or connects a key or account, for rows no agent uses. */
+  hideKeyActions?: boolean;
 }) {
   return (
     <ul>
@@ -586,6 +606,7 @@ export function EgressServiceRows({
           errorMessages={errorMessages}
           serviceEditing={serviceEditing}
           agent={agent}
+          hideKeyActions={hideKeyActions}
         />
       ))}
     </ul>

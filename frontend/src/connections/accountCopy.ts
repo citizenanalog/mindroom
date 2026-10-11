@@ -1,3 +1,5 @@
+import type { EgressScope } from "./types";
+
 /** Wording about accounts and keys that the Connections pages share. */
 
 /** `a`, `a and b`, or `a, b, and c`. */
@@ -65,7 +67,31 @@ export function personalAccountRefusal(
   return `${why} Ask ${who} to add a team API key.`;
 }
 
+/**
+ * Why a personal account is no use for an agent that is not shared, whose
+ * sandbox runs other users' commands too, and what to do instead.
+ */
+export function personalSandboxRefusal(provider: string): string {
+  return `Personal ${provider} accounts can't be used in this sandbox, which other users' commands share. Add an API key instead.`;
+}
+
+/**
+ * What deleting a service takes away from whom, by the scope its store has.
+ * `agents` names the agents that share a `user` scope's store, this one included.
+ */
+export function deleteServiceWarning(
+  scope: EgressScope,
+  agent: string,
+  agents: readonly string[],
+): string {
+  if (scope === "user_agent")
+    return `This deletes the service and its saved key. Your ${agent} loses access through it.`;
+  if (scope === "user")
+    return `This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: ${(agents.length > 0 ? agents : [agent]).join(", ")}.`;
+  return `This deletes the service and its shared key. Everyone using ${agent} loses access through it.`;
+}
+
 /** The `Passed through` text for a tunnel the broker only relayed. */
 export const PASSED_THROUGH = "Passed through (no key added)";
 export const PASS_THROUGH_CAPTION =
-  "Requests to sites without a service pass straight through; MindRoom sees only the host.";
+  "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).";

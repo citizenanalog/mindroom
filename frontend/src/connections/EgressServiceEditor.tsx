@@ -14,6 +14,7 @@ import {
   formFromService,
   looksLikeGithub,
   presetOf,
+  presetPlaceholderWarnings,
   ruleField,
   scopeNote,
   suggestedName,
@@ -30,6 +31,7 @@ import {
   type RuleEditing,
   inputClass,
   selectClass,
+  warningClass,
 } from "./EgressRuleFields";
 import { useServiceSubmit } from "./useServiceSubmit";
 import type {
@@ -229,6 +231,12 @@ export function EgressServiceEditor({
   };
 
   const preset = presetOf(presets, form.preset);
+  // Shown beside the preset, since it is the preset that brings these variables.
+  const presetWarnings = presetPlaceholderWarnings(
+    form,
+    preset,
+    configPlaceholders,
+  );
   const problemAt = (field: string) =>
     problems.find((problem) => problem.field === field)?.message;
   // The size of the whole service belongs to no field, so it is the one problem told in the alert.
@@ -354,6 +362,11 @@ export function EgressServiceEditor({
           {preset.rules.map(ruleCoverage).join(", ")}.
         </p>
       )}
+      {presetWarnings.map((warning) => (
+        <p key={warning} className={warningClass}>
+          {warning}
+        </p>
+      ))}
       {usesOwnRules(form) && (
         <div className="grid gap-3 sm:grid-cols-2">
           <RuleHostField {...ruleEditing(0, primaryRule)} />
@@ -404,6 +417,7 @@ export function EgressServiceEditor({
             problemAt={problemAt}
             disabled={disabled}
             context={context}
+            scope={scope}
             sharedTarget={sharedTarget}
             preset={preset}
             onGithub={showGithubHelper}

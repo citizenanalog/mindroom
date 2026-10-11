@@ -8,7 +8,6 @@ import {
   type PlaceholderForm,
   configPlaceholderWarning,
   placeholderField,
-  presetPlaceholderWarnings,
 } from "./egressServiceModel";
 import { errorClass, warningClass } from "./EgressRuleFields";
 import type { EgressPreset } from "./types";
@@ -43,11 +42,6 @@ export function PlaceholderRows({
         i === index ? placeholder : existing,
       ),
     });
-  const presetWarnings = presetPlaceholderWarnings(
-    form,
-    preset,
-    configPlaceholders,
-  );
 
   return (
     <div className="space-y-3">
@@ -56,7 +50,8 @@ export function PlaceholderRows({
         <p className="text-xs text-muted-foreground">
           Environment variables set in the agent's sandbox so tools find a key
           to send. Use a fixed value such as {BROKERED_PLACEHOLDER}; the broker
-          swaps in the real key.
+          swaps in the real key. Placeholders are set only while this service
+          has a key or a connected account.
           {preset
             ? form.explicitlyEmpty.placeholders
               ? ` This service sets none, which drops the placeholders of the ${preset.display_name} preset.`
@@ -68,11 +63,6 @@ export function PlaceholderRows({
             ? "Names use capital letters, digits, and underscores, and one word between underscores must be TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL (for example MY_API_KEY). No word may be COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS, and names cannot start with SSH_, MINDROOM_, or GIT_CONFIG_. PATH, HOME, and proxy and CA variables are reserved. Values are 1 to 256 letters, digits, or . _ : -"
             : "Names use capital letters, digits, and underscores. PATH, HOME, proxy and CA variables, and names starting with MINDROOM_ or GIT_CONFIG_ are reserved."}
         </p>
-        {presetWarnings.map((warning) => (
-          <p key={warning} className={warningClass}>
-            {warning}
-          </p>
-        ))}
       </div>
       {form.placeholders.map((placeholder, index) => {
         const nameError = problemAt(placeholderField(index, "name"));

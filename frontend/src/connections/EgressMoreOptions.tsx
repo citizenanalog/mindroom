@@ -17,25 +17,40 @@ import {
   inputClass,
 } from "./EgressRuleFields";
 import { PlaceholderRows } from "./EgressPlaceholderRows";
-import type { EgressPreset } from "./types";
+import type { EgressPreset, EgressScope } from "./types";
 
 // What "Refuse other paths" does, in the order spec 12.4 gives it. The second
-// sentence is about a user's own services, so the dashboard leaves it out.
+// sentence is about a user's own services, so the dashboard leaves it out. The
+// restriction applies to everyone the store serves, so it says who that is.
+const ADMINISTRATOR_LIMIT: Record<EgressScope, string> = {
+  user_agent:
+    "This also limits services from your administrator on these hosts, for this agent only.",
+  user: "This also limits services from your administrator on these hosts, for all your agents that share your personal workspace.",
+  shared:
+    "This also limits services from your administrator on these hosts, for everyone using this agent.",
+  unscoped:
+    "This also limits services from your administrator on these hosts, for everyone using this agent.",
+};
 const RESTRICT_HELP = {
   refusal:
     "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key.",
-  administrator:
-    "This also limits services from your administrator on these hosts, for this agent only.",
   boundary:
     "The real boundary is the key itself, so scope it as narrowly as the website allows.",
   github:
     "GraphQL (/graphql) is refused unless listed, and a listed GraphQL rule reaches every repository the key can reach. Use a fine-grained token or a GitHub App installed on selected repositories.",
 };
 
-function restrictHelp(context: EditorContext, onGithub: boolean): string {
+function restrictHelp(
+  context: EditorContext,
+  scope: EgressScope | undefined,
+  onGithub: boolean,
+): string {
   return [
     RESTRICT_HELP.refusal,
-    context === "personal" ? RESTRICT_HELP.administrator : null,
+    // Without the scope there is no saying whom the limit reaches.
+    context === "personal" && scope !== undefined
+      ? ADMINISTRATOR_LIMIT[scope]
+      : null,
     RESTRICT_HELP.boundary,
     onGithub ? RESTRICT_HELP.github : null,
   ]
@@ -55,6 +70,7 @@ export function MoreOptions({
   problemAt,
   disabled,
   context,
+  scope,
   sharedTarget,
   preset,
   onGithub,
@@ -68,6 +84,8 @@ export function MoreOptions({
   problemAt: (field: string) => string | undefined;
   disabled: boolean;
   context: EditorContext;
+  /** Whose store the service lives in, for whom its restriction also limits the administrator's services. */
+  scope: EgressScope | undefined;
   /** Shared and unscoped agents cannot use personal accounts. */
   sharedTarget: boolean;
   preset: EgressPreset | undefined;
@@ -218,7 +236,7 @@ export function MoreOptions({
           <span className="font-medium">Refuse other paths on these hosts</span>
         </label>
         <p className="pl-6 text-xs text-muted-foreground">
-          {restrictHelp(context, onGithub)}
+          {restrictHelp(context, scope, onGithub)}
         </p>
       </div>
 

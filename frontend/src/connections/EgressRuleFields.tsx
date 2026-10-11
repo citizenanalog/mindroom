@@ -251,6 +251,7 @@ export function RuleSendFields({
         <Field
           id={`${id}-template`}
           label="Value template"
+          hint="Leave empty to send the key as is."
           error={errorFor("template")}
         >
           {(control) => (

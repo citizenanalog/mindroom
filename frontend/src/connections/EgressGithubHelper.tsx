@@ -91,11 +91,11 @@ export function GithubHelper({
         </h4>
         <p className="text-xs text-muted-foreground">
           One repository per line, as owner/repo, or owner/* for everything an
-          owner has. Applying replaces this service's rules with rules for just
-          those repositories (API and git over HTTPS) and refuses every other
-          path on GitHub. Other API paths, such as /user or search, stop
-          working. Matching is case sensitive, so write names as they appear in
-          GitHub URLs.
+          owner has. Applying replaces the rules above with rules for just those
+          repositories (API and git over HTTPS) and refuses every other path on
+          api.github.com and github.com. Other API paths, such as /user or
+          search, stop working. Matching is case sensitive, so write names as
+          they appear in GitHub URLs.
         </p>
       </div>
       <Textarea

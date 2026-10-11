@@ -1,10 +1,4 @@
-import {
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, RefreshCw } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -12,8 +6,10 @@ import { Button } from "@/components/ui/button";
 import {
   PASS_THROUGH_CAPTION,
   PASSED_THROUGH,
+  deleteServiceWarning,
   sharedAgentNote,
 } from "./accountCopy";
+import { breakAfterUnderscores } from "./breakAfterUnderscores";
 import { ConnectionsHeader } from "./ConnectionsHeader";
 import { InactiveServices } from "./EgressInactiveServices";
 import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
@@ -83,20 +79,6 @@ function limitedServiceName(taken: readonly string[]): string {
     const name = n === 1 ? base : `${base}-${n}`;
     if (!taken.includes(name)) return name;
   }
-}
-
-/** A refusal code that can wrap after an underscore, and nowhere inside a word. */
-function breakableCode(code: string): ReactNode[] {
-  const words = code.split("_");
-  return words.flatMap((word, index) =>
-    index < words.length - 1 ? [`${word}_`, <wbr key={index} />] : [word],
-  );
-}
-
-function deleteWarning(service: EgressCredentialService): string {
-  return service.is_shared
-    ? "This deletes the service and its shared key. Everyone who relies on it loses access to it until it is added again."
-    : "This deletes the service and its saved key. Your agent loses access to it until you add it again, along with any other personal agent of yours that shares this scope.";
 }
 
 /** The caller's own recent brokered requests for one agent, loaded when the table is opened. */
@@ -267,7 +249,7 @@ function RecentRequests({ agentName }: { agentName: string }) {
                           </Badge>
                           {refusal && (
                             <div className="mt-1 text-xs text-muted-foreground">
-                              {breakableCode(refusal)}
+                              {breakAfterUnderscores(refusal)}
                             </div>
                           )}
                         </td>
@@ -406,7 +388,12 @@ function AgentSection({
     editingName: editor?.kind === "edit" ? editor.name : null,
     onEdit: requestEdit,
     onDelete: (service) => remove(service.name),
-    deleteWarning,
+    deleteWarning: () =>
+      deleteServiceWarning(
+        agent.scope,
+        agent.agent_display_name,
+        agent.scope_agents,
+      ),
     onLimitToRepositories: () => {
       setError(null);
       setEditor({

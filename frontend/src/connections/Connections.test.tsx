@@ -89,7 +89,7 @@ it("shows shared connection availability without account controls for agent user
     ),
   ).toBeInTheDocument();
   expect(
-    screen.queryByRole("button", { name: "Disconnect Mail" }),
+    screen.queryByRole("button", { name: "Disconnect for Mail" }),
   ).not.toBeInTheDocument();
   expect(
     screen.queryByRole("button", { name: "Connect Mail" }),
@@ -255,6 +255,44 @@ describe("brokered API keys on agent cards", () => {
     );
   });
 
+  it("tells a personal agent's user that its sandbox is shared, not that the agent is", async () => {
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            {
+              ...catalog([service]).agents[0],
+              egress_services: [
+                {
+                  ...egressService,
+                  oauth: {
+                    provider: "github",
+                    display_name: "GitHub",
+                    connected: false,
+                    account_label: null,
+                    can_connect: false,
+                    reset_required: false,
+                    service_account: false,
+                    unavailable_reason: "shared_sandbox",
+                    shared_worker_opt_in: false,
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+    });
+    render(<Connections />);
+    await expandAgent();
+
+    expect(
+      await screen.findByText(
+        "Personal GitHub accounts can't be used in this sandbox, which other users' commands share. Add an API key instead.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/shared agents/)).toBeNull();
+  });
+
   it("connects an account from the agent card and refreshes the catalog", async () => {
     let connected = false;
     let catalogRequests = 0;
@@ -325,7 +363,7 @@ describe("brokered API keys on agent cards", () => {
     expect(await screen.findByText("Connected as octocat")).toBeInTheDocument();
     expect(catalogRequests).toBe(2);
     expect(
-      screen.getByRole("button", { name: "Disconnect GitHub" }),
+      screen.getByRole("button", { name: "Disconnect for GitHub" }),
     ).toBeInTheDocument();
   });
 });
@@ -499,7 +537,7 @@ describe("connections", () => {
     render(<Connections />);
     await expandAgent();
     expect(
-      await screen.findByRole("button", { name: "Disconnect Calendar" }),
+      await screen.findByRole("button", { name: "Disconnect for Calendar" }),
     ).toBeEnabled();
     await act(async () =>
       finishMail(json({ detail: "Internal configuration details" }, 500)),
@@ -511,7 +549,7 @@ describe("connections", () => {
       screen.queryByText("Internal configuration details"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Disconnect Calendar" }),
+      screen.getByRole("button", { name: "Disconnect for Calendar" }),
     ).toBeEnabled();
   });
 
@@ -552,7 +590,7 @@ describe("connections", () => {
     render(<Connections />);
     await expandAgent();
     fireEvent.click(
-      await screen.findByRole("button", { name: "Disconnect Mail" }),
+      await screen.findByRole("button", { name: "Disconnect for Mail" }),
     );
     expect(connected).toBe(true);
     const dialog = screen.getByRole("dialog");
@@ -576,7 +614,7 @@ describe("connections", () => {
     render(<Connections />);
     await expandAgent();
     fireEvent.click(
-      await screen.findByRole("button", { name: "Reset Mail connection" }),
+      await screen.findByRole("button", { name: "Reset connection for Mail" }),
     );
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", {
@@ -642,7 +680,7 @@ describe("connections", () => {
         ),
       );
       expect(
-        await screen.findByRole("button", { name: "Disconnect Mail" }),
+        await screen.findByRole("button", { name: "Disconnect for Mail" }),
       ).toBeEnabled();
     },
   );
@@ -749,10 +787,14 @@ describe("shared agent connections", () => {
     });
     const shared = await screen.findByRole("region", { name: "Research Team" });
     expect(
-      await within(personal).findByRole("button", { name: "Disconnect Mail" }),
+      await within(personal).findByRole("button", {
+        name: "Disconnect for Mail",
+      }),
     ).toBeEnabled();
     fireEvent.click(
-      await within(shared).findByRole("button", { name: "Disconnect Mail" }),
+      await within(shared).findByRole("button", {
+        name: "Disconnect for Mail",
+      }),
     );
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", {
@@ -836,7 +878,9 @@ describe("shared agent connections", () => {
         .closest("tr"),
     ).toHaveTextContent("Shared");
     fireEvent.click(
-      await within(shared).findByRole("button", { name: "Disconnect Mail" }),
+      await within(shared).findByRole("button", {
+        name: "Disconnect for Mail",
+      }),
     );
     const dialog = screen.getByRole("dialog");
     expect(dialog).toHaveTextContent(
@@ -873,7 +917,7 @@ it("does not call a requester-only connection on a shared agent shared", async (
   render(<Connections />);
   await expandAgent("Research Team");
   fireEvent.click(
-    await screen.findByRole("button", { name: "Disconnect Mail" }),
+    await screen.findByRole("button", { name: "Disconnect for Mail" }),
   );
   const dialog = screen.getByRole("dialog");
   expect(dialog).toHaveTextContent(
@@ -1268,12 +1312,19 @@ describe("shared accounts on agent cards", () => {
       expect(window.open).not.toHaveBeenCalled();
     });
 
-    it("starts one connection however fast Continue is clicked", async () => {
+    it("starts one connection when Continue is clicked twice before the page updates", async () => {
       const connectCalls: string[] = [];
       const dialog = await renderShared(connectCalls);
       const button = within(dialog).getByRole("button", { name: "Continue" });
-      fireEvent.click(button);
-      fireEvent.click(button);
+      // Both clicks reach the dialog before React renders again, as with a
+      // fast double click, so only the dialog's own guard can stop the second.
+      // (After a render the first click has closed the dialog and the button
+      // is gone, so a second fireEvent.click would reach nothing at all.)
+      act(() => {
+        button.click();
+        button.click();
+      });
+      expect(window.open).toHaveBeenCalledTimes(1);
       await waitFor(() => expect(connectCalls).toEqual(["connect"]));
     });
 
@@ -1471,7 +1522,7 @@ describe("shared accounts on agent cards", () => {
       name: "Personal assistant tools",
     });
     fireEvent.click(
-      await within(tools).findByRole("button", { name: "Disconnect Mail" }),
+      await within(tools).findByRole("button", { name: "Disconnect for Mail" }),
     );
     expect(
       within(
@@ -1560,7 +1611,7 @@ describe("agent table summary, search, and order", () => {
       "2 tools / 2 of 3 accounts and keys set",
     );
     await expandAgent();
-    await screen.findByRole("button", { name: "Disconnect Mail" });
+    await screen.findByRole("button", { name: "Disconnect for Mail" });
     expect(agentRow("Personal assistant")).toHaveTextContent(
       "2 tools / 2 of 3 accounts and keys set",
     );
@@ -1586,7 +1637,7 @@ describe("agent table summary, search, and order", () => {
       ),
     );
     fireEvent.click(
-      await screen.findByRole("button", { name: "Disconnect Mail" }),
+      await screen.findByRole("button", { name: "Disconnect for Mail" }),
     );
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", {

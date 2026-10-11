@@ -111,7 +111,7 @@ describe("egress broker panel with the real config store", () => {
   it("saves an edited preset service as the preset plus what changed", async () => {
     render(<EgressBroker />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Edit GitHub service" }),
+      await screen.findByRole("button", { name: "Edit service for GitHub" }),
     );
     await presetsReady();
     fireEvent.click(screen.getByRole("button", { name: "More options" }));
@@ -158,7 +158,7 @@ describe("egress broker panel with the real config store", () => {
   it("removes a deleted service from the saved config", async () => {
     render(<EgressBroker />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Delete OpenAI service" }),
+      await screen.findByRole("button", { name: "Delete service for OpenAI" }),
     );
     fireEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", {
@@ -324,7 +324,9 @@ describe("egress broker panel with the real config store", () => {
       saveResponse = () => json({ detail: "Failed to save" }, 500);
       render(<EgressBroker />);
       fireEvent.click(
-        await screen.findByRole("button", { name: "Delete OpenAI service" }),
+        await screen.findByRole("button", {
+          name: "Delete service for OpenAI",
+        }),
       );
       fireEvent.click(
         within(await screen.findByRole("dialog")).getByRole("button", {
@@ -346,7 +348,7 @@ describe("egress broker panel with the real config store", () => {
     useConfigStore.getState().updateConfigValue(["router"], { model: "other" });
     render(<EgressBroker />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Edit GitHub service" }),
+      await screen.findByRole("button", { name: "Edit service for GitHub" }),
     );
     await presetsReady();
     fireEvent.click(screen.getByRole("button", { name: "More options" }));
