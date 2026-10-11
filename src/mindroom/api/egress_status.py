@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException
@@ -247,25 +248,7 @@ class AuditLogsResponse(BaseModel):
 def audit_logs_response(records: Iterable[AuditRecord]) -> AuditLogsResponse:
     """Describe audit records, already in the order the log returned them, for an API response."""
     return AuditLogsResponse(
-        records=[
-            AuditRecordResponse(
-                at=rec.at.isoformat(),
-                kind=rec.kind,
-                scope=rec.scope,
-                agent_name=rec.agent_name,
-                requester_id=rec.requester_id,
-                method=rec.method,
-                host=rec.host,
-                path=rec.path,
-                service=rec.service,
-                status=rec.status,
-                bytes_up=rec.bytes_up,
-                bytes_down=rec.bytes_down,
-                duration_ms=rec.duration_ms,
-                code=rec.code,
-            )
-            for rec in records
-        ],
+        records=[AuditRecordResponse.model_validate({**asdict(rec), "at": rec.at.isoformat()}) for rec in records],
     )
 
 
