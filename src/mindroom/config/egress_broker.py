@@ -6,7 +6,7 @@ import copy
 import re
 from typing import TYPE_CHECKING, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from mindroom.credential_policy import is_oauth_client_config_service, is_oauth_token_service
 from mindroom.egress_broker.presets import EGRESS_PRESETS
@@ -233,7 +233,8 @@ class EgressService(BaseModel):
             "Presets never set this"
         ),
     )
-    restrict_only: bool = Field(
+    # Strict, so a string such as "true" is refused instead of silently changing what the service does.
+    restrict_only: StrictBool = Field(
         default=False,
         description=(
             "Only limit paths: the rules take part in the path check like restrict_to_rules (which this implies), "

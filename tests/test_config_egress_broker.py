@@ -321,3 +321,10 @@ def test_restrict_only_keeps_a_presets_rules_and_names_but_not_its_login_or_plac
     # An authored login is still refused: only the preset's own is dropped.
     with pytest.raises(ValidationError, match="cannot set oauth_provider"):
         EgressService.model_validate({"preset": "github", "restrict_only": True, "oauth_provider": "github"})
+
+
+@pytest.mark.parametrize("value", ["true", "yes", 1, "false"])
+def test_restrict_only_must_be_a_real_boolean(value: object) -> None:
+    """A string or number is refused, so `restrict_only: "true"` never quietly turns a service into a limit or not."""
+    with pytest.raises(ValidationError, match="restrict_only\n  Input should be a valid boolean"):
+        EgressService.model_validate({"restrict_only": value, "rules": [{"host": "api.github.com"}]})
