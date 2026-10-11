@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.audit import AuditRecord
     from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.secrets import SecretResult
+    from tests.egress_broker.raw_http import Script, UpstreamFactory
 
 DEFAULT_CLAIMS = WorkerClaims(
     worker_key="worker-alice-code",
@@ -321,6 +322,43 @@ async def http_upstream() -> AsyncIterator[Upstream]:
     """Serve the fake upstream over plain HTTP on ``localhost``."""
     async for upstream in _serve_upstream(None):
         yield upstream
+
+
+@pytest_asyncio.fixture
+async def upstreams(upstream_ca: UpstreamCA, tmp_path: Path) -> AsyncIterator[UpstreamFactory]:
+    """Return ``start(script=None, *, tls=False, ssl_context=None)``, starting a `RawUpstream` on 127.0.0.1.
+
+    Without a script every request gets a short 200; ``tls=True`` serves `upstream_ca`'s ``localhost`` certificate.
+    """
+    # raw_http imports this module's request helpers, so it is imported here rather than at the top.
+    from tests.egress_broker.raw_http import OK, RawUpstream, UpstreamConnection  # noqa: PLC0415
+
+    started: list[tuple[RawUpstream, asyncio.Server]] = []
+
+    async def start(
+        script: Script | None = None,
+        *,
+        tls: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> RawUpstream:
+        upstream = RawUpstream(script=script or (lambda _index: [OK]))
+        context = ssl_context or (upstream_ca.server_context(tmp_path) if tls else None)
+        server = await asyncio.get_running_loop().create_server(
+            lambda: UpstreamConnection(upstream),
+            "127.0.0.1",
+            0,
+            ssl=context,
+        )
+        upstream.port = server.sockets[0].getsockname()[1]
+        started.append((upstream, server))
+        return upstream
+
+    yield start
+    for upstream, server in started:
+        server.close()
+        for transport in upstream.transports:
+            transport.abort()
+        await server.wait_closed()
 
 
 @pytest.fixture
