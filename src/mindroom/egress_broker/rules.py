@@ -8,7 +8,7 @@ import unicodedata
 from collections.abc import Mapping  # noqa: TC003
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlsplit
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService  # noqa: TC001
 from mindroom.egress_broker.messages import refusal_body
@@ -409,7 +409,7 @@ def _inject_query_param(target: bytes, param_name: str, template: str, secret: s
     Replaces all occurrences of the param with one at the first occurrence position.
     """
     target_str = target.decode("latin-1")
-    parsed = urlparse(target_str)
+    parsed = urlsplit(target_str)
     path = parsed.path
     raw_query = parsed.query
 

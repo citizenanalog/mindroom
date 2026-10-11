@@ -920,6 +920,21 @@ def test_inject_adds_the_credential_header(auth: EgressAuth, header: tuple[bytes
             b"/v1?my%20key=s3cret&a=1",
             id="param-name-encoded",
         ),
+        # The path goes upstream byte for byte, `;params` on its last segment included; only the query changes.
+        pytest.param(
+            EgressAuth(type="query", name="key"),
+            b"/repos/o/r;v=1?x=1",
+            "s3cret",
+            b"/repos/o/r;v=1?x=1&key=s3cret",
+            id="path-params-kept",
+        ),
+        pytest.param(
+            EgressAuth(type="query", name="key"),
+            b"/repos/o/r;v=1",
+            "s3cret",
+            b"/repos/o/r;v=1?key=s3cret",
+            id="path-params-kept-without-query",
+        ),
     ],
 )
 def test_inject_query_replaces_the_param_and_leaves_headers_alone(
