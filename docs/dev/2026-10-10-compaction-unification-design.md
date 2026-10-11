@@ -3,6 +3,9 @@
 Design spec, October 10, 2026, revised after three GPT-6 Astra design review rounds the same day.
 Branch base: `origin/main` at `d649e5657` (#2776 merged).
 
+Revised October 11, 2026: a mid-turn compaction of a stored conversation records a positioned generation instead of archiving snapshots of the running turn (section 5).
+Twelve review rounds of the snapshot design kept finding data-loss bugs where snapshots met rollback, edit, redaction, and run ordering; the archive stores whole runs, and a compaction boundary inside a running run does not fit that shape.
+
 ## Goal
 
 Compaction behaves the same way for every agent, team, subagent, workflow participant, and agent mode: after a compaction the summary replaces all older messages, and the conversation builds on from there.
@@ -42,7 +45,12 @@ Success criteria:
 3. **Request projection.**
    Keep the full turn in the run record and project each outbound request, marking folded messages so replay skips them.
    Rejected: every reader of run messages (Agno's replay, MindRoom's estimators, summary input, continuation) would have to honor the fold marker, and a missed reader replays folded content twice.
-4. **Keep the last tool exchange verbatim after a mid-turn compaction.**
+4. **Archive snapshots of the running turn (the first revision of this design).**
+   Each folded exchange became a synthetic run archived beside the scope's runs while the real run stayed live.
+   Rejected after review: every operation on runs (rollback, edit, redaction, run ordering, member runs, stale session writes) had to treat a half-archived run specially, and partial commits needed their own rollback.
+5. **Compact in memory only, for every target.**
+   Rejected: the next reply finds the older runs still stored raw and compacts again, paying a second summary call for work the first summary already covered.
+6. **Keep the last tool exchange verbatim after a mid-turn compaction.**
    Rejected: the kept assistant message's signed thinking is bound to the replaced prefix on Claude models with adaptive thinking, Gemini and OpenAI carry their own reasoning and response-chain rules, and a provider-specific keep-or-strip contract is more code than the fidelity it buys.
 
 ## Design
@@ -73,6 +81,7 @@ Success criteria:
 - The summary is never stored as a message.
   It is derived from the archive's latest generation, cached in `session.summary`, at each request build.
 - A paused run stores only its non-history messages, so its resume re-fetches history from the session and the builder re-inserts the summary with it; both come from the same session state.
+  An approval resume reconciles the scope first (section 5), so a mid-turn compaction made before the pause is in place when the run continues.
   When the conversation changed in between (another turn, a compaction, a redaction), the resume sees the new state consistently, as it already does for replayed runs.
 - Later turns cannot replay the summary twice, because no stored run contains it.
 - No session migration is needed (question 8): existing sessions already cache the latest generation summary.
@@ -89,7 +98,7 @@ Success criteria:
 - A new module, `history/mid_turn_compaction.py`, owns the policy.
   `create_agent` and team creation call `install_mid_turn_compaction(target, config=..., runtime_paths=..., entity_name=..., model_name=...)` on the target's model once the Agent or Team exists, and install the tool-call cap after it, so the cap's wrapper is outermost and refuses a request before compaction spends a summary call.
   Response preparation (`ai.py`, `teams.py`) attaches the turn's `CompactionLifecycle` to that binding; paths without one (approval continuations, delegated children, team members, workflow participants) compact without a notice.
-- The builder patch records on the same binding the session object Agno built the request from, because that is the object Agno writes at the end of the run (section 5).
+- The builder patch records which runs it built for each target, so a request that reuses the model for another conversation (a skill review fork) is never compacted.
 - Before each request the hook:
   1. skips when compaction is disabled or text compaction is unavailable for the entity, or when this run already failed a mid-turn compaction;
   2. sizes the request: when this response loop has already received a response, the provider-reported input context of the latest one (`context_input_tokens_from_counts` over its usage counters, or the native final-iteration `context_usage` when present) plus an estimate of that assistant message and every message after it; otherwise the replay planner's estimate of the whole list plus the tool definitions.
@@ -107,34 +116,37 @@ The rewritten request is `[leading system and developer messages, summary messag
 - **Transient messages**: messages with `add_to_agent_memory=False`, such as the per-turn transient context and the approval receipt; they are never stored, so they are never summarized either.
 - **Queued-message notices**: the hidden notices that a newer message is waiting, recognized by their existing marker.
 - **Folded**: replayed history, an earlier summary, the rest of the turn's input (unseen thread messages and other context), and every other current-turn message (assistant, tool, tool media follow-ups).
-  The summarizer sees every folded current-turn tool call and result: `max_tool_calls_from_history` limits replayed history only, so it is not applied to the in-progress snapshot.
+  The summarizer sees every folded current-turn tool call and result: `max_tool_calls_from_history` limits replayed history only, so it is not applied to the in-memory snapshots.
   The run's tool trace (`run_response.tools`) is untouched, so the visible reply still lists every tool call.
 - With no assistant message left, Agno has no `response_id` to chain from, so OpenAI Responses cannot restore folded items through `previous_response_id`, whether or not portable replay is on.
 - With nothing to fold, compaction is skipped.
 
-### 5. Scoped compaction and the archive (question 4)
+### 5. Compacting a stored conversation mid-turn (question 4)
 
 A request is scoped when its target replays persisted history (`add_history_to_context`) and has session storage.
 
-- The hook runs the existing scope compactor (`compact_scope_history` through `history/runtime.py`) on the session object Agno loaded for this run, which the builder patch recorded, after reconciling it; the compactor already adopts the freshest stored row into that object after every committed chunk, so Agno's end-of-run row write carries the new summary even when a later chunk fails or the run is cancelled.
-  The one addition is the running turn's snapshots, appended after every visible run as the last compactable runs.
-- Each folded exchange of the turn (an assistant message with the tool results that answer it) becomes one snapshot: a completed `RunOutput` or `TeamRunOutput` with the scope's agent or team id.
-  The first snapshot also carries the current input, for the summarizer's context, and a copy of the live run's metadata (every Matrix event id the run has consumed so far); the others carry no metadata, since redaction normalizes every snapshot to its run.
-  Separate snapshots let the existing chunker size the turn with the summary model's own estimator and summarize it in as many chunks as it needs, so only an exchange larger than a whole summary input is excerpted.
-  Run-local compaction summarizes the same snapshots in chunks with `summarize_runs`.
-  Its run id is unique per snapshot and starts with the live run's id (`archive.snapshot_run_id(origin_run_id)` appends a fresh suffix), so the archive can find every snapshot of a run, two snapshots of one run never collide, and none collides with the live run, which keeps its own id and stays live.
-- Redaction treats a run and its snapshots as one: when redaction removes a live run, or hits a run archived later, compaction rolls back to the earliest archived row of that run or any of its snapshots, using the existing `roll_back_to`.
-  Redaction therefore keeps the ids of the runs it removes (`remove_run_by_event_id` returns them) and looks up their snapshots before rolling back.
-  This covers events the run consumed after its snapshot was taken and the reply event attached to the live run after it finished.
-  Snapshots are always the last run of their generation and are never restored as live runs.
-- A turn's snapshots commit together: the in-flight list is rewritten only when every snapshot was archived, including when a cancellation arrives after the last chunk committed.
-  When a later chunk fails or is cancelled after some of the turn's snapshots committed, the turn is rolled back to before its first snapshot (`roll_back_running_turn`), so the request stays unchanged and no kept assistant message sits behind a rewritten prefix.
-  Chunks of earlier runs that committed before the turn's first snapshot stay compacted; the run stops compacting for the rest of the reply.
+- The archive stays run-shaped: a pre-reply generation archives whole runs, and its summary covers every run it and the earlier generations archived.
+- A mid-turn compaction summarizes the scope's previous summary, every visible stored run, and the running turn's folded exchanges, in chunks with `summarize_runs`, and writes nothing until the last chunk succeeds.
+  The turn reaches the summarizer as in-memory snapshots, one per folded exchange (an assistant message with the tool results that answer it), the first led by the bounded prompt context and the run's metadata; snapshots are never stored.
+  Visible runs are read from storage at that moment, so the summary covers every run a pre-reply compaction would fold, including runs a `num_history_runs` limit keeps out of replay.
+- It then commits one generation holding that summary and a position, `through_run_id`, the running run's id.
+  A positioned generation covers every visible run stored before its position run plus the messages of that run folded so far, and archives no runs when it is written.
+- After the commit the in-flight request is rewritten (section 4), so the run record keeps its prompt and every message after the fold; a cancellation after the commit still rewrites it, and a failure before it leaves both the request and storage unchanged.
+- Nothing else in storage changes during the turn: no run moves, and Agno's end-of-run session write is left alone, because reconcile already restores a stale `session.summary` from the archive.
+- Reconcile (`reconcile_compaction_state`) runs before every reply and, new here, before every approval resume.
+  It materializes the latest positioned generation: every visible live run stored before the position run is archived into that generation with the existing whole-run archive write, without another summary call.
+  The next reply therefore replays `[summary, the position run's prompt and its messages after the fold, later runs]`.
+- A positioned generation depends on its position run.
+  When an edit or redaction removes that run, or a redaction hits it in the archive, compaction rolls back from the earliest generation that archived the run or is positioned on it, with `roll_back_to`: the previous summary replays again and the runs those generations archived before the run return to the live table.
+  Reconcile rolls back the same way when the latest positioned generation's run is neither live nor archived.
+- A rollback leaves the session's live runs in creation order (`created_at`, then stored order), so restored runs and older live runs that compaction skipped, such as a pending approval, keep their relative order.
+- A second mid-turn compaction of the same run commits a newer generation on the same position, seeded with the first summary.
+- When a later pre-reply compaction archives the position run, its record already lacks the folded messages, so nothing is summarized twice.
 - Tool results join the latest assistant tool call even when a projection such as an approval receipt sits between them, so a fold never leaves a tool result without its call.
 - After the rewrite the hook re-sizes the request; when the system prompt, tools, current prompt, and new summary exceed the model's own `context_window` minus `reserve_tokens`, it raises the error replay planning already uses, `Saved conversation summary exceeds the available history budget`, instead of sending an oversized request.
   When they fit the model window but still exceed the replay window, the run stops compacting, since compacting again would only summarize each new tool result before the model saw it.
 - The force-compaction flag is left untouched, so a `compact_context` request made during the turn still applies before the next reply.
-- Folded assistant messages leave the run record, so their per-request usage is appended to `run_response.metadata` under a dedicated key that `usage_storage.project_usage` merges into the run's request list in order; run totals and the request breakdown stay complete across repeated compactions, approval resumes, and cancellation.
+- Folded assistant messages leave the run record, so their per-request usage is appended to `run_response.metadata` under a dedicated key that `usage_storage.project_usage` merges into the run's request list in order, skipping entries whose message the run still holds; run totals and the request breakdown stay complete across repeated compactions, approval resumes, and cancellation.
   The summary input omits that metadata key.
 
 ### 6. Run-local compaction (question 5)
@@ -144,7 +156,7 @@ A request without persisted replay (team members, `room_agent` workflow particip
 - The folded messages and any earlier run-local summary are summarized with the same summary model, prompt, budgets, and fallback, without touching the archive.
 - The summary call's usage is recorded as `compaction_summary` usage under the reply's helper usage owner, else in the target's session storage (seeding the session row), else logged as a warning; every MindRoom reply binds a usage owner, so the warning only covers runs outside a reply.
 - The summary message is an ordinary message (`from_history=False`), so it is stored with the run and a member's approval resume replays it.
-- Teams: the leader's request is scoped to the team scope, with the team summary first and its in-progress snapshot a `TeamRunOutput`; member runs stay attached to the live team run.
+- Teams: the leader's request is scoped to the team scope, with the team summary first and its in-memory snapshots `TeamRunOutput`s; member runs stay attached to the live team run, which never moves during the turn.
   Members keep no history or summary of their own, and each member's tool loop compacts run-locally.
 
 ### 7. Counting the summary once (question 6)
@@ -157,7 +169,8 @@ A request without persisted replay (team members, `room_agent` workflow particip
 
 - Mid-turn compaction posts the same `Compacting history...` notice in the thread, edits it with progress and the result, and the streamed reply continues after the summary call.
 - The failure notice becomes `Compaction failed; continuing without compaction.` for both paths, since a mid-turn failure continues with the uncompacted request.
-- Compaction hooks (`compaction:before`, `compaction:after`) fire for scoped mid-turn compaction exactly as for pre-reply compaction; run-local compaction has no scope and emits none.
+- Compaction hooks (`compaction:before`, `compaction:after`) fire for scoped mid-turn compaction exactly as for pre-reply compaction, with the folded runs and exchanges as their messages; run-local compaction has no scope and emits none.
+- The notice counts the visible runs plus the running turn once.
 
 ### 9. Minimal authored subagents' context documents (question 9)
 
@@ -169,12 +182,14 @@ With the summary in every agent's history, `agent-context` is no longer any agen
 | Module | Change |
 | --- | --- |
 | `history/replay.py` | Summary message rendering and estimate; summary-only plans as zero runs; request sizing helpers for the mid-turn trigger. |
-| `history/agno_compat_message_builder.py` | Inserts the summary message in Agent and Team new-run and continuation builders and records the request's session (new `AGNO_COMPAT` marker). |
+| `history/agno_compat_message_builder.py` | Inserts the summary message in Agent and Team new-run and continuation builders and records which runs it built (new `AGNO_COMPAT` marker). |
 | `history/legacy_summary_system_prompt.py` (new) | Recognizes a paused system message that already embeds Agno's summary block. |
 | `agno_compat_model_hooks.py` | `install_request_preparation` (new `AGNO_COMPAT` marker). |
-| `history/mid_turn_compaction.py` (new) | Binding, trigger, in-flight rewrite, snapshot construction, scoped and run-local compaction, native fallback, usage carry-over. |
-| `history/compaction.py`, `history/runtime.py` | Accept the in-progress snapshot; expose a run-local summary call that reuses chunk generation without archive writes. |
-| `history/archive.py`, `history/storage.py` | Snapshot run ids; redaction rolls back to a run's earliest snapshot; restore skips snapshots. |
+| `history/mid_turn_compaction.py` (new) | Binding, trigger, in-flight rewrite, in-memory snapshots, scoped and run-local compaction, native fallback, usage carry-over. |
+| `history/compaction.py`, `history/runtime.py` | A chunked summary call without archive writes, used by both mid-turn destinations; the scoped commit of a positioned generation with its hooks and notice. |
+| `history/archive_schema.py`, `history/archive.py` | `through_run_id` on generations, added to existing archives; the earliest generation depending on a run; creation-order restore. |
+| `history/storage.py` | Reconcile materializes or rolls back positioned generations; edit and redaction roll back from a removed run's earliest dependent generation. |
+| `approval/execution.py` | Reconcile the scope before an approval resume. |
 | `history/native.py` | Route identity from the rendered summary message. |
 | `model_usage.py` | Request-context size of one assistant message, shared with run metadata. |
 | `agents.py`, `teams.py`, `ai.py` | Flag off, hook installation order, lifecycle binding. |
@@ -182,7 +197,7 @@ With the summary in every agent's history, `agent-context` is no longer any agen
 | `usage/storage.py`, `history/summary_input.py` | Carried-over request usage merged into projections and omitted from summary input. |
 | `delivery_gateway.py` | Failure notice wording. |
 
-`tach.toml` gains the new modules; `docs/architecture/compaction.md`, `docs/architecture/agno-compatibility.md`, `docs/architecture/migrations.md`, and `docs/architecture/code-map.md` follow the code.
+`tach.toml` gains the new modules; `docs/architecture/compaction.md`, `docs/architecture/agno-compatibility.md`, `docs/architecture/migrations.md` (the additive `through_run_id` column), and `docs/architecture/code-map.md` follow the code.
 
 ## User docs
 
@@ -204,14 +219,15 @@ Failing-first tests at the owning seams (history modules, the builder patch, the
 - A large unseen thread context with a short current prompt is folded, not kept.
 - A resumed run sizes its first request by estimate, not by the paused response's usage.
 - A rewritten request that still exceeds the limit raises `Saved conversation summary exceeds the available history budget`.
-- A cancellation after the snapshot's chunk committed still leaves the request rewritten and the live session holding the new summary.
+- A cancellation after the positioned generation committed still leaves the request rewritten; a failure in any chunk leaves the request and storage unchanged.
+- After a mid-turn compaction the next reply replays the summary, the position run's prompt and tail, and nothing older, without a summary call, and its reconcile archives the covered runs.
+- An approval resume after a mid-turn compaction sees the materialized archive and one summary.
 - A team member's long tool loop compacts run-locally and its approval resume keeps the run-local summary.
-- Redacting each of: an event the run consumed before its snapshot, an event it consumed after its snapshot, and its reply event, rolls back to before the run, after one and after two mid-turn compactions, including team member runs.
-- A compaction that commits an earlier chunk and then fails leaves the request unchanged and storage consistent.
+- Editing the position run, and redacting an event the run consumed before or after the fold or its reply event, rolls back to the previous summary before and after materialization, after one and after two mid-turn compactions, and after a later pre-reply compaction archived the run; covered runs return live in creation order with an older paused run kept.
 - Request usage of folded requests stays in the run's usage projection, in order and exactly once, and reconciles with run totals across two compactions, an approval resume, and a cancellation.
 - Request sizing anchors on provider usage for providers that report cache tokens inside and outside `input_tokens`, and falls back to estimates when usage is missing.
 - An oversized native request turns native compaction off and compacts as text; a native request under the limit never text-compacts.
-- `tests/test_compaction_fuzz.py` extended with mid-turn snapshots and their redaction in generated histories.
+- `tests/test_compaction_fuzz.py` extended with positioned generations, materialization, edits, and redactions in generated histories.
 
 Live tests over Matrix on a text route (Gemini or a local OpenAI-compatible model) and a native route, recording provider cache-read tokens for the requests before and after a pre-reply and a mid-turn compaction, and checking that after a mid-turn compaction the agent continues its task instead of restarting it.
 A Claude text route (for example with an explicit `compaction.model`) also runs one mid-turn compaction when credentials allow, since Claude validates reasoning most strictly.
@@ -222,5 +238,6 @@ A Claude text route (for example with an explicit `compaction.model`) also runs 
 - Turning native replay off does not remove an authored `compact_20260112` policy from the request, as in today's pre-reply fallback.
 
 - Fallback models (`FallbackConfig`) do not get the mid-turn hook; a fallback serves only after the primary fails.
+- A mid-turn compaction that fails in a late chunk discards its earlier chunks; the next pre-reply compaction persists chunk by chunk as before.
 - Synchronous Agno response loops; MindRoom runs every agent and team asynchronously.
 - The prompt-builder and skills changes of #2794.
