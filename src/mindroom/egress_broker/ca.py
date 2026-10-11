@@ -88,8 +88,6 @@ class BrokerCA:
 
         CA files: ca.pem (0644) and ca.key (0600, PKCS8, encrypted when key_password is given).
         Parent directory is created with mode 0700 if it does not exist.
-        An existing CA certificate without a SubjectKeyIdentifier, which strict TLS clients require, is reissued
-        for the same key and both files are rewritten.
         """
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -98,20 +96,14 @@ class BrokerCA:
 
         if cert_path.exists() and key_path.exists():
             cert_pem = cert_path.read_bytes()
-            ca_cert = x509.load_pem_x509_certificate(cert_pem)
-            has_ski = _has_subject_key_identifier(ca_cert)
-            ca_key = _load_ca_key(key_path, key_password)
-            if has_ski:
-                return BrokerCA(
-                    ca_cert=ca_cert,
-                    ca_key=ca_key,
-                    cert_pem=cert_pem.decode("utf-8"),
-                    directory=directory,
-                )
-            # Created before the SubjectKeyIdentifier fix: reissue the certificate below for the same key.
-        else:
-            ca_key = ec.generate_private_key(ec.SECP256R1())
+            return BrokerCA(
+                ca_cert=x509.load_pem_x509_certificate(cert_pem),
+                ca_key=_load_ca_key(key_path, key_password),
+                cert_pem=cert_pem.decode("utf-8"),
+                directory=directory,
+            )
 
+        ca_key = ec.generate_private_key(ec.SECP256R1())
         ca_cert = _issue_ca_certificate(ca_key)
         cert_pem_bytes = _write_ca_files(cert_path, key_path, ca_cert=ca_cert, ca_key=ca_key, key_password=key_password)
         return BrokerCA(
@@ -184,13 +176,6 @@ class BrokerCA:
         not_before = now - timedelta(hours=1)  # 1h in the past
         not_after = now + timedelta(hours=_LEAF_VALIDITY_HOURS)
 
-        # Get CA's SubjectKeyIdentifier for AuthorityKeyIdentifier
-        ca_ski_ext = self._ca_cert.extensions.get_extension_for_oid(
-            x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER,
-        )
-        assert isinstance(ca_ski_ext.value, x509.SubjectKeyIdentifier)
-        ca_ski = ca_ski_ext.value
-
         leaf_cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
@@ -204,7 +189,8 @@ class BrokerCA:
                 critical=False,
             )
             .add_extension(
-                x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski),
+                # The same key id as the CA's SubjectKeyIdentifier, which `_issue_ca_certificate` derives from its key.
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(self._ca_key.public_key()),
                 critical=False,
             )
             .add_extension(san, critical=False)
@@ -253,15 +239,6 @@ class BrokerCA:
             # Unlink temp file
             with contextlib.suppress(OSError):
                 tmp_path.unlink()
-
-
-def _has_subject_key_identifier(ca_cert: x509.Certificate) -> bool:
-    """Return whether the CA certificate has the SubjectKeyIdentifier that strict TLS clients require."""
-    try:
-        ca_cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
-    except x509.ExtensionNotFound:
-        return False
-    return True
 
 
 def _load_ca_key(key_path: Path, key_password: bytes | None) -> ec.EllipticCurvePrivateKey:

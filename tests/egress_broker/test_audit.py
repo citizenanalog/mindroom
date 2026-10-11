@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -15,25 +14,6 @@ from mindroom.egress_broker.audit import AuditLog, AuditRecord
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-# The audit table as it was written before refusal codes added the `code` column.
-_OLD_AUDIT_TABLE = """
-    CREATE TABLE audit (
-        at TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        agent_name TEXT,
-        requester_id TEXT,
-        method TEXT NOT NULL,
-        host TEXT NOT NULL,
-        path TEXT NOT NULL,
-        service TEXT,
-        status INTEGER NOT NULL,
-        bytes_up INTEGER NOT NULL,
-        bytes_down INTEGER NOT NULL,
-        duration_ms INTEGER NOT NULL
-    )
-"""
 
 
 @pytest.fixture
@@ -88,38 +68,6 @@ def _record_series(
                 duration_ms=i,
             ),
         )
-
-
-def _write_log_without_code_column(path: Path, *, row_at: datetime | None = None) -> None:
-    """Create a log file in the old schema, with one denied row at `row_at` if given."""
-    old = sqlite3.connect(path)
-    old.execute(_OLD_AUDIT_TABLE)
-    if row_at is not None:
-        old.execute(
-            "INSERT INTO audit VALUES (?, 'denied', 'user', 'a', '@u:x', 'GET', 'h', '/old', 's', 403, 1, 2, 3)",
-            (row_at.isoformat(),),
-        )
-    old.commit()
-    old.close()
-
-
-def _open_connections_as(monkeypatch: pytest.MonkeyPatch, connection_class: type[sqlite3.Connection]) -> None:
-    """Make `sqlite3.connect` open connections of `connection_class`."""
-    real_connect = sqlite3.connect
-    monkeypatch.setattr(
-        sqlite3,
-        "connect",
-        lambda *args, **kwargs: real_connect(*args, factory=connection_class, **kwargs),
-    )
-
-
-def _column_count(path: Path, column: str) -> int:
-    """Return how many times the audit table at `path` declares `column`."""
-    check = sqlite3.connect(path)
-    try:
-        return [row[1] for row in check.execute("PRAGMA table_info(audit)")].count(column)
-    finally:
-        check.close()
 
 
 def test_record_and_query_newest_first(log: AuditLog, sample_record: AuditRecord) -> None:
@@ -376,76 +324,3 @@ def test_refusal_code_is_stored_and_a_forward_has_none(log: AuditLog, sample_rec
 
     assert (refused.path, refused.code) == ("/other", "path_not_allowed")
     assert (forwarded.path, forwarded.code) == ("/ok", None)
-
-
-def test_a_log_from_before_refusal_codes_gains_the_column(tmp_path: Path, sample_record: AuditRecord) -> None:
-    """Opening a log written without the `code` column adds it, keeps old rows, and accepts new ones."""
-    path = tmp_path / "old.db"
-    _write_log_without_code_column(path, row_at=datetime.now(UTC) - timedelta(minutes=1))
-
-    log = AuditLog(path)
-    log.record(replace(sample_record, path="/new", kind="denied", status=403, code="bad_request"))
-    newest, oldest = log.query()
-    log.close()
-    reopened = AuditLog(path)
-    rows = reopened.query()
-    reopened.close()
-
-    assert (oldest.path, oldest.code) == ("/old", None)
-    assert (newest.path, newest.code) == ("/new", "bad_request")
-    assert [(row.path, row.code) for row in rows] == [("/new", "bad_request"), ("/old", None)]
-    assert _column_count(path, "code") == 1
-
-
-def test_a_concurrent_alter_of_the_same_log_is_tolerated(
-    tmp_path: Path,
-    sample_record: AuditRecord,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Another process adding `code` between the column check and the ALTER leaves the log usable, not failing."""
-    path = tmp_path / "racing.db"
-    _write_log_without_code_column(path)
-    real_connect = sqlite3.connect
-    alters = []
-
-    class RacingConnection(sqlite3.Connection):
-        def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
-            if sql.startswith("ALTER TABLE audit ADD COLUMN"):
-                alters.append(sql)
-                other = real_connect(path)
-                other.execute(sql)
-                other.commit()
-                other.close()
-            return super().execute(sql, *args)
-
-    _open_connections_as(monkeypatch, RacingConnection)
-
-    log = AuditLog(path)
-    log.record(replace(sample_record, kind="denied", status=403, code="bad_request"))
-    (row,) = log.query()
-    log.close()
-
-    assert len(alters) == 1
-    assert row.code == "bad_request"
-    assert _column_count(path, "code") == 1
-
-
-def test_another_failure_while_adding_the_column_is_not_swallowed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only a duplicate column is tolerated; any other error opening the log still surfaces."""
-    path = tmp_path / "broken.db"
-    _write_log_without_code_column(path)
-
-    class FailingConnection(sqlite3.Connection):
-        def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
-            if sql.startswith("ALTER TABLE audit ADD COLUMN"):
-                msg = "database is locked"
-                raise sqlite3.OperationalError(msg)
-            return super().execute(sql, *args)
-
-    _open_connections_as(monkeypatch, FailingConnection)
-
-    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-        AuditLog(path)
