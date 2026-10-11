@@ -31,7 +31,8 @@ from mindroom.oauth.credential_lifecycle import load_oauth_credentials_snapshot_
 from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.providers import OAuthProvider
-from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from mindroom.tool_system.worker_routing import resolve_worker_target
+from tests.egress_broker.conftest import tool_identity
 from tests.oauth_test_utils import (
     DelayedTokenEndpointOutcome,
     TokenEndpointOutcome,
@@ -120,23 +121,9 @@ def _fresh_unknown_provider_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(oauth_source, "_warned_unknown_providers", set())
 
 
-def _identity(requester_id: str | None, agent_name: str = "code") -> ToolExecutionIdentity:
-    return ToolExecutionIdentity(
-        channel="matrix",
-        agent_name=agent_name,
-        requester_id=requester_id,
-        room_id="!room:example.org",
-        thread_id="$thread",
-        resolved_thread_id="$thread",
-        session_id="session-1",
-        tenant_id=None,
-        account_id=None,
-    )
-
-
 def _tool_target(requester_id: str | None, scope: WorkerScope | None = "user_agent") -> ResolvedWorkerTarget:
     """Return the worker target a tool call on agent `code` carries."""
-    return resolve_worker_target(scope, "code", _identity(requester_id))
+    return resolve_worker_target(scope, "code", tool_identity(requester_id))
 
 
 def _broker_target(requester_id: str | None, scope: WorkerScope | None = "user_agent") -> ResolvedWorkerTarget:
@@ -150,7 +137,7 @@ def _broker_target(requester_id: str | None, scope: WorkerScope | None = "user_a
 
 def _github_store(requester_id: str) -> ResolvedWorkerTarget:
     """Return the requester's own store, where GitHub connections live whatever the agent's scope."""
-    return resolve_worker_target("user", "code", _identity(requester_id))
+    return resolve_worker_target("user", "code", tool_identity(requester_id))
 
 
 def _credentials(

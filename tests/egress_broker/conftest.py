@@ -29,6 +29,7 @@ from mindroom.egress_broker.proxy import EgressBroker, ManageUrl
 from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import Secret, SecretMissing
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
+from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.audit import AuditRecord
     from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.secrets import SecretResult
+    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, WorkerScope
     from tests.egress_broker.raw_http import Script, UpstreamFactory
 
 type ServeFactory = Callable[..., Awaitable[int]]
@@ -51,6 +53,36 @@ DEFAULT_CLAIMS = WorkerClaims(
     agent_name="code",
     requester_id="@alice:example.org",
 )
+
+
+def tool_identity(requester_id: str | None, agent_name: str = "code") -> ToolExecutionIdentity:
+    """Return the identity of a tool call by `requester_id` on agent `agent_name`, in a Matrix thread."""
+    return ToolExecutionIdentity(
+        channel="matrix",
+        agent_name=agent_name,
+        requester_id=requester_id,
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-1",
+        tenant_id=None,
+        account_id=None,
+    )
+
+
+def worker_target(
+    requester_id: str = "@alice:example.org",
+    agent_name: str = "code",
+    *,
+    scope: WorkerScope | None = "user_agent",
+) -> ResolvedWorkerTarget:
+    """Return the worker target a tool call by `requester_id` on `agent_name` resolves to under `scope`."""
+    return resolve_worker_target(
+        scope,
+        agent_name,
+        tool_identity(requester_id, agent_name),
+        private_agent_names=frozenset(),
+    )
 
 
 @dataclass(frozen=True)

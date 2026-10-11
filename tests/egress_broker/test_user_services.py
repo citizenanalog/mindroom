@@ -24,7 +24,7 @@ from mindroom.egress_broker.user_services import (
     save_user_service,
     user_service_hosts_not_allowed,
 )
-from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from tests.egress_broker.conftest import worker_target
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -46,26 +46,6 @@ def manager(tmp_path: Path) -> CredentialsManager:
     return CredentialsManager(tmp_path / "mindroom_data" / "credentials")
 
 
-def _target(
-    requester_id: str = _ALICE,
-    agent_name: str = "code",
-    *,
-    scope: WorkerScope | None = "user_agent",
-) -> ResolvedWorkerTarget:
-    identity = ToolExecutionIdentity(
-        channel="matrix",
-        agent_name=agent_name,
-        requester_id=requester_id,
-        room_id="!room:example.org",
-        thread_id="$thread",
-        resolved_thread_id="$thread",
-        session_id="session-1",
-        tenant_id=None,
-        account_id=None,
-    )
-    return resolve_worker_target(scope, agent_name, identity, private_agent_names=frozenset())
-
-
 def _service(host: str = "api.example.com", **fields: object) -> EgressService:
     return EgressService.model_validate({"rules": [{"host": host, "auth": {"type": "bearer"}}], **fields})
 
@@ -80,9 +60,14 @@ def _delete(manager: CredentialsManager, target: ResolvedWorkerTarget | None, na
 
 def test_saved_service_is_stored_in_authored_form_in_the_primary_only_scope_store(manager: CredentialsManager) -> None:
     """A preset service keeps its preset form, in the requester's primary-only store under the reserved name."""
-    _save(manager, _target(), "work-github", EgressService.model_validate({"preset": "github", "display_name": "Work"}))
+    _save(
+        manager,
+        worker_target(),
+        "work-github",
+        EgressService.model_validate({"preset": "github", "display_name": "Work"}),
+    )
 
-    loaded = load_user_services(manager, _target())
+    loaded = load_user_services(manager, worker_target())
 
     assert list(loaded) == ["work-github"]
     assert loaded["work-github"].oauth_provider == "github"
@@ -94,15 +79,15 @@ def test_saved_service_is_stored_in_authored_form_in_the_primary_only_scope_stor
 
 def test_services_belong_to_their_scope(manager: CredentialsManager) -> None:
     """Personal services stay with their requester and agent; a shared agent's services apply to all its requesters."""
-    _save(manager, _target(), "mine", _service())
-    _save(manager, _target(scope="shared"), "team", _service("team.example.com"))
+    _save(manager, worker_target(), "mine", _service())
+    _save(manager, worker_target(scope="shared"), "team", _service("team.example.com"))
 
-    assert list(load_user_services(manager, _target())) == ["mine"]
-    assert load_user_services(manager, _target(_BOB)) == {}
-    assert load_user_services(manager, _target(agent_name="docs")) == {}
-    assert load_user_services(manager, _target(scope="user")) == {}
-    assert list(load_user_services(manager, _target(_ALICE, scope="shared"))) == ["team"]
-    assert list(load_user_services(manager, _target(_BOB, scope="shared"))) == ["team"]
+    assert list(load_user_services(manager, worker_target())) == ["mine"]
+    assert load_user_services(manager, worker_target(_BOB)) == {}
+    assert load_user_services(manager, worker_target(agent_name="docs")) == {}
+    assert load_user_services(manager, worker_target(scope="user")) == {}
+    assert list(load_user_services(manager, worker_target(_ALICE, scope="shared"))) == ["team"]
+    assert list(load_user_services(manager, worker_target(_BOB, scope="shared"))) == ["team"]
 
 
 def test_global_scope_has_its_own_services(manager: CredentialsManager) -> None:
@@ -110,16 +95,16 @@ def test_global_scope_has_its_own_services(manager: CredentialsManager) -> None:
     _save(manager, None, "everyone", _service())
 
     assert list(load_user_services(manager, None)) == ["everyone"]
-    assert list(load_user_services(manager, _target(scope=None))) == ["everyone"]
-    assert load_user_services(manager, _target()) == {}
+    assert list(load_user_services(manager, worker_target(scope=None))) == ["everyone"]
+    assert load_user_services(manager, worker_target()) == {}
 
 
 def test_config_service_name_is_a_conflict(manager: CredentialsManager) -> None:
     """The operator's service wins: saving a user service under its name is refused and stores nothing."""
     with pytest.raises(UserServiceConflictError, match="github"):
-        _save(manager, _target(), "github", _service())
+        _save(manager, worker_target(), "github", _service())
 
-    assert load_user_services(manager, _target()) == {}
+    assert load_user_services(manager, worker_target()) == {}
 
 
 @pytest.mark.parametrize(
@@ -129,33 +114,33 @@ def test_config_service_name_is_a_conflict(manager: CredentialsManager) -> None:
 def test_invalid_names_are_rejected(manager: CredentialsManager, name: str) -> None:
     """Names follow the config rules, so none can produce the reserved `egress__services` store name."""
     with pytest.raises(ValueError, match="service name"):
-        _save(manager, _target(), name, _service())
+        _save(manager, worker_target(), name, _service())
 
-    assert load_user_services(manager, _target()) == {}
+    assert load_user_services(manager, worker_target()) == {}
 
 
 def test_oauth_on_shared_workers_stays_operator_only(manager: CredentialsManager) -> None:
     """Only an operator may let personal accounts serve shared sandboxes."""
     with pytest.raises(ValueError, match="oauth_on_shared_workers"):
-        _save(manager, _target(), "mine", _service(oauth_provider="github", oauth_on_shared_workers=True))
+        _save(manager, worker_target(), "mine", _service(oauth_provider="github", oauth_on_shared_workers=True))
 
-    assert load_user_services(manager, _target()) == {}
+    assert load_user_services(manager, worker_target()) == {}
 
 
 def test_service_count_is_limited_per_scope(manager: CredentialsManager) -> None:
     """A scope holds at most 50 services; replacing one of them still works at the limit."""
     for index in range(MAX_USER_SERVICES):
-        _save(manager, _target(), f"svc-{index}", _service())
+        _save(manager, worker_target(), f"svc-{index}", _service())
 
     with pytest.raises(ValueError, match=f"at most {MAX_USER_SERVICES} services"):
-        _save(manager, _target(), "one-too-many", _service())
-    _save(manager, _target(), "svc-0", _service("replaced.example.com"))
+        _save(manager, worker_target(), "one-too-many", _service())
+    _save(manager, worker_target(), "svc-0", _service("replaced.example.com"))
 
-    loaded = load_user_services(manager, _target())
+    loaded = load_user_services(manager, worker_target())
     assert len(loaded) == MAX_USER_SERVICES
     assert loaded["svc-0"].rules[0].host == "replaced.example.com"
     # Another scope has its own allowance.
-    _save(manager, _target(_BOB), "svc-0", _service())
+    _save(manager, worker_target(_BOB), "svc-0", _service())
 
 
 def test_rule_count_is_limited_per_service(manager: CredentialsManager) -> None:
@@ -164,11 +149,11 @@ def test_rule_count_is_limited_per_service(manager: CredentialsManager) -> None:
         {"host": f"h{index}.example.com", "auth": {"type": "bearer"}} for index in range(MAX_RULES_PER_SERVICE + 1)
     ]
 
-    _save(manager, _target(), "fits", EgressService.model_validate({"rules": rules[:MAX_RULES_PER_SERVICE]}))
+    _save(manager, worker_target(), "fits", EgressService.model_validate({"rules": rules[:MAX_RULES_PER_SERVICE]}))
     with pytest.raises(ValueError, match=f"at most {MAX_RULES_PER_SERVICE} rules"):
-        _save(manager, _target(), "too-big", EgressService.model_validate({"rules": rules}))
+        _save(manager, worker_target(), "too-big", EgressService.model_validate({"rules": rules}))
 
-    assert list(load_user_services(manager, _target())) == ["fits"]
+    assert list(load_user_services(manager, worker_target())) == ["fits"]
 
 
 def test_invalid_stored_entry_is_skipped_by_name_only(manager: CredentialsManager) -> None:
@@ -189,7 +174,7 @@ def test_invalid_stored_entry_is_skipped_by_name_only(manager: CredentialsManage
     )
 
     with capture_logs() as logs:
-        loaded = load_user_services(manager, _target())
+        loaded = load_user_services(manager, worker_target())
 
     assert list(loaded) == ["good"]
     skipped = [entry["service"] for entry in logs if entry["event"] == "egress_broker_user_service_invalid"]
@@ -222,7 +207,7 @@ def test_inactive_entries_are_the_shadowed_and_the_invalid_ones_with_their_reaso
     )
 
     with capture_logs() as logs:
-        inactive = inactive_user_services(config, manager, _target())
+        inactive = inactive_user_services(config, manager, worker_target())
 
     assert [(entry.name, entry.reason) for entry in inactive] == [
         ("Bad Name", "invalid"),
@@ -233,19 +218,19 @@ def test_inactive_entries_are_the_shadowed_and_the_invalid_ones_with_their_reaso
         ("opted-in", "invalid"),
     ]
     assert logs == []
-    assert list(load_user_services(manager, _target())) == ["good", "github"]
-    assert inactive_user_services(config, manager, _target(_BOB)) == []
+    assert list(load_user_services(manager, worker_target())) == ["good", "github"]
+    assert inactive_user_services(config, manager, worker_target(_BOB)) == []
     assert inactive_user_services(config, manager, None) == []
 
 
 def test_a_scope_without_ignored_entries_has_no_inactive_ones(manager: CredentialsManager) -> None:
     """Active services and a missing or malformed document are not reported."""
-    assert inactive_user_services(_CONFIG, manager, _target()) == []
-    _save(manager, _target(), "mine", _service())
-    assert inactive_user_services(_CONFIG, manager, _target()) == []
+    assert inactive_user_services(_CONFIG, manager, worker_target()) == []
+    _save(manager, worker_target(), "mine", _service())
+    assert inactive_user_services(_CONFIG, manager, worker_target()) == []
     store = manager.for_primary_runtime_scope(_ALICE, "code")
     store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": ["not", "a", "mapping"]})
-    assert inactive_user_services(_CONFIG, manager, _target()) == []
+    assert inactive_user_services(_CONFIG, manager, worker_target()) == []
 
 
 def test_deleting_an_invalid_entry_removes_it_and_its_key(manager: CredentialsManager) -> None:
@@ -255,14 +240,14 @@ def test_deleting_an_invalid_entry_removes_it_and_its_key(manager: CredentialsMa
         USER_SERVICES_CREDENTIAL_SERVICE,
         {"services": {"stale": {"rules": []}, "good": _service().authored_model_dump()}},
     )
-    save_secret(manager, _target(), "stale", "old-key")
+    save_secret(manager, worker_target(), "stale", "old-key")
 
-    assert _delete(manager, _target(), "stale") is True
+    assert _delete(manager, worker_target(), "stale") is True
 
-    assert inactive_user_services(_CONFIG, manager, _target()) == []
-    assert list(load_user_services(manager, _target())) == ["good"]
-    assert load_secret(manager, _target(), "stale") is None
-    assert _delete(manager, _target(), "stale") is False
+    assert inactive_user_services(_CONFIG, manager, worker_target()) == []
+    assert list(load_user_services(manager, worker_target())) == ["good"]
+    assert load_secret(manager, worker_target(), "stale") is None
+    assert _delete(manager, worker_target(), "stale") is False
 
 
 def test_deleting_an_entry_with_a_name_the_store_rejects_still_succeeds(manager: CredentialsManager) -> None:
@@ -273,10 +258,10 @@ def test_deleting_an_entry_with_a_name_the_store_rejects_still_succeeds(manager:
         {"services": {"Bad Name": _service().authored_model_dump(), "good": _service().authored_model_dump()}},
     )
 
-    assert _delete(manager, _target(), "Bad Name") is True
+    assert _delete(manager, worker_target(), "Bad Name") is True
 
-    assert inactive_user_services(_CONFIG, manager, _target()) == []
-    assert list(load_user_services(manager, _target())) == ["good"]
+    assert inactive_user_services(_CONFIG, manager, worker_target()) == []
+    assert list(load_user_services(manager, worker_target())) == ["good"]
 
 
 def test_malformed_document_reads_as_no_services(manager: CredentialsManager) -> None:
@@ -285,20 +270,20 @@ def test_malformed_document_reads_as_no_services(manager: CredentialsManager) ->
     store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": ["not", "a", "mapping"]})
 
     with capture_logs() as logs:
-        assert load_user_services(manager, _target()) == {}
+        assert load_user_services(manager, worker_target()) == {}
 
     assert [entry["event"] for entry in logs] == ["egress_broker_user_services_malformed"]
 
 
 def test_delete_removes_one_service_and_the_document_with_the_last(manager: CredentialsManager) -> None:
     """Deleting reports whether the service existed; the last deletion removes the document itself."""
-    _save(manager, _target(), "one", _service())
-    _save(manager, _target(), "two", _service())
+    _save(manager, worker_target(), "one", _service())
+    _save(manager, worker_target(), "two", _service())
 
-    assert _delete(manager, _target(), "one") is True
-    assert _delete(manager, _target(), "one") is False
-    assert list(load_user_services(manager, _target())) == ["two"]
-    assert _delete(manager, _target(), "two") is True
+    assert _delete(manager, worker_target(), "one") is True
+    assert _delete(manager, worker_target(), "one") is False
+    assert list(load_user_services(manager, worker_target())) == ["two"]
+    assert _delete(manager, worker_target(), "two") is True
     store = manager.for_primary_runtime_scope(_ALICE, "code")
     assert store.load_credentials(USER_SERVICES_CREDENTIAL_SERVICE) is None
 
@@ -310,15 +295,15 @@ def test_effective_config_puts_config_services_first_and_ignores_shadowed_user_s
     # Saved while the config had no `github`, then the operator added one.
     save_user_service(
         manager,
-        _target(),
+        worker_target(),
         "github",
         _service("evil.example.com"),
         config_services={},
         oauth_providers=_PROVIDERS,
     )
-    _save(manager, _target(), "mine", _service())
+    _save(manager, worker_target(), "mine", _service())
 
-    effective = effective_config(_CONFIG, manager, _target())
+    effective = effective_config(_CONFIG, manager, worker_target())
 
     assert list(effective.services) == ["github", "mine"]
     assert effective.services["github"] is _CONFIG.services["github"]
@@ -329,34 +314,34 @@ def test_effective_config_puts_config_services_first_and_ignores_shadowed_user_s
 
 def test_effective_config_without_user_services_is_the_config(manager: CredentialsManager) -> None:
     """A scope without services matches against the config object itself."""
-    assert effective_config(_CONFIG, manager, _target()) is _CONFIG
+    assert effective_config(_CONFIG, manager, worker_target()) is _CONFIG
     assert effective_config(_CONFIG, manager, None) is _CONFIG
 
 
 def test_effective_config_is_cached_and_invalidated_by_save_and_delete(manager: CredentialsManager) -> None:
     """Repeated reads reuse one merged config; every save and delete makes the next read see the change."""
-    assert effective_config(_CONFIG, manager, _target()) is _CONFIG
+    assert effective_config(_CONFIG, manager, worker_target()) is _CONFIG
 
-    _save(manager, _target(), "mine", _service())
-    saved = effective_config(_CONFIG, manager, _target())
+    _save(manager, worker_target(), "mine", _service())
+    saved = effective_config(_CONFIG, manager, worker_target())
     assert list(saved.services) == ["github", "mine"]
-    assert effective_config(_CONFIG, manager, _target()) is saved
+    assert effective_config(_CONFIG, manager, worker_target()) is saved
 
-    _save(manager, _target(), "mine", _service("other.example.com"))
-    replaced = effective_config(_CONFIG, manager, _target())
+    _save(manager, worker_target(), "mine", _service("other.example.com"))
+    replaced = effective_config(_CONFIG, manager, worker_target())
     assert replaced.services["mine"].rules[0].host == "other.example.com"
 
-    _delete(manager, _target(), "mine")
-    assert effective_config(_CONFIG, manager, _target()) is _CONFIG
+    _delete(manager, worker_target(), "mine")
+    assert effective_config(_CONFIG, manager, worker_target()) is _CONFIG
 
 
 def test_effective_config_follows_a_config_change(manager: CredentialsManager) -> None:
     """A new config object is merged afresh: its services appear and a now-shadowed user service drops out."""
-    save_user_service(manager, _target(), "openai", _service(), config_services={}, oauth_providers=_PROVIDERS)
-    before = effective_config(_CONFIG, manager, _target())
+    save_user_service(manager, worker_target(), "openai", _service(), config_services={}, oauth_providers=_PROVIDERS)
+    before = effective_config(_CONFIG, manager, worker_target())
     changed = EgressBrokerConfig.model_validate({"services": {"openai": {"preset": "openai"}}})
 
-    after = effective_config(changed, manager, _target())
+    after = effective_config(changed, manager, worker_target())
 
     assert list(before.services) == ["github", "openai"]
     assert before.services["openai"].rules[0].host == "api.example.com"
@@ -374,24 +359,24 @@ def test_a_read_racing_a_save_is_never_cached(manager: CredentialsManager, monke
         target: ResolvedWorkerTarget | None,
     ) -> dict[str, EgressService]:
         stale = original(read_manager, target)
-        _save(manager, _target(), "late", _service())
+        _save(manager, worker_target(), "late", _service())
         return stale
 
     monkeypatch.setattr(user_services, "load_user_services", read_then_save)
-    assert effective_config(_CONFIG, manager, _target()) is _CONFIG
+    assert effective_config(_CONFIG, manager, worker_target()) is _CONFIG
     monkeypatch.undo()
 
-    assert list(effective_config(_CONFIG, manager, _target()).services) == ["github", "late"]
+    assert list(effective_config(_CONFIG, manager, worker_target()).services) == ["github", "late"]
 
 
 def test_scopes_have_separate_cache_entries(manager: CredentialsManager) -> None:
     """Alice's cached merge is never served to Bob, whose own services are merged separately."""
-    _save(manager, _target(), "alice-svc", _service())
-    _save(manager, _target(_BOB), "bob-svc", _service())
+    _save(manager, worker_target(), "alice-svc", _service())
+    _save(manager, worker_target(_BOB), "bob-svc", _service())
 
-    assert list(effective_config(_CONFIG, manager, _target()).services) == ["github", "alice-svc"]
-    assert list(effective_config(_CONFIG, manager, _target(_BOB)).services) == ["github", "bob-svc"]
-    assert list(effective_config(_CONFIG, manager, _target()).services) == ["github", "alice-svc"]
+    assert list(effective_config(_CONFIG, manager, worker_target()).services) == ["github", "alice-svc"]
+    assert list(effective_config(_CONFIG, manager, worker_target(_BOB)).services) == ["github", "bob-svc"]
+    assert list(effective_config(_CONFIG, manager, worker_target()).services) == ["github", "alice-svc"]
 
 
 def test_restrict_to_rules_on_a_user_service_applies_only_to_its_scope(manager: CredentialsManager) -> None:
@@ -402,12 +387,12 @@ def test_restrict_to_rules_on_a_user_service_applies_only_to_its_scope(manager: 
             "restrict_to_rules": True,
         },
     )
-    _save(manager, _target(), "repo", restricted)
+    _save(manager, worker_target(), "repo", restricted)
     # Under passthrough, so the user host is the scope's own to intercept.
     config = EgressBrokerConfig.model_validate({"services": {"github": {"preset": "github"}}})
 
-    alice = EgressRules(operator=config, effective=effective_config(config, manager, _target()))
-    bob = EgressRules(operator=config, effective=effective_config(config, manager, _target(_BOB)))
+    alice = EgressRules(operator=config, effective=effective_config(config, manager, worker_target()))
+    bob = EgressRules(operator=config, effective=effective_config(config, manager, worker_target(_BOB)))
 
     assert route_request(alice, "api.example.com", 443, "/repos/alice/x/pulls").match is not None
     assert route_request(alice, "api.example.com", 443, "/repos/bob/y").refusal == "path_not_allowed"
@@ -421,12 +406,12 @@ def test_a_restrict_only_limit_is_saved_and_narrows_the_config_service_in_its_sc
     limit = EgressService.model_validate(
         {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/alice/x"}]},
     )
-    _save(manager, _target(), "github-limited", limit)
+    _save(manager, worker_target(), "github-limited", limit)
 
-    alice = EgressRules(operator=_CONFIG, effective=effective_config(_CONFIG, manager, _target()))
-    bob = EgressRules(operator=_CONFIG, effective=effective_config(_CONFIG, manager, _target(_BOB)))
+    alice = EgressRules(operator=_CONFIG, effective=effective_config(_CONFIG, manager, worker_target()))
+    bob = EgressRules(operator=_CONFIG, effective=effective_config(_CONFIG, manager, worker_target(_BOB)))
 
-    assert load_user_services(manager, _target())["github-limited"].restrict_only is True
+    assert load_user_services(manager, worker_target())["github-limited"].restrict_only is True
     allowed = route_request(alice, "api.github.com", 443, "/repos/alice/x/pulls")
     assert allowed.match is not None
     assert allowed.match.service == "github"
@@ -439,7 +424,7 @@ def test_a_restrict_only_limit_is_saved_and_narrows_the_config_service_in_its_sc
         {"restrict_only": True, "rules": [{"host": "api.github.com"}] * (MAX_RULES_PER_SERVICE + 1)},
     )
     with pytest.raises(ValueError, match="at most 50 rules"):
-        _save(manager, _target(), "too-many", too_many)
+        _save(manager, worker_target(), "too-many", too_many)
 
 
 def test_hosts_outside_deny_are_reported_for_a_save_check() -> None:
@@ -483,7 +468,7 @@ def test_a_limit_under_deny_may_name_hosts_the_operator_does_not_cover() -> None
 
 def test_a_new_service_never_inherits_a_stored_key(manager: CredentialsManager) -> None:
     """Saving a new name clears a key left under it; replacing the service keeps its key; deleting removes it."""
-    for target in (_target(), _target(scope="shared")):
+    for target in (worker_target(), worker_target(scope="shared")):
         # For example a key a since-removed config service of the same name left behind.
         save_secret(manager, target, "mine", "left-behind")
         _save(manager, target, "mine", _service())
@@ -502,7 +487,7 @@ def test_turning_a_service_into_a_limit_deletes_its_stored_key(manager: Credenti
     limit = EgressService.model_validate(
         {"restrict_only": True, "rules": [{"host": "api.example.com", "path_prefix": "/repos/o/a"}]},
     )
-    for target in (_target(), _target(scope="shared")):
+    for target in (worker_target(), worker_target(scope="shared")):
         _save(manager, target, "mine", _service())
         save_secret(manager, target, "mine", "own-key")
 
@@ -515,7 +500,7 @@ def test_turning_a_service_into_a_limit_deletes_its_stored_key(manager: Credenti
 def test_deleting_a_shadowed_entry_keeps_the_key_its_config_service_uses(manager: CredentialsManager) -> None:
     """A config service of the same name shadows the entry and uses the key in this scope, so only the entry goes."""
     shadowing = {**_CONFIG.services, "mine": _service("config.example.com")}
-    for target in (_target(), _target(scope="shared")):
+    for target in (worker_target(), worker_target(scope="shared")):
         _save(manager, target, "mine", _service())
         save_secret(manager, target, "mine", "key")
 
@@ -537,7 +522,7 @@ def test_oauth_provider_is_refused_outside_personal_scopes(
     scope: WorkerScope | None,
 ) -> None:
     """A manager cannot route a shared or unscoped agent's OAuth connection to an arbitrary host, preset or not."""
-    for target in (_target(scope=scope), None) if scope is None else (_target(scope=scope),):
+    for target in (worker_target(scope=scope), None) if scope is None else (worker_target(scope=scope),):
         for authored in ({"oauth_provider": "github"}, {"preset": "github"}):
             with pytest.raises(ValueError, match="oauth_provider"):
                 _save(
@@ -549,8 +534,8 @@ def test_oauth_provider_is_refused_outside_personal_scopes(
         _save(manager, target, "keyed", EgressService.model_validate({"preset": "github", "oauth_provider": None}))
         assert load_user_services(manager, target)["keyed"].oauth_provider is None
 
-    _save(manager, _target(), "personal", _service(oauth_provider="github"))
-    assert load_user_services(manager, _target())["personal"].oauth_provider == "github"
+    _save(manager, worker_target(), "personal", _service(oauth_provider="github"))
+    assert load_user_services(manager, worker_target())["personal"].oauth_provider == "github"
 
 
 def test_stored_oauth_provider_is_ignored_outside_personal_scopes(manager: CredentialsManager) -> None:
@@ -562,11 +547,11 @@ def test_stored_oauth_provider_is_ignored_outside_personal_scopes(manager: Crede
     )
 
     with capture_logs() as logs:
-        loaded = load_user_services(manager, _target(scope="shared"))
+        loaded = load_user_services(manager, worker_target(scope="shared"))
 
     assert loaded["team"].oauth_provider is None
     assert [rule.host for rule in loaded["team"].rules] == ["api.github.com", "uploads.github.com", "github.com"]
-    assert effective_config(_CONFIG, manager, _target(scope="shared")).services["team"].oauth_provider is None
+    assert effective_config(_CONFIG, manager, worker_target(scope="shared")).services["team"].oauth_provider is None
     assert [(entry["event"], entry["service"]) for entry in logs] == [
         ("egress_broker_user_service_oauth_ignored", "team"),
     ]
@@ -579,9 +564,9 @@ def test_stored_oauth_provider_is_ignored_outside_personal_scopes(manager: Crede
 def test_placeholder_names_must_be_credential_words(manager: CredentialsManager, variable: str) -> None:
     """A user placeholder needs a credential word between underscores, so loader and shell variables are refused."""
     with pytest.raises(ValueError, match=f"^{variable} is not allowed as a placeholder: name a credential"):
-        _save(manager, _target(), "mine", _service(placeholder_env={variable: "mindroom-brokered"}))
+        _save(manager, worker_target(), "mine", _service(placeholder_env={variable: "mindroom-brokered"}))
 
-    assert load_user_services(manager, _target()) == {}
+    assert load_user_services(manager, worker_target()) == {}
 
 
 @pytest.mark.parametrize(
@@ -622,7 +607,7 @@ def test_placeholder_messages_follow_the_spec(
 ) -> None:
     """The three refusals read exactly as spec 12.4 words them, and never quote the value."""
     with pytest.raises(ValueError) as raised:  # noqa: PT011
-        _save(manager, _target(), "mine", _service(placeholder_env={variable: value}))
+        _save(manager, worker_target(), "mine", _service(placeholder_env={variable: value}))
 
     assert str(raised.value) == message
 
@@ -630,82 +615,103 @@ def test_placeholder_messages_follow_the_spec(
 def test_credential_placeholder_names_are_accepted(manager: CredentialsManager) -> None:
     """Common credential variables qualify."""
     names = ["GH_TOKEN", "OPENAI_API_KEY", "GITLAB_PAT", "AWS_ACCESS_KEY_ID", "DB_PASSWORD", "X_AUTH", "APP_SECRET"]
-    _save(manager, _target(), "mine", _service(placeholder_env=dict.fromkeys(names, "mindroom-brokered")))
+    _save(manager, worker_target(), "mine", _service(placeholder_env=dict.fromkeys(names, "mindroom-brokered")))
 
-    assert list(load_user_services(manager, _target())["mine"].placeholder_env) == names
+    assert list(load_user_services(manager, worker_target())["mine"].placeholder_env) == names
 
 
 @pytest.mark.parametrize("value", ["", "two words", "a/b", "x" * 257, "$(id)", "semi;colon", "pa\tss"])
 def test_placeholder_values_must_be_plain(manager: CredentialsManager, value: str) -> None:
     """A user placeholder value is 1 to 256 plain characters; the error never quotes it."""
     with pytest.raises(ValueError, match=r"^The value of GH_TOKEN must be 1 to 256 letters") as raised:
-        _save(manager, _target(), "mine", _service(placeholder_env={"GH_TOKEN": value}))
+        _save(manager, worker_target(), "mine", _service(placeholder_env={"GH_TOKEN": value}))
 
     if value:
         assert value not in str(raised.value)
-    assert load_user_services(manager, _target()) == {}
+    assert load_user_services(manager, worker_target()) == {}
 
 
-def test_stored_placeholders_users_may_not_set_are_dropped(manager: CredentialsManager) -> None:
+@pytest.mark.parametrize(
+    ("placeholders", "dropped", "never_logged"),
+    [
+        # Names and values that fail the user rules.
+        pytest.param(
+            {"GH_TOKEN": "mindroom-brokered", "LD_PRELOAD": "evil.so", "NPM_TOKEN": "has space"},
+            ["LD_PRELOAD", "NPM_TOKEN"],
+            ["evil.so", "has space"],
+            id="not-credential-words-or-plain-values",
+        ),
+        # Credential-looking names that tools read as a program, path, or options, and SSH_*.
+        pytest.param(
+            {"GH_TOKEN": "mindroom-brokered", "SSH_AUTH_SOCK": "agent.sock", "SOPS_AGE_KEY_CMD": "age"},
+            ["SSH_AUTH_SOCK", "SOPS_AGE_KEY_CMD"],
+            ["agent.sock"],
+            id="names-tools-run-or-load",
+        ),
+    ],
+)
+def test_stored_placeholders_users_may_not_set_are_dropped(
+    manager: CredentialsManager,
+    placeholders: dict[str, str],
+    dropped: list[str],
+    never_logged: list[str],
+) -> None:
     """A stored placeholder that fails the user rules is dropped by name; the service and its other placeholders stay."""
     store = manager.for_primary_runtime_scope(_ALICE, "code")
-    authored = {
-        **_service().authored_model_dump(),
-        "placeholder_env": {"GH_TOKEN": "mindroom-brokered", "LD_PRELOAD": "evil.so", "NPM_TOKEN": "has space"},
-    }
+    authored = {**_service().authored_model_dump(), "placeholder_env": placeholders}
     store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": {"mine": authored}})
 
     with capture_logs() as logs:
-        loaded = load_user_services(manager, _target())
+        loaded = load_user_services(manager, worker_target())
 
     assert loaded["mine"].placeholder_env == {"GH_TOKEN": "mindroom-brokered"}
-    dropped = [
+    ignored = [
         (entry["service"], entry["variable"])
         for entry in logs
         if entry["event"] == "egress_broker_user_service_placeholder_ignored"
     ]
-    assert dropped == [("mine", "LD_PRELOAD"), ("mine", "NPM_TOKEN")]
-    assert "evil.so" not in str(logs)
-    assert "has space" not in str(logs)
+    assert ignored == [("mine", variable) for variable in dropped]
+    for value in never_logged:
+        assert value not in str(logs)
 
 
 def test_a_service_is_limited_to_16_kib(manager: CredentialsManager) -> None:
     """One service's authored JSON may take at most 16 KiB."""
-    _save(manager, _target(), "fits", _service(description="x" * 16_000))
+    _save(manager, worker_target(), "fits", _service(description="x" * 16_000))
     with pytest.raises(ValueError, match="at most 16 KiB"):
-        _save(manager, _target(), "too-big", _service(description="x" * 16_500))
+        _save(manager, worker_target(), "too-big", _service(description="x" * 16_500))
 
-    assert list(load_user_services(manager, _target())) == ["fits"]
+    assert list(load_user_services(manager, worker_target())) == ["fits"]
 
 
 def test_a_scope_document_is_limited_to_256_kib(manager: CredentialsManager) -> None:
     """All of a scope's services together may take at most 256 KiB, well before the 50-service limit."""
     for index in range(16):
-        _save(manager, _target(), f"svc-{index}", _service(description="x" * 15_500))
+        _save(manager, worker_target(), f"svc-{index}", _service(description="x" * 15_500))
 
     with pytest.raises(ValueError, match="at most 256 KiB"):
-        _save(manager, _target(), "svc-16", _service(description="x" * 15_500))
+        _save(manager, worker_target(), "svc-16", _service(description="x" * 15_500))
 
-    assert len(load_user_services(manager, _target())) == 16
+    assert len(load_user_services(manager, worker_target())) == 16
     # Replacing a service with a smaller one still fits.
-    _save(manager, _target(), "svc-0", _service())
+    _save(manager, worker_target(), "svc-0", _service())
 
 
 def test_oauth_provider_must_be_registered(manager: CredentialsManager) -> None:
     """A user service can name only a provider the registry knows, a preset's provider included."""
     with pytest.raises(ValueError, match="unknown oauth_provider 'nope'"):
-        _save(manager, _target(), "mine", _service(oauth_provider="nope"))
+        _save(manager, worker_target(), "mine", _service(oauth_provider="nope"))
     with pytest.raises(ValueError, match="unknown oauth_provider 'atlassian'"):
-        _save(manager, _target(), "mine", EgressService.model_validate({"preset": "atlassian"}))
+        _save(manager, worker_target(), "mine", EgressService.model_validate({"preset": "atlassian"}))
 
-    assert load_user_services(manager, _target()) == {}
-    _save(manager, _target(), "mine", _service(oauth_provider="github"))
-    assert load_user_services(manager, _target())["mine"].oauth_provider == "github"
+    assert load_user_services(manager, worker_target()) == {}
+    _save(manager, worker_target(), "mine", _service(oauth_provider="github"))
+    assert load_user_services(manager, worker_target())["mine"].oauth_provider == "github"
 
 
 def test_equal_config_copies_share_a_cache_entry(manager: CredentialsManager, monkeypatch: pytest.MonkeyPatch) -> None:
     """The broker's and the tools' config objects can be separate equal copies; they share one entry, not evict."""
-    _save(manager, _target(), "mine", _service())
+    _save(manager, worker_target(), "mine", _service())
     authored = {"unmatched_hosts": "deny", "services": {"github": {"preset": "github"}}}
     api_copy = EgressBrokerConfig.model_validate(authored)
     orchestrator_copy = EgressBrokerConfig.model_validate(authored)
@@ -717,19 +723,19 @@ def test_equal_config_copies_share_a_cache_entry(manager: CredentialsManager, mo
         return original(read_manager, target)
 
     monkeypatch.setattr(user_services, "load_user_services", counting)
-    first = effective_config(api_copy, manager, _target())
+    first = effective_config(api_copy, manager, worker_target())
     for _ in range(3):
-        assert effective_config(orchestrator_copy, manager, _target()) is first
-        assert effective_config(api_copy, manager, _target()) is first
+        assert effective_config(orchestrator_copy, manager, worker_target()) is first
+        assert effective_config(api_copy, manager, worker_target()) is first
     changed = EgressBrokerConfig.model_validate({**authored, "unmatched_hosts": "passthrough"})
-    assert effective_config(changed, manager, _target()).unmatched_hosts == "passthrough"
+    assert effective_config(changed, manager, worker_target()).unmatched_hosts == "passthrough"
 
     assert len(reads) == 2
 
 
 def test_reordered_config_is_merged_again_so_ties_follow_the_new_order(manager: CredentialsManager) -> None:
     """Equal services in another order break rule ties differently, so the cache never serves the old order."""
-    _save(manager, _target(), "mine", _service("mine.example.com"))
+    _save(manager, worker_target(), "mine", _service("mine.example.com"))
     tied = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
     first = EgressBrokerConfig.model_validate({"services": {"alpha": tied, "beta": tied}})
     reordered = EgressBrokerConfig.model_validate({"services": {"beta": tied, "alpha": tied}})
@@ -742,7 +748,7 @@ def test_reordered_config_is_merged_again_so_ties_follow_the_new_order(manager: 
         assert match.match is not None
         return match.match.service
 
-    for target in (_target(), _target(_BOB)):  # with and without services of the scope's own
+    for target in (worker_target(), worker_target(_BOB)):  # with and without services of the scope's own
         assert picked(first, target) == "alpha"
         assert picked(reordered, target) == "beta"
         assert picked(first, target) == "alpha"
@@ -766,24 +772,6 @@ def test_reordered_config_is_merged_again_so_ties_follow_the_new_order(manager: 
 def test_placeholder_names_that_tools_run_or_load_are_refused(manager: CredentialsManager, variable: str) -> None:
     """Credential-looking names that tools read as a program, path, or options are refused, and so is SSH_*."""
     with pytest.raises(ValueError, match=f"^{variable} is not allowed: tools read names with"):
-        _save(manager, _target(), "mine", _service(placeholder_env={variable: "mindroom-brokered"}))
+        _save(manager, worker_target(), "mine", _service(placeholder_env={variable: "mindroom-brokered"}))
 
-    assert load_user_services(manager, _target()) == {}
-
-
-def test_stored_placeholders_that_tools_run_or_load_are_dropped(manager: CredentialsManager) -> None:
-    """The same names are dropped from stored services on load, by name only."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
-    placeholders = {"GH_TOKEN": "mindroom-brokered", "SSH_AUTH_SOCK": "agent.sock", "SOPS_AGE_KEY_CMD": "age"}
-    authored = {**_service().authored_model_dump(), "placeholder_env": placeholders}
-    store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": {"mine": authored}})
-
-    with capture_logs() as logs:
-        loaded = load_user_services(manager, _target())
-
-    assert loaded["mine"].placeholder_env == {"GH_TOKEN": "mindroom-brokered"}
-    dropped = [
-        entry["variable"] for entry in logs if entry["event"] == "egress_broker_user_service_placeholder_ignored"
-    ]
-    assert dropped == ["SSH_AUTH_SOCK", "SOPS_AGE_KEY_CMD"]
-    assert "agent.sock" not in str(logs)
+    assert load_user_services(manager, worker_target()) == {}

@@ -39,7 +39,7 @@ from mindroom.egress_broker.tokens import TokenSigner
 from mindroom.egress_broker.user_services import delete_user_service, save_user_service
 from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.google_drive import google_drive_oauth_provider
-from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity, resolve_worker_target
+from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, resolve_worker_target
 from tests.oauth_test_utils import (
     DelayedTokenEndpointOutcome,
     publish_oauth_credentials,
@@ -47,7 +47,14 @@ from tests.oauth_test_utils import (
     serve_token_endpoint,
 )
 
-from .conftest import audit_records, connect_request, free_port, proxy_authorization
+from .conftest import (
+    audit_records,
+    connect_request,
+    free_port,
+    proxy_authorization,
+    tool_identity,
+    worker_target,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -130,32 +137,13 @@ def _broker_env(port: int, **extra: str) -> dict[str, str]:
     }
 
 
-def _identity(requester_id: str, agent_name: str = "code") -> ToolExecutionIdentity:
-    return ToolExecutionIdentity(
-        channel="matrix",
-        agent_name=agent_name,
-        requester_id=requester_id,
-        room_id="!room:example.org",
-        thread_id="$thread",
-        resolved_thread_id="$thread",
-        session_id="session-1",
-        tenant_id=None,
-        account_id=None,
-    )
-
-
 def _target(
     requester_id: str = "@alice:example.org",
     agent_name: str = "code",
     *,
-    scope: WorkerScope = "user_agent",
+    scope: WorkerScope | None = "user_agent",
 ) -> ResolvedWorkerTarget:
-    target = resolve_worker_target(
-        scope,
-        agent_name,
-        _identity(requester_id, agent_name),
-        private_agent_names=frozenset(),
-    )
+    target = worker_target(requester_id, agent_name, scope=scope)
     # An unscoped call has no worker key; it is routed to a worker that its proxy token names.
     return replace(target, worker_key="v1:local:unscoped:code") if target.worker_key is None else target
 
@@ -771,7 +759,7 @@ def _connect_github(
             "_oauth_provider": "github",
         },
         credentials_manager=manager,
-        worker_target=resolve_worker_target("user", "code", _identity(requester_id)),
+        worker_target=resolve_worker_target("user", "code", tool_identity(requester_id)),
     )
 
 
