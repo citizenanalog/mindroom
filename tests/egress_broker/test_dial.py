@@ -13,7 +13,6 @@ import pytest
 from mindroom import server_fetch_url
 from mindroom.egress_broker.dial import (
     DestinationBlockedError,
-    DestinationUnresolvableError,
     DialPolicy,
     open_upstream,
 )
@@ -380,8 +379,8 @@ async def test_connect_timeout_raises_oserror() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unresolvable_hostname_raises_destination_unresolvable_error() -> None:
-    """Unresolvable hostname raises DestinationUnresolvableError which is an OSError."""
+async def test_unresolvable_hostname_raises_os_error() -> None:
+    """An unresolvable hostname raises a plain OSError, so the broker answers it as an unreachable upstream."""
 
     # Create a mock ValueError that simulates ServerFetchUrlError with reason="dns_resolution_failed"
     def mock_validated_connect_addresses(*_args: object, **_kwargs: object) -> list[object]:
@@ -391,16 +390,16 @@ async def test_unresolvable_hostname_raises_destination_unresolvable_error() -> 
 
     with patch("mindroom.egress_broker.dial.validated_connect_addresses", side_effect=mock_validated_connect_addresses):
         policy = DialPolicy()
-        with pytest.raises(DestinationUnresolvableError) as exc_info:
+        with pytest.raises(OSError, match="URL is not allowed") as exc_info:
             await open_upstream("nonexistent.invalid", 443, policy=policy, ssl_context=None)
 
-        # Verify it's an OSError subclass
-        assert isinstance(exc_info.value, OSError)
+        # The resolution failure is the cause, not a dial attempt.
+        assert isinstance(exc_info.value.__cause__, ValueError)
 
 
 @pytest.mark.asyncio
 async def test_blocked_address_still_raises_destination_blocked_error() -> None:
-    """Blocked address raises DestinationBlockedError, not DestinationUnresolvableError."""
+    """Blocked address raises DestinationBlockedError, not the OSError of an unresolvable host."""
 
     # Create a mock ValueError that simulates ServerFetchUrlError with a validation failure reason
     def mock_validated_connect_addresses(*_args: object, **_kwargs: object) -> list[object]:
