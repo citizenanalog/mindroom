@@ -35,13 +35,7 @@ def put_egress_secret(
     """Set or replace an egress service secret for one agent; a `restrict_only` service takes no key (422)."""
     require_egress_same_origin(request)
 
-    agent, egress_service = resolve_agent_and_service(
-        request,
-        requester_id,
-        agent_name,
-        service,
-        require_management=True,
-    )
+    agent, egress_service = resolve_agent_and_service(request, requester_id, agent_name, service)
     if egress_service.restrict_only:
         raise unprocessable(RESTRICT_ONLY_KEY_REFUSAL)
 
@@ -62,13 +56,7 @@ def delete_egress_secret(
     """Delete an egress service secret for one agent."""
     require_egress_same_origin(request)
 
-    agent, _service = resolve_agent_and_service(
-        request,
-        requester_id,
-        agent_name,
-        service,
-        require_management=True,
-    )
+    agent, _service = resolve_agent_and_service(request, requester_id, agent_name, service)
 
     manager = get_runtime_credentials_manager(agent.runtime_paths)
     delete_secret(manager, agent.target, service)

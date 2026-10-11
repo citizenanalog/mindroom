@@ -38,7 +38,6 @@ async def connect_egress_account(
         requester_id,
         agent_name,
         service,
-        require_management=True,
         requester_owned_oauth=True,
     )
     provider = oauth_provider_of_service(
@@ -74,7 +73,6 @@ async def disconnect_egress_account(
         requester_id,
         agent_name,
         service,
-        require_management=True,
         requester_owned_oauth=True,
     )
     provider = oauth_provider_of_service(

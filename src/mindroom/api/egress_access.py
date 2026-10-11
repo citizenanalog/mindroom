@@ -145,10 +145,9 @@ def resolve_agent_and_service(
     agent_name: str,
     service_name: str,
     *,
-    require_management: bool,
     requester_owned_oauth: bool = False,
 ) -> tuple[_ResolvedAgent, EgressService]:
-    """Resolve and authorize one agent and one of its services for mutation or query.
+    """Resolve one agent and one of its services for a mutation, which needs credential management (403).
 
     The service is one of the config's or one the requester's scope defines for itself, so a name that exists only
     in another requester's scope is a 404.
@@ -165,7 +164,7 @@ def resolve_agent_and_service(
     if requester_owned_oauth:
         provider = service_oauth_provider(config_lifecycle.bind_current_request_snapshot(request), service)
         requester_owned = provider is not None and provider.requester_scoped_credentials
-    if require_management and not agent.can_manage and not requester_owned:
+    if not agent.can_manage and not requester_owned:
         raise HTTPException(403, "Credential management is required", headers=CONNECTIONS_HEADERS)
 
     return agent, service
