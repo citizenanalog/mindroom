@@ -9,7 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import { EgressCredentials } from "./EgressCredentials";
-import { githubRepositoryRules } from "./egressServiceModel";
+import { githubRepositoryRules } from "./githubRepositoryRules";
 import type {
   AuthoredEgressService,
   EgressCredentialAgent,

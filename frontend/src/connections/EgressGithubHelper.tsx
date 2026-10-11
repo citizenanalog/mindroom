@@ -6,9 +6,9 @@ import {
   BROKERED_PLACEHOLDER,
   type EgressServiceForm,
   type PlaceholderForm,
-  githubLimitLabels,
   ruleFormFrom,
-} from "./egressServiceModel";
+} from "./egressServiceForm";
+import { githubLimitLabels } from "./githubRepositoryRules";
 import { parseGithubLimit } from "./githubLimits";
 import type { AuthoredEgressService, EgressRule } from "./types";
 

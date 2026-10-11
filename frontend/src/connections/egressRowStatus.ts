@@ -1,5 +1,5 @@
 import { formatList, sharedAccountStatus } from "./accountCopy";
-import { BROKERED_PLACEHOLDER } from "./egressServiceModel";
+import { BROKERED_PLACEHOLDER } from "./egressServiceForm";
 import { GRAPHQL_CAVEAT, limitedTo, parseGithubLimit } from "./githubLimits";
 import type {
   EgressCredentialService,

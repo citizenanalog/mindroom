@@ -5,10 +5,10 @@ import {
   type EditorContext,
   type EgressServiceForm,
   type RuleForm,
-  MAX_RULES,
   emptyRule,
   usesOwnRules,
-} from "./egressServiceModel";
+} from "./egressServiceForm";
+import { MAX_RULES } from "./egressServiceValidation";
 import {
   ExtraRule,
   Field,

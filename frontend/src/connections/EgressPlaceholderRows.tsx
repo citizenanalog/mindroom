@@ -6,9 +6,9 @@ import {
   type EditorContext,
   type EgressServiceForm,
   type PlaceholderForm,
-  configPlaceholderWarning,
-  placeholderField,
-} from "./egressServiceModel";
+} from "./egressServiceForm";
+import { configPlaceholderWarning } from "./egressServiceNotes";
+import { placeholderField } from "./egressServiceValidation";
 import { errorClass, warningClass } from "./EgressRuleFields";
 import type { EgressPreset } from "./types";
 

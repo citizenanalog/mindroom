@@ -1,20 +1,31 @@
-import { githubRepositoryRules } from "./egressServiceModel";
+import { type EgressServiceForm, usesOwnRules } from "./egressServiceForm";
+import {
+  GITHUB_API_HOST,
+  GITHUB_UPLOADS_HOST,
+  GITHUB_WEB_HOST,
+  githubRepositoryRules,
+} from "./githubRepositoryRules";
 import type { EgressRuleSummary } from "./types";
 
-const API_HOSTS = ["api.github.com", "uploads.github.com"];
-const WEB_HOST = "github.com";
-const UPLOADS_HOST = "uploads.github.com";
+const API_HOSTS = [GITHUB_API_HOST, GITHUB_UPLOADS_HOST];
 const GRAPHQL_PATH = "/graphql";
 
 type Rules = readonly EgressRuleSummary[] | undefined;
 
-const hostOf = (rule: EgressRuleSummary) => rule.host.trim().toLowerCase();
-const onGithub = (rule: EgressRuleSummary) =>
-  hostOf(rule) === WEB_HOST || API_HOSTS.includes(hostOf(rule));
+const hostOf = (rule: { host: string }) => rule.host.trim().toLowerCase();
+const onGithub = (rule: { host: string }) =>
+  hostOf(rule) === GITHUB_WEB_HOST || API_HOSTS.includes(hostOf(rule));
 
 /** Whether any rule applies to GitHub's API, web, or upload host. */
 export function coversGithub(rules: Rules): boolean {
   return (rules ?? []).some(onGithub);
+}
+
+/** Whether to offer the GitHub helper: the GitHub preset, or the service's own rules on a GitHub host. */
+export function looksLikeGithub(form: EgressServiceForm): boolean {
+  if (form.preset === "github") return true;
+  if (!usesOwnRules(form)) return false;
+  return form.rules.some(onGithub);
 }
 
 /** The repository a rule names, as `owner/repo` or `owner/*`, or null when it names none. */
@@ -48,7 +59,7 @@ export function limitedRepositories(rules: Rules): string[] {
 }
 
 const isGraphql = (rule: EgressRuleSummary) =>
-  hostOf(rule) === "api.github.com" && rule.path_prefix === GRAPHQL_PATH;
+  hostOf(rule) === GITHUB_API_HOST && rule.path_prefix === GRAPHQL_PATH;
 
 /** What a limit is said to reach when GraphQL is among its rules. */
 export const GRAPHQL_CAVEAT =
@@ -93,7 +104,7 @@ const ruleKey = (rule: EgressRuleSummary) => `${rule.host}${rule.path_prefix}`;
  */
 export function parseGithubLimit(rules: Rules): GithubLimit {
   const all = rules ?? [];
-  const uploads = all.some((rule) => hostOf(rule) === UPLOADS_HOST);
+  const uploads = all.some((rule) => hostOf(rule) === GITHUB_UPLOADS_HOST);
   const graphql = all.some(isGraphql);
   const repositories = [
     ...new Set(

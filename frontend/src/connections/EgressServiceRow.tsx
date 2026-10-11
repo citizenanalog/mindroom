@@ -1,0 +1,483 @@
+import { type FormEvent, useEffect, useRef, useState } from "react";
+import { Loader2 } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { disconnectDescription } from "./accountCopy";
+import { ConfirmDialog } from "./ConfirmDialog";
+import {
+  limitOf,
+  removeWarning,
+  type RowAgent,
+  type ServiceEditing,
+  servicesUsingAccount,
+  sharesAccount,
+} from "./egressRowStatus";
+import { ServiceLabels, ServiceStatus } from "./EgressServiceStatus";
+import { coversGithub } from "./githubLimits";
+import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
+import { type RequestErrorMessages, requestConnection } from "./request";
+import { SharedAccountDialog } from "./SharedAccountDialog";
+import type { EgressCredentialService } from "./types";
+
+/** The endpoints one service row talks to. */
+export interface ServicePaths {
+  secret: string;
+  connect: string;
+  disconnect: string;
+  /** Whether the service's account is connected now, read again from the listing the row came from. */
+  accountConnected: (signal: AbortSignal) => Promise<boolean>;
+}
+
+export function EgressServiceRow({
+  paths,
+  service,
+  onChanged,
+  errorMessages,
+  serviceEditing,
+  agent,
+  hideKeyActions,
+}: {
+  paths: ServicePaths;
+  service: EgressCredentialService;
+  onChanged: () => void;
+  errorMessages?: RequestErrorMessages;
+  serviceEditing?: ServiceEditing;
+  agent: RowAgent;
+  hideKeyActions: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState<
+    "save" | "remove" | "connect" | "disconnect" | "delete" | null
+  >(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<
+    "key" | "account" | "service" | "shared" | null
+  >(null);
+  const operation = useRef<AbortController | null>(null);
+  const keyLabel = `${service.display_name} API key`;
+  const oauth = service.oauth;
+  // Rows with an account keep the key behind a toggle until a key is set.
+  const showKeyControls = !oauth || service.key_configured || editing;
+  const canManageKey = service.can_manage && !hideKeyActions;
+  const keyInsteadLabel = oauth?.connected
+    ? "Use an API key instead of the account"
+    : "Use an API key instead";
+  // Requester-scoped accounts belong to the requester, so the server lets any
+  // eligible user manage them even without key rights.
+  const canResetAccount =
+    oauth !== null &&
+    !hideKeyActions &&
+    (oauth.connected || oauth.reset_required) &&
+    (service.can_manage || oauth.can_connect);
+
+  const canEditService =
+    serviceEditing !== undefined &&
+    service.source === serviceEditing.editableSource &&
+    service.can_manage;
+  // A limit of the viewer's that narrows this administrator's service.
+  const limit = limitOf(service, agent.services);
+  const canChangeLimit =
+    limit !== null &&
+    serviceEditing?.onChangeLimit !== undefined &&
+    serviceEditing.onRemoveLimit !== undefined &&
+    limit.can_manage;
+  // A service that already has a limit changes or removes it instead of getting another.
+  const canLimit =
+    limit === null &&
+    serviceEditing?.onLimitToRepositories !== undefined &&
+    service.source === "config" &&
+    service.can_manage &&
+    coversGithub(service.rules);
+  // Everyone using a shared agent acts as the account connected there.
+  const asksAboutSharedAccount = sharesAccount(agent, oauth);
+
+  useEffect(() => () => operation.current?.abort(), []);
+
+  const closeEditor = () => {
+    setEditing(false);
+    setSecret("");
+  };
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!secret.trim() || busy) return;
+    const controller = new AbortController();
+    operation.current = controller;
+    setBusy("save");
+    setError(null);
+    try {
+      await requestConnection<void>(
+        paths.secret,
+        controller.signal,
+        "PUT",
+        { secret },
+        errorMessages,
+      );
+      if (controller.signal.aborted) return;
+      closeEditor();
+      onChanged();
+    } catch (cause) {
+      if (!controller.signal.aborted)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not save the key. Try again.",
+        );
+    } finally {
+      if (!controller.signal.aborted) setBusy(null);
+    }
+  };
+
+  const remove = async () => {
+    setConfirm(null);
+    const controller = new AbortController();
+    operation.current = controller;
+    setBusy("remove");
+    setError(null);
+    try {
+      await requestConnection<void>(
+        paths.secret,
+        controller.signal,
+        "DELETE",
+        undefined,
+        errorMessages,
+      );
+      if (!controller.signal.aborted) onChanged();
+    } catch (cause) {
+      if (!controller.signal.aborted)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not remove the key. Try again.",
+        );
+    } finally {
+      if (!controller.signal.aborted) setBusy(null);
+    }
+  };
+
+  const deleteService = async () => {
+    setConfirm(null);
+    if (!serviceEditing) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      await serviceEditing.onDelete(service);
+    } catch (cause) {
+      setError(
+        cause instanceof Error && cause.message
+          ? cause.message
+          : "Could not delete the service. Try again.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const connect = async () => {
+    // A second click on Continue, while the first connect is under way, starts nothing.
+    if (!oauth || busy !== null) return;
+    const controller = new AbortController();
+    operation.current = controller;
+    setBusy("connect");
+    setError(null);
+    try {
+      await connectWithPopup(
+        oauth.provider,
+        () =>
+          requestConnection<OAuthAuthorization>(
+            paths.connect,
+            controller.signal,
+            "POST",
+            {},
+            errorMessages,
+          ),
+        controller.signal,
+        // A popup that closed after connecting is a connection, not a cancel.
+        () => paths.accountConnected(controller.signal),
+      );
+      if (!controller.signal.aborted) onChanged();
+    } catch (cause) {
+      if (!controller.signal.aborted)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not connect. Try again.",
+        );
+    } finally {
+      if (!controller.signal.aborted) setBusy(null);
+    }
+  };
+
+  const disconnect = async () => {
+    setConfirm(null);
+    const controller = new AbortController();
+    operation.current = controller;
+    setBusy("disconnect");
+    setError(null);
+    try {
+      await requestConnection<void>(
+        paths.disconnect,
+        controller.signal,
+        "POST",
+        {},
+        errorMessages,
+      );
+      if (!controller.signal.aborted) onChanged();
+    } catch (cause) {
+      if (!controller.signal.aborted)
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not disconnect. Try again.",
+        );
+    } finally {
+      if (!controller.signal.aborted) setBusy(null);
+    }
+  };
+
+  return (
+    <li
+      aria-label={service.display_name}
+      className="border-t border-border/60 px-5 py-3 first:border-t-0"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <ServiceLabels
+          service={service}
+          limit={limit}
+          canChangeLimit={canChangeLimit}
+          serviceEditing={serviceEditing}
+          onError={setError}
+        />
+        <div className="flex flex-wrap items-center gap-2 max-sm:justify-start sm:justify-end">
+          <ServiceStatus
+            service={service}
+            agent={agent}
+            serviceEditing={serviceEditing}
+          />
+          {/* Connecting reads the saved connection first, so an unreadable one needs a reset before. */}
+          {oauth &&
+            !hideKeyActions &&
+            oauth.can_connect &&
+            !oauth.connected &&
+            !oauth.reset_required && (
+              <Button
+                size="sm"
+                disabled={busy !== null}
+                aria-label={`Connect ${oauth.display_name} for ${service.display_name}`}
+                onClick={() =>
+                  asksAboutSharedAccount ? setConfirm("shared") : void connect()
+                }
+              >
+                {busy === "connect"
+                  ? "Connecting…"
+                  : `Connect ${oauth.display_name}`}
+              </Button>
+            )}
+          {busy === "connect" && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                operation.current?.abort();
+                setBusy(null);
+              }}
+            >
+              Cancel
+            </Button>
+          )}
+          {oauth && canResetAccount && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy !== null}
+              aria-label={`${oauth.connected ? "Disconnect" : "Reset connection"} for ${service.display_name}`}
+              onClick={() => setConfirm("account")}
+            >
+              {busy === "disconnect"
+                ? "Disconnecting…"
+                : oauth.connected
+                  ? "Disconnect"
+                  : "Reset connection"}
+            </Button>
+          )}
+          {oauth && canManageKey && !showKeyControls && (
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy !== null}
+              aria-label={`${keyInsteadLabel} for ${service.display_name}`}
+              onClick={() => {
+                setError(null);
+                setEditing(true);
+              }}
+            >
+              {keyInsteadLabel}
+            </Button>
+          )}
+          {canManageKey && showKeyControls && !editing && (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy !== null}
+                aria-label={`${service.key_configured ? "Replace" : "Set"} key for ${service.display_name}`}
+                onClick={() => {
+                  setError(null);
+                  setEditing(true);
+                }}
+              >
+                {service.key_configured ? "Replace key" : "Set key"}
+              </Button>
+              {service.key_configured && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy !== null}
+                  aria-label={`Remove key for ${service.display_name}`}
+                  onClick={() => setConfirm("key")}
+                >
+                  {busy === "remove" ? "Removing…" : "Remove key"}
+                </Button>
+              )}
+            </>
+          )}
+          {canLimit && serviceEditing?.onLimitToRepositories && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={
+                busy !== null ||
+                serviceEditing.disabled ||
+                serviceEditing.limitDisabled
+              }
+              aria-label={`Limit to repositories for ${service.display_name}`}
+              onClick={() => serviceEditing.onLimitToRepositories?.(service)}
+            >
+              Limit to repositories
+            </Button>
+          )}
+          {canEditService && serviceEditing && (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={
+                  busy !== null ||
+                  serviceEditing.disabled ||
+                  serviceEditing.editingName === service.name
+                }
+                aria-label={`Edit service for ${service.display_name}`}
+                onClick={() => serviceEditing.onEdit(service)}
+              >
+                Edit service
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy !== null || serviceEditing.disabled}
+                aria-label={`Delete service for ${service.display_name}`}
+                onClick={() => setConfirm("service")}
+              >
+                {busy === "delete" ? "Deleting…" : "Delete service"}
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+      {canManageKey && editing && (
+        <form
+          className="mt-3 flex flex-wrap items-center gap-2"
+          onSubmit={(event) => void save(event)}
+        >
+          <Input
+            type="password"
+            autoComplete="off"
+            aria-label={keyLabel}
+            placeholder="Paste the key"
+            className="h-9 max-w-sm flex-1 max-sm:basis-full"
+            value={secret}
+            disabled={busy !== null}
+            onChange={(event) => setSecret(event.target.value)}
+          />
+          <Button
+            type="submit"
+            size="sm"
+            disabled={busy !== null || !secret.trim()}
+          >
+            {busy === "save" ? (
+              <>
+                <Loader2
+                  className="mr-2 h-3.5 w-3.5 animate-spin"
+                  aria-hidden="true"
+                />
+                Saving…
+              </>
+            ) : (
+              "Save"
+            )}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={busy !== null}
+            onClick={closeEditor}
+          >
+            Cancel
+          </Button>
+        </form>
+      )}
+      {error && (
+        <Alert variant="destructive" className="mt-3 p-2">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      <ConfirmDialog
+        open={confirm === "key"}
+        title={`Remove ${keyLabel}?`}
+        description={removeWarning(service)}
+        confirmLabel="Remove"
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => void remove()}
+      />
+      {canEditService && serviceEditing && (
+        <ConfirmDialog
+          open={confirm === "service"}
+          title={`Delete ${service.display_name}?`}
+          description={serviceEditing.deleteWarning(service)}
+          confirmLabel="Delete"
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => void deleteService()}
+        />
+      )}
+      {oauth && (
+        <SharedAccountDialog
+          open={confirm === "shared"}
+          agent={agent.displayName}
+          provider={oauth.display_name}
+          onCancel={() => setConfirm(null)}
+          onContinue={() => {
+            setConfirm(null);
+            void connect();
+          }}
+        />
+      )}
+      {oauth && (
+        <ConfirmDialog
+          open={confirm === "account"}
+          title={`${oauth.connected ? "Disconnect" : "Reset"} ${oauth.display_name}?`}
+          description={disconnectDescription(
+            oauth.display_name,
+            agent.displayName,
+            servicesUsingAccount(agent, oauth),
+          )}
+          confirmLabel={oauth.connected ? "Disconnect" : "Reset connection"}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => void disconnect()}
+        />
+      )}
+    </li>
+  );
+}

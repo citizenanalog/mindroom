@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { githubRepositoryRules } from "./egressServiceModel";
+import { githubRepositoryRules } from "./githubRepositoryRules";
 import {
   DiscardEditsNotice,
   EgressServiceEditor,

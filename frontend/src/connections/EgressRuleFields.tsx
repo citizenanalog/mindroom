@@ -5,17 +5,20 @@ import {
   AUTH_CHOICES,
   DEFAULT_TEMPLATE,
   type RuleAuthChoice,
-  type RuleFieldPart,
+} from "./egressRuleAuth";
+import {
   type RuleForm,
   applyAuthChoice,
   splitHostInput,
-} from "./egressServiceModel";
+} from "./egressServiceForm";
+import { type RuleFieldPart } from "./egressServiceValidation";
 
 /**
  * The editor's labelled fields and the fields of one rule. The first rule is
  * edited in the basic form (`RuleHostField`, `RuleSendFields`) and under More
- * options (`RulePathAndPortFields`); `BASIC_RULE_PARTS` in the model names the
- * parts the basic form shows. Every other rule is an `ExtraRule`.
+ * options (`RulePathAndPortFields`); `BASIC_RULE_PARTS` in
+ * `egressServiceValidation.ts` names the parts the basic form shows. Every
+ * other rule is an `ExtraRule`.
  */
 
 export const selectClass =

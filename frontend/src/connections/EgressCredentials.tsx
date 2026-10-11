@@ -15,7 +15,7 @@ import { breakAfterUnderscores } from "./breakAfterUnderscores";
 import { ConnectionsHeader } from "./ConnectionsHeader";
 import { InactiveServices } from "./EgressInactiveServices";
 import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
-import { configPlaceholderOwners } from "./egressServiceModel";
+import { configPlaceholderOwners } from "./egressServiceNotes";
 import {
   EgressServiceRows,
   type RowAgent,

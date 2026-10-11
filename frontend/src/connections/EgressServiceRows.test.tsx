@@ -9,7 +9,7 @@ import {
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { githubRepositoryRules } from "./egressServiceModel";
+import { githubRepositoryRules } from "./githubRepositoryRules";
 import {
   EgressServiceRows as Rows,
   type RowAgent,

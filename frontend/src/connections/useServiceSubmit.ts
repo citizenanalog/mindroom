@@ -8,11 +8,13 @@ import {
 import {
   type EditorOptions,
   type EgressServiceForm,
+  serializeService,
+} from "./egressServiceForm";
+import {
   type ServiceProblem,
   isBasicField,
-  serializeService,
   validateService,
-} from "./egressServiceModel";
+} from "./egressServiceValidation";
 import type { AuthoredEgressService } from "./types";
 
 /** The message of a rejection, or `fallback` when it has none. */

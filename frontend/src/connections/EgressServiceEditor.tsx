@@ -12,23 +12,26 @@ import {
   type EditorContext,
   type EditorOptions,
   type EgressServiceForm,
-  type RuleFieldPart,
   type RuleForm,
   NOT_EXPLICITLY_EMPTY,
   emptyRule,
   formFromService,
-  githubLimitRules,
-  githubRepositoryRules,
-  looksLikeGithub,
-  overlapWarnings,
   presetOf,
-  presetPlaceholderWarnings,
-  ruleField,
-  scopeNote,
   suggestedName,
   usesMoreOptions,
   usesOwnRules,
-} from "./egressServiceModel";
+} from "./egressServiceForm";
+import {
+  overlapWarnings,
+  presetPlaceholderWarnings,
+  scopeNote,
+} from "./egressServiceNotes";
+import { type RuleFieldPart, ruleField } from "./egressServiceValidation";
+import { looksLikeGithub } from "./githubLimits";
+import {
+  githubLimitRules,
+  githubRepositoryRules,
+} from "./githubRepositoryRules";
 import {
   GithubHelper,
   githubHelperChanges,

@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { githubRepositoryRules } from "./egressServiceModel";
+import { type EgressServiceForm, formFromService } from "./egressServiceForm";
+import { validRule } from "./egressServiceTestKit";
 import {
   coversGithub,
   limitedRepositories,
+  looksLikeGithub,
   parseGithubLimit,
 } from "./githubLimits";
+import { githubRepositoryRules } from "./githubRepositoryRules";
 import type { EgressRuleSummary } from "./types";
 
 const rule = (host: string, path_prefix = "/"): EgressRuleSummary => ({
@@ -114,5 +117,40 @@ describe("the choices behind a limit's rules", () => {
       exact: false,
     });
     expect(parseGithubLimit(undefined).repositories).toEqual([]);
+  });
+});
+
+describe("offering the GitHub helper", () => {
+  const withHost = (
+    host: string,
+    changes: Partial<EgressServiceForm> = {},
+  ) => ({
+    ...formFromService("svc", null),
+    rules: [{ ...validRule(), host }],
+    ...changes,
+  });
+
+  it("is for the GitHub preset and for rules on a GitHub host", () => {
+    expect(looksLikeGithub(formFromService("svc", { preset: "github" }))).toBe(
+      true,
+    );
+    for (const host of ["github.com", "api.github.com", "uploads.github.com"])
+      expect(looksLikeGithub(withHost(host))).toBe(true);
+    expect(looksLikeGithub(withHost(" API.GitHub.com "))).toBe(true);
+  });
+
+  it("is hidden for other hosts and for an empty host", () => {
+    expect(looksLikeGithub(withHost("httpbin.org"))).toBe(false);
+    expect(looksLikeGithub(withHost(""))).toBe(false);
+    expect(looksLikeGithub(withHost("gist.github.com"))).toBe(false);
+  });
+
+  it("looks at the rules only while the service uses its own", () => {
+    const kept = withHost("github.com", { preset: "openai" });
+    expect(looksLikeGithub(kept)).toBe(false);
+    expect(looksLikeGithub({ ...kept, replacePresetRules: true })).toBe(true);
+    expect(
+      looksLikeGithub({ ...withHost("httpbin.org"), preset: "github" }),
+    ).toBe(true);
   });
 });

@@ -1,0 +1,80 @@
+import egressPresets from "@/test/fixtures/egressPresets.json";
+import {
+  type EditorOptions,
+  type EgressServiceForm,
+  formFromService,
+  serializeService,
+} from "./egressServiceForm";
+import { validateService } from "./egressServiceValidation";
+import type { AuthoredEgressService, EgressPreset, EgressRule } from "./types";
+
+/** What the editor model's tests share: the server's presets, the options of each context, and helpers that run a service through the form. */
+
+type Options = EditorOptions;
+
+export const presets = egressPresets.presets as EgressPreset[];
+export const personal: Options = {
+  context: "personal",
+  sharedTarget: false,
+  presets,
+};
+export const sharedPersonal: Options = {
+  context: "personal",
+  sharedTarget: true,
+  presets,
+};
+export const operator: Options = {
+  context: "operator",
+  sharedTarget: false,
+  presets,
+};
+export const newService = { editing: false, takenNames: [] as string[] };
+
+export const bearerRule: EgressRule = {
+  host: "api.example.com",
+  auth: { type: "bearer" },
+};
+
+export const serialize = (
+  service: AuthoredEgressService,
+  options: Options = personal,
+  name = "svc",
+) => serializeService(formFromService(name, service), options, service);
+
+export const problemsFor = (
+  service: AuthoredEgressService | null,
+  changes: Partial<EgressServiceForm> = {},
+  options: Options = personal,
+  settings: { editing: boolean; takenNames: string[] } = newService,
+) =>
+  validateService(
+    { ...formFromService("svc", service), ...changes },
+    options,
+    settings,
+  );
+
+export const errorsFor = (
+  service: AuthoredEgressService | null,
+  changes: Partial<EgressServiceForm> = {},
+  options: Options = personal,
+  settings: { editing: boolean; takenNames: string[] } = newService,
+) =>
+  problemsFor(service, changes, options, settings).map(
+    (problem) => problem.message,
+  );
+
+export function basicAuth(username: string) {
+  return { type: "basic", username } as const;
+}
+
+export function validRule() {
+  return {
+    host: "api.example.com",
+    port: "",
+    pathPrefix: "",
+    authType: "bearer" as const,
+    username: "",
+    headerOrParam: "",
+    template: "",
+  };
+}
