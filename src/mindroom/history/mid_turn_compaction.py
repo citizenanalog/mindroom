@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -74,11 +74,23 @@ logger = get_logger(__name__)
 _HOOK_MARKER = "_mindroom_mid_turn_compaction_installed"
 _BINDING_KEY = "_mindroom_mid_turn_compaction"
 _PROMPT_ROLES = frozenset({"system", "developer"})
+_RUN_STATES_KEPT = 32
+
+
+@dataclass
+class _RunState:
+    """Mid-turn compaction state of one run."""
+
+    # Identity of the response loop being prepared, and the message ids it started with.
+    loop_identity: int
+    start_ids: frozenset[str]
+    # A failed compaction stops compacting for the rest of the run, including after an approval resume.
+    failed: bool = False
 
 
 @dataclass
 class _MidTurnCompaction:
-    """One Agent's or Team's mid-turn compaction policy and the state of its current run."""
+    """One Agent's or Team's mid-turn compaction policy and the state of each run it serves."""
 
     target: Agent | Team
     config: Config
@@ -86,16 +98,8 @@ class _MidTurnCompaction:
     entity_name: str | None
     model_name: str
     lifecycle: CompactionLifecycle | None = None
-    failed_run_id: str | None = None
-    # (run id, run identity) of the loop being prepared, and the message ids it started with.
-    loop_key: tuple[str, int] | None = None
-    loop_start_ids: frozenset[str] = frozenset()
-
-    def compacts_run(self, run_id: str) -> bool:
-        """Return whether mid-turn compaction still runs for this run; a failure disables it until the next run."""
-        if self.failed_run_id != run_id:
-            self.failed_run_id = None
-        return self.failed_run_id is None
+    # Parallel delegations can run one member several times at once, so state is kept per run.
+    runs: dict[str, _RunState] = field(default_factory=dict)
 
     def resolved_inputs(self) -> HistoryPreparationInputs:
         if isinstance(self.target, Agent):
@@ -115,13 +119,16 @@ class _MidTurnCompaction:
             active_context_window=None,
         )
 
-    def loaded_message_ids(self, run_response: RunOutput | TeamRunOutput, messages: list[Message]) -> frozenset[str]:
-        """Return the ids present when this response loop first prepared a request; they predate its responses."""
-        key = (run_response.run_id or "", id(run_response))
-        if self.loop_key != key:
-            self.loop_key = key
-            self.loop_start_ids = frozenset(message.id for message in messages if message.id)
-        return self.loop_start_ids
+    def run_state(self, run_id: str, run_response: RunOutput | TeamRunOutput, messages: list[Message]) -> _RunState:
+        """Return the run's state; a new response loop records the ids it starts with, which predate its responses."""
+        state = self.runs.pop(run_id, None)
+        if state is None or state.loop_identity != id(run_response):
+            ids = frozenset(message.id for message in messages if message.id)
+            state = _RunState(id(run_response), ids, failed=state.failed if state is not None else False)
+        self.runs[run_id] = state
+        while len(self.runs) > _RUN_STATES_KEPT:
+            self.runs.pop(next(iter(self.runs)))
+        return state
 
 
 @dataclass(frozen=True)
@@ -189,12 +196,13 @@ async def _prepare_request(
     tools: list[dict[str, Any]] | None,
     run_response: RunOutput | TeamRunOutput | None,
 ) -> None:
-    if run_response is None or not run_response.run_id or not binding.compacts_run(run_response.run_id):
+    if run_response is None or not run_response.run_id:
         return
+    state = binding.run_state(run_response.run_id, run_response, messages)
     built_session = built_request_session(binding.target, run_response.run_id)
-    if built_session is None:
+    if state.failed or built_session is None:
         return
-    loaded_ids = binding.loaded_message_ids(run_response, messages)
+    loaded_ids = state.start_ids
     policy = _policy(binding)
     if policy is None or _request_tokens(binding, policy, messages, tools, loaded_ids) <= policy.limit:
         return
@@ -205,7 +213,7 @@ async def _prepare_request(
         return
     summary_message = await _summarize(binding, policy, layout, messages, run_response, session)
     if summary_message is None:
-        binding.failed_run_id = run_response.run_id
+        state.failed = True
         return
     if policy.replay_model is not None and policy.replay_model.native_compaction is not None:
         # The provider's own compaction could not keep this request within the window.

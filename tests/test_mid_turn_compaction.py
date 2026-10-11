@@ -1449,3 +1449,84 @@ async def test_thinking_a_native_checkpoint_replaced_never_triggers_text_compact
 
     assert summary_calls.inputs == []
     assert model.native_compaction is not None
+
+
+class _TwoTaskLeader(SyntheticModel):
+    """Delegate two tasks to the same member in one response, then answer."""
+
+    def __init__(self) -> None:
+        super().__init__(id="leader-model", name="leader", provider="test")
+        self.requests = 0
+
+    async def ainvoke(self, messages: list[Message], **_kwargs: object) -> ModelResponse:  # noqa: ARG002
+        self.requests += 1
+        if self.requests > 1:
+            return ModelResponse(content="team done")
+        return ModelResponse(
+            tool_calls=[
+                {
+                    "id": f"delegate_{task}",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task_to_member",
+                        "arguments": json.dumps({"member_id": "test_agent", "task": f"Task {task}"}),
+                    },
+                }
+                for task in ("A", "B")
+            ],
+        )
+
+    async def ainvoke_stream(self, messages: list[Message], **kwargs: object) -> AsyncIterator[ModelResponse]:
+        yield await self.ainvoke(messages, **kwargs)
+
+
+class _PerTaskLoop(SyntheticModel):
+    """Call ``probe`` a fixed number of times per delegated task, interleaving tasks, then answer."""
+
+    def __init__(self, *, tool_rounds: int) -> None:
+        super().__init__(id="test-model", name="test", provider="test")
+        self.tool_rounds = tool_rounds
+        self.calls: dict[str, int] = {}
+        self.requests: list[tuple[str, list[Message]]] = []
+
+    async def ainvoke(self, messages: list[Message], **_kwargs: object) -> ModelResponse:
+        task = next(name for name in ("Task A", "Task B") if any(name in str(message.content) for message in messages))
+        self.requests.append((task, list(messages)))
+        await asyncio.sleep(0)
+        self.calls[task] = self.calls.get(task, 0) + 1
+        if self.calls[task] <= self.tool_rounds:
+            call_id = f"call_{task[-1]}_{self.calls[task]}"
+            return ModelResponse(
+                tool_calls=[{"id": call_id, "type": "function", "function": {"name": "probe", "arguments": "{}"}}],
+            )
+        return ModelResponse(content=f"{task} done")
+
+    async def ainvoke_stream(self, messages: list[Message], **kwargs: object) -> AsyncIterator[ModelResponse]:
+        yield await self.ainvoke(messages, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_parallel_delegations_to_one_member_both_compact(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
+    config, paths = _config(tmp_path)
+    member_model = _PerTaskLoop(tool_rounds=6)
+    member = Agent(id="test_agent", name="Test Agent", model=member_model, tools=[probe], telemetry=False)
+    install_mid_turn_compaction(
+        member,
+        config=config,
+        runtime_paths=paths,
+        entity_name="test_agent",
+        model_name="default",
+    )
+    team = Team(id="crew", name="Crew", model=_TwoTaskLeader(), members=[member], telemetry=False)
+
+    output = await team.arun("Coordinate the tasks")
+
+    assert str(output.content).endswith("team done")
+    assert summary_calls.inputs
+    for task in ("Task A", "Task B"):
+        compacted = [
+            messages
+            for name, messages in member_model.requests
+            if name == task and any(is_compaction_summary(m) for m in messages)
+        ]
+        assert compacted, task
