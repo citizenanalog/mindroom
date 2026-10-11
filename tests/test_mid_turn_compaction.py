@@ -598,6 +598,39 @@ async def test_run_local_summary_survives_approval_resume(tmp_path: Path, summar
     assert all(summary.from_history is False for summary in summaries)
 
 
+@pytest.mark.asyncio
+async def test_scoped_compaction_after_resume_keeps_the_run_local_summary(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+
+    class _PausingLoop(_ToolLoopModel):
+        async def ainvoke(self, messages: list[Message], **kwargs: object) -> ModelResponse:
+            response = await super().ainvoke(messages, **kwargs)
+            if len(self.requests) == 5 and response.tool_calls:
+                response.tool_calls[0]["function"]["name"] = "approve_me"
+            return response
+
+    model = _PausingLoop(tool_rounds=6)
+    agent = _agent(model, config, paths, db=SqliteDb(db_file=str(tmp_path / "runs.db")))
+    agent.tools = [probe, Function(name="approve_me", entrypoint=lambda: "approved", requires_confirmation=True)]
+    paused = await agent.arun("Do the task", session_id="session")
+    assert paused.status == RunStatus.paused
+    local_summaries = len(summary_calls.inputs)
+    assert local_summaries
+    for requirement in paused.requirements or []:
+        requirement.confirm()
+
+    # The resumed request replays stored history, so its next compaction is scoped.
+    agent.add_history_to_context = True
+    model.requests.clear()
+    await agent.acontinue_run(run_id=paused.run_id, requirements=paused.requirements, session_id="session")
+
+    assert len(summary_calls.inputs) > local_summaries
+    assert f"SUMMARY-{local_summaries}" in summary_calls.inputs[local_summaries]
+
+
 def test_factories_install_mid_turn_compaction() -> None:
     from tests.conftest import runtime_paths_for  # noqa: PLC0415
     from tests.test_agents import _test_config  # noqa: PLC0415
@@ -915,7 +948,7 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     messages = [legacy_system, prompt, Message(role="assistant", content="step"), Message(role="tool", content="r")]
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
-    layout = mid_turn_compaction._layout(messages, run_response)
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
     mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
 
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"

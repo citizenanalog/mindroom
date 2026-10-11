@@ -190,7 +190,8 @@ async def _prepare_request(
     policy = _policy(binding)
     if policy is None or _request_tokens(binding, policy, messages, tools, loaded_ids) <= policy.limit:
         return
-    layout = _layout(messages, run_response)
+    session = _scoped_session(binding, run_response)
+    layout = _layout(messages, run_response, scoped=session is not None)
     if not layout.folded:
         return
     if policy.native_route is not None and policy.replay_model is not None:
@@ -200,7 +201,6 @@ async def _prepare_request(
             run_id=run_response.run_id,
         )
         policy.replay_model.configure_native_compaction(threshold=None)
-    session = _scoped_session(binding, run_response)
     try:
         if session is None:
             summary_message = await _summarize_run_locally(binding, policy.inputs, layout, run_response, messages)
@@ -412,7 +412,12 @@ def _reasoning_tokens(messages: Sequence[Message]) -> int:
     )
 
 
-def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput) -> _Layout:
+def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput, *, scoped: bool) -> _Layout:
+    """Split a request into kept and folded messages.
+
+    A run-local summary this run already wrote seeds the next run-local summary; a scoped compaction folds it into
+    the snapshot instead, since the scope summary never saw it.
+    """
     leading = next(
         (index for index, message in enumerate(messages) if message.role not in _PROMPT_ROLES),
         len(messages),
@@ -424,7 +429,7 @@ def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput) ->
     for message in messages[leading:]:
         if message is prompt or not message.add_to_agent_memory or _is_queued_notice(message):
             kept.append(message)
-        elif is_compaction_summary(message) and not message.from_history:
+        elif is_compaction_summary(message) and not message.from_history and not scoped:
             previous = compaction_summary_text(message)
         else:
             folded.append(message)
