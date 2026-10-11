@@ -40,6 +40,10 @@ path = "mindroom.bounded_bytes"
 depends_on = []
 
 [[modules]]
+path = "mindroom.origins"
+depends_on = []
+
+[[modules]]
 path = "mindroom.embeddings.factory"
 depends_on = [
     "mindroom.credentials.sync",
@@ -1529,6 +1533,7 @@ depends_on = [
     "mindroom.api.config_lifecycle",
     "mindroom.api.open_access",
     "mindroom.constants",
+    "mindroom.origins",
     "mindroom.tool_system.dependencies",
 ]
 
@@ -1680,6 +1685,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.connections"
 depends_on = [
+    "mindroom.origins",
     "mindroom.matrix.users",
     "mindroom.matrix.media",
     "mindroom.api.auth",
@@ -1738,6 +1744,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.main"
 depends_on = [
+    "mindroom.origins",
     "mindroom.api.agent_cli",
     "mindroom.api.config_reload",
     "mindroom.api.response_activity",
@@ -6554,6 +6561,7 @@ depends_on = [
     "mindroom.api.connection_agents",
     "mindroom.logging_config",
     "mindroom.mcp.manager",
+    "mindroom.origins",
     "mindroom.mcp_gateway.admission",
     "mindroom.mcp_gateway.accounts",
     "mindroom.mcp_gateway.consent",
@@ -7327,6 +7335,7 @@ depends_on = [
     "mindroom.bounded_bytes",
     "mindroom.runtime_env_policy",
     "mindroom.constants",
+    "mindroom.origins",
     "mindroom.requester_identity",
     "mindroom.worker_computer.sessions",
 ]
