@@ -37,6 +37,7 @@ inactive_services  # JSON response field consumed by the personal egress page (s
 scope_agents  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_listing.py)
 managers  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_listing.py)
 placeholder_names  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_listing.py)
+name_pattern  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 credential_words  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 refused_words  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 refused_prefix  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)

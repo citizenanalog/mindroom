@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ import pytest
 import yaml
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from structlog.testing import capture_logs
 
 from mindroom.api import (
@@ -31,7 +33,7 @@ from mindroom.api import (
     oauth,
 )
 from mindroom.api.connection_agents import build_connection_agent_target
-from mindroom.config.egress_broker import RESERVED_PLACEHOLDER_NAMES, RESERVED_PLACEHOLDER_PREFIXES
+from mindroom.config.egress_broker import RESERVED_PLACEHOLDER_NAMES, RESERVED_PLACEHOLDER_PREFIXES, EgressService
 from mindroom.config.main import Config
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
@@ -44,6 +46,7 @@ from mindroom.egress_broker.user_services import (
     MAX_RULES_PER_SERVICE,
     MAX_SERVICE_BYTES,
     MAX_USER_SERVICES,
+    PLACEHOLDER_NAME,
     PLACEHOLDER_NAME_WORDS,
     PLACEHOLDER_REFUSED_PREFIX,
     PLACEHOLDER_REFUSED_WORDS,
@@ -2452,6 +2455,7 @@ def test_presets_serve_the_user_service_limits_the_server_enforces(egress_portal
         "max_service_bytes": MAX_SERVICE_BYTES,
         "max_document_bytes": MAX_DOCUMENT_BYTES,
         "placeholder": {
+            "name_pattern": PLACEHOLDER_NAME.pattern,
             # The word lists keep the order of the server's messages; the sets are sorted.
             "credential_words": list(PLACEHOLDER_NAME_WORDS),
             "refused_words": list(PLACEHOLDER_REFUSED_WORDS),
@@ -2463,14 +2467,41 @@ def test_presets_serve_the_user_service_limits_the_server_enforces(egress_portal
     }
 
 
+def test_served_placeholder_rules_give_the_answers_of_the_server_checks() -> None:
+    """Each served placeholder rule refuses what the server refuses, so an editor that checks them agrees with a save."""
+    placeholder = egress_status.presets_response({}).limits.placeholder
+
+    def refused_by_the_config_model(name: str) -> bool:
+        try:
+            EgressService.model_validate({**_NOTES, "placeholder_env": {name: "mindroom-brokered"}})
+        except ValidationError:
+            return True
+        return False
+
+    assert placeholder.reserved_names
+    assert placeholder.reserved_prefixes
+    for name in placeholder.reserved_names:
+        assert refused_by_the_config_model(name), name
+    for prefix in placeholder.reserved_prefixes:
+        assert refused_by_the_config_model(f"{prefix}X_TOKEN"), prefix
+    assert not refused_by_the_config_model("MY_API_KEY")
+    # The server saves `mindroom-brokered` and refuses `two words` (see the 422 cases above).
+    value_pattern = re.compile(placeholder.value_pattern)
+    assert value_pattern.fullmatch("mindroom-brokered")
+    assert not value_pattern.fullmatch("two words")
+    name_pattern = re.compile(placeholder.name_pattern)
+    assert name_pattern.fullmatch("MY_API_KEY")
+    assert not name_pattern.fullmatch("my_key")
+
+
 def test_frontend_preset_fixture_matches_the_served_presets() -> None:
     """The preset fixture the UI tests load is exactly what the presets routes serve, so the two cannot drift."""
     fixture_path = Path(__file__).resolve().parents[2] / "frontend" / "src" / "test" / "fixtures" / "egressPresets.json"
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-    # The fixture is the payload `{"presets": [...]}` or just its list.
-    presets = fixture["presets"] if isinstance(fixture, dict) else fixture
+    served = egress_status.presets_response({}).model_dump(mode="json")
 
-    assert presets == egress_status.presets_response({}).model_dump(mode="json")["presets"]
+    assert fixture["presets"] == served["presets"]
+    assert fixture["limits"] == served["limits"]
 
 
 def test_presets_need_a_signed_user_and_take_no_query(egress_portal: dict[str, Any]) -> None:

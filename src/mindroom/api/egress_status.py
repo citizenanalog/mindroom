@@ -19,6 +19,7 @@ from mindroom.egress_broker.user_services import (
     MAX_RULES_PER_SERVICE,
     MAX_SERVICE_BYTES,
     MAX_USER_SERVICES,
+    PLACEHOLDER_NAME,
     PLACEHOLDER_NAME_WORDS,
     PLACEHOLDER_REFUSED_PREFIX,
     PLACEHOLDER_REFUSED_WORDS,
@@ -139,13 +140,14 @@ class EgressOAuthProviderOption(BaseModel):
 class PlaceholderLimits(BaseModel):
     """The placeholder rules of a service a user defines, as the server checks them on save.
 
-    A name needs one of the `credential_words` as an underscore-separated word and none of the `refused_words`,
-    must not start with `refused_prefix`, and may be none of the `reserved_names` or start with a
-    `reserved_prefixes` entry, which the config model reserves for every service. A value must match
+    A name must match `name_pattern` completely, needs one of the `credential_words` as an underscore-separated word
+    and none of the `refused_words`, must not start with `refused_prefix`, and may be none of the `reserved_names` or
+    start with a `reserved_prefixes` entry, which the config model reserves for every service. A value must match
     `value_pattern` completely. Both word lists keep the order the server's error messages list them in; the other
     lists are sorted.
     """
 
+    name_pattern: str
     credential_words: list[str]
     refused_words: list[str]
     refused_prefix: str
@@ -184,6 +186,7 @@ def _egress_limits() -> EgressLimits:
         max_service_bytes=MAX_SERVICE_BYTES,
         max_document_bytes=MAX_DOCUMENT_BYTES,
         placeholder=PlaceholderLimits(
+            name_pattern=PLACEHOLDER_NAME.pattern,
             credential_words=list(PLACEHOLDER_NAME_WORDS),
             refused_words=list(PLACEHOLDER_REFUSED_WORDS),
             refused_prefix=PLACEHOLDER_REFUSED_PREFIX,

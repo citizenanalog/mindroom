@@ -47,6 +47,7 @@ __all__ = [
     "MAX_RULES_PER_SERVICE",
     "MAX_SERVICE_BYTES",
     "MAX_USER_SERVICES",
+    "PLACEHOLDER_NAME",
     "PLACEHOLDER_NAME_WORDS",
     "PLACEHOLDER_REFUSED_PREFIX",
     "PLACEHOLDER_REFUSED_WORDS",
@@ -78,9 +79,9 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 # NODE_OPTIONS, BASH_ENV, or PYTHONPATH (which only contains PAT inside a word) never qualify. No word may name a
 # command, file, directory, helper, provider, or options setting, and no name may start with SSH_, because tools read
 # such variables as programs or paths to run or load (RESTIC_PASSWORD_COMMAND, SOPS_AGE_KEY_CMD, SSH_AUTH_SOCK).
-_PLACEHOLDER_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
-# Tuples keep the order the error messages list the words in. The presets routes serve these constants and the
-# limits above as `limits`, so the editor checks the same rules before it saves.
+PLACEHOLDER_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+# Tuples keep the order the error messages list the words in. The presets routes serve these constants, the name
+# pattern above, and the limits above as `limits`, so the editor checks the same rules before it saves.
 PLACEHOLDER_NAME_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL")
 PLACEHOLDER_REFUSED_WORDS = ("COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS")
 PLACEHOLDER_REFUSED_PREFIX = "SSH_"
@@ -314,7 +315,7 @@ def _placeholder_error(variable: str, value: str) -> str | None:
     The texts are the ones the Connections editor shows beside the field.
     """
     words = set(variable.split("_"))
-    if not _PLACEHOLDER_NAME.fullmatch(variable) or words.isdisjoint(PLACEHOLDER_NAME_WORDS):
+    if not PLACEHOLDER_NAME.fullmatch(variable) or words.isdisjoint(PLACEHOLDER_NAME_WORDS):
         return (
             f"{variable} is not allowed as a placeholder: name a credential, such as MY_API_KEY, "
             f"with {_word_list(PLACEHOLDER_NAME_WORDS)} as one of its words."
