@@ -433,7 +433,11 @@ def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput, *,
     folded: list[Message] = []
     previous: str | None = None
     for message in messages[leading:]:
-        if message is prompt or not message.add_to_agent_memory or _is_queued_notice(message):
+        if (
+            message is prompt
+            or not message.add_to_agent_memory
+            or (_is_queued_notice(message) and not message.from_history)
+        ):
             kept.append(message)
         elif is_compaction_summary(message) and not message.from_history and not scoped:
             previous = compaction_summary_text(message)

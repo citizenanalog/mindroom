@@ -481,6 +481,29 @@ async def test_queued_notice_survives_mid_turn_compaction(tmp_path: Path, summar
     assert compacted.contents[-2:] == ["Do the task", "A newer message is waiting."]
 
 
+def test_replayed_queued_notice_is_folded() -> None:
+    old_notice = Message(
+        role="user",
+        content="A newer message is waiting.",
+        provider_data={_NOTICE_KEY: "persisted"},
+        from_history=True,
+    )
+    prompt = Message(role="user", content="Do the task")
+    messages = [
+        Message(role="system", content="Be precise."),
+        old_notice,
+        prompt,
+        Message(role="assistant", content="step"),
+        Message(role="tool", content="r"),
+    ]
+    run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
+
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
+
+    assert layout.kept == (prompt,)
+    assert old_notice in layout.folded
+
+
 @pytest.mark.asyncio
 async def test_parallel_tool_batch_is_folded_whole(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
