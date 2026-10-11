@@ -380,6 +380,27 @@ export function placeholderField(
 }
 
 /**
+ * The parts of the first rule the basic form shows: the website, how the key is
+ * sent, and what that way needs. Path prefix and port sit under More options.
+ */
+export const BASIC_RULE_PARTS: readonly RuleFieldPart[] = [
+  "host",
+  "username",
+  "authName",
+  "template",
+];
+
+const BASIC_FIELDS: ReadonlySet<string> = new Set([
+  "name",
+  ...BASIC_RULE_PARTS.map((part) => ruleField(0, part)),
+]);
+
+/** Whether the basic form shows the field of a problem; any other opens More options. */
+export function isBasicField(field: string): boolean {
+  return BASIC_FIELDS.has(field);
+}
+
+/**
  * What stops a form from being saved, and where to say so. `field` is `name`,
  * `rules`, `oauthProvider`, a `ruleField`, or a `placeholderField`; `form`
  * means the service as a whole, which no single field shows.
@@ -684,18 +705,33 @@ export function looksLikeGithub(form: EgressServiceForm): boolean {
   );
 }
 
+const MAX_NAME_LENGTH = 63;
+
 /**
  * The name a new service gets until the user types one: the preset's id, or
  * the first label of the first rule's host (`httpbin.org` gives `httpbin`).
+ * When `takenNames` has it, the first free `{base}-2` or `{base}-3` instead;
+ * with all three taken it stays the base, so saving names the clash.
  */
-export function suggestedName(form: EgressServiceForm): string {
-  if (form.preset) return form.preset;
-  const host = (form.rules[0]?.host ?? "").trim().toLowerCase();
-  const label = host.replace(/^\*\./, "").split(/[.:/]/)[0];
-  return label
-    .replace(/[^a-z0-9_-]/g, "")
-    .replace(/^[-_]+/, "")
-    .slice(0, 63);
+export function suggestedName(
+  form: EgressServiceForm,
+  takenNames: readonly string[] = [],
+): string {
+  let base = form.preset;
+  if (!base) {
+    const host = (form.rules[0]?.host ?? "").trim().toLowerCase();
+    const label = host.replace(/^\*\./, "").split(/[.:/]/)[0];
+    base = label
+      .replace(/[^a-z0-9_-]/g, "")
+      .replace(/^[-_]+/, "")
+      .slice(0, MAX_NAME_LENGTH);
+  }
+  if (base === "") return "";
+  for (const suffix of ["", "-2", "-3"]) {
+    const candidate = `${base.slice(0, MAX_NAME_LENGTH - suffix.length)}${suffix}`;
+    if (!takenNames.includes(candidate)) return candidate;
+  }
+  return base;
 }
 
 /** What to tell the user about a placeholder that an administrator's service also sets, or null. */
@@ -707,6 +743,30 @@ export function configPlaceholderWarning(
   if (!Object.prototype.hasOwnProperty.call(configPlaceholders, variable))
     return null;
   return `${variable} is also set by ${configPlaceholders[variable]} from your administrator; when both are set, theirs is used.`;
+}
+
+/**
+ * What to tell the user about the placeholders their preset sets that an
+ * administrator's service also sets, one text per variable in the preset's
+ * order. The preset's placeholders apply only while the service lists none of
+ * its own and has not dropped them on purpose.
+ */
+export function presetPlaceholderWarnings(
+  form: EgressServiceForm,
+  preset: EgressPreset | undefined,
+  configPlaceholders: Readonly<Record<string, string>>,
+): string[] {
+  if (
+    !preset ||
+    form.preset !== preset.id ||
+    form.placeholders.length > 0 ||
+    form.explicitlyEmpty.placeholders
+  )
+    return [];
+  return Object.keys(preset.placeholder_env).flatMap((variable) => {
+    const warning = configPlaceholderWarning(variable, configPlaceholders);
+    return warning === null ? [] : [warning];
+  });
 }
 
 /** Map each variable to the display name of the administrator's service that sets it, from a listing. */

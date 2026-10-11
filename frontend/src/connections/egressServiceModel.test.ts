@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
+  BASIC_RULE_PARTS,
   type EditorOptions,
   type EgressServiceForm,
   applyAuthChoice,
@@ -10,8 +11,10 @@ import {
   formFromService,
   githubLimitLabels,
   githubRepositoryRules,
+  isBasicField,
   looksLikeGithub,
   placeholderField,
+  presetPlaceholderWarnings,
   ruleField,
   scopeNote,
   serializeService,
@@ -1297,5 +1300,122 @@ describe("knowing when the form uses more than the basic fields", () => {
     ["a placeholder", { placeholders: [{ name: "A_KEY", value: "x" }] }],
   ])("is true with %s", (_name, changes) => {
     expect(usesMoreOptions({ ...blank, ...changes })).toBe(true);
+  });
+});
+
+describe("suggesting a free name", () => {
+  const form = (preset: string, host = "") => ({
+    ...formFromService("", null),
+    preset,
+    rules: [{ ...validRule(), host }],
+  });
+
+  it("takes the first of base, base-2, and base-3 that is free", () => {
+    expect(suggestedName(form("github"), [])).toBe("github");
+    expect(suggestedName(form("github"), ["openai"])).toBe("github");
+    expect(suggestedName(form("github"), ["github"])).toBe("github-2");
+    expect(suggestedName(form("github"), ["github", "github-2"])).toBe(
+      "github-3",
+    );
+    // A later gap does not matter: the order is base, -2, -3.
+    expect(
+      suggestedName(form("", "httpbin.org"), ["httpbin", "httpbin-3"]),
+    ).toBe("httpbin-2");
+  });
+
+  it("falls back to the base, so the clash is named, when all three are taken", () => {
+    expect(
+      suggestedName(form("github"), ["github", "github-2", "github-3"]),
+    ).toBe("github");
+  });
+
+  it("keeps the suffix inside the 63 characters a name may have", () => {
+    const base = "a".repeat(63);
+    const name = suggestedName(form("", `${base}.example.com`), [base]);
+    expect(name).toBe(`${"a".repeat(61)}-2`);
+    expect(name).toHaveLength(63);
+  });
+
+  it("suggests nothing, and no suffix, without a base", () => {
+    expect(suggestedName(form("", ""), [""])).toBe("");
+  });
+});
+
+describe("a placeholder the preset sets that an administrator's service also sets", () => {
+  const github = presets.find((preset) => preset.id === "github");
+  const config = { GH_TOKEN: "GitHub", GITHUB_TOKEN: "Work GitHub" };
+  const warnings = (
+    changes: Partial<EgressServiceForm>,
+    owners: Record<string, string> = config,
+  ) =>
+    presetPlaceholderWarnings(
+      { ...formFromService("svc", { preset: "github" }), ...changes },
+      github,
+      owners,
+    );
+
+  it("warns for each variable the preset sets, in the preset's order", () => {
+    expect(warnings({})).toEqual([
+      "GH_TOKEN is also set by GitHub from your administrator; when both are set, theirs is used.",
+      "GITHUB_TOKEN is also set by Work GitHub from your administrator; when both are set, theirs is used.",
+    ]);
+    expect(warnings({}, { GITHUB_TOKEN: "GitHub" })).toHaveLength(1);
+    expect(warnings({}, {})).toEqual([]);
+  });
+
+  it("says nothing once the service lists its own placeholders or drops the preset's", () => {
+    expect(
+      warnings({ placeholders: [{ name: "MY_API_KEY", value: "x" }] }),
+    ).toEqual([]);
+    expect(
+      warnings({
+        explicitlyEmpty: {
+          ...formFromService("svc", null).explicitlyEmpty,
+          placeholders: true,
+        },
+      }),
+    ).toEqual([]);
+  });
+
+  it("says nothing without a preset or while the presets load", () => {
+    const custom = formFromService("svc", null);
+    expect(presetPlaceholderWarnings(custom, github, config)).toEqual([]);
+    expect(
+      presetPlaceholderWarnings(
+        formFromService("svc", { preset: "github" }),
+        undefined,
+        config,
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("which problems the basic fields show", () => {
+  it("lists the name and the first rule's host and way of sending", () => {
+    expect(BASIC_RULE_PARTS).toEqual([
+      "host",
+      "username",
+      "authName",
+      "template",
+    ]);
+    for (const field of [
+      "name",
+      ...BASIC_RULE_PARTS.map((part) => ruleField(0, part)),
+    ])
+      expect(isBasicField(field)).toBe(true);
+  });
+
+  it("leaves everything else to More options", () => {
+    for (const field of [
+      ruleField(0, "pathPrefix"),
+      ruleField(0, "port"),
+      ruleField(1, "host"),
+      ruleField(1, "authName"),
+      "rules",
+      "oauthProvider",
+      "form",
+      placeholderField(0, "name"),
+    ])
+      expect(isBasicField(field)).toBe(false);
   });
 });
