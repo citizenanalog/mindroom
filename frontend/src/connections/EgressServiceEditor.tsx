@@ -42,10 +42,7 @@ import {
   validateService,
 } from "./egressServiceValidation";
 import { looksLikeGithub } from "./githubLimits";
-import {
-  githubLimitRules,
-  githubRepositoryRules,
-} from "./githubRepositoryRules";
+import { githubRepositoryRules } from "./githubRepositoryRules";
 import {
   GithubHelper,
   githubHelperChanges,
@@ -257,9 +254,13 @@ export function EgressServiceEditor({
     if (!showGithubHelper || (!typed && !limiting)) return form;
     if (typed && helperSignature(helperInput) === appliedHelper.current)
       return form;
-    const result = limiting
-      ? githubLimitRules(helperInput.repositories, helperInput)
-      : githubRepositoryRules(helperInput.repositories, helperInput);
+    // A limit always covers uploads.github.com: it narrows only the hosts it
+    // has rules for, so the administrator's uploads.github.com rule would
+    // otherwise keep reaching every repository with the user's key or account.
+    const result = githubRepositoryRules(helperInput.repositories, {
+      ...helperInput,
+      uploads: limiting || helperInput.uploads,
+    });
     setHelperErrors(result.errors);
     return result.errors.length > 0 ? null : applyGithubRules(result);
   };

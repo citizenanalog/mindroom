@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   githubLimitLabels,
-  githubLimitRules,
   githubRepositoryRules,
 } from "./githubRepositoryRules";
 
@@ -73,9 +72,9 @@ describe("GitHub repository rules", () => {
     ]);
   });
 
-  it("always covers uploads.github.com in a limit in place, which narrows only the hosts it has rules for", () => {
+  it("writes each repository's uploads.github.com rule after its others, and GraphQL last", () => {
     const written = (graphql: boolean) =>
-      githubLimitRules("a/b\nc/*", { graphql }).rules.map(
+      githubRepositoryRules("a/b\nc/*", { uploads: true, graphql }).rules.map(
         (rule) => `${rule.host}${rule.path_prefix}`,
       );
     expect(written(false)).toEqual([
@@ -88,9 +87,6 @@ describe("GitHub repository rules", () => {
       "uploads.github.com/repos/c/",
     ]);
     expect(written(true).slice(-1)).toEqual(["api.github.com/graphql"]);
-    expect(githubLimitRules("not a repository", { graphql: false })).toEqual(
-      githubRepositoryRules("not a repository", none),
-    );
   });
 
   it("adds /graphql once, only when ticked", () => {
