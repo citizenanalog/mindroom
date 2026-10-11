@@ -10,8 +10,8 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import parse_qs, urlsplit
 
 import h11
 
@@ -46,6 +46,11 @@ _CHUNK = 64 * 1024
 _CLOSE_TIMEOUT = 5.0
 _PROXY_AUTHENTICATE = (b"proxy-authenticate", b'Basic realm="mindroom-egress-broker"')
 _HOSTNAME = re.compile(r"[a-z0-9_][a-z0-9_.-]*")
+# A refusal's reason phrase repeats its message for clients that print only the status line.
+_REASON_LIMIT = 200
+# The git ERR line has room for the whole message; this only bounds a message that quotes a huge path.
+_GIT_ERROR_LIMIT = 4096
+_GIT_DISCOVERY_SERVICES = frozenset({"git-upload-pack", "git-receive-pack"})
 
 logger = get_logger(__name__)
 
@@ -90,7 +95,9 @@ class Peer:
         self.conn = conn
         self.reader = reader
         self.writer = writer
+        # The request being answered, for the shape of a refusal; empty until one is read in this cycle.
         self.request_method = b""
+        self.request_target = b""
         self._idle_timeout = idle_timeout
 
     async def next_event(self) -> h11.Event | type[h11.NEED_DATA | h11.PAUSED]:
@@ -101,7 +108,14 @@ class Peer:
             self.conn.receive_data(data)
         if isinstance(event, h11.Request):
             self.request_method = event.method
+            self.request_target = event.target
         return event
+
+    def start_next_cycle(self) -> None:
+        """Get ready for the next request on this connection, forgetting the one just answered."""
+        self.conn.start_next_cycle()
+        self.request_method = b""
+        self.request_target = b""
 
     async def send(self, *events: h11.Event) -> None:
         for event in events:
@@ -127,6 +141,34 @@ class Peer:
         return True
 
 
+def _printable(text: str, *, limit: int) -> str:
+    """Return `text` as printable ASCII of at most `limit` characters: CR and LF removed, other characters as `?`."""
+    text = text.replace("\r", "").replace("\n", "")
+    return "".join(char if " " <= char <= "~" else "?" for char in text[:limit])
+
+
+def _git_discovery_service(method: bytes, target: bytes) -> str | None:
+    """Return the service a git smart-HTTP discovery request names (`GET .../info/refs?service=git-upload-pack`).
+
+    Any target that does not parse as a URL is not one, since refusing a malformed request must never fail.
+    """
+    if method != b"GET":
+        return None
+    try:
+        parts = urlsplit(target.decode("latin-1"))
+    except ValueError:
+        return None
+    services = parse_qs(parts.query).get("service", [])
+    if not parts.path.endswith("/info/refs") or len(services) != 1 or services[0] not in _GIT_DISCOVERY_SERVICES:
+        return None
+    return services[0]
+
+
+def _pkt_line(data: bytes) -> bytes:
+    """Frame `data` as one git pkt-line: four hex digits giving the length, the prefix included, then the data."""
+    return b"%04x" % (len(data) + 4) + data
+
+
 async def send_json(
     client: Peer,
     status: int,
@@ -134,17 +176,35 @@ async def send_json(
     *,
     headers: tuple[tuple[bytes, bytes], ...] = (),
 ) -> None:
-    """Answer the client with a JSON error and close, unless a response is already under way."""
+    """Answer the client with a refusal body from `refusal_body` and close, unless a response is already under way.
+
+    Every refusal carries `X-MindRoom-Error: <code>`, and its reason phrase is the body's message (printable ASCII, at
+    most 200 characters), so clients that print only the status line, such as urllib or `curl -f`, still show it.
+    A refusal of a git smart-HTTP discovery request (`GET .../info/refs?service=git-upload-pack` or
+    `git-receive-pack`) is a 200 advertisement whose pkt-lines end in `ERR <message>`, so git prints `remote error:
+    <message>` instead of a bare status; the caller's audit row keeps the refusal's own status and code. A 407 stays a
+    407 for git too: git's curl answers the challenge with the proxy credentials.
+    """
     if client.conn.our_state not in {h11.IDLE, h11.SEND_RESPONSE}:
         return
-    payload = json.dumps(body).encode()
+    code, message = str(body["error"]), str(body["message"])
+    git_service = None if status == 407 else _git_discovery_service(client.request_method, client.request_target)
+    if git_service is None:
+        content_type = b"application/json"
+        payload = json.dumps(body).encode()
+    else:
+        status = 200
+        content_type = f"application/x-{git_service}-advertisement".encode()
+        error = _printable(message, limit=_GIT_ERROR_LIMIT)
+        payload = _pkt_line(f"# service={git_service}\n".encode()) + b"0000" + _pkt_line(f"ERR {error}\n".encode())
     response = h11.Response(
         status_code=status,
-        reason=HTTPStatus(status).phrase.encode(),
+        reason=_printable(message, limit=_REASON_LIMIT).encode(),
         headers=[
-            (b"content-type", b"application/json"),
+            (b"content-type", content_type),
             (b"content-length", str(len(payload)).encode()),
             (b"connection", b"close"),
+            (b"x-mindroom-error", code.encode()),
             *headers,
         ],
     )
@@ -164,7 +224,7 @@ async def serve_peer(peer: Peer, serve_one: Callable[[Peer], Awaitable[bool]]) -
     try:
         try:
             while await serve_one(peer):
-                peer.conn.start_next_cycle()
+                peer.start_next_cycle()
         except h11.RemoteProtocolError as exc:
             await send_json(peer, exc.error_status_hint, refusal_body("bad_request"))
     except OSError as exc:

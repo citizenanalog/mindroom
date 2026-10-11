@@ -479,6 +479,7 @@ class RawResponse:
     status: int
     headers: dict[str, str]
     body: bytes
+    reason: str = ""
 
     def json(self) -> object:
         """Decode the body as JSON."""
@@ -494,7 +495,8 @@ async def read_raw_response(reader: asyncio.StreamReader) -> RawResponse:
             name.strip().lower(): value.strip() for name, _, value in (line.partition(":") for line in lines[1:])
         }
         body = await reader.readexactly(int(headers.get("content-length", "0")))
-    return RawResponse(status=int(lines[0].split(" ")[1]), headers=headers, body=body)
+    _version, status, reason = (*lines[0].split(" ", 2), "")[:3]
+    return RawResponse(status=int(status), headers=headers, body=body, reason=reason)
 
 
 async def _raw_proxy_request(port: int, request: bytes) -> RawResponse:
