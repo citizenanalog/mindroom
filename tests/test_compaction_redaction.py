@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from agno.db.base import SessionType
 from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.run.agent import RunOutput
@@ -23,6 +24,7 @@ from mindroom.history.storage import (
     archive_compaction_chunk,
     read_scope_seen_event_ids,
     reconcile_compaction_state,
+    remove_runs_for_sources,
     update_scope_seen_event_ids,
 )
 from mindroom.history.types import HistoryScope
@@ -487,6 +489,17 @@ def test_redacting_any_event_of_a_run_that_compacted_mid_turn_rolls_back_before_
     assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
     assert stored.summary is None
     assert all(archive.snapshot_origin(run.run_id or "") is None for run in stored.runs or [])
+
+
+def test_removing_an_edited_turn_rolls_back_its_mid_turn_compaction(storage: SqliteDb) -> None:
+    """Regenerating an edited turn must not replay a summary of the reply it replaces."""
+    session = _seed_with_snapshots(storage, snapshots=1)
+
+    assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
+
+    stored = _stored(storage)
+    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
+    assert stored.summary is None
 
 
 def test_redacting_an_event_first_consumed_between_snapshots_after_the_run_was_archived(storage: SqliteDb) -> None:

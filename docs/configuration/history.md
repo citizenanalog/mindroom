@@ -96,6 +96,7 @@ Compaction deletes no stored history; only Matrix redaction and conversation del
 Redacting a message, including one the agent never answered, removes the first stored run that read, answered, or wrote it, and every later run, from an agent's or team's history before that agent or team next replies in the conversation (for a private agent, its next reply to that requester).
 Until then the text stays in local storage; a reply that continues after a tool approval, and a voice-call reply, do not remove it first.
 Redacting a Matrix event that a compacted run consumed rolls compaction back to just before that run, removing that run and everything after it, instead of clearing the whole conversation.
+Editing a message whose reply compacted history during the reply rolls that compaction back too, so the regenerated reply never sees a summary of the reply it replaces.
 
 If a reply fails with `Saved conversation summary exceeds the available history budget`, the saved summary no longer fits beside the current prompt.
 This can happen after switching to a model with a smaller context window or when system instructions and the current message leave too little room.

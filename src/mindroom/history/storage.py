@@ -373,7 +373,7 @@ def update_scope_seen_event_ids(
     return True
 
 
-def remove_run_by_event_id(
+def _remove_run_by_event_id(
     storage: BaseDb,
     session_id: str,
     event_id: str,
@@ -428,7 +428,7 @@ def _remove_redacted_event_from_history(
     and compacted history is rolled back the same way. ``session`` is synced to
     the stored result. Returns whether the scope's history changed.
     """
-    removed_run_ids = remove_run_by_event_id(
+    removed_run_ids = _remove_run_by_event_id(
         storage,
         session.session_id,
         event_id,
@@ -544,6 +544,49 @@ def _remove_redacted_event_from_compaction(
         return False
     if legacy_redaction == "retire":
         archive.retire_summaries(storage, session_id=session.session_id, scope_key=scope.key)
+    _sync_after_history_removal(storage, session, scope)
+    return True
+
+
+def remove_runs_for_sources(
+    storage: BaseDb,
+    session_id: str,
+    session_type: SessionType,
+    scope: HistoryScope,
+    source_event_ids: Sequence[str],
+) -> bool:
+    """Remove each source's runs and every run after them, and undo compaction that archived their snapshots.
+
+    A run that compacted while it was running left its earlier work in the archive; without the rollback, a
+    regenerated reply would replay a summary of the reply it replaces. Returns whether any run went.
+    """
+    removed_run_ids: list[str] = []
+    for source_event_id in source_event_ids:
+        removed_run_ids += _remove_run_by_event_id(
+            storage,
+            session_id,
+            source_event_id,
+            session_type=session_type,
+            remove_following_runs=True,
+        )
+    if not removed_run_ids:
+        return False
+    hit = archive.earliest_archived_run(storage, session_id=session_id, scope_key=scope.key, run_ids=removed_run_ids)
+    session = storage.get_session(session_id=session_id, session_type=session_type)
+    if hit is not None and isinstance(session, (AgentSession, TeamSession)):
+        archive.roll_back_to(
+            storage,
+            session_id=session_id,
+            scope_key=scope.key,
+            hit=hit,
+            live_run_ids=[run.run_id for run in session.runs or [] if run.run_id],
+        )
+        _sync_after_history_removal(storage, session, scope)
+    return True
+
+
+def _sync_after_history_removal(storage: BaseDb, session: AgentSession | TeamSession, scope: HistoryScope) -> None:
+    """Store the archive's latest summary on the session row and drop the scope's preserved seen ids."""
     target_session = _latest_persisted_session(storage, session)
     _replace_scope_seen_event_ids(target_session, scope, set())
     generation = archive.latest_generation(storage, session_id=session.session_id, scope_key=scope.key)
@@ -551,7 +594,6 @@ def _remove_redacted_event_from_compaction(
         _refresh_summary(target_session, generation.summary)
     storage.upsert_session(target_session)
     _adopt_session_fields(session, target_session)
-    return True
 
 
 def _earliest_dependent_row(
