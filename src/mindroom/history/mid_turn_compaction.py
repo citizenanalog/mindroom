@@ -86,8 +86,8 @@ class _RunState:
     # Identity of the response loop being prepared, and the message ids it started with.
     loop_identity: int
     start_ids: frozenset[str]
-    # Set when compaction failed or cannot bring the request under the limit; the rest of the run, including after
-    # an approval resume, is not compacted again.
+    # Set when compaction failed or cannot bring the request under the limit; this target does not compact the run
+    # again. An approval resume builds a new target, so it may try once more.
     stopped: bool = False
 
 

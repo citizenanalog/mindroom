@@ -44,6 +44,7 @@ from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, inst
 from mindroom.history.replay import compaction_summary_message, estimate_request_messages_tokens, is_compaction_summary
 from mindroom.history.storage import new_scope_session, read_scope_state, set_force_compaction_state
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState, PreparedHistoryState
+from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, HookRegistry, hook
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
 from mindroom.providers.anthropic_claude import MindRoomAnthropicClaude
@@ -52,13 +53,16 @@ from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.providers.openai_tool_search import install_openai_deferred_tool_search
 from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.teams import TeamMode, _create_team_instance, prepare_materialized_team_execution
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.usage.storage import project_usage
 from tests.conftest import FakeModel, make_turn_context, seed_session
 from tests.history_helpers import (
     RecordingCompactionLifecycle,
     _completed_run,
     _completed_team_run,
+    _hook_runtime_context,
     _make_config,
+    _plugin,
     _session,
     _team_session,
     archived_run_ids,
@@ -1877,6 +1881,34 @@ async def test_mid_turn_compaction_posts_notices(tmp_path: Path, summary_calls: 
     # Two earlier runs and the running turn, however many exchanges the turn folded.
     outcome = next(event for event in lifecycle.events if isinstance(event, CompactionOutcome))
     assert outcome.compacted_run_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("summary_calls")
+async def test_mid_turn_compaction_emits_compaction_hooks(tmp_path: Path) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    observed: list[CompactionHookContext] = []
+
+    @hook(EVENT_COMPACTION_BEFORE)
+    async def before(ctx: CompactionHookContext) -> None:
+        observed.append(ctx)
+
+    @hook(EVENT_COMPACTION_AFTER)
+    async def after(ctx: CompactionHookContext) -> None:
+        observed.append(ctx)
+
+    registry = HookRegistry.from_plugins([_plugin("compaction-hooks", [before, after])])
+    hook_context = _hook_runtime_context(config=config, runtime_paths=paths, registry=registry, session_id="session-1")
+
+    with tool_runtime_context(hook_context):
+        await _run_in_session(_scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage), "Do the task")
+
+    assert [ctx.event_name for ctx in observed[:2]] == [EVENT_COMPACTION_BEFORE, EVENT_COMPACTION_AFTER]
+    # The hooks see the running turn's folded tool work, not only the earlier runs.
+    assert any(message.role == "tool" for message in observed[0].messages)
+    assert observed[1].token_count_after is not None
+    assert observed[1].token_count_after < observed[1].token_count_before
 
 
 @pytest.mark.asyncio
