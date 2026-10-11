@@ -20,7 +20,6 @@ _TOKEN_PREFIX = "mrb1"  # noqa: S105
 _TOKEN_VERSION_TAG = b"mindroom-egress-broker-token-v1"
 _MAX_TOKEN_LENGTH = 4096
 _KEY_SIZE = 32
-_OPTIONAL_STR_CLAIMS = ("routing_agent_name", "tenant_id", "account_id", "requester_id")
 
 
 @dataclass(frozen=True)
@@ -93,8 +92,14 @@ def _literal_values(annotation: object) -> tuple[object, ...]:
     """Return the values a `Literal[...]` or `Literal[...] | None` annotation allows."""
     if get_origin(annotation) is Literal:
         return get_args(annotation)
-    # `Literal[...] | None`: the Literal's values and None.
-    return tuple(value for arg in get_args(annotation) for value in ((None,) if arg is type(None) else get_args(arg)))
+    # `Literal[...] | None`: the Literal's values, then None.
+    values: list[object] = []
+    for member in get_args(annotation):
+        if member is type(None):
+            values.append(None)
+        else:
+            values.extend(get_args(member))
+    return tuple(values)
 
 
 # What a token's claims must hold, read from `WorkerClaims` so the check follows the dataclass.
@@ -102,6 +107,7 @@ _CLAIM_KEYS = frozenset(field.name for field in fields(WorkerClaims))
 _CLAIM_TYPES = get_type_hints(WorkerClaims)
 _WORKER_SCOPES = _literal_values(_CLAIM_TYPES["worker_scope"])
 _CHANNELS = _literal_values(_CLAIM_TYPES["channel"])
+_OPTIONAL_STR_CLAIMS = tuple(name for name, hint in _CLAIM_TYPES.items() if hint == str | None)
 
 
 class TokenSigner:
