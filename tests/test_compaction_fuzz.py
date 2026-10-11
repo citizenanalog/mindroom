@@ -61,6 +61,11 @@ def _summary_of(run_ids: set[str]) -> str:
     return "|".join(sorted(run_ids))
 
 
+def _seen_ids(run: RunOutput) -> set[str]:
+    seen = (run.metadata or {}).get(constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY)
+    return set(seen) if isinstance(seen, list) else set()
+
+
 def _covered(session: AgentSession) -> set[str]:
     """Return the run ids the replayed summary covers."""
     return set(session.summary.summary.split("|")) if session.summary is not None else set()
@@ -78,6 +83,8 @@ class _Runner:
         self._snapshots: list[AgentSession] = []
         # Runs waiting for an approval: stored but not history-visible, so a later run reads them as unseen context.
         self._paused: set[str] = set()
+        # Run ids whose events each run read as unseen context; reading one makes it part of what that run represents.
+        self._reads: dict[str, set[str]] = {}
         seeding = self._open()
         if legacy:
             seed_session(seeding, self._legacy_session())
@@ -179,7 +186,10 @@ class _Runner:
         session = self._load()
         reconcile_compaction_state(self._storage, session, _SCOPE)
         session = self._load()
-        chunk = [run for run in session.runs or [] if isinstance(run, RunOutput)][:count]
+        # Compaction folds only history-visible runs, so a run waiting for an approval stays live.
+        chunk = [run for run in session.runs or [] if isinstance(run, RunOutput) and run.run_id not in self._paused][
+            :count
+        ]
         if not chunk:
             return None
         return session, chunk, _summary_of(_covered(session) | {run.run_id for run in chunk if run.run_id})
@@ -219,9 +229,13 @@ class _Runner:
         unseen = sorted(
             run.run_id for run in session.runs or [] if isinstance(run, RunOutput) and run.run_id in self._paused
         )
+        self._reads.setdefault(current.run_id or "", set()).update(unseen)
         current.metadata = {
             **(current.metadata or {}),
-            constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [_event(current.run_id or ""), *map(_event, unseen)],
+            constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [
+                _event(current.run_id or ""),
+                *map(_event, sorted(self._reads[current.run_id or ""])),
+            ],
         }
         self._storage.upsert_run(run=current, session_id=_SESSION, user_id=None)
         generation_id = record_mid_turn_generation(
@@ -253,8 +267,9 @@ class _Runner:
             summary=summary,
             summary_model="fuzz-model",
             runs=runs,
-            event_ids={run.run_id: {_event(run.run_id)} for run in runs if run.run_id},
-            seen_event_ids={run.run_id: {_event(run.run_id)} for run in runs if run.run_id},
+            # The same ids compaction derives from each run's metadata, including events it read as context.
+            event_ids={run.run_id: _seen_ids(run) for run in runs if run.run_id},
+            seen_event_ids={run.run_id: _seen_ids(run) for run in runs if run.run_id},
         )
 
     def _snapshot(self, _action: Action) -> None:
@@ -332,12 +347,17 @@ class _Runner:
         if redacted_event_id is None:
             assert not lost
         elif redacted_event_id[1:] in self._created:
-            first = self._created.index(redacted_event_id[1:])
+            # Redaction removes the first run that answered or read the event, and every run after it.
+            readers = [run_id for run_id, read in self._reads.items() if redacted_event_id[1:] in read]
+            first = min(self._created.index(run_id) for run_id in [redacted_event_id[1:], *readers])
             assert all(self._created.index(run_id) >= first for run_id in lost)
         self._present = present
         # Seen ids are exactly the events replay represents, so nothing is repeated or dropped; a paused run is
         # not history-visible, so only a summary that read it represents it.
-        expected_seen = {_event(run_id) for run_id in (live - self._paused) | covered}
+        represented = (live - self._paused) | covered
+        expected_seen = {_event(run_id) for run_id in represented} | {
+            _event(read) for run_id in represented for read in self._reads.get(run_id, ())
+        }
         assert read_scope_seen_event_ids(self._storage, session, _SCOPE) == expected_seen
 
 
