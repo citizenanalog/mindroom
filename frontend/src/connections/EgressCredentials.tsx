@@ -18,6 +18,7 @@ import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
 import { configPlaceholderOwners } from "./egressServiceNotes";
 import {
   EgressServiceRows,
+  keyPath,
   type RowAgent,
   type ServiceEditing,
 } from "./EgressServiceRows";
@@ -73,11 +74,6 @@ function loadPresets(signal: AbortSignal): Promise<EgressPresetCatalog> {
 
 function servicePath(agentName: string, serviceName: string): string {
   return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/services/${encodeURIComponent(serviceName)}`;
-}
-
-/** Where a service's API key is written; the rows write the same one. */
-function keyPath(agentName: string, serviceName: string): string {
-  return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
 }
 
 /** The name a service limited to repositories starts with: `github-limited`, or the first of `-2`, `-3`... that is free. */
@@ -341,59 +337,40 @@ function AgentSection({
     }
   };
 
-  // Writes are not interrupted by another action: the rows stay disabled meanwhile.
+  // Writes are not interrupted by another action: the rows stay disabled
+  // meanwhile. Resolves to whether the write still counts, which it does not
+  // once another action took its place.
+  const write = async (path: string, method: string, body?: object) => {
+    const controller = newOperation();
+    setSaving(true);
+    try {
+      await requestConnection<void>(
+        path,
+        controller.signal,
+        method,
+        body,
+        SERVICE_ERROR_MESSAGES,
+      );
+    } finally {
+      setSaving(false);
+    }
+    return !controller.signal.aborted;
+  };
+
   // The editor stays open after the service is written: it saves the key next
   // and closes through `onSaved`, so a key that fails can be reported there.
   const save = async (name: string, service: AuthoredEgressService) => {
-    const controller = newOperation();
-    setSaving(true);
-    try {
-      await requestConnection<void>(
-        servicePath(agent.agent_name, name),
-        controller.signal,
-        "PUT",
-        service,
-        SERVICE_ERROR_MESSAGES,
-      );
-    } finally {
-      setSaving(false);
-    }
-    if (controller.signal.aborted) return;
-    onChanged();
+    if (await write(servicePath(agent.agent_name, name), "PUT", service))
+      onChanged();
   };
 
   const saveKey = async (secret: string, name: string) => {
-    const controller = newOperation();
-    setSaving(true);
-    try {
-      await requestConnection<void>(
-        keyPath(agent.agent_name, name),
-        controller.signal,
-        "PUT",
-        { secret },
-        SERVICE_ERROR_MESSAGES,
-      );
-    } finally {
-      setSaving(false);
-    }
-    if (!controller.signal.aborted) onChanged();
+    if (await write(keyPath(agent.agent_name, name), "PUT", { secret }))
+      onChanged();
   };
 
   const remove = async (name: string) => {
-    const controller = newOperation();
-    setSaving(true);
-    try {
-      await requestConnection<void>(
-        servicePath(agent.agent_name, name),
-        controller.signal,
-        "DELETE",
-        undefined,
-        SERVICE_ERROR_MESSAGES,
-      );
-    } finally {
-      setSaving(false);
-    }
-    if (controller.signal.aborted) return;
+    if (!(await write(servicePath(agent.agent_name, name), "DELETE"))) return;
     setEditor((current) =>
       current?.kind === "edit" && current.name === name ? null : current,
     );

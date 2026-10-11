@@ -26,6 +26,10 @@ type ServiceTarget =
 
 const EGRESS_LISTING_PATH = "/api/connections/egress";
 
+/** Where the personal page writes a service's API key. */
+export const keyPath = (agentName: string, serviceName: string) =>
+  `${EGRESS_LISTING_PATH}/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
+
 const accountConnectedIn = (
   services: readonly EgressCredentialService[] | undefined,
   serviceName: string,
@@ -58,7 +62,7 @@ function servicePathsFor(
     };
   }
   const { agentName } = target;
-  const base = `/api/connections/egress/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
+  const base = keyPath(agentName, serviceName);
   return {
     secret: base,
     connect: `${base}/connect`,
