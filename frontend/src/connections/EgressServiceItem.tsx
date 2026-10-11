@@ -6,14 +6,20 @@ import { Input } from "@/components/ui/input";
 import { disconnectDescription } from "./accountCopy";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
+  agentSeesNote,
+  hostsNote,
+  limitedNote,
   limitOf,
+  limitTarget,
   removeWarning,
   type RowAgent,
+  sentAsNote,
   type ServiceEditing,
   servicesUsingAccount,
   sharesAccount,
+  unsetNote,
 } from "./egressRowText";
-import { ServiceLabels } from "./EgressServiceLabels";
+import { LimitActions } from "./EgressLimitRows";
 import { ServiceStatus } from "./EgressServiceStatus";
 import { coversGithub } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
@@ -93,6 +99,7 @@ export function EgressServiceItem({
     coversGithub(service.rules);
   // Everyone using a shared agent acts as the account connected there.
   const asksAboutSharedAccount = sharesAccount(agent, oauth);
+  const limitedText = limitedNote(service);
 
   useEffect(() => () => operation.current?.abort(), []);
 
@@ -187,13 +194,50 @@ export function EgressServiceItem({
       className="border-t border-border/60 px-5 py-3 first:border-t-0"
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <ServiceLabels
-          service={service}
-          limit={limit}
-          canChangeLimit={canChangeLimit}
-          serviceEditing={serviceEditing}
-          onError={setError}
-        />
+        {/* What the service is, where it sends, and the limit that narrows it. */}
+        <div className="min-w-0 space-y-0.5">
+          <span className="font-medium">{service.display_name}</span>
+          <p
+            className="max-w-md truncate text-xs text-muted-foreground"
+            title={service.description}
+          >
+            {service.description}
+          </p>
+          {[
+            hostsNote(service),
+            sentAsNote(service),
+            agentSeesNote(service),
+            unsetNote(service),
+          ].map(
+            (text) =>
+              text && (
+                <p
+                  key={text}
+                  className="break-words text-xs text-muted-foreground"
+                >
+                  {text}
+                </p>
+              ),
+          )}
+          {limitedText && (
+            <p className="text-xs text-muted-foreground">{limitedText}</p>
+          )}
+          {limit && (
+            <div className="flex flex-wrap items-center gap-x-2">
+              <p className="text-xs text-muted-foreground">
+                Limited to {limitTarget(limit)}
+              </p>
+              {canChangeLimit && serviceEditing && (
+                <LimitActions
+                  limit={limit}
+                  label={service.display_name}
+                  serviceEditing={serviceEditing}
+                  onError={setError}
+                />
+              )}
+            </div>
+          )}
+        </div>
         <div className="flex flex-wrap items-center gap-2 max-sm:justify-start sm:justify-end">
           <ServiceStatus
             service={service}
