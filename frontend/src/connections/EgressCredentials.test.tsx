@@ -838,7 +838,7 @@ describe("egress services on the personal page", () => {
       "for all your agents that share your personal workspace.",
     ],
     [{ shared: true, scope: "shared" }, "for everyone using this agent."],
-    [{ shared: true, scope: "unscoped" }, "for everyone using this agent."],
+    [{ shared: true, scope: "unscoped" }, "for every agent without a scope."],
   ])(
     "tells whom the restriction reaches for the agent's scope (%j)",
     async (change, audience) => {
@@ -1269,9 +1269,12 @@ describe("what deleting a service says about its scope", () => {
     );
   });
 
-  it.each(["shared", "unscoped"] as const)(
-    "says everyone using the agent loses access on a %s scope",
-    async (scope) => {
+  it.each([
+    ["shared", "Everyone using Personal Mind loses access through it."],
+    ["unscoped", "Every agent without a scope loses access through it."],
+  ] as const)(
+    "says who loses access on a %s scope",
+    async (scope, consequence) => {
       const text = await open({
         shared: true,
         scope,
@@ -1281,7 +1284,7 @@ describe("what deleting a service says about its scope", () => {
         services: [{ ...userService, is_shared: true }],
       });
       expect(text).toContain(
-        "This deletes the service and its shared key. Everyone using Personal Mind loses access through it.",
+        `This deletes the service and its shared key. ${consequence}`,
       );
       expect(text).not.toContain("personal workspace");
     },

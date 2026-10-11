@@ -88,6 +88,8 @@ export function deleteServiceWarning(
     return `This deletes the service and its saved key. Your ${agent} loses access through it.`;
   if (scope === "user")
     return `This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: ${(agents.length > 0 ? agents : [agent]).join(", ")}.`;
+  if (scope === "unscoped")
+    return "This deletes the service and its shared key. Every agent without a scope loses access through it.";
   return `This deletes the service and its shared key. Everyone using ${agent} loses access through it.`;
 }
 

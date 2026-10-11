@@ -722,7 +722,7 @@ describe("the help beside refusing other paths", () => {
     user_agent: "this agent only",
     user: "all your agents that share your personal workspace",
     shared: "everyone using this agent",
-    unscoped: "everyone using this agent",
+    unscoped: "every agent without a scope",
   } as const;
   const limit = (scope: keyof typeof LIMIT_FOR) =>
     `This also limits services from your administrator on these hosts, for ${LIMIT_FOR[scope]}.`;
@@ -1009,13 +1009,16 @@ describe("the question before deleting from inside the editor", () => {
     );
   });
 
-  it.each(["shared", "unscoped"] as const)(
-    "says everyone using the agent loses access on a %s scope",
-    async (scope) => {
+  it.each([
+    ["shared", "Everyone using Team Bot loses access through it."],
+    ["unscoped", "Every agent without a scope loses access through it."],
+  ] as const)(
+    "says who loses access on a %s scope",
+    async (scope, consequence) => {
       expect(
         await ask({ scope, agentName: "Team Bot", scopeAgents: [] }),
       ).toHaveTextContent(
-        "Delete mine? This deletes the service and its shared key. Everyone using Team Bot loses access through it.",
+        `Delete mine? This deletes the service and its shared key. ${consequence}`,
       );
     },
   );

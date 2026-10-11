@@ -29,7 +29,7 @@ const ADMINISTRATOR_LIMIT: Record<EgressScope, string> = {
   shared:
     "This also limits services from your administrator on these hosts, for everyone using this agent.",
   unscoped:
-    "This also limits services from your administrator on these hosts, for everyone using this agent.",
+    "This also limits services from your administrator on these hosts, for every agent without a scope.",
 };
 const RESTRICT_HELP = {
   refusal:

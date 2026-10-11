@@ -92,10 +92,12 @@ describe("account copy", () => {
     expect(deleteServiceWarning("user", "Coder", [])).toBe(
       "This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Coder.",
     );
-    for (const scope of ["shared", "unscoped"] as const)
-      expect(deleteServiceWarning(scope, "Team Bot", [])).toBe(
-        "This deletes the service and its shared key. Everyone using Team Bot loses access through it.",
-      );
+    expect(deleteServiceWarning("shared", "Team Bot", [])).toBe(
+      "This deletes the service and its shared key. Everyone using Team Bot loses access through it.",
+    );
+    expect(deleteServiceWarning("unscoped", "Team Bot", [])).toBe(
+      "This deletes the service and its shared key. Every agent without a scope loses access through it.",
+    );
   });
 
   it("tells the viewer that administrators can see the requests too", () => {
