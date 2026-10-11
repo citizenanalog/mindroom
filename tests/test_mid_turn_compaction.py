@@ -32,7 +32,7 @@ from mindroom.agno_compat_model_hooks import install_request_preparation
 from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
 from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY as _NOTICE_KEY
-from mindroom.history import agno_compat_message_builder, mid_turn_compaction
+from mindroom.history import agno_compat_message_builder, archive, mid_turn_compaction
 from mindroom.history.agno_compat_message_builder import built_request_session
 from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
 from mindroom.history.replay import compaction_summary_message, is_compaction_summary
@@ -1181,6 +1181,39 @@ async def test_partial_commit_then_failure_leaves_the_request_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_failure_after_part_of_the_turn_committed_rolls_the_turn_back(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, paths = _config(tmp_path, summary_context_window=6_000)
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(storage, _session("session-1"))
+
+    async def fail_second(**kwargs: Any) -> SessionSummary:  # noqa: ANN401
+        if summary_calls.inputs:
+            summary_calls.inputs.append(kwargs["summary_input"])
+            msg = "summary model unavailable"
+            raise RuntimeError(msg)
+        return await summary_calls(**kwargs)
+
+    monkeypatch.setattr("mindroom.history.compaction.generate_compaction_summary", fail_second)
+    model = _ToolLoopModel(tool_rounds=5)
+
+    output = await _run_in_session(_scoped_agent(model, config, paths, storage), "Do the task")
+
+    assert str(output.content).endswith("done")
+    assert len(summary_calls.inputs) == 2
+    # The turn's first chunk committed before the second failed; the request kept every exchange unchanged.
+    assert not any(is_compaction_summary(message) for request in model.requests for message in request.messages)
+    generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert generation is None or generation.summary is None
+    stored = get_agent_session(storage, "session-1")
+    assert stored is not None
+    assert stored.summary is None
+
+
+@pytest.mark.asyncio
 async def test_force_flag_survives_mid_turn_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     storage = _seeded_storage(config, paths)
@@ -1306,12 +1339,7 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
     layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
-    mid_turn_compaction._rewrite(
-        messages,
-        layout,
-        compaction_summary_message("NEW", run_local=False),
-        len(layout.exchanges),
-    )
+    mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
 
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"
     assert [is_compaction_summary(message) for message in messages] == [False, True, False]

@@ -585,6 +585,24 @@ def remove_runs_for_sources(
     return True
 
 
+def roll_back_running_turn(
+    storage: BaseDb,
+    session: AgentSession | TeamSession,
+    scope: HistoryScope,
+    run_id: str,
+) -> None:
+    """Undo compaction from the first archived snapshot of a still-running run, keeping everything before it.
+
+    A turn's exchanges fold together or not at all, so a compaction that committed only some of them is undone;
+    runs archived earlier in that generation return live, and ``session`` is synced to the stored result.
+    """
+    hit = archive.earliest_archived_run(storage, session_id=session.session_id, scope_key=scope.key, run_ids=[run_id])
+    if hit is None:
+        return
+    archive.roll_back_to(storage, session_id=session.session_id, scope_key=scope.key, hit=hit, live_run_ids=())
+    _sync_after_history_removal(storage, session, scope)
+
+
 def _sync_after_history_removal(storage: BaseDb, session: AgentSession | TeamSession, scope: HistoryScope) -> None:
     """Store the archive's latest summary on the session row and drop the scope's preserved seen ids."""
     target_session = _latest_persisted_session(storage, session)

@@ -49,7 +49,7 @@ from mindroom.history.runtime import (
     summarize_run_locally,
 )
 from mindroom.history.session_context import resolve_history_scope
-from mindroom.history.storage import new_scope_session, reconcile_compaction_state
+from mindroom.history.storage import new_scope_session, reconcile_compaction_state, roll_back_running_turn
 from mindroom.history.types import HistoryScope
 from mindroom.logging_config import get_logger
 from mindroom.model_usage import response_context_tokens
@@ -203,14 +203,10 @@ async def _prepare_request(
     if not layout.exchanges and all(is_compaction_summary(message) for message in layout.history):
         # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
         return
-    summarized = await _summarize(binding, policy, layout, messages, run_response, session)
-    if summarized is None:
+    summary_message = await _summarize(binding, policy, layout, messages, run_response, session)
+    if summary_message is None:
         binding.failed_run_id = run_response.run_id
         return
-    summary_message, committed = summarized
-    if committed < len(layout.exchanges):
-        # Part of the turn could not be summarized; the rest stays in the request and this run stops compacting.
-        binding.failed_run_id = run_response.run_id
     if policy.replay_model is not None and policy.replay_model.native_compaction is not None:
         # The provider's own compaction could not keep this request within the window.
         logger.warning(
@@ -218,7 +214,7 @@ async def _prepare_request(
             run_id=run_response.run_id,
         )
         policy.replay_model.configure_native_compaction(threshold=None)
-    _finish(messages, layout, summary_message, run_response, committed)
+    _finish(messages, layout, summary_message, run_response)
     _require_fit(policy, messages, tools, summary_message)
 
 
@@ -229,12 +225,11 @@ async def _summarize(
     messages: list[Message],
     run_response: RunOutput | TeamRunOutput,
     session: AgentSession | TeamSession | None,
-) -> tuple[Message, int] | None:
-    """Return the summary and how many of the turn's exchanges it covers, or None when nothing was summarized."""
+) -> Message | None:
+    """Summarize the folded history and every exchange of the turn, or return None when compaction failed."""
     try:
         if session is None:
-            summary = await _summarize_run_locally(binding, policy.inputs, layout, run_response)
-            return summary, len(layout.exchanges)
+            return await _summarize_run_locally(binding, policy.inputs, layout, run_response)
         return await _compact_scope(binding, policy, layout, messages, run_response, session)
     except asyncio.CancelledError:
         raise
@@ -248,10 +243,9 @@ def _finish(
     layout: _Layout,
     summary_message: Message,
     run_response: RunOutput | TeamRunOutput,
-    committed: int,
 ) -> None:
-    _rewrite(messages, layout, summary_message, committed)
-    _carry_request_usage(run_response, [message for exchange in layout.exchanges[:committed] for message in exchange])
+    _rewrite(messages, layout, summary_message)
+    _carry_request_usage(run_response, [message for exchange in layout.exchanges for message in exchange])
 
 
 def _scoped_session(
@@ -273,10 +267,11 @@ async def _compact_scope(
     messages: list[Message],
     run_response: RunOutput | TeamRunOutput,
     session: AgentSession | TeamSession,
-) -> tuple[Message, int] | None:
+) -> Message | None:
     """Archive the scope's visible runs and this run's exchanges behind a new summary, on Agno's own session.
 
-    Returns the summary and how many exchanges, oldest first, it covers, or None when none committed.
+    The turn's exchanges commit together: when a later chunk fails or is cancelled after some of them committed,
+    those are rolled back so the request stays unchanged, while chunks of earlier runs stay compacted.
     """
     storage = binding.target.db
     assert isinstance(storage, BaseDb)
@@ -304,15 +299,15 @@ async def _compact_scope(
                 compaction_lifecycle=binding.lifecycle,
             )
         except asyncio.CancelledError:
-            # Committed snapshots archived their exchanges; the request must not resend them.
-            if committed := await _committed(storage, session, snapshots):
-                _finish(messages, layout, _scope_summary_message(session), run_response, committed)
+            # A fully committed turn archived its exchanges, so the request must not resend them.
+            if await _turn_committed(storage, session, scope, run_response, snapshots):
+                _finish(messages, layout, _scope_summary_message(session), run_response)
             raise
+        committed = await _turn_committed(storage, session, scope, run_response, snapshots)
     finally:
         kept = {run.run_id for run in session.runs or []}
         session.runs = [*(session.runs or []), *(run for run in member_runs if run.run_id not in kept)]
-    committed = await _committed(storage, session, snapshots)
-    return (_scope_summary_message(session), committed) if committed else None
+    return _scope_summary_message(session) if committed else None
 
 
 def _prepare_scope_session(storage: BaseDb, session: AgentSession | TeamSession, scope: HistoryScope) -> None:
@@ -328,17 +323,25 @@ def _session_type(session: AgentSession | TeamSession) -> SessionType:
     return SessionType.TEAM if isinstance(session, TeamSession) else SessionType.AGENT
 
 
-async def _committed(
+async def _turn_committed(
     storage: BaseDb,
     session: AgentSession | TeamSession,
+    scope: HistoryScope,
+    run_response: RunOutput | TeamRunOutput,
     snapshots: Sequence[RunOutput | TeamRunOutput],
-) -> int:
-    """Return how many of the turn's snapshots, oldest first, the archive holds; chunks commit in order."""
+) -> bool:
+    """Return whether every snapshot of the turn committed, rolling back a turn that committed only in part."""
     run_ids = [snapshot.run_id or "" for snapshot in snapshots]
     archived = await run_blocking_until_complete(
         partial(archive.archived_run_ids, storage, session_id=session.session_id, run_ids=run_ids),
     )
-    return next((index for index, run_id in enumerate(run_ids) if run_id not in archived), len(run_ids))
+    if all(run_id in archived for run_id in run_ids):
+        return True
+    if any(run_id in archived for run_id in run_ids):
+        await run_blocking_until_complete(
+            partial(roll_back_running_turn, storage, session, scope, run_response.run_id or ""),
+        )
+    return False
 
 
 def _scope_summary_message(session: AgentSession | TeamSession) -> Message:
@@ -639,16 +642,10 @@ def _summary_usage_recorder(
     return record
 
 
-def _rewrite(messages: list[Message], layout: _Layout, summary_message: Message, committed: int) -> None:
-    """Replace the folded history and the first ``committed`` exchanges with the summary, keeping message order."""
+def _rewrite(messages: list[Message], layout: _Layout, summary_message: Message) -> None:
+    """Replace the folded history and the turn's exchanges with the summary, keeping the kept messages in order."""
     leading = [without_embedded_summary(message) for message in messages[: layout.leading]]
-    keep = {id(message) for message in layout.kept}
-    keep.update(id(message) for exchange in layout.exchanges[committed:] for message in exchange)
-    messages[:] = [
-        *leading,
-        summary_message,
-        *(message for message in messages[layout.leading :] if id(message) in keep),
-    ]
+    messages[:] = [*leading, summary_message, *layout.kept]
 
 
 def _carry_request_usage(run_response: RunOutput | TeamRunOutput, folded: Sequence[Message]) -> None:
