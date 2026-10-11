@@ -1,3 +1,4 @@
+import { formatList } from "./accountCopy";
 import type {
   AuthoredEgressService,
   EgressAuth,
@@ -162,6 +163,8 @@ export interface EgressServiceForm {
   rules: RuleForm[];
   placeholders: PlaceholderForm[];
   restrictToRules: boolean;
+  /** A service that only limits paths: no key, account, or placeholders, and rules that never pick a credential. */
+  restrictOnly: boolean;
   oauthProvider: string;
   explicitlyEmpty: ExplicitlyEmpty;
 }
@@ -214,11 +217,15 @@ export function formFromService(
     displayName: displayName ?? "",
     description: service?.description ?? "",
     replacePresetRules,
-    rules: preset === "" && rules.length === 0 ? [emptyRule()] : rules,
+    rules:
+      preset === "" && rules.length === 0 && !service?.restrict_only
+        ? [emptyRule()]
+        : rules,
     placeholders: Object.entries(service?.placeholder_env ?? {}).map(
       ([placeholderName, value]) => ({ name: placeholderName, value }),
     ),
     restrictToRules: service?.restrict_to_rules ?? false,
+    restrictOnly: service?.restrict_only ?? false,
     oauthProvider: service?.oauth_provider ?? "",
     explicitlyEmpty: {
       displayName:
@@ -271,6 +278,18 @@ function ruleToAuthored(rule: RuleForm): EgressRule {
 }
 
 /**
+ * The display name a new custom service gets while the form leaves it empty:
+ * its website, as the person typed it, not the title-cased name the server
+ * would derive. A preset keeps its own, which the server supplies, and so does
+ * a service whose display name was emptied on purpose.
+ */
+function defaultDisplayName(form: EgressServiceForm): string {
+  if (form.preset !== "" || form.explicitlyEmpty.displayName !== undefined)
+    return "";
+  return form.rules[0]?.host.trim().toLowerCase() ?? "";
+}
+
+/**
  * Turn the form into the service as authored.
  *
  * A preset service keeps `{preset: id}` and only the fields the user set,
@@ -286,12 +305,25 @@ export function serializeService(
   initial: AuthoredEgressService | null = null,
 ): AuthoredEgressService {
   const authored: AuthoredEgressService = {};
-  if (form.preset) authored.preset = form.preset;
-  if (form.displayName.trim()) authored.display_name = form.displayName.trim();
+  // A service that only limits paths has rules of its own, whatever preset the form once held.
+  if (form.preset && !form.restrictOnly) authored.preset = form.preset;
+  // A service that is edited keeps the display name it has, or none.
+  const displayName =
+    form.displayName.trim() ||
+    (initial === null ? defaultDisplayName(form) : "");
+  if (displayName) authored.display_name = displayName;
   else if (form.explicitlyEmpty.displayName !== undefined)
     authored.display_name = form.explicitlyEmpty.displayName;
   if (form.description.trim()) authored.description = form.description.trim();
   else if (form.explicitlyEmpty.description) authored.description = "";
+  if (form.restrictOnly) {
+    // It sends no key, so there is no login or placeholder to write, and the
+    // restriction is what it is for.
+    authored.rules = form.rules.map(ruleToAuthored);
+    authored.restrict_to_rules = true;
+    authored.restrict_only = true;
+    return authored;
+  }
   if (usesOwnRules(form)) authored.rules = form.rules.map(ruleToAuthored);
   const placeholders = form.placeholders.filter(
     (placeholder) => placeholder.name.trim() !== "",
@@ -335,14 +367,25 @@ export function presetHasLogin(
   return presetOf(options.presets, presetId)?.oauth_provider != null;
 }
 
+const HOST_ONLY_MESSAGE = "Enter only the host, without https:// or a path";
+
+/**
+ * What the Website field keeps of what was typed or pasted: no scheme, and
+ * nothing from the first `/`, `?`, or `#` on, so a copied URL becomes its host.
+ */
+export function stripHostInput(value: string): string {
+  const scheme = value.indexOf("://");
+  const rest = scheme === -1 ? value : value.slice(scheme + 3);
+  const end = rest.search(/[/?#]/);
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
 function hostError(host: string): string | null {
   const value = host.trim().toLowerCase();
   if (!value) return "Host is required";
-  if (value.includes("://")) return "Host must not contain a scheme";
+  if (/[/?#]/.test(value)) return HOST_ONLY_MESSAGE;
   if (value.includes(":"))
     return "Host must not contain a port (use the port field)";
-  if (value.includes("/"))
-    return "Host must not contain a path (use the path prefix field)";
   if (value.startsWith("*.")) {
     const parts = value.split(".");
     if (parts.filter((part) => part === "*").length > 1)
@@ -528,6 +571,15 @@ export function validateService(
   if (!settings.editing) {
     const message = nameProblem(form.name, settings);
     if (message) problems.push({ field: "name", message });
+  }
+  if (form.restrictOnly) {
+    // The repository helper writes the rules and the server checks them again.
+    if (form.rules.length === 0)
+      problems.push({
+        field: "rules",
+        message: "Enter at least one repository, such as owner/repo",
+      });
+    return problems;
   }
   if (
     form.preset === "" &&
@@ -784,6 +836,45 @@ export function configPlaceholderOwners(
         owners[name] = service.display_name;
   }
   return owners;
+}
+
+/**
+ * What to tell the user when another service of the agent already sends a key
+ * to a website this form covers: one text per such service, with all the
+ * hosts it shares. Services that only limit paths send no key, and the service
+ * being edited does not compete with itself.
+ */
+export function overlapWarnings(
+  form: EgressServiceForm,
+  preset: EgressPreset | undefined,
+  others: readonly Pick<
+    EgressCredentialService,
+    "name" | "display_name" | "rules" | "restrict_only"
+  >[],
+  editingName: string | undefined,
+): string[] {
+  const covered = new Set(
+    (usesOwnRules(form) ? form.rules : (preset?.rules ?? []))
+      .map((rule) => rule.host.trim().toLowerCase())
+      .filter((host) => host !== ""),
+  );
+  if (covered.size === 0) return [];
+  return others.flatMap((other) => {
+    if (other.restrict_only === true || other.name === editingName) return [];
+    const shared = [
+      ...new Set(
+        (other.rules ?? [])
+          .filter((rule) => rule.auth_type !== null)
+          .map((rule) => rule.host.toLowerCase())
+          .filter((host) => covered.has(host)),
+      ),
+    ];
+    return shared.length > 0
+      ? [
+          `${other.display_name} already sends a key to ${formatList(shared)} for this agent. The most specific path wins, and equal paths go to the service listed first.`,
+        ]
+      : [];
+  });
 }
 
 /** Who uses a personal service, for the note under the form's title; null where nothing needs saying. */

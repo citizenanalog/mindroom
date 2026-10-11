@@ -13,11 +13,13 @@ import {
   githubRepositoryRules,
   isBasicField,
   looksLikeGithub,
+  overlapWarnings,
   placeholderField,
   presetPlaceholderWarnings,
   ruleField,
   scopeNote,
   serializeService,
+  stripHostInput,
   suggestedName,
   usesMoreOptions,
   validateService,
@@ -258,9 +260,12 @@ describe("validating a service", () => {
 
   it.each([
     ["", "Host is required"],
-    ["https://api.example.com", "Host must not contain a scheme"],
+    [
+      "https://api.example.com",
+      "Enter only the host, without https:// or a path",
+    ],
     ["api.example.com:8443", "Host must not contain a port"],
-    ["api.example.com/v1", "Host must not contain a path"],
+    ["api.example.com/v1", "Enter only the host, without https:// or a path"],
     ["*.*.example.com", "Host can only have one wildcard label"],
     ["*.com", "Wildcard host must have at least one domain part"],
     ["api.*.com", "Wildcard must be a single leading *. label"],
@@ -488,11 +493,12 @@ describe("validating a service", () => {
     const largest = (char: string, cost: number) =>
       Math.floor((limit - (sizeWith(char) - cost)) / cost);
 
-    // The sizes the server's `_json_size` reports for the same service.
-    expect(sizeWith("a")).toBe(81);
-    expect(sizeWith("\u00e9")).toBe(86);
-    expect(sizeWith("\u{1F600}")).toBe(92);
-    expect(sizeWith("\u007f")).toBe(86);
+    // The sizes the server's `_json_size` reports for the same service, which
+    // a new service writes with its website as the display name.
+    expect(sizeWith("a")).toBe(114);
+    expect(sizeWith("\u00e9")).toBe(119);
+    expect(sizeWith("\u{1F600}")).toBe(125);
+    expect(sizeWith("\u007f")).toBe(119);
 
     const plain = largest("a", 1);
     expect(sizeWith("a".repeat(plain))).toBe(limit);
@@ -1417,5 +1423,225 @@ describe("which problems the basic fields show", () => {
       placeholderField(0, "name"),
     ])
       expect(isBasicField(field)).toBe(false);
+  });
+});
+
+describe("the display name a new custom service gets", () => {
+  const add = (service: AuthoredEgressService, options: Options = personal) =>
+    serializeService(formFromService("svc", service), options);
+
+  it("is the first rule's host, lowercased, and not a title-cased name", () => {
+    expect(
+      add({ rules: [{ ...bearerRule, host: "Echo-Test.example.com" }] }),
+    ).toMatchObject({ display_name: "echo-test.example.com" });
+  });
+
+  it("gives way to a display name that is typed", () => {
+    expect(
+      add({ display_name: "Echo", rules: [bearerRule] }).display_name,
+    ).toBe("Echo");
+  });
+
+  it("is left to the server for a preset, and for a service that is edited", () => {
+    expect(add({ preset: "openai" })).toEqual({ preset: "openai" });
+    expect(serialize({ rules: [bearerRule] })).toEqual({ rules: [bearerRule] });
+  });
+
+  it("is left alone for a display name emptied on purpose", () => {
+    expect(
+      add({ display_name: null, rules: [bearerRule] }).display_name,
+    ).toBeNull();
+    expect(add({ display_name: "", rules: [bearerRule] }).display_name).toBe(
+      "",
+    );
+  });
+
+  it("is written on the dashboard too", () => {
+    expect(add({ rules: [bearerRule] }, operator).display_name).toBe(
+      "api.example.com",
+    );
+  });
+});
+
+describe("what the Website field keeps", () => {
+  it.each([
+    ["httpbin.org", "httpbin.org"],
+    ["https://httpbin.org", "httpbin.org"],
+    ["http://httpbin.org/anything", "httpbin.org"],
+    ["https://httpbin.org/a?b=1#c", "httpbin.org"],
+    ["httpbin.org/anything", "httpbin.org"],
+    ["httpbin.org?x=1", "httpbin.org"],
+    ["https://api.example.com:8443/v1", "api.example.com:8443"],
+    ["*.example.com/x", "*.example.com"],
+    ["https://", ""],
+    ["https:/", "https:"],
+    ["", ""],
+  ])("turns %j into %j", (typed, kept) => {
+    expect(stripHostInput(typed)).toBe(kept);
+  });
+});
+
+describe("a service that only limits paths", () => {
+  const limit: AuthoredEgressService = {
+    display_name: "GitHub (a/b)",
+    description: "Limited to a/b",
+    rules: githubRepositoryRules("a/b", { uploads: false, graphql: false })
+      .rules,
+    restrict_to_rules: true,
+    restrict_only: true,
+  };
+
+  it("round-trips through the form, with restrict_only and the restriction on", () => {
+    const form = formFromService("github-limited", limit);
+    expect(form.restrictOnly).toBe(true);
+    expect(form.restrictToRules).toBe(true);
+    expect(serializeService(form, personal, limit)).toEqual(limit);
+  });
+
+  it("writes no login, placeholders, or preset, whatever the form holds", () => {
+    const form = {
+      ...formFromService("github-limited", limit),
+      oauthProvider: "github",
+      placeholders: [{ name: "GH_TOKEN", value: "mindroom-brokered" }],
+      preset: "github",
+    };
+    expect(serializeService(form, personal, limit)).toEqual(limit);
+    const written = serializeService(form, personal, limit);
+    expect(written).not.toHaveProperty("oauth_provider");
+    expect(written).not.toHaveProperty("placeholder_env");
+  });
+
+  it("starts a new one with no rules, and needs repositories to be saved", () => {
+    const form = {
+      ...formFromService("github-limited", null),
+      restrictOnly: true,
+      rules: [],
+    };
+    expect(validateService(form, personal, newService)).toEqual([
+      {
+        field: "rules",
+        message: "Enter at least one repository, such as owner/repo",
+      },
+    ]);
+  });
+
+  it("checks only the name otherwise, since the helper wrote the rules", () => {
+    const form = { ...formFromService("Bad Name", limit) };
+    expect(
+      validateService(form, personal, newService).map((p) => p.field),
+    ).toEqual(["name"]);
+    expect(
+      validateService(formFromService("github-limited", limit), personal, {
+        editing: true,
+        takenNames: ["github-limited"],
+      }),
+    ).toEqual([]);
+  });
+
+  it("does not make the other forms restrict-only", () => {
+    expect(formFromService("svc", { rules: [bearerRule] }).restrictOnly).toBe(
+      false,
+    );
+    expect(
+      serializeService(
+        formFromService("svc", { rules: [bearerRule] }),
+        personal,
+      ),
+    ).not.toHaveProperty("restrict_only");
+  });
+});
+
+describe("services of the agent that already send a key to a website", () => {
+  const rule = (host: string, auth_type: string | null = "bearer") => ({
+    host,
+    port: null,
+    path_prefix: "/",
+    auth_type: auth_type as "bearer" | null,
+    auth_name: null,
+  });
+  const listed = (
+    name: string,
+    display_name: string,
+    rules: ReturnType<typeof rule>[],
+    restrict_only = false,
+  ) => ({ name, display_name, rules, restrict_only });
+  const form = (service: AuthoredEgressService | null = null) =>
+    formFromService("svc", service ?? { rules: [bearerRule] });
+
+  it("names each such service once with the websites they share", () => {
+    expect(
+      overlapWarnings(
+        formFromService("svc", {
+          rules: [
+            { host: "API.github.com", auth: { type: "bearer" } },
+            { host: "github.com", auth: { type: "basic", username: "x" } },
+          ],
+        }),
+        undefined,
+        [
+          listed("github", "GitHub", [
+            rule("api.github.com"),
+            rule("github.com", "basic"),
+            rule("uploads.github.com"),
+          ]),
+          listed("other", "Other", [rule("other.example.com")]),
+        ],
+        undefined,
+      ),
+    ).toEqual([
+      "GitHub already sends a key to api.github.com and github.com for this agent. The most specific path wins, and equal paths go to the service listed first.",
+    ]);
+  });
+
+  it("reads a preset's websites when the form uses the preset's rules", () => {
+    const github = presets.find((preset) => preset.id === "github");
+    expect(
+      overlapWarnings(
+        formFromService("svc", { preset: "github" }),
+        github,
+        [listed("mine", "Mine", [rule("uploads.github.com")])],
+        undefined,
+      ),
+    ).toEqual([
+      "Mine already sends a key to uploads.github.com for this agent. The most specific path wins, and equal paths go to the service listed first.",
+    ]);
+    expect(
+      overlapWarnings(
+        formFromService("svc", { preset: "github" }),
+        undefined,
+        [listed("mine", "Mine", [rule("uploads.github.com")])],
+        undefined,
+      ),
+    ).toEqual([]);
+  });
+
+  it("skips a service that only limits paths, one that sends no key, the one being edited, and an empty host", () => {
+    const others = [
+      listed("limit", "Limit", [rule("api.example.com")], true),
+      listed("nokey", "NoKey", [rule("api.example.com", null)]),
+      listed("self", "Self", [rule("api.example.com")]),
+    ];
+    expect(overlapWarnings(form(), undefined, others, "self")).toEqual([]);
+    expect(
+      overlapWarnings(
+        formFromService("svc", {
+          rules: [{ host: " ", auth: { type: "bearer" } }],
+        }),
+        undefined,
+        [listed("a", "A", [rule("")])],
+        undefined,
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not compare services whose listing has no rules", () => {
+    expect(
+      overlapWarnings(
+        form(),
+        undefined,
+        [{ name: "old", display_name: "Old", rules: undefined }],
+        undefined,
+      ),
+    ).toEqual([]);
   });
 });

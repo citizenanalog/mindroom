@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { githubRepositoryRules } from "./egressServiceModel";
-import { coversGithub, limitedRepositories } from "./githubLimits";
+import {
+  coversGithub,
+  limitedRepositories,
+  parseGithubLimit,
+} from "./githubLimits";
 import type { EgressRuleSummary } from "./types";
 
 const rule = (host: string, path_prefix = "/"): EgressRuleSummary => ({
@@ -65,5 +69,50 @@ describe("repositories a service is limited to", () => {
     expect(limitedRepositories([rule("api.github.com", "/a/b")])).toEqual([]);
     expect(limitedRepositories([rule("github.com", "/repos/a/b")])).toEqual([]);
     expect(limitedRepositories([rule("github.com", "/a/b/")])).toEqual([]);
+  });
+});
+
+describe("the choices behind a limit's rules", () => {
+  it("reads back repositories, owners, and the options the helper wrote", () => {
+    expect(parseGithubLimit(summarized("a/b\nc/d", true, true))).toEqual({
+      repositories: ["a/b", "c/d"],
+      uploads: true,
+      graphql: true,
+      exact: true,
+    });
+    expect(parseGithubLimit(summarized("octo/*\na/b"))).toEqual({
+      repositories: ["octo/*", "a/b"],
+      uploads: false,
+      graphql: false,
+      exact: true,
+    });
+  });
+
+  it("reads past GraphQL, which makes limitedRepositories give up", () => {
+    const rules = summarized("a/b", false, true);
+    expect(limitedRepositories(rules)).toEqual([]);
+    expect(parseGithubLimit(rules).repositories).toEqual(["a/b"]);
+  });
+
+  it("is not exact when a rule is not one the helper writes, and still names the repositories it can", () => {
+    const odd = parseGithubLimit([
+      ...summarized("a/b"),
+      rule("api.github.com", "/user"),
+      rule("httpbin.org", "/"),
+    ]);
+    expect(odd.repositories).toEqual(["a/b"]);
+    expect(odd.exact).toBe(false);
+    // A rule missing from what the helper would write is not exact either.
+    expect(parseGithubLimit(summarized("a/b").slice(0, 2)).exact).toBe(false);
+  });
+
+  it("has nothing to read in rules that name no repository", () => {
+    expect(parseGithubLimit([rule("api.github.com", "/")])).toEqual({
+      repositories: [],
+      uploads: false,
+      graphql: false,
+      exact: false,
+    });
+    expect(parseGithubLimit(undefined).repositories).toEqual([]);
   });
 });

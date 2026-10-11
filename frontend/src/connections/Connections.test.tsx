@@ -255,6 +255,103 @@ describe("brokered API keys on agent cards", () => {
     );
   });
 
+  it("says View services instead of Manage services to someone who can change none of them", async () => {
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            {
+              ...catalog([service]).agents[0],
+              egress_services: [
+                { ...egressService, is_shared: true, can_manage: false },
+              ],
+            },
+          ],
+        }),
+    });
+    render(<Connections />);
+    await expandAgent();
+
+    const link = await screen.findByRole("link", { name: "View services" });
+    expect(link).toHaveAttribute(
+      "href",
+      `/connections/egress#egress-agent-${catalog([service]).agents[0].agent_name}`,
+    );
+    expect(screen.queryByRole("link", { name: "Manage services" })).toBeNull();
+  });
+
+  it("keeps Manage services when the viewer can change at least one service", async () => {
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            {
+              ...catalog([service]).agents[0],
+              egress_services: [
+                { ...egressService, can_manage: false },
+                { ...egressService, name: "openai", display_name: "OpenAI" },
+              ],
+            },
+          ],
+        }),
+    });
+    render(<Connections />);
+    await expandAgent();
+    expect(
+      await screen.findByRole("link", { name: "Manage services" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("link", { name: "View services" })).toBeNull();
+  });
+
+  it("shows a limit on the agent's card as a row that only limits, and the administrator's row as limited", async () => {
+    const rule = (host: string, path_prefix: string) => ({
+      host,
+      port: null,
+      path_prefix,
+    });
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            {
+              ...catalog([service]).agents[0],
+              egress_services: [
+                {
+                  ...egressService,
+                  source: "config",
+                  rules: [rule("api.github.com", "/"), rule("github.com", "/")],
+                },
+                {
+                  ...egressService,
+                  name: "github-limited",
+                  display_name: "GitHub (octocat/Hello-World)",
+                  source: "user",
+                  restrict_only: true,
+                  rules: [
+                    rule("api.github.com", "/repos/octocat/Hello-World"),
+                    rule("github.com", "/octocat/Hello-World"),
+                    rule("github.com", "/octocat/Hello-World.git"),
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+    });
+    render(<Connections />);
+    await expandAgent();
+
+    const github = await screen.findByLabelText("GitHub");
+    expect(
+      within(github).getByText("Limited to octocat/Hello-World"),
+    ).toBeVisible();
+    // The portal has no editor, so there is nothing to change or remove here.
+    expect(screen.queryByRole("button", { name: /limit/i })).toBeNull();
+    const limit = screen.getByLabelText("GitHub (octocat/Hello-World)");
+    expect(within(limit).getByText("Limit only")).toBeVisible();
+    expect(within(limit).queryByRole("button")).toBeNull();
+  });
+
   it("tells a personal agent's user that its sandbox is shared, not that the agent is", async () => {
     installApi({
       "/api/connections": async () =>
@@ -1614,6 +1711,36 @@ describe("agent table summary, search, and order", () => {
     await screen.findByRole("button", { name: "Disconnect for Mail" });
     expect(agentRow("Personal assistant")).toHaveTextContent(
       "2 tools / 2 of 3 accounts and keys set",
+    );
+  });
+
+  it("does not count a service that only limits paths as an account or a key", async () => {
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            {
+              ...withCalculator(),
+              services: [],
+              egress_services: [
+                egress("github", "GitHub", {
+                  configured: true,
+                  key_configured: true,
+                  active_source: "key",
+                }),
+                egress("github-limited", "GitHub (a/b)", {
+                  source: "user",
+                  restrict_only: true,
+                }),
+              ],
+            },
+          ],
+        }),
+    });
+    render(<Connections />);
+    await screen.findByRole("button", { name: "Expand Personal assistant" });
+    expect(agentRow("Personal assistant")).toHaveTextContent(
+      "2 tools / 1 of 1 accounts and keys set",
     );
   });
 

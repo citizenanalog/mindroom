@@ -11,14 +11,19 @@ import {
 } from "./accountCopy";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
+  agentSeesNote,
   hostsNote,
   limitedNote,
+  limitOf,
+  limitTarget,
   removeWarning,
   type RowAgent,
   type ServiceEditing,
+  sentAsNote,
   servicesUsingAccount,
   sharesAccount,
   statusLabel,
+  unsetNote,
 } from "./egressRowStatus";
 import { coversGithub } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
@@ -69,6 +74,9 @@ function EgressServiceRow({
   // Rows with an account keep the key behind a toggle until a key is set.
   const showKeyControls = !oauth || service.key_configured || editing;
   const canManageKey = service.can_manage && !hideKeyActions;
+  const keyInsteadLabel = oauth?.connected
+    ? "Use an API key instead of the account"
+    : "Use an API key instead";
   // Requester-scoped accounts belong to the requester, so the server lets any
   // eligible user manage them even without key rights.
   const canResetAccount =
@@ -85,20 +93,33 @@ function EgressServiceRow({
     serviceEditing !== undefined &&
     service.source === serviceEditing.editableSource &&
     service.can_manage;
+  const limitedText = limitedNote(service);
+  const hostsText = hostsNote(service);
+  const sentAsText = sentAsNote(service);
+  const agentSeesText = agentSeesNote(service);
+  const unsetText = unsetNote(service);
+  // A limit of the viewer's that narrows this administrator's service.
+  const limit = limitOf(service, agent.services);
+  const canChangeLimit =
+    limit !== null &&
+    serviceEditing?.onChangeLimit !== undefined &&
+    serviceEditing.onRemoveLimit !== undefined &&
+    limit.can_manage;
+  // A service that already has a limit changes or removes it instead of getting another.
   const canLimit =
+    limit === null &&
     serviceEditing?.onLimitToRepositories !== undefined &&
     service.source === "config" &&
     service.can_manage &&
     coversGithub(service.rules);
-  const limitedText = limitedNote(service);
-  const hostsText = hostsNote(service);
   // Everyone using a shared agent acts as the account connected there.
   const asksAboutSharedAccount = sharesAccount(agent, oauth);
+  // Once a key is saved there is nothing left to ask for, so the hint goes.
+  const refusalShown =
+    oauth?.unavailable_reason === "shared_sandbox" && !service.key_configured;
   // The page names a shared agent's managers once, and a refused personal
   // account row says whom to ask itself, so the row only does without it.
-  const managersNamed =
-    agent.managers !== undefined ||
-    oauth?.unavailable_reason === "shared_sandbox";
+  const managersNamed = agent.managers !== undefined || refusalShown;
 
   useEffect(() => () => operation.current?.abort(), []);
 
@@ -261,8 +282,34 @@ function EgressServiceRow({
               {hostsText}
             </p>
           )}
+          {[sentAsText, agentSeesText, unsetText].map(
+            (text) =>
+              text && (
+                <p
+                  key={text}
+                  className="break-words text-xs text-muted-foreground"
+                >
+                  {text}
+                </p>
+              ),
+          )}
           {limitedText && (
             <p className="text-xs text-muted-foreground">{limitedText}</p>
+          )}
+          {limit && (
+            <div className="flex flex-wrap items-center gap-x-2">
+              <p className="text-xs text-muted-foreground">
+                Limited to {limitTarget(limit)}
+              </p>
+              {canChangeLimit && serviceEditing && (
+                <LimitActions
+                  limit={limit}
+                  label={service.display_name}
+                  serviceEditing={serviceEditing}
+                  onError={setError}
+                />
+              )}
+            </div>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2 max-sm:justify-start sm:justify-end">
@@ -288,7 +335,7 @@ function EgressServiceRow({
               Uses a shared service account
             </span>
           )}
-          {oauth?.unavailable_reason === "shared_sandbox" && (
+          {refusalShown && (
             <span className="text-xs text-muted-foreground">
               {agent.shared
                 ? personalAccountRefusal(
@@ -363,13 +410,13 @@ function EgressServiceRow({
               size="sm"
               variant="ghost"
               disabled={busy !== null}
-              aria-label={`Use an API key instead for ${service.display_name}`}
+              aria-label={`${keyInsteadLabel} for ${service.display_name}`}
               onClick={() => {
                 setError(null);
                 setEditing(true);
               }}
             >
-              Use an API key instead
+              {keyInsteadLabel}
             </Button>
           )}
           {canManageKey && showKeyControls && !editing && (
@@ -538,6 +585,127 @@ function EgressServiceRow({
   );
 }
 
+/** Change and Remove for a limit, with the question before it goes. `label` names what the buttons are for. */
+function LimitActions({
+  limit,
+  label,
+  serviceEditing,
+  onError,
+}: {
+  limit: EgressCredentialService;
+  label: string;
+  serviceEditing: ServiceEditing;
+  onError: (message: string | null) => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const disabled = busy || serviceEditing.disabled === true;
+
+  const remove = async () => {
+    setConfirming(false);
+    setBusy(true);
+    onError(null);
+    try {
+      await serviceEditing.onRemoveLimit?.(limit);
+    } catch (cause) {
+      onError(
+        cause instanceof Error && cause.message
+          ? cause.message
+          : "Could not remove the limit. Try again.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <Button
+        size="sm"
+        variant="ghost"
+        disabled={disabled || serviceEditing.editingName === limit.name}
+        aria-label={`Change limit for ${label}`}
+        onClick={() => serviceEditing.onChangeLimit?.(limit)}
+      >
+        Change limit
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        disabled={disabled}
+        aria-label={`Remove limit for ${label}`}
+        onClick={() => setConfirming(true)}
+      >
+        {busy ? "Removing…" : "Remove limit"}
+      </Button>
+      <ConfirmDialog
+        open={confirming}
+        title={`Remove the limit on ${label}?`}
+        description={serviceEditing.removeLimitWarning ?? ""}
+        confirmLabel="Remove limit"
+        onCancel={() => setConfirming(false)}
+        onConfirm={() => void remove()}
+      />
+    </>
+  );
+}
+
+/** A service that only limits paths: no key, account, or status, just what it limits and how to change that. */
+function LimitRow({
+  service,
+  serviceEditing,
+}: {
+  service: EgressCredentialService;
+  serviceEditing?: ServiceEditing;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const hosts = hostsNote(service)?.replace(/^Sends to/, "Limits requests to");
+  const canChange =
+    serviceEditing?.onChangeLimit !== undefined &&
+    serviceEditing.onRemoveLimit !== undefined &&
+    service.source === serviceEditing.editableSource &&
+    service.can_manage;
+  return (
+    <li
+      aria-label={service.display_name}
+      className="border-t border-border/60 px-5 py-3 first:border-t-0"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0 space-y-0.5">
+          <span className="font-medium">{service.display_name}</span>
+          <p
+            className="max-w-md truncate text-xs text-muted-foreground"
+            title={service.description}
+          >
+            {service.description}
+          </p>
+          {hosts && (
+            <p className="break-words text-xs text-muted-foreground">{hosts}</p>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2 max-sm:justify-start sm:justify-end">
+          <Badge variant="outline" className="font-normal">
+            Limit only
+          </Badge>
+          {canChange && serviceEditing && (
+            <LimitActions
+              limit={service}
+              label={service.display_name}
+              serviceEditing={serviceEditing}
+              onError={setError}
+            />
+          )}
+        </div>
+      </div>
+      {error && (
+        <Alert variant="destructive" className="mt-3 p-2">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+    </li>
+  );
+}
+
 /** Where one service's secret is written and its account is connected. */
 type ServiceTarget =
   | {
@@ -598,18 +766,26 @@ export function EgressServiceRows({
 }) {
   return (
     <ul>
-      {services.map((service) => (
-        <EgressServiceRow
-          key={service.name}
-          paths={servicePathsFor(target, service.name)}
-          service={service}
-          onChanged={onChanged}
-          errorMessages={errorMessages}
-          serviceEditing={serviceEditing}
-          agent={agent}
-          hideKeyActions={hideKeyActions}
-        />
-      ))}
+      {services.map((service) =>
+        service.restrict_only ? (
+          <LimitRow
+            key={service.name}
+            service={service}
+            serviceEditing={serviceEditing}
+          />
+        ) : (
+          <EgressServiceRow
+            key={service.name}
+            paths={servicePathsFor(target, service.name)}
+            service={service}
+            onChanged={onChanged}
+            errorMessages={errorMessages}
+            serviceEditing={serviceEditing}
+            agent={agent}
+            hideKeyActions={hideKeyActions}
+          />
+        ),
+      )}
     </ul>
   );
 }

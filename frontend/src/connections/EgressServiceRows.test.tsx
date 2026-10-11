@@ -15,7 +15,12 @@ import {
   type RowAgent,
   type ServiceEditing,
 } from "./EgressServiceRows";
-import type { EgressCredentialService, EgressOAuthStatus } from "./types";
+import type {
+  EgressCredentialService,
+  EgressOAuthStatus,
+  EgressRuleAuthType,
+  EgressRuleSummary,
+} from "./types";
 
 type RowsProps =
   ComponentProps<typeof Rows> extends infer P
@@ -523,6 +528,68 @@ describe("connected accounts", () => {
     expect(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
+  });
+
+  describe("when the popup's own page answers", () => {
+    const answer = (status: string) =>
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: authorization.completion_origin,
+          source: popup as unknown as Window,
+          data: { type: "mindroom-oauth", provider: "github", status },
+        }),
+      );
+    const startConnect = async (onChanged = vi.fn()) => {
+      vi.mocked(fetch).mockImplementation(async () => json(authorization));
+      render(
+        <EgressServiceRows
+          agentName="personal"
+          services={[withAccount()]}
+          onChanged={onChanged}
+        />,
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+      );
+      await waitFor(() =>
+        expect(popup.location.href).toBe(authorization.auth_url),
+      );
+      expect(screen.getByText("Connecting…")).toBeVisible();
+      return onChanged;
+    };
+
+    it("stops Connecting when the user cancelled, without waiting for the popup to close", async () => {
+      const onChanged = await startConnect();
+      answer("cancelled");
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Authorization was cancelled.",
+      );
+      expect(screen.queryByText("Connecting…")).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+      ).toBeEnabled();
+      expect(onChanged).not.toHaveBeenCalled();
+      // The page closes itself, so the row leaves the popup alone.
+      expect(popup.close).not.toHaveBeenCalled();
+    });
+
+    it("stops Connecting and says so when the provider reported an error", async () => {
+      const onChanged = await startConnect();
+      answer("error");
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Could not connect. Try again.",
+      );
+      expect(screen.queryByText("Connecting…")).toBeNull();
+      expect(onChanged).not.toHaveBeenCalled();
+    });
+
+    it("reports the change when it says connected", async () => {
+      const onChanged = await startConnect();
+      answer("connected");
+      await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+      expect(screen.queryByText("Connecting…")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
   });
 
   it("uses the supplied account paths for connect and disconnect", async () => {
@@ -2020,5 +2087,239 @@ describe("rows with an agent's wording", () => {
       },
     });
     expect(screen.queryByText(/administrator/)).toBeNull();
+  });
+});
+
+describe("what a row says about how the key is sent", () => {
+  const rule = (
+    host: string,
+    authType: EgressRuleAuthType | null,
+    authName: string | null = null,
+  ) => ({
+    host,
+    port: null,
+    path_prefix: "/",
+    auth_type: authType,
+    auth_name: authName,
+  });
+  const custom = (
+    rules: EgressRuleSummary[],
+    changes: Partial<EgressCredentialService> = {},
+  ): EgressCredentialService => ({
+    ...github,
+    name: "httpbin",
+    display_name: "httpbin.org",
+    description: "",
+    rules,
+    placeholder_names: [],
+    ...changes,
+  });
+  const renderRows = (services: EgressCredentialService[]) =>
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={services}
+        onChanged={vi.fn()}
+      />,
+    );
+
+  it.each<[string, EgressRuleSummary, string]>([
+    ["bearer", rule("a.example.com", "bearer"), "Sent as a bearer token"],
+    [
+      "header",
+      rule("a.example.com", "header", "X-Api-Key"),
+      "Sent as header X-Api-Key",
+    ],
+    [
+      "query",
+      rule("a.example.com", "query", "api_key"),
+      "Sent as query parameter api_key",
+    ],
+    ["basic", rule("a.example.com", "basic"), "Sent with basic auth"],
+    [
+      "template",
+      rule("a.example.com", "template", "Authorization"),
+      "Sent with a custom header template",
+    ],
+  ])("says how a %s rule sends the key", (_way, ruleSummary, text) => {
+    renderRows([custom([ruleSummary])]);
+    expect(within(row("httpbin.org")).getByText(text)).toBeVisible();
+  });
+
+  it("names each way a service's rules differ once, in rule order", () => {
+    renderRows([
+      custom([
+        rule("api.github.com", "bearer"),
+        rule("uploads.github.com", "bearer"),
+        rule("github.com", "basic"),
+      ]),
+    ]);
+    expect(
+      within(row("httpbin.org")).getByText(
+        "Sent as a bearer token and with basic auth",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says nothing about it when the server does not say, or the service sends no key", () => {
+    renderRows([
+      custom([{ host: "a.example.com", port: null, path_prefix: "/" }]),
+    ]);
+    expect(screen.queryByText(/^Sent /)).toBeNull();
+    cleanup();
+    renderRows([
+      custom([rule("a.example.com", null)], { restrict_only: true }),
+    ]);
+    expect(screen.queryByText(/^Sent /)).toBeNull();
+  });
+
+  it("tells what the agent sees for each placeholder the service sets", () => {
+    renderRows([
+      custom([rule("api.github.com", "bearer")], {
+        placeholder_names: ["GH_TOKEN", "GITHUB_TOKEN"],
+      }),
+    ]);
+    expect(
+      within(row("httpbin.org")).getByText(
+        "Your agent sees GH_TOKEN=mindroom-brokered, GITHUB_TOKEN=mindroom-brokered",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/is not told this key exists/)).toBeNull();
+  });
+
+  it("says a custom service without placeholders leaves the agent not told, and which website to name", () => {
+    renderRows([custom([rule("httpbin.org", "header", "X-Api-Key")])]);
+    expect(
+      within(row("httpbin.org")).getByText(
+        "Your agent is not told this key exists; mention httpbin.org in your request.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("leaves out what the agent sees where the listing does not name the variables, or an account is the way in", () => {
+    renderRows([
+      custom([rule("httpbin.org", "bearer")], { placeholder_names: undefined }),
+    ]);
+    expect(screen.queryByText(/Your agent/)).toBeNull();
+    cleanup();
+    renderRows([
+      custom([rule("www.googleapis.com", "bearer")], {
+        oauth: { ...githubAccount, provider: "google" },
+      }),
+    ]);
+    expect(screen.queryByText(/Your agent/)).toBeNull();
+  });
+
+  it("says that requests are refused while no key is set", () => {
+    renderRows([
+      custom([rule("api.github.com", "bearer"), rule("github.com", "basic")]),
+    ]);
+    expect(
+      within(row("httpbin.org")).getByText(
+        "While no key is set, requests to api.github.com and github.com are refused.",
+      ),
+    ).toBeVisible();
+    cleanup();
+    renderRows([custom([rule("httpbin.org", "bearer")], { configured: true })]);
+    expect(screen.queryByText(/While no key is set/)).toBeNull();
+  });
+});
+
+describe("a shared agent's key where a personal account is refused", () => {
+  const refused = (changes: Partial<EgressCredentialService> = {}) => ({
+    ...github,
+    is_shared: true,
+    oauth: {
+      ...githubAccount,
+      can_connect: false,
+      unavailable_reason: "shared_sandbox" as const,
+    },
+    ...changes,
+  });
+  const sharedAgent = (services: EgressCredentialService[]): RowAgent => ({
+    displayName: "Shared Dev",
+    shared: true,
+    managers: ["@alice:example.org"],
+    services,
+  });
+  const renderRows = (service: EgressCredentialService) =>
+    render(
+      <Rows
+        agentName="shared"
+        services={[service]}
+        onChanged={vi.fn()}
+        agent={sharedAgent([service])}
+      />,
+    );
+
+  it("gives the hint while no key is saved", () => {
+    renderRows(refused({ can_manage: false }));
+    const hint =
+      "Personal GitHub accounts can't be used by shared agents. Ask @alice:example.org to add a team API key.";
+    expect(within(row("GitHub")).getByText(hint)).toBeVisible();
+    expect(within(row("GitHub")).getByText("Not set")).toBeVisible();
+  });
+
+  it("drops the hint and says Key saved with the date once a team key is saved", () => {
+    renderRows(
+      refused({
+        configured: true,
+        active_source: "key",
+        key_configured: true,
+        key_updated_at: "2026-10-05T12:00:00+00:00",
+        updated_at: "2026-10-05T12:00:00+00:00",
+      }),
+    );
+    expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
+    expect(
+      within(row("GitHub")).getByText(
+        `Key saved ${new Date("2026-10-05T12:00:00+00:00").toLocaleDateString()}`,
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText("Using API key")).toBeNull();
+  });
+
+  it("still names the managers to someone who cannot change the key, after the hint is gone", () => {
+    renderRows(
+      refused({
+        can_manage: false,
+        configured: true,
+        active_source: "key",
+        key_configured: true,
+        key_updated_at: "2026-10-05T12:00:00+00:00",
+      }),
+    );
+    expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
+    // The page names the managers once, so the row says nothing more about who manages it.
+    expect(screen.queryByText(/credential managers/)).toBeNull();
+  });
+});
+
+describe("the other way to connect when an account is connected", () => {
+  const renderRows = (service: EgressCredentialService) =>
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[service]}
+        onChanged={vi.fn()}
+      />,
+    );
+
+  it("offers an API key instead of the account once the account is connected", () => {
+    renderRows(connectedGithub);
+    expect(
+      within(row("GitHub")).getByRole("button", {
+        name: "Use an API key instead of the account for GitHub",
+      }),
+    ).toHaveTextContent(/^Use an API key instead of the account$/);
+  });
+
+  it("keeps the shorter wording while no account is connected", () => {
+    renderRows(withAccount());
+    expect(
+      within(row("GitHub")).getByRole("button", {
+        name: "Use an API key instead for GitHub",
+      }),
+    ).toHaveTextContent(/^Use an API key instead$/);
   });
 });

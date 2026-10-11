@@ -1753,14 +1753,24 @@ describe("the page's header and intro", () => {
     ).toHaveAttribute("href", "/");
   });
 
-  it("explains what the page does in the words of the spec", async () => {
+  it("says in one line what the page does and holds the full explanation behind How this works", async () => {
     render(<EgressCredentials />);
     expect(
       await screen.findByText(
-        "Connect an account or paste an API key for the services below, or add a service of your own. MindRoom stores them and adds them to your agents' requests to the matching websites. Your agents never get the keys themselves, but a website can send a key back in its response (an echo service does), so only add keys for sites you trust. Saved keys cannot be read back.",
+        "Connect accounts or add API keys; MindRoom adds them to your agents' requests and your agents never get the keys themselves.",
       ),
     ).toBeInTheDocument();
+    const full =
+      "Connect an account or paste an API key for the services below, or add a service of your own. MindRoom stores them and adds them to your agents' requests to the matching websites. Your agents never get the keys themselves, but a website can send a key back in its response (an echo service does), so only add keys for sites you trust. Saved keys cannot be read back.";
+    expect(screen.queryByText(full)).toBeNull();
+    const toggle = screen.getByRole("button", { name: "How this works" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(full)).toBeVisible();
     expect(screen.queryByText(/never see them/)).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.queryByText(full)).toBeNull();
   });
 });
 
@@ -1998,10 +2008,13 @@ describe("who can change a shared agent's keys", () => {
 
 describe("limiting a GitHub service to repositories", () => {
   let listing: EgressCredentialAgent[];
+  let calls: { method: string; path: string; body: unknown }[];
   const githubRules = [
     { host: "api.github.com", port: null, path_prefix: "/" },
     { host: "github.com", port: null, path_prefix: "/" },
   ];
+  const limitRules = (repositories: string, graphql = false) =>
+    githubRepositoryRules(repositories, { uploads: false, graphql }).rules;
   const limited = (
     name: string,
     repositories: string,
@@ -2009,84 +2022,306 @@ describe("limiting a GitHub service to repositories", () => {
     ...service,
     name,
     display_name: `GitHub (${repositories})`,
-    description: "",
+    description: `Limited to ${repositories}`,
     source: "user",
-    rules: githubRepositoryRules(repositories, {
-      uploads: false,
-      graphql: false,
-    }).rules.map((rule) => ({
+    restrict_only: true,
+    rules: limitRules(repositories).map((rule) => ({
       host: rule.host,
       port: null,
       path_prefix: rule.path_prefix ?? "/",
     })),
   });
+  const github = (): EgressCredentialService => ({
+    ...service,
+    source: "config",
+    rules: githubRules,
+  });
+  const authoredLimit = (repositories: string): AuthoredEgressService => ({
+    display_name: `GitHub (${repositories})`,
+    description: `Limited to ${repositories}`,
+    rules: limitRules(repositories),
+    restrict_to_rules: true,
+    restrict_only: true,
+  });
+  const githubRow = () => screen.findByLabelText("GitHub");
 
   beforeEach(() => {
-    listing = [
-      {
-        ...agents[0],
-        services: [{ ...service, source: "config", rules: githubRules }],
-      },
-    ];
-    vi.mocked(fetch).mockImplementation(async (input) => {
+    calls = [];
+    listing = [{ ...agents[0], services: [github()] }];
+    vi.mocked(fetch).mockImplementation(async (input, options) => {
       const path = String(input);
+      const method = options?.method ?? "GET";
+      calls.push({
+        method,
+        path,
+        body: options?.body ? JSON.parse(String(options.body)) : undefined,
+      });
       if (path === "/api/connections/me") return json(identity);
       if (path === "/api/connections/egress") return json({ agents: listing });
-      if (path === "/api/connections/egress/presets")
-        return json(egressPresets);
-      throw new Error(`Unexpected request: ${path}`);
+      if (path === PRESETS) return json(egressPresets);
+      if (path.startsWith(SERVICES)) {
+        if (method === "GET") return json(authoredLimit("a/b"));
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
     });
   });
+  const writes = () => calls.filter((call) => call.method !== "GET");
 
-  it("opens the editor to add a GitHub service named github-limited", async () => {
+  it("opens a limit with the name github-limited, the repositories, and no key", async () => {
     render(<EgressCredentials />);
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Limit to repositories for GitHub",
       }),
     );
-    await presetsReady();
-    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
-    expect(screen.getByLabelText("Preset")).toHaveValue("github");
-    expect(screen.getByRole("button", { name: "Save service" })).toBeVisible();
+    const form = await screen.findByRole("form", {
+      name: "Limit to repositories",
+    });
+    expect(within(form).getByLabelText("Name")).toHaveValue("github-limited");
+    expect(within(form).getByLabelText("GitHub repositories")).toBeVisible();
+    // It only limits paths: nothing to pick a preset, send, or key.
+    for (const label of ["Preset", "Website", "API key", "Send the key as"])
+      expect(within(form).queryByLabelText(label)).toBeNull();
+    expect(
+      within(form).queryByRole("button", { name: "More options" }),
+    ).toBeNull();
+    expect(
+      within(form).getByText(
+        "This also limits services from your administrator on these hosts, for this agent only.",
+      ),
+    ).toBeVisible();
     // The editor is open, so a second one is not started.
     expect(
       screen.getByRole("button", { name: "Limit to repositories for GitHub" }),
     ).toBeDisabled();
   });
 
-  it("takes the next free name when github-limited is already there", async () => {
-    listing[0].services.push(limited("github-limited", "a/b"));
+  it("saves the limit as a restrict-only service and closes", async () => {
     render(<EgressCredentials />);
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Limit to repositories for GitHub",
       }),
     );
-    await presetsReady();
-    expect(screen.getByLabelText("Name")).toHaveValue("github-limited-2");
+    fireEvent.change(await screen.findByLabelText("GitHub repositories"), {
+      target: { value: "octocat/Hello-World" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("form", { name: "Limit to repositories" }),
+      ).toBeNull(),
+    );
+    expect(writes()).toEqual([
+      {
+        method: "PUT",
+        path: `${SERVICES}/github-limited`,
+        body: {
+          display_name: "GitHub (octocat/Hello-World)",
+          description: "Limited to octocat/Hello-World",
+          rules: limitRules("octocat/Hello-World"),
+          restrict_to_rules: true,
+          restrict_only: true,
+        },
+      },
+    ]);
+  });
+
+  it("asks for a repository instead of saving a limit without one", async () => {
+    render(<EgressCredentials />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Limit to repositories for GitHub",
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Save limit" }));
+    expect(
+      await screen.findByText(
+        "Enter at least one repository, such as owner/repo",
+      ),
+    ).toBeVisible();
+    expect(screen.getByLabelText("GitHub repositories")).toHaveFocus();
+    expect(writes()).toEqual([]);
+  });
+
+  it("takes the next free name when github-limited is already there", async () => {
+    // An earlier limit that was a service of its own with a key, so the row still offers one.
+    listing[0].services.push({
+      ...limited("github-limited", "a/b"),
+      restrict_only: false,
+    });
+    render(<EgressCredentials />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Limit to repositories for GitHub",
+      }),
+    );
+    expect(await screen.findByLabelText("Name")).toHaveValue(
+      "github-limited-2",
+    );
   });
 
   it("offers it only to someone who can manage the agent", async () => {
     listing[0] = {
       ...listing[0],
       can_manage: false,
-      services: [
-        { ...service, source: "config", rules: githubRules, can_manage: false },
-      ],
+      services: [{ ...github(), can_manage: false }],
     };
     render(<EgressCredentials />);
     await screen.findByRole("region", { name: "Personal Mind" });
     expect(screen.queryByText("Limit to repositories")).toBeNull();
   });
 
+  it("shows the administrator's row as limited, with Change limit and Remove limit", async () => {
+    listing[0].services.push(limited("github-limited", "basnijholt/agent-cli"));
+    render(<EgressCredentials />);
+    const row = await githubRow();
+    expect(
+      within(row).getByText("Limited to basnijholt/agent-cli"),
+    ).toBeVisible();
+    expect(
+      within(row).getByRole("button", { name: "Change limit for GitHub" }),
+    ).toBeVisible();
+    expect(
+      within(row).getByRole("button", { name: "Remove limit for GitHub" }),
+    ).toBeVisible();
+    // The limit replaces the offer to add another.
+    expect(
+      within(row).queryByRole("button", {
+        name: "Limit to repositories for GitHub",
+      }),
+    ).toBeNull();
+  });
+
+  it("lists the limit itself under what the user added, with its own Change and Remove", async () => {
+    listing[0].services.push(limited("github-limited", "basnijholt/agent-cli"));
+    render(<EgressCredentials />);
+    const added = await screen.findByRole("group", { name: "Added by you" });
+    const row = within(added).getByLabelText("GitHub (basnijholt/agent-cli)");
+    expect(within(row).getByText("Limit only")).toBeVisible();
+    expect(
+      within(row).getByText(/Limits requests to api\.github\.com, github\.com/),
+    ).toBeVisible();
+    // It has no key, account, or status to set.
+    expect(within(row).queryByText("Not set")).toBeNull();
+    expect(within(row).queryByRole("button", { name: /key/i })).toBeNull();
+    expect(
+      within(row).getByRole("button", {
+        name: "Change limit for GitHub (basnijholt/agent-cli)",
+      }),
+    ).toBeVisible();
+  });
+
+  it("opens the limit in the editor with its repositories when Change limit is pressed", async () => {
+    listing[0].services.push(limited("github-limited", "a/b"));
+    render(<EgressCredentials />);
+    fireEvent.click(
+      within(await githubRow()).getByRole("button", {
+        name: "Change limit for GitHub",
+      }),
+    );
+    const form = await screen.findByRole("form", { name: "Change limit" });
+    expect(
+      calls.some(
+        (call) =>
+          call.method === "GET" && call.path === `${SERVICES}/github-limited`,
+      ),
+    ).toBe(true);
+    expect(within(form).getByLabelText("Name")).toHaveValue("github-limited");
+    expect(within(form).getByLabelText("Name")).toBeDisabled();
+    expect(within(form).getByLabelText("GitHub repositories")).toHaveValue(
+      "a/b",
+    );
+
+    fireEvent.change(within(form).getByLabelText("GitHub repositories"), {
+      target: { value: "a/b\nc/d" },
+    });
+    fireEvent.click(within(form).getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(writes()[0]).toMatchObject({
+      method: "PUT",
+      path: `${SERVICES}/github-limited`,
+      body: {
+        display_name: "GitHub (a/b)",
+        rules: limitRules("a/b\nc/d"),
+        restrict_to_rules: true,
+        restrict_only: true,
+      },
+    });
+  });
+
+  it("removes the limit after asking, and nothing else", async () => {
+    listing[0].services.push(limited("github-limited", "a/b"));
+    render(<EgressCredentials />);
+    fireEvent.click(
+      within(await githubRow()).getByRole("button", {
+        name: "Remove limit for GitHub",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Remove the limit on GitHub?",
+    });
+    expect(
+      within(dialog).getByText(
+        "This removes the limit. Your Personal Mind can then reach every repository the key or connected account allows.",
+      ),
+    ).toBeVisible();
+    expect(writes()).toEqual([]);
+    listing[0].services = [github()];
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Remove limit" }),
+    );
+
+    await waitFor(() =>
+      expect(writes()).toEqual([
+        {
+          method: "DELETE",
+          path: `${SERVICES}/github-limited`,
+          body: undefined,
+        },
+      ]),
+    );
+    expect(
+      await screen.findByRole("button", {
+        name: "Limit to repositories for GitHub",
+      }),
+    ).toBeVisible();
+    expect(screen.queryByText(/Limited to a\/b/)).toBeNull();
+  });
+
+  it("shows why a limit could not be removed and keeps it", async () => {
+    listing[0].services.push(limited("github-limited", "a/b"));
+    vi.mocked(fetch).mockImplementation(async (input, options) => {
+      const path = String(input);
+      if (path === "/api/connections/me") return json(identity);
+      if (path === "/api/connections/egress") return json({ agents: listing });
+      if (options?.method === "DELETE")
+        return json({ detail: "Not allowed" }, 403);
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<EgressCredentials />);
+    fireEvent.click(
+      within(await githubRow()).getByRole("button", {
+        name: "Remove limit for GitHub",
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Remove limit",
+      }),
+    );
+    // The server says why, as it does for every change to a service.
+    expect(await screen.findByRole("alert")).toHaveTextContent("Not allowed");
+    expect(within(await githubRow()).getByText("Limited to a/b")).toBeVisible();
+  });
+
   it("shows what a limited service is limited to", async () => {
     listing[0].services.push(limited("gh-a", "basnijholt/agent-cli"));
     render(<EgressCredentials />);
     const row = await screen.findByLabelText("GitHub (basnijholt/agent-cli)");
-    expect(
-      within(row).getByText("Limited to basnijholt/agent-cli"),
-    ).toBeVisible();
+    expect(within(row).getByText("Limit only")).toBeVisible();
   });
 });
 
@@ -2177,5 +2412,112 @@ describe("recent requests: wording and wrapping", () => {
     expect(code.querySelectorAll("wbr")).toHaveLength(2);
     // The break opportunities sit right after the underscores.
     expect(code.innerHTML).toBe("credential_<wbr>not_<wbr>configured");
+  });
+});
+
+describe("who uses a personal agent's keys", () => {
+  const show = (changes: Partial<EgressCredentialAgent>) => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input) === "/api/connections/me") return json(identity);
+      return json({ agents: [{ ...agents[0], ...changes }] });
+    });
+    render(<EgressCredentials />);
+    return screen.findByRole("region", { name: "Personal Mind" });
+  };
+
+  it("says that only you use the keys of a user_agent agent, always", async () => {
+    const card = await show({ scope: "user_agent" });
+    expect(
+      within(card).getByText("Only you use this agent's keys."),
+    ).toBeVisible();
+  });
+
+  it("says the keys of a user agent are shared by all your agents in your workspace", async () => {
+    const card = await show({
+      scope: "user",
+      scope_agents: ["Personal Mind", "Notes"],
+    });
+    expect(
+      within(card).getByText(
+        "Shared by all your agents in your personal workspace.",
+      ),
+    ).toBeVisible();
+    expect(within(card).queryByText(/Only you use/)).toBeNull();
+  });
+
+  it("names the managers of a shared agent instead", async () => {
+    const card = await show({
+      scope: "shared",
+      shared: true,
+      can_manage: false,
+      managers: ["@alice:example.org"],
+    });
+    expect(
+      within(card).getByText(
+        "Only @alice:example.org can change keys for this shared agent.",
+      ),
+    ).toBeVisible();
+    expect(within(card).queryByText(/Only you use/)).toBeNull();
+    expect(within(card).queryByText(/Shared by all your agents/)).toBeNull();
+  });
+});
+
+describe("the latest recent requests", () => {
+  const records = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      at: new Date(
+        Date.UTC(2026, 9, 9, 12, 0, 0) - index * 60_000,
+      ).toISOString(),
+      kind: "request",
+      agent_name: "personal",
+      method: "GET",
+      host: `site${index}.example.com`,
+      path: "/",
+      service: null,
+      status: 200,
+      code: null,
+    }));
+  const openLog = async (count: number) => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/connections/me") return json(identity);
+      if (path === "/api/connections/egress") return json({ agents });
+      return json({ records: records(count) });
+    });
+    render(<EgressCredentials />);
+    fireEvent.click(
+      within(
+        await screen.findByRole("region", { name: "Personal Mind" }),
+      ).getByRole("button", { name: "Recent requests" }),
+    );
+    return screen.findByRole("table", { name: "Recent requests for personal" });
+  };
+
+  it("shows the newest ten and a Show all button with the count", async () => {
+    const table = await openLog(25);
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+    expect(within(table).getByText("site0.example.com")).toBeVisible();
+    expect(within(table).getByText("site9.example.com")).toBeVisible();
+    expect(within(table).queryByText("site10.example.com")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all (25)" }));
+    expect(within(table).getAllByRole("row")).toHaveLength(26);
+    expect(within(table).getByText("site24.example.com")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show latest 10" }));
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+  });
+
+  it("has no Show all button when there are ten or fewer", async () => {
+    const table = await openLog(10);
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+    expect(screen.queryByRole("button", { name: /Show all/ })).toBeNull();
+  });
+
+  it("says in the caption that only your own requests are shown", async () => {
+    const table = await openLog(3);
+    expect(table.querySelector("caption")).toHaveTextContent(
+      "Only your own requests are shown.",
+    );
   });
 });

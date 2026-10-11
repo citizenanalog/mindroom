@@ -3,7 +3,11 @@ import { Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { deleteServiceWarning } from "./accountCopy";
+import {
+  administratorLimitNote,
+  deleteServiceWarning,
+  removeLimitWarning,
+} from "./accountCopy";
 import {
   type EditorContext,
   type EditorOptions,
@@ -13,7 +17,9 @@ import {
   NOT_EXPLICITLY_EMPTY,
   emptyRule,
   formFromService,
+  githubRepositoryRules,
   looksLikeGithub,
+  overlapWarnings,
   presetOf,
   presetPlaceholderWarnings,
   ruleField,
@@ -22,8 +28,13 @@ import {
   usesMoreOptions,
   usesOwnRules,
 } from "./egressServiceModel";
-import { githubHelperChanges, GithubHelper } from "./EgressGithubHelper";
-import type { HelperLabels } from "./EgressGithubHelper";
+import {
+  GithubHelper,
+  githubHelperChanges,
+  helperSignature,
+  restoredHelperInput,
+} from "./EgressGithubHelper";
+import type { HelperInput, HelperLabels } from "./EgressGithubHelper";
 import { MoreOptions } from "./EgressMoreOptions";
 import {
   Field,
@@ -37,7 +48,10 @@ import {
 import { useServiceSubmit } from "./useServiceSubmit";
 import type {
   AuthoredEgressService,
+  EgressCredentialService,
+  EgressOAuthProviderOption,
   EgressPreset,
+  EgressPresetCatalog,
   EgressRule,
   EgressRuleSummary,
   EgressScope,
@@ -54,10 +68,14 @@ export interface EgressServiceEditorProps {
   service: AuthoredEgressService | null;
   /** The name of the service being edited; it cannot change. Omit it to add one. */
   name?: string;
-  /** Add mode only: start with this preset, as a typed choice. */
-  initialPreset?: string;
   /** Add mode only: start with this name; it counts as typed, so it is never replaced by a suggestion. */
   initialName?: string;
+  /**
+   * Add mode only: add a service that only limits GitHub repositories, which
+   * has no key or account of its own. Editing a service that is restrict-only
+   * opens the same form.
+   */
+  initialRestrictOnly?: boolean;
   context: EditorContext;
   /** Shared and unscoped agents cannot use personal accounts. */
   sharedTarget?: boolean;
@@ -69,13 +87,18 @@ export interface EgressServiceEditorProps {
    * since the administrator's value wins. Leave it out on the dashboard.
    */
   configPlaceholders?: Readonly<Record<string, string>>;
+  /**
+   * The services the agent already has, to warn when the form covers a website
+   * one of them already sends a key to. Leave it out on the dashboard.
+   */
+  agentServices?: readonly EgressCredentialService[];
   /** Whose store the service lives in, and the agent it is being added to, for the note under the title. */
   scope?: EgressScope;
   agentName?: string;
   /** For a `user` scope: the display names of the agents that share the store. */
   scopeAgents?: readonly string[];
-  /** Fetch the server's presets when the form opens. */
-  loadPresets: (signal: AbortSignal) => Promise<EgressPreset[]>;
+  /** Fetch the server's presets and account logins when the form opens. */
+  loadPresets: (signal: AbortSignal) => Promise<EgressPresetCatalog>;
   /**
    * Said before a save when saving has a wider effect, such as writing other
    * unsaved settings too; the user confirms once before the save goes out.
@@ -113,12 +136,13 @@ export interface EgressServiceEditorProps {
 export function EgressServiceEditor({
   service,
   name,
-  initialPreset,
   initialName,
+  initialRestrictOnly = false,
   context,
   sharedTarget = false,
   takenNames = [],
   configPlaceholders = {},
+  agentServices = [],
   scope,
   agentName,
   scopeAgents = [],
@@ -135,6 +159,7 @@ export function EgressServiceEditor({
   const editing = name !== undefined;
   // `null` while the presets load, then the server's list (empty when it could not be loaded).
   const [presets, setPresets] = useState<EgressPreset[] | null>(null);
+  const [providers, setProviders] = useState<EgressOAuthProviderOption[]>([]);
   const [presetsFailed, setPresetsFailed] = useState(false);
   const options: EditorOptions = { context, sharedTarget, presets };
   // Checked against the names the editor opened with: a save that is still
@@ -145,14 +170,15 @@ export function EgressServiceEditor({
     !editing && initialName !== undefined && initialName !== "",
   );
   const [form, setForm] = useState(() => {
-    const opened = formFromService(
-      name ?? initialName ?? "",
-      service ?? (!editing && initialPreset ? { preset: initialPreset } : null),
-    );
+    const limiting = initialRestrictOnly && !editing;
+    const opened = formFromService(name ?? initialName ?? "", service);
+    if (limiting) return { ...opened, restrictOnly: true, rules: [] };
     return editing || nameTyped
       ? opened
       : { ...opened, name: suggestedName(opened, openedWithNames) };
   });
+  // A service that only limits repositories has no key, login, or website of its own.
+  const limiting = form.restrictOnly;
   const [apiKey, setApiKey] = useState("");
   const [moreOpen, setMoreOpen] = useState(() => usesMoreOptions(form));
   const loadPresetsRef = useRef(loadPresets);
@@ -161,7 +187,50 @@ export function EgressServiceEditor({
     displayName: "",
     description: "",
   });
+  // The repositories typed in the helper, which a save applies when the person
+  // did not. A limit that is edited starts with the ones it is limited to.
+  const [restored] = useState(() => restoredHelperInput(service));
+  const [helperInput, setHelperInput] = useState<HelperInput>(restored.input);
+  const [helperErrors, setHelperErrors] = useState<string[]>([]);
+  // The choices the form's rules were last written from, so a save writes
+  // them anew only after they change and keeps rules edited by hand until then.
+  const appliedHelper = useRef<string | null>(
+    restored.input.repositories === "" ? null : helperSignature(restored.input),
+  );
+  const showGithubHelper = limiting || looksLikeGithub(form);
   const settings = { editing, takenNames: openedWithNames };
+
+  const applyGithubRules = (result: {
+    rules: EgressRule[];
+    repositories: string[];
+  }): EgressServiceForm => {
+    const { changes, written } = githubHelperChanges(
+      form,
+      result,
+      helperLabels.current,
+    );
+    helperLabels.current = written;
+    appliedHelper.current = helperSignature(helperInput);
+    // The helper fixed the name along with the rules, so a later edit of the host does not rename it.
+    if (form.name !== "") setNameTyped(true);
+    // What was generated sits under More options, so show it.
+    if (!limiting) setMoreOpen(true);
+    setForm((previous) => ({ ...previous, ...changes }));
+    return { ...form, ...changes };
+  };
+
+  // Typed repositories count even when "Use these repositories" was not
+  // pressed, and a service that limits repositories needs some.
+  const prepareForm = (): EgressServiceForm | null => {
+    const typed = helperInput.repositories.trim() !== "";
+    if (!showGithubHelper || (!typed && !limiting)) return form;
+    if (typed && helperSignature(helperInput) === appliedHelper.current)
+      return form;
+    const result = githubRepositoryRules(helperInput.repositories, helperInput);
+    setHelperErrors(result.errors);
+    return result.errors.length > 0 ? null : applyGithubRules(result);
+  };
+
   const {
     formRef,
     problems,
@@ -182,16 +251,18 @@ export function EgressServiceEditor({
     apiKey,
     saveWarning,
     onSave,
-    saveKey,
+    saveKey: limiting ? undefined : saveKey,
     onSaved,
     onDelete,
     openMoreOptions: () => setMoreOpen(true),
+    prepareForm,
   });
   const dirty = useMemo(
     () =>
       JSON.stringify(form) !== JSON.stringify(openedWith.current) ||
-      apiKey !== "",
-    [form, apiKey],
+      apiKey !== "" ||
+      helperSignature(helperInput) !== helperSignature(restored.input),
+    [form, apiKey, helperInput, restored],
   );
   const nameLocked = editing || saved;
   const disabled = busy !== null;
@@ -201,7 +272,9 @@ export function EgressServiceEditor({
     loadPresetsRef
       .current(controller.signal)
       .then((loaded) => {
-        if (!controller.signal.aborted) setPresets(loaded);
+        if (controller.signal.aborted) return;
+        setPresets(loaded.presets);
+        setProviders(loaded.oauth_providers ?? []);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
@@ -249,8 +322,13 @@ export function EgressServiceEditor({
       : serverError
         ? [serverError]
         : [];
-  const title = editing ? `Edit ${name}` : "Add service";
-  const showGithubHelper = looksLikeGithub(form);
+  const title = limiting
+    ? editing
+      ? "Change limit"
+      : "Limit to repositories"
+    : editing
+      ? `Edit ${name}`
+      : "Add service";
   const note =
     context === "personal" && agentName !== undefined
       ? scopeNote(scope, agentName, scopeAgents)
@@ -258,8 +336,16 @@ export function EgressServiceEditor({
   // Deleting takes the service from everyone the store serves, so say who that is.
   const deleteNote =
     context === "personal" && scope !== undefined && agentName !== undefined
-      ? deleteServiceWarning(scope, agentName, scopeAgents)
+      ? (limiting ? removeLimitWarning : deleteServiceWarning)(
+          scope,
+          agentName,
+          scopeAgents,
+        )
       : null;
+  // The services this form would send a key to the same website as, for this agent.
+  const overlaps = limiting
+    ? []
+    : overlapWarnings(form, preset, agentServices, name);
   const primaryRule = form.rules[0] ?? emptyRule();
   const ruleEditing = (index: number, rule: RuleForm): RuleEditing => ({
     index,
@@ -280,21 +366,10 @@ export function EgressServiceEditor({
       explicitlyEmpty: NOT_EXPLICITLY_EMPTY,
     });
 
-  const applyGithubRules = (result: {
-    rules: EgressRule[];
-    repositories: string[];
-  }) => {
-    const { changes, written } = githubHelperChanges(
-      form,
-      result,
-      helperLabels.current,
-    );
-    helperLabels.current = written;
-    // The helper fixed the name along with the rules, so a later edit of the host does not rename it.
-    if (form.name !== "") setNameTyped(true);
-    // What was generated sits under More options, so show it.
-    setMoreOpen(true);
-    set(changes);
+  const applyTypedRepositories = () => {
+    const result = githubRepositoryRules(helperInput.repositories, helperInput);
+    setHelperErrors(result.errors);
+    if (result.errors.length === 0) applyGithubRules(result);
   };
 
   return (
@@ -308,78 +383,86 @@ export function EgressServiceEditor({
       <h3 className="font-semibold">{title}</h3>
       {note && <p className="text-xs text-muted-foreground">{note}</p>}
 
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field
-          label="Name"
-          id={`${id}-name`}
-          hint={
-            editing
-              ? "The name cannot be changed."
-              : "Lowercase letters, digits, - and _. It cannot be changed later."
-          }
-          error={problemAt("name")}
-        >
-          {(control) => (
-            <Input
-              {...control}
-              className={inputClass}
-              value={form.name}
-              disabled={nameLocked || disabled}
-              onChange={(event) => {
-                setNameTyped(event.target.value !== "");
-                set({ name: event.target.value });
-              }}
-            />
-          )}
-        </Field>
-        <Field label="Preset" id={`${id}-preset`}>
-          {(control) => (
-            <select
-              {...control}
-              className={selectClass}
-              value={form.preset}
-              disabled={disabled || presets === null}
-              onChange={(event) => choosePreset(event.target.value)}
-            >
-              <option value="">
-                {presets === null ? "Loading…" : "Custom"}
-              </option>
-              {(presets ?? []).map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.display_name}
+      {!limiting && (
+        <>
+          <Field label="Preset" id={`${id}-preset`} className="max-w-md">
+            {(control) => (
+              <select
+                {...control}
+                className={selectClass}
+                value={form.preset}
+                disabled={disabled || presets === null}
+                onChange={(event) => choosePreset(event.target.value)}
+              >
+                <option value="">
+                  {presets === null ? "Loading…" : "Custom"}
                 </option>
-              ))}
-              {form.preset !== "" && !preset && (
-                <option value={form.preset}>{form.preset}</option>
-              )}
-            </select>
+                {(presets ?? []).map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.display_name}
+                  </option>
+                ))}
+                {form.preset !== "" && !preset && (
+                  <option value={form.preset}>{form.preset}</option>
+                )}
+              </select>
+            )}
+          </Field>
+          {presetsFailed && (
+            <p className="text-xs text-muted-foreground">
+              The preset list could not be loaded. You can still use a custom
+              service.
+            </p>
           )}
-        </Field>
-      </div>
-      {presetsFailed && (
-        <p className="text-xs text-muted-foreground">
-          The preset list could not be loaded. You can still use a custom
-          service.
-        </p>
+          {preset && !form.replacePresetRules && (
+            <p className="text-xs text-muted-foreground">
+              The {preset.display_name} preset covers{" "}
+              {preset.rules.map(ruleCoverage).join(", ")}.
+            </p>
+          )}
+          {presetWarnings.map((warning) => (
+            <p key={warning} className={warningClass}>
+              {warning}
+            </p>
+          ))}
+          {usesOwnRules(form) && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <RuleHostField {...ruleEditing(0, primaryRule)} />
+              <RuleSendFields {...ruleEditing(0, primaryRule)} />
+            </div>
+          )}
+          {overlaps.map((warning) => (
+            <p key={warning} className={warningClass}>
+              {warning}
+            </p>
+          ))}
+        </>
       )}
-      {preset && !form.replacePresetRules && (
-        <p className="text-xs text-muted-foreground">
-          The {preset.display_name} preset covers{" "}
-          {preset.rules.map(ruleCoverage).join(", ")}.
-        </p>
-      )}
-      {presetWarnings.map((warning) => (
-        <p key={warning} className={warningClass}>
-          {warning}
-        </p>
-      ))}
-      {usesOwnRules(form) && (
-        <div className="grid gap-3 sm:grid-cols-2">
-          <RuleHostField {...ruleEditing(0, primaryRule)} />
-          <RuleSendFields {...ruleEditing(0, primaryRule)} />
-        </div>
-      )}
-      {saveKey && (
+      <Field
+        label="Name"
+        id={`${id}-name`}
+        hint={
+          editing
+            ? "The name cannot be changed."
+            : "Lowercase letters, digits, - and _. It cannot be changed later."
+        }
+        error={problemAt("name")}
+        className="max-w-md"
+      >
+        {(control) => (
+          <Input
+            {...control}
+            className={inputClass}
+            value={form.name}
+            disabled={nameLocked || disabled}
+            onChange={(event) => {
+              setNameTyped(event.target.value !== "");
+              set({ name: event.target.value });
+            }}
+          />
+        )}
+      </Field>
+      {saveKey && !limiting && (
         <Field
           label="API key"
           id={`${id}-key`}
@@ -402,36 +485,66 @@ export function EgressServiceEditor({
           )}
         </Field>
       )}
-      {showGithubHelper && <GithubHelper onApply={applyGithubRules} />}
+      {showGithubHelper && (
+        <GithubHelper
+          input={helperInput}
+          onInput={(next) => {
+            setConfirmingSave(false);
+            setHelperErrors([]);
+            setHelperInput(next);
+          }}
+          errors={helperErrors}
+          onApply={limiting ? undefined : applyTypedRepositories}
+          limit={limiting}
+        />
+      )}
+      {limiting && (
+        <>
+          {!restored.exact && (
+            <p className={warningClass}>
+              Some rules of this limit are not repositories from the list.
+              Changing the list replaces them.
+            </p>
+          )}
+          {scope !== undefined && context === "personal" && (
+            <p className="text-xs text-muted-foreground">
+              {administratorLimitNote(scope)}
+            </p>
+          )}
+        </>
+      )}
 
-      <section className="space-y-3">
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          aria-expanded={moreOpen}
-          aria-controls={`${id}-more`}
-          onClick={() => setMoreOpen((open) => !open)}
-        >
-          More options
-        </Button>
-        {moreOpen && (
-          <MoreOptions
-            id={`${id}-more`}
-            form={form}
-            set={set}
-            problemAt={problemAt}
-            disabled={disabled}
-            context={context}
-            scope={scope}
-            sharedTarget={sharedTarget}
-            preset={preset}
-            onGithub={showGithubHelper}
-            configPlaceholders={configPlaceholders}
-            ruleEditing={ruleEditing}
-          />
-        )}
-      </section>
+      {!limiting && (
+        <section className="space-y-3">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-expanded={moreOpen}
+            aria-controls={`${id}-more`}
+            onClick={() => setMoreOpen((open) => !open)}
+          >
+            More options
+          </Button>
+          {moreOpen && (
+            <MoreOptions
+              id={`${id}-more`}
+              form={form}
+              set={set}
+              problemAt={problemAt}
+              disabled={disabled}
+              context={context}
+              scope={scope}
+              sharedTarget={sharedTarget}
+              preset={preset}
+              providers={providers}
+              onGithub={showGithubHelper}
+              configPlaceholders={configPlaceholders}
+              ruleEditing={ruleEditing}
+            />
+          )}
+        </section>
+      )}
 
       {generalErrors.length > 0 && (
         <Alert variant="destructive" className="p-2">
@@ -459,7 +572,7 @@ export function EgressServiceEditor({
         <Button
           type="submit"
           size="sm"
-          disabled={busy !== null || presets === null}
+          disabled={busy !== null || (presets === null && !limiting)}
         >
           {busy === "save" ? (
             <>
@@ -471,6 +584,8 @@ export function EgressServiceEditor({
             </>
           ) : confirmingSave ? (
             "Save all changes"
+          ) : limiting ? (
+            "Save limit"
           ) : (
             "Save service"
           )}
@@ -493,12 +608,13 @@ export function EgressServiceEditor({
             disabled={busy !== null}
             onClick={() => setConfirmingDelete(true)}
           >
-            Delete service
+            {limiting ? "Remove limit" : "Delete service"}
           </Button>
         )}
         {editing && onDelete && confirmingDelete && (
           <span className="ml-auto flex flex-wrap items-center gap-2 text-xs">
-            Delete {name}?{deleteNote ? ` ${deleteNote}` : ""}
+            {limiting ? "Remove limit?" : `Delete ${name}?`}
+            {deleteNote ? ` ${deleteNote}` : ""}
             {saveWarning ? ` ${saveWarning}` : ""}
             <Button
               type="button"
@@ -507,7 +623,13 @@ export function EgressServiceEditor({
               disabled={busy !== null}
               onClick={() => void remove()}
             >
-              {busy === "delete" ? "Deleting…" : "Confirm delete"}
+              {busy === "delete"
+                ? limiting
+                  ? "Removing…"
+                  : "Deleting…"
+                : limiting
+                  ? "Confirm remove"
+                  : "Confirm delete"}
             </Button>
             <Button
               type="button"

@@ -269,4 +269,90 @@ describe("connection popup", () => {
       expect(vi.getTimerCount()).toBe(0);
     },
   );
+
+  describe("what the popup's own page says", () => {
+    const say = (
+      status: unknown,
+      overrides: { provider?: unknown; type?: unknown } & MessageEventInit = {},
+    ) => {
+      const { provider = "mail", type = "mindroom-oauth", ...init } = overrides;
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: authorization.completion_origin,
+          source: popup as unknown as Window,
+          data: { type, provider, status },
+          ...init,
+        }),
+      );
+    };
+    const open = async () => {
+      const operation = connectWithPopup(
+        "mail",
+        async () => authorization,
+        controller.signal,
+      );
+      await Promise.resolve();
+      return { operation };
+    };
+
+    it("finishes on connected and leaves the popup to close itself", async () => {
+      const { operation } = await open();
+      say("connected");
+      await expect(operation).resolves.toBeUndefined();
+      expect(popup.close).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("stops Connecting as soon as it says cancelled, and the popup shows its words until it closes", async () => {
+      const { operation } = await open();
+      const rejection = expect(operation).rejects.toThrow(
+        "Authorization was cancelled.",
+      );
+      say("cancelled");
+      await rejection;
+      expect(popup.close).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("stops Connecting on error with a message of its own", async () => {
+      const { operation } = await open();
+      const rejection = expect(operation).rejects.toThrow(
+        "Could not connect. Try again.",
+      );
+      say("error");
+      await rejection;
+      expect(popup.close).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not mistake the popup closing itself for a second answer", async () => {
+      const { operation } = await open();
+      say("cancelled");
+      await expect(operation).rejects.toThrow(/cancelled/i);
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("ignores a wrong origin, source, provider, status, or type", async () => {
+      const { operation } = await open();
+      say("connected", { origin: "https://untrusted.example.com" });
+      say("connected", { source: window });
+      say("connected", { provider: "other" });
+      say("pending");
+      say(undefined);
+      say("connected", { type: "something-else" });
+      expect(popup.close).not.toHaveBeenCalled();
+      expect(popup.location.href).toBe(authorization.auth_url);
+      say("connected");
+      await expect(operation).resolves.toBeUndefined();
+    });
+
+    it("still closes the popup itself for the older page that only says it is complete", async () => {
+      const { operation } = await open();
+      complete();
+      await expect(operation).resolves.toBeUndefined();
+      expect(popup.close).toHaveBeenCalledOnce();
+    });
+  });
 });

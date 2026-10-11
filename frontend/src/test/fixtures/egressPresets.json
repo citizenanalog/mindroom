@@ -1,4 +1,38 @@
 {
+  "oauth_providers": [
+    {
+      "display_name": "GitHub",
+      "id": "github"
+    },
+    {
+      "display_name": "Google Drive",
+      "id": "google_drive"
+    },
+    {
+      "display_name": "Gmail",
+      "id": "google_gmail"
+    },
+    {
+      "display_name": "Google Calendar",
+      "id": "google_calendar"
+    },
+    {
+      "display_name": "Google Sheets",
+      "id": "google_sheets"
+    },
+    {
+      "display_name": "Google Docs",
+      "id": "google_docs"
+    },
+    {
+      "display_name": "Google Tasks",
+      "id": "google_tasks"
+    },
+    {
+      "display_name": "Atlassian",
+      "id": "atlassian"
+    }
+  ],
   "presets": [
     {
       "description": "GitHub API, gh CLI, and git over HTTPS",

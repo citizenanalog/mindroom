@@ -85,12 +85,22 @@ export interface EgressOAuthStatus {
 /** Who defined a service: the administrator in config.yaml or the caller's own scope. */
 export type EgressServiceSource = "config" | "user";
 
-/** Where a rule applies; the server never sends how it authenticates. */
+/**
+ * How a listed rule sends the key. A custom header template reads `template`,
+ * and a restrict-only service's rule, which sends nothing, reads `null`.
+ */
+export type EgressRuleAuthType = EgressAuthType | "template";
+
+/** Where a rule applies and how it sends the key, never the key itself. */
 export interface EgressRuleSummary {
   host: string;
   /** `null` matches any port. */
   port: number | null;
   path_prefix: string;
+  /** Absent in responses from before the server sent it. */
+  auth_type?: EgressRuleAuthType | null;
+  /** The header or query parameter the key goes in; `null` for any other way to send it. */
+  auth_name?: string | null;
 }
 
 export interface EgressCredentialService {
@@ -101,6 +111,12 @@ export interface EgressCredentialService {
   source?: EgressServiceSource;
   /** Where the service applies, in rule order. Absent in responses from before the server sent it. */
   rules?: EgressRuleSummary[];
+  /**
+   * The service only limits which paths a request may reach: its rules never
+   * pick a credential, and it has no key or account. Absent in responses from
+   * before the server sent it.
+   */
+  restrict_only?: boolean;
   /**
    * The names of the variables the service sets in the sandbox, a preset's
    * included, so a service of one's own that sets the same one can be warned
@@ -189,6 +205,8 @@ export interface AuthoredEgressService {
   /** Operator-only; the personal API rejects it. */
   oauth_on_shared_workers?: boolean;
   restrict_to_rules?: boolean;
+  /** Only limits paths: no key, account, or placeholders, and its rules never pick a credential. */
+  restrict_only?: boolean;
 }
 
 /** A built-in service preset as the server expands it. */
@@ -200,6 +218,19 @@ export interface EgressPreset {
   oauth_provider: string | null;
   rules: EgressRuleSummary[];
   placeholder_env: Record<string, string>;
+}
+
+/** An account login the editor offers for a service. */
+export interface EgressOAuthProviderOption {
+  id: string;
+  display_name: string;
+}
+
+/** What the presets endpoints return. */
+export interface EgressPresetCatalog {
+  presets: EgressPreset[];
+  /** The providers a service can sign in with. Absent in responses from before the server sent it. */
+  oauth_providers?: EgressOAuthProviderOption[];
 }
 
 /** One row of the request log. */

@@ -47,6 +47,7 @@ export function useServiceSubmit({
   onSaved,
   onDelete,
   openMoreOptions,
+  prepareForm,
 }: {
   form: EgressServiceForm;
   options: EditorOptions;
@@ -61,6 +62,12 @@ export function useServiceSubmit({
   onDelete?: () => Promise<void>;
   /** Show the section that holds a problem the basic form does not. */
   openMoreOptions: () => void;
+  /**
+   * Called when a save starts, to bring in what the person typed but did not
+   * apply yet. Returns the form to save, or `null` when something it holds is
+   * wrong, which it shows itself and which stops the save.
+   */
+  prepareForm?: () => EgressServiceForm | null;
 }): {
   formRef: RefObject<HTMLFormElement | null>;
   /** The form's problems, empty until the user has tried to save. */
@@ -104,7 +111,12 @@ export function useServiceSubmit({
     if (busy) return;
     setAttempted(true);
     setServerError(null);
-    const found = validateService(form, options, settings);
+    const current = prepareForm ? prepareForm() : form;
+    if (current === null) {
+      setFocusRequest((count) => count + 1);
+      return;
+    }
+    const found = validateService(current, options, settings);
     if (found.length > 0) {
       if (found.some(needsMoreOptions)) openMoreOptions();
       setFocusRequest((count) => count + 1);
@@ -116,12 +128,12 @@ export function useServiceSubmit({
     }
     setConfirmingSave(false);
     setBusy("save");
-    const authored = serializeService(form, options, service);
-    const signature = JSON.stringify([form.name, authored]);
+    const authored = serializeService(current, options, service);
+    const signature = JSON.stringify([current.name, authored]);
     try {
       // The service goes first, and the key only after it is written.
       if (signature !== savedSignature) {
-        await onSave(form.name, authored);
+        await onSave(current.name, authored);
         setSavedSignature(signature);
       }
     } catch (cause) {
@@ -131,7 +143,7 @@ export function useServiceSubmit({
     }
     if (saveKey && apiKey.trim() !== "") {
       try {
-        await saveKey(apiKey, form.name);
+        await saveKey(apiKey, current.name);
       } catch (cause) {
         const reason = reasonOf(cause, "Could not save the key.");
         setServerError(

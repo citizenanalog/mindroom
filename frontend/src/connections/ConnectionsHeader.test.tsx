@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionsHeader } from "./ConnectionsHeader";
 import type { ConnectionsIdentity } from "./types";
@@ -101,5 +101,53 @@ describe("connections header", () => {
     ).toBeVisible();
     expect(screen.queryByText(/Signed in as/)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("the notice after a redirect from the dashboard", () => {
+  const NOTICE =
+    "The dashboard is for administrators. Manage your agents' keys and accounts here.";
+  afterEach(() => window.history.replaceState({}, "", "/"));
+
+  it("tells someone sent here from the dashboard that it is for administrators", () => {
+    window.history.replaceState({}, "", "/connections?notice=admin-only");
+    renderHeader();
+    expect(screen.getByRole("alert")).toHaveTextContent(NOTICE);
+  });
+
+  it("shows nothing without the notice, or for one it does not know", () => {
+    renderHeader();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    cleanup();
+    window.history.replaceState({}, "", "/connections?notice=something-else");
+    renderHeader();
+    expect(screen.queryByRole("alert")).toBeNull();
+    cleanup();
+    window.history.replaceState({}, "", "/connections?notice=");
+    renderHeader();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("the explanation behind How this works", () => {
+  it("is hidden until the disclosure is opened, and offered only when there is one", () => {
+    render(
+      <ConnectionsHeader
+        current="keys"
+        title="Your title"
+        howItWorks="The long explanation."
+      >
+        The intro.
+      </ConnectionsHeader>,
+    );
+    const toggle = screen.getByRole("button", { name: "How this works" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("The long explanation.")).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("The long explanation.")).toBeVisible();
+    cleanup();
+    renderHeader();
+    expect(screen.queryByRole("button", { name: "How this works" })).toBeNull();
   });
 });

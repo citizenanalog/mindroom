@@ -2,16 +2,32 @@ interface OAuthCompletionOptions {
   provider: string;
   expectedOrigin: () => string | null;
   pollIntervalMs: number;
+  /** What a popup that was closed or answered `cancelled` reports. */
   cancellationMessage: string;
-  onSettled: (error?: Error) => void;
+  /** What a popup that answered `error` reports. */
+  errorMessage?: string;
+  /**
+   * Called once. `popupClosesItself` is true when the popup's own page
+   * answered, and closes itself after a moment so that its text can be read.
+   */
+  onSettled: (error?: Error, popupClosesItself?: boolean) => void;
 }
 
-function isOAuthCompleteMessage(
+type Outcome = "connected" | "cancelled" | "error";
+
+// The older page only ever says `connected`, and closes the popup itself at once.
+const LEGACY_COMPLETE_TYPE = "mindroom:oauth-complete";
+// The pages of the OAuth popup answer `connected`, `cancelled`, or `error`.
+const OUTCOME_TYPE = "mindroom-oauth";
+const OUTCOMES: readonly unknown[] = ["connected", "cancelled", "error"];
+
+/** What the popup's page said, or null when the message is not from this popup, origin, and provider. */
+function readOutcome(
   event: MessageEvent,
   popup: Window,
   provider: string,
   expectedOrigin: string | null,
-): boolean {
+): { status: Outcome; popupClosesItself: boolean } | null {
   if (
     expectedOrigin === null ||
     event.origin !== expectedOrigin ||
@@ -19,13 +35,14 @@ function isOAuthCompleteMessage(
     event.data === null ||
     typeof event.data !== "object"
   )
-    return false;
+    return null;
   const data = event.data as Record<string, unknown>;
-  return (
-    data.type === "mindroom:oauth-complete" &&
-    data.provider === provider &&
-    data.status === "connected"
-  );
+  if (data.provider !== provider) return null;
+  if (data.type === LEGACY_COMPLETE_TYPE && data.status === "connected")
+    return { status: "connected", popupClosesItself: false };
+  if (data.type === OUTCOME_TYPE && OUTCOMES.includes(data.status))
+    return { status: data.status as Outcome, popupClosesItself: true };
+  return null;
 }
 
 /** Own completion filtering, single settlement, and popup-observer cleanup. */
@@ -34,23 +51,31 @@ export function watchOAuthCompletion(
   options: OAuthCompletionOptions,
 ) {
   let finished = false;
-  const finish = (error?: Error) => {
+  const finish = (error?: Error, popupClosesItself = false) => {
     if (finished) return;
     finished = true;
     window.clearInterval(poll);
     window.removeEventListener("message", onMessage);
-    options.onSettled(error);
+    options.onSettled(error, popupClosesItself);
   };
   const onMessage = (event: MessageEvent) => {
-    if (
-      isOAuthCompleteMessage(
-        event,
-        popup,
-        options.provider,
-        options.expectedOrigin(),
-      )
-    )
-      finish();
+    const outcome = readOutcome(
+      event,
+      popup,
+      options.provider,
+      options.expectedOrigin(),
+    );
+    if (outcome === null) return;
+    finish(
+      outcome.status === "connected"
+        ? undefined
+        : new Error(
+            outcome.status === "cancelled"
+              ? options.cancellationMessage
+              : (options.errorMessage ?? "Authorization failed. Try again."),
+          ),
+      outcome.popupClosesItself,
+    );
   };
   const poll = window.setInterval(() => {
     if (popup.closed) finish(new Error(options.cancellationMessage));

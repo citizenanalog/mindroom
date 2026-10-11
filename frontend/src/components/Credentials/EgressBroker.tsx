@@ -21,7 +21,7 @@ import type {
   AuthoredEgressService,
   EgressCredentialService,
   EgressOAuthStatus,
-  EgressPreset,
+  EgressPresetCatalog,
   EgressRuleSummary,
   EgressServiceSource,
 } from "@/connections/types";
@@ -76,6 +76,8 @@ interface BrokerService {
   description: string;
   source: EgressServiceSource;
   rules: EgressRuleSummary[];
+  /** The service only limits paths: it has no key or account. Absent from older servers. */
+  restrict_only?: boolean;
   configured: boolean;
   updated_at: string | null;
   active_source: "key" | "oauth" | null;
@@ -112,16 +114,17 @@ type LogState =
   | { kind: "not-running" }
   | { kind: "error" };
 
+// The path comes last because it is the one that can be long; it is cut short
+// with its full value as a title, and the duration is in the time's title.
 const LOG_COLUMNS = [
   "Time",
   "User",
   "Agent",
   "Method",
   "Host",
-  "Path",
-  "Service",
   "Status",
-  "Duration",
+  "Service",
+  "Path",
 ];
 
 const NO_FILTERS: LogFilters = { user: "", agent: "", host: "", service: "" };
@@ -135,6 +138,8 @@ const STALE_SAVE_MESSAGE =
 const USER_SERVICE_LABEL = "User service";
 const DELETE_WARNING =
   "This removes the service from the configuration. Saved keys stay stored and apply again if a service with the same name is added back.";
+const REMOVE_LIMIT_WARNING =
+  "This removes the limit from the configuration. The services it limited can then reach every path their rules allow.";
 // Saving writes the whole draft, so the other unsaved changes go out with the service.
 const OTHER_CHANGES_WARNING =
   "This also saves your other unsaved settings changes.";
@@ -177,11 +182,8 @@ function saveFailureMessage(
   return issues.length > 0 ? issues.join("; ") : result.message;
 }
 
-async function loadPresets(): Promise<EgressPreset[]> {
-  const payload = await fetchJSON<{ presets: EgressPreset[] }>(
-    API_ENDPOINTS.egressBroker.presets,
-  );
-  return payload.presets;
+function loadPresets(): Promise<EgressPresetCatalog> {
+  return fetchJSON<EgressPresetCatalog>(API_ENDPOINTS.egressBroker.presets);
 }
 
 function canUseEgress(agent: Agent, defaults: Config["defaults"]): boolean {
@@ -352,6 +354,12 @@ function ServiceSection({
     onDelete: (service) => deleteService(service.name),
     deleteWarning: () =>
       saveWarning ? `${DELETE_WARNING} ${saveWarning}` : DELETE_WARNING,
+    // A service in the config that only limits paths is changed and removed as a limit.
+    onChangeLimit: (limit) => requestEdit(limit.name),
+    onRemoveLimit: (limit) => deleteService(limit.name),
+    removeLimitWarning: saveWarning
+      ? `${REMOVE_LIMIT_WARNING} ${saveWarning}`
+      : REMOVE_LIMIT_WARNING,
     labels: { user: USER_SERVICE_LABEL },
   };
 
@@ -472,7 +480,14 @@ function ServiceSection({
   );
 }
 
-function LogTable({ records }: { records: AuditRecord[] }) {
+function LogTable({
+  records,
+  agentNames,
+}: {
+  records: AuditRecord[];
+  /** The display name of each configured agent, by its id. */
+  agentNames: ReadonlyMap<string, string>;
+}) {
   if (records.length === 0)
     return (
       <p className="text-sm text-muted-foreground">No requests logged yet.</p>
@@ -496,20 +511,22 @@ function LogTable({ records }: { records: AuditRecord[] }) {
               key={`${record.at}-${index}`}
               className="border-t border-border/60"
             >
-              <td className="whitespace-nowrap px-3 py-2">
+              <td
+                className="whitespace-nowrap px-3 py-2"
+                title={`${record.duration_ms} ms`}
+              >
                 {new Date(record.at).toLocaleString()}
               </td>
-              <td className="px-3 py-2">{record.requester_id ?? "-"}</td>
-              <td className="px-3 py-2">{record.agent_name ?? "-"}</td>
+              <td className="break-all px-3 py-2">
+                {record.requester_id ?? "-"}
+              </td>
+              <td className="px-3 py-2">
+                {record.agent_name === null
+                  ? "-"
+                  : (agentNames.get(record.agent_name) ?? record.agent_name)}
+              </td>
               <td className="px-3 py-2 font-mono text-xs">{record.method}</td>
               <td className="px-3 py-2">{record.host}</td>
-              <td
-                className="max-w-xs truncate px-3 py-2 font-mono text-xs"
-                title={record.path}
-              >
-                {record.path}
-              </td>
-              <td className="px-3 py-2">{record.service ?? "-"}</td>
               <td className="px-3 py-2">
                 <Badge
                   variant={record.status >= 400 ? "destructive" : "secondary"}
@@ -523,8 +540,12 @@ function LogTable({ records }: { records: AuditRecord[] }) {
                   </div>
                 )}
               </td>
-              <td className="whitespace-nowrap px-3 py-2">
-                {record.duration_ms} ms
+              <td className="px-3 py-2">{record.service ?? "-"}</td>
+              <td
+                className="max-w-[14rem] truncate px-3 py-2 font-mono text-xs"
+                title={record.path}
+              >
+                {record.path}
               </td>
             </tr>
           ))}
@@ -535,6 +556,16 @@ function LogTable({ records }: { records: AuditRecord[] }) {
 }
 
 function LogSection() {
+  const agents = useConfigStore((state) => state.agents);
+  const agentNames = useMemo(
+    () =>
+      new Map(
+        agents.flatMap((agent) =>
+          agent.display_name ? [[agent.id, agent.display_name] as const] : [],
+        ),
+      ),
+    [agents],
+  );
   const [filters, setFilters] = useState<LogFilters>(NO_FILTERS);
   const [log, setLog] = useState<LogState>({ kind: "loading" });
   const operation = useRef<AbortController | null>(null);
@@ -636,7 +667,9 @@ function LogSection() {
           <AlertDescription>{LOG_ERROR_MESSAGE}</AlertDescription>
         </Alert>
       )}
-      {log.kind === "ready" && <LogTable records={log.records} />}
+      {log.kind === "ready" && (
+        <LogTable records={log.records} agentNames={agentNames} />
+      )}
       {/* The CA only exists while the broker runs, so the link would 409. */}
       {log.kind === "not-running" ? (
         <Button size="sm" variant="outline" disabled>

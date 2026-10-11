@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   PASS_THROUGH_CAPTION,
+  administratorLimitNote,
   deleteServiceWarning,
   disconnectDescription,
   formatList,
   personalAccountRefusal,
   personalSandboxRefusal,
+  personalScopeLine,
+  removeLimitWarning,
   sharedAccountBody,
   sharedAccountStatus,
   sharedAgentNote,
@@ -100,9 +103,50 @@ describe("account copy", () => {
     );
   });
 
-  it("tells the viewer that administrators can see the requests too", () => {
+  it("tells the viewer that administrators can see the requests too, and that only their own are shown", () => {
     expect(PASS_THROUGH_CAPTION).toBe(
-      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).",
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.",
+    );
+  });
+
+  it("says who uses a personal agent's keys, and nothing for a shared one", () => {
+    expect(personalScopeLine("user_agent")).toBe(
+      "Only you use this agent's keys.",
+    );
+    expect(personalScopeLine("user")).toBe(
+      "Shared by all your agents in your personal workspace.",
+    );
+    expect(personalScopeLine("shared")).toBeNull();
+    expect(personalScopeLine("unscoped")).toBeNull();
+  });
+
+  it("says for whom a restriction also limits the administrator's services", () => {
+    expect(administratorLimitNote("user_agent")).toBe(
+      "This also limits services from your administrator on these hosts, for this agent only.",
+    );
+    expect(administratorLimitNote("user")).toBe(
+      "This also limits services from your administrator on these hosts, for all your agents that share your personal workspace.",
+    );
+    expect(administratorLimitNote("shared")).toBe(
+      "This also limits services from your administrator on these hosts, for everyone using this agent.",
+    );
+    expect(administratorLimitNote("unscoped")).toBe(
+      "This also limits services from your administrator on these hosts, for every agent without a scope.",
+    );
+  });
+
+  it("says what removing a limit gives back, to whom", () => {
+    expect(removeLimitWarning("user_agent", "Mind", [])).toBe(
+      "This removes the limit. Your Mind can then reach every repository the key or connected account allows.",
+    );
+    expect(removeLimitWarning("user", "Mind", ["Mind", "Notes"])).toBe(
+      "This removes the limit. All your agents that share your personal workspace (Mind, Notes) can then reach every repository the key or connected account allows.",
+    );
+    expect(removeLimitWarning("shared", "Team Bot", [])).toBe(
+      "This removes the limit. Everyone using Team Bot can then reach every repository the key or connected account allows.",
+    );
+    expect(removeLimitWarning("unscoped", "Team Bot", [])).toBe(
+      "This removes the limit. Every agent without a scope can then reach every repository the key or connected account allows.",
     );
   });
 });

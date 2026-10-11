@@ -17,6 +17,7 @@ import {
   vi,
 } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
+import { githubRepositoryRules } from "@/connections/egressServiceModel";
 import { EgressBroker } from "./EgressBroker";
 
 const NOT_RUNNING =
@@ -866,10 +867,9 @@ describe("egress broker request log", () => {
       "Agent",
       "Method",
       "Host",
-      "Path",
-      "Service",
       "Status",
-      "Duration",
+      "Service",
+      "Path",
     ]);
     expect(
       within(rows[1])
@@ -878,13 +878,13 @@ describe("egress broker request log", () => {
     ).toEqual([
       new Date(newest.at).toLocaleString(),
       "@bob:example.com",
-      "coder",
+      // The agent is named as the config names it, not by its id.
+      "Agent coder",
       "POST",
       "api.github.com",
-      "/repos/acme/app/issues",
-      "github",
       "201",
-      "87 ms",
+      "github",
+      "/repos/acme/app/issues",
     ]);
     expect(
       within(rows[2])
@@ -896,13 +896,37 @@ describe("egress broker request log", () => {
       "-",
       "GET",
       "example.com",
-      "/",
-      "-",
       // The refusal code sits beside the status.
       "403host_not_allowed",
-      "3 ms",
+      "-",
+      "/",
     ]);
     expect(within(rows[1]).queryByText("host_not_allowed")).toBeNull();
+  });
+
+  it("keeps the duration in the time's title and cuts a long path short with its full value as the title", async () => {
+    const path = `/repos/acme/app/${"very-long-segment/".repeat(12)}issues`;
+    logsResponse = () => json({ records: [{ ...newest, path }] });
+    render(<EgressBroker />);
+
+    const table = await screen.findByRole("table", { name: "Request log" });
+    const cells = within(within(table).getAllByRole("row")[1]).getAllByRole(
+      "cell",
+    );
+    expect(cells[0]).toHaveAttribute("title", "87 ms");
+    expect(within(table).queryByText("87 ms")).toBeNull();
+    const pathCell = cells[cells.length - 1];
+    expect(pathCell).toHaveAttribute("title", path);
+    expect(pathCell).toHaveClass("truncate");
+  });
+
+  it("names an agent the config does not know by its id", async () => {
+    logsResponse = () =>
+      json({ records: [{ ...newest, agent_name: "retired_agent" }] });
+    render(<EgressBroker />);
+
+    const table = await screen.findByRole("table", { name: "Request log" });
+    expect(within(table).getByText("retired_agent")).toBeInTheDocument();
   });
 
   it("offers the user filter without a value until one is typed", async () => {
@@ -1255,6 +1279,139 @@ describe("egress broker service editor", () => {
         .getAllByRole("option")
         .map((option) => option.textContent),
     ).toEqual(["Custom", ...egressPresets.presets.map((p) => p.display_name)]);
+  });
+
+  it("offers the account logins the presets endpoint lists, by display name", async () => {
+    render(<EgressBroker />);
+    await screen.findByLabelText("GitHub");
+    fireEvent.click(screen.getByRole("button", { name: "Add service" }));
+    await presetsReady();
+    openMoreOptions();
+    const login = screen.getByLabelText("Account login (optional)");
+    expect(login.tagName).toBe("SELECT");
+    expect(
+      within(login)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([
+      "No account login",
+      ...egressPresets.oauth_providers.map((p) => p.display_name),
+    ]);
+  });
+
+  it("saves a new custom service with its website as the display name", async () => {
+    render(<EgressBroker />);
+    await screen.findByLabelText("GitHub");
+    fireEvent.click(screen.getByRole("button", { name: "Add service" }));
+    await presetsReady();
+    fill("Website", "https://httpbin.org/anything");
+    save();
+
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
+    expect(updateConfigValue).toHaveBeenCalledWith(
+      ["egress_broker", "services", "httpbin"],
+      {
+        display_name: "httpbin.org",
+        rules: [{ host: "httpbin.org", auth: { type: "bearer" } }],
+      },
+    );
+  });
+
+  describe("a service in the config that only limits paths", () => {
+    const limitRules = githubRepositoryRules("acme/app", {
+      uploads: false,
+      graphql: false,
+    }).rules;
+    const authoredLimit = {
+      display_name: "GitHub (acme/app)",
+      rules: limitRules,
+      restrict_to_rules: true,
+      restrict_only: true,
+    };
+    beforeEach(() => {
+      storeState = {
+        ...storeState,
+        config: {
+          defaults: { tools: ["shell"] },
+          egress_broker: {
+            services: { github: githubPreset, "acme-only": authoredLimit },
+          },
+        },
+      };
+      services = [
+        configRow("github", "GitHub", githubRules),
+        {
+          ...configRow(
+            "acme-only",
+            "GitHub (acme/app)",
+            limitRules.map((rule) => ({
+              host: rule.host,
+              port: null,
+              path_prefix: rule.path_prefix ?? "/",
+            })),
+          ),
+          restrict_only: true,
+        },
+      ];
+    });
+
+    it("is a row with no key or status, that can be changed and removed", async () => {
+      render(<EgressBroker />);
+      const row = await screen.findByLabelText("GitHub (acme/app)");
+      expect(within(row).getByText("Limit only")).toBeVisible();
+      expect(within(row).queryByText("Not set")).toBeNull();
+      expect(within(row).queryByRole("button", { name: /key/i })).toBeNull();
+      expect(
+        within(row).getByRole("button", {
+          name: "Change limit for GitHub (acme/app)",
+        }),
+      ).toBeVisible();
+    });
+
+    it("opens as a limit in the editor and saves it back as authored", async () => {
+      render(<EgressBroker />);
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Change limit for GitHub (acme/app)",
+        }),
+      );
+      const form = await screen.findByRole("form", { name: "Change limit" });
+      expect(within(form).getByLabelText("GitHub repositories")).toHaveValue(
+        "acme/app",
+      );
+      expect(
+        within(form).queryByText(/limits services from your administrator/),
+      ).toBeNull();
+      fireEvent.click(within(form).getByRole("button", { name: "Save limit" }));
+      await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
+      expect(updateConfigValue).toHaveBeenCalledWith(
+        ["egress_broker", "services", "acme-only"],
+        authoredLimit,
+      );
+    });
+
+    it("is removed from the config after asking", async () => {
+      render(<EgressBroker />);
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Remove limit for GitHub (acme/app)",
+        }),
+      );
+      const dialog = await screen.findByRole("dialog", {
+        name: "Remove the limit on GitHub (acme/app)?",
+      });
+      expect(
+        within(dialog).getByText(/removes the limit from the configuration/),
+      ).toBeVisible();
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Remove limit" }),
+      );
+      await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
+      expect(updateConfigValue).toHaveBeenCalledWith(
+        ["egress_broker", "services", "acme-only"],
+        undefined,
+      );
+    });
   });
 
   it("edits a preset service without expanding it", async () => {

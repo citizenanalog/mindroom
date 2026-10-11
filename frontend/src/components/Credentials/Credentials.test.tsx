@@ -25,6 +25,14 @@ vi.mock("./EgressBroker", async (importOriginal) => {
 
 global.fetch = vi.fn();
 
+/** The raw payloads start collapsed, so open them as a person would. */
+function renderOpen() {
+  render(<Credentials />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Raw credential payloads (advanced)" }),
+  );
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => {
@@ -63,7 +71,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect(screen.getByText("Configured")).toBeInTheDocument();
@@ -85,7 +93,7 @@ describe("Credentials", () => {
       json: async () => [],
     });
 
-    render(<Credentials />);
+    renderOpen();
 
     await screen.findByText(/No services found yet/);
     expect(screen.getByTestId("egress-broker")).toBeInTheDocument();
@@ -136,13 +144,36 @@ describe("Credentials", () => {
     ).toBeTruthy();
   });
 
-  it("names the raw editor's save button Save payload", async () => {
+  it("collapses the raw payloads until the heading is opened", async () => {
     (global.fetch as any).mockResolvedValue({
       ok: true,
       json: async () => [],
     });
 
     render(<Credentials />);
+
+    const toggle = screen.getByRole("button", {
+      name: "Raw credential payloads (advanced)",
+    });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByPlaceholderText('{"api_key":"..."}')).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save payload" })).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByPlaceholderText('{"api_key":"..."}'),
+    ).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByPlaceholderText('{"api_key":"..."}')).toBeNull();
+  });
+
+  it("names the raw editor's save button Save payload", async () => {
+    (global.fetch as any).mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+
+    renderOpen();
 
     await screen.findByText(/No services found yet/);
     expect(
@@ -173,7 +204,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     const editor = screen.getByPlaceholderText(
       '{"api_key":"..."}',
@@ -237,7 +268,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await screen.findByText("Empty");
     await waitFor(() => {
@@ -312,7 +343,7 @@ describe("Credentials", () => {
       },
     );
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect((global.fetch as any).mock.calls).toHaveLength(1);
@@ -364,7 +395,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect((global.fetch as any).mock.calls).toHaveLength(3);
@@ -413,7 +444,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect((global.fetch as any).mock.calls).toHaveLength(3);
@@ -466,7 +497,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect((global.fetch as any).mock.calls).toHaveLength(3);
@@ -494,7 +525,7 @@ describe("Credentials", () => {
       json: async () => [],
     });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect((global.fetch as any).mock.calls).toHaveLength(1);
@@ -537,7 +568,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect(screen.getByText("good_service")).toBeInTheDocument();
@@ -582,7 +613,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     await waitFor(() => {
       expect((global.fetch as any).mock.calls).toHaveLength(4);
@@ -632,7 +663,7 @@ describe("Credentials", () => {
         }),
       });
 
-    render(<Credentials />);
+    renderOpen();
 
     const serviceBButton = await screen.findByRole("button", {
       name: /service_b/i,

@@ -7,6 +7,8 @@ import {
   PASS_THROUGH_CAPTION,
   PASSED_THROUGH,
   deleteServiceWarning,
+  personalScopeLine,
+  removeLimitWarning,
   sharedAgentNote,
 } from "./accountCopy";
 import { breakAfterUnderscores } from "./breakAfterUnderscores";
@@ -27,10 +29,12 @@ import type {
   EgressCredentialList,
   EgressCredentialService,
   EgressLogRecord,
-  EgressPreset,
+  EgressPresetCatalog,
 } from "./types";
 
 const LOG_LIMIT = 50;
+/** How many of the newest requests the table shows before Show all. */
+const LOG_PREVIEW = 10;
 const SERVICE_ERROR_MESSAGES: RequestErrorMessages = {
   forbidden: "You are not allowed to change the services of this agent.",
   // The server says why, such as that a shared agent needs a credential manager.
@@ -40,7 +44,12 @@ const SERVICE_ERROR_MESSAGES: RequestErrorMessages = {
 };
 
 type EditorState = (
-  | { kind: "add"; initialPreset?: string; initialName?: string }
+  | {
+      kind: "add";
+      initialName?: string;
+      /** Add a limit on GitHub repositories, which has no key of its own. */
+      restrictOnly?: boolean;
+    }
   | { kind: "edit"; name: string; service: AuthoredEgressService }
 ) & {
   /**
@@ -55,12 +64,11 @@ type LogState =
   | { kind: "ready"; records: EgressLogRecord[] }
   | { kind: "error"; message: string };
 
-async function loadPresets(signal: AbortSignal): Promise<EgressPreset[]> {
-  const data = await requestConnection<{ presets: EgressPreset[] }>(
+function loadPresets(signal: AbortSignal): Promise<EgressPresetCatalog> {
+  return requestConnection<EgressPresetCatalog>(
     "/api/connections/egress/presets",
     signal,
   );
-  return data.presets;
 }
 
 function servicePath(agentName: string, serviceName: string): string {
@@ -85,6 +93,7 @@ function limitedServiceName(taken: readonly string[]): string {
 function RecentRequests({ agentName }: { agentName: string }) {
   const [open, setOpen] = useState(false);
   const [log, setLog] = useState<LogState>({ kind: "loading" });
+  const [showAll, setShowAll] = useState(false);
   const request = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
@@ -117,6 +126,10 @@ function RecentRequests({ agentName }: { agentName: string }) {
     if (!open) void load();
     setOpen(!open);
   };
+
+  // The newest come first, so the first few are the ones to look at.
+  const records = log.kind === "ready" ? log.records : [];
+  const shownRecords = showAll ? records : records.slice(0, LOG_PREVIEW);
 
   return (
     <div className="border-t border-border/60">
@@ -195,7 +208,7 @@ function RecentRequests({ agentName }: { agentName: string }) {
                   </tr>
                 </thead>
                 <tbody className={STACKED.body}>
-                  {log.records.map((record, index) => {
+                  {shownRecords.map((record, index) => {
                     const refusal =
                       record.code ??
                       (record.kind === "denied" ? "refused" : null);
@@ -259,6 +272,18 @@ function RecentRequests({ agentName }: { agentName: string }) {
                 </tbody>
               </table>
             </div>
+          )}
+          {records.length > LOG_PREVIEW && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setShowAll(!showAll)}
+            >
+              {showAll
+                ? `Show latest ${LOG_PREVIEW}`
+                : `Show all (${records.length})`}
+            </Button>
           )}
         </div>
       )}
@@ -398,12 +423,19 @@ function AgentSection({
       setError(null);
       setEditor({
         kind: "add",
-        initialPreset: "github",
+        restrictOnly: true,
         initialName: limitedServiceName(
           agent.services.map((service) => service.name),
         ),
       });
     },
+    onChangeLimit: requestEdit,
+    onRemoveLimit: (limit) => remove(limit.name),
+    removeLimitWarning: removeLimitWarning(
+      agent.scope,
+      agent.agent_display_name,
+      agent.scope_agents,
+    ),
     limitDisabled: editor !== null,
   };
   const rowAgent: RowAgent = {
@@ -412,6 +444,9 @@ function AgentSection({
     managers: agent.managers,
     services: agent.services,
   };
+  const scopeLine = agent.shared
+    ? sharedAgentNote(agent.can_manage, agent.managers)
+    : personalScopeLine(agent.scope);
   const groups = [
     {
       label: "From your administrator",
@@ -453,9 +488,9 @@ function AgentSection({
           </Button>
         )}
       </div>
-      {agent.shared && (
+      {scopeLine && (
         <p className="border-b border-border/60 px-5 py-3 text-sm text-muted-foreground">
-          {sharedAgentNote(agent.can_manage, agent.managers)}
+          {scopeLine}
         </p>
       )}
       {error && (
@@ -477,12 +512,13 @@ function AgentSection({
             sharedTarget={agent.shared}
             name={editor.kind === "edit" ? editor.name : undefined}
             service={editor.kind === "edit" ? editor.service : null}
-            initialPreset={
-              editor.kind === "add" ? editor.initialPreset : undefined
-            }
             initialName={editor.kind === "add" ? editor.initialName : undefined}
+            initialRestrictOnly={
+              editor.kind === "add" && editor.restrictOnly === true
+            }
             takenNames={agent.services.map((service) => service.name)}
             configPlaceholders={configPlaceholderOwners(agent.services)}
+            agentServices={agent.services}
             scope={agent.scope}
             agentName={agent.agent_display_name}
             scopeAgents={agent.scope_agents}
@@ -569,13 +605,13 @@ export function EgressCredentials() {
   return (
     <main className="min-h-screen bg-muted/20 px-4 py-8 sm:px-6 sm:py-12">
       <div className="mx-auto max-w-4xl space-y-6">
-        <ConnectionsHeader current="keys" title="Your agents' API keys">
-          Connect an account or paste an API key for the services below, or add
-          a service of your own. MindRoom stores them and adds them to your
-          agents' requests to the matching websites. Your agents never get the
-          keys themselves, but a website can send a key back in its response (an
-          echo service does), so only add keys for sites you trust. Saved keys
-          cannot be read back.
+        <ConnectionsHeader
+          current="keys"
+          title="Your agents' API keys"
+          howItWorks="Connect an account or paste an API key for the services below, or add a service of your own. MindRoom stores them and adds them to your agents' requests to the matching websites. Your agents never get the keys themselves, but a website can send a key back in its response (an echo service does), so only add keys for sites you trust. Saved keys cannot be read back."
+        >
+          Connect accounts or add API keys; MindRoom adds them to your agents'
+          requests and your agents never get the keys themselves.
         </ConnectionsHeader>
         {error && (
           <Alert variant="destructive">

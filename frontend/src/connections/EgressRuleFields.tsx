@@ -8,6 +8,7 @@ import {
   type RuleFieldPart,
   type RuleForm,
   applyAuthChoice,
+  stripHostInput,
 } from "./egressServiceModel";
 
 /**
@@ -106,7 +107,10 @@ export function RuleHostField({
           className={inputClass}
           value={rule.host}
           disabled={disabled}
-          onChange={(event) => onChange({ ...rule, host: event.target.value })}
+          // A pasted address keeps only its host.
+          onChange={(event) =>
+            onChange({ ...rule, host: stripHostInput(event.target.value) })
+          }
         />
       )}
     </Field>

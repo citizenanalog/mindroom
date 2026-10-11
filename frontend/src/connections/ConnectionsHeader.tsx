@@ -1,4 +1,6 @@
 import { type ReactNode, useEffect, useState } from "react";
+import { ChevronDown } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import mindroomLogo from "../../../assets/logo/logo-mark-animated.svgz?url";
 import { requestConnection } from "./request";
 import type { ConnectionsIdentity } from "./types";
@@ -10,8 +12,17 @@ const LINKS: readonly { page: Page; href: string; label: string }[] = [
   { page: "keys", href: "/connections/egress", label: "API keys and accounts" },
 ];
 
+/** What a non-administrator who followed a link to the dashboard is told on arriving here. */
+const NOTICES: Record<string, string> = {
+  "admin-only":
+    "The dashboard is for administrators. Manage your agents' keys and accounts here.",
+};
+
 /**
  * Title, intro, who is signed in, and links between the Connections pages.
+ * `howItWorks` is the longer explanation behind a disclosure under the intro.
+ * A `notice` in the page's address, such as `admin-only` after a redirect,
+ * shows its text above the page.
  *
  * The identity is a courtesy: when it cannot be loaded the header shows the
  * links without it, and the page's own requests report any real failure.
@@ -19,13 +30,20 @@ const LINKS: readonly { page: Page; href: string; label: string }[] = [
 export function ConnectionsHeader({
   current,
   title,
+  howItWorks,
   children,
 }: {
   current: Page;
   title: string;
+  howItWorks?: ReactNode;
   children: ReactNode;
 }) {
   const [identity, setIdentity] = useState<ConnectionsIdentity | null>(null);
+  const [explaining, setExplaining] = useState(false);
+  const [notice] = useState(
+    () =>
+      NOTICES[new URLSearchParams(window.location.search).get("notice") ?? ""],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -55,8 +73,31 @@ export function ConnectionsHeader({
             {title}
           </h1>
           <p className="max-w-2xl text-sm text-muted-foreground">{children}</p>
+          {howItWorks && (
+            <div className="max-w-2xl space-y-1.5 text-sm text-muted-foreground">
+              <button
+                type="button"
+                aria-expanded={explaining}
+                aria-controls="how-this-works"
+                onClick={() => setExplaining(!explaining)}
+                className="inline-flex items-center gap-1 rounded-md font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                How this works
+                <ChevronDown
+                  aria-hidden="true"
+                  className={`h-3.5 w-3.5 transition-transform ${explaining ? "rotate-180" : ""}`}
+                />
+              </button>
+              {explaining && <p id="how-this-works">{howItWorks}</p>}
+            </div>
+          )}
         </div>
       </div>
+      {notice && (
+        <Alert>
+          <AlertDescription>{notice}</AlertDescription>
+        </Alert>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b pb-3 text-sm">
         <nav
           aria-label="Connections pages"

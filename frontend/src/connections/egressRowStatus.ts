@@ -1,8 +1,10 @@
-import { sharedAccountStatus } from "./accountCopy";
-import { limitedRepositories } from "./githubLimits";
+import { formatList, sharedAccountStatus } from "./accountCopy";
+import { BROKERED_PLACEHOLDER } from "./egressServiceModel";
+import { limitedRepositories, parseGithubLimit } from "./githubLimits";
 import type {
   EgressCredentialService,
   EgressOAuthStatus,
+  EgressRuleSummary,
   EgressServiceSource,
 } from "./types";
 
@@ -41,6 +43,12 @@ export interface ServiceEditing {
    * GitHub, when the viewer can manage the agent.
    */
   onLimitToRepositories?: (service: EgressCredentialService) => void;
+  /** Opens a limit (a restrict-only service of the viewer's) to change its repositories. */
+  onChangeLimit?: (limit: EgressCredentialService) => void;
+  /** Removes a limit; rejects with an Error whose message the row shows. */
+  onRemoveLimit?: (limit: EgressCredentialService) => Promise<void>;
+  /** What removing a limit gives back, for the question before it goes. */
+  removeLimitWarning?: string;
   /** Turns Limit to repositories off while the editor is open. */
   limitDisabled?: boolean;
 }
@@ -64,6 +72,13 @@ export function sharesAccount(
   );
 }
 
+function keySavedLabel(saved: string | null): string {
+  const date = saved ? new Date(saved) : null;
+  return date && !Number.isNaN(date.getTime())
+    ? `Key saved ${date.toLocaleDateString()}`
+    : "Key saved";
+}
+
 /** What the row's badge says about where the service's credential comes from. */
 export function statusLabel(
   service: EgressCredentialService,
@@ -71,7 +86,11 @@ export function statusLabel(
 ): string {
   const oauth = service.oauth;
   if (oauth) {
-    if (service.active_source === "key") return "Using API key";
+    // An account that cannot be used here leaves the key as all there is to say.
+    if (service.active_source === "key")
+      return oauth.unavailable_reason === null
+        ? "Using API key"
+        : keySavedLabel(service.key_updated_at ?? service.updated_at);
     if (service.active_source === "oauth")
       return sharesAccount(agent, oauth)
         ? sharedAccountStatus(oauth.account_label, agent.displayName)
@@ -81,10 +100,7 @@ export function statusLabel(
     return oauth.reset_required ? "Reset required" : "Not set";
   }
   if (!service.configured) return "Not set";
-  const updated = service.updated_at ? new Date(service.updated_at) : null;
-  return updated && !Number.isNaN(updated.getTime())
-    ? `Key saved ${updated.toLocaleDateString()}`
-    : "Key saved";
+  return keySavedLabel(service.updated_at);
 }
 
 export function removeWarning(service: EgressCredentialService): string {
@@ -118,14 +134,100 @@ export function limitedNote(service: EgressCredentialService): string | null {
   return service.description === text ? null : text;
 }
 
-/** "Sends to a.com, b.com:8443" for the hosts a service's rules cover, each once; null where the listing gives no rules. */
-export function hostsNote(service: EgressCredentialService): string | null {
-  const hosts = [
+/** The hosts a service's rules cover, each once, with the port when a rule names one. */
+function ruleHosts(rules: readonly EgressRuleSummary[] | undefined): string[] {
+  return [
     ...new Set(
-      (service.rules ?? []).map(
+      (rules ?? []).map(
         (rule) => `${rule.host}${rule.port === null ? "" : `:${rule.port}`}`,
       ),
     ),
   ];
+}
+
+/** "Sends to a.com, b.com:8443" for the hosts a service's rules cover, each once; null where the listing gives no rules. */
+export function hostsNote(service: EgressCredentialService): string | null {
+  const hosts = ruleHosts(service.rules);
   return hosts.length > 0 ? `Sends to ${hosts.join(", ")}` : null;
+}
+
+const SENT_AS: Record<string, (name: string | null | undefined) => string> = {
+  bearer: () => "as a bearer token",
+  header: (name) => (name ? `as header ${name}` : "as a header"),
+  query: (name) =>
+    name ? `as query parameter ${name}` : "as a query parameter",
+  basic: () => "with basic auth",
+  template: () => "with a custom header template",
+};
+
+/**
+ * How the service's rules send the key: "Sent as a bearer token", "Sent as
+ * header X-Api-Key", and so on, once for each way its rules differ. Null where
+ * the listing does not say, and for a service that sends no key.
+ */
+export function sentAsNote(service: EgressCredentialService): string | null {
+  const ways = [
+    ...new Set(
+      (service.rules ?? []).flatMap((rule) =>
+        rule.auth_type ? [SENT_AS[rule.auth_type]?.(rule.auth_name)] : [],
+      ),
+    ),
+  ].filter((way) => way !== undefined);
+  return ways.length > 0 ? `Sent ${formatList(ways)}` : null;
+}
+
+/**
+ * What the sandbox is told about the service: the variables it sets, or for a
+ * service with a key and nothing to set, that the agent must be told which
+ * website to use. Null where the listing does not name the variables, and for
+ * an account service, which the agent finds through the API it calls.
+ */
+export function agentSeesNote(service: EgressCredentialService): string | null {
+  const names = service.placeholder_names;
+  if (names === undefined || service.restrict_only === true) return null;
+  if (names.length > 0)
+    return `Your agent sees ${names.map((name) => `${name}=${BROKERED_PLACEHOLDER}`).join(", ")}`;
+  const hosts = ruleHosts(service.rules);
+  return service.oauth === null && hosts.length > 0
+    ? `Your agent is not told this key exists; mention ${formatList(hosts)} in your request.`
+    : null;
+}
+
+/** What happens to requests while the service has no key or account; null once it has, and for a limit. */
+export function unsetNote(service: EgressCredentialService): string | null {
+  const hosts = ruleHosts(service.rules);
+  return service.configured ||
+    service.restrict_only === true ||
+    hosts.length === 0
+    ? null
+    : `While no key is set, requests to ${formatList(hosts)} are refused.`;
+}
+
+/** The repositories a limit names, as `a/b, c/*`; "selected paths" when its rules name none. */
+export function limitTarget(limit: EgressCredentialService): string {
+  const { repositories } = parseGithubLimit(limit.rules);
+  return repositories.length > 0 ? repositories.join(", ") : "selected paths";
+}
+
+/**
+ * The limit that narrows an administrator's service: a service of the viewer's
+ * that only restricts paths on one of its hosts. Null for any other service.
+ */
+export function limitOf(
+  service: EgressCredentialService,
+  services: readonly EgressCredentialService[],
+): EgressCredentialService | null {
+  if (service.source !== "config" || service.restrict_only === true)
+    return null;
+  const hosts = new Set(
+    (service.rules ?? []).map((rule) => rule.host.toLowerCase()),
+  );
+  return (
+    services.find(
+      (other) =>
+        other.restrict_only === true &&
+        other.source === "user" &&
+        (other.rules ?? []).some((rule) => hosts.has(rule.host.toLowerCase())),
+    ) ?? null
+  );
 }

@@ -38,7 +38,10 @@ const accountKey = (agentName: string, provider: string) =>
  * otherwise, as after a connect or disconnect.
  */
 function accountCounts(agent: AgentTableRow) {
-  const egress = agent.egress_services ?? [];
+  // A service that only limits paths is neither an account nor a key.
+  const egress = (agent.egress_services ?? []).filter(
+    (service) => service.restrict_only !== true,
+  );
   const connectedServices = agent.services.filter(
     (service) =>
       agent.accounts[accountKey(agent.agent_name, service.provider)] ??
@@ -178,6 +181,9 @@ function AgentEgress({
   if (!Array.isArray(services)) return null;
   // The catalog gives the agent's scope only through its services, which all share it.
   const shared = services.some((service) => service.is_shared === true);
+  // Nobody who can change none of an agent's services manages it; with no services there is no telling.
+  const viewOnly =
+    services.length > 0 && services.every((service) => !service.can_manage);
   return (
     <div className="border-t border-border/60">
       <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
@@ -188,7 +194,7 @@ function AgentEgress({
           href={`/connections/egress#egress-agent-${agent.agent_name}`}
           className="text-xs font-medium text-primary underline-offset-4 hover:underline"
         >
-          Manage services
+          {viewOnly ? "View services" : "Manage services"}
         </a>
       </div>
       {shared && agent.managers !== undefined && (

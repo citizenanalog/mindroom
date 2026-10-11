@@ -47,6 +47,14 @@ export function sharedAgentNote(
     : "Only administrators can change keys for this shared agent.";
 }
 
+/** Who uses a personal agent's keys, for the line under its name; null for a shared agent, whose managers are named instead. */
+export function personalScopeLine(scope: EgressScope): string | null {
+  if (scope === "user_agent") return "Only you use this agent's keys.";
+  if (scope === "user")
+    return "Shared by all your agents in your personal workspace.";
+  return null;
+}
+
 /**
  * Why a personal account is no use on a shared agent, and what to do instead.
  * `managers` is undefined where the response does not name them.
@@ -75,6 +83,32 @@ export function personalSandboxRefusal(provider: string): string {
   return `Personal ${provider} accounts can't be used in this sandbox, which other users' commands share. Add an API key instead.`;
 }
 
+/** What a service that refuses other paths on a host also does to the administrator's services there, and for whom. */
+export function administratorLimitNote(scope: EgressScope): string {
+  const reach = {
+    user_agent: "for this agent only",
+    user: "for all your agents that share your personal workspace",
+    shared: "for everyone using this agent",
+    unscoped: "for every agent without a scope",
+  }[scope];
+  return `This also limits services from your administrator on these hosts, ${reach}.`;
+}
+
+/** What removing a limit gives back, to whom, by the scope its store has. */
+export function removeLimitWarning(
+  scope: EgressScope,
+  agent: string,
+  agents: readonly string[],
+): string {
+  const who = {
+    user_agent: `Your ${agent}`,
+    user: `All your agents that share your personal workspace (${(agents.length > 0 ? agents : [agent]).join(", ")})`,
+    shared: `Everyone using ${agent}`,
+    unscoped: "Every agent without a scope",
+  }[scope];
+  return `This removes the limit. ${who} can then reach every repository the key or connected account allows.`;
+}
+
 /**
  * What deleting a service takes away from whom, by the scope its store has.
  * `agents` names the agents that share a `user` scope's store, this one included.
@@ -96,4 +130,4 @@ export function deleteServiceWarning(
 /** The `Passed through` text for a tunnel the broker only relayed. */
 export const PASSED_THROUGH = "Passed through (no key added)";
 export const PASS_THROUGH_CAPTION =
-  "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).";
+  "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.";

@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { administratorLimitNote } from "./accountCopy";
 import {
   type EditorContext,
   type EgressServiceForm,
@@ -15,22 +16,18 @@ import {
   type RuleEditing,
   errorClass,
   inputClass,
+  selectClass,
 } from "./EgressRuleFields";
 import { PlaceholderRows } from "./EgressPlaceholderRows";
-import type { EgressPreset, EgressScope } from "./types";
+import type {
+  EgressOAuthProviderOption,
+  EgressPreset,
+  EgressScope,
+} from "./types";
 
 // What "Refuse other paths" does, in the order spec 12.4 gives it. The second
 // sentence is about a user's own services, so the dashboard leaves it out. The
 // restriction applies to everyone the store serves, so it says who that is.
-const ADMINISTRATOR_LIMIT: Record<EgressScope, string> = {
-  user_agent:
-    "This also limits services from your administrator on these hosts, for this agent only.",
-  user: "This also limits services from your administrator on these hosts, for all your agents that share your personal workspace.",
-  shared:
-    "This also limits services from your administrator on these hosts, for everyone using this agent.",
-  unscoped:
-    "This also limits services from your administrator on these hosts, for every agent without a scope.",
-};
 const RESTRICT_HELP = {
   refusal:
     "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key.",
@@ -49,7 +46,7 @@ function restrictHelp(
     RESTRICT_HELP.refusal,
     // Without the scope there is no saying whom the limit reaches.
     context === "personal" && scope !== undefined
-      ? ADMINISTRATOR_LIMIT[scope]
+      ? administratorLimitNote(scope)
       : null,
     RESTRICT_HELP.boundary,
     onGithub ? RESTRICT_HELP.github : null,
@@ -73,6 +70,7 @@ export function MoreOptions({
   scope,
   sharedTarget,
   preset,
+  providers,
   onGithub,
   configPlaceholders,
   ruleEditing,
@@ -89,6 +87,8 @@ export function MoreOptions({
   /** Shared and unscoped agents cannot use personal accounts. */
   sharedTarget: boolean;
   preset: EgressPreset | undefined;
+  /** The account logins a custom service can use. */
+  providers: readonly EgressOAuthProviderOption[];
   /** The service is on GitHub, so the help adds what GraphQL does. */
   onGithub: boolean;
   configPlaceholders: Readonly<Record<string, string>>;
@@ -96,6 +96,12 @@ export function MoreOptions({
 }) {
   const isPersonal = context === "personal";
   const primaryRule = form.rules[0] ?? emptyRule();
+  const primaryHost = primaryRule.host.trim().toLowerCase();
+  const displayNameHint = preset
+    ? `Leave empty to use ${preset.display_name}.`
+    : primaryHost
+      ? `Leave empty to use ${primaryHost}.`
+      : undefined;
   const rulesProblem = problemAt("rules");
   const loginField = preset?.oauth_provider ? (
     <p className="text-xs text-muted-foreground">
@@ -111,18 +117,32 @@ export function MoreOptions({
         hint={
           sharedTarget
             ? "Accounts cannot be connected on a shared agent. Use an API key."
-            : "The id of an OAuth provider MindRoom knows, such as github, google_drive, or atlassian. Leave empty to use an API key."
+            : "Users can connect an account of this kind instead of an API key. Leave it empty to use an API key."
         }
         error={problemAt("oauthProvider")}
       >
         {(control) => (
-          <Input
+          <select
             {...control}
-            className={`${inputClass} max-w-xs`}
+            className={`${selectClass} max-w-xs`}
             value={sharedTarget ? "" : form.oauthProvider}
             disabled={sharedTarget || disabled}
             onChange={(event) => set({ oauthProvider: event.target.value })}
-          />
+          >
+            <option value="">No account login</option>
+            {providers.map((provider) => (
+              <option key={provider.id} value={provider.id}>
+                {provider.display_name}
+              </option>
+            ))}
+            {/* A login the service already has that the server does not list stays selectable. */}
+            {form.oauthProvider !== "" &&
+              !providers.some(
+                (provider) => provider.id === form.oauthProvider,
+              ) && (
+                <option value={form.oauthProvider}>{form.oauthProvider}</option>
+              )}
+          </select>
         )}
       </Field>
     )
@@ -131,13 +151,7 @@ export function MoreOptions({
   return (
     <div id={id} className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field
-          label="Display name"
-          id={`${id}-display`}
-          hint={
-            preset ? `Leave empty to use ${preset.display_name}.` : undefined
-          }
-        >
+        <Field label="Display name" id={`${id}-display`} hint={displayNameHint}>
           {(control) => (
             <Input
               {...control}
