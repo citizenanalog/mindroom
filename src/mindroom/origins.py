@@ -18,7 +18,16 @@ def normalized_origin(url: str | None) -> str | None:
         return None
     if parsed.username is not None or parsed.password is not None:
         return None
-    host = f"[{host}]" if ":" in host else host
+    if ":" in host:
+        try:
+            host = f"[{ipaddress.ip_address(host.split('%')[0])}]"
+        except ValueError:
+            return None
+    else:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
     return f"{scheme}://{host}" + ("" if port in {None, _DEFAULT_PORTS[scheme]} else f":{port}")
 
 

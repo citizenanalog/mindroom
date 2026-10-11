@@ -17,7 +17,7 @@ from mindroom.agent_policy import build_agent_policy_seeds, resolve_agent_policy
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.api import config_lifecycle
 from mindroom.api.agent_cli import router as agent_cli_router
-from mindroom.api.auth import ApiAuthState, public_origin, verify_user  # noqa: F401
+from mindroom.api.auth import ApiAuthState, verify_user  # noqa: F401
 from mindroom.api.auth import router as auth_router
 from mindroom.api.computers import active_computer_worker_keys, rebind_computer_runtime
 from mindroom.api.computers import router as computers_router
@@ -67,6 +67,7 @@ from mindroom.matrix.decrypt_failure import e2ee_stats
 from mindroom.matrix.health import get_matrix_sync_health_snapshot
 from mindroom.matrix_openid import allowed_client_origins
 from mindroom.orchestration.runtime import matrix_ingestion_grace_seconds, matrix_sync_startup_timeout_seconds
+from mindroom.origins import normalized_origin
 from mindroom.runtime_env_policy import COMPUTER_ALLOWED_ORIGINS_ENV
 from mindroom.runtime_state import get_runtime_state
 from mindroom.workers.backend import maintain_workers
@@ -644,8 +645,8 @@ def _api_cors_origins(runtime_paths: constants.RuntimePaths) -> list[str]:
         dict.fromkeys(
             origin
             for origin in (
-                public_origin(runtime_paths.env_value("MINDROOM_PUBLIC_URL")),
-                public_origin(runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL")),
+                normalized_origin(runtime_paths.env_value("MINDROOM_PUBLIC_URL")),
+                normalized_origin(runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL")),
             )
             if origin is not None
         ),

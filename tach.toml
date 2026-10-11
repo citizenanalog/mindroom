@@ -1676,6 +1676,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.connections"
 depends_on = [
+    "mindroom.origins",
     "mindroom.matrix.users",
     "mindroom.matrix.media",
     "mindroom.api.auth",
@@ -1709,6 +1710,7 @@ depends_on = [
     "mindroom.authorization",
     "mindroom.matrix.identity",
     "mindroom.mcp_gateway.types",
+    "mindroom.origins",
     "mindroom.requester_identity",
     "mindroom.tool_system.worker_routing",
 ]
@@ -1747,6 +1749,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.main"
 depends_on = [
+    "mindroom.origins",
     "mindroom.api.agent_cli",
     "mindroom.api.config_reload",
     "mindroom.api.response_activity",
@@ -6541,6 +6544,7 @@ depends_on = [
     "mindroom.mcp_gateway.toolkits",
     "mindroom.mcp_gateway.tools",
     "mindroom.mcp_gateway.types",
+    "mindroom.origins",
     "mindroom.api.mcp_identity",
     "mindroom.api.mcp_selection",
     "mindroom.mcp_gateway.selection",
@@ -6612,6 +6616,7 @@ depends_on = [
     "mindroom.mcp.toolkit",
     "mindroom.mcp_gateway.execution",
     "mindroom.mcp_gateway.types",
+    "mindroom.origins",
     "mindroom.runtime_resolution",
     "mindroom.tool_system.catalog",
     "mindroom.tool_system.tool_hooks",
@@ -6624,6 +6629,7 @@ depends_on = [
     "mindroom.mcp_gateway.execution",
     "mindroom.mcp_gateway.toolkits",
     "mindroom.mcp_gateway.types",
+    "mindroom.origins",
     "mindroom.oauth.providers",
     "mindroom.tool_approval",
     "mindroom.tool_system.catalog",
