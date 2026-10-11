@@ -734,10 +734,12 @@ def _resolve_positioned_generations(
         return
     target_session = _latest_persisted_session(storage, session)
     live = {run.run_id: run for run in target_session.runs or [] if run.run_id}
+    # A position run left only as a tombstone lost its record, so its fold no longer applies.
     archived = archive.archived_run_ids(
         storage,
         session_id=session.session_id,
         run_ids=[generation.through_run_id for generation in positioned],
+        with_content=True,
     )
     unapplied: list[int] = []
     orphaned: set[str] = set()

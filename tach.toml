@@ -2396,7 +2396,6 @@ depends_on = [
     "mindroom.agent_storage",
     "mindroom.background_tasks",
     "mindroom.error_handling",
-    "mindroom.history.archive",
     "mindroom.history.claude_replay_compat",
     "mindroom.history.replay",
     "mindroom.history.storage",
@@ -2485,7 +2484,6 @@ depends_on = [
     "mindroom.usage.storage",
 ]
 visibility = [
-    "mindroom.history.compaction",
     "mindroom.history.mid_turn_compaction",
     "mindroom.history.storage",
 ]

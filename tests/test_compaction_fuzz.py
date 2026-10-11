@@ -76,6 +76,8 @@ class _Runner:
         self._redacted: set[str] = set()
         self._ever_archived: set[str] = set()
         self._snapshots: list[AgentSession] = []
+        # Runs waiting for an approval: stored but not history-visible, so a later run reads them as unseen context.
+        self._paused: set[str] = set()
         seeding = self._open()
         if legacy:
             seed_session(seeding, self._legacy_session())
@@ -89,6 +91,8 @@ class _Runner:
     def run(self, actions: list[Action]) -> None:
         operations = {
             "add": self._add,
+            "pause": self._pause,
+            "approve": self._approve,
             "compact": self._compact,
             "midturn": self._midturn,
             "interrupt": self._interrupt,
@@ -133,14 +137,14 @@ class _Runner:
         assert session is not None
         return session
 
-    def _add(self, _action: Action) -> None:
+    def _add(self, _action: Action, *, status: RunStatus = RunStatus.completed) -> None:
         run_id = f"r{len(self._created)}"
         self._storage.upsert_run(
             run=RunOutput(
                 run_id=run_id,
                 agent_id="code",
                 session_id=_SESSION,
-                status=RunStatus.completed,
+                status=status,
                 content=f"answer {run_id}",
                 messages=[Message(role="user", content=f"question {run_id}")],
                 metadata={
@@ -153,6 +157,22 @@ class _Runner:
         )
         self._created.append(run_id)
         self._events.append(_event(run_id))
+        if status is RunStatus.paused:
+            self._paused.add(run_id)
+
+    def _pause(self, action: Action) -> None:
+        self._add(action, status=RunStatus.paused)
+
+    def _approve(self, _action: Action) -> None:
+        """Complete the oldest paused run that is still live, as an approval resume would."""
+        session = self._load()
+        paused = [run for run in session.runs or [] if isinstance(run, RunOutput) and run.run_id in self._paused]
+        if not paused:
+            return
+        run = paused[0]
+        run.status = RunStatus.completed
+        self._storage.upsert_run(run=run, session_id=_SESSION, user_id=None)
+        self._paused.discard(run.run_id or "")
 
     def _chunk(self, count: int) -> tuple[AgentSession, list[RunOutput], str] | None:
         """Return the oldest live runs a compaction would fold next, after the reconcile it runs first."""
@@ -187,15 +207,28 @@ class _Runner:
         session = self._load()
         reconcile_compaction_state(self._storage, session, _SCOPE)
         session = self._load()
-        live = [run for run in session.runs or [] if isinstance(run, RunOutput) and run.run_id]
+        live = [
+            run
+            for run in session.runs or []
+            if isinstance(run, RunOutput) and run.run_id and run.run_id not in self._paused
+        ]
         if not live:
             return
         *prior, current = live
+        # The running run reads every paused run's prompt as unseen thread context, so its fold covers them too.
+        unseen = sorted(
+            run.run_id for run in session.runs or [] if isinstance(run, RunOutput) and run.run_id in self._paused
+        )
+        current.metadata = {
+            **(current.metadata or {}),
+            constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [_event(current.run_id or ""), *map(_event, unseen)],
+        }
+        self._storage.upsert_run(run=current, session_id=_SESSION, user_id=None)
         generation_id = record_mid_turn_generation(
             self._storage,
             session=session,
             scope=_SCOPE,
-            summary=_summary_of(_covered(session) | {run.run_id for run in live if run.run_id}),
+            summary=_summary_of(_covered(session) | {run.run_id for run in live if run.run_id} | set(unseen)),
             summary_model="fuzz-model",
             position_run=current,
             covered_runs=prior,
@@ -277,6 +310,7 @@ class _Runner:
         reconcile_compaction_state(self._storage, session, _SCOPE)
         session = self._load()
         live = {run.run_id for run in session.runs or [] if run.run_id}
+        self._paused &= live
         archived = self._archived_content_ids()
         covered = _covered(session)
 
@@ -301,8 +335,9 @@ class _Runner:
             first = self._created.index(redacted_event_id[1:])
             assert all(self._created.index(run_id) >= first for run_id in lost)
         self._present = present
-        # Seen ids are exactly the events replay represents, so nothing is repeated or dropped.
-        expected_seen = {_event(run_id) for run_id in live | covered}
+        # Seen ids are exactly the events replay represents, so nothing is repeated or dropped; a paused run is
+        # not history-visible, so only a summary that read it represents it.
+        expected_seen = {_event(run_id) for run_id in (live - self._paused) | covered}
         assert read_scope_seen_event_ids(self._storage, session, _SCOPE) == expected_seen
 
 
@@ -313,6 +348,8 @@ _ACTIONS = st.builds(
             "add",
             "add",
             "add",
+            "pause",
+            "approve",
             "compact",
             "midturn",
             "interrupt",
@@ -415,6 +452,20 @@ _ACTIONS = st.builds(
         Action("stale_write"),
     ],
     legacy=True,
+)
+@example(
+    # A fold reads a paused run as unseen context, the run completes and is archived with the fold's run, and its
+    # event is redacted.
+    actions=[
+        Action("add"),
+        Action("pause"),
+        Action("add"),
+        Action("midturn", index=1),
+        Action("approve"),
+        Action("compact", count=3),
+        Action("redact", index=1),
+    ],
+    legacy=False,
 )
 def test_generated_compaction_histories_keep_the_archive_invariants(actions: list[Action], *, legacy: bool) -> None:
     """Interleaved compaction, interruption, stale writes, and redaction never lose or leak history."""

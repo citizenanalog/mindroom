@@ -21,6 +21,7 @@ from mindroom.agent_storage import create_state_storage, get_agent_session, get_
 from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history import archive
 from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot
+from mindroom.history.native import restore_paused_history
 from mindroom.history.storage import (
     _read_scope_history_event_ids,
     _remove_redacted_event_from_compaction,
@@ -677,6 +678,53 @@ def test_an_interrupted_record_keeps_the_fold_its_turn_applied(storage: SqliteDb
     ] == [generation_id]
     assert _summary(_stored(storage)) == "folded"
     assert _live(storage) == ["x"]
+
+
+def test_redacting_an_event_a_fold_read_undoes_the_fold_after_its_run_was_archived(storage: SqliteDb) -> None:
+    """An event a folded run read as unseen context keeps reaching that fold after a later compaction."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"), _live_run_with(["$p", "$x"], reply="$reply"))
+    _fold(storage, session, "x", ["r1"])
+    reconcile_compaction_state(storage, session, _SCOPE)
+    stored = _stored(storage)
+    approved = next(run for run in stored.runs or [] if run.run_id == "p")
+    approved.status = RunStatus.completed
+    storage.upsert_run(run=approved, session_id="session", user_id=approved.user_id)
+    stored = _stored(storage)
+    archive_compaction_chunk(
+        storage=storage,
+        session=stored,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="folded, p, and x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=list(stored.runs or []),
+    )
+
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$p") is True
+
+    assert "$p" not in archive.redactable_compacted_event_ids(storage, session_id="session", scope_key=_SCOPE.key)
+    assert _summary(_stored(storage)) is None
+    assert _live(storage) == ["r1"]
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_paused_run_settles_its_folds_before_the_route_reads_the_summary(storage: SqliteDb) -> None:
+    """An approval recovery archives what the paused run's fold covered and loads the summary it replays."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"))
+    _fold(storage, session, "p", ["r1"])
+    paused_session = _stored(storage)
+    paused_session.summary = None
+
+    await restore_paused_history(
+        object(),
+        persisted_run=next(run for run in paused_session.runs or [] if run.run_id == "p"),
+        storage=storage,
+        session=paused_session,
+        scope=_SCOPE,
+    )
+
+    assert archived_content(storage, "session") == {"r1": True}
+    assert [run.run_id for run in paused_session.runs or []] == ["p"]
+    assert _summary(paused_session) == "folded"
 
 
 def test_a_fold_a_crash_kept_out_of_its_run_is_resolved_before_redaction(storage: SqliteDb) -> None:
