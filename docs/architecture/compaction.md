@@ -13,7 +13,7 @@ All paths below are relative to `src/mindroom/`.
 | `history/runtime.py` | Preparing one response, model construction, compaction notices, failure handling, and applying the final replay decision. |
 | `history/session_context.py` | Canonical agent/team scope identity, opening the correct session store, and closing owned handles. |
 | `history/replay.py` | Materializing visible persisted history, rendering the compaction summary message, estimating history and request cost, and fitting replay limits. |
-| `history/mid_turn_compaction.py` | Sizing each model request of a reply, folding everything but the system prompt, current prompt, transient messages, and queued notices into a summary, and archiving a snapshot of the running turn. |
+| `history/mid_turn_compaction.py` | Sizing each model request of a reply, folding everything but the system prompt, current prompt, transient messages, and queued notices into a summary, and archiving the running turn's exchanges as snapshots. |
 | `history/compaction.py` | Selecting runs, executing summary chunks, switching fallback models, and committing chunk progress. |
 | `history/summary_input.py` | Serializing conversation and prior summary into bounded inputs; preserving a progress-making run envelope when shrinking. |
 | `history/message_content.py` | The shared text and media projection used by serialization and token estimation. |
@@ -56,7 +56,10 @@ Mantle currently needs its existing HTTP transport passed explicitly when copyin
 
 - The summary is never stored in a run: the builder derives it from the session's cached latest generation for every request that replays history, marks it `from_history`, and Agno drops it when it stores the run, so an approval resume rebuilds it with its history and later turns cannot replay it twice; Agno's own system-prompt summary is off for every Agent and Team.
 - A run-local summary (a request without persisted replay) is an ordinary run message and never suppresses the scope summary.
-- Mid-turn compaction of a scoped request archives every visible run and one snapshot of the running turn in the same generations, on the session object Agno writes when the run ends; the request is rewritten only when the snapshot committed, including when cancellation arrives after that commit.
+- Mid-turn compaction of a scoped request archives every visible run and then one snapshot per exchange of the running turn, oldest first, on the session object Agno writes when the run ends; the summary chunker sizes them with the summary model's own estimator, so an exchange is truncated only when it alone exceeds a summary input.
+- The request drops exactly the exchanges whose snapshots committed, including when cancellation or a failed later chunk stops the compaction, and a run whose exchanges did not all commit stops compacting; a whole turn always folds otherwise, so no earlier response chain or signed thinking stays behind a rewritten prefix.
+- Run-local compaction summarizes the same per-exchange snapshots in as many chunks as needed and commits nothing until all of them are summarized.
+- Snapshots of one running turn count as one run in compaction notices.
 - Snapshot run ids start with the live run's id, are unique per snapshot, sit last in their generation, and never return as live runs; redaction that removes a run, or hits an archived row of it, rolls back to the earliest archived row of that run or any of its snapshots.
 - Folded assistant requests keep their usage in run metadata, which the usage projection merges ahead of the run's remaining requests.
 

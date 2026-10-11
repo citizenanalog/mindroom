@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -15,6 +16,7 @@ from agno.db.in_memory import InMemoryDb
 from agno.db.sqlite import SqliteDb
 from agno.media import Image
 from agno.metrics import MessageMetrics
+from agno.models.anthropic import Claude
 from agno.models.message import Message
 from agno.models.response import ModelResponse
 from agno.run.agent import RunInput, RunOutput
@@ -466,25 +468,46 @@ async def test_rewritten_request_within_the_model_window_is_sent(
 
 
 @pytest.mark.asyncio
-async def test_turn_larger_than_the_summary_input_keeps_its_newest_exchanges(
+@pytest.mark.parametrize("stream", [False, True])
+async def test_turn_larger_than_one_summary_input_folds_whole_in_chunks(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stream: bool,
 ) -> None:
+    # A Claude summarizer sizes its input by bytes, more conservatively than request estimates.
+    monkeypatch.setattr(
+        "mindroom.model_loading.get_model_instance",
+        lambda *_args, **_kwargs: Claude(id="claude-haiku-5-5", api_key="test"),
+    )
     config, paths = _config(tmp_path, context_window=20_000, summary_context_window=8_000)
     model = _ToolLoopModel(tool_rounds=25)
+    facts = iter(range(100))
 
-    output = await _run(_agent(model, config, paths), "Do the task")
+    def probe() -> str:
+        """Return one tool result carrying a distinct fact."""
+        return f"FACT-{next(facts):02d} " + "r" * 4_000
+
+    agent = _agent(model, config, paths)
+    agent.tools = [probe]
+
+    output = await _run(agent, "Do the task", stream=stream)
 
     assert str(output.content).endswith("done")
-    assert summary_calls.inputs
-    assert all("Run truncated to fit compaction budget." not in summary for summary in summary_calls.inputs)
     compacted = _first_compacted(model)
-    assert compacted.roles[-1] == "tool"
-    assert compacted.contents.index("Do the task") < compacted.roles.index("tool")
+    assert "tool" not in compacted.roles
+    assert "assistant" not in compacted.roles
+    summary_inputs = "\n".join(summary_calls.inputs)
+    assert "Run truncated to fit compaction budget." not in summary_inputs
+    seen = set(re.findall(r"FACT-\d\d", " ".join(model.requests[model.requests.index(compacted) - 1].contents)))
+    assert len(summary_calls.inputs) >= 2
+    assert seen
+    assert all(fact in summary_inputs for fact in seen)
 
 
 @pytest.mark.asyncio
-async def test_partial_fold_that_still_overflows_folds_again(
+async def test_an_exchange_larger_than_the_summary_input_still_folds(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
 ) -> None:
@@ -502,7 +525,22 @@ async def test_partial_fold_that_still_overflows_folds_again(
     output = await _run(agent, "Do the task")
 
     assert str(output.content).endswith("done")
-    assert len(summary_calls.inputs) >= 2
+    assert summary_calls.inputs
+    assert "tool" not in _first_compacted(model).roles
+
+
+@pytest.mark.asyncio
+async def test_request_sizing_counts_thinking_the_response_did_not_show(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path, context_window=20_000)
+    model = _ToolLoopModel(tool_rounds=2, usage=lambda _number: MessageMetrics(input_tokens=10, output_tokens=30_000))
+
+    await _run(_agent(model, config, paths), "Do the task")
+
+    assert summary_calls.inputs
+    assert any(is_compaction_summary(message) for message in model.requests[1].messages)
 
 
 @pytest.mark.asyncio
@@ -563,10 +601,10 @@ def test_replayed_queued_notice_is_folded() -> None:
     ]
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
-    layout = mid_turn_compaction._layout(messages, run_response, scoped=True, fold_budget=100_000)
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
 
     assert layout.kept == (prompt,)
-    assert old_notice in layout.folded
+    assert old_notice in layout.history
 
 
 @pytest.mark.asyncio
@@ -1112,6 +1150,9 @@ async def test_mid_turn_compaction_posts_notices(tmp_path: Path, summary_calls: 
     kinds = [type(event).__name__ for event in lifecycle.events]
     assert kinds[0] == "CompactionLifecycleStart"
     assert "CompactionOutcome" in kinds
+    # Two earlier runs and the running turn, however many exchanges the turn folded.
+    outcome = next(event for event in lifecycle.events if isinstance(event, CompactionOutcome))
+    assert outcome.compacted_run_count == 3
 
 
 @pytest.mark.asyncio
@@ -1201,8 +1242,13 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     messages = [legacy_system, prompt, Message(role="assistant", content="step"), Message(role="tool", content="r")]
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
-    layout = mid_turn_compaction._layout(messages, run_response, scoped=True, fold_budget=100_000)
-    mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
+    mid_turn_compaction._rewrite(
+        messages,
+        layout,
+        compaction_summary_message("NEW", run_local=False),
+        len(layout.exchanges),
+    )
 
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"
     assert [is_compaction_summary(message) for message in messages] == [False, True, False]

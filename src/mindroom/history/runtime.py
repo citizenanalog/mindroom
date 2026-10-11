@@ -63,7 +63,7 @@ from mindroom.timing import timed
 from mindroom.token_budget import estimate_text_tokens
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from agno.agent import Agent
     from agno.db.base import BaseDb
@@ -459,7 +459,7 @@ async def _run_scope_compaction_with_lifecycle(
     runtime_paths: RuntimePaths,
     compaction_lifecycle: CompactionLifecycle | None,
     replay_model: NativeCompactionModel | None = None,
-    in_progress: RunOutput | TeamRunOutput | None = None,
+    in_progress: Sequence[RunOutput | TeamRunOutput] = (),
 ) -> _ScopeCompactionLifecycleResult:
     execution_plan = resolved_inputs.execution_plan
     assert execution_plan.summary_input_budget_tokens is not None
@@ -611,15 +611,15 @@ async def summarize_run_locally(
     *,
     resolved_inputs: HistoryPreparationInputs,
     previous_summary: str | None,
-    snapshot: RunOutput | TeamRunOutput,
+    snapshots: Sequence[RunOutput | TeamRunOutput],
     scope: HistoryScope,
     config: Config,
     runtime_paths: RuntimePaths,
     on_response: Callable[[Model, ModelResponse], Awaitable[None]] | None,
 ) -> str:
-    """Summarize one run's own folded messages with the scope's summary model, outside any archive."""
+    """Summarize one run's own folded messages, oldest first, with the scope's summary model, outside any archive."""
     execution_plan = resolved_inputs.execution_plan
-    session_id = snapshot.session_id or ""
+    session_id = snapshots[0].session_id or ""
     summary_model, fallback_model = _load_summary_models(
         execution_plan,
         config=config,
@@ -631,7 +631,7 @@ async def summarize_run_locally(
         summary_model=summary_model,
         fallback_summary_model=fallback_model,
         previous_summary=previous_summary,
-        runs=[snapshot],
+        runs=snapshots,
         session_id=session_id,
         scope=scope,
         # Replay limits trim history; the run's own tool results must all reach the summary.
@@ -657,7 +657,7 @@ async def _run_scope_compaction(
     progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None = None,
     completion_callback: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]] | None = None,
     replay_model: NativeCompactionModel | None = None,
-    in_progress: RunOutput | TeamRunOutput | None = None,
+    in_progress: Sequence[RunOutput | TeamRunOutput] = (),
 ) -> CompactionOutcome | None:
     execution_plan = resolved_inputs.execution_plan
     summary_model, fallback_model = _load_summary_models(
@@ -695,13 +695,13 @@ async def compact_scope_mid_turn(
     session: AgentSession | TeamSession,
     scope: HistoryScope,
     resolved_inputs: HistoryPreparationInputs,
-    snapshot: RunOutput | TeamRunOutput,
+    snapshots: Sequence[RunOutput | TeamRunOutput],
     before_tokens: int,
     config: Config,
     runtime_paths: RuntimePaths,
     compaction_lifecycle: CompactionLifecycle | None,
 ) -> CompactionOutcome | None:
-    """Fold the scope's visible runs and a snapshot of the running turn into a new generation."""
+    """Fold the scope's visible runs and snapshots of the running turn into a new generation."""
     # Replay limits trim history; the running turn's own tool results must all reach the summary.
     inputs = replace(
         resolved_inputs,
@@ -721,7 +721,7 @@ async def compact_scope_mid_turn(
         config=config,
         runtime_paths=runtime_paths,
         compaction_lifecycle=compaction_lifecycle,
-        in_progress=snapshot,
+        in_progress=snapshots,
     )
     return result.outcome
 

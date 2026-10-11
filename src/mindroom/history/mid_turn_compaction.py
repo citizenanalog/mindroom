@@ -74,8 +74,6 @@ logger = get_logger(__name__)
 _HOOK_MARKER = "_mindroom_mid_turn_compaction_installed"
 _BINDING_KEY = "_mindroom_mid_turn_compaction"
 _PROMPT_ROLES = frozenset({"system", "developer"})
-# Room in one summary input for its wrapper and the summary prompt's framing.
-_SUMMARY_INPUT_MARGIN_TOKENS = 1024
 
 
 @dataclass
@@ -132,11 +130,12 @@ class _Layout:
 
     leading: int
     kept: tuple[Message, ...]
-    folded: tuple[Message, ...]
+    # Replayed messages of earlier turns, which the scope summary or the archive already covers.
+    history: tuple[Message, ...]
+    # This turn's folded messages, each with the tool results that answer it, oldest first.
+    exchanges: tuple[tuple[Message, ...], ...]
     prompt: Message | None
     previous_run_local_summary: str | None
-    # True when newer turn exchanges stayed unfolded because the summary input could not hold them.
-    partial: bool
 
 
 def install_mid_turn_compaction(
@@ -200,26 +199,26 @@ async def _prepare_request(
     if policy is None or _request_tokens(binding, policy, messages, tools, loaded_ids) <= policy.limit:
         return
     session = _scoped_session(binding, built_session, run_response)
-    while True:
-        layout = _layout(messages, run_response, scoped=session is not None, fold_budget=_fold_budget(policy, messages))
-        if all(is_compaction_summary(message) for message in layout.folded):
-            # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
-            return
-        summary_message = await _summarize(binding, policy, layout, messages, run_response, session)
-        if summary_message is None:
-            binding.failed_run_id = run_response.run_id
-            return
-        if policy.replay_model is not None and policy.replay_model.native_compaction is not None:
-            # The provider's own compaction could not keep this request within the window.
-            logger.warning(
-                "Native compaction left the request over its limit; compacted as text",
-                run_id=run_response.run_id,
-            )
-            policy.replay_model.configure_native_compaction(threshold=None)
-        _finish(messages, layout, summary_message, run_response)
-        # A turn larger than one summary input folds in more passes, as long as the request cannot be sent.
-        if not layout.partial or _estimated_request_tokens(policy, messages, tools) <= policy.fit_limit:
-            break
+    layout = _layout(messages, run_response, scoped=session is not None)
+    if not layout.exchanges and all(is_compaction_summary(message) for message in layout.history):
+        # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
+        return
+    summarized = await _summarize(binding, policy, layout, messages, run_response, session)
+    if summarized is None:
+        binding.failed_run_id = run_response.run_id
+        return
+    summary_message, committed = summarized
+    if committed < len(layout.exchanges):
+        # Part of the turn could not be summarized; the rest stays in the request and this run stops compacting.
+        binding.failed_run_id = run_response.run_id
+    if policy.replay_model is not None and policy.replay_model.native_compaction is not None:
+        # The provider's own compaction could not keep this request within the window.
+        logger.warning(
+            "Native compaction left the request over its limit; compacted as text",
+            run_id=run_response.run_id,
+        )
+        policy.replay_model.configure_native_compaction(threshold=None)
+    _finish(messages, layout, summary_message, run_response, committed)
     _require_fit(policy, messages, tools, summary_message)
 
 
@@ -230,11 +229,12 @@ async def _summarize(
     messages: list[Message],
     run_response: RunOutput | TeamRunOutput,
     session: AgentSession | TeamSession | None,
-) -> Message | None:
-    """Summarize one layout's folded messages, or return None when compaction failed."""
+) -> tuple[Message, int] | None:
+    """Return the summary and how many of the turn's exchanges it covers, or None when nothing was summarized."""
     try:
         if session is None:
-            return await _summarize_run_locally(binding, policy.inputs, layout, run_response, messages)
+            summary = await _summarize_run_locally(binding, policy.inputs, layout, run_response)
+            return summary, len(layout.exchanges)
         return await _compact_scope(binding, policy, layout, messages, run_response, session)
     except asyncio.CancelledError:
         raise
@@ -248,9 +248,10 @@ def _finish(
     layout: _Layout,
     summary_message: Message,
     run_response: RunOutput | TeamRunOutput,
+    committed: int,
 ) -> None:
-    _rewrite(messages, layout, summary_message)
-    _carry_request_usage(run_response, layout.folded)
+    _rewrite(messages, layout, summary_message, committed)
+    _carry_request_usage(run_response, [message for exchange in layout.exchanges[:committed] for message in exchange])
 
 
 def _scoped_session(
@@ -272,8 +273,11 @@ async def _compact_scope(
     messages: list[Message],
     run_response: RunOutput | TeamRunOutput,
     session: AgentSession | TeamSession,
-) -> Message | None:
-    """Archive the scope's visible runs and a snapshot of this run behind a new summary, on Agno's own session."""
+) -> tuple[Message, int] | None:
+    """Archive the scope's visible runs and this run's exchanges behind a new summary, on Agno's own session.
+
+    Returns the summary and how many exchanges, oldest first, it covers, or None when none committed.
+    """
     storage = binding.target.db
     assert isinstance(storage, BaseDb)
     scope = (
@@ -284,35 +288,31 @@ async def _compact_scope(
     assert scope is not None
     # Members' runs of this turn exist only in memory until the turn ends, and loading the stored row drops them.
     member_runs = [run for run in session.runs or [] if run.parent_run_id == run_response.run_id]
+    snapshots = _snapshots(run_response, layout)
     try:
         await run_blocking_until_complete(partial(_prepare_scope_session, storage, session, scope))
-        snapshot = _snapshot(run_response, layout, messages)
-        snapshot.run_id = archive.snapshot_run_id(run_response.run_id or "")
-        snapshot.metadata = deepcopy(run_response.metadata)
-        snapshot.created_at = run_response.created_at
         try:
             await compact_scope_mid_turn(
                 storage=storage,
                 session=session,
                 scope=scope,
                 resolved_inputs=policy.inputs,
-                snapshot=snapshot,
+                snapshots=snapshots,
                 before_tokens=estimate_request_messages_tokens(messages, replay_model=policy.replay_model),
                 config=binding.config,
                 runtime_paths=binding.runtime_paths,
                 compaction_lifecycle=binding.lifecycle,
             )
         except asyncio.CancelledError:
-            # A snapshot that committed has archived this turn's folded messages; the request must not resend them.
-            if await _archived(storage, session, snapshot):
-                _finish(messages, layout, _scope_summary_message(session), run_response)
+            # Committed snapshots archived their exchanges; the request must not resend them.
+            if committed := await _committed(storage, session, snapshots):
+                _finish(messages, layout, _scope_summary_message(session), run_response, committed)
             raise
     finally:
         kept = {run.run_id for run in session.runs or []}
         session.runs = [*(session.runs or []), *(run for run in member_runs if run.run_id not in kept)]
-    if not await _archived(storage, session, snapshot):
-        return None
-    return _scope_summary_message(session)
+    committed = await _committed(storage, session, snapshots)
+    return (_scope_summary_message(session), committed) if committed else None
 
 
 def _prepare_scope_session(storage: BaseDb, session: AgentSession | TeamSession, scope: HistoryScope) -> None:
@@ -328,12 +328,17 @@ def _session_type(session: AgentSession | TeamSession) -> SessionType:
     return SessionType.TEAM if isinstance(session, TeamSession) else SessionType.AGENT
 
 
-async def _archived(storage: BaseDb, session: AgentSession | TeamSession, snapshot: RunOutput | TeamRunOutput) -> bool:
-    run_id = snapshot.run_id or ""
+async def _committed(
+    storage: BaseDb,
+    session: AgentSession | TeamSession,
+    snapshots: Sequence[RunOutput | TeamRunOutput],
+) -> int:
+    """Return how many of the turn's snapshots, oldest first, the archive holds; chunks commit in order."""
+    run_ids = [snapshot.run_id or "" for snapshot in snapshots]
     archived = await run_blocking_until_complete(
-        partial(archive.archived_run_ids, storage, session_id=session.session_id, run_ids=[run_id]),
+        partial(archive.archived_run_ids, storage, session_id=session.session_id, run_ids=run_ids),
     )
-    return run_id in archived
+    return next((index for index, run_id in enumerate(run_ids) if run_id not in archived), len(run_ids))
 
 
 def _scope_summary_message(session: AgentSession | TeamSession) -> Message:
@@ -399,7 +404,7 @@ def _request_tokens(
                 replay_model=policy.replay_model,
                 native_route=policy.native_route,
             )
-            + _reasoning_tokens(messages)
+            + _thinking_tokens(messages)
             + _tool_tokens(tools)
         )
     anchor = next(
@@ -423,11 +428,11 @@ def _request_tokens(
             return (
                 reported
                 + estimate_request_messages_tokens(newer, replay_model=policy.replay_model)
-                + _reasoning_tokens(newer)
+                + _thinking_tokens(newer)
             )
     return (
         estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
-        + _reasoning_tokens(messages)
+        + _thinking_tokens(messages)
         + _tool_tokens(tools)
     )
 
@@ -435,7 +440,7 @@ def _request_tokens(
 def _estimated_request_tokens(policy: _Policy, messages: list[Message], tools: list[dict[str, Any]] | None) -> int:
     return (
         estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
-        + _reasoning_tokens(messages)
+        + _thinking_tokens(messages)
         + _tool_tokens(tools)
     )
 
@@ -444,27 +449,27 @@ def _tool_tokens(tools: list[dict[str, Any]] | None) -> int:
     return estimate_text_tokens(stable_serialize(tools)) if tools else 0
 
 
-def _reasoning_tokens(messages: Sequence[Message]) -> int:
-    """Estimate this turn's thinking, which providers resend inside a tool loop but history estimates skip."""
-    return sum(
-        estimate_text_tokens((message.reasoning_content or "") + (message.redacted_reasoning_content or ""))
-        for message in messages
-        if not message.from_history
-    )
+def _thinking_tokens(messages: Sequence[Message]) -> int:
+    """Estimate this turn's thinking, which providers resend inside a tool loop but history estimates skip.
+
+    Encrypted or omitted thinking shows no text, so a response's reported output beyond its visible part counts too.
+    """
+    total = 0
+    for message in messages:
+        if message.from_history or message.role != "assistant":
+            continue
+        text = estimate_text_tokens((message.reasoning_content or "") + (message.redacted_reasoning_content or ""))
+        reported = message.metrics.output_tokens if message.metrics is not None else 0
+        visible = estimate_request_messages_tokens([message], replay_model=None)
+        total += max(text, reported - visible, 0)
+    return total
 
 
-def _layout(
-    messages: list[Message],
-    run_response: RunOutput | TeamRunOutput,
-    *,
-    scoped: bool,
-    fold_budget: int,
-) -> _Layout:
-    """Split a request into kept and folded messages.
+def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput, *, scoped: bool) -> _Layout:
+    """Split a request into kept messages, replayed history, and this turn's exchanges to fold.
 
     A run-local summary this run already wrote seeds the next run-local summary; a scoped compaction folds it into
-    the snapshot instead, since the scope summary never saw it. The turn's own exchanges fold oldest first, and
-    only as many as the summary input can hold whole; the newer ones stay in the request for a later compaction.
+    the snapshots instead, since the scope summary never saw it.
     """
     leading = next(
         (index for index, message in enumerate(messages) if message.role not in _PROMPT_ROLES),
@@ -472,38 +477,26 @@ def _layout(
     )
     prompt = _current_prompt(messages[leading:], run_response)
     kept: list[Message] = []
-    folded: list[Message] = []
+    history: list[Message] = []
+    exchanges: list[tuple[Message, ...]] = []
     previous: str | None = None
-    turn_tokens = 0
-    keep_rest = False
     for exchange in _exchanges(messages[leading:]):
         head = exchange[0]
-        if (
-            keep_rest
-            or head is prompt
-            or not head.add_to_agent_memory
-            or (_is_queued_notice(head) and not head.from_history)
-        ):
+        if head is prompt or not head.add_to_agent_memory or (_is_queued_notice(head) and not head.from_history):
             kept.extend(exchange)
-            continue
-        if is_compaction_summary(head) and not head.from_history and not scoped:
+        elif is_compaction_summary(head) and not head.from_history and not scoped:
             previous = compaction_summary_text(head)
-            continue
-        if not head.from_history:
-            tokens = estimate_request_messages_tokens(exchange, replay_model=None)
-            keep_rest = turn_tokens > 0 and turn_tokens + tokens > fold_budget
-            if keep_rest:
-                kept.extend(exchange)
-                continue
-            turn_tokens += tokens
-        folded.extend(exchange)
+        elif head.from_history:
+            history.extend(exchange)
+        else:
+            exchanges.append(tuple(exchange))
     return _Layout(
         leading=leading,
         kept=tuple(kept),
-        folded=tuple(folded),
+        history=tuple(history),
+        exchanges=tuple(exchanges),
         prompt=prompt,
         previous_run_local_summary=previous,
-        partial=keep_rest,
     )
 
 
@@ -516,15 +509,6 @@ def _exchanges(messages: Sequence[Message]) -> list[list[Message]]:
         else:
             exchanges.append([message])
     return exchanges
-
-
-def _fold_budget(policy: _Policy, messages: Sequence[Message]) -> int:
-    """Return how much of the turn one summary input can hold beside the summaries it merges with."""
-    budget = policy.inputs.execution_plan.summary_input_budget_tokens or 0
-    summaries = sum(
-        estimate_text_tokens(str(message.content)) for message in messages if is_compaction_summary(message)
-    )
-    return budget - 2 * summaries - _SUMMARY_INPUT_MARGIN_TOKENS
 
 
 def _current_prompt(messages: Sequence[Message], run_response: RunOutput | TeamRunOutput) -> Message | None:
@@ -554,31 +538,41 @@ def _is_queued_notice(message: Message) -> bool:
     return isinstance(message.provider_data, dict) and bool(message.provider_data.get(QUEUED_MESSAGE_NOTICE_MARKER_KEY))
 
 
-def _snapshot(
-    run_response: RunOutput | TeamRunOutput,
-    layout: _Layout,
-    messages: Sequence[Message],
-) -> RunOutput | TeamRunOutput:
-    """Return the run's folded messages, with its prompt for context, as one completed run to summarize."""
-    folded_ids = {id(message) for message in layout.folded if not message.from_history}
-    run_messages = [
-        message.model_copy(deep=True) for message in messages if id(message) in folded_ids or message is layout.prompt
-    ]
-    if isinstance(run_response, TeamRunOutput):
-        return TeamRunOutput(
-            run_id=run_response.run_id,
-            team_id=run_response.team_id,
-            session_id=run_response.session_id,
-            status=RunStatus.completed,
-            messages=run_messages,
-        )
-    return RunOutput(
-        run_id=run_response.run_id,
-        agent_id=run_response.agent_id,
-        session_id=run_response.session_id,
-        status=RunStatus.completed,
-        messages=run_messages,
-    )
+def _snapshots(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list[RunOutput | TeamRunOutput]:
+    """Return one completed run per folded exchange, oldest first, the first led by the prompt for context.
+
+    Separate runs let the summary chunker size the turn with the summary model's own estimator and summarize it in
+    as many chunks as it needs, without truncating any exchange that fits a summary input by itself.
+    """
+    origin = run_response.run_id or ""
+    snapshots: list[RunOutput | TeamRunOutput] = []
+    for index, exchange in enumerate(layout.exchanges):
+        lead = (layout.prompt,) if index == 0 and layout.prompt is not None else ()
+        run_messages = [message.model_copy(deep=True) for message in (*lead, *exchange)]
+        run_id = archive.snapshot_run_id(origin)
+        metadata = deepcopy(run_response.metadata)
+        if isinstance(run_response, TeamRunOutput):
+            snapshot: RunOutput | TeamRunOutput = TeamRunOutput(
+                run_id=run_id,
+                team_id=run_response.team_id,
+                session_id=run_response.session_id,
+                status=RunStatus.completed,
+                messages=run_messages,
+                metadata=metadata,
+                created_at=run_response.created_at,
+            )
+        else:
+            snapshot = RunOutput(
+                run_id=run_id,
+                agent_id=run_response.agent_id,
+                session_id=run_response.session_id,
+                status=RunStatus.completed,
+                messages=run_messages,
+                metadata=metadata,
+                created_at=run_response.created_at,
+            )
+        snapshots.append(snapshot)
+    return snapshots
 
 
 async def _summarize_run_locally(
@@ -586,7 +580,6 @@ async def _summarize_run_locally(
     inputs: HistoryPreparationInputs,
     layout: _Layout,
     run_response: RunOutput | TeamRunOutput,
-    messages: Sequence[Message],
 ) -> Message:
     scope = HistoryScope(
         kind="team" if isinstance(run_response, TeamRunOutput) else "agent",
@@ -595,7 +588,7 @@ async def _summarize_run_locally(
     summary = await summarize_run_locally(
         resolved_inputs=inputs,
         previous_summary=layout.previous_run_local_summary,
-        snapshot=_snapshot(run_response, layout, messages),
+        snapshots=_snapshots(run_response, layout),
         scope=scope,
         config=binding.config,
         runtime_paths=binding.runtime_paths,
@@ -646,9 +639,16 @@ def _summary_usage_recorder(
     return record
 
 
-def _rewrite(messages: list[Message], layout: _Layout, summary_message: Message) -> None:
+def _rewrite(messages: list[Message], layout: _Layout, summary_message: Message, committed: int) -> None:
+    """Replace the folded history and the first ``committed`` exchanges with the summary, keeping message order."""
     leading = [without_embedded_summary(message) for message in messages[: layout.leading]]
-    messages[:] = [*leading, summary_message, *layout.kept]
+    keep = {id(message) for message in layout.kept}
+    keep.update(id(message) for exchange in layout.exchanges[committed:] for message in exchange)
+    messages[:] = [
+        *leading,
+        summary_message,
+        *(message for message in messages[layout.leading :] if id(message) in keep),
+    ]
 
 
 def _carry_request_usage(run_response: RunOutput | TeamRunOutput, folded: Sequence[Message]) -> None:
