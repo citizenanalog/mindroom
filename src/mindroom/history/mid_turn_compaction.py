@@ -55,7 +55,7 @@ from mindroom.logging_config import get_logger
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, checkpoint_items, native_replay_messages
 from mindroom.providers.claude_prompt_cache import claude_deferred_tool_names, claude_loaded_tool_names
-from mindroom.providers.openai_tool_search import model_deferred_tool_names, openai_loaded_tool_names
+from mindroom.providers.openai_tool_search import model_deferred_tool_names
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
 
@@ -471,12 +471,16 @@ def _estimated_request_tokens(policy: _Policy, messages: list[Message], tools: l
 
 
 def _tool_tokens(model: Model, tools: list[dict[str, Any]] | None, messages: Sequence[Message]) -> int:
-    """Estimate the tool definitions a request carries in full; tool search keeps deferred ones out until it loads them."""
+    """Estimate the tool definitions a request carries in full; tool search keeps deferred ones out until it loads them.
+
+    Claude expands a search's tool references into definitions; OpenAI replays them inside the search output, which
+    the message estimate already counts.
+    """
     if not tools:
         return 0
     deferred = claude_deferred_tool_names(model) | model_deferred_tool_names(model)
     if deferred:
-        deferred -= claude_loaded_tool_names(messages) | openai_loaded_tool_names(messages)
+        deferred -= claude_loaded_tool_names(messages)
     sent = [tool for tool in tools if _tool_name(tool) not in deferred] if deferred else tools
     return estimate_text_tokens(stable_serialize(sent)) if sent else 0
 

@@ -435,15 +435,33 @@ def test_request_sizing_leaves_out_deferred_tool_definitions(provider: str) -> N
 
 @pytest.mark.parametrize("provider", ["openai", "claude"])
 def test_request_sizing_counts_deferred_tool_definitions_once_tool_search_loads_them(provider: str) -> None:
-    """A deferred definition enters the context when a tool search in the request returns it."""
+    """A deferred definition enters the context once when a tool search in the request returns it.
+
+    OpenAI replays the loaded definitions inside the search output, which the message estimate counts; Claude
+    replays only references that the provider expands.
+    """
     big_tool = {"type": "function", "function": {"name": "big_tool", "description": "d" * 80_000, "parameters": {}}}
     if provider == "openai":
         model: Any = MindRoomOpenAIResponses(id="gpt-6-luna", store=False)
         install_openai_deferred_tool_search(model, deferred_tool_names=frozenset({"big_tool"}))
         provider_data: dict[str, Any] = {
             "tool_search_items": [
-                {"type": "tool_search_call", "id": "ts_1", "execution": "server", "arguments": {"query": "big"}},
-                {"type": "tool_search_output", "id": "tso_1", "execution": "server", "tools": [big_tool["function"]]},
+                {
+                    "type": "tool_search_call",
+                    "id": "ts_1",
+                    "call_id": "search_1",
+                    "execution": "server",
+                    "arguments": {"query": "big"},
+                    "status": "completed",
+                },
+                {
+                    "type": "tool_search_output",
+                    "id": "tso_1",
+                    "call_id": "search_1",
+                    "execution": "server",
+                    "status": "completed",
+                    "tools": [{"type": "function", **big_tool["function"]}],
+                },
             ],
         }
     else:
@@ -467,7 +485,13 @@ def test_request_sizing_counts_deferred_tool_definitions_once_tool_search_loads_
         Message(role="assistant", provider_data=provider_data),
     ]
 
-    assert mid_turn_compaction._tool_tokens(model, [big_tool], searched) > 15_000
+    total = estimate_request_messages_tokens(searched, replay_model=model) + mid_turn_compaction._tool_tokens(
+        model,
+        [big_tool],
+        searched,
+    )
+
+    assert 15_000 < total < 30_000
 
 
 def test_aggregate_usage_of_retried_requests_never_anchors_sizing() -> None:
