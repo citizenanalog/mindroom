@@ -74,7 +74,7 @@ def _injected_request(
 
 
 def _host_header_name(value: bytes) -> str | None:
-    """Return the normalized hostname a Host header names, ignoring a numeric port; None when malformed."""
+    """Return the normalized hostname a Host header names, ignoring an ASCII-digit port; None when malformed."""
     text = value.decode("latin-1")
     if text.startswith("["):
         name, bracket, port = text[1:].partition("]")
@@ -83,7 +83,8 @@ def _host_header_name(value: bytes) -> str | None:
         port = port.removeprefix(":")
     else:
         name, _, port = text.partition(":")
-    if port and not (port.isdigit() and len(port) <= 5):
+    # str.isdigit alone would accept Latin-1 digits such as a superscript two.
+    if port and not (port.isascii() and port.isdigit() and len(port) <= 5):
         return None
     try:
         return normalize_host(name)

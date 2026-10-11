@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import itertools
 import posixpath
 import re
 import ssl
@@ -20,6 +21,7 @@ from structlog.testing import capture_logs
 
 from mindroom import server_fetch_url
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
+from mindroom.egress_broker import dial
 from mindroom.egress_broker.mitm import _host_header_name
 from mindroom.egress_broker.proxy import _token_from
 from mindroom.egress_broker.rules import EgressRules, is_ambiguous_path, route_request
@@ -27,6 +29,7 @@ from mindroom.egress_broker.tokens import TokenSigner
 from tests.egress_broker.conftest import DEFAULT_CLAIMS, connect_request, proxy_authorization, read_raw_response
 
 if TYPE_CHECKING:
+    from mindroom.egress_broker.dial import DialPolicy
     from mindroom.egress_broker.proxy import EgressBroker
     from tests.egress_broker.conftest import BrokerFactory, SeenRequest, Upstream
 
@@ -61,6 +64,9 @@ IDEOGRAPHIC_STOP = "\u3002"
 FULLWIDTH_SLASH = "\uff0f"
 FULLWIDTH_BACKSLASH = "\uff3c"
 FULLWIDTH_PERCENT_2E = "\uff05\uff12\uff45"
+# Combining marks compose with a preceding hex letter under NFKC (C + U+0301 is one character), which can break an
+# escape such as %5C apart in the folded form while the unfolded form still decodes it.
+COMBINING_MARKS = ("\u0301", "\u0307", "\u0327")
 _UNICODE_DOTS = (ONE_DOT_LEADER, TWO_DOT_LEADER, FULLWIDTH_STOP, SMALL_STOP, IDEOGRAPHIC_STOP)
 # The brief's alphabet: path syntax, hex digits for %2e %2f %5c %25, and the unicode dots.
 _ALPHABET = st.sampled_from([*"/.%2eEfF5cC;?#ab-", *_UNICODE_DOTS])
@@ -110,6 +116,10 @@ _TOKENS = st.sampled_from(
         FULLWIDTH_SLASH,
         FULLWIDTH_BACKSLASH,
         FULLWIDTH_PERCENT_2E,
+        *COMBINING_MARKS,
+        "%CC%81",
+        "%CC%87",
+        "%CC%A7",
         "a",
         "echo",
         "private",
@@ -198,6 +208,14 @@ _PATHS = st.one_of(
     user_prefixes=[],
     user_restricts=False,
 )
+# Review counterexample to the first NFKC fix: folding C + U+0301 hid the %5C that decodes to a backslash.
+@example(
+    path="/private/..%255C%CC%81/echo",
+    operator_prefixes=["/private"],
+    operator_restricts=False,
+    user_prefixes=[],
+    user_restricts=False,
+)
 def test_routed_paths_stay_under_their_prefix_after_server_normalization(
     path: str,
     operator_prefixes: list[str],
@@ -245,6 +263,9 @@ def test_routed_paths_stay_under_their_prefix_after_server_normalization(
         ("/private/%E2%80%A5/echo", True),
         (f"/private/x{FULLWIDTH_SLASH}{TWO_DOT_LEADER}{FULLWIDTH_SLASH}y", True),
         (f"/private/{FULLWIDTH_PERCENT_2E * 2}/echo", True),
+        ("/private/..%255C%CC%81/echo", True),
+        ("/private/..%252f%CC%87", True),
+        ("/private/..%255C\u0327/echo", True),
         ("/wiki/Caf\u00e9", False),
         ("/wiki/Caf%C3%A9", False),
         ("/files/\ufb01le", False),
@@ -254,6 +275,56 @@ def test_routed_paths_stay_under_their_prefix_after_server_normalization(
 def test_nfkc_dot_segments_are_ambiguous(path: str, *, ambiguous: bool) -> None:
     """Dots and slashes that NFKC folds to ASCII count as dot segments; other non-ASCII paths stay allowed."""
     assert is_ambiguous_path(path) is ambiguous
+
+
+def _had_dot_segment_at_d64dbefb7(path: str) -> bool:
+    return any(
+        re.split(r"[;?#]", segment, maxsplit=1)[0].strip() in {".", ".."} for segment in re.split(r"[/\\]", path)
+    )
+
+
+def _refused_at_d64dbefb7(path: str) -> bool:
+    """Return `is_ambiguous_path` as of d64dbefb7, before NFKC folding, kept verbatim as a regression oracle."""
+    if "\\" in path or "//" in path:
+        return True
+    layer = path
+    for _ in range(5):
+        if "\x00" in layer or _had_dot_segment_at_d64dbefb7(layer):
+            return True
+        try:
+            decoded = unquote(layer, errors="strict")
+        except UnicodeDecodeError:
+            return True
+        if decoded == layer:
+            return False
+        layer = decoded
+    return True
+
+
+@FUZZ
+@given(path=_PATHS)
+@example(path="/private/..%255C%CC%81/echo")
+@example(path="/private/..%252f%CC%87")
+def test_every_path_refused_before_nfkc_folding_is_still_refused(path: str) -> None:
+    """Folding look-alikes only adds refusals: whatever the d64dbefb7 check refused, the current one refuses too."""
+    if _refused_at_d64dbefb7(path):
+        assert is_ambiguous_path(path), path
+
+
+# Short pieces whose combinations reach escapes split by combining marks, such as ``..%5C`` + U+0301.
+_ESCAPE_ATOMS = ("/", ".", "..", "%", "%25", "%2", "%5", "5", "c", "C", "e", "f", "\u0301", "\u0307", "%CC%81", "a")
+
+
+def test_every_short_escape_combination_refused_before_nfkc_folding_is_still_refused() -> None:
+    """Exhaustively, every path of up to four atoms after a prefix keeps the refusal the d64dbefb7 check gave it."""
+    lost = [
+        path
+        for length in range(1, 5)
+        for atoms in itertools.product(_ESCAPE_ATOMS, repeat=length)
+        if _refused_at_d64dbefb7(path := "/private/" + "".join(atoms)) and not is_ambiguous_path(path)
+    ]
+
+    assert lost == []
 
 
 # Token and Host header parsing.
@@ -296,7 +367,7 @@ def test_proxy_authorization_never_raises_and_only_the_minted_token_verifies(val
             st.sampled_from([b"", b"[", b"user@", b" ", b"LOCAL"]),
             st.one_of(
                 st.binary(max_size=12),
-                st.sampled_from([b".", b":443", b".:8443", b"@evil", b"\x00", b"..", b"]"]),
+                st.sampled_from([b".", b":443", b".:8443", b"@evil", b"\x00", b"..", b"]", b":\xb2", b":4\xb943"]),
             ),
         ),
     ),
@@ -307,14 +378,10 @@ def test_host_header_names_localhost_only_when_it_says_nothing_else(value: bytes
         assert re.fullmatch(rb"localhost\.?(:\d{0,5})?", value, re.IGNORECASE), value
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="H2-1: _host_header_name checks the port with str.isdigit, which accepts Latin-1 digits such as \\xb2; "
-    "the name must still match the tunnel host, and the fix (port.isascii()) belongs in mitm.py",
-)
-def test_host_header_port_of_non_ascii_digits_is_malformed() -> None:
-    """A Host port is ASCII digits only; a superscript two as the port is malformed, not the tunnel host."""
-    assert _host_header_name(b"localhost:\xb2") is None
+@pytest.mark.parametrize("value", [b"localhost:\xb2", b"localhost:4\xb943", b"[::1]:\xb3"])
+def test_host_header_port_of_non_ascii_digits_is_malformed(value: bytes) -> None:
+    """A Host port is ASCII digits only (H2-1): a superscript digit in the port is malformed, not the tunnel host."""
+    assert _host_header_name(value) is None
 
 
 # Mutated raw requests against a live broker.
@@ -396,9 +463,35 @@ def _resolve_only_localhost(host: str, *, port: int | None, scheme: str) -> list
 
 
 @pytest_asyncio.fixture
-async def fuzz_broker(broker: BrokerFactory, monkeypatch: pytest.MonkeyPatch) -> EgressBroker:
-    """Return one broker for every example of a property: ``localhost/ok`` gets SECRET, and DNS stays local."""
+async def fuzz_broker(
+    broker: BrokerFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    http_upstream: Upstream,
+    tls_upstream: Upstream,
+) -> EgressBroker:
+    """Return one broker for every example of a property: ``localhost/ok`` gets SECRET.
+
+    It stays hermetic: DNS resolves only ``localhost``, and of the loopback ports the broker may dial, only the two
+    fake upstreams' answer; a mutated port gets connection refused instead of reaching a local service.
+    """
     monkeypatch.setattr(server_fetch_url, "_resolve_host_addresses", _resolve_only_localhost)
+    upstream_ports = {http_upstream.port, tls_upstream.port}
+    dial_checked_address = dial._dial
+
+    async def dial_fake_upstreams_only(
+        host: str,
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        port: int,
+        *,
+        policy: DialPolicy,
+        ssl_context: ssl.SSLContext | None,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if port not in upstream_ports:
+            msg = f"Port {port} is not a fake upstream."
+            raise ConnectionRefusedError(msg)
+        return await dial_checked_address(host, address, port, policy=policy, ssl_context=ssl_context)
+
+    monkeypatch.setattr(dial, "_dial", dial_fake_upstreams_only)
     rule = EgressRule(host="localhost", path_prefix=_RULE_PREFIX, auth=EgressAuth(type="bearer"))
     return await broker(EgressBrokerConfig(services={"svc": EgressService(rules=[rule])}), secrets={"svc": SECRET})
 
@@ -463,7 +556,9 @@ def _assert_upstream_never_saw_credentials(requests: list[SeenRequest], token: s
             assert seen.headers.get("authorization") == [f"Bearer {SECRET}"], seen
             assert [value for value in values if SECRET in value] == [f"Bearer {SECRET}"], seen
             assert re.fullmatch(r"localhost\.?(:\d+)?", seen.headers["host"][0], re.IGNORECASE), seen
-            assert all(_stays_under(_RULE_PREFIX, view) for view in server_views(seen.path)), seen
+            # The raw target (without its query, as the broker routed it) and aiohttp's decoded path both count.
+            views = server_views(seen.raw_path.split("?", 1)[0]) | server_views(seen.path)
+            assert all(_stays_under(_RULE_PREFIX, view) for view in views), seen
 
 
 async def _assert_plain_request_served(broker: BrokerFactory, upstream: Upstream) -> None:

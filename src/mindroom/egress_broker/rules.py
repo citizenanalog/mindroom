@@ -174,27 +174,35 @@ def is_ambiguous_path(path: str) -> bool:
 
     Raw backslashes and empty segments (``//``) are refused outright. Then the raw path and every
     percent-decoded layer must hold no dot segment and no NUL, which catches ``%2e%2e``, ``%252e%252e``,
-    and ``x%2f..%2fy``. Each layer is also checked, and decoded further, in NFKC form, because a server that
-    applies it reads the two dot leader (U+2025) or two fullwidth full stops (U+FF0E) as ``..``, and the
-    fullwidth form of ``%2e`` as ``%2e``. A layer that is not valid UTF-8 (such as the overlong ``%c0%ae``) is
-    refused, and so is a path still changing after `_MAX_DECODE_LAYERS` rounds. A bare encoded slash such as GitLab's
-    ``group%2Fproject`` stays allowed: rules match the raw path, so only a dot segment can climb out of a prefix.
-    The broker refuses rather than normalizes, because servers disagree on how to normalize.
+    and ``x%2f..%2fy``. Each layer is also checked in NFKC form, because a server that applies it reads the two
+    dot leader (U+2025) or two fullwidth full stops (U+FF0E) as ``..``. Decoding continues from both forms, so
+    folding only adds refusals: NFKC turns the fullwidth form of ``%2e`` into ``%2e``, but it also merges a hex
+    letter with a following combining mark (``%5C`` + U+0301), hiding an escape the unfolded form still decodes.
+    A layer that is not valid UTF-8 (such as the overlong ``%c0%ae``) is refused, and so is a path still changing
+    after `_MAX_DECODE_LAYERS` rounds. That includes a fullwidth percent sign (U+FF05) before hex that is not
+    UTF-8 once folded, as in ``100`` + U+FF05 + ``CBD``: refusing it fails safe. A bare encoded slash such as
+    GitLab's ``group%2Fproject`` stays allowed: rules match the raw path, so only a dot segment can climb out of a
+    prefix. The broker refuses rather than normalizes, because servers disagree on how to normalize.
     """
     if "\\" in path or "//" in path:
         return True
-    layer = path
+    layers = {path}
     for _ in range(_MAX_DECODE_LAYERS + 1):
-        folded = unicodedata.normalize("NFKC", layer)
-        if "\x00" in layer or _has_dot_segment(layer) or _has_dot_segment(folded):
-            return True
-        try:
-            decoded = unquote(folded, errors="strict")
-        except UnicodeDecodeError:
-            return True
-        if decoded == layer:
+        decoded_layers: set[str] = set()
+        for layer in layers:
+            folded = unicodedata.normalize("NFKC", layer)
+            if "\x00" in layer or _has_dot_segment(layer) or (folded != layer and _has_dot_segment(folded)):
+                return True
+            for form in dict.fromkeys((layer, folded)):
+                try:
+                    decoded = unquote(form, errors="strict")
+                except UnicodeDecodeError:
+                    return True
+                if decoded != layer:
+                    decoded_layers.add(decoded)
+        if not decoded_layers:
             return False
-        layer = decoded
+        layers = decoded_layers
     return True
 
 

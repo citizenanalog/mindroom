@@ -248,9 +248,10 @@ UPSTREAM_ROUTES: dict[str, Callable[[web.Request], Awaitable[web.StreamResponse]
 
 @dataclass(frozen=True)
 class SeenRequest:
-    """One request the fake upstream served: path, headers (lowercased names), and the connection's client port."""
+    """One request the fake upstream served: decoded path, raw target, headers (lowercased names), and client port."""
 
     path: str
+    raw_path: str
     headers: dict[str, list[str]]
     peer_port: int
 
@@ -284,7 +285,14 @@ async def _serve_upstream(ssl_context: ssl.SSLContext | None) -> AsyncIterator[U
     ) -> web.StreamResponse:
         assert request.transport is not None
         peer_port = request.transport.get_extra_info("peername")[1]
-        seen.append(SeenRequest(path=request.path, headers=_header_lists(request), peer_port=peer_port))
+        seen.append(
+            SeenRequest(
+                path=request.path,
+                raw_path=request.raw_path,
+                headers=_header_lists(request),
+                peer_port=peer_port,
+            ),
+        )
         return await handler(request)
 
     app = web.Application(middlewares=[record_hit])
