@@ -41,7 +41,7 @@ const baseProps = () => ({
     validation,
   })),
   onSave: vi.fn(async () => undefined),
-  onCancel: vi.fn(),
+  onClose: vi.fn(),
 });
 
 /** Render the editor and wait until the server's presets are in the dropdown. */
@@ -49,7 +49,7 @@ async function renderEditor(props: Partial<EgressServiceEditorProps> = {}) {
   const merged = { ...baseProps(), ...props };
   render(<EgressServiceEditor {...merged} />);
   await waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
-  return { onSave: merged.onSave, onCancel: merged.onCancel };
+  return { onSave: merged.onSave, onClose: merged.onClose };
 }
 
 /** Open the section that holds everything but the basic fields. */
@@ -605,9 +605,9 @@ describe("the editor form", () => {
   });
 
   it("cancels without saving", async () => {
-    const { onSave, onCancel } = await renderEditor();
+    const { onSave, onClose } = await renderEditor();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(onCancel).toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalled();
     expect(onSave).not.toHaveBeenCalled();
   });
 });
@@ -1858,14 +1858,14 @@ describe("saving the API key with the service", () => {
     const saveKey = vi.fn(async () => {
       calls.push("key");
     });
-    const onSaved = vi.fn(() => {
+    const onClose = vi.fn(() => {
       calls.push("saved");
     });
-    await renderEditor({ onSave, saveKey, onSaved });
+    await renderEditor({ onSave, saveKey, onClose });
     fill();
     type("API key", "sk-123");
     save();
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(calls).toEqual(["service", "key", "saved"]);
     expect(saveKey).toHaveBeenCalledWith("sk-123", "httpbin");
     expect(onSave).toHaveBeenCalledWith("httpbin", {
@@ -1876,12 +1876,12 @@ describe("saving the API key with the service", () => {
 
   it("saves only the service when no key was typed", async () => {
     const saveKey = vi.fn(async () => undefined);
-    const onSaved = vi.fn();
-    const { onSave } = await renderEditor({ saveKey, onSaved });
+    const onClose = vi.fn();
+    const { onSave } = await renderEditor({ saveKey, onClose });
     fill();
     type("API key", "   ");
     save();
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(saveKey).not.toHaveBeenCalled();
   });
@@ -1891,8 +1891,8 @@ describe("saving the API key with the service", () => {
       throw new Error("The server said no");
     });
     const saveKey = vi.fn(async () => undefined);
-    const onSaved = vi.fn();
-    await renderEditor({ onSave, saveKey, onSaved });
+    const onClose = vi.fn();
+    await renderEditor({ onSave, saveKey, onClose });
     fill();
     type("API key", "sk-123");
     save();
@@ -1900,7 +1900,7 @@ describe("saving the API key with the service", () => {
       "The server said no",
     );
     expect(saveKey).not.toHaveBeenCalled();
-    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
     // The key stays typed for the next try.
     expect(screen.getByLabelText("API key")).toHaveValue("sk-123");
     expect(screen.getByLabelText("Name")).toBeEnabled();
@@ -1912,8 +1912,8 @@ describe("saving the API key with the service", () => {
       .fn<(key: string, name: string) => Promise<void>>()
       .mockRejectedValueOnce(new Error("The vault is read-only"))
       .mockResolvedValue(undefined);
-    const onSaved = vi.fn();
-    await renderEditor({ onSave, saveKey, onSaved });
+    const onClose = vi.fn();
+    await renderEditor({ onSave, saveKey, onClose });
     fill();
     type("API key", "sk-123");
     save();
@@ -1922,7 +1922,7 @@ describe("saving the API key with the service", () => {
       "The service was saved, but its key was not: The vault is read-only",
     );
     expect(alert).toHaveTextContent("Paste the key again and save to retry.");
-    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
     // The saved service stays: it keeps its name, and the form stays open.
     expect(screen.getByLabelText("Name")).toBeDisabled();
     expect(
@@ -1931,7 +1931,7 @@ describe("saving the API key with the service", () => {
     expect(screen.getByLabelText("API key")).toHaveValue("sk-123");
 
     save();
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(saveKey).toHaveBeenCalledTimes(2);
     expect(saveKey).toHaveBeenLastCalledWith("sk-123", "httpbin");
     // Nothing changed in the service, so it is not written again.
@@ -1975,16 +1975,16 @@ describe("saving the API key with the service", () => {
 
   it("can set a key while editing a service", async () => {
     const saveKey = vi.fn(async () => undefined);
-    const onSaved = vi.fn();
+    const onClose = vi.fn();
     await renderEditor({
       name: "github",
       service: { preset: "github" },
       saveKey,
-      onSaved,
+      onClose,
     });
     type("API key", "ghp_x");
     save();
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveKey).toHaveBeenCalledWith("ghp_x", "github");
   });
 });
@@ -2639,7 +2639,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     const merged = { ...baseProps(), ...props };
     render(<EgressServiceEditor {...merged} />);
     await limitSavable();
-    return { onSave: merged.onSave, onCancel: merged.onCancel };
+    return { onSave: merged.onSave, onClose: merged.onClose };
   };
   const enter = (value: string) =>
     fireEvent.change(screen.getByLabelText("GitHub repositories"), {
@@ -2698,17 +2698,17 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
 
   it("saves restrict-only rules for the repositories, with no key, login, or placeholders", async () => {
     const saveKey = vi.fn(async () => undefined);
-    const onSaved = vi.fn();
+    const onClose = vi.fn();
     const { onSave } = await renderEditor({
       initialRestrictOnly: true,
       saveKey,
-      onSaved,
+      onClose,
     });
     enter("octocat/Hello-World");
     // Its uploads.github.com rules are not a choice: without them that host would stay open.
     expect(screen.queryByLabelText(/Also allow uploads.github.com/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("github-limited", {
       display_name: "GitHub (octocat/Hello-World)",
       description: "Limited to octocat/Hello-World",

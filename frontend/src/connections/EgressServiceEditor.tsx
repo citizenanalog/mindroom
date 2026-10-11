@@ -141,8 +141,8 @@ export interface EgressServiceEditorProps {
   onDirtyChange?: (dirty: boolean) => void;
   /**
    * Save the service; reject with an Error whose message is shown in the form.
-   * With `saveKey`, do not close the editor here: `onSaved` does that once the
-   * key is saved too.
+   * Do not close the editor here: `onClose` does that once the key, when one
+   * was typed, is saved too.
    */
   onSave: (name: string, service: AuthoredEgressService) => Promise<void>;
   /**
@@ -152,11 +152,10 @@ export interface EgressServiceEditorProps {
    * says that only the key failed.
    */
   saveKey?: (key: string, name: string) => Promise<void>;
-  /** Called once the service, and its key when one was typed, are saved. */
-  onSaved?: () => void;
   /** Delete the service being edited; reject like `onSave`. Without it there is no delete button. */
   onDelete?: () => Promise<void>;
-  onCancel: () => void;
+  /** Close the editor: on Cancel, and once the service, and its key when one was typed, are saved. */
+  onClose: () => void;
 }
 
 /**
@@ -183,9 +182,8 @@ export function EgressServiceEditor({
   onDirtyChange,
   onSave,
   saveKey,
-  onSaved,
   onDelete,
-  onCancel,
+  onClose,
 }: EgressServiceEditorProps) {
   const id = useId();
   const editing = name !== undefined;
@@ -469,7 +467,7 @@ export function EgressServiceEditor({
         return;
       }
     }
-    onSaved?.();
+    onClose();
   };
 
   const remove = async () => {
@@ -713,7 +711,7 @@ export function EgressServiceEditor({
           size="sm"
           variant="ghost"
           disabled={busy !== null}
-          onClick={confirmingSave ? () => setConfirmingSave(false) : onCancel}
+          onClick={confirmingSave ? () => setConfirmingSave(false) : onClose}
         >
           {confirmingSave ? "Go back" : "Cancel"}
         </Button>

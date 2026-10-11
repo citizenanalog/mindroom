@@ -348,7 +348,7 @@ function AgentSection({
   };
 
   // The editor stays open after the service is written: it saves the key next
-  // and closes through `onSaved`, so a key that fails can be reported there.
+  // and closes through `onClose`, so a key that fails can be reported there.
   const save = async (name: string, service: AuthoredEgressService) => {
     if (await write(servicePath(agent.agent_name, name), "PUT", service))
       onChanged();
@@ -480,11 +480,10 @@ function AgentSection({
             onDirtyChange={setEditorDirty}
             onSave={save}
             saveKey={saveKey}
-            onSaved={() => setEditor(null)}
             onDelete={
               editor.kind === "edit" ? () => remove(editor.name) : undefined
             }
-            onCancel={() => setEditor(null)}
+            onClose={() => setEditor(null)}
           />
         </div>
       )}

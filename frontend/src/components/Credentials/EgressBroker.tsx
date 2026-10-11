@@ -309,11 +309,6 @@ function ServiceSection({
     }
   };
 
-  const saveService = async (name: string, service: AuthoredEgressService) => {
-    await writeService(name, service);
-    setEditor(null);
-  };
-
   const deleteService = async (name: string) => {
     await writeService(name, undefined);
     setEditor((current) =>
@@ -422,13 +417,13 @@ function ServiceSection({
             loadPresets={loadPresets}
             saveWarning={saveWarning}
             onDirtyChange={setEditorDirty}
-            onSave={saveService}
+            onSave={writeService}
             onDelete={
               editor.kind === "edit"
                 ? () => deleteService(editor.name)
                 : undefined
             }
-            onCancel={() => setEditor(null)}
+            onClose={() => setEditor(null)}
           />
         </div>
       )}
