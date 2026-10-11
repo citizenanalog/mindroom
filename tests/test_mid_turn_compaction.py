@@ -38,7 +38,7 @@ from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, inst
 from mindroom.history.replay import compaction_summary_message, is_compaction_summary
 from mindroom.history.storage import read_scope_state, set_force_compaction_state
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState
-from mindroom.native_compaction import NativeCompactionModel
+from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
 from mindroom.synthetic_model import SyntheticModel
 from mindroom.usage_storage import project_usage
 from tests.conftest import FakeModel, runtime_paths_for, seed_session
@@ -1420,3 +1420,32 @@ async def test_a_request_the_target_never_built_is_not_compacted(
     )
 
     assert summary_calls.inputs == []
+
+
+class _CheckpointingLoop(_NativeToolLoopModel):
+    """A native tool loop whose provider compacts on its third request."""
+
+    async def ainvoke(self, messages: list[Message], **kwargs: object) -> ModelResponse:
+        response = await super().ainvoke(messages, **kwargs)
+        if len(self.requests) == 3:
+            items = [{"type": "compaction", "id": "cmp", "encrypted_content": "c" * 400}]
+            record_native_checkpoint(response, items, self.native_compaction)
+        return response
+
+
+@pytest.mark.asyncio
+async def test_thinking_a_native_checkpoint_replaced_never_triggers_text_compaction(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path, context_window=40_000)
+    model = _CheckpointingLoop(
+        tool_rounds=6,
+        usage=lambda number: MessageMetrics(input_tokens=0, output_tokens=15_000 if number < 3 else 5_000),
+    )
+    model.configure_native_compaction(threshold=20_000)
+
+    await _run(_agent(model, config, paths), "Do the task")
+
+    assert summary_calls.inputs == []
+    assert model.native_compaction is not None

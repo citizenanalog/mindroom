@@ -53,7 +53,7 @@ from mindroom.history.storage import new_scope_session, reconcile_compaction_sta
 from mindroom.history.types import HistoryScope
 from mindroom.logging_config import get_logger
 from mindroom.model_usage import response_context_tokens
-from mindroom.native_compaction import NativeCompactionModel
+from mindroom.native_compaction import NativeCompactionModel, checkpoint_items, native_replay_messages
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from mindroom.usage_storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
 
@@ -407,7 +407,14 @@ def _request_tokens(
                 replay_model=policy.replay_model,
                 native_route=policy.native_route,
             )
-            + _thinking_tokens(messages)
+            # Thinking before the latest checkpoint is part of that checkpoint, not of the request.
+            + _thinking_tokens(
+                [
+                    message
+                    for message in native_replay_messages(messages, policy.native_route)
+                    if not checkpoint_items(message, policy.native_route)
+                ],
+            )
             + _tool_tokens(tools)
         )
     anchor = next(
