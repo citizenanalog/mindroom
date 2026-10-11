@@ -156,12 +156,7 @@ class TlsInterceptor:
             logger.debug("egress_broker_client_tls_failed", error_type=type(exc).__name__)
             return
         tunnel = _Tunnel(token=token, claims=claims, host=host, port=port)
-        tls_client = Peer(
-            h11.Connection(h11.SERVER),
-            client.reader,
-            client.writer,
-            idle_timeout=self._relay.idle_timeout,
-        )
+        tls_client = Peer.serving(client.reader, client.writer, idle_timeout=self._relay.idle_timeout)
         try:
             await serve_peer(tls_client, functools.partial(self._serve_request, tunnel=tunnel))
         finally:

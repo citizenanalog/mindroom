@@ -67,15 +67,15 @@ async def test_sni_differing_from_connect_host_is_refused(broker: BrokerFactory,
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "server_hostname",
-    ["localhost", "localhost.", None],
-    ids=["sni", "sni-trailing-dot", "no-sni"],
+    ["localhost", "localhost.", "LOCALHOST", None],
+    ids=["sni", "sni-trailing-dot", "sni-uppercase", "no-sni"],
 )
 async def test_sni_matching_or_absent_routes_by_connect_host(
     broker: BrokerFactory,
     upstreams: UpstreamFactory,
     server_hostname: str | None,
 ) -> None:
-    """A matching SNI (trailing dot or not) or none gets the CONNECT host's leaf; Host still has to match it."""
+    """A matching SNI (any case, trailing dot or not) or none gets the CONNECT host's leaf; Host still has to match."""
     await broker(rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=True)
     probe = await upstreams()
@@ -96,7 +96,7 @@ async def test_sni_matching_or_absent_routes_by_connect_host(
     assert [request.target for request in upstream.complete] == [b"/a"]
     assert_contained(
         intercepted=upstream,
-        others=[probe],
+        others=[],
         client_bytes=bytes(client.received),
         host=f"localhost:{upstream.port}",
     )
@@ -144,7 +144,7 @@ async def test_alpn_selects_only_http11(
         assert len(upstream.complete) == 1
     assert_contained(
         intercepted=upstream,
-        others=[probe],
+        others=[],
         client_bytes=bytes(client.received),
         host=f"localhost:{upstream.port}",
     )

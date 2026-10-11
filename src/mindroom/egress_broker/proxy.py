@@ -193,7 +193,7 @@ class EgressBroker:
         task.add_done_callback(self._connections.pop)
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        client = Peer(h11.Connection(h11.SERVER), reader, writer, idle_timeout=self._relay.idle_timeout)
+        client = Peer.serving(reader, writer, idle_timeout=self._relay.idle_timeout)
         try:
             await serve_peer(client, self._serve_request)
         finally:

@@ -43,6 +43,8 @@ __all__ = [
 ]
 
 _CHUNK = 64 * 1024
+# A client's request head, request line through the blank line, whether it arrives in one read or many.
+_MAX_REQUEST_HEAD = 64 * 1024
 _CLOSE_TIMEOUT = 5.0
 _PROXY_AUTHENTICATE = (b"proxy-authenticate", b'Basic realm="mindroom-egress-broker"')
 _HOSTNAME = re.compile(r"[a-z0-9_][a-z0-9_.-]*")
@@ -98,17 +100,40 @@ class Peer:
         # The request being answered, for the shape of a refusal; empty until one is read in this cycle.
         self.request_method = b""
         self.request_target = b""
+        # Whether the connection must close after the response (RFC 9112 section 6.1).
+        self.close_after_response = False
         self._idle_timeout = idle_timeout
 
+    @classmethod
+    def serving(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, idle_timeout: float) -> Peer:
+        """Return the broker's side of a client connection, which reads request heads of up to 64 KiB."""
+        conn = h11.Connection(h11.SERVER, max_incomplete_event_size=_MAX_REQUEST_HEAD)
+        return cls(conn, reader, writer, idle_timeout=idle_timeout)
+
     async def next_event(self) -> h11.Event | type[h11.NEED_DATA | h11.PAUSED]:
-        """Return the next event, reading from the stream until h11 has one (never NEED_DATA)."""
+        """Return the next event, reading from the stream until h11 has one (never NEED_DATA).
+
+        A request head over 64 KiB is refused with 431 however it arrives: h11 limits only an incomplete head, so a
+        complete one that came in a single read is measured here. A request with both Content-Length and
+        Transfer-Encoding is served, framed by the latter, but its connection closes after the response, so nothing
+        a parser that trusted the length would read as a further request is ever read.
+        """
+        awaiting_head = self.conn.their_role is h11.CLIENT and self.conn.their_state is h11.IDLE
+        # Bytes h11 holds or receives while it parses the head, minus what it holds afterwards, are the head.
+        consumed = len(self.conn.trailing_data[0]) if awaiting_head else 0
         while (event := self.conn.next_event()) is h11.NEED_DATA:
             async with asyncio.timeout(self._idle_timeout):
                 data = await self.reader.read(_CHUNK)
+            consumed += len(data)
             self.conn.receive_data(data)
         if isinstance(event, h11.Request):
             self.request_method = event.method
             self.request_target = event.target
+            if consumed - len(self.conn.trailing_data[0]) > _MAX_REQUEST_HEAD:
+                msg = "Request head too large."
+                raise h11.RemoteProtocolError(msg, error_status_hint=431)
+            names = {name for name, _ in event.headers}
+            self.close_after_response = {b"content-length", b"transfer-encoding"} <= names
         return event
 
     def start_next_cycle(self) -> None:
@@ -116,6 +141,7 @@ class Peer:
         self.conn.start_next_cycle()
         self.request_method = b""
         self.request_target = b""
+        self.close_after_response = False
 
     async def send(self, *events: h11.Event) -> None:
         for event in events:
@@ -124,21 +150,28 @@ class Peer:
         await self.writer.drain()
 
     async def sent_unprompted(self) -> bool:
-        """Return, without waiting, whether the peer closed or sent bytes after the last message h11 read.
+        """Return, almost without waiting, whether the peer closed or sent bytes after the last message h11 read.
 
-        An idle upstream answers nothing yet, so such bytes would be taken as the next request's response.
+        An idle upstream answers nothing yet, so such bytes would be taken as the next request's response. They are
+        found in h11's buffer or the stream's. Bytes still in the socket reach the stream only in the loop iteration
+        in which the first read's zero timeout cancels it, so a second read takes them from the stream. Bytes that
+        reach the socket after that iteration polled it are not seen, the same window as urllib3's
+        `is_connection_dropped`. They can only come from this tunnel's own upstream, and the next response read on
+        this tunnel would take them; no other tunnel, host, or requester is affected.
         """
         if self.conn.trailing_data[0]:
             return True
-        try:
-            # A read that cannot complete at once is cancelled on the next loop iteration.
-            async with asyncio.timeout(0):
-                await self.reader.read(1)
-        except TimeoutError:
-            return False
-        except OSError:
+        for _attempt in range(2):
+            try:
+                # A read that cannot complete at once is cancelled on the next loop iteration.
+                async with asyncio.timeout(0):
+                    await self.reader.read(1)
+            except TimeoutError:
+                continue
+            except OSError:
+                return True
             return True
-        return True
+        return False
 
 
 def _printable(text: str, *, limit: int) -> str:
@@ -527,6 +560,9 @@ class Relay:
         if switched:
             await client.send(h11.InformationalResponse(status_code=101, reason=response.reason, headers=headers))
             return True
+        if client.close_after_response:
+            # h11 then ends the client connection after this response.
+            headers.append((b"connection", b"close"))
         await client.send(h11.Response(status_code=response.status_code, reason=response.reason, headers=headers))
         while isinstance(event := await _from_upstream(upstream.next_event()), h11.Data):
             entry.bytes_down += len(event.data)

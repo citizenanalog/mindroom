@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import h11
 import pytest
 
+from mindroom.egress_broker._relay import Peer
 from tests.egress_broker.raw_http import (
     OK,
     SECOND,
@@ -174,8 +177,24 @@ async def test_upstream_anomaly(
     ]
     assert_contained(
         intercepted=upstream if tunnel else None,
-        others=[probe] if tunnel else [upstream, probe],
+        others=[] if tunnel else [upstream],
         client_bytes=bytes(client.received),
         host=target.host,
     )
     await assert_listener_serves(broker, probe)
+
+
+@pytest.mark.asyncio
+async def test_bytes_already_in_the_socket_count_as_sent_unprompted() -> None:
+    """Stray bytes that reached the socket but not yet the stream are found before the upstream is reused."""
+    ours, theirs = socket.socketpair()
+    reader, writer = await asyncio.open_connection(sock=ours)
+    try:
+        upstream = Peer(h11.Connection(h11.CLIENT), reader, writer, idle_timeout=5.0)
+        assert await upstream.sent_unprompted() is False
+        # Written synchronously, so the bytes sit in the socket until the loop next polls it.
+        theirs.sendall(STRAY_RESPONSE)
+        assert await upstream.sent_unprompted() is True
+    finally:
+        writer.transport.abort()
+        theirs.close()

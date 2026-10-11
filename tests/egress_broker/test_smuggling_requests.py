@@ -6,6 +6,7 @@ strict upstream parser and the invariants every case checks.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -98,26 +99,41 @@ def _same(statuses: tuple[int, ...], forwarded: int, **kwargs: bool) -> dict[str
     return {"plain": outcome, "tunnel": outcome}
 
 
+_HEAD_LIMIT = 64 * 1024
+
+
+def _padded_to(size: int) -> Callable[[bytes], bytes]:
+    """Pad the empty `X-Pad` header ending the head so that the whole head is exactly `size` bytes."""
+
+    def pad(raw: bytes) -> bytes:
+        assert raw.endswith(b"X-Pad: \r\n\r\n")
+        return raw[:-4] + b"a" * (size - len(raw)) + raw[-4:]
+
+    return pad
+
+
 _POST = "POST {t}/a HTTP/1.1\r\nHost: {h}\r\n{a}"
 _GET = "GET {t}/a HTTP/1.1\r\nHost: {h}\r\n{a}"
 # A request with no credentials and another Host: as plain HTTP it is unauthenticated, in a tunnel it is fronting.
 _SMUGGLED = "GET /smuggled HTTP/1.1\r\nHost: evil.example\r\n\r\n"
 _AFTER_SMUGGLE = {"plain": Outcome((200, 407), 1), "tunnel": Outcome((200, 403), 1)}
+# RFC 9112 section 6.1: after a request with both length headers the connection closes, so the rest is never read.
+_CLOSES_AFTER_BOTH_LENGTHS = {"plain": Outcome((200,), 1, closes=True), "tunnel": Outcome((200,), 1, closes=True)}
 _REJECTED_TE = "Content-Length: 5\r\nTransfer-Encoding: {value}\r\n\r\n0\r\n\r\n"
 _ACCEPTED_TE = "Content-Length: 5\r\n{line}\r\n\r\n0\r\n\r\n"
 
 REQUEST_CASES = [
-    # Conflicting length headers: the broker frames by Transfer-Encoding and forwards chunked framing only.
+    # Conflicting length headers: the broker frames by Transfer-Encoding, forwards chunked framing only, and closes.
     Case(
         "cl-te",
         _POST + "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + _SMUGGLED,
-        **_AFTER_SMUGGLE,
+        **_CLOSES_AFTER_BOTH_LENGTHS,
         check=_body(b"", chunked=True),
     ),
     Case(
         "te-cl",
         _POST + "Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n8\r\nSMUGGLED\r\n0\r\n\r\n" + _SMUGGLED,
-        **_AFTER_SMUGGLE,
+        **_CLOSES_AFTER_BOTH_LENGTHS,
         check=_body(b"SMUGGLED", chunked=True),
     ),
     *(
@@ -225,8 +241,10 @@ REQUEST_CASES = [
         check=_single_line(b"x-folded", b"one two"),
     ),
     Case("obs-fold-first-line", "GET {t}/a HTTP/1.1\r\n X-Folded: one\r\nHost: {h}\r\n{a}\r\n", **_same((400,), 0)),
-    # h11 limits only an incomplete head (16 KiB), so the head never ends; the broker reads it all before answering.
-    Case("oversized-head", _GET + "X-Big: " + "a" * 20_000, **_same((431,), 0)),
+    # Request heads are limited to 64 KiB, request line through the blank line, however the reads split them.
+    Case("oversized-head", _GET + "X-Big: " + "a" * 70_000, **_same((431,), 0)),
+    Case("head-at-limit", _GET + "X-Pad: \r\n\r\n", **_same((200,), 1), rewrite=_padded_to(_HEAD_LIMIT)),
+    Case("head-over-limit", _GET + "X-Pad: \r\n\r\n", **_same((431,), 0), rewrite=_padded_to(_HEAD_LIMIT + 1)),
     Case("repeated-host", _GET + "Host: evil.example\r\n\r\n", **_same((400,), 0)),
     # Pipelined requests that would reach another host.
     Case(
@@ -349,7 +367,7 @@ async def test_request_corpus(broker: BrokerFactory, upstreams: UpstreamFactory,
             case.check(request)
     assert_contained(
         intercepted=upstream if tunnel else None,
-        others=[probe] if tunnel else [upstream, probe],
+        others=[] if tunnel else [upstream],
         client_bytes=bytes(client.received),
         host=target.host,
     )
@@ -388,7 +406,50 @@ async def test_expect_continue_forwards_one_request_after_the_body(
     assert request.header(b"expect") == []
     assert_contained(
         intercepted=upstream if tunnel else None,
-        others=[probe] if tunnel else [upstream, probe],
+        others=[] if tunnel else [upstream],
+        client_bytes=bytes(client.received),
+        host=target.host,
+    )
+    await assert_listener_serves(broker, probe)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tunnel", [False, True], ids=["plain", "tunnel"])
+@pytest.mark.parametrize(
+    ("first_part", "total", "status"),
+    [(20 * 1024, _HEAD_LIMIT, 200), (60 * 1024, 70 * 1024, 431)],
+    ids=["split-at-limit", "split-over-limit"],
+)
+async def test_head_limit_holds_however_the_head_is_split(
+    broker: BrokerFactory,
+    upstreams: UpstreamFactory,
+    tunnel: bool,
+    first_part: int,
+    total: int,
+    status: int,
+) -> None:
+    """A head of 64 KiB is read even when its first part alone exceeds h11's default; one over it never is."""
+    await broker(rule_config(), secrets={"svc": SECRET}, max_body_bytes=MAX_BODY)
+    upstream = await upstreams(tls=tunnel)
+    probe = await upstreams()
+    client, target = await client_for(broker, upstream, tunnel=tunnel)
+    try:
+        raw = _padded_to(total)(target.render(_GET + "X-Pad: \r\n\r\n"))
+        client.send(raw[:first_part])
+        await client.writer.drain()
+        # Let the broker read the first part on its own before the rest arrives.
+        await asyncio.sleep(0.1)
+        client.send(raw[first_part:])
+        reply = await client.reply()
+    finally:
+        client.close()
+
+    assert reply is not None
+    assert reply.status == status
+    assert len(upstream.requests) == (status == 200)
+    assert_contained(
+        intercepted=upstream if tunnel else None,
+        others=[] if tunnel else [upstream],
         client_bytes=bytes(client.received),
         host=target.host,
     )
@@ -404,6 +465,7 @@ async def test_pipelined_plain_requests_reach_only_their_own_hosts(
     await broker(rule_config(), secrets={"svc": SECRET})
     first = await upstreams()
     second = await upstreams(lambda _index: [SECOND])
+    probe = await upstreams()
     client, _target = await client_for(broker, first, tunnel=False)
     credential = proxy_authorization(broker.token())
     try:
@@ -429,6 +491,7 @@ async def test_pipelined_plain_requests_reach_only_their_own_hosts(
     ]
     assert first.errors == second.errors == []
     assert SECRET.encode() not in first.raw + second.raw
+    await assert_listener_serves(broker, probe)
 
 
 @pytest.mark.asyncio
