@@ -98,7 +98,7 @@ Success criteria:
 - A new module, `history/mid_turn_compaction.py`, owns the policy.
   `create_agent` and team creation call `install_mid_turn_compaction(target, config=..., runtime_paths=..., entity_name=..., model_name=...)` on the target's model once the Agent or Team exists, and install the tool-call cap after it, so the cap's wrapper is outermost and refuses a request before compaction spends a summary call.
   Response preparation (`ai.py`, `teams.py`) attaches the turn's `CompactionLifecycle` to that binding; paths without one (approval continuations, delegated children, team members, workflow participants) compact without a notice.
-- The builder patch records which runs it built for each target, so a request that reuses the model for another conversation (a skill review fork) is never compacted.
+- The builder patch records the session object Agno loaded for each run it built, so a request that reuses the model for another conversation (a skill review fork) is never compacted, and a mid-turn compaction can set its new summary on the object Agno writes at the end of the run (section 5).
 - Before each request the hook:
   1. skips when compaction is disabled or text compaction is unavailable for the entity, or when this run already failed a mid-turn compaction;
   2. sizes the request: when this response loop has already received a response, the provider-reported input context of the latest one (`context_input_tokens_from_counts` over its usage counters, or the native final-iteration `context_usage` when present) plus an estimate of that assistant message and every message after it; otherwise the replay planner's estimate of the whole list plus the tool definitions.
@@ -129,10 +129,12 @@ A request is scoped when its target replays persisted history (`add_history_to_c
 - A mid-turn compaction summarizes the scope's latest summary, the visible stored runs no earlier generation covers, and the running turn's folded exchanges, in chunks with `summarize_runs`, and writes nothing until the last chunk succeeds.
   The turn reaches the summarizer as in-memory snapshots, one per folded exchange (an assistant message with the tool results that answer it), the first led by the bounded prompt context and the run's metadata; snapshots are never stored.
   Visible runs are read from storage when the compaction starts, so the summary covers every run a pre-reply compaction would fold, including runs a `num_history_runs` limit keeps out of replay and runs newer than a resumed run.
-- It then commits one positioned generation: the summary, the running run's id as its position (`through_run_id`), and the frozen list of stored runs it summarized (`covered_run_ids`).
+- It then commits one positioned generation: the summary, the running run's id as its position (`through_run_id`), the frozen list of stored runs it summarized (`covered_run_ids`), and the Matrix event ids the summary represents (`event_ids` and `seen_event_ids` of those runs and of the running run's metadata at the fold).
   It archives no runs when it is written.
+  While the generation is active its event ids count as compacted history, so `compacted_event_ids` and `redactable_compacted_event_ids` include them even when the running run later ends paused, cancelled, or failed and is not history-visible; a rollback or retirement removes them with the generation.
+- The commit also sets the new summary on the session object Agno loaded for the run (recorded by the builder patch), so Agno's end-of-run session write stores it and reconcile has no stale summary to repair; repairing one, as after a crash, still clears the scope's preserved seen ids as today.
 - The rewrite (section 4) then records that generation's id in the run's metadata (`mindroom_mid_turn_generation`), so the run's stored row says which fold it reflects; a cancellation after the commit still rewrites, and a failure before it leaves both the request and storage unchanged.
-- Nothing else in storage changes during the turn: no run moves, and Agno's end-of-run session write is left alone, because reconcile restores a stale `session.summary` from the archive.
+- Nothing else in storage changes during the turn: no run moves, and the live session object keeps every run Agno loaded.
 - A second mid-turn compaction of the same run commits another positioned generation on the same position, seeded with the latest summary; it covers only stored runs no earlier generation covers, so nothing is summarized twice.
 - Reconcile (`reconcile_compaction_state`) derives each positioned generation's state from storage:
   - **Applied**: its position run is stored with a recorded generation id at least its own, or is archived.
@@ -140,11 +142,14 @@ A request is scoped when its target replays persisted history (`add_history_to_c
   - **Orphaned**: its position run is neither stored nor archived, after an edit or redaction removed it or a crash lost a run that was never saved; reconcile rolls back from it.
   - It materializes every applied generation with a summary: the generation's own covered runs that are still live move into it with the existing whole-run archive write, without another summary call.
   The next reply therefore replays `[summary, the position run's prompt and its messages after the fold, later runs]`.
-- Reconcile runs before every reply, as today, and before every continuation that reloads stored history: the builder patch reconciles the session Agno loaded before Agno builds a continuation's history, which covers approval resumes of agents and teams, delegated children, and the automatic continuation after a delegation; approval recovery also reconciles before restoring native history, so the route identity sees the current summary.
-- A positioned generation depends on its position run and on every run it covers.
-  When an edit or redaction removes any of them, or a redaction hits one in the archive, compaction rolls back from the earliest generation that archived, covers, or is positioned on a removed run, with `roll_back_to`.
-- The archive keeps each run's original `run_index`, and a rollback restores every archived run of the rolled-back generations that precedes the removed run in that order, at its original index; the rest stay as tombstones.
-  Live runs never move during a turn, so original indexes order restored runs, older live runs that compaction skipped such as a pending approval, and member subtrees exactly; rows archived before this release have no index and keep today's behavior of appending in archive order.
+- Reconcile runs before every reply, as today, and before every continuation that reloads stored history: the builder patch reconciles the session Agno loaded before calling Agno's continuation builder, so history is fetched from the reconciled runs; this covers approval resumes of agents and teams, member and delegated-child approvals, and the automatic continuation after a delegation.
+  Agent approval recovery, team approval recovery, and delegated-child recovery also reconcile before restoring native history, so the route identity sees the current summary.
+- A positioned generation depends on its position run and on every run it covers, and the position run's shortened record depends on the generation.
+  When an edit or redaction removes any run a generation depends on, or a redaction hits one in the archive, compaction rolls back from the earliest generation that archived, covers, or is positioned on a removed run, with `roll_back_to`.
+  As today, that generation's runs archived before the removed run return to the live table and every later archived run stays as a tombstone.
+  The rollback also removes the live position run of every positioned generation it rolls back, since that run's record lacks its folded messages and its tail may build on content the rollback removed; removing it can roll back nothing further, because every generation that depends on it is at least as new.
+- The archive keeps each run's original `run_index`, and restored runs return at those indexes.
+  Every live run that survives a rollback is older than the removed run and coexisted with the restored runs when their generation was written, so original indexes order restored runs, older live runs that compaction skipped such as a pending approval, and member subtrees exactly, after reopening storage too; rows archived before this release have no index and keep today's behavior of appending in archive order.
 - Retiring or clearing summaries (`retire_summaries`, `clear_to_legacy`) also clears positions and covered lists, so a retired generation is never materialized; a generation without a summary stays the barrier it is today.
 - When a later pre-reply compaction archives the position run, its record already lacks the folded messages, so nothing is summarized twice.
 - Tool results join the latest assistant tool call even when a projection such as an approval receipt sits between them, so a fold never leaves a tool result without its call.
@@ -187,14 +192,14 @@ With the summary in every agent's history, `agent-context` is no longer any agen
 | Module | Change |
 | --- | --- |
 | `history/replay.py` | Summary message rendering and estimate; summary-only plans as zero runs; request sizing helpers for the mid-turn trigger. |
-| `history/agno_compat_message_builder.py` | Inserts the summary message in Agent and Team new-run and continuation builders and records which runs it built (new `AGNO_COMPAT` marker). |
+| `history/agno_compat_message_builder.py` | Inserts the summary message in Agent and Team new-run and continuation builders and records each built run's session (new `AGNO_COMPAT` marker). |
 | `history/legacy_summary_system_prompt.py` (new) | Recognizes a paused system message that already embeds Agno's summary block. |
 | `agno_compat_model_hooks.py` | `install_request_preparation` (new `AGNO_COMPAT` marker). |
 | `history/mid_turn_compaction.py` (new) | Binding, trigger, in-flight rewrite, in-memory snapshots, scoped and run-local compaction, native fallback, usage carry-over. |
 | `history/compaction.py`, `history/runtime.py` | A chunked summary call without archive writes, used by both mid-turn destinations; the scoped commit of a positioned generation with its hooks and notice. |
-| `history/archive_schema.py`, `history/archive.py` | `through_run_id` and `covered_run_ids` on generations and `run_index` on archived runs, added to existing archives; the earliest generation depending on a run; restore at original indexes. |
+| `history/archive_schema.py`, `history/archive.py` | `through_run_id`, `covered_run_ids`, `event_ids`, and `seen_event_ids` on generations and `run_index` on archived runs, added to existing archives; compacted ids include active positioned generations; the earliest generation depending on a run; restore at original indexes. |
 | `history/storage.py` | Reconcile deletes, rolls back, or materializes positioned generations; edit and redaction roll back from a removed run's earliest dependent generation. |
-| `history/agno_compat_message_builder.py`, `approval/execution.py`, `teams.py` | Reconcile before a continuation builds history and before approval recovery restores native history. |
+| `history/agno_compat_message_builder.py`, `approval/execution.py`, `teams.py`, `delegation/execution.py` | Reconcile before a continuation builds history and before recovery restores native history. |
 | `history/native.py` | Route identity from the rendered summary message. |
 | `model_usage.py` | Request-context size of one assistant message, shared with run metadata. |
 | `agents.py`, `teams.py`, `ai.py` | Flag off, hook installation order, lifecycle binding. |
@@ -225,11 +230,13 @@ Failing-first tests at the owning seams (history modules, the builder patch, the
 - A resumed run sizes its first request by estimate, not by the paused response's usage.
 - A rewritten request that still exceeds the limit raises `Saved conversation summary exceeds the available history budget`.
 - A cancellation after the positioned generation committed still leaves the request rewritten; a failure in any chunk leaves the request and storage unchanged.
-- After a mid-turn compaction the next reply replays the summary, the position run's prompt and tail, and nothing older, without a summary call, and its reconcile archives exactly the covered runs; Agno's end-of-run row may hold the old summary, and reconcile restores it on the next load.
+- After a mid-turn compaction the next reply replays the summary, the position run's prompt and tail, and nothing older, without a summary call; the session row Agno wrote at the run's end already holds the new summary, and the next reconcile archives exactly the covered runs.
+- Unseen thread context folded by a run that then stops, fails, or pauses does not return as raw context in the next reply, before and after materialization, and a redaction of such an event rolls the generation back.
+- A redaction of a covered run that a resumed older position run summarized removes that position run too, before and after materialization, after the position run was archived, and after two folds.
 - Every continuation path (agent and team approval, member approval, delegated child approval, automatic continuation after a delegation) replays one summary and no covered run after a mid-turn compaction before its pause.
 - Crash recovery: a positioned generation with no stored position run, an older paused row, or a row reflecting only an earlier fold is deleted or rolled back so the summary matches the run's record.
 - Two folds of one run, a paused run that completes after a fold, and a resumed older run that folds while newer runs exist each materialize and roll back exactly their covered runs.
-- Restored runs keep their original order after reopening storage, including equal creation timestamps, a skipped paused run, and member subtrees.
+- Restored runs keep their original order after reopening storage, including equal creation timestamps, a skipped paused run, member subtrees, and a history archived whole twice before the redaction.
 - Retiring or clearing summaries never materializes a positioned generation; an existing archive gains the new columns.
 - A team member's long tool loop compacts run-locally and its approval resume keeps the run-local summary.
 - Editing the position run, redacting an event the run consumed before or after the fold or its reply event, and redacting an event of a covered run roll back to the previous summary, before and after materialization, after one and after two mid-turn compactions, and after a later pre-reply compaction archived the run.
