@@ -9,7 +9,7 @@ has a direct safety net.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock
@@ -19,22 +19,26 @@ import pytest
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.constants import SKIP_MENTIONS_KEY
-from mindroom.conversation_resolver import ConversationResolver, ConversationResolverDeps
+from mindroom.constants import ATTACHMENT_IDS_KEY, HOOK_SOURCE_KEY, SKIP_MENTIONS_KEY
+from mindroom.conversation_resolver import ConversationResolver, ConversationResolverDeps, MessageContext
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.event_journal import (
+    ConversationCursor,
     ConversationPage,
     EventClass,
     EventJournalStore,
     EventKind,
+    RefreshRequest,
     VisibleMessage,
 )
 from mindroom.logging_config import get_logger
 from mindroom.matrix.conversation_hydration import ConversationHydrator
 from mindroom.matrix.conversation_reads import ConversationReader
+from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.journal_ingress import _inbound_event, _projected_event
 from mindroom.matrix.relation_lookup import RelationLookup
-from mindroom.matrix.thread_membership import ThreadMembershipLookupError
+from mindroom.matrix.thread_membership import RelatedEventUnavailableError, ThreadMembershipLookupError
+from mindroom.message_target import MessageTarget
 from tests.conftest import (
     bind_runtime_paths,
     make_matrix_client_mock,
@@ -44,7 +48,7 @@ from tests.conftest import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
 _ROOM_ID = "!test:localhost"
@@ -206,6 +210,36 @@ def _room() -> nio.MatrixRoom:
     # A synced cache is what makes an absent mention mean absent rather than "not fetched yet".
     room.members_synced = True
     return room
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", ["refresh", "cursor", "truncated"])
+async def test_dispatch_repairs_pending_refresh_before_counting_participants(config: Config, incomplete: str) -> None:
+    """Repair a withheld streamed reply before planning, without retrying permanent bounds."""
+    messages = (
+        replace(_projected(_THREAD_ROOT, "First participant"), thread_id=_THREAD_ROOT),
+        replace(_projected("$second", "Second participant"), thread_id=_THREAD_ROOT, sender=_HUMAN_USER_ID),
+    )
+    reader = _conversation_reader(*messages)
+    reader.read.return_value = ConversationPage(  # type: ignore[attr-defined]
+        messages=messages,
+        refresh_pending=(RefreshRequest(_ROOM_ID, _THREAD_ROOT, "$answer", "$final-edit", 1, 1),)
+        if incomplete == "refresh"
+        else (),
+        next_cursor=ConversationCursor(500, "$older") if incomplete == "cursor" else None,
+    )
+    reader.hydration_was_truncated.return_value = incomplete == "truncated"  # type: ignore[attr-defined]
+    resolver = _resolver(config, conversation_reader=reader)
+
+    result = await resolver.extract_dispatch_context(_room(), _threaded_event())
+
+    if incomplete == "refresh":
+        reader.read_strict.assert_awaited_once()  # type: ignore[attr-defined]
+        assert not result.context.planning_thread_history_unavailable
+        assert {message.sender for message in result.context.planning_thread_history} == {_SENDER, _HUMAN_USER_ID}
+    else:
+        reader.read_strict.assert_not_awaited()  # type: ignore[attr-defined]
+        assert result.context.planning_thread_history_unavailable
 
 
 @pytest.mark.asyncio
@@ -535,6 +569,51 @@ async def test_build_ingress_envelope_carries_event_identity(config: Config) -> 
     assert envelope.source_kind == "message"
 
 
+@pytest.mark.parametrize(("body", "expected_body"), [(None, "hello"), ("", "hello"), ("override", "override")])
+def test_full_and_lightweight_envelopes_share_fields(config: Config, body: str | None, expected_body: str) -> None:
+    """Both adapters preserve mentions, body fallback, attachments, and relay metadata."""
+    resolver = _resolver(config)
+    event = _event({"body": "hello", ATTACHMENT_IDS_KEY: [" a ", "a", "b"]})
+    target = MessageTarget.resolve(_ROOM_ID, _THREAD_ROOT, _EVENT_ID)
+    mentions = [MatrixID.parse(_BOT_USER_ID)]
+    context = MessageContext(
+        am_i_mentioned=True,
+        is_thread=True,
+        thread_id=_THREAD_ROOT,
+        thread_history=(),
+        mentioned_agents=mentions,
+        has_non_agent_mentions=False,
+    )
+    full = resolver.build_message_envelope(
+        event=event,
+        requester_user_id=_SENDER,
+        context=context,
+        target=target,
+        body=body,
+        hook_source="test-hook",
+        message_received_depth=2,
+        original_sender=_HUMAN_USER_ID,
+        trusted_user_relay=True,
+    )
+    lightweight = resolver.build_ingress_envelope(
+        event=event,
+        requester_user_id=_SENDER,
+        target=target,
+        body=body,
+        mentioned_agents=mentions,
+        hook_source="test-hook",
+        message_received_depth=2,
+        original_sender=_HUMAN_USER_ID,
+        trusted_user_relay=True,
+    )
+    assert full == lightweight
+    assert full.body == expected_body
+    assert full.attachment_ids == ("a", "b")
+    assert full.mentioned_agents == ("general",)
+    assert full.hook_source == "test-hook"
+    assert full.message_received_depth == 2
+
+
 def _parse(source: dict[str, Any]) -> nio.Event:
     event = nio.Event.parse_event(source)
     assert isinstance(event, nio.Event)
@@ -778,3 +857,125 @@ async def test_coalescing_still_fails_closed_when_the_repair_cannot_prove_the_ro
     ) as resolver:
         with pytest.raises(ThreadMembershipLookupError):
             await resolver.coalescing_thread_id(_room(), _reply_event())
+
+
+@dataclass
+class _HomeserverRefusingEveryEvent(_HomeserverWithAThread):
+    """A homeserver that answers every event lookup with one fixed error."""
+
+    errcode: str = "M_NOT_FOUND"
+
+    async def room_get_event(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> nio.RoomGetEventResponse | nio.RoomGetEventError:
+        """Refuse the event, whatever it is."""
+        del room_id, event_id
+        return nio.RoomGetEventError("refused", self.errcode)
+
+
+def _reference_event() -> nio.RoomMessageText:
+    return _event(
+        {
+            "body": "a reference",
+            "m.relates_to": {"rel_type": "m.reference", "event_id": "$fabricated:localhost"},
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("errcode", ["M_NOT_FOUND", "M_FORBIDDEN"])
+@pytest.mark.parametrize("make_event", [_reply_event, _reference_event])
+async def test_coalescing_reports_a_relation_target_the_homeserver_will_not_serve(
+    config: Config,
+    tmp_path: Path,
+    errcode: str,
+    make_event: Callable[[], nio.RoomMessageText],
+) -> None:
+    """A target that is missing or hidden fails the same way on every retry.
+
+    Anyone in the room can name one, so the caller has to be able to tell it
+    from a lookup that failed for a moment, or one message holds up the room.
+    """
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverRefusingEveryEvent(errcode=errcode),
+    ) as resolver:
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), make_event())
+
+
+@dataclass
+class _HomeserverServingAStateEvent(_HomeserverWithAThread):
+    """A homeserver whose ``$parent`` is a membership event, not a message."""
+
+    async def room_get_event(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> nio.RoomGetEventResponse | nio.RoomGetEventError:
+        """Serve a join event under the ID every relation in these tests names."""
+        del room_id, event_id
+        response = nio.RoomGetEventResponse()
+        response.event = _parse(
+            {
+                "event_id": _PARENT,
+                "sender": _SENDER,
+                "origin_server_ts": 1_000,
+                "type": "m.room.member",
+                "state_key": _SENDER,
+                "room_id": _ROOM_ID,
+                "content": {"membership": "join"},
+            },
+        )
+        return response
+
+
+@pytest.mark.asyncio
+async def test_coalescing_reports_a_relation_target_that_is_not_a_message(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    """An event's type never changes, so a reply to a join fails the same way on every retry."""
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverServingAStateEvent(),
+    ) as resolver:
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), _reply_event())
+
+
+@pytest.mark.asyncio
+async def test_coalescing_keeps_a_server_failure_retryable(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    """A homeserver that failed to answer may answer next time, so it is not a refusal."""
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverRefusingEveryEvent(errcode="M_UNKNOWN"),
+    ) as resolver:
+        with pytest.raises(ThreadMembershipLookupError) as raised:
+            await resolver.coalescing_thread_id(_room(), _reply_event())
+
+    assert not isinstance(raised.value, RelatedEventUnavailableError)
+
+
+def test_only_a_managed_sender_can_mark_a_turn_as_an_automation_turn(config: Config) -> None:
+    """A person's message carrying an automation hook source is an ordinary turn, so auto-flush still keeps it."""
+    resolver = _resolver(config)
+    event = _event({"body": "hello", HOOK_SOURCE_KEY: "automation/dreaming"})
+
+    envelope = resolver.build_ingress_envelope(
+        event=event,
+        requester_user_id=_SENDER,
+        target=MessageTarget.resolve(_ROOM_ID, None, _EVENT_ID),
+        body="hello",
+        mentioned_agents=[],
+    )
+
+    assert envelope.hook_source is None

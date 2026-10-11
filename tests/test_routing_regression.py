@@ -18,8 +18,8 @@ from agno.models.ollama import Ollama
 
 from mindroom.background_tasks import wait_for_background_tasks
 from mindroom.bot import AgentBot, TeamBot
-from mindroom.coalescing import CoalescingGate, ReadyPendingEvent
-from mindroom.coalescing_batch import CoalescingKey, RequesterCoalescingOwner
+from mindroom.coalescing.batch import CoalescingKey, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate, ReadyPendingEvent
 from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
@@ -36,7 +36,7 @@ from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.orchestration.runtime import EntityStartResults
 from mindroom.orchestrator import _MultiAgentOrchestrator
-from mindroom.routing import suggest_responder_for_message
+from mindroom.routing import ResponderSelection, suggest_responder_for_message
 from mindroom.teams import TeamOutcome, TeamResolution
 from mindroom.text_ingress_dispatch import _run_admitted_router_relay
 from mindroom.thread_utils import AgentResponseDecision
@@ -60,6 +60,7 @@ from tests.conftest import (
 )
 from tests.identity_helpers import actual_entity_usernames, entity_ids, entity_name_for_id, persist_entity_accounts
 from tests.journal_helpers import admit_dispatch_event
+from tests.response_attempt_helpers import install_direct_response_admission
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -158,6 +159,7 @@ def setup_test_bot(
         rooms=[room_id],
         enable_streaming=enable_streaming,
     )
+    install_direct_response_admission(bot)
     bot.client = make_matrix_client_mock(user_id=agent.user_id)
     return install_runtime_journal_support(bot)
 
@@ -300,7 +302,7 @@ async def test_suggest_responder_for_message_returns_aliases_for_actual_ids(
         runtime_paths,
         usernames={"router": "actual_router", "news": "actual_news", "facts": "actual_facts"},
     )
-    mock_suggest_responder.return_value = "news"
+    mock_suggest_responder.return_value = ResponderSelection("news")
 
     result = await suggest_responder_for_message(
         "what happened?",
@@ -488,6 +490,15 @@ class TestRoutingRegression:
     ) -> None:
         """Recover ready selections while retaining only an exact unready target."""
         router_bot, _healthy_bot, stuck_bot, room = _selective_router_recovery_runtime(tmp_path)
+
+        async def recover_until_settled(event_id: str) -> None:
+            async with asyncio.timeout(5):
+                while await router_bot._journal_dispatcher.store.is_pending(event_id):
+                    await router_bot.recover_pending_turn_journal_events()
+                    await drain_coalescing(router_bot)
+                    assert await wait_for_background_tasks(timeout=1, owner=router_bot._runtime_view)
+                    await asyncio.sleep(0.01)
+
         room_id = room.room_id
         event = _router_readiness_event("$selective-recovery")
         router_bot.client.room_send.return_value = nio.RoomSendResponse.from_dict(
@@ -503,10 +514,7 @@ class TestRoutingRegression:
             EventClass.ACTIONABLE,
         )
 
-        await router_bot.recover_pending_turn_journal_events()
-        await drain_coalescing(router_bot)
-        assert await wait_for_background_tasks(timeout=1, owner=router_bot._runtime_view)
-        await router_bot.recover_pending_turn_journal_events()
+        await recover_until_settled(event.event_id)
 
         mock_suggest_responder.assert_awaited_once()
         content = router_bot.client.room_send.await_args.kwargs["content"]
@@ -539,10 +547,7 @@ class TestRoutingRegression:
             {"event_id": "$stuck-router-response"},
             room_id=room_id,
         )
-        await router_bot.recover_pending_turn_journal_events()
-        await drain_coalescing(router_bot)
-        assert await wait_for_background_tasks(timeout=1, owner=router_bot._runtime_view)
-        await router_bot.recover_pending_turn_journal_events()
+        await recover_until_settled(blocked_event.event_id)
 
         content = router_bot.client.room_send.await_args.kwargs["content"]
         assert content["body"] == "@mindroom_stuck:localhost could you help with this?"
@@ -1436,7 +1441,6 @@ class TestRoutingRegression:
             config=test_config,
             runtime_paths=runtime_paths,
             rooms=[test_room_id],
-            team_mode="coordinate",
         )
         bot.orchestrator = SimpleNamespace(
             agent_bots={
@@ -1595,7 +1599,7 @@ class TestRoutingRegression:
                 models={"default": ModelConfig(provider="test", id="test-model")},
                 router=RouterConfig(
                     model="default",
-                    access=ResponderAccessConfig(users=["@alice:localhost"]),
+                    access=ResponderAccessConfig(current_room_members=False, users=["@alice:localhost"]),
                 ),
             ),
             tmp_path,
@@ -1748,7 +1752,7 @@ class TestRoutingRegression:
     @patch("mindroom.teams.create_agent")
     @patch("mindroom.teams.Team.arun")
     @patch("mindroom.response_runner.ai_response")
-    @patch("mindroom.model_loading.get_model_instance")
+    @patch("mindroom.providers.model_loading.get_model_instance")
     @patch("mindroom.config.main.load_config")
     async def test_multiple_mentions_each_responds_once(
         self,
@@ -1773,7 +1777,7 @@ class TestRoutingRegression:
                     },
                     teams={},
                     room_models={},
-                    models={"default": ModelConfig(provider="anthropic", id="claude-3-5-haiku-latest")},
+                    models={"default": ModelConfig(provider="anthropic", id="claude-haiku-4-5")},
                     authorization={},
                 ),
             ),

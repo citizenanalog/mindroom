@@ -10,7 +10,7 @@ from uuid import UUID
 
 import nio
 import pytest
-from nio import TimelineEventProvenance
+from nio import AuthenticatedToDeviceEvent, TimelineEventProvenance
 from nio.durable import RecordKind, SyncBatch, SyncRecord
 from nio.durable.model import OwnMembership
 
@@ -43,7 +43,6 @@ from mindroom.hooks import (
 )
 from mindroom.matrix.durable_ingestion import validate_ingestion_batch
 from mindroom.matrix.state import MatrixState
-from mindroom.matrix.to_device import AuthenticatedToDeviceEvent
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.orchestrator import _MultiAgentOrchestrator
 from tests.conftest import (
@@ -207,6 +206,7 @@ def _plugin(name: str, callbacks: list[object]) -> object:
         {
             "name": name,
             "discovered_hooks": tuple(callbacks),
+            "discovered_automations": (),
             "entry_config": PluginEntryConfig(path=f"./plugins/{name}"),
             "plugin_order": 0,
         },
@@ -421,6 +421,7 @@ async def test_call_reconciliation_runs_once_per_sync_loop(tmp_path: Path) -> No
         await wait_for_background_tasks(timeout=1.0, owner=bot._runtime_view)
 
     assert call_manager.reconcile_joined_rooms.await_count == 2
+    assert [request.args for request in call_manager.reconcile_joined_rooms.await_args_list] == [(), ()]
 
 
 def test_router_sync_loop_start_revokes_room_backed_grants(tmp_path: Path) -> None:
@@ -434,10 +435,17 @@ def test_router_sync_loop_start_revokes_room_backed_grants(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_router_first_response_refreshes_room_backed_grants(tmp_path: Path) -> None:
-    """The first successful response in each receive generation rebuilds grants."""
+    """The first successful response in each receive generation rebuilds grants.
+
+    Startup publishes semantic callbacks on the router's ready signal, so the
+    rebuild must finish before that signal.
+    """
     bot, orchestrator = _router_bot_with_orchestrator(tmp_path)
     bot.client = make_matrix_client_mock(user_id=bot.agent_user.user_id)
     bot.mark_sync_loop_started()
+    call_order: list[str] = []
+    orchestrator.refresh_agent_reply_memberships.side_effect = lambda: call_order.append("refresh")
+    orchestrator.handle_bot_ready.side_effect = lambda _bot: call_order.append("ready")
 
     with (
         patch("mindroom.bot.mark_matrix_sync_success", return_value=datetime.now(UTC)),
@@ -446,6 +454,7 @@ async def test_router_first_response_refreshes_room_backed_grants(tmp_path: Path
         await _complete_frame(bot)
 
     orchestrator.refresh_agent_reply_memberships.assert_awaited_once_with()
+    assert call_order == ["refresh", "ready"]
 
 
 @pytest.mark.asyncio

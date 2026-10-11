@@ -239,12 +239,12 @@ def test_build_frontend_rejects_git_lfs_pointer_assets(
         hatch_build_module._build_frontend(frontend_dir, output_dir, "/usr/local/bin/bun")
 
 
-def test_dashboard_shell_uses_canonical_png_logo() -> None:
-    """The installed dashboard should use the canonical PNG logo assets."""
+def test_dashboard_shell_uses_canonical_logo_exports() -> None:
+    """The installed dashboard uses the SVG mark and generated PNG favicon."""
     repo_root = Path(__file__).resolve().parents[1]
 
     assert 'href="/favicon.png"' in (repo_root / "frontend/index.html").read_text()
-    assert 'src="/logo.png"' in (repo_root / "frontend/src/App.tsx").read_text()
+    assert 'src="/logo.svg"' in (repo_root / "frontend/src/App.tsx").read_text()
 
 
 def test_wheel_force_include_does_not_bundle_avatar_assets() -> None:
@@ -258,7 +258,7 @@ def test_wheel_force_include_does_not_bundle_avatar_assets() -> None:
 
 
 def test_runtime_dependency_requires_released_durable_nio() -> None:
-    """The wheel requires the published durable API and excludes older releases."""
+    """The wheel requires the release that copies deeply nested event trees without recursion."""
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     dependencies = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
     requirement = Requirement(
@@ -269,5 +269,19 @@ def test_runtime_dependency_requires_released_durable_nio() -> None:
     assert requirement.extras == {"e2e"}
     assert requirement.url is None
     assert Version("0.40.0") not in requirement.specifier
-    assert Version("1.0.0") in requirement.specifier
+    assert Version("1.0.0") not in requirement.specifier
+    assert Version("1.0.1") not in requirement.specifier
+    assert Version("1.0.2") not in requirement.specifier
+    assert Version("1.0.3") not in requirement.specifier
+    assert Version("1.0.4") not in requirement.specifier
+    assert Version("1.0.5") not in requirement.specifier
+    assert Version("1.0.6") not in requirement.specifier
+    assert Version("1.0.7") not in requirement.specifier
+    assert Version("1.0.8") not in requirement.specifier
+    assert Version("1.0.9") not in requirement.specifier
+    assert Version("1.1.0") not in requirement.specifier
+    assert Version("1.1.1") not in requirement.specifier
+    assert Version("1.1.2") not in requirement.specifier
+    assert Version("1.1.3") not in requirement.specifier
+    assert Version("1.1.4") in requirement.specifier
     assert Version("2.0.0") not in requirement.specifier

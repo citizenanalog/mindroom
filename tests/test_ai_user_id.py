@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextvars import Context
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -34,17 +35,21 @@ from structlog.testing import capture_logs
 
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.ai import (
-    _collect_streamed_response_content,
     _compose_current_turn_prompt,
     _prepare_agent_and_prompt,
-    _run_error_event_text,
     _stream_completed_without_visible_output,
     _StreamingAttemptState,
+    _track_model_request_metrics,
     ai_response,
     build_matrix_run_metadata,
+    collect_streamed_response_content,
     stream_agent_response,
 )
-from mindroom.ai_run_metadata import _serialize_metrics, build_ai_run_metadata_content
+from mindroom.ai_run_metadata import (
+    _serialize_metrics,
+    build_ai_run_metadata_content,
+    build_model_request_metrics_fallback,
+)
 from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
@@ -59,7 +64,7 @@ from mindroom.constants import (
     RuntimePaths,
 )
 from mindroom.dynamic_tool_continuation import DYNAMIC_TOOL_CONTINUATION_LIMIT
-from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE
+from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE, run_error_event_text
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import PreparedHistoryState
@@ -70,12 +75,12 @@ from mindroom.llm_request_logging import install_llm_request_logging, stream_wit
 from mindroom.media_inputs import MediaInputs
 from mindroom.memory import MemoryPromptParts
 from mindroom.message_target import MessageTarget
+from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.response_runner import (
     _paused_with_committed_presentation,
     prepare_memory_and_model_context,
 )
-from mindroom.response_turn import PausedAttempt, ResponsePausedForApproval
-from mindroom.synthetic_model import SyntheticModel
+from mindroom.response_turn import CompletedAttempt, PausedAttempt, ResponsePausedForApproval
 from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.runtime_context import (
     LiveToolDispatchContext,
@@ -141,6 +146,46 @@ def _model_runtime_context(
     )
 
 
+@pytest.mark.parametrize(
+    ("output_tokens", "expected_total", "expected_payload"),
+    [
+        (None, 0, None),
+        (0, 0, {"output_tokens": 0}),
+        (False, 0, {"output_tokens": 0}),
+        (True, 1, {"output_tokens": 1}),
+        (1.5, 0, None),
+        ("3", 0, None),
+    ],
+)
+def test_stream_request_metrics_preserve_zero_initialized_totals(
+    output_tokens: int | None,
+    expected_total: int,
+    expected_payload: dict[str, int] | None,
+) -> None:
+    """Unknown counters stay zero internally while only observed integers reach metadata."""
+    state = _StreamingAttemptState()
+
+    _track_model_request_metrics(state, ModelRequestCompletedEvent(output_tokens=output_tokens))
+    _track_model_request_metrics(state, ModelRequestCompletedEvent())
+
+    assert state.request_metric_totals == {
+        "input_tokens": 0,
+        "output_tokens": expected_total,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    assert (
+        build_model_request_metrics_fallback(
+            state.request_metric_totals,
+            state.first_token_latency,
+            state.observed_request_metric_fields,
+        )
+        == expected_payload
+    )
+
+
 def test_serialize_metrics_preserves_zero_usage_fields_from_metrics() -> None:
     """RunMetrics serialization should preserve only the provider payload Agno exposes."""
     payload = _serialize_metrics(RunMetrics(input_tokens=6, output_tokens=0, cache_read_tokens=46449))
@@ -154,12 +199,12 @@ def test_serialize_metrics_preserves_zero_usage_fields_from_metrics() -> None:
 def test_ai_run_metadata_prefers_provider_counters_over_estimate_for_cache_token_providers() -> None:
     """Cache-token providers report context as raw input plus cache read/write, not the estimate."""
     metadata = build_ai_run_metadata_content(
-        config=_metadata_config("vertexai_claude", "claude-sonnet-4-6"),
+        config=_metadata_config("vertexai_claude", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         model_provider="google",
         context_input_tokens=30_210,
         context_raw_input_tokens=1_200,
@@ -200,12 +245,12 @@ def test_ai_run_metadata_context_uses_raw_input_for_non_cache_token_providers() 
 def test_ai_run_metadata_context_falls_back_to_estimate_without_provider_counters() -> None:
     """Without any provider usage counters, the pre-flight estimate still populates the context block."""
     metadata = build_ai_run_metadata_content(
-        config=_metadata_config("anthropic", "claude-sonnet-4-6"),
+        config=_metadata_config("anthropic", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         model_provider="Anthropic",
         context_input_tokens=30_210,
         prepared_history=PreparedHistoryState(prepared_context_tokens=30_210),
@@ -223,12 +268,12 @@ def test_ai_run_metadata_context_falls_back_to_estimate_without_provider_counter
 def test_ai_run_metadata_context_regression_cached_prefix_sample() -> None:
     """Regression: a 49,886-token cached prefix must not be reported as a 30,210-token context."""
     metadata = build_ai_run_metadata_content(
-        config=_metadata_config("vertexai_claude", "claude-sonnet-4-6"),
+        config=_metadata_config("vertexai_claude", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         model_provider="google",
         metrics={"input_tokens": 3_277, "cache_read_tokens": 99_772, "cache_write_tokens": 49_886},
         context_input_tokens=30_210,
@@ -415,8 +460,6 @@ class TestUserIdPassthrough:
         config = bind_runtime_paths(_config(), runtime_paths)
         bot = MagicMock(spec=AgentBot)
         bot.logger = MagicMock()
-        bot.stop_manager = MagicMock()
-        bot.stop_manager.remove_stop_button = AsyncMock()
         bot.client = AsyncMock()
         bot.agent_name = "general"
         bot.storage_path = tmp_path
@@ -457,8 +500,6 @@ class TestUserIdPassthrough:
         config = bind_runtime_paths(_config(), runtime_paths)
         bot = MagicMock(spec=AgentBot)
         bot.logger = MagicMock()
-        bot.stop_manager = MagicMock()
-        bot.stop_manager.remove_stop_button = AsyncMock()
         bot.client = AsyncMock()
         bot.agent_name = "general"
         bot.matrix_id = MagicMock()
@@ -511,8 +552,6 @@ class TestUserIdPassthrough:
         config = bind_runtime_paths(_config(), runtime_paths)
         bot = MagicMock(spec=AgentBot)
         bot.logger = MagicMock()
-        bot.stop_manager = MagicMock()
-        bot.stop_manager.remove_stop_button = AsyncMock()
         bot.client = AsyncMock()
         bot.agent_name = "general"
         bot.storage_path = tmp_path
@@ -594,8 +633,6 @@ class TestUserIdPassthrough:
         config = bind_runtime_paths(_config(), runtime_paths)
         bot = MagicMock(spec=AgentBot)
         bot.logger = MagicMock()
-        bot.stop_manager = MagicMock()
-        bot.stop_manager.remove_stop_button = AsyncMock()
         bot.client = AsyncMock()
         bot.agent_name = "general"
         bot.storage_path = tmp_path
@@ -882,6 +919,41 @@ class TestUserIdPassthrough:
         assert mock_prepare_execution.await_args.kwargs["current_sender_id"] == expected_sender
 
     @pytest.mark.asyncio
+    async def test_prepare_agent_and_prompt_labels_an_agent_reply_with_its_author(self, tmp_path: Path) -> None:
+        """A reply an agent wrote for a human stays that agent's words while the human is the requester."""
+        mock_agent = MagicMock()
+        prepared_execution = _PreparedExecutionContext(
+            messages=(Message(role="user", content="prepared prompt"),),
+            unseen_event_ids=[],
+            prepared_history=PreparedHistoryState(),
+        )
+
+        with (
+            patch(
+                "mindroom.ai.build_memory_prompt_parts",
+                new_callable=AsyncMock,
+                return_value=MemoryPromptParts(),
+            ),
+            patch("mindroom.ai.create_agent", return_value=mock_agent),
+            patch(
+                "mindroom.ai.prepare_agent_execution_context",
+                new=AsyncMock(return_value=prepared_execution),
+            ) as mock_prepare_execution,
+        ):
+            await _prepare_agent_and_prompt(
+                replace(
+                    make_turn_context("general", requester_id="@alice:example.com"),
+                    current_sender_id="@mindroom_research:example.com",
+                ),
+                prompt="test",
+                runtime_paths=_runtime_paths(tmp_path),
+                config=_config(),
+            )
+
+        assert mock_prepare_execution.await_args is not None
+        assert mock_prepare_execution.await_args.kwargs["current_sender_id"] == "@mindroom_research:example.com"
+
+    @pytest.mark.asyncio
     async def test_ai_response_passes_config_path_to_prepare_agent(self, tmp_path: Path) -> None:
         """Non-streaming replies should build agents against the orchestrator-owned config file."""
         config_path = tmp_path / "custom-config.yaml"
@@ -982,6 +1054,38 @@ class TestUserIdPassthrough:
 
         assert mock_prepare.await_args.kwargs["prompt"] == "raw prompt"
         assert mock_prepare.await_args.kwargs["model_prompt"] == "model metadata"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("content", "status"), [(None, RunStatus.error), ("Answer", RunStatus.completed)])
+    async def test_stream_completion_status_does_not_require_metadata_collector(
+        self,
+        tmp_path: Path,
+        content: str | None,
+        status: RunStatus,
+    ) -> None:
+        """A typed terminal callback classifies empty output even without wire metadata."""
+        agent = MagicMock()
+        completed: list[CompletedAttempt] = []
+
+        async def events(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+            yield RunCompletedEvent(content=content, run_id="run-final", session_id="session1")
+
+        agent.arun = MagicMock(side_effect=events)
+        with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as prepare:
+            prepare.return_value = _prepared_prompt_result(agent)
+            await collect_streamed_response_content(
+                stream_agent_response(
+                    make_turn_context("general", session_id="session1"),
+                    prompt="test",
+                    runtime_paths=_runtime_paths(tmp_path),
+                    config=_config(),
+                    on_completed=completed.append,
+                ),
+                presentation=CollectedStreamPresentation(show_tool_calls=False),
+            )
+        assert len(completed) == 1
+        assert completed[0].status is status
+        assert completed[0].metadata_content is None
 
     @pytest.mark.asyncio
     async def test_stream_agent_response_passes_config_path_to_prepare_agent(self, tmp_path: Path) -> None:
@@ -1572,7 +1676,7 @@ class TestUserIdPassthrough:
     async def test_ai_response_passes_all_files_for_vertex_claude(self, tmp_path: Path) -> None:
         """Vertex Claude path should not silently drop non-PDF file media."""
         mock_agent = MagicMock()
-        mock_agent.model = VertexAIClaude(id="claude-sonnet-4@20250514")
+        mock_agent.model = VertexAIClaude(id="claude-sonnet-5")
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -1603,7 +1707,7 @@ class TestUserIdPassthrough:
     async def test_stream_agent_response_passes_all_files_for_vertex_claude(self, tmp_path: Path) -> None:
         """Streaming path should not silently drop non-PDF files for Vertex Claude."""
         mock_agent = MagicMock()
-        mock_agent.model = VertexAIClaude(id="claude-sonnet-4@20250514")
+        mock_agent.model = VertexAIClaude(id="claude-sonnet-5")
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -1642,7 +1746,7 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
         mock_agent.arun = AsyncMock(
@@ -1679,7 +1783,7 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -1841,7 +1945,7 @@ class TestUserIdPassthrough:
         expected: str,
     ) -> None:
         """Run errors should surface nested provider payloads before static fallback."""
-        assert _run_error_event_text(event) == expected
+        assert run_error_event_text(event) == expected
 
     @pytest.mark.asyncio
     async def test_stream_agent_response_uses_run_error_event_metadata_when_content_empty(
@@ -1882,6 +1986,51 @@ class TestUserIdPassthrough:
         assert chunks == ["friendly-error"]
         friendly_error = mock_friendly_error.call_args.args[0]
         assert str(friendly_error) == "Agent run failed (type=APITimeoutError, id=timeout-1)"
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_response_errored_run_keeps_request_usage(self, tmp_path: Path) -> None:
+        """A run that fails after model requests still reports their tokens in the run metadata."""
+        mock_agent = MagicMock()
+        mock_agent.model = MagicMock()
+        mock_agent.model.__class__.__name__ = "OpenAIChat"
+        mock_agent.model.id = "test-model"
+        mock_agent.name = "GeneralAgent"
+        mock_agent.add_history_to_context = False
+
+        async def failing_stream() -> AsyncIterator[object]:
+            yield ModelRequestCompletedEvent(
+                model="test-model",
+                model_provider="openai",
+                input_tokens=500,
+                output_tokens=60,
+                total_tokens=560,
+            )
+            yield RunErrorEvent(content="provider failed")
+
+        mock_agent.arun = MagicMock(return_value=failing_stream())
+
+        with (
+            patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
+            patch("mindroom.ai.get_user_friendly_error_message", return_value="friendly-error"),
+        ):
+            mock_prepare.return_value = _prepared_prompt_result(mock_agent)
+            run_metadata: dict[str, object] = {}
+            chunks = [
+                chunk
+                async for chunk in stream_agent_response(
+                    make_turn_context("general", session_id="session1"),
+                    prompt="test",
+                    runtime_paths=_runtime_paths(tmp_path),
+                    config=_config(),
+                    run_metadata_collector=run_metadata,
+                )
+            ]
+
+        assert chunks == ["friendly-error"]
+        payload = run_metadata["io.mindroom.ai_run"]
+        assert payload["status"] == "error"
+        assert payload["usage"]["input_tokens"] == 500
+        assert payload["usage"]["output_tokens"] == 60
 
     @pytest.mark.asyncio
     async def test_user_id_none_when_not_provided(self, tmp_path: Path) -> None:
@@ -2618,7 +2767,7 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
@@ -2628,7 +2777,7 @@ class TestUserIdPassthrough:
         mock_run_output.run_id = "run-1"
         mock_run_output.session_id = "session1"
         mock_run_output.status = RunStatus.completed
-        mock_run_output.model = "claude-sonnet-4-6"
+        mock_run_output.model = "claude-sonnet-5"
         mock_run_output.model_provider = "Anthropic"
         mock_run_output.metrics = RunMetrics(
             input_tokens=3000,
@@ -2641,7 +2790,7 @@ class TestUserIdPassthrough:
 
         config = Config(
             agents={"general": AgentConfig(display_name="General")},
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-4-6", context_window=200_000)},
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5", context_window=200_000)},
         )
 
         with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare:
@@ -3180,14 +3329,14 @@ class TestUserIdPassthrough:
         ):
             mock_prepare.return_value = _prepared_prompt_result(mock_agent)
             with pytest.raises(ResponsePausedForApproval) as raised:
-                await _collect_streamed_response_content(
+                await collect_streamed_response_content(
                     stream_agent_response(
                         make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
                         prompt="Run the action",
                         runtime_paths=_runtime_paths(tmp_path),
                         config=_config(),
                     ),
-                    show_tool_calls=True,
+                    presentation=CollectedStreamPresentation(show_tool_calls=True),
                 )
 
         assert raised.value.paused.run_id == "run-paused"
@@ -3232,7 +3381,7 @@ class TestUserIdPassthrough:
         ):
             mock_prepare.return_value = _prepared_prompt_result(mock_agent)
             with pytest.raises(ResponsePausedForApproval) as raised:
-                await _collect_streamed_response_content(
+                await collect_streamed_response_content(
                     stream_agent_response(
                         make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
                         prompt="Run the action",
@@ -3240,7 +3389,7 @@ class TestUserIdPassthrough:
                         config=_config(),
                         show_tool_calls=False,
                     ),
-                    show_tool_calls=False,
+                    presentation=CollectedStreamPresentation(show_tool_calls=False),
                 )
 
         paused = _paused_with_committed_presentation(raised.value, show_tool_calls=False)
@@ -3334,6 +3483,7 @@ class TestUserIdPassthrough:
                 session_id="session-1",
                 run_id="run-paused",
                 tools=(tool,),
+                toolkit_owners={("general", "inspect"): "test_toolkit"},
             ),
         )
 
@@ -3343,7 +3493,10 @@ class TestUserIdPassthrough:
             raise pause
 
         with pytest.raises(ResponsePausedForApproval) as raised:
-            await _collect_streamed_response_content(paused_stream(), show_tool_calls=True)
+            await collect_streamed_response_content(
+                paused_stream(),
+                presentation=CollectedStreamPresentation(show_tool_calls=True),
+            )
 
         assert raised.value is pause
         assert pause.presentation is not None
@@ -3584,6 +3737,7 @@ class TestUserIdPassthrough:
 
         async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="ok")
+            yield ModelRequestCompletedEvent(model="earlier-model", model_provider="earlier-provider")
             yield ModelRequestCompletedEvent(
                 model="test-model",
                 model_provider="openai",
@@ -3591,6 +3745,7 @@ class TestUserIdPassthrough:
                 output_tokens=3,
                 time_to_first_token=0.12,
             )
+            yield ModelRequestCompletedEvent(model="", model_provider="", time_to_first_token=0.8)
 
         mock_agent.arun = MagicMock(return_value=fake_arun_stream())
 
@@ -3617,6 +3772,8 @@ class TestUserIdPassthrough:
         assert payload["usage"]["output_tokens"] == 3
         assert payload["usage"]["total_tokens"] == 15
         assert payload["usage"]["time_to_first_token"] == format(0.12, ".12g")
+        assert payload["model"]["id"] == "test-model"
+        assert payload["model"]["provider"] == "openai"
         assert payload["context"]["input_tokens"] == 12
         assert payload["context"]["window_tokens"] == 100
         assert "utilization_pct" not in payload["context"]
@@ -3736,10 +3893,13 @@ class TestUserIdPassthrough:
         assert payload["context"]["window_tokens"] == 1000
         assert payload["prepared_context"] == {"tokens": 900}
 
+    @pytest.mark.parametrize(("latest_input_tokens", "expected_context_tokens"), [(120, 120), (None, 700)])
     @pytest.mark.asyncio
     async def test_stream_agent_response_does_not_backfill_latest_context_cache_from_usage(
         self,
         tmp_path: Path,
+        latest_input_tokens: int | None,
+        expected_context_tokens: int,
     ) -> None:
         """Missing latest-request cache counters should stay unknown, not use cumulative totals."""
         mock_agent = MagicMock()
@@ -3758,12 +3918,13 @@ class TestUserIdPassthrough:
                 output_tokens=50,
                 total_tokens=750,
                 cache_read_tokens=512,
+                cache_write_tokens=32,
             )
             yield RunContentEvent(content="step two")
             yield ModelRequestCompletedEvent(
                 model="test-model",
                 model_provider="openai",
-                input_tokens=120,
+                input_tokens=latest_input_tokens,
                 output_tokens=20,
                 total_tokens=140,
             )
@@ -3789,7 +3950,8 @@ class TestUserIdPassthrough:
 
         payload = run_metadata["io.mindroom.ai_run"]
         assert payload["usage"]["cache_read_tokens"] == 512
-        assert payload["context"]["input_tokens"] == 120
+        assert payload["usage"]["cache_write_tokens"] == 32
+        assert payload["context"]["input_tokens"] == expected_context_tokens
         assert "cache_read_input_tokens" not in payload["context"]
         assert "cache_write_input_tokens" not in payload["context"]
         assert "uncached_input_tokens" not in payload["context"]
@@ -3868,14 +4030,14 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
         async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="step one")
             yield ModelRequestCompletedEvent(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 model_provider="Anthropic",
                 input_tokens=3000,
                 output_tokens=50,
@@ -3885,7 +4047,7 @@ class TestUserIdPassthrough:
             )
             yield RunContentEvent(content="step two")
             yield ModelRequestCompletedEvent(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 model_provider="Anthropic",
                 input_tokens=120,
                 output_tokens=20,
@@ -3898,7 +4060,7 @@ class TestUserIdPassthrough:
 
         config = Config(
             agents={"general": AgentConfig(display_name="General")},
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-4-6", context_window=200_000)},
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5", context_window=200_000)},
         )
 
         with patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare:
@@ -3933,14 +4095,14 @@ class TestUserIdPassthrough:
         mock_agent = MagicMock()
         mock_agent.model = MagicMock()
         mock_agent.model.__class__.__name__ = "Claude"
-        mock_agent.model.id = "claude-sonnet-4-6"
+        mock_agent.model.id = "claude-sonnet-5"
         mock_agent.name = "GeneralAgent"
         mock_agent.add_history_to_context = False
 
         async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="step one")
             yield ModelRequestCompletedEvent(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 model_provider="google",
                 input_tokens=120,
                 output_tokens=20,
@@ -3956,7 +4118,7 @@ class TestUserIdPassthrough:
             models={
                 "default": ModelConfig(
                     provider="vertexai_claude",
-                    id="claude-sonnet-4-6",
+                    id="claude-sonnet-5",
                     context_window=200_000,
                 ),
             },

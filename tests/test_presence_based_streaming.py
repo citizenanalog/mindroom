@@ -14,6 +14,7 @@ from mindroom.config.main import Config
 from mindroom.matrix.presence import is_user_online, should_use_streaming
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
 from tests.access_schema_support import with_current_room_member_access
 from tests.authorization_helpers import (
     make_test_bot_for_entity,
@@ -283,7 +284,7 @@ class TestBotIntegration:
                     agents={
                         "test_agent": AgentConfig(
                             display_name="Test Agent",
-                            model="gpt-4",
+                            model="gpt-6-astra",
                             rooms=["#test:localhost"],
                         ),
                     },
@@ -334,6 +335,10 @@ class TestBotIntegration:
         ):
             await bot._response_runner.generate_response(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$msg123",),
+                        logical_source_event_ids=("$msg123",),
+                    ),
                     prompt="Hello bot",
                     thread_history=[],
                     user_id="@user:localhost",
@@ -377,7 +382,7 @@ class TestBotIntegration:
                     agents={
                         "test_agent": AgentConfig(
                             display_name="Test Agent",
-                            model="gpt-4",
+                            model="gpt-6-astra",
                             rooms=["#test:localhost"],
                         ),
                     },
@@ -405,6 +410,10 @@ class TestBotIntegration:
         # Simulate a message from a user
         await bot._response_runner.generate_response(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$msg123",),
+                    logical_source_event_ids=("$msg123",),
+                ),
                 prompt="Hello bot",
                 thread_history=[],
                 user_id="@user:localhost",

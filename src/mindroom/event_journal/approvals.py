@@ -20,12 +20,23 @@ if TYPE_CHECKING:
 
     from .backend import Row, Transaction
 
-from . import approval_card_state, approval_continuations, background_approvals, outbox, reads
+from . import (
+    approval_card_state,
+    approval_continuations,
+    approval_grants,
+    background_approvals,
+    outbox,
+    reads,
+    scheduled_approvals,
+)
 from .approval_card_state import ApprovalCardReservation, RecordedApprovalDecision
 from .identity import decode_thread_id
 from .models import DURABLE_DELIVERY_ID_KEY, DeliveryStage
 
 _DEFAULT_ROOM_CARD_LIMIT = 256
+# Automatic receipts are approved originals published without a pending card.
+_AUTOMATIC_RECEIPT = f"({approval_grants.GRANT_RECEIPT} OR {scheduled_approvals.RECEIPT})"
+_ApprovalTargetKind = Literal["continuation", "background_script", "scheduled_call"]
 logger = get_logger(__name__)
 _CARD_COLUMNS = """
     cards.delivery_id AS delivery_id,
@@ -35,7 +46,7 @@ _CARD_COLUMNS = """
     cards.continuation_id AS continuation_id,
     cards.continuation_generation AS continuation_generation,
     cards.tool_call_id AS tool_call_id,
-    continuations.entity_name AS continuation_entity_name,
+    paused_reply.entity_name AS continuation_entity_name,
     background.run_id AS background_run_id,
     background.call_id AS background_call_id
 """
@@ -54,6 +65,12 @@ _CARD_DELIVERY_JOINS = """
     LEFT JOIN approval_continuations AS continuations
       ON continuations.approval_id = cards.continuation_id
      AND continuations.generation = cards.continuation_generation
+    LEFT JOIN reply_spans AS paused_span
+      ON paused_span.principal_id = continuations.principal_id
+     AND paused_span.span_id = continuations.span_id
+    LEFT JOIN reply_messages AS paused_reply
+      ON paused_reply.principal_id = paused_span.principal_id
+     AND paused_reply.reply_id = paused_span.reply_id
 """
 
 
@@ -72,7 +89,7 @@ class StoredApprovalCard:
     continuation_generation: int
     tool_call_id: str
     continuation_entity_name: str | None
-    target_kind: Literal["continuation", "background_script"] = "continuation"
+    target_kind: _ApprovalTargetKind = "continuation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +111,7 @@ def reserve_deliveries(
     cards: tuple[ApprovalCardReservation, ...],
 ) -> bool:
     """Atomically own every exact call, frozen card, and publication lease."""
+    approval_grants.lock(transaction, card_principal_id)
     # Reservation and a failure fence can arrive through different processes.
     # Lock the aggregate before reading its publication lease so either every
     # card and activation wins, or the failure wins without orphan deliveries.
@@ -147,6 +165,16 @@ def reserve_deliveries(
     ):
         return False
     for card in cards:
+        scoped_card = approval_grants.reserve_identity(
+            transaction,
+            card_principal_id,
+            continuation_principal_id,
+            continuation,
+            card,
+            membership_epoch,
+        )
+        if approval_grants.apply_active(transaction, card_principal_id, card=scoped_card):
+            continue
         approval_card_state.reserve_delivery(
             transaction,
             card_principal_id,
@@ -154,7 +182,7 @@ def reserve_deliveries(
             thread_id=continuation.thread_id,
             membership_epoch=membership_epoch,
             identity=(continuation_id, expected_generation, card.tool_call_id),
-            card=card,
+            card=scoped_card,
         )
     return (
         approval_continuations.activate(
@@ -196,7 +224,7 @@ def resolve_card(
     card_event_id: str | None,
     requested_status: Literal["approved", "denied", "expired"],
     reason: str | None,
-    resolution: Mapping[str, Any] | None,
+    metadata: approval_card_state.ApprovalDecisionMetadata | None,
     delivery_id: str | None = None,
 ) -> RecordedApprovalDecision:
     """Resolve one typed approval target through the shared card lifecycle."""
@@ -215,15 +243,23 @@ def resolve_card(
         (principal_id, selector_value),
     )
     if background is not None:
-        return background_approvals.resolve(
+        recorded = background_approvals.resolve(
             transaction,
             principal_id,
             card_event_id=card_event_id,
             delivery_id=delivery_id,
             requested_status=requested_status,
             reason=reason,
-            resolution=resolution,
+            metadata=metadata,
         )
+        scheduled_approvals.record_decision(
+            transaction,
+            principal_id,
+            recorded=recorded,
+            requested_status=requested_status,
+            metadata=metadata,
+        )
+        return recorded
     return _resolve_continuation(
         transaction,
         principal_id,
@@ -231,7 +267,7 @@ def resolve_card(
         delivery_id=delivery_id,
         requested_status=requested_status,
         reason=reason,
-        resolution=resolution,
+        metadata=metadata,
     )
 
 
@@ -242,7 +278,7 @@ def _resolve_continuation(
     card_event_id: str | None,
     requested_status: Literal["approved", "denied", "expired"],
     reason: str | None,
-    resolution: Mapping[str, Any] | None,
+    metadata: approval_card_state.ApprovalDecisionMetadata | None,
     delivery_id: str | None = None,
 ) -> RecordedApprovalDecision:
     """Commit one current-format card and exact-call decision atomically."""
@@ -288,11 +324,16 @@ def _resolve_continuation(
     )
     existing = approval_card_state.decode_resolution(None if settled is None else cast("str", settled["payload_json"]))
     if existing is not None:
-        return RecordedApprovalDecision(resolution=existing, recorded=False)
+        return RecordedApprovalDecision(
+            resolution=existing,
+            recorded=False,
+            delivery_id=str(card["delivery_id"]),
+            card_event_id=card_event_id,
+        )
     generation = int(generation_value)
     continuation = transaction.fetchone(
         """
-        SELECT principal_id, entity_name, state, generation, failure_reason
+        SELECT principal_id, state, generation, failure_reason
         FROM approval_continuations WHERE approval_id = ?
         """,
         (continuation_id,),
@@ -300,7 +341,6 @@ def _resolve_continuation(
     if continuation is None or int(continuation["generation"]) != generation:
         return RecordedApprovalDecision(resolution=None, recorded=False)
     continuation_principal_id = str(continuation["principal_id"])
-    entity_name = str(continuation["entity_name"])
     call = transaction.fetchone(
         """
         SELECT calls.expires_at_ns
@@ -320,7 +360,7 @@ def _resolve_continuation(
         return RecordedApprovalDecision(resolution=None, recorded=False)
     failure_reason = cast("str | None", continuation["failure_reason"])
     expired = time.time_ns() >= int(call["expires_at_ns"])
-    if resolution is None and not expired:
+    if metadata is None and not expired:
         return RecordedApprovalDecision(resolution=None, recorded=False)
     decision, decision_reason = _effective_continuation_decision(
         requested_status=requested_status,
@@ -332,7 +372,7 @@ def _resolve_continuation(
     )
     stored_resolution = approval_card_state.stored_resolution(
         card,
-        resolution=resolution,
+        metadata=metadata,
         requested_status=requested_status,
         decision=decision,
         reason=decision_reason,
@@ -378,19 +418,21 @@ def _resolve_continuation(
         """,
         (continuation_principal_id, continuation_id, generation),
     )
-    source_rows = transaction.fetchall(
-        """
-        SELECT event_id FROM approval_continuation_sources
-        WHERE principal_id = ? AND approval_id = ? ORDER BY source_ordinal
-        """,
-        (continuation_principal_id, continuation_id),
+    decided_continuation = approval_continuations.get(
+        transaction,
+        continuation_principal_id,
+        approval_id=continuation_id,
     )
+    assert decided_continuation is not None, "a continuation decided in this transaction exists"
     return RecordedApprovalDecision(
         resolution=stored_resolution,
         recorded=True,
+        delivery_id=str(card["delivery_id"]),
+        card_event_id=card_event_id,
         continuation_ready=state is not None and state["state"] == "ready",
-        continuation_entity_name=entity_name,
-        source_event_ids=tuple(str(row["event_id"]) for row in source_rows),
+        continuation_entity_name=decided_continuation.entity_name,
+        continuation_room_id=str(card["room_id"]),
+        source_event_ids=decided_continuation.source_event_ids,
     )
 
 
@@ -417,7 +459,7 @@ def retire_completed_cards_for_departure(
 ) -> None:
     """Finish domain retirement that crashed after a terminal Matrix acknowledgement."""
     rows = transaction.fetchall(
-        """
+        f"""
         SELECT cards.principal_id, cards.delivery_id, initial.acknowledged_event_id
         FROM approval_cards AS cards
         JOIN matrix_delivery_outbox AS initial
@@ -440,19 +482,10 @@ def retire_completed_cards_for_departure(
               OR (
                   background.delivery_id IS NULL
                   AND continuations.principal_id = ?
-                  AND EXISTS (
-                      SELECT 1
-                      FROM approval_continuation_sources AS sources
-                      JOIN journal_events AS events
-                        ON events.principal_id = sources.principal_id
-                       AND events.event_id = sources.event_id
-                      WHERE sources.principal_id = continuations.principal_id
-                        AND sources.approval_id = continuations.approval_id
-                        AND events.room_id = ?
-                  )
+                  AND {approval_continuations.holds_source_in_room("continuations")}
               )
           )
-        """,
+        """,  # noqa: S608 - a fixed SQL fragment, not input
         (principal_id, room_id, principal_id, room_id),
     )
     for row in rows:
@@ -476,24 +509,15 @@ def expire_cards_for_departed_continuations(
     # cleanup. Keep the same order before fencing the deliveries and deleting
     # the continuation, otherwise the two transactions can deadlock.
     transaction.execute(
-        """
+        f"""
         UPDATE approval_continuations SET state = state
         WHERE principal_id = ?
-          AND EXISTS (
-              SELECT 1
-              FROM approval_continuation_sources AS sources
-              JOIN journal_events AS events
-                ON events.principal_id = sources.principal_id
-               AND events.event_id = sources.event_id
-              WHERE sources.principal_id = approval_continuations.principal_id
-                AND sources.approval_id = approval_continuations.approval_id
-                AND events.room_id = ?
-          )
-        """,
+          AND {approval_continuations.holds_source_in_room("approval_continuations")}
+        """,  # noqa: S608 - a fixed SQL fragment, not input
         (continuation_principal_id, room_id),
     )
     rows = transaction.fetchall(
-        """
+        f"""
         SELECT cards.principal_id, cards.delivery_id, initial.event_type,
                initial.room_id, initial.thread_id, initial.payload_json,
                initial.attempted, initial.acknowledged_event_id, initial.membership_epoch,
@@ -514,17 +538,8 @@ def expire_cards_for_departed_continuations(
          AND final.stage = 'final'
         WHERE background.delivery_id IS NULL
           AND continuations.principal_id = ?
-          AND EXISTS (
-              SELECT 1
-              FROM approval_continuation_sources AS sources
-              JOIN journal_events AS events
-                ON events.principal_id = sources.principal_id
-               AND events.event_id = sources.event_id
-              WHERE sources.principal_id = continuations.principal_id
-                AND sources.approval_id = continuations.approval_id
-                AND events.room_id = ?
-          )
-        """,
+          AND {approval_continuations.holds_source_in_room("continuations")}
+        """,  # noqa: S608 - a fixed SQL fragment, not input
         (continuation_principal_id, room_id),
     )
     for row in rows:
@@ -622,13 +637,12 @@ def fail_continuations_for_departed_card_owner(
         delivery_id = str(row["delivery_id"])
         if row["background_run_id"] is not None:
             try:
-                content = approval_card_state.decode_object_payload(
+                approval_card_state.decode_object_payload(
                     row["payload_json"],
                     description="background approval payload",
                 )
             except (json.JSONDecodeError, TypeError):
                 continue
-            resolution = approval_card_state.terminal_content(content, status="denied", reason=reason)
             background_approvals.resolve(
                 transaction,
                 card_principal_id,
@@ -636,7 +650,7 @@ def fail_continuations_for_departed_card_owner(
                 delivery_id=delivery_id,
                 requested_status="denied",
                 reason=reason,
-                resolution=resolution,
+                metadata=None,
             )
             if not bool(row["attempted"]):
                 _delete_unattempted_card_delivery(transaction, card_principal_id, delivery_id)
@@ -789,6 +803,78 @@ def retire(
     return True
 
 
+def remember_terminal_alias(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    room_id: str,
+    card_event_id: str,
+    delivery_id: str,
+) -> None:
+    """Remember a transport-verified alias only when a retained automatic approval proves it terminal."""
+    transaction.execute(
+        """
+        INSERT INTO approval_action_tombstones (principal_id, room_id, card_event_id)
+        SELECT audit.principal_id, audit.room_id, ? FROM approval_grant_cards AS audit
+        WHERE audit.principal_id = ? AND audit.room_id = ? AND audit.delivery_id = ?
+          AND audit.grant_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM approval_cards AS cards
+              WHERE cards.principal_id = audit.principal_id AND cards.delivery_id = audit.delivery_id
+          )
+        ON CONFLICT (principal_id, card_event_id) DO NOTHING
+        """,
+        (card_event_id, principal_id, room_id, delivery_id),
+    )
+    scheduled_approvals.remember_receipt_alias(
+        transaction,
+        principal_id,
+        room_id=room_id,
+        card_event_id=card_event_id,
+        delivery_id=delivery_id,
+    )
+
+
+def retire_automatic_receipts(transaction: Transaction, principal_id: str) -> None:
+    """Release acknowledged automatic receipts while retaining their action identity."""
+    approval_grants.lock(transaction, principal_id)
+    transaction.execute(
+        f"""
+        INSERT INTO approval_action_tombstones (principal_id, room_id, card_event_id)
+        SELECT initial.principal_id, initial.room_id, initial.acknowledged_event_id
+        FROM matrix_delivery_outbox AS initial
+        WHERE initial.principal_id = ? AND initial.stage = 'initial'
+          AND initial.acknowledged_event_id IS NOT NULL
+          AND {_AUTOMATIC_RECEIPT.format(initial="initial")}
+          AND NOT EXISTS (
+              SELECT 1 FROM approval_cards AS cards
+              WHERE cards.principal_id = initial.principal_id AND cards.delivery_id = initial.delivery_id
+          )
+        ON CONFLICT (principal_id, card_event_id) DO NOTHING
+        """,  # noqa: S608 - a fixed predicate, not interpolated input
+        (principal_id,),
+    )
+    transaction.execute(
+        f"""
+        DELETE FROM matrix_delivery_outbox
+        WHERE principal_id = ? AND stage = 'initial'
+          AND {_AUTOMATIC_RECEIPT.format(initial="matrix_delivery_outbox")}
+          AND EXISTS (
+              SELECT 1 FROM approval_action_tombstones AS terminal
+              WHERE terminal.principal_id = matrix_delivery_outbox.principal_id
+                AND terminal.room_id = matrix_delivery_outbox.room_id
+                AND terminal.card_event_id = matrix_delivery_outbox.acknowledged_event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM approval_cards AS cards
+              WHERE cards.principal_id = matrix_delivery_outbox.principal_id
+                AND cards.delivery_id = matrix_delivery_outbox.delivery_id
+          )
+        """,  # noqa: S608 - a fixed predicate, not interpolated input
+        (principal_id,),
+    )
+
+
 def is_terminal_card(
     transaction: Transaction,
     principal_id: str,
@@ -796,13 +882,23 @@ def is_terminal_card(
     room_id: str,
     card_event_id: str,
 ) -> bool:
-    """Return whether a delivered terminal approval owns this Matrix event."""
+    """Recognize terminal approvals before and after their payloads are retired."""
     row = transaction.fetchone(
-        """
+        f"""
         SELECT 1 AS present FROM approval_action_tombstones
         WHERE principal_id = ? AND room_id = ? AND card_event_id = ?
-        """,
-        (principal_id, room_id, card_event_id),
+        UNION ALL
+        SELECT 1 AS present FROM matrix_delivery_outbox AS initial
+        WHERE initial.principal_id = ? AND initial.room_id = ?
+          AND initial.acknowledged_event_id = ? AND initial.stage = 'initial'
+          AND {_AUTOMATIC_RECEIPT.format(initial="initial")}
+          AND NOT EXISTS (
+              SELECT 1 FROM approval_cards AS cards
+              WHERE cards.principal_id = initial.principal_id AND cards.delivery_id = initial.delivery_id
+          )
+        LIMIT 1
+        """,  # noqa: S608 - a fixed predicate, not interpolated input
+        (principal_id, room_id, card_event_id, principal_id, room_id, card_event_id),
     )
     return row is not None
 
@@ -938,15 +1034,20 @@ def _card(row: Row) -> StoredApprovalCard | None:
         )
         background_run_id = cast("str | None", row["background_run_id"])
         if background_run_id is None:
-            target_kind: Literal["continuation", "background_script"] = "continuation"
+            target_kind: _ApprovalTargetKind = "continuation"
             card_identity = _native_identity(card)
             continuation_entity_name = cast("str | None", row["continuation_entity_name"])
         else:
-            target_kind = "background_script"
             continuation_entity_name = None
             background_call_id = _required_background_call_id(row)
             stored_identity = (background_run_id, -1, background_call_id)
-            card_run_id, card_call_id = background_approvals.background_identity(card)
+            scheduled_identity = scheduled_approvals.card_identity(card)
+            if scheduled_identity is None:
+                target_kind = "background_script"
+                card_run_id, card_call_id = background_approvals.background_identity(card)
+            else:
+                target_kind = "scheduled_call"
+                card_run_id, card_call_id = scheduled_identity
             card_identity = (card_run_id, -1, card_call_id)
         resolution = approval_card_state.decode_resolution(row["resolution_json"])
     except (json.JSONDecodeError, TypeError, ValueError):

@@ -72,6 +72,7 @@ from tests.conftest import (
     replace_turn_controller_deps,
     replace_turn_policy_deps,
     runtime_paths_for,
+    serve_media_from_download,
     sync_bot_runtime_state,
     test_runtime_paths,
     unwrap_extracted_collaborator,
@@ -108,6 +109,7 @@ def _plugin(name: str, callbacks: list[object]) -> object:
         {
             "name": name,
             "discovered_hooks": tuple(callbacks),
+            "discovered_automations": (),
             "entry_config": PluginEntryConfig(path=f"./plugins/{name}"),
             "plugin_order": 0,
         },
@@ -1281,6 +1283,7 @@ async def test_dispatch_text_message_hydrates_sidecar_body_for_hooks_and_prompt(
     """Inbound dispatch should use the canonical sidecar body everywhere downstream."""
     bot = _agent_bot(tmp_path)
     bot.client = AsyncMock(spec=nio.AsyncClient)
+    serve_media_from_download(bot.client)
     bot.client.rooms = {}
     bot.client.user_id = bot.matrix_id.full_id
     bot.client.download = AsyncMock(
@@ -2167,6 +2170,12 @@ async def test_precheck_rejects_hook_dispatch_with_unauthorized_original_sender(
     turn_store.record_turn = AsyncMock()
     room = nio.MatrixRoom(room_id="!room:localhost", own_user_id="@mindroom_router:localhost")
     room.canonical_alias = None
+    bot.client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[room.room_id])
+    bot.client.joined_members.return_value = nio.JoinedMembersResponse(
+        members=[nio.RoomMember("@mindroom_router:localhost", None, None)],
+        room_id=room.room_id,
+    )
+    await bot._runtime_view.agent_reply_memberships.refresh(bot.config, bot.runtime_paths, bot.client)
     event = nio.RoomMessageText.from_dict(
         {
             "event_id": "$unauthorized-hook-dispatch",

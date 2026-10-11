@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
+import ssl
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -24,8 +25,8 @@ from mindroom.cancellation import (
     current_task_is_process_shutdown,
     request_task_cancel,
 )
-from mindroom.constants import RuntimePaths, runtime_matrix_ssl_verify
 from mindroom.logging_config import get_logger
+from mindroom.matrix.client_session import maybe_ssl_context
 from mindroom.matrix.health import (
     MATRIX_INGESTION_GRACE_SECONDS,
     MATRIX_SYNC_STARTUP_GRACE_SECONDS,
@@ -35,9 +36,11 @@ from mindroom.matrix.health import (
     matrix_versions_url,
     response_has_matrix_versions,
 )
+from mindroom.matrix.sync_diagnostics import SyncStallDiagnostics
 from mindroom.runtime_shutdown import (
     GENERIC_SHUTDOWN,
     SYNC_RESTART_SHUTDOWN,
+    ResponseShutdownTimeoutError,
     RestartReasonCategory,
     RuntimeLifecycleAction,
     RuntimeShutdownIntent,
@@ -54,6 +57,7 @@ if TYPE_CHECKING:
     import structlog
 
     from mindroom.bot import AgentBot, TeamBot
+    from mindroom.constants import RuntimePaths
 
 logger = get_logger(__name__)
 
@@ -285,6 +289,7 @@ class _SyncIteration:
         ingestion_grace_seconds = matrix_ingestion_grace_seconds(bot.runtime_paths)
         startup_monotonic = time.monotonic()
         observed_ingestion_generation = bot.durable_ingestion_progress_generation()
+        diagnostics = SyncStallDiagnostics(bot.agent_name, startup_monotonic, observed_ingestion_generation)
         while _matrix_sync_receive_loop_active(bot) and not sync_task.done():
             await asyncio.sleep(_MATRIX_SYNC_WATCHDOG_POLL_INTERVAL_SECONDS)
             if not _matrix_sync_receive_loop_active(bot):
@@ -295,6 +300,11 @@ class _SyncIteration:
                 if ingestion_generation is not None:
                     mark_matrix_ingestion_progress(bot.agent_name)
             sync_age_seconds = bot.seconds_since_last_sync_activity()
+            diagnostics.observe(
+                now=time.monotonic(),
+                sync_age=sync_age_seconds,
+                generation=ingestion_generation,
+            )
 
             if sync_age_seconds is None:
                 # Still waiting for the first SyncResponse/SyncError.
@@ -557,6 +567,19 @@ async def run_with_retry(
             return
 
 
+def _certificate_verification_failure(error: BaseException) -> ssl.SSLCertVerificationError | None:
+    """Return the certificate verification error behind an httpx transport error, if any."""
+    seen: list[BaseException] = []
+    cause: BaseException | None = error
+    while cause is not None and cause not in seen:
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            return cause
+        seen.append(cause)
+        # Follow __context__ even when suppressed: httpcore re-raises connect errors with a cosmetic `from None`.
+        cause = cause.__cause__ or cause.__context__
+    return None
+
+
 async def wait_for_matrix_homeserver(
     *,
     runtime_paths: RuntimePaths,
@@ -567,7 +590,8 @@ async def wait_for_matrix_homeserver(
     """Wait for the configured Matrix homeserver to answer `/versions`."""
     if timeout_seconds is None:
         timeout_seconds = _matrix_homeserver_startup_timeout_seconds_from_env(runtime_paths)
-    versions_url = matrix_versions_url(constants.runtime_matrix_homeserver(runtime_paths=runtime_paths))
+    homeserver = constants.runtime_matrix_homeserver(runtime_paths=runtime_paths)
+    versions_url = matrix_versions_url(homeserver)
     set_runtime_starting(f"Waiting for Matrix homeserver at {versions_url}")
     loop = asyncio.get_running_loop()
     deadline = None if timeout_seconds is None else loop.time() + timeout_seconds
@@ -578,20 +602,31 @@ async def wait_for_matrix_homeserver(
         timeout_seconds=timeout_seconds,
     )
 
+    # Probe with the TLS trust Matrix logins use, so the probe cannot reject a server logins would accept.
     async with httpx.AsyncClient(
         timeout=request_timeout_seconds,
-        verify=runtime_matrix_ssl_verify(runtime_paths=runtime_paths),
+        verify=maybe_ssl_context(homeserver, runtime_paths) or True,
     ) as client:
         while deadline is None or loop.time() < deadline:
             attempt += 1
             try:
                 response = await client.get(versions_url)
             except httpx.TransportError as exc:
+                # An untrusted certificate is a setup problem that waiting cannot fix.
+                verification_error = _certificate_verification_failure(exc)
+                if verification_error is not None:
+                    msg = (
+                        f"Could not verify the TLS certificate of Matrix homeserver {homeserver}: {verification_error}. "
+                        "Make sure the system CA store trusts the homeserver's certificate, or set SSL_CERT_FILE "
+                        "to a CA bundle that does. Set MATRIX_SSL_VERIFY=false only for local testing."
+                    )
+                    raise PermanentStartupError(msg) from exc
                 if attempt == 1 or attempt % 5 == 0:
                     logger.info(
                         "Matrix homeserver not ready yet",
                         url=versions_url,
                         attempt=attempt,
+                        error_type=type(exc).__name__,
                         error=str(exc),
                     )
                 await asyncio.sleep(retry_interval_seconds)
@@ -635,6 +670,29 @@ async def cancel_sync_task(
     await cancel_task(task, shutdown_intent=shutdown_intent)
 
 
+def _split_restart_response_timeouts(
+    bot_entity_names: list[str],
+    phase_results: tuple[list[object], ...],
+    *,
+    restart_entities: set[str],
+) -> tuple[list[BaseException], set[str]]:
+    """Separate failed bot stops from restarting bots whose reply outlived the drain.
+
+    A restarting bot releases every resource even when a reply outlives the
+    bounded drain, and the cancelled reply stays pending for its replacement
+    to replay, so any other failure still keeps it from being replaced.
+    """
+    failures: list[BaseException] = []
+    response_timeout_entities: set[str] = set()
+    for results in phase_results:
+        for entity_name, result in zip(bot_entity_names, results, strict=True):
+            if isinstance(result, ResponseShutdownTimeoutError) and entity_name in restart_entities:
+                response_timeout_entities.add(entity_name)
+            elif isinstance(result, BaseException):
+                failures.append(result)
+    return failures, response_timeout_entities
+
+
 async def stop_entities(
     entities_to_stop: set[str],
     agent_bots: dict[str, AgentBot | TeamBot],
@@ -649,7 +707,8 @@ async def stop_entities(
         for entity_name in entities_to_stop
     }
     entity_names = sorted(entities_to_stop)
-    bots_to_stop = [agent_bots[entity_name] for entity_name in entity_names if entity_name in agent_bots]
+    bot_entity_names = [entity_name for entity_name in entity_names if entity_name in agent_bots]
+    bots_to_stop = [agent_bots[entity_name] for entity_name in bot_entity_names]
     phase_cancellations: list[asyncio.CancelledError] = []
     quiesce_results, cancellation = await gather_shutdown_phase(
         *(bot._quiesce_matrix_ingestion() for bot in bots_to_stop),
@@ -676,8 +735,7 @@ async def stop_entities(
             agent_bots[entity_name].prepare_for_sync_shutdown(
                 shutdown_intent=shutdown_intents[entity_name],
             )
-            for entity_name in entity_names
-            if entity_name in agent_bots
+            for entity_name in bot_entity_names
         ),
     )
     if cancellation is not None:
@@ -685,21 +743,25 @@ async def stop_entities(
     stop_results, cancellation = await gather_shutdown_phase(
         *(
             agent_bots[entity_name].stop(shutdown_intent=shutdown_intents[entity_name])
-            for entity_name in entity_names
-            if entity_name in agent_bots
+            for entity_name in bot_entity_names
         ),
     )
     if cancellation is not None:
         phase_cancellations.append(cancellation)
-    cleanup_failures = [
-        result
-        for results in (cancel_results, prepare_results, stop_results)
-        for result in results
-        if isinstance(result, BaseException)
-    ]
-    failures = [*quiesce_failures, *phase_cancellations, *cleanup_failures]
+    bot_failures, response_timeout_entities = _split_restart_response_timeouts(
+        bot_entity_names,
+        (prepare_results, stop_results),
+        restart_entities=restart_entities,
+    )
+    cleanup_failures = [result for result in cancel_results if isinstance(result, BaseException)]
+    failures = [*quiesce_failures, *phase_cancellations, *cleanup_failures, *bot_failures]
     if failures:
         raise failures[0]
+    if response_timeout_entities:
+        logger.warning(
+            "restart_replacing_entities_after_response_drain_timeout",
+            entities=sorted(response_timeout_entities),
+        )
 
     for entity_name in entity_names:
         agent_bots.pop(entity_name, None)

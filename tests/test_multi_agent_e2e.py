@@ -33,6 +33,7 @@ from tests.conftest import (
     patch_response_runner_module,
     runtime_paths_for,
 )
+from tests.response_attempt_helpers import install_direct_response_admission
 from tests.threading_helpers import seed_thread_history
 
 if TYPE_CHECKING:
@@ -283,7 +284,7 @@ async def test_agent_responds_in_threads_based_on_participation(  # noqa: PLR091
     """Test that agents respond in threads based on whether other agents are participating."""
     # Create the config first to get the actual domain
     mock_config = _make_config(tmp_path)
-    mock_config.models = {"default": ModelConfig(provider="anthropic", id="claude-3-5-haiku-latest")}
+    mock_config.models = {"default": ModelConfig(provider="anthropic", id="claude-haiku-4-5")}
     mock_resolve_agent_knowledge_access.return_value = _KnowledgeResolution(knowledge=None)
     fake_member = MagicMock()
     fake_member.name = "MockAgent"
@@ -323,6 +324,7 @@ async def test_agent_responds_in_threads_based_on_participation(  # noqa: PLR091
             rooms=[test_room_id],
             enable_streaming=False,
         )
+        install_direct_response_admission(bot)
         install_runtime_journal_support(bot)
 
         # Mock orchestrator
@@ -455,9 +457,10 @@ async def test_agent_responds_in_threads_based_on_participation(  # noqa: PLR091
                 thread_id=thread_root_id,
                 messages=thread_history,
             )
+            # A homeserver never reuses an event ID, and each reply is bound to the one it created.
             bot.client.room_send.side_effect = [
-                nio.RoomSendResponse.from_dict({"event_id": "$placeholder"}, test_room_id),
-                nio.RoomSendResponse.from_dict({"event_id": "$edit"}, test_room_id),
+                nio.RoomSendResponse.from_dict({"event_id": "$placeholder-team"}, test_room_id),
+                nio.RoomSendResponse.from_dict({"event_id": "$edit-team"}, test_room_id),
             ]
 
             mock_ai = AsyncMock()
@@ -479,7 +482,7 @@ async def test_agent_responds_in_threads_based_on_participation(  # noqa: PLR091
             assert placeholder_content[STREAM_STATUS_KEY] == "pending"
             assert placeholder_content["body"].startswith("🤝 Team Response: Thinking...")
             assert final_content["m.relates_to"]["rel_type"] == "m.replace"
-            assert final_content["m.relates_to"]["event_id"] == "$placeholder"
+            assert final_content["m.relates_to"]["event_id"] == "$placeholder-team"
             assert final_content["m.new_content"]["body"] != placeholder_content["body"]
             bot.client.room_send.side_effect = None
 
@@ -660,7 +663,7 @@ async def test_agent_handles_room_invite(mock_calculator_agent: AgentMatrixUser,
         mock_room.inviter = mock_event.sender
         bot.client.invited_rooms = {invite_room: mock_room}
 
-        bot._room_lifecycle.record_pending_room_invite(mock_room.room_id, mock_event.sender)
+        await bot._room_lifecycle.record_pending_room_invite(mock_room.room_id, mock_event.sender)
         await bot._room_lifecycle.handle_recorded_invite(mock_room, mock_event.sender)
 
         # Verify new room was joined (not the initial room)

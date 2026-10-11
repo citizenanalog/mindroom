@@ -3,8 +3,9 @@
 from typing import Any, ClassVar
 
 import pytest
-from fastapi import HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 
+from mindroom.api import config_lifecycle
 from mindroom.api.dashboard_credential_scope import (
     require_agent_credential_management_authorized,
     require_agent_oauth_connection_authorized,
@@ -16,12 +17,16 @@ from mindroom.constants import RuntimePaths, resolve_runtime_paths
 
 
 def _request(auth_user: dict[str, Any] | None = None, query_string: bytes = b"") -> Request:
+    """Build a dashboard request served by an app with MindRoom state, as every production request is."""
+    app = FastAPI()
+    config_lifecycle.ensure_app_state(app)
     scope: dict[str, Any] = {
         "type": "http",
         "method": "GET",
         "path": "/",
         "headers": [],
         "query_string": query_string,
+        "app": app,
     }
     if auth_user is not None:
         scope["auth_user"] = auth_user
@@ -35,7 +40,7 @@ def _config(
     private_per: str | None = None,
 ) -> Config:
     payload: dict[str, object] = {
-        "models": {"default": {"provider": "openai", "id": "gpt-4o-mini"}},
+        "models": {"default": {"provider": "openai", "id": "gpt-5.6-luna"}},
         "agents": {
             "general": {
                 "display_name": "General",

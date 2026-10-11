@@ -26,19 +26,18 @@ from googleapiclient.errors import HttpError
 from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
-from mindroom.credentials import (
+from mindroom.credentials.manager import (
     CredentialsManager,
     get_runtime_credentials_manager,
-    save_scoped_credentials,
-    scoped_credentials_path,
 )
 from mindroom.custom_tools import google_service
 from mindroom.custom_tools.gmail import GmailTools
 from mindroom.custom_tools.google_calendar import GoogleCalendarTools
 from mindroom.custom_tools.google_docs import GoogleDocsTools
 from mindroom.custom_tools.google_drive import GoogleDriveTools
-from mindroom.custom_tools.google_service import ThreadLocalGoogleServiceMixin, google_service_account_configured
+from mindroom.custom_tools.google_service import ThreadLocalGoogleServiceMixin
 from mindroom.custom_tools.google_sheets import GoogleSheetsTools
+from mindroom.custom_tools.google_tasks import GoogleTasksTools
 from mindroom.oauth import client as oauth_client_module
 from mindroom.oauth.client import ScopedOAuthClientMixin
 from mindroom.oauth.credential_lifecycle import (
@@ -50,14 +49,42 @@ from mindroom.oauth.credential_lifecycle import (
     oauth_credentials_worker_target,
     reset_oauth_credentials,
 )
+from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.google_drive import GOOGLE_DRIVE_READ_OAUTH_SCOPES
-from mindroom.oauth.providers import OAuthConnectionRequired, OAuthTokenResult
-from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.oauth.providers import OAuthConnectionRequired, OAuthProviderError, OAuthTokenResult
+from mindroom.tool_system.metadata import export_tools_metadata, get_tool_by_name
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target, tool_execution_identity
+from tests.oauth_test_utils import corrupt_oauth_credential_payload, publish_oauth_credentials
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
+
+    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
+
+
+def _save_scoped_oauth_credentials(
+    service: str,
+    credentials: dict[str, Any],
+    *,
+    credentials_manager: CredentialsManager,
+    worker_target: ResolvedWorkerTarget | None,
+) -> None:
+    providers = (
+        GmailTools._oauth_provider,
+        GoogleCalendarTools._oauth_provider,
+        GoogleDocsTools._oauth_provider,
+        GoogleDriveTools._oauth_provider,
+        GoogleSheetsTools._oauth_provider,
+        GoogleTasksTools._oauth_provider,
+    )
+    provider = next(provider for provider in providers if provider.credential_service == service)
+    publish_oauth_credentials(
+        provider,
+        credentials,
+        credentials_manager=credentials_manager,
+        worker_target=worker_target,
+    )
 
 
 def _valid_credentials(*, token: str = "valid-access-token") -> GoogleOAuthCredentials:  # noqa: S107
@@ -97,7 +124,7 @@ def runtime_paths(tmp_path: Path) -> RuntimePaths:
 @pytest.mark.parametrize("worker_scope", ["user", "user_agent"])
 @pytest.mark.parametrize(
     "tool_class",
-    [GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools],
+    [GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools, GoogleTasksTools],
 )
 def test_google_wrappers_allow_isolating_worker_scopes(
     worker_scope: str,
@@ -132,7 +159,7 @@ def test_google_wrappers_allow_isolating_worker_scopes(
 
 @pytest.mark.parametrize(
     "tool_class",
-    [GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools],
+    [GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools, GoogleTasksTools],
 )
 def test_google_service_cache_is_isolated_per_thread(
     tool_class: type[Any],
@@ -268,7 +295,7 @@ def test_google_account_cache_is_thread_local(cache_field: str, values: tuple[ob
     assert observed == list(values)
 
 
-def test_google_service_account_configured_checks_instance_and_runtime_values(
+def test_google_api_toolkit_service_account_fallback_checks_instance_and_runtime_values(
     runtime_paths: RuntimePaths,
     tmp_path: Path,
 ) -> None:
@@ -282,9 +309,17 @@ def test_google_service_account_configured_checks_instance_and_runtime_values(
         },
     )
 
-    assert google_service_account_configured(str(service_account_path), runtime_paths) is True
-    assert google_service_account_configured(None, runtime_paths_with_env) is True
-    assert google_service_account_configured(None, runtime_paths) is False
+    def docs_tool(paths: RuntimePaths, **kwargs: object) -> GoogleDocsTools:
+        return GoogleDocsTools(
+            runtime_paths=paths,
+            credentials_manager=CredentialsManager(tmp_path / "credentials"),
+            worker_target=None,
+            **kwargs,
+        )
+
+    assert docs_tool(runtime_paths, service_account_path=str(service_account_path))._should_fallback_to_original_auth()
+    assert docs_tool(runtime_paths_with_env)._should_fallback_to_original_auth() is True
+    assert docs_tool(runtime_paths)._should_fallback_to_original_auth() is False
 
 
 @pytest.mark.parametrize(
@@ -301,6 +336,10 @@ def test_google_service_account_configured_checks_instance_and_runtime_values(
         (
             GoogleSheetsTools,
             list(GoogleSheetsTools._oauth_provider.scopes),
+        ),
+        (
+            GoogleTasksTools,
+            list(GoogleTasksTools._oauth_provider.scopes),
         ),
     ],
 )
@@ -339,6 +378,7 @@ def test_google_wrapper_build_credentials_uses_provider_scopes(
         ("google_docs", "google_docs_oauth"),
         ("google_drive", "google_drive_oauth"),
         ("google_sheets", "google_sheets_oauth"),
+        ("google_tasks", "google_tasks_oauth"),
     ],
 )
 def test_google_wrappers_load_provider_oauth_credentials(
@@ -349,7 +389,7 @@ def test_google_wrappers_load_provider_oauth_credentials(
 ) -> None:
     """Google wrappers should load each provider's OAuth token service."""
     credentials_manager = CredentialsManager(base_path=tmp_path / "credentials")
-    credentials_manager.save_credentials(
+    _save_scoped_oauth_credentials(
         credential_service,
         {
             "token": "token",
@@ -359,6 +399,8 @@ def test_google_wrappers_load_provider_oauth_credentials(
             "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
             "_source": "oauth",
         },
+        credentials_manager=credentials_manager,
+        worker_target=None,
     )
 
     tool = get_tool_by_name(
@@ -368,8 +410,34 @@ def test_google_wrappers_load_provider_oauth_credentials(
         worker_target=None,
     )
 
-    assert isinstance(tool, (GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools))
+    assert isinstance(
+        tool,
+        (GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools, GoogleTasksTools),
+    )
     assert tool._load_token_data() is not None
+
+
+def test_gmail_catalog_matches_default_registered_functions(runtime_paths: RuntimePaths, tmp_path: Path) -> None:
+    """The catalog must describe operations available through the default factory."""
+    credentials_manager = CredentialsManager(base_path=tmp_path / "credentials")
+    _save_scoped_oauth_credentials(
+        "google_gmail_oauth",
+        {
+            "token": "token",
+            "refresh_token": "refresh",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client-id",
+            "scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+            "expiry": "2100-01-01T00:00:00Z",
+            "_source": "oauth",
+        },
+        credentials_manager=credentials_manager,
+        worker_target=None,
+    )
+    tool = get_tool_by_name("gmail", runtime_paths, credentials_manager=credentials_manager, worker_target=None)
+    assert isinstance(tool, GmailTools)
+    exported = next(item for item in export_tools_metadata() if item["name"] == "gmail")
+    assert set(exported["function_names"]) == set(tool.functions)
 
 
 def test_scoped_oauth_client_structured_auth_failure_returns_oauth_required_json_string() -> None:
@@ -433,7 +501,7 @@ def test_google_wrapper_routes_unreadable_credentials_to_reset_flow(
             shared_base_path=credentials_manager.shared_base_path,
             encryption_key=wrong_key,
         )
-        save_scoped_credentials(
+        _save_scoped_oauth_credentials(
             GoogleDriveTools._oauth_provider.credential_service,
             {
                 "token": "unreadable-access",
@@ -446,12 +514,26 @@ def test_google_wrapper_routes_unreadable_credentials_to_reset_flow(
             worker_target=worker_target,
         )
     else:
-        credential_path = scoped_credentials_path(
+        credentials = {
+            "token": "unreadable-access",
+            "client_id": "client-id",
+            "scopes": list(GoogleDriveTools._oauth_provider.scopes),
+            "_source": "oauth",
+            "_oauth_provider": GoogleDriveTools._oauth_provider.id,
+        }
+        _save_scoped_oauth_credentials(
             GoogleDriveTools._oauth_provider.credential_service,
+            credentials,
             credentials_manager=credentials_manager,
             worker_target=worker_target,
         )
-        credential_path.write_bytes(b"corrupt-plaintext-secret")
+        context = OAuthCredentialContext(
+            provider=GoogleDriveTools._oauth_provider,
+            runtime_paths=runtime_paths,
+            credentials_manager=credentials_manager,
+            worker_target=worker_target,
+        )
+        corrupt_oauth_credential_payload(_oauth_credential_database_path(context), b"corrupt-plaintext-secret")
     tool = GoogleDriveTools(
         runtime_paths=runtime_paths,
         credentials_manager=credentials_manager,
@@ -543,7 +625,7 @@ def test_google_wrapper_refresh_failure_recovery_is_terminal_only(
         "_source": "oauth",
         "_oauth_provider": GoogleDriveTools._oauth_provider.id,
     }
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         token_data,
         credentials_manager=credentials_manager,
@@ -572,6 +654,57 @@ def test_google_wrapper_refresh_failure_recovery_is_terminal_only(
         assert payload.get("reason") == expected_reason
     stored = load_oauth_credentials_snapshot_sync(tool._oauth_credential_context()).credentials
     assert (stored is not None) is credential_remains
+
+
+@pytest.mark.parametrize(
+    "tool_class",
+    [GmailTools, GoogleCalendarTools, GoogleDocsTools, GoogleDriveTools, GoogleSheetsTools, GoogleTasksTools],
+)
+def test_google_credential_read_failure_does_not_require_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: RuntimePaths,
+    tool_class: type[Any],
+) -> None:
+    """A temporary storage failure preserves the connection for a later tool attempt."""
+    credentials_manager = get_runtime_credentials_manager(runtime_paths)
+    provider = tool_class._oauth_provider
+    _save_scoped_oauth_credentials(
+        provider.credential_service,
+        {
+            "token": "valid-access-token",
+            "refresh_token": "stored-refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client-id",
+            "expires_at": 4_102_444_800.0,
+            "scopes": list(provider.scopes),
+            "_source": "oauth",
+            "_oauth_provider": provider.id,
+        },
+        credentials_manager=credentials_manager,
+        worker_target=None,
+    )
+    tool = tool_class(
+        runtime_paths=runtime_paths,
+        credentials_manager=credentials_manager,
+        worker_target=None,
+    )
+    assert tool._ensure_structured_auth() is None
+    context = tool._oauth_credential_context()
+    before = load_oauth_credentials_snapshot_sync(context)
+
+    def fail_generation_read(_context: OAuthCredentialContext) -> Never:
+        message = "Temporary credential store failure with private storage detail"
+        raise OAuthProviderError(message)
+
+    with monkeypatch.context() as scoped_patch:
+        scoped_patch.setattr(oauth_client_module, "oauth_credential_generation", fail_generation_read)
+        with pytest.raises(RefreshError, match=r"^OAuth credential refresh failed$"):
+            tool._ensure_structured_auth()
+        assert tool._consume_oauth_connection_required() == (False, None)
+
+    assert load_oauth_credentials_snapshot_sync(context) == before
+    assert tool._ensure_structured_auth() is None
+    assert tool.creds.token == "valid-access-token"  # noqa: S105
 
 
 @pytest.mark.parametrize(
@@ -663,7 +796,7 @@ def test_google_authorized_http_lazy_refresh_uses_bounded_provider_request(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "retained-access-token",
@@ -733,7 +866,7 @@ def test_google_final_401_provider_text_is_redacted_before_toolkit_logging(
     """Final managed 401 bodies cannot reach Google tool results or logs."""
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
     provider = tool_class._oauth_provider
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         provider.credential_service,
         {
             "token": "retained-access-token",
@@ -852,7 +985,7 @@ def test_google_wrapper_maps_swallowed_final_resource_401_to_access_rejected(
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
     service = GoogleDriveTools._oauth_provider.credential_service
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         service,
         {
             "token": "retained-access-token",
@@ -906,7 +1039,7 @@ def test_google_docs_partial_create_401_preserves_non_retryable_result(
     """A rejected initial-text write must not hide or encourage duplicating the created document."""
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
     provider = GoogleDocsTools._oauth_provider
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         provider.credential_service,
         {
             "token": "retained-access-token",
@@ -1036,7 +1169,7 @@ def test_nested_google_wrapper_preserves_final_resource_401_for_outer_owner(
     """A nested tool call must leave final-401 translation to the outer entrypoint."""
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
     service = GoogleDriveTools._oauth_provider.credential_service
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         service,
         {
             "token": "retained-access-token",
@@ -1092,7 +1225,7 @@ def test_google_lazy_refresh_rejects_expired_access_only_snapshot(runtime_paths:
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "expired-access-only-token",
@@ -1132,7 +1265,7 @@ def test_google_forced_refresh_rejects_unexpired_access_only_snapshot(runtime_pa
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "unexpired-access-only-token",
@@ -1178,7 +1311,7 @@ def test_google_drive_refreshes_expired_readonly_grant(
             session_id=None,
         ),
     )
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "expired-readonly-token",
@@ -1228,7 +1361,7 @@ def test_google_forced_refresh_rejects_unchanged_readonly_bearer(
             session_id=None,
         ),
     )
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "rejected-readonly-token",
@@ -1285,7 +1418,7 @@ def test_google_wrapper_replaces_swallowed_mid_call_refresh_rejection(
         "general",
         execution_identity=identity,
     )
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "valid-access-token",
@@ -1354,7 +1487,7 @@ def test_google_lazy_refresh_reuses_rotation_committed_for_a_stale_client(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "expired-access-token",
@@ -1431,7 +1564,7 @@ def test_google_lazy_refresh_serializes_local_snapshot_publication(  # noqa: PLR
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "expired-access-token",
@@ -1539,7 +1672,7 @@ def test_google_before_request_serializes_validity_check_with_refresh(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "expired-access-token",
@@ -1619,7 +1752,7 @@ def test_google_forced_refresh_waiting_on_valid_request_does_not_reuse_old_succe
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "expired-access-token",
@@ -1721,7 +1854,7 @@ def test_google_wrapper_constructor_canonicalizes_alias_without_runtime_context(
         config=config,
     )
     assert canonical_target is not None
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": canonical_access_token,
@@ -1764,7 +1897,7 @@ async def test_google_wrapper_reloads_callback_replacement_in_materialized_worke
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "account-a-access-token",
@@ -1820,6 +1953,7 @@ async def test_google_wrapper_reloads_callback_replacement_in_materialized_worke
             callback_context,
             "account-b-code",
             "pkce-verifier",
+            token_url=callback_context.provider.token_url,
             expected_connection_generation=issued_connection_generation,
         )
 
@@ -1851,7 +1985,7 @@ async def test_google_lazy_refresh_cannot_adopt_reconnected_account(runtime_path
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "account-a-access-token",
@@ -1899,6 +2033,7 @@ async def test_google_lazy_refresh_cannot_adopt_reconnected_account(runtime_path
         callback_context,
         "account-b-code",
         "pkce-verifier",
+        token_url=callback_context.provider.token_url,
         expected_connection_generation=issued_connection_generation,
     )
 
@@ -1929,7 +2064,7 @@ def test_google_wrapper_full_context_key_clears_persistent_worker_between_reques
     alice_target = resolve_worker_target("user_agent", "general", execution_identity=alice_identity)
     bob_target = resolve_worker_target("user_agent", "general", execution_identity=bob_identity)
     for target, token in ((alice_target, "alice-token"), (bob_target, "bob-token")):
-        save_scoped_credentials(
+        _save_scoped_oauth_credentials(
             GoogleDriveTools._oauth_provider.credential_service,
             {
                 "token": token,
@@ -1987,7 +2122,7 @@ async def test_google_wrapper_drops_valid_cached_credentials_after_reset(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "valid-access-token",
@@ -2033,7 +2168,7 @@ async def test_google_wrapper_drops_cached_services_in_every_worker_after_reset(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "valid-access-token",
@@ -2091,12 +2226,11 @@ async def test_google_wrapper_drops_cached_services_in_every_worker_after_reset(
     assert results == [(True, True), (True, True)]
 
 
-@pytest.mark.asyncio
-async def test_google_wrapper_replaces_swallowed_async_upload_refresh_rejection(
+def test_google_wrapper_replaces_swallowed_upload_refresh_rejection(
     monkeypatch: pytest.MonkeyPatch,
     runtime_paths: RuntimePaths,
 ) -> None:
-    """Async uploads should return the same reconnect response as synchronous calls."""
+    """Drive uploads return the reconnect response when the upload swallows a refresh rejection."""
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
     identity = ToolExecutionIdentity(
         channel="matrix",
@@ -2112,7 +2246,7 @@ async def test_google_wrapper_replaces_swallowed_async_upload_refresh_rejection(
         "general",
         execution_identity=identity,
     )
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "valid-access-token",
@@ -2146,10 +2280,10 @@ async def test_google_wrapper_replaces_swallowed_async_upload_refresh_rejection(
         credentials_manager=credentials_manager,
         worker_target=worker_target,
     )
-    entrypoint = tool.async_functions["google_drive_upload_file"].entrypoint
+    entrypoint = tool.functions["google_drive_upload_file"].entrypoint
     assert entrypoint is not None
 
-    payload = json.loads(await entrypoint("unused"))
+    payload = json.loads(entrypoint("unused"))
 
     assert payload["oauth_connection_required"] is True
     assert payload["reason"] == "refresh_rejected"
@@ -2172,7 +2306,7 @@ def test_google_wrapper_keeps_refresh_rejection_state_per_call(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "valid-access-token",
@@ -2255,7 +2389,7 @@ def test_google_wrapper_reports_missing_connection_after_terminal_deletion(
         session_id=None,
     )
     worker_target = resolve_worker_target("user_agent", "general", execution_identity=identity)
-    save_scoped_credentials(
+    _save_scoped_oauth_credentials(
         GoogleDriveTools._oauth_provider.credential_service,
         {
             "token": "valid-access-token",

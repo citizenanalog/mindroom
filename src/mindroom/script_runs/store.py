@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, cast
 
+from mindroom.script_runs.legacy_schema import migrate_legacy_script_run_columns
 from mindroom.script_runs.models import (
     ScriptCallClaim,
     ScriptCallRecord,
@@ -146,12 +147,12 @@ class ScriptRunStore:
                         run_id, agent_name, owner_user_id, room_id, thread_root_event_id,
                         execution_identity_json, source_digest, grants_json, token_hash, preapprove_launch_grants,
                         worker_key, worker_id, worker_backend_locator,
-                        snapshot_locator, name, local_unsafe,
+                        snapshot_locator, recovery_signature, name, local_unsafe,
                         resource_profile, resource_requests_json, resource_limits_json,
                         max_tool_calls_per_minute, max_runtime_seconds, state, created_at,
                         started_at, finished_at, exit_code, error, output,
                         cancel_requested_at, cancellation_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     _run_values(run),
                 )
@@ -613,12 +614,7 @@ class ScriptRunStore:
         with self._write_transaction() as connection:
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
-            existing_columns = {
-                str(row["name"]) for row in connection.execute("PRAGMA table_info(script_runs)").fetchall()
-            }
-            for column_name, statement in _SCRIPT_RUN_COLUMN_MIGRATIONS:
-                if column_name not in existing_columns:
-                    connection.execute(statement)
+            migrate_legacy_script_run_columns(connection)
 
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection]:
@@ -661,6 +657,7 @@ _SCHEMA_STATEMENTS = (
                     worker_id TEXT,
                     worker_backend_locator TEXT,
                     snapshot_locator TEXT,
+                    recovery_signature TEXT,
                     name TEXT,
                     local_unsafe INTEGER NOT NULL,
                     resource_profile TEXT,
@@ -702,18 +699,6 @@ _SCHEMA_STATEMENTS = (
                 """,
 )
 
-_SCRIPT_RUN_COLUMN_MIGRATIONS = (
-    ("resource_profile", "ALTER TABLE script_runs ADD COLUMN resource_profile TEXT"),
-    (
-        "resource_requests_json",
-        "ALTER TABLE script_runs ADD COLUMN resource_requests_json TEXT NOT NULL DEFAULT '{}'",
-    ),
-    (
-        "resource_limits_json",
-        "ALTER TABLE script_runs ADD COLUMN resource_limits_json TEXT NOT NULL DEFAULT '{}'",
-    ),
-)
-
 
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path, isolation_level=None, timeout=10)
@@ -748,6 +733,7 @@ def _run_values(run: ScriptRunRecord) -> tuple[object, ...]:
         run.worker_id,
         run.worker_backend_locator,
         run.snapshot_locator,
+        run.recovery_signature,
         run.name,
         int(run.local_unsafe),
         run.resource_profile,
@@ -784,6 +770,7 @@ def _run_from_row(row: sqlite3.Row) -> ScriptRunRecord:
         worker_id=_nullable_string(row["worker_id"]),
         worker_backend_locator=_nullable_string(row["worker_backend_locator"]),
         snapshot_locator=_nullable_string(row["snapshot_locator"]),
+        recovery_signature=_nullable_string(row["recovery_signature"]),
         name=_nullable_string(row["name"]),
         local_unsafe=bool(row["local_unsafe"]),
         resource_profile=_nullable_string(row["resource_profile"]),

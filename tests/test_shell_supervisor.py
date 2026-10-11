@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from mindroom import shell_execution as shell_execution_module
-from mindroom import shell_supervisor
 from mindroom.api import sandbox_runner as sandbox_runner_module
 from mindroom.constants import resolve_runtime_paths
 from mindroom.script_runs import shim as script_run_shim
-from mindroom.shell_execution import run_command
-from mindroom.shell_supervisor import (
+from mindroom.shell import execution as shell_execution_module
+from mindroom.shell import supervisor as shell_supervisor
+from mindroom.shell.execution import run_command
+from mindroom.shell.supervisor import (
     SHELL_SUPERVISOR_SOCKET_ENV,
     _handle_connection,
     _ShellSupervisorManager,
@@ -33,6 +33,7 @@ from mindroom.shell_supervisor import (
     run_command_via_supervisor,
 )
 from mindroom.tool_system.metadata import get_tool_by_name
+from tests.process_helpers import assert_linux_pid_not_running
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from agno.tools.toolkit import Toolkit
 
     from mindroom.constants import RuntimePaths
-    from mindroom.shell_execution import ProcessRecord
+    from mindroom.shell.execution import ProcessRecord
 
 _MINIMAL_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
@@ -67,13 +68,35 @@ def test_supervisor_status_parser_is_canonical(
     assert status.exit_code == exit_code
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"message": "Finished", "handle": None, "output_file_handled": "false"},
+        {"message": "Started", "handle": 123, "output_file_handled": True},
+        {"message": {}, "handle": None, "output_file_handled": False},
+        {"message": "Missing ownership metadata"},
+    ],
+)
+def test_invalid_result_metadata_cannot_claim_output_ownership(payload: dict[str, object]) -> None:
+    """Malformed supervisor fields must not suppress the caller's normal error handling."""
+    result = shell_supervisor._parse_supervisor_response(json.dumps(payload).encode())
+
+    assert result.output_file_handled is False
+    assert result.handle is None
+    assert result.message.startswith("Error: Invalid shell supervisor response:")
+
+
 @contextlib.asynccontextmanager
-async def _running_server(registry: dict[str, ProcessRecord]) -> AsyncIterator[str]:
+async def _running_server(
+    registry: dict[str, ProcessRecord],
+    deadline_tasks: set[asyncio.Task[None]] | None = None,
+) -> AsyncIterator[str]:
     runtime_dir = Path(tempfile.mkdtemp(prefix="mindroom-shell-test-"))
     socket_path = str(runtime_dir / "s.sock")
     handle_reservations: set[str] = set()
+    tracked_deadline_tasks = deadline_tasks if deadline_tasks is not None else set()
     server = await asyncio.start_unix_server(
-        partial(_handle_connection, registry, handle_reservations),
+        partial(_handle_connection, registry, handle_reservations, tracked_deadline_tasks),
         path=socket_path,
     )
     try:
@@ -81,6 +104,9 @@ async def _running_server(registry: dict[str, ProcessRecord]) -> AsyncIterator[s
     finally:
         server.close()
         await server.wait_closed()
+        for task in tracked_deadline_tasks:
+            task.cancel()
+        await asyncio.gather(*tracked_deadline_tasks, return_exceptions=True)
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
@@ -91,8 +117,9 @@ async def _run(
     namespace: str = "ns",
     timeout: float = 30,  # noqa: ASYNC109
     handle: str | None = None,
+    max_runtime_seconds: float | None = None,
 ) -> str:
-    return await run_command_via_supervisor(
+    result = await run_command_via_supervisor(
         socket_path,
         namespace=namespace,
         argv=argv,
@@ -101,7 +128,9 @@ async def _run(
         tail=100,
         timeout=timeout,
         handle=handle,
+        max_runtime_seconds=max_runtime_seconds,
     )
+    return result.message
 
 
 def _extract_handle(message: str) -> str:
@@ -141,21 +170,6 @@ async def _assert_pid_dead(pid: int) -> None:
             return
         await asyncio.sleep(0.05)
     message = f"Process {pid} is still alive"
-    raise AssertionError(message)
-
-
-async def _assert_linux_pid_not_running(pid: int) -> None:
-    """Wait until a Linux process exits, allowing an unreaped zombie."""
-    stat_path = Path(f"/proc/{pid}/stat")
-    for _ in range(40):
-        try:
-            state = stat_path.read_text(encoding="utf-8").split()[2]
-        except (FileNotFoundError, ProcessLookupError):
-            return
-        if state == "Z":
-            return
-        await asyncio.sleep(0.05)
-    message = f"Process {pid} is still running"
     raise AssertionError(message)
 
 
@@ -242,6 +256,172 @@ async def test_run_timeout_backgrounds_then_check_and_kill() -> None:
         assert "Force-killed" in kill_result
 
         assert "FINISHED" in await _wait_for_finished(socket_path, handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_seconds",
+    [0, -1, float("inf"), float("nan"), 10**1000, -(10**1000)],
+    ids=["zero", "negative", "infinite", "nan", "oversized-positive", "oversized-negative"],
+)
+async def test_invalid_process_deadline_returns_structured_error(runtime_seconds: float) -> None:
+    """Invalid deadlines cannot spawn a process or break the supervisor response protocol."""
+    registry: dict[str, ProcessRecord] = {}
+    async with _running_server(registry) as socket_path:
+        result = await _run(socket_path, ["sleep", "300"], timeout=0, max_runtime_seconds=runtime_seconds)
+
+    assert result.startswith("Error: Invalid shell supervisor request:")
+    assert registry == {}
+
+
+@pytest.mark.asyncio
+async def test_process_deadlines_are_independent_and_leave_ordinary_background_calls_running(tmp_path: Path) -> None:
+    """Each maximum runtime kills only its original process group and drains its timer."""
+    registry: dict[str, ProcessRecord] = {}
+    deadline_tasks: set[asyncio.Task[None]] = set()
+    resistant_handle = f"shell:{'a' * 32}"
+    completed_handle = f"shell:{'b' * 32}"
+    cancelled_handle = f"shell:{'c' * 32}"
+    ready_path = tmp_path / "deadline-ready"
+    resistant_script = (
+        "import pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "pathlib.Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+        "time.sleep(300)"
+    )
+
+    async with _running_server(registry, deadline_tasks) as socket_path:
+        resistant = await _run(
+            socket_path,
+            [sys.executable, "-c", resistant_script, str(ready_path)],
+            timeout=0,
+            handle=resistant_handle,
+            max_runtime_seconds=3.0,
+        )
+        ordinary, completed, cancelled = await asyncio.gather(
+            _run(socket_path, ["sleep", "300"], timeout=0),
+            _run(
+                socket_path,
+                [sys.executable, "-c", "pass"],
+                timeout=0,
+                handle=completed_handle,
+                max_runtime_seconds=10.0,
+            ),
+            _run(
+                socket_path,
+                ["sleep", "300"],
+                timeout=0,
+                handle=cancelled_handle,
+                max_runtime_seconds=10.0,
+            ),
+        )
+        ordinary_handle = _extract_handle(ordinary)
+
+        try:
+            assert _extract_handle(resistant) == resistant_handle
+            assert _extract_handle(completed) == completed_handle
+            assert _extract_handle(cancelled) == cancelled_handle
+            assert "Force-killed" in await _kill(socket_path, cancelled_handle, force=True)
+            assert "FINISHED" in await _wait_for_finished(socket_path, cancelled_handle)
+            for _ in range(20):
+                if ready_path.exists():
+                    break
+                await asyncio.sleep(0.05)
+            assert ready_path.exists()
+            assert "Terminated" in await _kill(socket_path, resistant_handle)
+            await asyncio.sleep(0.1)
+            assert "RUNNING" in await _check(socket_path, resistant_handle)
+            assert "FINISHED" in await _wait_for_finished(socket_path, completed_handle)
+            assert "FINISHED" in await _wait_for_finished(socket_path, resistant_handle)
+            assert "exit code -9" in await _check(socket_path, resistant_handle)
+            assert "RUNNING" in await _check(socket_path, ordinary_handle)
+            for _ in range(20):
+                if not deadline_tasks:
+                    break
+                await asyncio.sleep(0.05)
+            assert deadline_tasks == set()
+        finally:
+            await _kill(socket_path, resistant_handle, force=True)
+            await _kill(socket_path, cancelled_handle, force=True)
+            await _kill(socket_path, ordinary_handle, force=True)
+
+
+@pytest.mark.asyncio
+async def test_process_deadline_kills_descendant_after_leader_exits(tmp_path: Path) -> None:
+    """An inherited output pipe cannot keep descendants alive past the deadline."""
+    registry: dict[str, ProcessRecord] = {}
+    release_path = tmp_path / "exit-leader"
+    child_path = tmp_path / "child-pid"
+    script = (
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+        "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
+    )
+    async with _running_server(registry) as socket_path:
+        result = await _run(
+            socket_path,
+            [sys.executable, "-c", script, str(child_path), str(release_path)],
+            timeout=0,
+            max_runtime_seconds=3,
+        )
+        handle = _extract_handle(result)
+        try:
+            for _ in range(100):
+                if child_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert child_path.exists()
+            child_pid = int(child_path.read_text())
+            release_path.touch()
+            for _ in range(100):
+                if registry[handle].process.returncode is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert registry[handle].process.returncode == 0
+            # The monitor may already have killed the group when the leader exits.
+            assert "FINISHED" in await _wait_for_finished(socket_path, handle)
+            await _assert_pid_dead(child_pid)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(registry[handle].pid, signal.SIGKILL)
+            await _wait_for_finished(socket_path, handle)
+
+
+@pytest.mark.asyncio
+async def test_script_shim_puts_workspace_modules_after_installed_ones(tmp_path: Path) -> None:
+    """A workspace file named like a standard-library module must not shadow it in the script."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # `colorsys` is not imported before the script runs, unlike `json`, so its origin shows the search order.
+    (workspace / "colorsys.py").write_text("raise RuntimeError('workspace module shadowed the standard library')\n")
+    (workspace / "helper.py").write_text("VALUE = 'helper-value'\n")
+    source_path = workspace / "source.py"
+    source_path.write_text(
+        "import colorsys\nimport helper\nprint(helper.VALUE, colorsys.__name__, flush=True)\n",
+        encoding="utf-8",
+    )
+    token_path = workspace / "capability"
+    token_path.write_text("raw-secret", encoding="utf-8")
+    env = {
+        **_MINIMAL_ENV,
+        "MINDROOM_SCRIPT_WORKSPACE_ROOT": str(workspace),
+        "MINDROOM_SCRIPT_SOURCE_DIGEST": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "MINDROOM_SCRIPT_TOKEN_PATH": str(token_path),
+    }
+    registry: dict[str, ProcessRecord] = {}
+
+    result = await run_command(
+        registry,
+        namespace="script:test",
+        argv=[sys.executable, "-P", "-s", "-m", "mindroom.script_runs.shim", str(source_path), str(token_path)],
+        env=env,
+        cwd=str(workspace),
+        tail=100,
+        timeout=30,
+    )
+
+    assert result.message == "helper-value colorsys"
 
 
 @pytest.mark.asyncio
@@ -460,7 +640,7 @@ async def test_script_shim_does_not_mask_directory_token_validation(tmp_path: Pa
     assert token_path.is_dir()
 
 
-@pytest.mark.parametrize("cleanup_operation", ["lstat", "unlink"])
+@pytest.mark.parametrize("cleanup_operation", ["stat", "unlink"])
 def test_script_shim_cleanup_permission_error_preserves_source_validation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -478,21 +658,31 @@ def test_script_shim_cleanup_permission_error_preserves_source_validation(
     monkeypatch.setenv("MINDROOM_SCRIPT_TOKEN_PATH", str(token_path))
 
     def reject_source(_source_path: Path) -> None:
-        if cleanup_operation == "lstat":
+        if cleanup_operation == "stat":
+            original_stat = os.stat
 
-            def deny_lstat(_path: Path) -> os.stat_result:
-                message = "cleanup denied"
-                raise PermissionError(message)
+            def deny_stat(
+                path: str | Path,
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                if dir_fd is not None:
+                    message = "cleanup denied"
+                    raise PermissionError(message)
+                return original_stat(path, follow_symlinks=follow_symlinks)
 
-            monkeypatch.setattr(Path, "lstat", deny_lstat)
+            monkeypatch.setattr(os, "stat", deny_stat)
         else:
+            original_unlink = os.unlink
 
-            def deny_unlink(_path: Path, *, missing_ok: bool = False) -> None:
-                del missing_ok
-                message = "cleanup denied"
-                raise PermissionError(message)
+            def deny_unlink(path: str | Path, *, dir_fd: int | None = None) -> None:
+                if dir_fd is not None:
+                    message = "cleanup denied"
+                    raise PermissionError(message)
+                original_unlink(path)
 
-            monkeypatch.setattr(Path, "unlink", deny_unlink)
+            monkeypatch.setattr(os, "unlink", deny_unlink)
         msg = "Script source digest does not match the launch receipt."
         raise ValueError(msg)
 
@@ -546,7 +736,7 @@ async def test_background_limit_discards_rejected_process(monkeypatch: pytest.Mo
         spawned_pids.append(process.pid)
         return process
 
-    monkeypatch.setattr(shell_execution_module, "_MAX_BACKGROUNDED", 1)
+    monkeypatch.setattr(shell_execution_module, "MAX_BACKGROUNDED", 1)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_spawn)
     async with _running_server(registry) as socket_path:
         accepted = await _run(socket_path, ["sleep", "300"], timeout=0)
@@ -724,7 +914,7 @@ async def test_ordinary_shell_run_does_not_use_script_parent_death_wrapper(
         argv = kwargs["argv"]
         assert isinstance(argv, list)
         observed_argv.extend(str(item) for item in argv)
-        return shell_execution_module._RunResult(message="ordinary result")
+        return shell_execution_module.ShellRunResult(message="ordinary result")
 
     monkeypatch.setattr(shell_supervisor, "run_command", record_run)
     reader = asyncio.StreamReader()
@@ -740,7 +930,8 @@ async def test_ordinary_shell_run_does_not_use_script_parent_death_wrapper(
 
     message = await shell_supervisor._handle_run({}, set(), payload, reader)
 
-    assert message == "ordinary result"
+    assert message is not None
+    assert message.message == "ordinary result"
     assert observed_argv == ["echo", "ordinary"]
 
 
@@ -839,9 +1030,9 @@ async def test_supervisor_sigkill_terminates_supervised_process_group(
         supervisor.process.kill()
         supervisor.process.wait(timeout=10)
 
-        await _assert_linux_pid_not_running(supervised_pid)
-        await _assert_linux_pid_not_running(script_pid)
-        await _assert_linux_pid_not_running(descendant_pid)
+        await assert_linux_pid_not_running(supervised_pid)
+        await assert_linux_pid_not_running(script_pid)
+        await assert_linux_pid_not_running(descendant_pid)
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(supervised_pid, signal.SIGKILL)
@@ -918,7 +1109,7 @@ async def test_finished_script_kills_same_group_descendants(
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
 
         assert "FINISHED" in await _wait_for_finished(socket_path, handle)
-        await _assert_linux_pid_not_running(child_pid)
+        await assert_linux_pid_not_running(child_pid)
     finally:
         if child_pid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -935,7 +1126,7 @@ async def test_orphaned_supervisor_exits_and_kills_children() -> None:
     # an orphan as soon as that parent exits.
     launcher = (
         "import pathlib, subprocess, sys, time\n"
-        "process = subprocess.Popen([sys.executable, '-m', 'mindroom.shell_supervisor', sys.argv[1]])\n"
+        "process = subprocess.Popen([sys.executable, '-m', 'mindroom.shell.supervisor', sys.argv[1]])\n"
         "pathlib.Path(sys.argv[2]).write_text(str(process.pid), encoding='utf-8')\n"
         "deadline = time.monotonic() + 20\n"
         "while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < deadline:\n"
@@ -972,7 +1163,7 @@ async def test_orphaned_supervisor_exits_and_kills_children() -> None:
 def _make_runtime_paths(tmp_path: Path) -> RuntimePaths:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "models:\n  default:\n    provider: openai\n    id: gpt-5.4\nagents: {}\nrouter:\n  model: default\n",
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\nagents: {}\nrouter:\n  model: default\n",
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text("", encoding="utf-8")
@@ -1074,7 +1265,7 @@ def test_subprocess_mode_shell_background_handle_across_requests(tmp_path: Path)
     """
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "models:\n  default:\n    provider: openai\n    id: gpt-5.4\nagents: {}\nrouter:\n  model: default\n",
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\nagents: {}\nrouter:\n  model: default\n",
         encoding="utf-8",
     )
     runtime_paths = resolve_runtime_paths(

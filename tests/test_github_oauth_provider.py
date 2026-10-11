@@ -14,7 +14,7 @@ import pytest
 from authlib.common.errors import AuthlibBaseError
 
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialContext,
     load_oauth_credentials_snapshot,
@@ -22,6 +22,7 @@ from mindroom.oauth.credential_lifecycle import (
 )
 from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.providers import OAuthRefreshRejectedError
+from tests.oauth_test_utils import oauth_authorization_url, publish_oauth_credentials
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -75,7 +76,8 @@ def test_github_authorization_url_omits_classic_oauth_scope(tmp_path: Path) -> N
     _save_client_config(runtime_paths)
 
     authorization_url = asyncio.run(
-        _provider().authorization_uri_async(
+        oauth_authorization_url(
+            _provider(),
             runtime_paths,
             state="opaque-state",
             code_verifier="v" * 64,
@@ -102,13 +104,14 @@ def test_github_token_exchange_normalizes_rotating_user_token(tmp_path: Path) ->
     }
 
     with patch(
-        "mindroom.oauth.providers.AsyncOAuth2Client.fetch_token",
+        "authlib.integrations.httpx_client.AsyncOAuth2Client.fetch_token",
         new=AsyncMock(return_value=token_response),
     ):
         result = asyncio.run(
             _provider().exchange_code(
                 "authorization-code",
                 runtime_paths,
+                token_url=_provider().token_url,
                 code_verifier="v" * 64,
             ),
         )
@@ -126,17 +129,20 @@ def test_github_refresh_persists_rotated_access_and_refresh_tokens(tmp_path: Pat
     runtime_paths = _runtime_paths(tmp_path)
     _save_client_config(runtime_paths)
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
-    credentials_manager.save_credentials(
-        "github_oauth",
+    publish_oauth_credentials(
+        _provider(),
         {
             "token": "old-access",
             "refresh_token": "old-refresh",
+            "token_uri": _provider().token_url,
             "client_id": "github-client-id",
             "scopes": [],
             "expires_at": 1.0,
             "_source": "oauth",
             "_oauth_provider": "github",
         },
+        credentials_manager=credentials_manager,
+        worker_target=None,
     )
     refresh_response = {
         "access_token": "rotated-access",
@@ -154,7 +160,7 @@ def test_github_refresh_persists_rotated_access_and_refresh_tokens(tmp_path: Pat
         worker_target=None,
     )
     with patch(
-        "mindroom.oauth.providers.AsyncOAuth2Client.refresh_token",
+        "authlib.integrations.httpx_client.AsyncOAuth2Client.refresh_token",
         new=AsyncMock(return_value=refresh_response),
     ):
         refreshed = asyncio.run(refresh_oauth_credentials(context))
@@ -171,23 +177,32 @@ def test_github_bad_refresh_token_is_terminal_and_deletes_credentials(tmp_path: 
     runtime_paths = _runtime_paths(tmp_path)
     _save_client_config(runtime_paths)
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
-    credentials_manager.save_credentials(
-        "github_oauth",
+    context = OAuthCredentialContext(
+        provider=_provider(),
+        runtime_paths=runtime_paths,
+        credentials_manager=credentials_manager,
+        worker_target=None,
+    )
+    publish_oauth_credentials(
+        context.provider,
         {
             "token": "old-access",
             "refresh_token": "old-refresh",
+            "token_uri": context.provider.token_url,
             "client_id": "github-client-id",
             "scopes": [],
             "expires_at": 1.0,
             "_source": "oauth",
             "_oauth_provider": "github",
         },
+        credentials_manager=context.credentials_manager,
+        worker_target=context.worker_target,
     )
     leaked_description = "provider-controlled account detail"
 
     with (
         patch(
-            "mindroom.oauth.providers.AsyncOAuth2Client.refresh_token",
+            "authlib.integrations.httpx_client.AsyncOAuth2Client.refresh_token",
             new=AsyncMock(
                 side_effect=AuthlibBaseError(
                     error="bad_refresh_token",
@@ -197,17 +212,8 @@ def test_github_bad_refresh_token_is_terminal_and_deletes_credentials(tmp_path: 
         ),
         pytest.raises(OAuthRefreshRejectedError) as exc_info,
     ):
-        asyncio.run(
-            refresh_oauth_credentials(
-                OAuthCredentialContext(
-                    provider=_provider(),
-                    runtime_paths=runtime_paths,
-                    credentials_manager=credentials_manager,
-                    worker_target=None,
-                ),
-            ),
-        )
+        asyncio.run(refresh_oauth_credentials(context))
 
     assert exc_info.value.oauth_error == "bad_refresh_token"
     assert leaked_description not in str(exc_info.value)
-    assert credentials_manager.load_credentials("github_oauth") is None
+    assert asyncio.run(load_oauth_credentials_snapshot(context)).credentials is None

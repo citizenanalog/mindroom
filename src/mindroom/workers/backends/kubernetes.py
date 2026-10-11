@@ -2,24 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mindroom.credential_policy import credential_service_policy
-from mindroom.credentials import get_runtime_credentials_manager, sync_shared_credentials_to_worker
-from mindroom.runtime_env_policy import (
-    CREDENTIALS_ENCRYPTION_KEY_ENV,
-    SANDBOX_RUNTIME_ENV_BY_KEY,
-    credentials_encryption_key_value,
-)
+from mindroom.credentials.manager import get_runtime_credentials_manager, sync_shared_credentials_to_worker
+from mindroom.credentials.policy import credential_service_policy
+from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.tool_system.worker_routing import resolved_worker_key_scope, worker_dir_name, worker_id_for_key
 from mindroom.workers.backend import (
     WorkerBackendError,
     effective_idle_status,
     filter_and_sort_worker_handles,
+)
+from mindroom.workers.backends._dedicated_worker_common import (
+    ScopedWorkspaceMount,
+    plan_scoped_workspace_mounts,
+    resolve_state_scope_worker_key,
 )
 from mindroom.workers.backends._lifecycle import mark_worker_failed, mark_worker_idle, touch_worker_lifecycle
 from mindroom.workers.models import (
@@ -36,13 +40,11 @@ from mindroom.workers.worker_retirement import open_worker_state_root
 from . import kubernetes_resources as resources
 from .kubernetes_config import (
     KubernetesWorkerBackendConfig,
-    credentials_encryption_key_hash,
     kubernetes_backend_config_signature,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from mindroom.constants import RuntimePaths
 
@@ -51,6 +53,7 @@ __all__ = [
     "KubernetesWorkerBackendConfig",
     "check_kubernetes_workers_absent_for_storage_upgrade",
     "kubernetes_backend_config_signature",
+    "standalone_resource_manager",
 ]
 
 _COLD_START_GRACE_SECONDS = 1.5
@@ -74,11 +77,24 @@ class _ReadyWorkerCacheEntry:
     spec: WorkerSpec
     handle: WorkerHandle
     validated_at: float
-    credentials_encryption_key_hash: str | None
+    workspace_mounts: tuple[ScopedWorkspaceMount, ...]
 
 
 def _noop_finalize_progress(_phase: WorkerReadyPhase, _error: str | None) -> None:
     del _phase, _error
+
+
+def standalone_resource_manager(runtime_paths: RuntimePaths) -> resources.KubernetesResourceManager:
+    """Build a resource manager for startup maintenance without constructing a worker backend."""
+    return resources.KubernetesResourceManager(
+        runtime_paths=runtime_paths,
+        config=KubernetesWorkerBackendConfig.from_runtime(runtime_paths),
+        auth_token=None,
+        storage_root=runtime_paths.storage_root,
+        tool_validation_snapshot={},
+        config_snapshot={},
+        worker_grantable_credentials=frozenset(),
+    )
 
 
 def check_kubernetes_workers_absent_for_storage_upgrade(
@@ -87,17 +103,9 @@ def check_kubernetes_workers_absent_for_storage_upgrade(
     timeout_seconds: float,
 ) -> None:
     """Verify Kubernetes worker absence without constructing a worker backend."""
-    config = KubernetesWorkerBackendConfig.from_runtime(runtime_paths)
-    resource_manager = resources.KubernetesResourceManager(
-        runtime_paths=runtime_paths,
-        config=config,
-        auth_token=None,
-        storage_root=runtime_paths.storage_root,
-        tool_validation_snapshot={},
-        config_snapshot={},
-        worker_grantable_credentials=frozenset(),
+    standalone_resource_manager(runtime_paths).check_workers_absent_for_storage_upgrade(
+        timeout_seconds=timeout_seconds,
     )
-    resource_manager.check_workers_absent_for_storage_upgrade(timeout_seconds=timeout_seconds)
 
 
 def _progress_event(
@@ -309,7 +317,40 @@ class KubernetesWorkerBackend:
             },
         }
 
+    def script_resource_recovery_authority(self, resource_profile: str | None) -> dict[str, object]:
+        """Return current pod resources for one run's persisted profile."""
+        requests, limits = self.config.resources_for_profile(resource_profile)
+        return {
+            "profile": resource_profile,
+            "requests": requests,
+            "limits": limits,
+        }
+
     cleanup_locator: str | None = None
+
+    def script_recovery_signature(self) -> str:
+        """Identify the worker authority that must stay fixed while an old image finishes a run."""
+        payload = self._script_recovery_payload()
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _script_recovery_payload(self) -> dict[str, object]:
+        config = asdict(self.config)
+        config.pop("image")
+        config.pop("image_pull_policy")
+        config.pop("image_pull_secrets")
+        config.pop("default_script_resource_profile")
+        config.pop("script_resource_profiles")
+        config.pop("resource_requests")
+        config.pop("resource_limits")
+        config.pop("tmp_size_limit")
+        config.pop("user_resources")
+        return {
+            "config": config,
+            "owner": self.cleanup_locator,
+            "auth_token": self.auth_token,
+            "storage_root": str(self.storage_root),
+            "grantable_credentials": sorted(self.worker_grantable_credentials),
+        }
 
     def __init__(
         self,
@@ -469,6 +510,12 @@ class KubernetesWorkerBackend:
                 deployment_apply: resources.DeploymentApplyResult | None = None
                 auth_secret_applied = False
                 try:
+                    # kubelet resolves the read-only mirror subPath when the pod starts, so the
+                    # primary validates and creates the worker's credential directories first.
+                    get_runtime_credentials_manager(self.runtime_paths).for_worker(worker_key)
+                    # kubelet creates missing subPath sources as root, so shared workspaces exist first;
+                    # the cache keeps these mounts to notice a workspace that appears after planning.
+                    workspace_mounts = self._plan_workspace_mounts(spec, create_shared=True)
                     self._resources.apply_auth_secret(worker_key=worker_key, worker_id=worker_id)
                     auth_secret_applied = True
                     deployment_apply = self._resources.apply_deployment(
@@ -545,7 +592,7 @@ class KubernetesWorkerBackend:
                     now=timestamp,
                     annotations_override=final_deployment_annotations,
                 )
-                self._store_ready_worker(spec, handle, validated_at=timestamp)
+                self._store_ready_worker(spec, handle, validated_at=timestamp, workspace_mounts=workspace_mounts)
                 return handle
         finally:
             if progress_sink is not None:
@@ -643,29 +690,41 @@ class KubernetesWorkerBackend:
         *,
         now: float,
     ) -> list[WorkerHandle]:
-        """Scale idle workers from one already-loaded Deployment snapshot."""
+        """Nominate idle workers from a snapshot, then recheck under their startup lock."""
         cleaned: list[WorkerHandle] = []
         for deployment in deployments:
             handle = self._handle_from_deployment(deployment, now=now)
             if handle.status != "idle" or int(deployment.spec.replicas or 0) == 0:
                 continue
-            annotations = dict(deployment.metadata.annotations or {})
-            resources.apply_lifecycle_annotations(
-                annotations,
-                mark_worker_idle(resources.lifecycle_from_annotations(annotations, now=now)),
-            )
-            self._resources.patch_deployment(handle.worker_id, replicas=0, annotations=annotations)
-            self._resources.delete_service(handle.worker_id)
-            self._resources.delete_secret(handle.worker_id)
-            self._invalidate_ready_worker(handle.worker_key)
-            cleaned.append(
-                self._handle_from_deployment(
-                    deployment,
-                    now=now,
-                    annotations_override=annotations,
-                    replicas_override=0,
-                ),
-            )
+            worker_lock = self._worker_lock(handle.worker_key)
+            if not worker_lock.acquire(blocking=False):
+                continue
+            try:
+                live = self._resources.read_deployment(handle.worker_id)
+                if live is None:
+                    continue
+                handle = self._handle_from_deployment(live, now=now)
+                if handle.status != "idle" or int(live.spec.replicas or 0) == 0:
+                    continue
+                annotations = dict(live.metadata.annotations or {})
+                resources.apply_lifecycle_annotations(
+                    annotations,
+                    mark_worker_idle(resources.lifecycle_from_annotations(annotations, now=now)),
+                )
+                self._resources.patch_deployment(handle.worker_id, replicas=0, annotations=annotations)
+                self._resources.delete_service(handle.worker_id)
+                self._resources.delete_secret(handle.worker_id)
+                self._invalidate_ready_worker(handle.worker_key)
+                cleaned.append(
+                    self._handle_from_deployment(
+                        live,
+                        now=now,
+                        annotations_override=annotations,
+                        replicas_override=0,
+                    ),
+                )
+            finally:
+                worker_lock.release()
         return cleaned
 
     def _reconcile_drifted_deployments(
@@ -790,6 +849,7 @@ class KubernetesWorkerBackend:
         *,
         now: float | None = None,
         annotations_override: dict[str, str] | None = None,
+        startup_count: int | None = None,
     ) -> WorkerHandle:
         """Persist a failed worker startup or execution state."""
         timestamp = time.time() if now is None else now
@@ -799,6 +859,7 @@ class KubernetesWorkerBackend:
                 failure_reason,
                 now=timestamp,
                 annotations_override=annotations_override,
+                startup_count=startup_count,
             )
 
     def _record_failure_locked(
@@ -808,14 +869,19 @@ class KubernetesWorkerBackend:
         *,
         now: float,
         annotations_override: dict[str, str] | None = None,
+        startup_count: int | None = None,
     ) -> WorkerHandle:
         """Persist failure state while holding the worker provisioning lock."""
-        self._invalidate_ready_worker(worker_key)
         worker_id = self._worker_id(worker_key)
         deployment = self._resources.read_deployment(worker_id)
         if deployment is None:
             msg = f"Unknown worker '{worker_key}' for Kubernetes failure recording."
             raise WorkerBackendError(msg)
+        current = self._handle_from_deployment(deployment, now=now)
+        if startup_count is not None and current.startup_count != startup_count:
+            # The request failed on a pod this worker has since replaced, such as for a new workspace mount.
+            return current
+        self._invalidate_ready_worker(worker_key)
 
         annotations = dict(deployment.metadata.annotations or {})
         if annotations_override is not None:
@@ -854,9 +920,25 @@ class KubernetesWorkerBackend:
             credentials_manager=get_runtime_credentials_manager(self.runtime_paths),
         )
 
+    def _plan_workspace_mounts(self, spec: WorkerSpec, *, create_shared: bool) -> tuple[ScopedWorkspaceMount, ...]:
+        return plan_scoped_workspace_mounts(
+            worker_key=resolve_state_scope_worker_key(spec.worker_key, spec.state_scope_worker_key),
+            local_shared_storage_root=self._resources.storage_root,
+            worker_visible_shared_storage_root=Path(self.config.storage_mount_path),
+            private_agent_names=spec.private_agent_names,
+            resolved_agent_policies=self._resources.resolved_agent_policies,
+            create_shared=create_shared,
+        )
+
     def _reuse_cached_ready_worker(self, spec: WorkerSpec, *, now: float) -> WorkerHandle | None:
         entry = self._cached_ready_worker(spec.worker_key, spec=spec, now=now)
         if entry is None:
+            return None
+        # Only user workers and workers whose plan mounted nothing can gain a workspace while running.
+        state_scope_worker_key = resolve_state_scope_worker_key(spec.worker_key, spec.state_scope_worker_key)
+        may_gain_workspace = not entry.workspace_mounts or resolved_worker_key_scope(state_scope_worker_key) == "user"
+        if may_gain_workspace and entry.workspace_mounts != self._plan_workspace_mounts(spec, create_shared=False):
+            self._invalidate_ready_worker(spec.worker_key)
             return None
         try:
             handle = self._patch_cached_worker_usage(entry, now=now)
@@ -874,24 +956,19 @@ class KubernetesWorkerBackend:
             raise WorkerBackendError(str(exc)) from exc
         return handle
 
-    def _current_credentials_encryption_key_hash(self) -> str | None:
-        encryption_key = credentials_encryption_key_value(
-            self.runtime_paths.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV),
-        )
-        return credentials_encryption_key_hash(encryption_key)
-
     def _store_ready_worker(
         self,
         spec: WorkerSpec,
         handle: WorkerHandle,
         *,
         validated_at: float,
+        workspace_mounts: tuple[ScopedWorkspaceMount, ...],
     ) -> None:
         entry = _ReadyWorkerCacheEntry(
             spec=spec,
             handle=handle,
             validated_at=validated_at,
-            credentials_encryption_key_hash=self._current_credentials_encryption_key_hash(),
+            workspace_mounts=workspace_mounts,
         )
         with self._ready_workers_lock:
             self._ready_workers[spec.worker_key] = entry
@@ -913,7 +990,6 @@ class KubernetesWorkerBackend:
                 return None
             cache_invalid = (
                 (spec is not None and entry.spec != spec)
-                or entry.credentials_encryption_key_hash != self._current_credentials_encryption_key_hash()
                 or now - entry.validated_at >= _READY_WORKER_REVALIDATE_SECONDS
                 or now - entry.handle.last_used_at >= self.idle_timeout_seconds
             )
@@ -945,6 +1021,7 @@ class KubernetesWorkerBackend:
             entry.spec,
             handle,
             validated_at=entry.validated_at,
+            workspace_mounts=entry.workspace_mounts,
         )
         return handle
 
@@ -1063,7 +1140,10 @@ class KubernetesWorkerBackend:
         replicas = int(deployment.spec.replicas or 0) if replicas_override is None else replicas_override
         if replicas == 0:
             return "idle"
+        last_used_at = resources.parse_annotation_float(annotations, resources.ANNOTATION_LAST_USED_AT, now)
+        idle_status = effective_idle_status("ready", last_used_at, self.idle_timeout_seconds, now)
+        if stored_status == "ready" and idle_status == "idle":
+            return "idle"
         if not self._deployment_ready(deployment):
             return "starting"
-        last_used_at = resources.parse_annotation_float(annotations, resources.ANNOTATION_LAST_USED_AT, now)
-        return effective_idle_status("ready", last_used_at, self.idle_timeout_seconds, now)
+        return idle_status

@@ -8,6 +8,7 @@ from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
@@ -19,11 +20,13 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="google_sheets",
+    file_access=ToolFileAccess.NONE,
     display_name="Google Sheets",
-    description="Read, create, and update Google Sheets spreadsheets",
+    description="Read, create, update, and format Google Sheets spreadsheets",
     category=ToolCategory.DEVELOPMENT,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.OAUTH,
+    requires_primary_runtime=True,
     auth_provider="google_sheets",
     icon="SiGooglesheets",
     icon_color="text-green-600",
@@ -66,7 +69,7 @@ if TYPE_CHECKING:
             type="boolean",
             required=False,
             default=True,
-            description="Allow updating existing spreadsheets",
+            description="Allow updating and formatting existing spreadsheets",
         ),
     ],
     managed_init_args=(
@@ -81,6 +84,7 @@ if TYPE_CHECKING:
         "create_sheet",
         "read_sheet",
         "update_sheet",
+        "batch_update_sheet",
     ),
 )
 def google_sheets_tools() -> type[GoogleSheetsTools]:

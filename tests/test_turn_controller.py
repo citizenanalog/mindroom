@@ -11,17 +11,17 @@ import nio
 import pytest
 
 from mindroom import interactive
-from mindroom.coalescing import CoalescingGate, IngressAdmissionClosedError, LaneSlot, ReadyPendingEvent
-from mindroom.coalescing_batch import CoalescingKey, PendingEvent, RequesterCoalescingOwner
+from mindroom.coalescing.batch import CoalescingKey, PendingEvent, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate, IngressAdmissionClosedError, LaneSlot, ReadyPendingEvent
+from mindroom.coalescing.ingress_lanes import ReceiptLaneKey
+from mindroom.coalescing.prompt_ingress_reservation import PromptIngressReservationOwner
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import MATRIX_SOURCE_EVENT_IDS_METADATA_KEY, MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY
 from mindroom.dispatch_handoff import PendingDispatchMetadata, PreparedIngress
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
-from mindroom.ingress_lanes import ReceiptLaneKey
 from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
-from mindroom.prompt_ingress_reservation import PromptIngressReservationOwner
 from mindroom.streaming import send_streaming_response
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
@@ -278,7 +278,6 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
         prompt: str,
         thread_history: list[object],
         existing_event_id: str | None = None,
-        existing_event_is_placeholder: bool = False,
         user_id: str | None = None,  # noqa: ARG001
         media: object | None = None,  # noqa: ARG001
         attachment_ids: list[str] | None = None,  # noqa: ARG001
@@ -299,7 +298,6 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
         assert response_envelope.target.resolved_thread_id == selection.thread_id
         assert thread_history == []
         assert existing_event_id == "$ack:localhost"
-        assert existing_event_is_placeholder is True
 
         async def response_stream() -> AsyncIterator[str]:
             yield "Processed selection"
@@ -315,7 +313,7 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
                 runtime_paths=runtime_paths_for(config),
                 response_stream=response_stream(),
                 existing_event_id=existing_event_id,
-                adopt_existing_placeholder=existing_event_is_placeholder,
+                adopt_existing_placeholder=True,
             )
 
         mock_edit.assert_awaited()
@@ -344,6 +342,8 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
     assert captured_metadata is not None
     assert captured_metadata[MATRIX_SOURCE_EVENT_IDS_METADATA_KEY] == ["$selection:localhost"]
     assert captured_metadata[MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY] == [selection.question_event_id]
+    request = bot._response_runner.generate_response.await_args.args[0]
+    assert request.history_boundary_event_id == "$selection:localhost"
     _assert_interactive_turn_aliases(bot, selection, "$selection:localhost")
 
 

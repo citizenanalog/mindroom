@@ -6,14 +6,15 @@ import asyncio
 import inspect
 import tempfile
 from contextlib import nullcontext
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agno.agent import Agent as AgnoAgent
-from agno.db.base import SessionType
+from agno.db.base import BaseDb, SessionType
 from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.models.response import ToolExecution
@@ -31,6 +32,7 @@ from agno.run.team import RunPausedEvent as TeamRunPausedEvent
 from agno.run.team import TeamRunOutput
 from agno.run.team import ToolCallCompletedEvent as TeamToolCallCompletedEvent
 from agno.run.team import ToolCallStartedEvent as TeamToolCallStartedEvent
+from agno.session import TeamSession
 from agno.team import Team as AgnoTeam
 from agno.team._run import _cleanup_and_store
 from agno.tools.function import Function
@@ -42,12 +44,13 @@ from mindroom.ai_runtime import (
     install_queued_message_notice_hook,
     queued_message_signal_context,
 )
-from mindroom.approval_receipt import approval_receipt_context
-from mindroom.approval_response import require_ordered_pause_presentation
+from mindroom.approval.receipt import approval_receipt_context
+from mindroom.approval.response import require_ordered_pause_presentation
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import AI_RUN_METADATA_KEY, ROUTER_AGENT_NAME, RuntimePaths
+from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationState
 from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE
 from mindroom.execution_preparation import (
     ThreadHistoryRenderLimits,
@@ -55,19 +58,25 @@ from mindroom.execution_preparation import (
     _PreparedExecutionContext,
     prepare_bound_team_run_context,
 )
-from mindroom.history.compaction import _compaction_replay_messages
 from mindroom.history.interrupted_replay import _render_interrupted_replay_content
-from mindroom.history.runtime import open_bound_scope_session_context
+from mindroom.history.session_context import ScopeSessionContext, open_bound_scope_session_context
 from mindroom.history.storage import read_scope_seen_event_ids, update_scope_seen_event_ids
+from mindroom.history.summary_input import _compaction_replay_messages
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import CompactionDecision, CompactionReplyOutcome, HistoryScope, PreparedHistoryState
 from mindroom.hooks import EnrichmentItem
 from mindroom.knowledge.utils import _KnowledgeResolution
 from mindroom.media_inputs import MediaInputs
+from mindroom.mid_turn import QueuedMessage
 from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
-from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, ResponsePausedForApproval
-from mindroom.synthetic_model import SyntheticModel
+from mindroom.providers.synthetic_model import SyntheticModel
+from mindroom.response_turn import (
+    CompletedApprovalRun,
+    PausedAttempt,
+    ResponsePausedForApproval,
+    apply_exact_approval_decisions,
+)
 from mindroom.team_exact_members import (
     ResolvedExactTeamMembers,
     materialize_exact_requested_team_members,
@@ -91,6 +100,7 @@ from mindroom.teams import (
 from mindroom.timing import DispatchPipelineTiming
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.conftest import (
+    FakeModel,
     bind_runtime_paths,
     make_turn_context,
     make_visible_message,
@@ -103,8 +113,10 @@ from tests.identity_helpers import entity_ids, fixture_entity_matrix_id, persist
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from mindroom.tool_system.events import StructuredStreamChunk
 
-_TEST_MODEL = "openai:gpt-5.4"
+
+_TEST_MODEL = "openai:gpt-6-astra"
 _QUEUED_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"
 _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY = "mindroom_queued_message_notice_response_turn_id"
 
@@ -163,6 +175,7 @@ def test_team_pause_reindexes_interleaved_member_tools_to_document_order() -> No
         response_text=presentation.render_body(),
         tool_trace=tuple(presentation.tool_trace),
         response_presentation_state=presentation.to_state(),
+        toolkit_owners={("general", "inspect_first"): "test_toolkit", ("general", "inspect_second"): "test_toolkit"},
     )
 
     require_ordered_pause_presentation(paused, show_tool_calls=True)
@@ -192,7 +205,6 @@ def test_hidden_team_stream_presentation_retains_only_internal_tool_identity() -
         show_tool_calls=False,
         state=presentation.to_state(),
         tool_trace=presentation.tool_trace,
-        prior_response_text=presentation.render_body(),
     )
     restored.complete_member_tool(
         "general",
@@ -248,10 +260,44 @@ async def test_team_continuation_appends_terminal_only_consensus() -> None:
     async def events() -> AsyncIterator[object]:
         yield terminal
 
-    response = await _collect_team_continuation(events(), presentation)
+    response = await _collect_team_continuation(events(), presentation, progress=None)
 
     assert response is terminal
     assert "Before approval. After approval." in presentation.render_body()
+
+
+@pytest.mark.asyncio
+async def test_team_continuation_publishes_progress_from_its_restored_document() -> None:
+    """Team progress resumes the saved document, then follows each applied member event."""
+    prior = _TeamStreamPresentation.new(["general"], ["GeneralAgent"], show_tool_calls=True)
+    prior.append_member("general", "Before approval.")
+    prior.start_member_tool("general", ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={}))
+    presentation = _TeamStreamPresentation.restore(
+        config_names=["general"],
+        show_tool_calls=True,
+        state=prior.to_state(),
+        tool_trace=prior.tool_trace,
+    )
+    published: list[str] = []
+
+    async def progress(chunk: StructuredStreamChunk) -> None:
+        published.append(chunk.content)
+
+    async def events() -> AsyncIterator[object]:
+        yield AgentToolCallCompletedEvent(
+            agent_id="general",
+            agent_name="GeneralAgent",
+            tool=ToolExecution(tool_call_id="call-1", tool_name="inspect", result="done"),
+        )
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="After approval.")
+        yield TeamRunOutput(run_id="run-1", session_id="session-1", status=RunStatus.completed)
+
+    await _collect_team_continuation(events(), presentation, progress=progress)
+
+    assert published[0] == prior.render_body()
+    assert "🔧 `inspect` [1] ⏳" in published[0]
+    assert all("🔧 `inspect` [1] ⏳" not in body for body in published[1:])
+    assert "🔧 `inspect` [1]\n\nAfter approval." in published[-1]
 
 
 @pytest.mark.asyncio
@@ -268,7 +314,6 @@ async def test_hidden_team_continuation_separates_text_across_the_tool_boundary(
         show_tool_calls=False,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     terminal = TeamRunOutput(
         run_id="run-1",
@@ -280,7 +325,7 @@ async def test_hidden_team_continuation_separates_text_across_the_tool_boundary(
     async def events() -> AsyncIterator[object]:
         yield terminal
 
-    await _collect_team_continuation(events(), presentation)
+    await _collect_team_continuation(events(), presentation, progress=None)
 
     assert "Before approval.\n\nAfter approval." in presentation.render_body()
 
@@ -306,7 +351,7 @@ async def test_hidden_team_continuation_separates_text_across_a_new_tool_boundar
         yield TeamToolCallCompletedEvent(tool=tool)
         yield terminal
 
-    await _collect_team_continuation(events(), presentation)
+    await _collect_team_continuation(events(), presentation, progress=None)
 
     assert "Before tool.\n\nAfter tool." in presentation.render_body()
 
@@ -338,7 +383,6 @@ def test_hidden_team_separator_state_survives_a_chained_pause_in_another_scope()
         show_tool_calls=False,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     restored.append_member("first", "After tool.")
 
@@ -359,7 +403,6 @@ async def test_team_continuation_reuses_an_existing_visible_tool_separator() -> 
         show_tool_calls=True,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     terminal = TeamRunOutput(
         run_id="run-1",
@@ -372,7 +415,7 @@ async def test_team_continuation_reuses_an_existing_visible_tool_separator() -> 
     async def events() -> AsyncIterator[object]:
         yield terminal
 
-    await _collect_team_continuation(events(), presentation)
+    await _collect_team_continuation(events(), presentation, progress=None)
 
     assert "Before approval.\n\n🔧 `inspect` [1]\n\nAfter approval." in presentation.render_body()
 
@@ -392,7 +435,7 @@ async def test_team_continuation_falls_back_per_unstreamed_slot() -> None:
         yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="Member delta.")
         yield terminal
 
-    await _collect_team_continuation(events(), presentation)
+    await _collect_team_continuation(events(), presentation, progress=None)
 
     body = presentation.render_body()
     assert "**GeneralAgent**: Member delta." in body
@@ -423,7 +466,7 @@ async def test_team_continuation_completes_terminal_only_member_tool_in_its_slot
     async def events() -> AsyncIterator[object]:
         yield terminal
 
-    await _collect_team_continuation(events(), presentation)
+    await _collect_team_continuation(events(), presentation, progress=None)
 
     assert presentation.tool_trace[0].type == "tool_call_completed"
     assert presentation.tool_trace[0].scope_key == "agent:general"
@@ -450,6 +493,7 @@ def test_blocking_team_pause_uses_the_structured_member_slot() -> None:
             run_id="run-1",
             tools=(tool,),
             requirements=(requirement,),
+            toolkit_owners={("general", "inspect"): "test_toolkit"},
         ),
         response=response,
         config_names=["general"],
@@ -462,7 +506,6 @@ def test_blocking_team_pause_uses_the_structured_member_slot() -> None:
         show_tool_calls=True,
         state=paused.response_presentation_state,
         tool_trace=paused.tool_trace,
-        prior_response_text=paused.response_text,
     )
     assert "Member answer." in restored.per_member["general"]
     assert "🔧 `inspect` [1] ⏳" in restored.per_member["general"]
@@ -483,6 +526,7 @@ def test_blocking_team_pause_renders_a_marker_only_member_tool_on_its_own_line()
             run_id="run-1",
             tools=(tool,),
             requirements=(requirement,),
+            toolkit_owners={("general", "inspect"): "test_toolkit"},
         ),
         response=TeamRunOutput(tools=[tool], status=RunStatus.paused),
         config_names=["general"],
@@ -507,6 +551,7 @@ def test_blocking_team_pause_maps_provider_member_id_to_raw_config_name() -> Non
             run_id="run-1",
             tools=(tool,),
             requirements=(requirement,),
+            toolkit_owners={("general", "inspect"): "test_toolkit"},
         ),
         response=TeamRunOutput(
             tools=[tool],
@@ -555,6 +600,7 @@ def test_blocking_team_pause_scopes_reused_call_ids_to_distinct_members() -> Non
             run_id="run-1",
             tools=(pending,),
             requirements=(requirement,),
+            toolkit_owners={("general", "inspect"): "test_toolkit"},
         ),
         response=response,
         config_names=["first", "second"],
@@ -567,7 +613,6 @@ def test_blocking_team_pause_scopes_reused_call_ids_to_distinct_members() -> Non
         show_tool_calls=True,
         state=paused.response_presentation_state,
         tool_trace=paused.tool_trace,
-        prior_response_text=paused.response_text,
     )
     assert [(entry.scope_key, entry.type) for entry in restored.tool_trace] == [
         ("agent:first", "tool_call_completed"),
@@ -670,6 +715,9 @@ def _has_persisted_queued_notice(
 class _PendingQueuedMessageState:
     def has_pending_human_messages(self) -> bool:
         return True
+
+    def pending_message_snapshot(self) -> tuple[QueuedMessage, ...]:
+        return (QueuedMessage("$pending", None),) if self.has_pending_human_messages() else ()
 
 
 def _assert_retry_notice_not_relocated(
@@ -779,18 +827,10 @@ def test_materialize_exact_requested_team_members_short_circuits_missing_live_me
 
 
 @pytest.mark.asyncio
-async def test_paused_team_scope_open_failure_closes_materialized_member_databases() -> None:
-    """A scope __enter__ failure must still release every newly materialized member DB."""
+async def test_paused_team_scope_open_failure_does_not_materialize_members() -> None:
+    """A failed history lookup must not materialize team members."""
     config = _build_test_config()
     runtime_paths = runtime_paths_for(config)
-    agent = _make_test_agent("GeneralAgent")
-    members = ResolvedExactTeamMembers(
-        requested_agent_names=["general"],
-        agents=[agent],
-        display_names=["GeneralAgent"],
-        materialized_agent_names={"general"},
-        failed_agent_names=[],
-    )
     identity = ToolExecutionIdentity(
         channel="matrix",
         agent_name="general",
@@ -810,9 +850,8 @@ async def test_paused_team_scope_open_failure_closes_materialized_member_databas
             return None
 
     with (
-        patch("mindroom.teams.materialize_exact_team_members", return_value=members),
-        patch("mindroom.teams.install_approval_receipt_hooks") as install_receipt,
-        patch("mindroom.teams.open_bound_scope_session_context", return_value=ThrowingScope()),
+        patch("mindroom.teams.materialize_exact_team_members") as materialize,
+        patch("mindroom.teams.open_resolved_scope_session_context", return_value=ThrowingScope()),
         patch("mindroom.teams.close_team_runtime_state_dbs") as close_dbs,
         pytest.raises(RuntimeError, match="scope open failed"),
     ):
@@ -830,31 +869,37 @@ async def test_paused_team_scope_open_failure_closes_materialized_member_databas
             decisions={"call-1": True},
             denial_reasons={"call-1": None},
             refresh_scheduler=None,
+            progress=None,
         )
 
+    materialize.assert_not_called()
     close_dbs.assert_called_once_with(
-        agents=[agent],
+        agents=[],
         team_db=None,
         shared_scope_storage=None,
     )
-    install_receipt.assert_called_once_with(agent.model, agent.fallback_config)
 
 
 @pytest.mark.parametrize(("approved", "reason"), [(True, None), (False, "too dangerous")])
+@pytest.mark.parametrize("delegated", [False, True])
 @pytest.mark.asyncio
-async def test_team_continuation_executes_real_agno_confirmation(
+async def test_team_continuation_executes_real_agno_confirmation(  # noqa: PLR0915
     tmp_path: Path,
     approved: bool,
     reason: str | None,
+    delegated: bool,
 ) -> None:
     """Exercise the real persisted Agno team pause and continuation spine."""
     executed: list[list[str]] = []
     observed_metadata: list[dict[str, object] | None] = []
-    original_metadata = {
+    original_metadata: dict[str, object] = {
         "room_id": "!room:localhost",
         "thread_id": "$thread",
         "correlation_id": "team-approval-metadata",
     }
+
+    if delegated:
+        original_metadata[DELEGATION_STATE_KEY] = DelegationState().to_dict()
 
     def run_shell_command(args: list[str], run_context: RunContext) -> str:
         executed.append(args)
@@ -925,18 +970,64 @@ async def test_team_continuation_executes_real_agno_confirmation(
     )
     persisted_scope = HistoryScope(kind="team", scope_id="ad_hoc_original_scope")
     storage_factory = MagicMock()
-    scope_context = SimpleNamespace(storage=None, storage_factory=storage_factory)
+    session = await team.aget_session(session_id="session-1", user_id="@user:localhost")
+    assert isinstance(session, TeamSession)
+    assert team.db is not None
+    # Conversation history can belong to an earlier participant than this paused run.
+    session.user_id = "@history-owner:localhost"
+    scope_context = ScopeSessionContext(
+        scope=persisted_scope,
+        storage=team.db,
+        session=session,
+        session_id="session-1",
+        storage_factory=storage_factory,
+    )
+
+    async def drive_resumed(
+        entity: object,
+        events: AsyncIterator[object],
+        **kwargs: object,
+    ) -> AsyncIterator[object]:
+        """Continue a local approval in a parent that may have delegated earlier."""
+        assert entity is team
+        if not delegated:
+            assert kwargs["decisions"] is None
+            async for event in events:
+                yield event
+            return
+        assert kwargs["decisions"] == {tool_call_id: approved}
+        assert kwargs["denial_reasons"] == {tool_call_id: reason}
+        async for retained in events:
+            assert isinstance(retained, TeamRunOutput)
+            requirements = apply_exact_approval_decisions(
+                deepcopy(retained.requirements or []),
+                decisions={tool_call_id: approved},
+                denial_reasons={tool_call_id: reason},
+            )
+            async for event in team.acontinue_run(
+                run_response=retained,
+                requirements=requirements,
+                session_id="session-1",
+                user_id="@user:localhost",
+                metadata=deepcopy(retained.metadata),
+                stream=True,
+                stream_events=True,
+                yield_run_output=True,
+            ):
+                yield event
 
     with (
+        pytest.raises(RuntimeError, match="approval calls") if approved else nullcontext(),
         patch("mindroom.teams.materialize_exact_team_members", return_value=members),
         patch(
-            "mindroom.teams.open_bound_scope_session_context",
+            "mindroom.teams.open_resolved_scope_session_context",
             return_value=nullcontext(scope_context),
         ) as open_scope,
         patch("mindroom.teams.build_materialized_team_instance", return_value=team),
         patch.object(team, "acontinue_run", new=continue_run),
         patch("mindroom.teams.close_team_runtime_state_dbs"),
         patch("mindroom.teams.ai_runtime.register_queued_notice_storage") as register_notice,
+        patch("mindroom.teams.drive_delegation_stream", new=drive_resumed),
         approval_receipt_context("trusted approval receipt"),
     ):
         result = await continue_paused_team_run(
@@ -954,13 +1045,16 @@ async def test_team_continuation_executes_real_agno_confirmation(
             denial_reasons={tool_call_id: reason},
             refresh_scheduler=None,
             history_scope=persisted_scope,
-            prior_response_text=prior.render_body(),
             prior_tool_trace=prior.tool_trace,
             prior_presentation_state=prior.to_state(),
             show_tool_calls=True,
             tool_trace_collector=collected_trace,
+            progress=None,
         )
 
+    if approved:
+        assert executed == []
+        return
     assert isinstance(result, CompletedApprovalRun)
     assert AI_RUN_METADATA_KEY in result.metadata_content
     assert bool(executed) is approved
@@ -1021,7 +1115,7 @@ async def test_team_continuation_rejects_non_exact_persisted_call_ids(
     )
     team = MagicMock()
     team.db = None
-    team.aget_session = AsyncMock(return_value=SimpleNamespace(get_run=lambda _run_id: persisted))
+    team.model = None
     team.acontinue_run = AsyncMock(
         return_value=TeamRunOutput(
             run_id="run-1",
@@ -1048,11 +1142,17 @@ async def test_team_continuation_rejects_non_exact_persisted_call_ids(
     decisions = dict.fromkeys(decision_call_ids, True)
     denial_reasons = dict.fromkeys(decision_call_ids)
 
+    scope_context = ScopeSessionContext(
+        scope=HistoryScope(kind="team", scope_id="research"),
+        storage=MagicMock(spec=BaseDb),
+        session=TeamSession(session_id="session-1", team_id="research", user_id="@user:localhost", runs=[persisted]),
+        session_id="session-1",
+    )
     with (
         patch("mindroom.teams.materialize_exact_team_members", return_value=members),
         patch(
-            "mindroom.teams.open_bound_scope_session_context",
-            return_value=nullcontext(SimpleNamespace(storage=None, storage_factory=None)),
+            "mindroom.teams.open_resolved_scope_session_context",
+            return_value=nullcontext(scope_context),
         ),
         patch("mindroom.teams.build_materialized_team_instance", return_value=team),
         patch("mindroom.teams.close_team_runtime_state_dbs"),
@@ -1072,6 +1172,7 @@ async def test_team_continuation_rejects_non_exact_persisted_call_ids(
             decisions=decisions,
             denial_reasons=denial_reasons,
             refresh_scheduler=None,
+            progress=None,
         )
 
     team.acontinue_run.assert_not_awaited()
@@ -2316,7 +2417,7 @@ async def test_team_response_persists_seen_event_ids_for_matrix_runs() -> None:
     ) as scope_context:
         assert scope_context is not None
         assert scope_context.session is not None
-        assert read_scope_seen_event_ids(scope_context.session, scope_context.scope) == {
+        assert read_scope_seen_event_ids(scope_context.storage, scope_context.session, scope_context.scope) == {
             "event-1",
             "event-2",
         }
@@ -2709,7 +2810,7 @@ async def test_team_response_stream_raises_cancelled_error_for_team_run_cancelle
 
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -2781,7 +2882,7 @@ async def test_team_response_stream_drains_confirmation_pause_before_handoff() -
     orchestrator.agent_bots = {"general": MagicMock(running=True)}
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -2930,6 +3031,87 @@ async def test_team_response_stream_records_hidden_interrupted_tool_state() -> N
     )
 
 
+def _prepared_team_execution_stub() -> AsyncMock:
+    return AsyncMock(
+        return_value=_PreparedMaterializedTeamExecution(
+            messages=(Message(role="user", content="Analyze this."),),
+            run_metadata={},
+            unseen_event_ids=[],
+            prepared_history=PreparedHistoryState(
+                replays_persisted_history=False,
+                compaction_decision=CompactionDecision(mode="none", reason="unclassified"),
+                compaction_reply_outcome="none",
+            ),
+            runtime_model_name="test-model",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_team_prompt_labels_an_agent_reply_with_its_author(stream: bool) -> None:
+    """A team acting for a human still shows the agent whose reply it answers as that message's author."""
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    orchestrator = MagicMock()
+    orchestrator.config = config
+    orchestrator.runtime_paths = runtime_paths
+    orchestrator.knowledge_managers = {}
+    orchestrator.agent_bots = {"general": MagicMock(running=True)}
+    team_members = ResolvedExactTeamMembers(
+        requested_agent_names=["general"],
+        agents=[_make_test_agent("GeneralAgent")],
+        display_names=["GeneralAgent"],
+        materialized_agent_names={"general"},
+        failed_agent_names=[],
+    )
+    mock_team = _make_test_team()
+    mock_team.arun = AsyncMock(return_value=TeamRunOutput(content="Done"))
+    ctx = replace(
+        make_turn_context(session_id="session-team", requester_id="@alice:localhost"),
+        current_sender_id="@mindroom_research:localhost",
+    )
+
+    async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        yield TeamRunContentEvent(content="Done")
+
+    with (
+        patch("mindroom.teams._materialize_team_members", return_value=team_members),
+        patch("mindroom.teams.open_bound_scope_session_context", return_value=nullcontext(None)),
+        patch("mindroom.teams._create_team_instance", return_value=mock_team),
+        patch("mindroom.teams.prepare_materialized_team_execution", new=_prepared_team_execution_stub()) as prepare,
+        patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
+    ):
+        if stream:
+            chunks = [
+                chunk
+                async for chunk in team_response_stream(
+                    agent_ids=[fixture_entity_matrix_id("general", config.get_domain(runtime_paths), runtime_paths)],
+                    message="Analyze this.",
+                    turn_recorder=TurnRecorder(user_message="Analyze this."),
+                    orchestrator=orchestrator,
+                    execution_identity=None,
+                    ctx=ctx,
+                    mode=TeamMode.COORDINATE,
+                    user_id="@alice:localhost",
+                )
+            ]
+            assert chunks
+        else:
+            await team_response(
+                agent_names=["general"],
+                mode=TeamMode.COORDINATE,
+                message="Analyze this.",
+                turn_recorder=_team_turn_recorder("Analyze this."),
+                orchestrator=orchestrator,
+                execution_identity=None,
+                ctx=ctx,
+                user_id="@alice:localhost",
+            )
+
+    assert prepare.await_args.kwargs["current_sender_id"] == "@mindroom_research:localhost"
+
+
 @pytest.mark.asyncio
 async def test_team_response_stream_marks_tool_call_timing_for_agent_and_team_tools() -> None:
     """Streaming team tool events should emit the same debug timing marks as agent streams."""
@@ -2973,14 +3155,14 @@ async def test_team_response_stream_marks_tool_call_timing_for_agent_and_team_to
         )
         yield TeamToolCallStartedEvent(
             tool=ToolExecution(
-                tool_name="delegate_task",
+                tool_name="run_subagent",
                 tool_args={"agent": "general"},
                 tool_call_id="team-call-1",
             ),
         )
         yield TeamToolCallCompletedEvent(
             tool=ToolExecution(
-                tool_name="delegate_task",
+                tool_name="run_subagent",
                 tool_args={"agent": "general"},
                 tool_call_id="team-call-1",
                 result="delegated",
@@ -3074,7 +3256,7 @@ async def test_team_response_stream_marks_tool_call_timing_for_agent_and_team_to
                 "team_name": "Team (GeneralAgent)",
                 "tool_scope": "team",
                 "agent_name": None,
-                "tool_name": "delegate_task",
+                "tool_name": "run_subagent",
                 "tool_call_id": "team-call-1",
                 "show_tool_calls": True,
             },
@@ -3086,7 +3268,7 @@ async def test_team_response_stream_marks_tool_call_timing_for_agent_and_team_to
                 "team_name": "Team (GeneralAgent)",
                 "tool_scope": "team",
                 "agent_name": None,
-                "tool_name": "delegate_task",
+                "tool_name": "run_subagent",
                 "tool_call_id": "team-call-1",
                 "show_tool_calls": True,
             },
@@ -3382,7 +3564,7 @@ async def test_team_response_stream_emits_team_run_output_fallback() -> None:
 
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -3506,7 +3688,7 @@ async def test_team_response_stream_keys_canonical_text_by_provider_member_id() 
     orchestrator.agent_bots = {"Code_Review": MagicMock(running=True)}
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["Code_Review"],
-        agents=[],
+        agents=[_make_test_agent("Code Review")],
         display_names=["Code Review"],
         materialized_agent_names={"Code_Review"},
         failed_agent_names=[],
@@ -3584,7 +3766,7 @@ async def test_team_response_stream_emits_plain_run_output_fallback_with_team_fo
 
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -3649,7 +3831,7 @@ async def test_team_response_stream_raises_cancelled_error_for_team_run_output_f
 
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -3702,7 +3884,7 @@ async def test_team_response_stream_returns_friendly_error_for_errored_run_outpu
 
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -3758,7 +3940,7 @@ async def test_team_response_stream_returns_friendly_error_for_errored_plain_run
 
     team_members = ResolvedExactTeamMembers(
         requested_agent_names=["general"],
-        agents=[],
+        agents=[_make_test_agent("GeneralAgent")],
         display_names=["GeneralAgent"],
         materialized_agent_names={"general"},
         failed_agent_names=[],
@@ -4352,7 +4534,7 @@ def _build_private_team_orchestrator(*, include_private_member: bool) -> tuple[C
                 ),
             },
             models={
-                "default": ModelConfig(provider="openai", id="gpt-4o-mini"),
+                "default": ModelConfig(provider="openai", id="gpt-5.6-luna"),
             },
         ),
         runtime_paths,
@@ -4396,7 +4578,10 @@ def test_materialized_private_ad_hoc_team_uses_opened_scope_id() -> None:
             config=config,
             execution_identity=identity,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=_TEST_MODEL),
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="fake-model", provider="fake"),
+        ),
     ):
         assert scope_context is not None
         team = build_materialized_team_instance(
@@ -4444,7 +4629,10 @@ async def test_private_ad_hoc_team_second_turn_replays_first_scoped_run() -> Non
             execution_identity=identity,
             create_session_if_missing=True,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=_TEST_MODEL),
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="fake-model", provider="fake"),
+        ),
     ):
         assert scope_context is not None
         assert scope_context.session is not None
@@ -4484,7 +4672,10 @@ async def test_private_ad_hoc_team_second_turn_replays_first_scoped_run() -> Non
             config=config,
             execution_identity=identity,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=_TEST_MODEL),
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="fake-model", provider="fake"),
+        ),
     ):
         assert scope_context is not None
         second_team = build_materialized_team_instance(

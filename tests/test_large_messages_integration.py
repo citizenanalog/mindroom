@@ -22,8 +22,9 @@ from mindroom.constants import (
 from mindroom.matrix.client import edit_message_result, send_message_result
 from mindroom.matrix.large_messages import (
     _NORMAL_MESSAGE_LIMIT,
-    _oversized_nonterminal_streaming_edit_sent_at,
+    calculate_event_size,
     prepare_large_message,
+    should_send_oversized_nonterminal_streaming_edit,
 )
 from mindroom.message_target import MessageTarget
 from mindroom.streaming import (
@@ -33,6 +34,7 @@ from mindroom.streaming import (
     send_streaming_response,
 )
 from mindroom.tool_system.events import _TOOL_TRACE_KEY, StructuredStreamChunk, ToolTraceEntry
+from tests.conftest import push_stream_chunk
 
 
 class MockClient:
@@ -257,7 +259,7 @@ async def test_streaming_initial_message_under_limit() -> None:
     )
 
     # Small initial content
-    await streaming.update_content("Hello streaming world", client)
+    await push_stream_chunk(streaming, "Hello streaming world", client)
 
     # Should trigger initial send
     assert len(client.messages_sent) == 1
@@ -335,9 +337,19 @@ async def test_streaming_edit_grows_over_limit() -> None:
 @pytest.mark.asyncio
 async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test streaming with multiple edits as message grows."""
-    _oversized_nonterminal_streaming_edit_sent_at.clear()
-    monotonic_values = iter([100.0, 106.0, 112.0])
-    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: next(monotonic_values))
+    now = {"value": 100.0}
+    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: now["value"])
+    cadence_edits: list[dict[str, object]] = []
+
+    def recording_cadence(*, room_id: str, original_event_id: str, edit_content: dict[str, object]) -> bool:
+        cadence_edits.append(edit_content)
+        return should_send_oversized_nonterminal_streaming_edit(
+            room_id=room_id,
+            original_event_id=original_event_id,
+            edit_content=edit_content,
+        )
+
+    monkeypatch.setattr("mindroom.streaming.should_send_oversized_nonterminal_streaming_edit", recording_cadence)
     client = MockClient()
     config = MockConfig()
 
@@ -361,6 +373,10 @@ async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPa
         is_final = label == "Larger"
 
         await streaming._send_or_edit_message(client, is_final=is_final)
+        if cadence_edits:
+            # Wait out the interval the latest in-progress edit reserved; every
+            # oversized edit exceeds 27 KB, so it always outlasts the 5 s floor.
+            now["value"] += calculate_event_size(cadence_edits[-1]) / 4096
 
         # After first, should have event_id
         if label != "Initial":

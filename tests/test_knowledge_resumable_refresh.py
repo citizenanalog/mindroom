@@ -23,22 +23,21 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 import pytest
 from agno.knowledge.document.base import Document
 from agno.knowledge.embedder.base import Embedder
-from agno.vectordb import chroma as agno_chroma
 from chromadb.errors import InternalError, NotFoundError
 from structlog.testing import capture_logs
 
 import mindroom.knowledge.collections as knowledge_collections_module
 import mindroom.knowledge.manager as knowledge_manager_module
+import mindroom.knowledge.read_proxy as knowledge_read_proxy
 import mindroom.knowledge.registry as knowledge_registry
 from mindroom.config.agent import AgentConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
-from mindroom.embedding_errors import (
+from mindroom.embeddings.errors import (
     EmbedderRequestError,
     embedder_failure_is_transient,
     embedder_retry_after_seconds,
 )
-from mindroom.knowledge import resolve_agent_knowledge_access
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.candidate_checkpoint import (
     CandidateCheckpoint,
@@ -63,7 +62,7 @@ from mindroom.knowledge.index_metadata import write_json_atomic
 from mindroom.knowledge.index_retry import EmbeddingRetryPolicy, run_with_embedding_retry
 from mindroom.knowledge.manager import KnowledgeManager
 from mindroom.knowledge.refresh_outcome import RefreshOutcome
-from mindroom.knowledge.refresh_runner import refresh_knowledge_binding
+from mindroom.knowledge.refresh_runner import _refresh_knowledge_binding as refresh_knowledge_binding
 from mindroom.knowledge.registry import (
     PublishedIndexState,
     get_published_index,
@@ -74,6 +73,7 @@ from mindroom.knowledge.registry import (
     save_published_index_state,
 )
 from mindroom.knowledge.status import get_knowledge_index_status
+from mindroom.knowledge.utils import resolve_agent_knowledge_access
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.knowledge_test_support import chroma_get_result, metadata_matches, validate_where_operands
 
@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     from mindroom.constants import RuntimePaths
+    from mindroom.knowledge.indexing_config import IndexingSettings
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +228,9 @@ class _FakeVectorDb:
         self.embedder = embedder
         self.client = _FakeClient()
 
+    def close(self) -> None:
+        """The in-memory fake has no external resources to release."""
+
     def exists(self) -> bool:
         with self.lock:
             return self.collection_name in self.store
@@ -250,6 +254,19 @@ class _FakeVectorDb:
 
     async def async_search(self, *, query: str, limit: int, filters: object = None) -> list[Document]:
         return self.search(query=query, limit=limit, filters=filters)
+
+
+class _FakeReadProxy(_FakeVectorDb):
+    def __init__(
+        self,
+        *,
+        collection_name: str,
+        path: str,
+        embedder: Embedder,
+        published_settings: IndexingSettings,
+    ) -> None:
+        self.published_settings = published_settings
+        super().__init__(collection=collection_name, path=path, embedder=embedder)
 
 
 class _FakeKnowledge:
@@ -504,7 +521,12 @@ def fake_vector_store(
     monkeypatch.setattr(knowledge_manager_module, "Knowledge", _FakeKnowledge)
     monkeypatch.setattr(knowledge_collections_module, "Knowledge", _FakeKnowledge)
     monkeypatch.setattr(knowledge_manager_module, "create_configured_embedder", lambda *_a, **_k: embedder)
-    monkeypatch.setattr(agno_chroma, "ChromaDb", _FakeVectorDb)
+    monkeypatch.setattr(knowledge_read_proxy, "ChromaReadProxy", _FakeReadProxy)
+    monkeypatch.setattr(
+        knowledge_read_proxy,
+        "collection_exists",
+        lambda _path, collection: _FakeVectorDb(collection=collection).exists(),
+    )
     monkeypatch.setattr(knowledge_registry, "StrictSearchKnowledge", _FakeKnowledge)
     monkeypatch.setattr(knowledge_registry, "create_configured_embedder", lambda *_a, **_k: embedder)
 

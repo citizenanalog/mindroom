@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import nio
 import pytest
 from nio.crypto import OutboundGroupSession
+from nio.crypto.attachments import decrypt_attachment
 
 from mindroom.constants import (
     AI_RUN_METADATA_KEY,
@@ -31,7 +32,8 @@ from mindroom.matrix.large_messages import (
     _SIDECAR_UPLOAD_FALLBACK_INDICATOR,
     _calculate_delivery_event_size,
     _create_preview,
-    _oversized_nonterminal_streaming_edit_sent_at,
+    _oversized_nonterminal_streaming_edit_next_allowed_at,
+    _upload_text_as_mxc,
     calculate_event_size,
     is_edit_message,
     prepare_large_message,
@@ -40,6 +42,7 @@ from mindroom.matrix.large_messages import (
 from mindroom.matrix.media import parse_matrix_media_event_source
 from mindroom.matrix.message_content import extract_and_resolve_message
 from mindroom.tool_system.events import _TOOL_TRACE_KEY
+from tests.conftest import TEST_ACCESS_TOKEN, FakeMediaResponse, serve_media_download
 
 _SIDECAR_UPLOAD_FALLBACK_TEXT = _SIDECAR_UPLOAD_FALLBACK_INDICATOR.strip()
 
@@ -65,6 +68,66 @@ class _UploadClient:
 
 def _large_text_content(prefix: str) -> dict[str, str]:
     return {"body": prefix + ("x" * 100000), "msgtype": "m.text"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", [False, True])
+@pytest.mark.parametrize(
+    ("mimetype", "filename"),
+    [("text/plain", "message.txt"), ("text/html", "message.html"), ("application/json", "message-content.json")],
+)
+async def test_text_upload_preserves_bytes_and_metadata(encrypted: bool, mimetype: str, filename: str) -> None:
+    """Sidecars retain plaintext size and type while uploading decryptable bytes under the right name."""
+    client = MagicMock(spec=nio.AsyncClient)
+    client.upload.return_value = (nio.UploadResponse("mxc://server/sidecar"), None)
+    text = "Sidecar with UTF-8: café"
+
+    uri, info = await _upload_text_as_mxc(client, text, mimetype=mimetype, room_encrypted=encrypted)
+
+    assert uri == "mxc://server/sidecar"
+    assert info is not None
+    assert info["url"] == uri
+    assert info["size"] == len(text.encode())
+    assert info["mimetype"] == mimetype
+    kwargs = client.upload.call_args.kwargs
+    uploaded = kwargs["data_provider"](None, None).read()
+    assert kwargs["filesize"] == len(uploaded)
+    assert kwargs["filename"] == (f"{filename}.enc" if encrypted else filename)
+    assert kwargs["content_type"] == ("application/octet-stream" if encrypted else mimetype)
+    if encrypted:
+        assert uploaded != text.encode()
+        assert info["v"] == "v2"
+        assert (
+            decrypt_attachment(
+                uploaded,
+                info["key"]["k"],
+                info["hashes"]["sha256"],
+                info["iv"],
+            )
+            == text.encode()
+        )
+    else:
+        assert uploaded == text.encode()
+        assert set(info) == {"url", "size", "mimetype"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ["key", "iv", "hashes"])
+async def test_text_upload_rejects_incomplete_encryption_metadata(missing_field: str) -> None:
+    """Sidecars handle malformed SDK metadata as an encryption failure before uploading."""
+    client = _UploadClient(nio.UploadResponse("mxc://server/sidecar"))
+    encryption = {
+        "v": "v2",
+        "key": {"kty": "oct", "alg": "A256CTR", "ext": True, "k": "key", "key_ops": ["encrypt", "decrypt"]},
+        "iv": "iv",
+        "hashes": {"sha256": "hash"},
+    }
+    del encryption[missing_field]
+
+    with patch("mindroom.matrix.media.crypto.attachments.encrypt_attachment", return_value=(b"encrypted", encryption)):
+        assert await _upload_text_as_mxc(client, "secret", room_encrypted=True) == (None, None)
+
+    assert client.uploaded_data is None
 
 
 def _actual_encrypted_event_size(
@@ -228,42 +291,68 @@ def test_is_edit_message() -> None:
     assert is_edit_message(edit2)
 
 
+def _oversized_edit_content(original_event_id: str, body: str) -> dict[str, object]:
+    return {
+        "body": f"* {body}",
+        "m.new_content": {
+            "body": body,
+            "msgtype": "m.text",
+            STREAM_STATUS_KEY: STREAM_STATUS_STREAMING,
+        },
+        "m.relates_to": {"rel_type": "m.replace", "event_id": original_event_id},
+        "msgtype": "m.text",
+    }
+
+
 def test_oversized_nonterminal_streaming_edit_rate_limit_prunes_expired_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Oversized streaming-edit rate state should not retain old streams forever."""
-    _oversized_nonterminal_streaming_edit_sent_at.clear()
     body = "x" * 40000
-
-    def oversized_edit_content(original_event_id: str) -> dict[str, object]:
-        return {
-            "body": f"* {body}",
-            "m.new_content": {
-                "body": body,
-                "msgtype": "m.text",
-                STREAM_STATUS_KEY: STREAM_STATUS_STREAMING,
-            },
-            "m.relates_to": {"rel_type": "m.replace", "event_id": original_event_id},
-            "msgtype": "m.text",
-        }
-
-    monotonic_values = iter([100.0, 106.0])
+    interval = max(5.0, calculate_event_size(_oversized_edit_content("$old", body)) / 4096)
+    monotonic_values = iter([100.0, 100.0 + interval])
     monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: next(monotonic_values))
 
     assert should_send_oversized_nonterminal_streaming_edit(
         room_id="!room:server",
         original_event_id="$old",
-        edit_content=oversized_edit_content("$old"),
+        edit_content=_oversized_edit_content("$old", body),
     )
-    assert _oversized_nonterminal_streaming_edit_sent_at == {("!room:server", "$old"): 100.0}
+    assert _oversized_nonterminal_streaming_edit_next_allowed_at == {("!room:server", "$old"): 100.0 + interval}
 
     assert should_send_oversized_nonterminal_streaming_edit(
         room_id="!room:server",
         original_event_id="$new",
-        edit_content=oversized_edit_content("$new"),
+        edit_content=_oversized_edit_content("$new", body),
     )
 
-    assert _oversized_nonterminal_streaming_edit_sent_at == {("!room:server", "$new"): 106.0}
+    assert _oversized_nonterminal_streaming_edit_next_allowed_at == {
+        ("!room:server", "$new"): 100.0 + 2 * interval,
+    }
+
+
+def test_oversized_nonterminal_streaming_edit_interval_grows_with_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Large in-progress edits upload sidecars at a bounded average byte rate."""
+    edit = _oversized_edit_content("$big", "x" * 1_000_000)
+    expected_interval = calculate_event_size(edit) / 4096
+    assert expected_interval > 200
+    now = {"value": 1000.0}
+    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: now["value"])
+
+    def allowed() -> bool:
+        return should_send_oversized_nonterminal_streaming_edit(
+            room_id="!room:server",
+            original_event_id="$big",
+            edit_content=edit,
+        )
+
+    assert allowed()
+    now["value"] = 1000.0 + 6.0
+    assert not allowed()
+    now["value"] = 1000.0 + expected_interval - 1.0
+    assert not allowed()
+    now["value"] = 1000.0 + expected_interval + 0.001
+    assert allowed()
 
 
 def test__create_preview() -> None:
@@ -1357,6 +1446,7 @@ async def test_prepare_large_message_trusted_metadata_round_trips_through_sideca
         rooms: dict = {}  # noqa: RUF012
         uploaded_data: bytes | None = None
         user_id = "@mindroom_agent:localhost"
+        access_token = TEST_ACCESS_TOKEN
 
         async def upload(self, **kwargs) -> tuple:  # noqa: ANN003
             data_provider = kwargs.get("data_provider")
@@ -1372,6 +1462,9 @@ async def test_prepare_large_message_trusted_metadata_round_trips_through_sideca
             response = MagicMock(spec=nio.DownloadResponse)
             response.body = self.uploaded_data
             return response
+
+        async def send(self, _method: str, path: str, *_args: object, **_kwargs: object) -> FakeMediaResponse:
+            return await serve_media_download(self.download, path)
 
     client = MockClient()
     content = {

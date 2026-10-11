@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from authlib.integrations.httpx_client import AsyncOAuth2Client
 
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials import manager as credentials_module
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.oauth.google import (
     _GOOGLE_PROVISIONED_CLIENT_FETCHED_AT_KEY,
     _GOOGLE_PROVISIONED_CLIENT_TTL_SECONDS,
@@ -20,10 +24,16 @@ from mindroom.oauth.google import (
     _google_token_parser,
 )
 from mindroom.oauth.google_calendar import _GOOGLE_CALENDAR_OAUTH_SCOPES, google_calendar_oauth_provider
+from mindroom.oauth.google_cloud import (
+    _GOOGLE_CLOUD_OAUTH_SCOPES,
+    _GOOGLE_CLOUD_READ_ONLY_SCOPE,
+    google_cloud_oauth_provider,
+)
 from mindroom.oauth.google_docs import _GOOGLE_DOCS_OAUTH_SCOPES, google_docs_oauth_provider
 from mindroom.oauth.google_drive import _GOOGLE_DRIVE_OAUTH_SCOPES, google_drive_oauth_provider
 from mindroom.oauth.google_gmail import _GOOGLE_GMAIL_OAUTH_SCOPES, google_gmail_oauth_provider
 from mindroom.oauth.google_sheets import _GOOGLE_SHEETS_OAUTH_SCOPES, google_sheets_oauth_provider
+from mindroom.oauth.google_tasks import _GOOGLE_TASKS_OAUTH_SCOPES, google_tasks_oauth_provider
 from mindroom.oauth.providers import (
     RUNTIME_BOOTSTRAPPED_CLIENT_CONFIG_KEY,
     OAuthClientConfig,
@@ -33,12 +43,15 @@ from mindroom.oauth.providers import (
     oauth_connection_required_payload,
 )
 from mindroom.oauth.service import build_oauth_connect_instruction, build_oauth_reconnect_instruction
+from tests.oauth_test_utils import oauth_authorization_url
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+    from typing import Any
 
     from mindroom.constants import RuntimePaths
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth.providers import OAuthProvider
 
 GOOGLE_AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -84,6 +97,18 @@ def test_terminal_oauth_refresh_error_classification(value: object, expected: bo
                 "tool_config_service": "google_calendar",
                 "client_config_services": ("google_calendar_oauth_client",),
                 "status_capabilities": ("Calendar event read/write",),
+            },
+        ),
+        (
+            google_cloud_oauth_provider(),
+            {
+                "id": "google_cloud",
+                "display_name": "Google Cloud",
+                "scopes": _GOOGLE_CLOUD_OAUTH_SCOPES,
+                "credential_service": "google_cloud_oauth",
+                "tool_config_service": None,
+                "client_config_services": ("google_cloud_oauth_client",),
+                "status_capabilities": ("Read-only Google Cloud API access",),
             },
         ),
         (
@@ -134,6 +159,18 @@ def test_terminal_oauth_refresh_error_classification(value: object, expected: bo
                 "status_capabilities": ("Sheets read/write",),
             },
         ),
+        (
+            google_tasks_oauth_provider(),
+            {
+                "id": "google_tasks",
+                "display_name": "Google Tasks",
+                "scopes": _GOOGLE_TASKS_OAUTH_SCOPES,
+                "credential_service": "google_tasks_oauth",
+                "tool_config_service": "google_tasks",
+                "client_config_services": ("google_tasks_oauth_client",),
+                "status_capabilities": ("Tasks read/write",),
+            },
+        ),
     ],
 )
 def test_public_google_oauth_providers_preserve_service_specific_fields(
@@ -167,16 +204,167 @@ def test_google_providers_request_minimum_functionality_preserving_scopes() -> N
         *GOOGLE_IDENTITY_SCOPES,
         "https://www.googleapis.com/auth/documents",
     )
+    assert google_tasks_oauth_provider().scopes == (
+        *GOOGLE_IDENTITY_SCOPES,
+        "https://www.googleapis.com/auth/tasks",
+    )
+
+
+def test_google_cloud_provider_requests_only_read_only_cloud_and_identity_scopes() -> None:
+    """Google Cloud asks only for identity plus the read-only cloud-platform scope."""
+    provider = google_cloud_oauth_provider()
+
+    assert provider.id == "google_cloud"
+    assert provider.display_name == "Google Cloud"
+    assert provider.scopes == (*GOOGLE_IDENTITY_SCOPES, _GOOGLE_CLOUD_READ_ONLY_SCOPE)
+    assert provider.scopes == _GOOGLE_CLOUD_OAUTH_SCOPES
+    assert _GOOGLE_CLOUD_READ_ONLY_SCOPE == "https://www.googleapis.com/auth/cloud-platform.read-only"
+    assert provider.credential_service == "google_cloud_oauth"
+    assert provider.tool_config_service is None
+    assert provider.client_config_services == ("google_cloud_oauth_client",)
+    assert provider.shared_client_config_services == ("google_oauth_client",)
+    assert provider.extra_auth_params == GOOGLE_NARROW_EXTRA_AUTH_PARAMS
+
+
+@pytest.mark.parametrize("scope_field", ["scopes", "scope"])
+@pytest.mark.parametrize(
+    ("requested_scope", "response_scope", "expected_scope"),
+    [
+        (None, None, None),
+        (
+            None,
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.readonly",
+        ),
+        ("openid", None, "openid"),
+        (
+            "openid",
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.readonly",
+        ),
+    ],
+)
+def test_calendar_refresh_preserves_grant_without_requesting_new_scopes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_scope: str | None,
+    response_scope: str | None,
+    expected_scope: str | None,
+    scope_field: str,
+) -> None:
+    """Refreshing an older broad grant must not request newly configured scopes."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={},
+    )
+    get_runtime_credentials_manager(runtime_paths).save_credentials(
+        "google_oauth_client",
+        {"client_id": "client-id", "client_secret": PROVISIONED_CLIENT_SECRET},
+    )
+    provider = replace(
+        google_calendar_oauth_provider(),
+        extra_token_params={"scope": requested_scope} if requested_scope is not None else {},
+    )
+    granted_scopes = [*GOOGLE_IDENTITY_SCOPES, "https://www.googleapis.com/auth/calendar"]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response: dict[str, object] = {"access_token": "new-access-token", "expires_in": 3600}
+        if response_scope is not None:
+            response["scope"] = response_scope
+        return httpx.Response(200, json=response)
+
+    def client_factory(**kwargs: object) -> AsyncOAuth2Client:
+        return AsyncOAuth2Client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("authlib.integrations.httpx_client.AsyncOAuth2Client", client_factory)
+    refreshed = asyncio.run(
+        provider.refresh_token_data(
+            {
+                "token": "old-access-token",
+                "refresh_token": "refresh-token",
+                "token_uri": GOOGLE_TOKEN_URL,
+                "client_id": "client-id",
+                "expires_at": 1.0,
+                scope_field: granted_scopes if scope_field == "scopes" else " ".join(granted_scopes),
+                "_oauth_claims": {"email": "alice@example.test", "email_verified": True, "sub": "subject-1"},
+                "_oauth_claims_verified": True,
+            },
+            runtime_paths,
+        ),
+    )
+
+    assert len(requests) == 1
+    assert requests[0].url == GOOGLE_TOKEN_URL
+    body = parse_qs(requests[0].content.decode(), keep_blank_values=True)
+    assert body["grant_type"] == ["refresh_token"]
+    if requested_scope is None:
+        assert "scope" not in body
+    else:
+        assert body["scope"] == [requested_scope]
+    assert refreshed is not None
+    assert refreshed["refresh_token"] == "refresh-token"  # noqa: S105
+    assert refreshed["scopes"] == (granted_scopes if expected_scope is None else expected_scope.split())
+
+
+def test_google_exchange_defaults_to_requested_scopes_when_response_omits_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initial authorization retains configured scopes when Google omits scope."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={},
+    )
+    get_runtime_credentials_manager(runtime_paths).save_credentials(
+        "google_oauth_client",
+        {"client_id": "client-id", "client_secret": PROVISIONED_CLIENT_SECRET},
+    )
+    provider = google_calendar_oauth_provider()
+
+    def client_factory(**kwargs: object) -> AsyncOAuth2Client:
+        assert kwargs["scope"] == provider.scopes
+        return AsyncOAuth2Client(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    200,
+                    json={"access_token": "access-token", "id_token": "identity-token"},
+                ),
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr("authlib.integrations.httpx_client.AsyncOAuth2Client", client_factory)
+    monkeypatch.setattr(
+        "google.oauth2.id_token.verify_oauth2_token",
+        lambda *_args: {"email": "alice@example.test", "email_verified": True, "sub": "subject-1"},
+    )
+
+    result = asyncio.run(
+        provider.exchange_code(
+            "auth-code",
+            runtime_paths,
+            token_url=provider.token_url,
+            code_verifier="pkce-verifier",
+        ),
+    )
+
+    assert result.token_data["scopes"] == list(provider.scopes)
 
 
 @pytest.mark.parametrize(
     "provider",
     [
         google_calendar_oauth_provider(),
+        google_cloud_oauth_provider(),
         google_docs_oauth_provider(),
         google_drive_oauth_provider(),
         google_gmail_oauth_provider(),
         google_sheets_oauth_provider(),
+        google_tasks_oauth_provider(),
     ],
 )
 def test_public_google_oauth_providers_preserve_shared_google_oauth_fields(provider: OAuthProvider) -> None:
@@ -194,7 +382,11 @@ def test_public_google_oauth_providers_preserve_shared_google_oauth_fields(provi
         f"{provider_prefix}_ALLOWED_HOSTED_DOMAINS",
         f"MINDROOM_OAUTH_{provider_prefix}_ALLOWED_HOSTED_DOMAINS",
     )
-    expected_auth_params = GOOGLE_NARROW_EXTRA_AUTH_PARAMS if provider.id == "google_docs" else GOOGLE_EXTRA_AUTH_PARAMS
+    expected_auth_params = (
+        GOOGLE_NARROW_EXTRA_AUTH_PARAMS
+        if provider.id in {"google_cloud", "google_docs", "google_tasks"}
+        else GOOGLE_EXTRA_AUTH_PARAMS
+    )
     assert provider.extra_auth_params == expected_auth_params
     assert provider.pkce_code_challenge_method == "S256"
     assert provider.runtime_bootstrapper is _google_runtime_bootstrapper
@@ -264,8 +456,8 @@ def test_google_token_parser_bounds_identity_certificate_fetch(
         request("https://www.googleapis.com/oauth2/v1/certs", method="GET")
         return {"sub": "subject-1", "email": "alice@example.com", "email_verified": True}
 
-    monkeypatch.setattr("mindroom.oauth.google.GoogleRequest", _Request)
-    monkeypatch.setattr("mindroom.oauth.google.google_id_token.verify_oauth2_token", verify_token)
+    monkeypatch.setattr("google.auth.transport.requests.Request", _Request)
+    monkeypatch.setattr("google.oauth2.id_token.verify_oauth2_token", verify_token)
     provider = google_drive_oauth_provider()
     runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
 
@@ -328,6 +520,115 @@ def _paired_runtime_paths(tmp_path: Path) -> RuntimePaths:
             "MINDROOM_LOCAL_CLIENT_SECRET": "local-secret",
         },
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("custom_client", "observed_operation"),
+    [(True, "read"), (False, "read"), (False, "manager"), (False, "save")],
+    ids=["custom-read", "provisioned-read", "provisioned-manager", "provisioned-save"],
+)
+async def test_google_bootstrap_client_storage_stays_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    custom_client: bool,
+    observed_operation: str,
+) -> None:
+    """Custom config reads and provisioned config reads/writes leave the owner loop free."""
+    owner_thread = threading.get_ident()
+    requests = _install_provisioning_transport(monkeypatch)
+    runtime_paths = _paired_runtime_paths(tmp_path)
+    manager = get_runtime_credentials_manager(runtime_paths)
+    service = "google_drive_oauth_client" if custom_client else "google_oauth_client"
+    manager.save_credentials(
+        service,
+        {
+            "client_id": "previous-client.apps.googleusercontent.com",
+            "client_secret": "previous-secret",
+            RUNTIME_BOOTSTRAPPED_CLIENT_CONFIG_KEY: not custom_client,
+            _GOOGLE_PROVISIONED_CLIENT_FETCHED_AT_KEY: 0.0,
+        },
+    )
+    client_path = manager.get_credentials_path(service)
+    original_read = credentials_module._read_credentials_payload
+    original_save = manager.save_credentials
+    operations: set[str] = set()
+
+    def observed_read(path: Path) -> bytes | None:
+        if path == client_path:
+            assert threading.get_ident() != owner_thread, "Google client read blocked the event loop"
+            operations.add("read")
+        return original_read(path)
+
+    def observed_manager(paths: RuntimePaths) -> CredentialsManager:
+        assert threading.get_ident() != owner_thread, "Google client path resolution blocked the event loop"
+        operations.add("manager")
+        return get_runtime_credentials_manager(paths)
+
+    def observed_save(saved_service: str, credentials: dict[str, Any]) -> None:
+        assert threading.get_ident() != owner_thread, "Google client write blocked the event loop"
+        operations.add("save")
+        original_save(saved_service, credentials)
+
+    with monkeypatch.context() as storage_patch:
+        if observed_operation == "read":
+            storage_patch.setattr(credentials_module, "_read_credentials_payload", observed_read)
+        elif observed_operation == "manager":
+            storage_patch.setattr("mindroom.oauth.google.get_runtime_credentials_manager", observed_manager)
+        else:
+            storage_patch.setattr(manager, "save_credentials", observed_save)
+        endpoints = await google_drive_oauth_provider().runtime_endpoints(runtime_paths)
+
+    assert operations == {observed_operation}
+    assert endpoints.authorization_url == GOOGLE_AUTHORIZATION_URL
+    assert endpoints.token_url == GOOGLE_TOKEN_URL
+    stored = manager.load_credentials(service)
+    assert stored is not None
+    if custom_client:
+        assert stored["client_id"] == "previous-client.apps.googleusercontent.com"
+        assert requests == []
+    else:
+        assert stored["client_id"] == PROVISIONED_CLIENT_ID
+        assert stored["client_secret"] == PROVISIONED_CLIENT_SECRET
+        assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_google_bootstrap_drains_client_publication_before_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated cancellation cannot abandon an accepted client-config publication."""
+    _install_provisioning_transport(monkeypatch)
+    runtime_paths = _paired_runtime_paths(tmp_path)
+    manager = get_runtime_credentials_manager(runtime_paths)
+    original_save = manager.save_credentials
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_save(service: str, credentials: dict[str, Any]) -> None:
+        entered.set()
+        assert release.wait(5), "Client publication gate was not released"
+        original_save(service, credentials)
+
+    monkeypatch.setattr(manager, "save_credentials", blocked_save)
+    bootstrap = asyncio.create_task(google_drive_oauth_provider().runtime_endpoints(runtime_paths))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        bootstrap.cancel()
+        await asyncio.sleep(0)
+        bootstrap.cancel()
+        await asyncio.sleep(0)
+        assert not bootstrap.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await bootstrap
+
+    stored = manager.load_credentials("google_oauth_client")
+    assert stored is not None
+    assert stored["client_id"] == PROVISIONED_CLIENT_ID
+    assert stored["client_secret"] == PROVISIONED_CLIENT_SECRET
 
 
 def test_google_oauth_provider_bootstraps_client_for_paired_install(
@@ -488,7 +789,8 @@ def test_google_oauth_provider_bootstrapped_client_authorization_uses_pkce(
     assert code_verifier is not None
 
     auth_url = asyncio.run(
-        provider.authorization_uri_async(
+        oauth_authorization_url(
+            provider,
             runtime_paths,
             state="test-state",
             code_verifier=code_verifier,

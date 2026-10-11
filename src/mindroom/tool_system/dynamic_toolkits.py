@@ -177,7 +177,7 @@ def _special_tool_names(
     tool_names: list[str] = []
 
     if agent_config.delegate_to:
-        from mindroom.custom_tools.delegate import MAX_DELEGATION_DEPTH  # noqa: PLC0415
+        from mindroom.delegation.lifecycle import MAX_DELEGATION_DEPTH  # noqa: PLC0415
 
         if delegation_depth < MAX_DELEGATION_DEPTH:
             tool_names.append("delegate")
@@ -189,6 +189,11 @@ def _special_tool_names(
     )
     if allow_self_config:
         tool_names.append("self_config")
+
+    if agent_config.skill_learning.enabled:
+        # Like Hermes, an agent that learns skills can also save them in chat, and its skill review can only call
+        # tools the agent's own request offered.
+        tool_names.append("skill_manage")
 
     if enable_dynamic_tools_manager and has_deferred_tools(config, agent_name):
         tool_names.append("dynamic_tools")
@@ -583,21 +588,3 @@ def deferred_tool_catalog_entries(
             ),
         )
     return entries
-
-
-def resolve_dynamic_tool_selection(
-    *,
-    agent_name: str,
-    config: Config,
-    session_id: str | None,
-    delegation_depth: int = 0,
-    include_matrix_room_runtime_tools: bool = False,
-) -> VisibleToolSurface:
-    """Return the current loaded tools and final runtime tool selection for one session."""
-    return visible_tool_surface(
-        agent_name=agent_name,
-        config=config,
-        session_id=session_id,
-        delegation_depth=delegation_depth,
-        include_matrix_room_runtime_tools=include_matrix_room_runtime_tools,
-    )

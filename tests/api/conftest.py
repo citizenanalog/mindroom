@@ -23,6 +23,7 @@ def trusted_upstream_headers(
 ) -> dict[str, str]:
     """Return trusted-upstream auth headers for API tests."""
     return {
+        "Origin": "http://testserver",
         "X-Trusted-User": user_id,
         "X-Trusted-Email": email,
         "X-Trusted-Matrix-User": matrix_user_id,
@@ -93,7 +94,7 @@ def test_client(temp_config_file: Path) -> TestClient:
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
 
     # Create test client
-    return TestClient(main.app)
+    return TestClient(main.app, base_url="http://localhost")
 
 
 @pytest.fixture

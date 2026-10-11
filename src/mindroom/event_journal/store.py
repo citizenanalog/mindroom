@@ -8,33 +8,43 @@ rather than something it is trusted not to do.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from itertools import batched
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from mindroom.history_recovery import (
+from mindroom import reply_lifecycle as rl
+from mindroom.event_journal.history_recovery import (
     HistoryRecoveryOutcome,
     RoomHistoryRecovery,
 )
+from mindroom.tool_approval_grants import ApprovalGrant, ApprovalGrantRevocation  # noqa: TC001
 
 from . import (
     approval_continuations,
+    approval_grants,
     approvals,
     background_approvals,
     interactive_questions,
     journal,
+    legacy_turn_records,
     membership_hooks,
     outbox,
     reads,
+    replies,
+    reply_messages,
+    reply_spans,
+    scheduled_approvals,
     turn_records,
 )
 from .approval_card_state import (  # noqa: TC001 - part of this module's runtime return types
     ApprovalCardReservation,
+    ApprovalDecisionMetadata,
     RecordedApprovalDecision,
 )
-from .approval_continuations import (  # noqa: TC001 - runtime return and input types
-    ApprovalCall,
+from .approval_continuations import (
+    ApprovalAdvance,
     ApprovalContinuation,
     ApprovalContinuationState,
 )
@@ -51,15 +61,40 @@ from .models import (
     DeliveryStage,
     IngestionConsumer,
     IngestionConsumerBindingError,
+    PermanentDeliveryFailure,
+    ReplyRowFacts,
     ResponseRecoveryState,
 )
-from .projection import discard_delivery_event, drop_refetched_message, install_refetched_revision, project
+from .projection import (
+    discard_delivery_event,
+    drop_refetched_message,
+    install_refetched_revision,
+    project,
+    tombstoned_event_ids,
+)
+from .replies import (
+    AppliedTransition,
+    PostCommitEffect,
+    PreparedReplyRow,
+    ReplyRowEnqueue,
+    ReplyRowRequest,
+    ReplyStore,
+)
+from .scheduled_approvals import (  # noqa: TC001
+    ScheduledApprovalArmState,
+    ScheduledCall,
+    ScheduledCallBinding,
+    ScheduledCallClaim,
+    ScheduledCallOutcome,
+    ScheduledCallRefusal,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
     from mindroom.interactive_models import InteractivePrompt
+    from mindroom.turn_record import TurnRecord
 
     from .backend import Backend, Transaction
     from .interactive_questions import InteractiveSelection
@@ -188,6 +223,7 @@ class PrincipalStore:
         self,
         *,
         limit: int = _DEFAULT_PENDING_LIMIT,
+        room_id: str | None = None,
         after_receipt_order: int | None = None,
         runtime_generation: str = "unmanaged",
     ) -> PendingPage:
@@ -197,6 +233,7 @@ class PrincipalStore:
                 transaction,
                 self._principal_id,
                 limit=limit,
+                room_id=room_id,
                 after_receipt_order=after_receipt_order,
                 runtime_generation=runtime_generation,
             ),
@@ -217,18 +254,25 @@ class PrincipalStore:
     async def response_recovery_state(
         self,
         *,
-        source_event_ids: tuple[str, ...],
-        turn_id: str | None,
+        turn_record: TurnRecord,
+        agent_name: str,
+        redaction_target: Callable[[JournalEvent], str | None],
     ) -> ResponseRecoveryState:
         """Read one response's durable handoff through the reserved recovery lane."""
 
         def load(transaction: Transaction) -> ResponseRecoveryState:
+            source_event_ids = turn_record.source_event_ids
+            turn_id = turn_record.anchor_event_id
+            records = {
+                event_id: turn_records.load_record(transaction, agent_name, event_id)
+                for event_id in turn_record.indexed_event_ids
+            }
             pending = tuple(
                 journal.is_pending(transaction, self._principal_id, event_id) for event_id in source_event_ids
             )
             delivery = (
                 None
-                if any(pending) or turn_id is None
+                if turn_id is None
                 else outbox.load(
                     transaction,
                     self._principal_id,
@@ -238,11 +282,25 @@ class PrincipalStore:
             )
             return ResponseRecoveryState(
                 pending_sources=pending,
+                redacted_sources=tuple(
+                    not is_pending
+                    and journal.source_has_redaction_handoff(
+                        transaction,
+                        self._principal_id,
+                        event_id,
+                        turn_record,
+                        records.get(event_id),
+                        redaction_target,
+                    )
+                    for event_id, is_pending in zip(source_event_ids, pending, strict=True)
+                ),
+                turn_records=tuple(records.values()),
                 final_delivery=delivery,
                 sources_settled_by_departure=(
                     not any(pending)
                     and journal.sources_settled_by_departure(transaction, self._principal_id, source_event_ids)
                 ),
+                reply=reply_messages.for_sources(transaction, self._principal_id, source_event_ids),
             )
 
         return await self._backend.recovery_read(load)
@@ -265,18 +323,21 @@ class PrincipalStore:
             lambda transaction: membership_hooks.mark_completed(transaction, self._principal_id, room_id, user_id),
         )
 
-    async def settle(self, event_id: str) -> None:
-        """Mark one event's semantic work terminal."""
-        await self._backend.write(
-            lambda transaction: journal.settle(transaction, self._principal_id, event_id),
-        )
+    async def settle(self, event_id: str) -> tuple[str, ...]:
+        """Mark one event's semantic work terminal; return the replies that ends, as ``settle_many`` does."""
+        return await self.settle_many((event_id,))
 
-    async def settle_many(self, event_ids: tuple[str, ...]) -> None:
-        """Settle every event that one terminal turn accounted for."""
+    async def settle_many(self, event_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """Settle every event that one terminal turn accounted for; return the replies that ends.
+
+        A reply an earlier span left waiting to replay these sources ends in
+        the same commit, since nothing replays them any more; what it owes
+        Matrix is its caller's to deliver.
+        """
         if not event_ids:
-            return
-        await self._backend.write(
-            lambda transaction: journal.settle_many(transaction, self._principal_id, event_ids),
+            return ()
+        return await self._backend.write(
+            lambda transaction: _settle_turn_sources(transaction, self._principal_id, event_ids),
         )
 
     async def unsettled_event_ids(self) -> frozenset[str]:
@@ -419,6 +480,16 @@ class PrincipalStore:
             ),
         )
 
+    async def redacted_event_ids(self, room_id: str, event_ids: tuple[str, ...]) -> frozenset[str]:
+        """Read recorded context tombstones in one transaction and one offload."""
+        return await self._backend.read(
+            lambda transaction: frozenset(
+                event_id
+                for batch in batched(event_ids, 256)
+                for event_id in tombstoned_event_ids(transaction, self._principal_id, room_id, batch)
+            ),
+        )
+
     async def read_conversation(
         self,
         *,
@@ -436,6 +507,28 @@ class PrincipalStore:
                 thread_id=thread_id,
                 limit=limit,
                 before=before,
+            ),
+        )
+
+    async def later_message_exists(
+        self,
+        *,
+        room_id: str,
+        thread_id: str | None,
+        source_event_ids: tuple[str, ...],
+        excluded_senders: frozenset[str],
+        whole_room: bool = False,
+    ) -> bool:
+        """Return whether someone outside ``excluded_senders`` wrote in the conversation after these sources."""
+        return await self._backend.read(
+            lambda transaction: reads.later_message_exists(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                thread_id=thread_id,
+                source_event_ids=source_event_ids,
+                excluded_senders=excluded_senders,
+                whole_room=whole_room,
             ),
         )
 
@@ -594,16 +687,26 @@ class PrincipalStore:
         recovery: RoomHistoryRecovery,
         *,
         exhausted_server: bool,
+        unreadable: bool,
         attempted_policy_rank: int,
         expected_membership_epoch: int,
     ) -> HistoryRecoveryOutcome:
-        """Publish an installed recovery and settle its exact obligation once."""
+        """Publish an installed recovery and settle its exact obligation once.
+
+        ``exhausted_server`` alone decides the obligation, because a walk that
+        reached the start of the room fetched everything the gap skipped.
+        ``unreadable`` says some of it could not be read, which no marker in
+        the room can vouch for, so a repaired settlement records the room
+        conversation as incomplete and revokes every thread's marker for that
+        thread's own walk to settle again.
+        """
         return await self._backend.write(
             lambda transaction: _settle_history_recovery(
                 transaction,
                 self._principal_id,
                 recovery,
                 exhausted_server=exhausted_server,
+                unreadable=unreadable,
                 attempted_policy_rank=attempted_policy_rank,
                 expected_membership_epoch=expected_membership_epoch,
             ),
@@ -618,8 +721,8 @@ class PrincipalStore:
         revision_sender: str,
         revision_transaction_id: str | None = None,
         content: Mapping[str, object],
-    ) -> bool:
-        """Install a point-refetched revision if its refresh token still holds."""
+    ) -> int | None:
+        """Install a point-refetched revision if its refresh token still holds, returning its stored size."""
         return await self._backend.write(
             lambda transaction: install_refetched_revision(
                 transaction,
@@ -697,6 +800,35 @@ class PrincipalStore:
             ),
         )
 
+    async def enqueue_reply_row(self, request: ReplyRowRequest, prepared: PreparedReplyRow) -> ReplyRowEnqueue | None:
+        """Decide and record one durable write of an agent or team reply.
+
+        ``None`` means the outbox refused the row (the membership that owns
+        the reply has ended), and nothing the rule decided was written.
+        """
+        try:
+            return await self._backend.write(
+                lambda transaction: _enqueue_reply_row(transaction, self._principal_id, request, prepared),
+            )
+        except _ReplyRowRefusedError:
+            return None
+
+    async def unresolved_reply_rows(
+        self,
+        reply_id: str,
+        *,
+        before_sequence: int | None = None,
+    ) -> tuple[tuple[str, DeliveryStage], ...]:
+        """Return a reply's rows whose Matrix outcome is unknown, in write order."""
+        return await self._backend.read(
+            lambda transaction: outbox.unresolved_reply_rows(
+                transaction,
+                self._principal_id,
+                reply_id,
+                before_sequence=before_sequence,
+            ),
+        )
+
     async def turn_membership_is_current(self, *, turn_id: str, room_id: str) -> bool:
         """Return whether a turn still speaks for the room's current membership."""
         return await self._backend.read(
@@ -744,17 +876,6 @@ class PrincipalStore:
             ),
         )
 
-    async def owns_matrix_response(self, *, room_id: str, event_id: str) -> bool:
-        """Return whether this journal owns the response in the current room membership."""
-        return await self._backend.read(
-            lambda transaction: outbox.owns_response(
-                transaction,
-                self._principal_id,
-                room_id=room_id,
-                event_id=event_id,
-            ),
-        )
-
     async def load_matrix_delivery(self, *, delivery_id: str, stage: DeliveryStage) -> MatrixDelivery | None:
         """Return one delivery without claiming it."""
         return await self._backend.read(
@@ -772,17 +893,30 @@ class PrincipalStore:
         delivery_id: str,
         stage: DeliveryStage,
         reason: str,
-    ) -> str | None:
-        """Stop retrying one definitively refused immutable payload, or return its ACK."""
-        return await self._backend.write(
-            lambda transaction: outbox.record_permanent_failure(
+    ) -> PermanentDeliveryFailure:
+        """Stop retrying one definitively refused immutable payload, or report its ACK.
+
+        Reply rows this refusal fails, including rows waiting on a refused
+        create, apply their reply's rule in the same transaction.
+        """
+
+        def record(transaction: Transaction) -> PermanentDeliveryFailure:
+            failed_rows, acknowledged = outbox.record_permanent_failure(
                 transaction,
                 self._principal_id,
                 delivery_id=delivery_id,
                 stage=stage,
                 reason=reason,
-            ),
-        )
+            )
+            effects: list[PostCommitEffect] = []
+            for failed_id, failed_stage in failed_rows:
+                delivery = outbox.load(transaction, self._principal_id, delivery_id=failed_id, stage=failed_stage)
+                applied = None if delivery is None else replies.fail_row(transaction, self._principal_id, delivery)
+                if applied is not None:
+                    effects.extend(applied.post_commit)
+            return PermanentDeliveryFailure(acknowledged_event_id=acknowledged, reply_effects=tuple(effects))
+
+        return await self._backend.write(record)
 
     async def retire_matrix_delivery(
         self,
@@ -888,14 +1022,11 @@ class PrincipalStore:
             # either. The row already names another event, and a terminal
             # record pointing somewhere else is the disagreement this whole
             # transaction exists to prevent.
-            if bound and terminal_turn is not None:
-                turn_records.upsert(
-                    transaction,
-                    terminal_turn.agent_name,
-                    index_event_ids=terminal_turn.index_event_ids,
-                    anchor_event_id=terminal_turn.anchor_event_id,
-                    record_json=terminal_turn.record_json,
-                )
+            committed_terminal = (
+                turn_records.commit_terminal(transaction, terminal_turn)
+                if bound and may_project and terminal_turn is not None
+                else None
+            )
             if bound and may_project:
                 for delivered_projection in delivered_projections:
                     project(
@@ -912,7 +1043,23 @@ class PrincipalStore:
                     event_id=event_id,
                 )
             if bound:
-                return DeliveryAcknowledgement(settled_event_id=event_id, bound=True)
+                delivery = outbox.load(transaction, self._principal_id, delivery_id=delivery_id, stage=stage)
+                reply_applied = (
+                    None
+                    if delivery is None
+                    else replies.acknowledge_row(
+                        transaction,
+                        self._principal_id,
+                        delivery,
+                        event_id=event_id,
+                        membership_current=may_project,
+                    )
+                )
+                return DeliveryAcknowledgement(
+                    settled_event_id=event_id,
+                    terminal_turn=committed_terminal,
+                    reply_effects=() if reply_applied is None else reply_applied.post_commit,
+                )
             # Lost the row. Whatever is on it now is the answer this delivery
             # resolves to, and the caller has to be told that rather than its
             # own event id -- everything downstream records what `flush`
@@ -927,7 +1074,6 @@ class PrincipalStore:
             )
             return DeliveryAcknowledgement(
                 settled_event_id=None if settled is None else str(settled["acknowledged_event_id"]),
-                bound=False,
             )
 
         return await self._backend.write(acknowledge)
@@ -982,7 +1128,7 @@ class PrincipalStore:
     ) -> bool:
         """Atomically reserve one exact background-call approval card."""
         return await self._backend.write(
-            lambda transaction: background_approvals.reserve_delivery(
+            lambda transaction: background_approvals.reserve_script_delivery(
                 transaction,
                 self._principal_id,
                 room_id=room_id,
@@ -1056,13 +1202,95 @@ class PrincipalStore:
             ),
         )
 
+    async def reserve_scheduled_call_approval(
+        self,
+        *,
+        binding: ScheduledCallBinding,
+        card: ApprovalCardReservation,
+    ) -> bool:
+        """Atomically reserve one scheduling-time card and its exact-call binding."""
+        return await self._backend.write(
+            lambda transaction: scheduled_approvals.reserve(
+                transaction,
+                self._principal_id,
+                binding=binding,
+                card=card,
+            ),
+        )
+
+    async def arm_scheduled_call_approval(
+        self,
+        *,
+        task_id: str,
+        workflow_digest: str,
+        any_arguments_allowed: bool,
+    ) -> ScheduledApprovalArmState:
+        """Arm one approved scheduled call for its unchanged task firing on time."""
+        return await self._backend.write(
+            lambda transaction: scheduled_approvals.arm(
+                transaction,
+                self._principal_id,
+                task_id=task_id,
+                workflow_digest=workflow_digest,
+                any_arguments_allowed=any_arguments_allowed,
+                now_ns=time.time_ns(),
+            ),
+        )
+
+    async def withdraw_scheduled_call_approval(self, *, task_id: str, reason: str) -> RecordedApprovalDecision:
+        """Withdraw one cancelled task's approval and deny its card if still pending."""
+        return await self._backend.write(
+            lambda transaction: scheduled_approvals.withdraw(
+                transaction,
+                self._principal_id,
+                task_id=task_id,
+                reason=reason,
+            ),
+        )
+
+    async def scheduled_call(self, *, task_id: str) -> ScheduledCall | None:
+        """Read the call one scheduled task stored."""
+        return await self._backend.read(
+            lambda transaction: scheduled_approvals.stored_call(transaction, self._principal_id, task_id=task_id),
+        )
+
+    async def claim_scheduled_call(
+        self,
+        *,
+        call: ScheduledCall,
+        arguments_json: str,
+        receipt: ApprovalCardReservation,
+    ) -> ScheduledCallClaim | ScheduledCallRefusal:
+        """Spend one armed scheduled approval and reserve its receipt in one commit."""
+        return await self._backend.write(
+            lambda transaction: scheduled_approvals.claim(
+                transaction,
+                self._principal_id,
+                call=call,
+                arguments_json=arguments_json,
+                receipt=receipt,
+                now_ns=time.time_ns(),
+            ),
+        )
+
+    async def record_scheduled_call_outcome(self, *, task_id: str, outcome: ScheduledCallOutcome) -> None:
+        """Record how one claimed scheduled call ended."""
+        await self._backend.write(
+            lambda transaction: scheduled_approvals.record_outcome(
+                transaction,
+                self._principal_id,
+                task_id=task_id,
+                outcome=outcome,
+            ),
+        )
+
     async def resolve_continuation_approval_card(
         self,
         *,
         card_event_id: str,
         requested_status: Literal["approved", "denied", "expired"],
         reason: str | None,
-        resolution: Mapping[str, Any],
+        metadata: ApprovalDecisionMetadata,
     ) -> RecordedApprovalDecision:
         """Atomically record one native card and its exact-call decision."""
         return await self._backend.write(
@@ -1072,7 +1300,77 @@ class PrincipalStore:
                 card_event_id=card_event_id,
                 requested_status=requested_status,
                 reason=reason,
-                resolution=resolution,
+                metadata=metadata,
+            ),
+        )
+
+    async def create_approval_grant(
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        sender_id: str,
+        seconds: int,
+        metadata: ApprovalDecisionMetadata,
+        reason: str | None = None,
+        current_binding: str | None = None,
+    ) -> tuple[RecordedApprovalDecision, ...]:
+        """Commit the originating decision, fixed grant, and matching pending decisions."""
+        return await self._backend.write(
+            lambda transaction: approval_grants.create(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+                sender_id=sender_id,
+                seconds=seconds,
+                metadata=metadata,
+                reason=reason,
+                current_binding=current_binding,
+            ),
+        )
+
+    async def approval_grant_for_card(self, *, room_id: str, card_event_id: str) -> ApprovalGrant | None:
+        """Load a grant independently of its retired card."""
+        return await self._backend.read(
+            lambda transaction: approval_grants.for_card(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+            ),
+        )
+
+    async def maintain_automatic_approvals(self, *, grant_id: str | None = None) -> tuple[str, ...]:
+        """Retire settled automatic receipts, enqueue grant revocations after their approval edits, and prune old scheduled calls."""
+
+        def maintain(transaction: Transaction) -> tuple[str, ...]:
+            if grant_id is None:
+                approvals.retire_automatic_receipts(transaction, self._principal_id)
+            deliveries = approval_grants.maintain(transaction, self._principal_id, grant_id=grant_id)
+            if grant_id is None:
+                scheduled_approvals.prune(transaction, self._principal_id, time.time_ns())
+            return deliveries
+
+        return await self._backend.write(maintain)
+
+    async def revoke_approval_grant(
+        self,
+        *,
+        room_id: str,
+        card_event_id: str,
+        sender_id: str,
+        grant_id: str,
+    ) -> ApprovalGrantRevocation | None:
+        """Record durable revocation debt for ordered acknowledgement delivery."""
+        return await self._backend.write(
+            lambda transaction: approval_grants.revoke(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+                sender_id=sender_id,
+                grant_id=grant_id,
             ),
         )
 
@@ -1089,7 +1387,7 @@ class PrincipalStore:
                 card_event_id=None,
                 requested_status="expired",
                 reason=None,
-                resolution=None,
+                metadata=None,
                 delivery_id=delivery_id,
             ),
         )
@@ -1102,6 +1400,18 @@ class PrincipalStore:
                 self._principal_id,
                 delivery_id=delivery_id,
                 card_event_id=card_event_id,
+            ),
+        )
+
+    async def remember_terminal_approval_alias(self, *, room_id: str, card_event_id: str, delivery_id: str) -> None:
+        """Retain a transport-verified receipt alias without changing its decision."""
+        await self._backend.write(
+            lambda transaction: approvals.remember_terminal_alias(
+                transaction,
+                self._principal_id,
+                room_id=room_id,
+                card_event_id=card_event_id,
+                delivery_id=delivery_id,
             ),
         )
 
@@ -1156,17 +1466,31 @@ class PrincipalStore:
             ),
         )
 
-    async def create_approval_continuation(
+    async def pause_for_approval(
         self,
-        continuation: ApprovalContinuation,
-    ) -> ApprovalContinuation | None:
-        """Create one paused-run owner while all original sources remain pending."""
-        return await self._backend.write(
-            lambda transaction: approval_continuations.create(
-                transaction,
-                self._principal_id,
-                continuation,
-            ),
+        hold: ApprovalContinuation | ApprovalAdvance,
+        request: ReplyRowRequest,
+        prepared: PreparedReplyRow,
+    ) -> ReplyRowEnqueue | None:
+        """Create or advance a paused run's owner and pause its reply with the pause row, in one transaction.
+
+        ``None`` means the continuation could not take its sources or advance,
+        or the outbox refused the row; a pause the reply's rule refuses (a Stop
+        committed meanwhile) comes back unapplied. Either way nothing is written.
+        """
+        try:
+            return await self._backend.write(
+                lambda transaction: _pause_for_approval(transaction, self._principal_id, hold, request, prepared),
+            )
+        except _ReplyRowRefusedError:
+            return None
+        except _PauseRefusedError as refused:
+            return refused.enqueue
+
+    async def pending_approvals(self) -> tuple[ApprovalContinuation, ...]:
+        """Return every approval continuation this principal owns."""
+        return await self._backend.read(
+            lambda transaction: approval_continuations.for_principal(transaction, self._principal_id),
         )
 
     async def approval_continuation_for_source(
@@ -1192,51 +1516,73 @@ class PrincipalStore:
             ),
         )
 
-    async def claim_approval_continuation(
+    async def claim_approval_resume(
+        self,
+        approval_id: str,
+        *,
+        claim: rl.ClaimRequest,
+    ) -> tuple[ApprovalContinuation | None, AppliedTransition | None]:
+        """Claim one ready paused run with its reply's resume span.
+
+        Returns neither when the continuation is not ready. A reply with
+        unresolved durable writes refuses the resume, and the continuation
+        stays ready.
+        """
+        return await self._backend.write(
+            lambda transaction: _claim_approval_resume(
+                transaction,
+                self._principal_id,
+                approval_id=approval_id,
+                claim=claim,
+            ),
+        )
+
+    async def claim_approval_in_place(
         self,
         approval_id: str,
         *,
         runtime_generation: str,
-        legacy_show_tool_calls: bool | None = None,
-    ) -> ApprovalContinuation | None:
-        """Claim one ready paused run for exactly one response lifecycle."""
-        return await self._backend.write(
-            lambda transaction: approval_continuations.claim(
-                transaction,
-                self._principal_id,
-                approval_id=approval_id,
-                runtime_generation=runtime_generation,
-                legacy_show_tool_calls=legacy_show_tool_calls,
-            ),
-        )
+        reply_id: str,
+        span_id: str,
+    ) -> tuple[ApprovalContinuation | None, AppliedTransition | None]:
+        """Claim a ready continuation for the response waiting on it, and resume its reply in place.
 
-    async def advance_approval_continuation(
-        self,
-        approval_id: str,
-        *,
-        claimant_generation: int,
-        run_id: str,
-        session_id: str,
-        calls: tuple[ApprovalCall, ...],
-        response_text: str | None = None,
-        response_tool_trace: tuple[dict[str, object], ...] | None = None,
-        response_presentation_state: dict[str, object] | None = None,
-    ) -> ApprovalContinuation | None:
-        """Replace one claimed generation with the next exact Agno pause."""
-        return await self._backend.write(
-            lambda transaction: approval_continuations.advance(
+        Only a span this bot instance still owns resumes; when the reply's
+        rule refuses, the continuation stays ready and nothing executes.
+        """
+
+        def claim(transaction: Transaction) -> tuple[ApprovalContinuation | None, AppliedTransition | None]:
+            current = approval_continuations.get(transaction, self._principal_id, approval_id=approval_id)
+            if current is None or current.state != "ready":
+                return None, None
+            resumed = replies.decide_on_span(
+                transaction,
+                self._principal_id,
+                reply_id=reply_id,
+                span_id=span_id,
+                author_generation=runtime_generation,
+                decide=lambda reply, span: rl.resumed_in_place(
+                    reply,
+                    span,
+                    approval_id=approval_id,
+                    now_ns=time.time_ns(),
+                ),
+            )
+            if not resumed.transition.applied:
+                raise _InPlaceResumeRefusedError(resumed)
+            claimed = approval_continuations.claim(
                 transaction,
                 self._principal_id,
                 approval_id=approval_id,
-                claimant_generation=claimant_generation,
-                run_id=run_id,
-                session_id=session_id,
-                calls=calls,
-                response_text=response_text,
-                response_tool_trace=response_tool_trace,
-                response_presentation_state=response_presentation_state,
-            ),
-        )
+                span_id=span_id,
+            )
+            assert claimed, "the reply resumed in place for a continuation no other span claimed"
+            return approval_continuations.get(transaction, self._principal_id, approval_id=approval_id), resumed
+
+        try:
+            return await self._backend.write(claim)
+        except _InPlaceResumeRefusedError as refused:
+            return None, refused.applied
 
     async def activate_approval_continuation(
         self,
@@ -1276,13 +1622,52 @@ class PrincipalStore:
             ),
         )
 
-    async def finish_approval_continuation(self, approval_id: str) -> bool:
-        """Settle one paused run after its FINAL delivery reaches a terminal outcome."""
+    async def release_approval_continuation(
+        self,
+        approval_id: str,
+        *,
+        expected_generation: int,
+    ) -> tuple[PostCommitEffect, ...] | None:
+        """Release an interrupted continuation, whose reply rule hands its sources back to replay or ends it stopped.
+
+        Returns the work its commit left for afterwards, or ``None`` when the run may not be released.
+        """
         return await self._backend.write(
-            lambda transaction: approval_continuations.finish(
+            lambda transaction: _end_approval(
                 transaction,
                 self._principal_id,
-                approval_id=approval_id,
+                approval_id,
+                may_end=lambda: approval_continuations.may_release(
+                    transaction,
+                    self._principal_id,
+                    approval_id=approval_id,
+                    expected_generation=expected_generation,
+                ),
+                end=lambda released: replies.approval_released(transaction, self._principal_id, released),
+            ),
+        )
+
+    async def finish_approval_continuation(self, approval_id: str) -> tuple[PostCommitEffect, ...] | None:
+        """Settle one paused run after its FINAL delivery reaches a terminal outcome, and end its reply.
+
+        Returns the work its commit left for afterwards, or ``None`` when the run is not ready to finish.
+        """
+        return await self._backend.write(
+            lambda transaction: _end_approval(
+                transaction,
+                self._principal_id,
+                approval_id,
+                may_end=lambda: approval_continuations.may_finish(
+                    transaction,
+                    self._principal_id,
+                    approval_id=approval_id,
+                ),
+                end=lambda finishing: replies.approval_finished(
+                    transaction,
+                    self._principal_id,
+                    finishing,
+                    owner_available=True,
+                ),
             ),
         )
 
@@ -1312,20 +1697,39 @@ class PrincipalStore:
         *,
         notice_principal_id: str,
     ) -> bool:
-        """Release sources after permanent owner loss and visible card cleanup."""
-        return await self._backend.write(
-            lambda transaction: approval_continuations.discard_unavailable(
+        """Release sources after permanent owner loss and visible card cleanup, ending the reply the approval paused."""
+        # The owner that could settle the reply is gone; the notice is what the room sees.
+        # No live ledger of that owner learns it; its next start loads it.
+        ended = await self._backend.write(
+            lambda transaction: _end_approval(
                 transaction,
                 self._principal_id,
-                approval_id=approval_id,
-                notice_principal_id=notice_principal_id,
+                approval_id,
+                may_end=lambda: approval_continuations.may_discard_unavailable(
+                    transaction,
+                    self._principal_id,
+                    approval_id=approval_id,
+                    notice_principal_id=notice_principal_id,
+                ),
+                end=lambda discarded: replies.approval_finished(
+                    transaction,
+                    self._principal_id,
+                    discarded,
+                    owner_available=False,
+                ),
             ),
         )
+        return ended is not None
 
     @property
     def principal_id(self) -> str:
         """Return this view's durable principal identity."""
         return self._principal_id
+
+    @property
+    def replies(self) -> ReplyStore:
+        """Return this principal's reply records."""
+        return ReplyStore(_backend=self._backend, _principal_id=self._principal_id)
 
 
 def _turn_membership_is_current(
@@ -1377,6 +1781,11 @@ def _enqueue_matrix_delivery(
     edits_event_id: str | None,
     settle_source_event_ids: tuple[str, ...],
     permanent_failure_reason: str | None,
+    edit_target_pending: bool = False,
+    reply_id: str | None = None,
+    span_id: str | None = None,
+    reply_sequence: int | None = None,
+    reply_row: ReplyRowFacts | None = None,
 ) -> str | None:
     """Record delivery intent unless the membership that authorized it has ended.
 
@@ -1450,12 +1859,298 @@ def _enqueue_matrix_delivery(
         payload=payload,
         result=result,
         edits_event_id=edits_event_id,
+        edit_target_pending=edit_target_pending,
         permanent_failure_reason=permanent_failure_reason,
+        reply_id=reply_id,
+        span_id=span_id,
+        reply_sequence=reply_sequence,
+        reply_row=reply_row,
     )
     if transaction_id is None:
         return None
     journal.settle_many(transaction, principal_id, settle_source_event_ids)
     return transaction_id
+
+
+def _claim_approval_resume(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    approval_id: str,
+    claim: rl.ClaimRequest,
+) -> tuple[ApprovalContinuation | None, AppliedTransition | None]:
+    """Claim a ready continuation with its paused reply's resume span, in one transaction."""
+    current = approval_continuations.get(transaction, principal_id, approval_id=approval_id)
+    if current is None or current.state != "ready":
+        return None, None
+    # Every continuation pauses a reply: the pause that created it recorded the reply.
+    applied = replies.claim(
+        transaction,
+        principal_id,
+        replace(claim, approval_id=current.approval_id),
+        existing_event_id=current.response_event_id,
+    )
+    if applied.transition.claimed is None:
+        # The reply's earlier writes are unresolved; their resolution wakes the sources.
+        return None, applied
+    claimed = approval_continuations.claim(
+        transaction,
+        principal_id,
+        approval_id=approval_id,
+        span_id=applied.transition.claimed.span_id,
+    )
+    assert claimed, "a ready continuation is claimed in the transaction that read it"
+    return approval_continuations.get(transaction, principal_id, approval_id=approval_id), applied
+
+
+def _end_approval(
+    transaction: Transaction,
+    principal_id: str,
+    approval_id: str,
+    *,
+    may_end: Callable[[], ApprovalContinuation | None],
+    end: Callable[[ApprovalContinuation], AppliedTransition | None],
+) -> tuple[PostCommitEffect, ...] | None:
+    """End one continuation that may end, applying the end to the reply it paused, in one transaction.
+
+    ``None`` means the continuation may not end now. The reply is locked before
+    the continuation, and it applies the end while the run still holds it; the
+    run goes after.
+    """
+    continuation = approval_continuations.get(transaction, principal_id, approval_id=approval_id)
+    paused = None if continuation is None else replies.lock_paused_reply(transaction, principal_id, continuation)
+    ending = may_end()
+    if ending is None:
+        return None
+    applied = end(ending)
+    approval_continuations.delete(transaction, principal_id, approval_id=approval_id)
+    effects = () if applied is None else applied.post_commit
+    # A claim that waited for the approval to end, such as an edit's regeneration, retries now.
+    return effects if paused is None else (*effects, replies.ApprovalEnded(approval_id, paused.reply_id))
+
+
+class _ReplyRowRefusedError(Exception):
+    """The outbox refused a reply row the lifecycle had already decided; roll both back."""
+
+
+class _InPlaceResumeRefusedError(Exception):
+    """The reply's rule refused an in-place resume; the continuation's claim rolls back."""
+
+    def __init__(self, applied: AppliedTransition) -> None:
+        super().__init__("The reply's rule refused the in-place resume")
+        self.applied = applied
+
+
+class _PauseRefusedError(Exception):
+    """The reply's rule refused a pause; the continuation created with it rolls back."""
+
+    def __init__(self, enqueue: ReplyRowEnqueue) -> None:
+        super().__init__("The reply's rule refused the pause")
+        self.enqueue = enqueue
+
+
+def _pause_for_approval(
+    transaction: Transaction,
+    principal_id: str,
+    hold: ApprovalContinuation | ApprovalAdvance,
+    request: ReplyRowRequest,
+    prepared: PreparedReplyRow,
+) -> ReplyRowEnqueue:
+    """Create or advance the continuation, then pause its reply, so neither exists without the other."""
+    held = (
+        hold.apply(transaction, principal_id)
+        if isinstance(hold, ApprovalAdvance)
+        else approval_continuations.create(transaction, principal_id, replace(hold, span_id=request.span_id))
+    )
+    if held is None:
+        raise _ReplyRowRefusedError
+    enqueued = _enqueue_reply_row(transaction, principal_id, request, prepared)
+    if not enqueued.transition.applied:
+        raise _PauseRefusedError(enqueued)
+    return enqueued
+
+
+def _decide_reply_row(
+    transaction: Transaction,
+    principal_id: str,
+    request: ReplyRowRequest,
+) -> ReplyRowEnqueue | tuple[rl.Reply, rl.Span, rl.Transition]:
+    """Return the row a retried write resolves to, or the reply, span, and transition the rule decided."""
+    if request.create is not None:
+        claim = request.create.claim
+        earlier = reply_spans.latest_for_delivery(transaction, principal_id, claim.delivery_id)
+        if earlier is not None:
+            # A retried acknowledgement finds the reply its first attempt created,
+            # and resolves that attempt's row instead of writing another.
+            created = reply_messages.lock(transaction, principal_id, earlier.reply_id)
+            assert created is not None
+            reused = _span_row(transaction, principal_id, created, earlier, rl.WriteStage.INITIAL)
+            assert reused is not None, "an acknowledgement's reply is created with its INITIAL row"
+            return replace(
+                reused,
+                applied=AppliedTransition(
+                    transition=rl.Transition(outcome=rl.Outcome.DUPLICATE, reply=created, spans=(earlier,)),
+                    post_commit=(),
+                ),
+            )
+        transition = rl.interactive_acknowledgement(claim, shown=request.create.shown)
+        assert transition.reply is not None
+        reply, span = transition.reply, transition.spans[0]
+    else:
+        assert request.decide is not None
+        locked = reply_messages.lock(transaction, principal_id, request.reply_id)
+        loaded = reply_spans.load(transaction, principal_id, request.span_id)
+        if locked is None or loaded is None:
+            msg = f"Reply {request.reply_id} or span {request.span_id} does not exist"
+            raise RuntimeError(msg)
+        reply, span = locked, loaded
+        earlier = _span_row(transaction, principal_id, reply, span, request.stage)
+        if earlier is not None:
+            return earlier
+        transition = (
+            rl.Transition(outcome=rl.Outcome.STALE, reply=reply)
+            if replies.retired(transaction, principal_id, span, author_generation=request.author_generation)
+            else request.decide(reply, span)
+        )
+    return reply, span, transition
+
+
+# Every reply row is a room message.
+_REPLY_ROW_EVENT_TYPE = "m.room.message"
+
+
+def _enqueue_reply_row(
+    transaction: Transaction,
+    principal_id: str,
+    request: ReplyRowRequest,
+    prepared: PreparedReplyRow,
+) -> ReplyRowEnqueue:
+    """Decide one reply write with its lifecycle rule and record the row it chose, in one transaction.
+
+    The rule runs against the locked reply and its span as they are now, so a
+    payload rendered before a Stop or deletion committed is refused rather
+    than written (``Outcome.RECOMPUTE``). Sources the rule settles are settled
+    here, replacing the turn handoff a plain ``FINAL`` carries.
+    """
+    decided = _decide_reply_row(transaction, principal_id, request)
+    if isinstance(decided, ReplyRowEnqueue):
+        return decided
+    reply, span, transition = decided
+    if not transition.applied or transition.row is None:
+        return ReplyRowEnqueue(
+            applied=replies.with_ended_span(replies.apply(transaction, principal_id, transition), span),
+            settled_event_ids=replies.settled_event_ids(transaction, principal_id, transition),
+        )
+    row = transition.row
+    stage = row.stage
+    edits_event_id = None if stage is DeliveryStage.INITIAL else reply.event_id
+    # A row waits for the reply's event only while an earlier row may still create it. With none left, as when
+    # Matrix refused the only create for good, the row creates the event itself.
+    edit_target_pending = (
+        edits_event_id is None
+        and stage is not DeliveryStage.INITIAL
+        and replies.has_unresolved_rows(transaction, principal_id, reply.reply_id)
+    )
+    row_fields = {
+        "reply_id": reply.reply_id,
+        "span_id": span.span_id,
+        "reply_sequence": row.sequence,
+        "reply_row": ReplyRowFacts(placeholder_only=request.placeholder_only, new_text=prepared.new_text),
+    }
+    if stage is DeliveryStage.EDIT:
+        delivery_id = replies.edit_delivery_id(span.delivery_id, row.sequence)
+        if not reads.claim_membership_epoch(
+            transaction,
+            principal_id,
+            room_id=reply.room_id,
+            expected_membership_epoch=reply.membership_epoch,
+        ):
+            raise _ReplyRowRefusedError
+        transaction_id = outbox.enqueue(
+            transaction,
+            principal_id,
+            delivery_id=delivery_id,
+            stage=stage,
+            event_type=_REPLY_ROW_EVENT_TYPE,
+            room_id=reply.room_id,
+            membership_epoch=reply.membership_epoch,
+            thread_id=reply.thread_id,
+            payload=prepared.payload,
+            result=prepared.result,
+            edits_event_id=edits_event_id,
+            edit_target_pending=edit_target_pending,
+            permanent_failure_reason=prepared.permanent_failure_reason,
+            **row_fields,
+        )
+    else:
+        delivery_id = span.delivery_id
+        transaction_id = _enqueue_matrix_delivery(
+            transaction,
+            principal_id,
+            delivery_id=delivery_id,
+            stage=stage,
+            event_type=_REPLY_ROW_EVENT_TYPE,
+            room_id=reply.room_id,
+            thread_id=reply.thread_id,
+            payload=prepared.payload,
+            result=prepared.result,
+            edits_event_id=edits_event_id,
+            settle_source_event_ids=(),
+            permanent_failure_reason=prepared.permanent_failure_reason,
+            edit_target_pending=edit_target_pending,
+            **row_fields,
+        )
+    if transaction_id is None:
+        raise _ReplyRowRefusedError
+    applied = replies.apply(transaction, principal_id, transition)
+    if prepared.permanent_failure_reason is not None:
+        # A payload refused before any send fails its row now, as a refusal from Matrix would.
+        refused = outbox.load(transaction, principal_id, delivery_id=delivery_id, stage=stage)
+        assert refused is not None
+        failed = replies.fail_row(transaction, principal_id, refused)
+        if failed is not None:
+            applied = AppliedTransition(
+                transition=transition,
+                post_commit=(*applied.post_commit, *failed.post_commit),
+            )
+    return ReplyRowEnqueue(
+        applied=applied,
+        delivery_id=delivery_id,
+        stage=row.stage,
+        settled_event_ids=replies.settled_event_ids(transaction, principal_id, transition),
+        sequence=row.sequence,
+    )
+
+
+def _span_row(
+    transaction: Transaction,
+    principal_id: str,
+    reply: rl.Reply,
+    span: rl.Span,
+    stage: rl.WriteStage | None,
+) -> ReplyRowEnqueue | None:
+    """Return the span's INITIAL or FINAL row already recorded, which a retried write resolves to.
+
+    A send that failed after its row was recorded leaves the row owed; writing
+    it again would decide a second time against a span that has moved on. The
+    stored row keeps its payload, as a re-enqueued attempted row does.
+    """
+    if stage not in {rl.WriteStage.INITIAL, rl.WriteStage.FINAL}:
+        return None
+    stored = outbox.load(transaction, principal_id, delivery_id=span.delivery_id, stage=stage)
+    if stored is None or stored.reply_id != reply.reply_id:
+        return None
+    if stage is rl.WriteStage.FINAL and stored.span_id != span.span_id:
+        return None
+    return ReplyRowEnqueue(
+        applied=AppliedTransition(
+            transition=rl.Transition(outcome=rl.Outcome.DUPLICATE, reply=reply),
+            post_commit=(),
+        ),
+        delivery_id=stored.delivery_id,
+        stage=stage,
+        sequence=stored.reply_sequence,
+    )
 
 
 def _settle_history_recovery(
@@ -1464,6 +2159,7 @@ def _settle_history_recovery(
     recovery: RoomHistoryRecovery,
     *,
     exhausted_server: bool,
+    unreadable: bool,
     attempted_policy_rank: int,
     expected_membership_epoch: int,
 ) -> HistoryRecoveryOutcome:
@@ -1477,12 +2173,18 @@ def _settle_history_recovery(
         return HistoryRecoveryOutcome.SUPERSEDED
     if not journal.claim_room_history_recovery(transaction, principal_id, recovery):
         return HistoryRecoveryOutcome.SUPERSEDED
+    if exhausted_server and unreadable:
+        # Repairing unmasks every marker the gap retracted, and one from before
+        # the gap cannot vouch for an event this walk could not read: it may be
+        # a reply in that very thread. A truncated obligation already withholds
+        # their completeness.
+        reads.revoke_room_hydration(transaction, principal_id, room_id=recovery.room_id)
     reads.publish_conversation_hydration(
         transaction,
         principal_id,
         room_id=recovery.room_id,
         thread_id=None,
-        complete=exhausted_server,
+        complete=exhausted_server and not unreadable,
         attempted_policy_rank=attempted_policy_rank,
         membership_epoch=expected_membership_epoch,
     )
@@ -1493,6 +2195,11 @@ def _settle_history_recovery(
         exhausted_server=exhausted_server,
         attempted_policy_rank=attempted_policy_rank,
     )
+
+
+def _settle_turn_sources(transaction: Transaction, principal_id: str, event_ids: tuple[str, ...]) -> tuple[str, ...]:
+    journal.settle_many(transaction, principal_id, event_ids)
+    return replies.drop_replays(transaction, principal_id, event_ids, now_ns=time.time_ns())
 
 
 def _install_room_history_recovery_chunk(
@@ -1514,13 +2221,15 @@ def _install_room_history_recovery_chunk(
     if not journal.claim_room_history_recovery(transaction, principal_id, recovery):
         return False
     for event in events:
-        project(
+        tombstoned = project(
             transaction,
             principal_id,
             event,
             receipt_order=0,
             membership_epoch=expected_membership_epoch,
         )
+        if tombstoned is not None:
+            replies.end_replies_of_deleted_source(transaction, principal_id, room_id=event.room_id, event_id=tombstoned)
     return True
 
 
@@ -1565,13 +2274,15 @@ def _install_hydration_chunk(
     ):
         return False
     for event in events:
-        project(
+        tombstoned = project(
             transaction,
             principal_id,
             event,
             receipt_order=0,
             membership_epoch=expected_membership_epoch,
         )
+        if tombstoned is not None:
+            replies.end_replies_of_deleted_source(transaction, principal_id, room_id=event.room_id, event_id=tombstoned)
     return True
 
 
@@ -1602,36 +2313,33 @@ class EventJournalStore:
             raise ValueError(msg)
         return PrincipalStore(_backend=self.backend, _principal_id=principal_id)
 
-    async def approval_continuations_for_entities(
-        self,
-        entity_names: set[str],
-        *,
-        limit: int = _DEFAULT_APPROVAL_CONTINUATION_OWNER_LIMIT,
-        after: tuple[str, str] | None = None,
-    ) -> tuple[tuple[str, ApprovalContinuation], ...]:
-        """Return one bounded page of owners for unavailable entities."""
-        return await self.backend.read(
-            lambda transaction: approval_continuations.for_entities(
-                transaction,
-                entity_names,
-                limit=limit,
-                after=after,
-            ),
-        )
-
     async def approval_continuations(
         self,
         *,
         limit: int = _DEFAULT_APPROVAL_CONTINUATION_OWNER_LIMIT,
-        after: tuple[str, str] | None = None,
+        after: str | None = None,
     ) -> tuple[tuple[str, ApprovalContinuation], ...]:
-        """Return one bounded page with its journal principals."""
+        """Return one bounded page of continuations after the approval id ``after``, with their journal principals."""
         return await self.backend.read(
             lambda transaction: approval_continuations.all_owners(
                 transaction,
                 limit=limit,
                 after=after,
             ),
+        )
+
+    async def hold_exclusively(self, identity: str) -> bool:
+        """Claim this journal for one runtime until it closes; ``False`` when another runtime holds it."""
+        return await self.backend.hold_exclusively(identity)
+
+    async def still_held(self) -> bool:
+        """Return whether this runtime's claim on the journal still holds."""
+        return await self.backend.still_held()
+
+    async def end_entity_replies(self, ends: Callable[[str], bool], *, now_ns: int) -> int:
+        """End the open replies of the entities ``ends`` names; return how many ended."""
+        return await self.backend.write(
+            lambda transaction: replies.end_entity_replies(transaction, ends, now_ns=now_ns),
         )
 
     async def generation(self, *, new_generation: str) -> str:
@@ -1719,10 +2427,10 @@ class TurnRecordStore:
         index_event_ids: Sequence[str],
         anchor_event_id: str,
         record_json: str,
-    ) -> None:
-        """Store one record under every event that indexes it."""
-        await self._backend.write(
-            lambda transaction: turn_records.upsert(
+    ) -> str | None:
+        """Store a record and return its committed state, or reject a changed owner."""
+        return await self._backend.write(
+            lambda transaction: turn_records.write_record(
                 transaction,
                 self._agent_name,
                 index_event_ids=index_event_ids,
@@ -1740,7 +2448,7 @@ class TurnRecordStore:
     ) -> int:
         """Fill only the indexes with no record yet, for migration. Returns how many."""
         return await self._backend.write(
-            lambda transaction: turn_records.adopt_missing(
+            lambda transaction: legacy_turn_records.adopt_missing(
                 transaction,
                 self._agent_name,
                 index_event_ids=index_event_ids,
@@ -1753,6 +2461,12 @@ class TurnRecordStore:
         """Return every record this agent holds, for a warm-up."""
         return await self._backend.read(
             lambda transaction: turn_records.load_all(transaction, self._agent_name),
+        )
+
+    async def load(self, event_id: str) -> TurnRecord | None:
+        """Read one exact record without depending on a runtime ledger cache."""
+        return await self._backend.read(
+            lambda transaction: turn_records.load_record(transaction, self._agent_name, event_id),
         )
 
     async def forget(self, *, index_event_ids: Sequence[str]) -> None:

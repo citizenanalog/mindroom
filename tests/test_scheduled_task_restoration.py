@@ -14,6 +14,7 @@ from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.matrix.client_room_admin import RoomJoinOutcome
 from mindroom.matrix.users import AgentMatrixUser
+from mindroom.scheduling import tasks as scheduling
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     bind_runtime_paths,
@@ -115,13 +116,20 @@ class TestScheduledTaskRestoration:
 
             # Verify router agent called restore_scheduled_tasks
             mock_join.assert_awaited_once_with(router_bot.client, "lobby")
+            assert mock_restore.await_args is not None
+            config_provider = mock_restore.await_args.kwargs["config_provider"]
             mock_restore.assert_awaited_once_with(
                 router_bot.client,
                 "lobby",
                 config,
                 runtime_paths_for(config),
                 router_bot._conversation_reader,
+                config_provider=config_provider,
             )
+            assert config_provider() is config
+            replacement_config = config.model_copy(deep=True)
+            router_bot.config = replacement_config
+            assert config_provider() is replacement_config
 
     @pytest.mark.asyncio
     async def test_non_router_agents_dont_restore_tasks(self, tmp_path: Path) -> None:
@@ -215,13 +223,20 @@ class TestScheduledTaskRestoration:
             await router_bot.join_configured_rooms()
 
         mock_join.assert_not_awaited()
+        assert mock_restore.await_args is not None
+        config_provider = mock_restore.await_args.kwargs["config_provider"]
         mock_restore.assert_awaited_once_with(
             router_bot.client,
             "lobby",
             config,
             runtime_paths_for(config),
             router_bot._conversation_reader,
+            config_provider=config_provider,
         )
+        assert config_provider() is config
+        replacement_config = config.model_copy(deep=True)
+        router_bot.config = replacement_config
+        assert config_provider() is replacement_config
         mock_restore_configs.assert_awaited_once_with(router_bot.client, "lobby")
         mock_welcome.assert_awaited_once_with("lobby")
 
@@ -259,12 +274,19 @@ class TestScheduledTaskRestoration:
             assert router_bot._deferred_overdue_task_drain_task is not None
             await router_bot._deferred_overdue_task_drain_task
 
+            assert mock_drain.await_args is not None
+            config_provider = mock_drain.await_args.kwargs["config_provider"]
             mock_drain.assert_awaited_once_with(
                 router_bot.client,
                 config,
                 runtime_paths_for(config),
                 router_bot._conversation_reader,
+                config_provider=config_provider,
             )
+            assert config_provider() is config
+            replacement_config = config.model_copy(deep=True)
+            router_bot.config = replacement_config
+            assert config_provider() is replacement_config
 
             await _complete_frame(router_bot, 1)
             mock_drain.assert_awaited_once()
@@ -381,6 +403,9 @@ class TestScheduledTaskRestoration:
         self._install_runtime_support(router_bot)
         drain_task = asyncio.create_task(asyncio.sleep(60))
         router_bot._deferred_overdue_task_drain_task = drain_task
+        scheduling.set_scheduled_task_runner_owner(
+            scheduling.ScheduledTaskRunnerOwner(router_bot.client, router_bot._conversation_reader),
+        )
 
         async def wait_for_background_tasks_side_effect(**kwargs: float) -> None:
             assert "timeout" in kwargs
@@ -402,9 +427,48 @@ class TestScheduledTaskRestoration:
             await router_bot.stop()
 
         assert drain_task.cancelled()
+        assert scheduling._runner_owner is None
         mock_clear.assert_called_once_with()
         mock_cancel.assert_awaited_once()
         router_bot.client.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_router_stop_keeps_scheduled_tasks_and_router_owner(self, tmp_path: Path) -> None:
+        """Replacing a non-router agent leaves the router's runner owner and running tasks alone."""
+        config = self._bind_runtime(
+            Config(
+                agents={"general": {"display_name": "GeneralAgent", "model": "default", "rooms": ["lobby"]}},
+                models={"default": {"provider": "test", "id": "test-model"}},
+            ),
+            tmp_path,
+        )
+        agent_user = AgentMatrixUser(
+            agent_name="general",
+            user_id="@general:mindroom.com",
+            password="test",  # noqa: S106
+            display_name="GeneralAgent",
+        )
+        agent_bot = make_test_agent_bot(
+            agent_user=agent_user,
+            storage_path=tmp_path,
+            config=config,
+            runtime_paths=runtime_paths_for(config),
+            rooms=["lobby"],
+        )
+        agent_bot.client = make_matrix_client_mock(user_id=agent_user.user_id)
+        agent_bot.client.rooms = {}
+        self._install_runtime_support(agent_bot)
+        router_owner = scheduling.ScheduledTaskRunnerOwner(
+            make_matrix_client_mock(user_id="@router:mindroom.com"),
+            agent_bot._conversation_reader,
+        )
+        scheduling.set_scheduled_task_runner_owner(router_owner)
+
+        with patch("mindroom.bot.cancel_all_running_scheduled_tasks", new_callable=AsyncMock) as mock_cancel:
+            await agent_bot.stop()
+
+        assert scheduling._runner_owner is router_owner
+        mock_cancel.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_multiple_agents_only_router_restores(self, tmp_path: Path) -> None:

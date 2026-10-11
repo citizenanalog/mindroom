@@ -25,7 +25,7 @@ from mindroom.config.plugin import PluginEntryConfig
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
-from mindroom.history.runtime import open_bound_scope_session_context
+from mindroom.history.session_context import open_bound_scope_session_context
 from mindroom.history.types import PreparedHistoryState
 from mindroom.hooks import (
     BUILTIN_EVENT_NAMES,
@@ -44,6 +44,7 @@ from mindroom.matrix.users import AgentMatrixUser
 from mindroom.memory import MemoryPromptParts
 from mindroom.message_target import MessageTarget
 from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode, build_materialized_team_instance, prepare_materialized_team_execution
 from tests.access_schema_support import with_current_room_member_access
@@ -57,7 +58,9 @@ from tests.conftest import (
     request_envelope,
     runtime_paths_for,
     test_runtime_paths,
+    unwrap_extracted_collaborator,
 )
+from tests.reply_span_helpers import response_span
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -90,6 +93,7 @@ def _plugin(name: str, callbacks: list[object]) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
         discovered_hooks=tuple(callbacks),
+        discovered_automations=(),
         entry_config=PluginEntryConfig(path=f"./plugins/{name}"),
         plugin_order=0,
     )
@@ -636,6 +640,10 @@ async def test_process_and_respond_threads_system_enrichment_items(tmp_path: Pat
     ):
         generation = await bot._response_runner._process_and_respond(
             ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$event",),
+                    logical_source_event_ids=("$event",),
+                ),
                 thread_history=[],
                 prompt="Please reply",
                 user_id="@user:localhost",
@@ -676,6 +684,23 @@ async def test_process_and_respond_streaming_threads_system_enrichment_items(tmp
             visible_body_state="visible_body",
         )
 
+    request = ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=("$event",),
+            logical_source_event_ids=("$event",),
+        ),
+        thread_history=[],
+        prompt="Please reply",
+        user_id="@user:localhost",
+        response_envelope=request_envelope(
+            room_id="!room:localhost",
+            reply_to_event_id="$event",
+            prompt="Please reply",
+            user_id="@user:localhost",
+        ),
+        system_enrichment_items=system_items,
+    )
+    runner = unwrap_extracted_collaborator(bot._response_runner)
     with (
         patch(
             "mindroom.delivery_gateway.send_streaming_response",
@@ -686,20 +711,8 @@ async def test_process_and_respond_streaming_threads_system_enrichment_items(tmp
             stream_agent_response=fake_stream_agent_response,
         ),
     ):
-        generation = await bot._response_runner._process_and_respond_streaming(
-            ResponseRequest(
-                thread_history=[],
-                prompt="Please reply",
-                user_id="@user:localhost",
-                response_envelope=request_envelope(
-                    room_id="!room:localhost",
-                    reply_to_event_id="$event",
-                    prompt="Please reply",
-                    user_id="@user:localhost",
-                ),
-                system_enrichment_items=system_items,
-            ),
-        )
+        async with response_span(runner, request):
+            generation = await runner._process_and_respond_streaming(request)
 
     assert generation.delivery.event_id == "$response"
     assert generation.delivery.response_text == "stream chunk"

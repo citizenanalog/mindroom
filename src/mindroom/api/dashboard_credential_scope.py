@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING, Any, cast
 from fastapi import HTTPException, Request
 
 from mindroom.agent_policy import ResolvedAgentPolicy, resolve_agent_policy_from_data
+from mindroom.api import config_lifecycle
 from mindroom.authorization import (
     is_platform_administrator,
     is_sender_allowed_for_agent_credential_management,
-    is_sender_allowed_for_agent_oauth_connection_management,
+    is_sender_allowed_for_agent_oauth_connection,
 )
 from mindroom.matrix.identity import try_parse_historical_matrix_user_id
 from mindroom.requester_identity import resolve_human_requester_alias
@@ -255,6 +256,7 @@ def require_agent_oauth_connection_authorized(
     config: Config,
     runtime_paths: RuntimePaths,
     agent_name: str,
+    requester_owned: bool = False,
 ) -> ToolExecutionIdentity:
     """Require requester-private or managed-agent authority for OAuth connections."""
     execution_identity = build_dashboard_execution_identity(
@@ -264,11 +266,13 @@ def require_agent_oauth_connection_authorized(
         runtime_paths=runtime_paths,
     )
     requester_id = execution_identity.requester_id
-    if requester_id is None or not is_sender_allowed_for_agent_oauth_connection_management(
+    if requester_id is None or not is_sender_allowed_for_agent_oauth_connection(
         requester_id,
-        agent_name=agent_name,
-        config=config,
-        runtime_paths=runtime_paths,
+        agent_name,
+        config,
+        runtime_paths,
+        config_lifecycle.app_state(request.app).agent_reply_memberships,
+        requester_owned=requester_owned,
     ):
         raise HTTPException(
             status_code=403,

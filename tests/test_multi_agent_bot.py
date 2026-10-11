@@ -55,6 +55,7 @@ from tests.bot_helpers import (
     _wrap_extracted_collaborators,
     make_mock_agent_user,
     make_test_agent_bot,
+    unique_room_send_responses,
 )
 from tests.conftest import (
     TEST_PASSWORD,
@@ -64,6 +65,7 @@ from tests.conftest import (
     wrap_extracted_collaborators,
 )
 from tests.identity_helpers import entity_ids, persist_entity_accounts
+from tests.response_attempt_helpers import install_direct_response_admission
 from tests.threading_helpers import seed_thread_history
 
 if TYPE_CHECKING:
@@ -483,7 +485,6 @@ class TestAgentBot(AgentBotTestBase):
             account_id: str,
             after_sync: object,
             after_ack: object,
-            authenticate_to_device: object,
             wait_for_work: object,
             wake_semantic_dispatch: object,
             wait_for_delivery_projection: object,
@@ -494,7 +495,6 @@ class TestAgentBot(AgentBotTestBase):
         ) -> None:
             assert after_sync == bot._on_ingestion_frame_completion
             assert after_ack == bot._ingestion_admission_progress.set
-            assert callable(authenticate_to_device)
             assert before_admission == bot._before_ingestion_admission
             assert wait_for_delivery_projection == bot._wait_for_delivery_projection
             assert after_admission == bot._after_ingestion_admission
@@ -918,6 +918,30 @@ class TestAgentBot(AgentBotTestBase):
         mock_start.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_agent_bot_try_start_does_not_retry_after_cancellation(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+    ) -> None:
+        """Cancelling a start stuck in login ends it instead of starting another attempt."""
+        config = self._config_for_storage(tmp_path)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        start_entered = asyncio.Event()
+
+        async def _blocked_start() -> None:
+            start_entered.set()
+            await asyncio.Event().wait()
+
+        with patch.object(bot, "start", new=AsyncMock(side_effect=_blocked_start)) as mock_start:
+            start = asyncio.create_task(bot.try_start())
+            await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+            start.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(start, timeout=1.0)
+
+        mock_start.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_agent_bot_stop(self, mock_agent_user: AgentMatrixUser, tmp_path: Path) -> None:
         """Test stopping an agent bot."""
         config = self._config_for_storage(tmp_path)
@@ -991,7 +1015,7 @@ class TestAgentBot(AgentBotTestBase):
         close_order: list[str] = []
         bot.prepare_for_sync_shutdown = AsyncMock(side_effect=failure)
         bot._journal_dispatcher = AsyncMock()
-        bot._journal_dispatcher.stop.side_effect = lambda: close_order.append("dispatcher")
+        bot._journal_dispatcher.stop.side_effect = lambda **_kwargs: close_order.append("dispatcher")
         bot._ingestion_session = AsyncMock()
         bot._ingestion_session.close.side_effect = lambda: close_order.append("ingestion")
         bot.client = _make_matrix_client_mock()
@@ -1036,7 +1060,7 @@ class TestAgentBot(AgentBotTestBase):
         with (
             patch("mindroom.bot_room_lifecycle.is_sender_allowed_for_agent_reply_in_room", return_value=True),
         ):
-            bot._room_lifecycle.record_pending_room_invite(mock_room.room_id, mock_event.sender)
+            await bot._room_lifecycle.record_pending_room_invite(mock_room.room_id, mock_event.sender)
             await bot._room_lifecycle.handle_recorded_invite(mock_room, mock_event.sender)
 
         assert change_membership.await_count == expected_join_calls
@@ -1127,6 +1151,7 @@ class TestAgentBot(AgentBotTestBase):
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
+        install_direct_response_admission(bot)
         # A threaded turn now reads through the projection, and a strict read
         # hydrates first. A bare AsyncMock returns a mock from room_get_event,
         # so hydration fails and the turn ends silently with no response.
@@ -1155,10 +1180,8 @@ class TestAgentBot(AgentBotTestBase):
 
             bot.client.get_presence = mock_get_presence
 
-        # Mock successful room_send response
-        mock_send_response = MagicMock()
-        mock_send_response.__class__ = nio.RoomSendResponse
-        bot.client.room_send.return_value = mock_send_response
+        # Each send creates its own event, as a homeserver does.
+        unique_room_send_responses(bot.client)
 
         mock_room = MagicMock()
         mock_room.room_id = "!test:localhost"
@@ -1569,7 +1592,7 @@ class TestAgentBot(AgentBotTestBase):
     @patch("mindroom.config.main.load_config")
     @patch("mindroom.teams.resolve_agent_knowledge_access")
     @patch("mindroom.teams.create_agent")
-    @patch("mindroom.model_loading.get_model_instance")
+    @patch("mindroom.providers.model_loading.get_model_instance")
     @patch("mindroom.teams.Team.arun")
     @patch("mindroom.response_runner.ai_response")
     @patch("mindroom.response_runner.stream_agent_response")
@@ -1610,6 +1633,7 @@ class TestAgentBot(AgentBotTestBase):
             rooms=["!test:localhost"],
             enable_streaming=enable_streaming,
         )
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
 
         # Mock orchestrator with agent_bots
@@ -1622,10 +1646,8 @@ class TestAgentBot(AgentBotTestBase):
         mock_orchestrator.runtime_paths = runtime_paths_for(config)
         bot.orchestrator = mock_orchestrator
 
-        # Mock successful room_send response
-        mock_send_response = MagicMock()
-        mock_send_response.__class__ = nio.RoomSendResponse
-        bot.client.room_send.return_value = mock_send_response
+        # Each send creates its own event, as a homeserver does.
+        unique_room_send_responses(bot.client)
 
         mock_room = MagicMock()
         mock_room.room_id = "!test:localhost"

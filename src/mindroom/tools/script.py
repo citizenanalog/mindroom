@@ -9,6 +9,7 @@ from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolStatus,
 )
 from mindroom.tool_system.registration import register_tool_with_metadata
@@ -20,14 +21,14 @@ if TYPE_CHECKING:
 @register_tool_with_metadata(
     name="script",
     display_name="Background Scripts",
-    description=(
-        "Run trusted arbitrary Python code with scoped worker filesystem and environment access plus "
-        "deployment-policy network access"
-    ),
+    description="Run Python scripts in the background, monitor them, or cancel them",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.UNCONFINED,
+    executes_code=True,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.PRIMARY,
+    requires_primary_runtime=True,
     icon="FileCode2",
     icon_color="text-cyan-500",
     config_fields=[

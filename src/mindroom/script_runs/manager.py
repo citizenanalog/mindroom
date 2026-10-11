@@ -6,8 +6,6 @@ import asyncio
 import hashlib
 import math
 import os
-import re
-import stat
 import sys
 import uuid
 from contextlib import suppress
@@ -20,6 +18,12 @@ from weakref import WeakValueDictionary
 from mindroom.background_tasks import run_blocking_until_complete, run_coroutine_until_complete
 from mindroom.constants import CONTROL_STATE_PATH_ENV
 from mindroom.logging_config import get_logger
+from mindroom.path_confinement import (
+    open_directory_within_root,
+    open_regular_file_within_root,
+    resolve_path_within_root,
+    write_file_within_root,
+)
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.script_runs.models import (
     ScriptRunRecord,
@@ -37,9 +41,10 @@ from mindroom.script_runs.reasons import (
     PROCESS_EXIT_OBSERVED,
     SUPERVISOR_UNAVAILABLE,
 )
+from mindroom.script_runs.recovery import script_recovery_signature
 from mindroom.script_runs.store import ScriptRunNotFoundError, ScriptRunStore, mint_script_capability
 from mindroom.script_runs.worker_client import ScriptWorkerClient, WorkerScriptCancel, WorkerScriptStatus
-from mindroom.shell_supervisor import (
+from mindroom.shell.supervisor import (
     background_script_supervision_supported,
     check_command_via_supervisor,
     ensure_shell_supervisor,
@@ -48,7 +53,7 @@ from mindroom.shell_supervisor import (
     run_command_via_supervisor,
 )
 from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context
-from mindroom.tool_system.sandbox_proxy import sandbox_proxy_config
+from mindroom.tool_system.sandbox_proxy import runner_config_snapshot, sandbox_proxy_config
 from mindroom.tool_system.worker_routing import (
     agent_workspace_root_path,
     build_agent_toolkit_worker_target,
@@ -57,7 +62,6 @@ from mindroom.tool_system.worker_routing import (
 from mindroom.workers.backends.static_runner import StaticSandboxRunnerBackend
 from mindroom.workers.models import ScriptResourceProfileName, WorkerHandle, WorkerSpec
 from mindroom.workers.worker_retirement import remove_directory_tree_at
-from mindroom.workspaces import resolve_workspace_relative_path
 
 if TYPE_CHECKING:
     import builtins
@@ -81,7 +85,6 @@ _MAX_SOURCE_BYTES = 128 * 1024
 _MAX_OUTPUT_BYTES = 64 * 1024
 _LOCAL_EXECUTION_MODES = frozenset({"off", "local", "disabled"})
 _WORKER_EXECUTION_MODES = frozenset({"all", "sandbox_all", "selective", "sandbox_selective"})
-_HANDLE_RE = re.compile(r"shell:[0-9a-f]{32}")
 _TERMINAL_STATES = frozenset(
     {
         ScriptRunState.EXITED,
@@ -240,12 +243,17 @@ class ScriptRunManager:
         await self._launches_drained.wait()
 
     async def begin_startup_reconciliation(self) -> None:
-        """Fence all launches until inherited durable ownership is revoked and retired."""
+        """Acquire a launch fence and drain admitted launches, undoing acquisition on failure."""
         async with self._launch_admission_lock:
             self._startup_reconciliation_owners += 1
             if self._launches_in_progress == 0:
                 self._launches_drained.set()
-        await self._launches_drained.wait()
+        try:
+            await self._launches_drained.wait()
+        except BaseException:
+            # Cancellation before acquiring the lock above never owns a fence to release.
+            await run_coroutine_until_complete(self.end_startup_reconciliation())
+            raise
 
     async def end_startup_reconciliation(self) -> None:
         """Reopen launch admission only after startup cleanup is durably complete."""
@@ -426,6 +434,13 @@ class ScriptRunManager:
             replace(
                 run,
                 worker_backend_locator=backend.cleanup_locator,
+                recovery_signature=script_recovery_signature(
+                    backend=self.worker_backend,
+                    config=context.config,
+                    agent_name=context.agent_name,
+                    gateway_url=self.gateway_url,
+                    resource_profile=profile,
+                ),
                 resource_profile=profile,
                 resource_requests=requests,
                 resource_limits=limits,
@@ -753,12 +768,14 @@ class ScriptRunManager:
                 run_id=run.run_id,
                 source_digest=run.source_digest,
                 gateway_url=self.gateway_url,
+                max_runtime_seconds=run.max_runtime_seconds,
                 state_scope_worker_key=worker_spec.state_scope_worker_key,
                 private_agent_names=(
                     tuple(sorted(worker_spec.private_agent_names))
                     if worker_spec.private_agent_names is not None
                     else None
                 ),
+                config_snapshot=runner_config_snapshot(context.runtime_paths, context.config),
             )
         except BaseException as exc:
             await self._preserve_ambiguous_launch(context, run.run_id)
@@ -863,19 +880,25 @@ class ScriptRunManager:
         )
         supervisor_handle = supervisor_handle_for_run(run.run_id)
         try:
-            message = await run_command_via_supervisor(
+            result = await run_command_via_supervisor(
                 socket_path,
                 namespace=_local_namespace(run.run_id),
-                argv=[sys.executable, "-m", "mindroom.script_runs.shim", str(source_path), str(token_path)],
+                argv=[sys.executable, "-P", "-s", "-m", "mindroom.script_runs.shim", str(source_path), str(token_path)],
                 env=environment,
                 cwd=str(workspace),
                 tail=200,
                 timeout=0,
                 handle=supervisor_handle,
+                max_runtime_seconds=run.max_runtime_seconds,
             )
-            _validate_local_launch_message(message, expected_handle=supervisor_handle)
         except BaseException as exc:
             return await self._resolve_ambiguous_launch_failure(context, run.run_id, exc)
+        if result.handle != supervisor_handle:
+            return await self._resolve_ambiguous_launch_failure(
+                context,
+                run.run_id,
+                ScriptRunManagerError(result.message),
+            )
         return await self._settle_spawned_run(context, run)
 
     async def _owned_run(self, context: ToolRuntimeContext, run_id: str) -> ScriptRunRecord:
@@ -935,6 +958,8 @@ class ScriptRunManager:
             backend = self._worker_backend_for(run)
             if run.worker_key is not None and backend is not None:
                 await asyncio.to_thread(backend.touch_worker, run.worker_key)
+            if run.state is ScriptRunState.STARTING:
+                return await asyncio.to_thread(self.store.transition_run, run.run_id, state=ScriptRunState.RUNNING)
             return run
         bounded_output = _bounded_output(status.output)
         if status.state == "unknown":
@@ -1270,16 +1295,18 @@ def _worker_workspace(context: ToolRuntimeContext, worker: WorkerHandle) -> Path
         msg = "Background script worker must expose a primary-visible state root or subpath."
         raise ScriptRunManagerError(msg)
     resolved_storage_root = context.runtime_paths.storage_root.expanduser().resolve()
-    resolved_root = root.expanduser().resolve()
-    if not resolved_root.is_relative_to(resolved_storage_root):
+    try:
+        resolved_root = resolve_path_within_root(resolved_storage_root, root.expanduser(), symlinks="internal")
+    except ValueError as exc:
         msg = "Background script worker state root must stay inside primary storage."
-        raise ScriptRunManagerError(msg)
+        raise ScriptRunManagerError(msg) from exc
     workspace = resolved_root / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    resolved_workspace = workspace.resolve()
-    if not resolved_workspace.is_relative_to(resolved_root):
+    try:
+        resolved_workspace = resolve_path_within_root(resolved_root, workspace, symlinks="internal")
+    except ValueError as exc:
         msg = "Background script workspace must stay inside its worker state root."
-        raise ScriptRunManagerError(msg)
+        raise ScriptRunManagerError(msg) from exc
     return resolved_workspace
 
 
@@ -1293,42 +1320,24 @@ def _read_workspace_source(workspace: Path, relative_path: str) -> bytes:
     if relative.is_absolute() or relative == Path() or ".." in relative.parts:
         msg = "Script source path must stay within the workspace root."
         raise ValueError(msg)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptors: list[int] = []
-    try:
-        current_descriptor = os.open(workspace, directory_flags)
-        descriptors.append(current_descriptor)
-        for part in relative.parts[:-1]:
-            current_descriptor = os.open(part, directory_flags, dir_fd=current_descriptor)
-            descriptors.append(current_descriptor)
-        source_descriptor = os.open(
-            relative.parts[-1],
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=current_descriptor,
-        )
-        descriptors.append(source_descriptor)
-        metadata = os.fstat(source_descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            msg = "Script source path must be a regular file in the agent workspace."
-            raise ValueError(msg)
-        chunks: list[bytes] = []
-        remaining = _MAX_SOURCE_BYTES + 1
-        while remaining:
-            chunk = os.read(source_descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-    finally:
-        for descriptor in reversed(descriptors):
-            with suppress(OSError):
-                os.close(descriptor)
+    with (
+        open_regular_file_within_root(workspace, relative) as descriptor,
+        os.fdopen(
+            descriptor,
+            "rb",
+            closefd=False,
+        ) as source,
+    ):
+        return source.read(_MAX_SOURCE_BYTES + 1)
 
 
 def _snapshot_locator(storage_root: Path, workspace: Path, run_id: str) -> str:
-    run_dir = (workspace / _snapshot_relative_dir(run_id)).resolve()
     try:
+        run_dir = resolve_path_within_root(
+            storage_root,
+            workspace / _snapshot_relative_dir(run_id),
+            symlinks="internal",
+        )
         return run_dir.relative_to(storage_root).as_posix()
     except ValueError as exc:
         msg = "Background script snapshot must stay inside primary storage."
@@ -1336,52 +1345,28 @@ def _snapshot_locator(storage_root: Path, workspace: Path, run_id: str) -> str:
 
 
 def _write_snapshot(workspace: Path, run_id: str, *, source: bytes, token: str) -> tuple[Path, Path]:
-    run_dir = resolve_workspace_relative_path(
-        workspace,
-        _snapshot_relative_dir(run_id),
-        field_name="Script run directory",
-    )
-    run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-    run_dir.chmod(0o700)
-    source_path = run_dir / "source.py"
-    token_path = run_dir / "capability"
-    _write_private_file(source_path, source)
-    _write_private_file(token_path, token.encode("utf-8"))
-    return source_path, token_path
-
-
-def _write_private_file(path: Path, content: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb", closefd=False) as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-    finally:
-        os.close(descriptor)
-    path.chmod(0o600)
+    """Publish one run's source and capability in a fresh directory below the workspace."""
+    relative_dir = _snapshot_relative_dir(run_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    with open_directory_within_root(workspace, relative_dir.parent, create=True, mode=0o700) as parent_fd:
+        os.mkdir(relative_dir.name, mode=0o700, dir_fd=parent_fd)
+    for name, payload in (("source.py", source), ("capability", token.encode("utf-8"))):
+        write_file_within_root(workspace, relative_dir / name, payload, exclusive=True)
+    return workspace / relative_dir / "source.py", workspace / relative_dir / "capability"
 
 
 def _remove_snapshot(storage_root: Path, locator: str) -> bool:
     """Recursively remove one descriptor-bound run snapshot without following symlinks."""
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptors: list[int] = []
+    relative = Path(locator)
     try:
-        current_descriptor = os.open(storage_root, directory_flags)
-        descriptors.append(current_descriptor)
-        parts = Path(locator).parts
-        for part in parts[:-1]:
-            current_descriptor = os.open(part, directory_flags, dir_fd=current_descriptor)
-            descriptors.append(current_descriptor)
-        remove_directory_tree_at(current_descriptor, parts[-1])
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            return False
+        with open_directory_within_root(storage_root, relative.parent) as directory:
+            remove_directory_tree_at(directory, relative.name)
     except FileNotFoundError:
         return True
     except (OSError, ValueError):
         return False
-    finally:
-        for descriptor in reversed(descriptors):
-            with suppress(OSError):
-                os.close(descriptor)
     return True
 
 
@@ -1394,12 +1379,6 @@ def _parse_local_status(message: str) -> WorkerScriptStatus:
         output=status.output,
         exit_code=status.exit_code,
     )
-
-
-def _validate_local_launch_message(message: str, *, expected_handle: str) -> None:
-    match = _HANDLE_RE.search(message)
-    if match is None or match.group(0) != expected_handle:
-        raise ScriptRunManagerError(message)
 
 
 def _parse_local_cancel(message: str) -> WorkerScriptCancel:

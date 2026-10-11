@@ -9,28 +9,33 @@ from contextlib import asynccontextmanager, closing
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import nio
 import pytest
-from nio.durable import DurableSyncConfig, RecordKind, SyncRecord
+from nio.durable import DurableSyncConfig, RecordKind, SyncBatch, SyncRecord
 from nio.durable.transport import HttpError
 
+from mindroom.background_tasks import run_coroutine_until_complete, wait_for_background_tasks
 from mindroom.bot import AgentBot
 from mindroom.bot_room_lifecycle import BotRoomLifecycle
 from mindroom.config.access import ResponderAccessConfig
+from mindroom.config.personal_rooms import PersonalRoomsConfig
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.event_journal import DeliveryStage, RoomMembershipPosition
 from mindroom.matrix._owned_session import MatrixCredentials, open_owned_matrix_session
 from mindroom.matrix.client_session import create_authenticated_client
 from mindroom.matrix.durable_ingestion import consume_one_ingestion_batch
+from mindroom.matrix.personal_rooms import PersonalRoomService
 from mindroom.matrix.state import MatrixState
 from mindroom.orchestrator import _MultiAgentOrchestrator
+from mindroom.personal_room_lifecycle import PersonalRoomTarget
+from mindroom.runtime_shutdown import ShutdownBudget
 from tests.bot_helpers import make_matrix_client_mock
 from tests.test_bot_ready_hook import _agent_bot
-from tests.test_durable_ingestion_admission import ROOM
-from tests.test_event_journal_store import admit, interactive_edit, interactive_prompt
+from tests.test_durable_ingestion_admission import ROOM, Session
+from tests.test_event_journal_store import admit, interactive_edit, interactive_prompt, projection
 from tests.test_room_invites import _handle_invite, _live_router_invite_scenario, _pending_room_invites
 
 if TYPE_CHECKING:
@@ -39,6 +44,68 @@ if TYPE_CHECKING:
     from nio.durable import DurableSync
 
     from mindroom.event_journal.store import PrincipalStore
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resists_cancellation", [False, True])
+async def test_personal_room_reconciliation_does_not_delay_sync_ack(
+    tmp_path: Path,
+    resists_cancellation: bool,
+) -> None:
+    """Slow personal-room maintenance must not hold the durable ingestion checkpoint."""
+    bot = _agent_bot(tmp_path, agent_name=ROUTER_AGENT_NAME)
+    bot.config.personal_rooms = PersonalRoomsConfig(agent="code", onboarding_rooms=[ROOM], backfill=True)
+    bot.client = make_matrix_client_mock(user_id=bot.agent_user.user_id)
+    bot.client.joined_members.return_value = nio.JoinedMembersResponse(
+        members=[nio.RoomMember("@alice:localhost", None, None)],
+        room_id=ROOM,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def ensure(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        try:
+            if resists_cancellation:
+                await run_coroutine_until_complete(release.wait())
+            else:
+                await release.wait()
+        finally:
+            stopped.set()
+
+    service = Mock(spec=PersonalRoomService)
+    service.ensure.side_effect = ensure
+    bot._personal_room_lifecycle.lookup_target = lambda _name: PersonalRoomTarget(service, first_sync_complete=True)
+    batch = SyncBatch(uuid4(), 1, (), completes_sync=True)
+    principal = bot.journal_principal()
+    consumer = await principal.load_or_create_ingestion_consumer(new_generation=uuid4())
+    await principal.bind_ingestion_stream(generation=consumer.generation, stream_id=batch.stream_id)
+    session = Session(batch)
+    preparation = None
+    try:
+        async with asyncio.timeout(2):
+            await consume_one_ingestion_batch(
+                session,
+                principal,
+                account_id=bot.agent_user.user_id,
+                after_sync=bot._on_ingestion_frame_completion,
+            )
+            await entered.wait()
+        assert session.acked == [batch]
+        assert not release.is_set()
+        bot._sync_shutdown_budget = ShutdownBudget.start(0.01)
+        preparation = asyncio.create_task(bot.prepare_for_sync_shutdown())
+        done, _ = await asyncio.wait((preparation,), timeout=2)
+        assert preparation in done, "maintenance cancellation exceeded the shutdown budget"
+        await preparation
+        assert stopped.is_set() is not resists_cancellation
+        assert not release.is_set()
+    finally:
+        release.set()
+        if preparation is not None:
+            await preparation
+        await wait_for_background_tasks(timeout=2, owner=bot._runtime_view)
 
 
 @asynccontextmanager
@@ -86,7 +153,7 @@ async def _consume_frame(bot: AgentBot, session: DurableSync, frame: bytes) -> N
         completed = True
 
     try:
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(30):
             while not completed:
                 facts = await consume_one_ingestion_batch(
                     session,
@@ -372,7 +439,7 @@ async def test_invite_completion_keeps_a_replacement_pending_inviter(
     replacement = "@replacement:localhost"
 
     async def welcome(_room_id: str, _sender: str) -> None:
-        bot._room_lifecycle.record_pending_room_invite(room.room_id, replacement)
+        await bot._room_lifecycle.record_pending_room_invite(room.room_id, replacement)
 
     monkeypatch.setattr(bot._room_lifecycle, "_send_invite_welcome", welcome)
     async with _owned_session(bot) as session:
@@ -416,11 +483,16 @@ async def test_malformed_message_does_not_block_following_valid_message(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_quiesce_is_bounded_when_delivery_projection_cannot_recover(
+@pytest.mark.parametrize("process_shutdown", [False, True], ids=["source-quiesce", "process-shutdown"])
+@pytest.mark.parametrize("projection_recovers", [False, True], ids=["unavailable", "recovered"])
+async def test_quiesce_retains_projection_ownership_until_drain_or_timeout(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    process_shutdown: bool,
+    projection_recovers: bool,
 ) -> None:
-    """Source drain must let shutdown continue while retaining blocked input."""
+    """Projection shutdown retains the source until it drains or the bounded owner cancels it."""
+    monkeypatch.setattr("mindroom.bot.SYNC_SHUTDOWN_PREPARATION_TIMEOUT_SECONDS", 0.05)
     bot = _agent_bot(tmp_path)
     principal = bot.journal_principal()
     account = bot.agent_user.user_id
@@ -431,12 +503,13 @@ async def test_quiesce_is_bounded_when_delivery_projection_cannot_recover(
         sender=account,
         content=interactive_prompt("Old?", "old", source_event_id="$turn"),
     )
+    edit = interactive_edit("$prompt", "New?", "new", source_event_id="$turn")
     await principal.enqueue_matrix_delivery(
         delivery_id="$edit",
         stage=DeliveryStage.FINAL,
         room_id=ROOM,
         thread_id=None,
-        payload=interactive_edit("$prompt", "New?", "new", source_event_id="$turn"),
+        payload=edit,
         edits_event_id="$prompt",
     )
     await principal.claim_matrix_delivery(delivery_id="$edit", stage=DeliveryStage.FINAL)
@@ -461,17 +534,43 @@ async def test_quiesce_is_bounded_when_delivery_projection_cannot_recover(
                 ),
             )
         recovery_attempted = asyncio.Event()
+        release_recovery = asyncio.Event()
+        session._maintain_crypto = AsyncMock()
 
-        async def unavailable_delivery() -> bool:
+        async def recover_projection() -> bool:
             recovery_attempted.set()
-            return False
+            await release_recovery.wait()
+            if projection_recovers:
+                await principal.acknowledge_matrix_delivery(
+                    delivery_id="$edit",
+                    stage=DeliveryStage.FINAL,
+                    event_id="$edit-event",
+                    delivered_projections=(projection("$edit-event", sender=account, ts=2500, content=edit),),
+                )
+            return projection_recovers
 
-        monkeypatch.setattr(bot, "_recover_unacknowledged_matrix_deliveries", unavailable_delivery)
+        monkeypatch.setattr(bot, "_recover_unacknowledged_matrix_deliveries", recover_projection)
         sync = asyncio.create_task(bot.sync_forever())
         try:
             await asyncio.wait_for(recovery_attempted.wait(), timeout=2)
-            await asyncio.wait_for(bot._quiesce_matrix_ingestion(), timeout=5.2)
+            source = session._running
+            assert source is not None
+            if process_shutdown:
+                bot.begin_process_shutdown()
+            quiescing = asyncio.create_task(bot._quiesce_matrix_ingestion())
+            await asyncio.sleep(0)
+            release_recovery.set()
+            await asyncio.wait_for(quiescing, timeout=1)
+            if projection_recovers:
+                await asyncio.wait_for(sync, timeout=1)
+                assert not source.cancelled()
+                assert await session.next_batch() is None
+                assert await principal.load_event("$reaction") is not None
+            else:
+                assert not source.done()
+                assert not sync.done()
         finally:
+            release_recovery.set()
             bot._sync_shutting_down = True
             bot._delivery_recovery_wake.set()
             sync.cancel()
@@ -480,9 +579,12 @@ async def test_quiesce_is_bounded_when_delivery_projection_cannot_recover(
                 await asyncio.gather(bot._delivery_recovery_task, return_exceptions=True)
     async with _owned_session(bot) as session:
         retained = await session.next_batch()
-        assert retained is not None
-        assert retained.records[0].source["event_id"] == "$reaction"
-        assert await principal.load_event("$reaction") is None
+        if projection_recovers:
+            assert retained is None
+        else:
+            assert retained is not None
+            assert retained.records[0].source["event_id"] == "$reaction"
+            assert await principal.load_event("$reaction") is None
 
 
 @pytest.mark.asyncio
@@ -672,7 +774,8 @@ async def test_entity_removal_leaves_with_retained_input_before_closing_stores(
         session._maintain_crypto = AsyncMock()
         orchestrator = _MultiAgentOrchestrator(runtime_paths=bot.runtime_paths)
         orchestrator.agent_bots[bot.agent_name] = bot
-        orchestrator._approval_transport.reconcile_unavailable_entities = AsyncMock()
+        monkeypatch.setattr(orchestrator._approval_recovery, "reconcile_unavailable_entities", AsyncMock())
+        monkeypatch.setattr(orchestrator, "_shared_journal_store", lambda: MagicMock(end_entity_replies=AsyncMock()))
         sync = asyncio.create_task(bot.sync_forever())
         orchestrator._sync_tasks[bot.agent_name] = sync
         try:

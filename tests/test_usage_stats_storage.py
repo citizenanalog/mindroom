@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.metrics import RunMetrics
+from agno.metrics import ModelMetrics, RunMetrics
 from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 from agno.run.team import TeamRunOutput
@@ -21,7 +22,8 @@ from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_key, worker_dir_name
-from mindroom.usage_stats_storage import (
+from mindroom.usage.legacy_usage_storage import migrate_usage_database
+from mindroom.usage.stats_storage import (
     UsageSessionRow,
     UsageStorageDiagnostic,
     UsageStorageSource,
@@ -49,6 +51,8 @@ _SESSION_COLUMNS = """
 
 
 def _source(path: Path, *, table: str = "code_sessions") -> UsageStorageSource:
+    # Existing-history fixtures pass through the same one-time import as startup.
+    migrate_usage_database(path, table)
     return UsageStorageSource(
         path=path,
         path_label=path.name,
@@ -56,7 +60,6 @@ def _source(path: Path, *, table: str = "code_sessions") -> UsageStorageSource:
         expected_session_table=table,
         source_agent_id="code",
         allowed_agent_ids=frozenset({"code"}),
-        allowed_team_ids=frozenset({"engineering"}),
         requester_isolated=False,
     )
 
@@ -79,7 +82,7 @@ def _run(*, nested: bool = False, parent_run_id: str | None = None) -> dict[str,
         "user_id": "@alice:example.test",
         "created_at": 1_723_837_600,
         "model_provider": "openai",
-        "model": "gpt-5.6",
+        "model": "gpt-6-astra",
         "status": "completed",
         "metrics": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
         "member_responses": member_responses,
@@ -205,10 +208,10 @@ def test_reader_extracts_only_top_level_usage_fields(tmp_path: Path) -> None:
     assert row.runs[0].metrics == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
     assert row.runs[0].requester_id == "@alice:example.test"
     assert row.runs[0].model_provider == "openai"
-    assert row.runs[0].model == "gpt-5.6"
+    assert row.runs[0].model == "gpt-6-astra"
+    assert row.runs[0].created_at == 1_723_837_600
     assert row.runs_available is True
     assert row.session_metrics_available is False
-    assert row.payload_bytes > 0
     assert not hasattr(row.runs[0], "member_responses")
     assert "secret" not in repr(row)
     assert "999" not in repr(row)
@@ -236,7 +239,7 @@ def test_reader_extracts_runs_written_by_mindroom_agno_storage(tmp_path: Path) -
                         user_id="@alice:example.test",
                         created_at=1_723_837_600,
                         model_provider="openai",
-                        model="gpt-5.6",
+                        model="gpt-6-astra",
                         status=RunStatus.completed,
                         metrics=RunMetrics(input_tokens=12, output_tokens=8, total_tokens=20),
                     ),
@@ -256,10 +259,76 @@ def test_reader_extracts_runs_written_by_mindroom_agno_storage(tmp_path: Path) -
     assert len(row.runs) == 1
     assert row.runs[0].metrics == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
     assert row.runs[0].model_provider == "openai"
-    assert row.runs[0].model == "gpt-5.6"
+    assert row.runs[0].model == "gpt-6-astra"
+    assert row.runs[0].created_at == 1_723_837_600
 
 
-def test_reader_extracts_team_session_metrics_written_by_agno(tmp_path: Path) -> None:
+@pytest.mark.parametrize("created_at", [None, True, "invalid", [], float("nan"), float("inf")])
+def test_reader_keeps_usage_when_run_timestamp_is_unusable(tmp_path: Path, created_at: object) -> None:
+    """Malformed or absent timestamps must not discard usable token metrics."""
+    database = tmp_path / "code.db"
+    _create_database(database, runs=[{**_run(), "created_at": created_at}])
+
+    result = list(iter_usage_storage_rows(_source(database)))
+
+    assert len(result) == 1
+    row = result[0]
+    assert isinstance(row, UsageSessionRow)
+    assert row.runs[0].created_at is None
+    assert row.runs[0].metrics["total_tokens"] == 20
+
+
+def test_reader_uses_run_table_timestamp_when_dict_payload_omits_it(tmp_path: Path) -> None:
+    """Agno's fallback timestamp remains available even when run_data omits it."""
+    storage = create_state_storage("code", tmp_path, subdir="sessions", session_table="code_sessions")
+    run = _run()
+    run.pop("created_at")
+    try:
+        storage.upsert_session(AgentSession(session_id="session-1", agent_id="code", user_id="@alice:example.test"))
+        storage.upsert_run(run, session_id="session-1", user_id="@alice:example.test")
+    finally:
+        storage.close()
+    database = tmp_path / "sessions" / "code.db"
+    with sqlite3.connect(database) as connection:
+        created_at = connection.execute("SELECT created_at FROM code_sessions_runs").fetchone()[0]
+    assert isinstance(created_at, int)
+
+    result = list(iter_usage_storage_rows(_source(database)))
+
+    assert len(result) == 1
+    row = result[0]
+    assert isinstance(row, UsageSessionRow)
+    assert row.runs[0].created_at == created_at
+    assert row.runs[0].metrics["total_tokens"] == 20
+
+
+@pytest.mark.parametrize("updated_timestamp", [None, "invalid", 1_723_924_000])
+def test_reader_preserves_run_table_creation_date_after_updates(tmp_path: Path, updated_timestamp: object) -> None:
+    """Updating a payload must not lose or move the run's original creation date."""
+    storage = create_state_storage("code", tmp_path, subdir="sessions", session_table="code_sessions")
+    run = _run()
+    try:
+        storage.upsert_session(AgentSession(session_id="session-1", agent_id="code", user_id="@alice:example.test"))
+        storage.upsert_run(run, session_id="session-1", user_id="@alice:example.test")
+        storage.upsert_run(
+            {**run, "created_at": updated_timestamp},
+            session_id="session-1",
+            user_id="@alice:example.test",
+        )
+    finally:
+        storage.close()
+
+    result = list(iter_usage_storage_rows(_source(tmp_path / "sessions" / "code.db")))
+
+    assert len(result) == 1
+    row = result[0]
+    assert isinstance(row, UsageSessionRow)
+    assert row.runs[0].created_at == 1_723_837_600
+    assert row.runs[0].metrics["total_tokens"] == 20
+
+
+@pytest.mark.parametrize("legacy_encoding", [False, True])
+def test_reader_extracts_team_session_metrics_written_by_agno(tmp_path: Path, legacy_encoding: bool) -> None:
     """Admin totals use Agno's member-inclusive team session aggregate."""
     session = TeamSession(
         session_id="session-1",
@@ -274,11 +343,41 @@ def test_reader_extracts_team_session_metrics_written_by_agno(tmp_path: Path) ->
         session,
         TeamRunOutput(
             team_id="engineering",
-            metrics=RunMetrics(input_tokens=7, output_tokens=3, total_tokens=10),
+            metrics=RunMetrics(
+                input_tokens=7,
+                output_tokens=3,
+                total_tokens=10,
+                details={
+                    "model": [
+                        ModelMetrics(
+                            id="model-a",
+                            provider="provider-a",
+                            input_tokens=7,
+                            output_tokens=3,
+                            total_tokens=10,
+                        ),
+                    ],
+                },
+            ),
             member_responses=[
                 RunOutput(
                     agent_id="code",
-                    metrics=RunMetrics(input_tokens=14, output_tokens=6, total_tokens=20),
+                    metrics=RunMetrics(
+                        input_tokens=14,
+                        output_tokens=6,
+                        total_tokens=20,
+                        details={
+                            "model": [
+                                ModelMetrics(
+                                    id="model-b",
+                                    provider="provider-b",
+                                    input_tokens=14,
+                                    output_tokens=6,
+                                    total_tokens=20,
+                                ),
+                            ],
+                        },
+                    ),
                 ),
             ],
         ),
@@ -295,14 +394,22 @@ def test_reader_extracts_team_session_metrics_written_by_agno(tmp_path: Path) ->
         storage.close()
 
     source = _source(tmp_path / "sessions" / "engineering.db", table="engineering_sessions")
-    result = list(iter_usage_storage_rows(source, mode="session_metrics"))
+    if legacy_encoding:
+        with sqlite3.connect(source.path) as connection:
+            (session_data,) = connection.execute("SELECT session_data FROM engineering_sessions").fetchone()
+            connection.execute("UPDATE engineering_sessions SET session_data = ?", (json.dumps(session_data),))
+    result = list(iter_usage_storage_rows(source, mode="both"))
 
     assert len(result) == 1
     row = result[0]
     assert isinstance(row, UsageSessionRow)
     assert row.session_metrics == {"input_tokens": 21, "output_tokens": 9, "total_tokens": 30}
+    assert [(entry.model_provider, entry.model, dict(entry.metrics)) for entry in row.session_model_metrics or ()] == [
+        ("provider-a", "model-a", {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}),
+        ("provider-b", "model-b", {"input_tokens": 14, "output_tokens": 6, "total_tokens": 20}),
+    ]
     assert row.runs == ()
-    assert row.runs_available is False
+    assert row.runs_available is True
     assert row.session_metrics_available is True
 
 
@@ -410,13 +517,11 @@ def test_reader_rejects_falsey_non_json_list_runs(tmp_path: Path, raw_runs: str)
 
     result = list(iter_usage_storage_rows(_source(database)))
 
-    assert result == [
-        UsageStorageDiagnostic(
-            path_label="code.db",
-            status="partial",
-            detail="malformed retained session",
-        ),
-    ]
+    assert len(result) == 1
+    assert isinstance(result[0], UsageSessionRow)
+    assert result[0].runs == ()
+    assert result[0].runs_available is False
+    assert "do not expose" not in repr(result)
 
 
 def test_missing_database_is_reported_without_creation(tmp_path: Path) -> None:
@@ -435,9 +540,10 @@ def test_reader_does_not_change_database_bytes(tmp_path: Path) -> None:
     """A successful read leaves the durable database bytes unchanged."""
     database = tmp_path / "code.db"
     _create_database(database)
+    source = _source(database)
     before = database.read_bytes()
 
-    result = list(iter_usage_storage_rows(_source(database)))
+    result = list(iter_usage_storage_rows(source))
 
     assert len(result) == 1
     assert database.read_bytes() == before
@@ -450,13 +556,11 @@ def test_malformed_runs_return_content_free_diagnostic(tmp_path: Path) -> None:
 
     result = list(iter_usage_storage_rows(_source(database)))
 
-    assert result == [
-        UsageStorageDiagnostic(
-            path_label="code.db",
-            status="partial",
-            detail="malformed retained session",
-        ),
-    ]
+    assert len(result) == 1
+    assert isinstance(result[0], UsageSessionRow)
+    assert result[0].runs == ()
+    assert result[0].runs_available is False
+    assert "do not expose" not in repr(result)
 
 
 def test_self_discovery_returns_only_current_private_database(tmp_path: Path) -> None:
@@ -509,6 +613,37 @@ def test_admin_discovery_finds_shared_private_and_team_databases(tmp_path: Path)
     assert team_database.resolve().relative_to(root.resolve()).as_posix() in labels
 
 
+@pytest.mark.parametrize("link_level", [0, 1, 2], ids=["database", "sessions", "team"])
+def test_admin_discovery_reports_rejected_team_symlinks(tmp_path: Path, link_level: int) -> None:
+    """Rejected team paths remain visible in coverage without hiding valid neighbors."""
+    runtime_paths = _paths(tmp_path)
+    root = runtime_paths.config_dir / "sessions"
+    rejected_database = root / "teams" / "team_rejected" / "sessions" / "team_rejected.db"
+    valid_database = root / "teams" / "team_valid" / "sessions" / "team_valid.db"
+    for database in (rejected_database, valid_database):
+        database.parent.mkdir(parents=True)
+        database.touch()
+    rejected_path = (rejected_database, rejected_database.parent, rejected_database.parent.parent)[link_level]
+    target = rejected_path.rename(tmp_path / "outside-team-source")
+    rejected_path.symlink_to(target, target_is_directory=link_level != 0)
+
+    sources = discover_admin_usage_sources(config=_config(), runtime_paths=runtime_paths)
+
+    assert (
+        UsageStorageDiagnostic(
+            path_label=rejected_database.relative_to(root).as_posix(),
+            status="partial",
+            detail="source discovery unavailable",
+            scope="team",
+        )
+        in sources
+    )
+    team_paths = {
+        source.path for source in sources if isinstance(source, UsageStorageSource) and source.scope == "team"
+    }
+    assert team_paths == {valid_database.resolve()}
+
+
 def test_admin_discovery_reports_directory_read_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -534,6 +669,35 @@ def test_admin_discovery_reports_directory_read_failure(
         and source.detail == "source discovery unavailable"
         for source in sources
     )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize("blocked", ["agents/broken", "agents/broken/sessions"])
+def test_admin_discovery_reports_unsearchable_shared_agent_directory(tmp_path: Path, blocked: str) -> None:
+    """One unsearchable agent directory becomes a coverage gap instead of failing discovery for every source."""
+    config = Config(agents={"broken": AgentConfig(display_name="Broken"), "shared": AgentConfig(display_name="Shared")})
+    runtime_paths = _paths(tmp_path)
+    root = runtime_paths.config_dir / "sessions"
+    (root / "agents" / "broken" / "sessions").mkdir(parents=True)
+    blocked_directory = root / blocked
+    blocked_directory.chmod(0)
+    try:
+        sources = discover_admin_usage_sources(config=config, runtime_paths=runtime_paths)
+    finally:
+        blocked_directory.chmod(0o755)
+
+    assert (
+        UsageStorageDiagnostic(
+            path_label="agents/broken/sessions/broken.db",
+            status="partial",
+            detail="source discovery unavailable",
+            scope="shared_agent",
+        )
+        in sources
+    )
+    assert [source.path_label for source in sources if isinstance(source, UsageStorageSource)] == [
+        "agents/shared/sessions/shared.db",
+    ]
 
 
 def test_reader_merges_legacy_blob_with_runs_table(tmp_path: Path) -> None:
@@ -563,4 +727,3 @@ def test_reader_merges_legacy_blob_with_runs_table(tmp_path: Path) -> None:
     assert [run.run_id for run in row.runs] == ["run-1", "run-2", "run-3"]
     assert row.runs[0].metrics == {"total_tokens": 99}
     assert row.runs[1].metrics == {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4}
-    assert row.payload_bytes > 0

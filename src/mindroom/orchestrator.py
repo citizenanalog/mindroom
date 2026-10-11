@@ -7,6 +7,7 @@ import signal
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from contextvars import Context
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, NoReturn, cast, overload
@@ -15,15 +16,22 @@ from uuid import uuid4
 import uvicorn
 
 from mindroom import constants
+from mindroom.agent_cli.session import TurnToolRegistry
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex, agent_reply_membership_policy_changed
 from mindroom.agent_reply_membership_sync import AgentReplyMembershipSync
 from mindroom.agents import ensure_default_agent_workspaces
-from mindroom.approval_transport import ApprovalMatrixTransport
+from mindroom.approval.manager import initialize_approval_store
+from mindroom.approval.recovery import ApprovalRecovery
+from mindroom.approval.tool_approval import shutdown_approval_runtime
+from mindroom.approval.transport import ApprovalMatrixTransport
 from mindroom.attachments import wait_for_attachment_cleanup_tasks
+from mindroom.automations.runner import AutomationRunner
 from mindroom.background_tasks import create_background_task, run_blocking_until_complete, wait_for_background_tasks
-from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.constants import ROUTER_AGENT_NAME, tracking_dir
+from mindroom.credentials.legacy_tool_credentials import migrate_tool_credential_defaults
+from mindroom.delegation.recovery import cancel_approval_delegations
 from mindroom.desktop.identity import controller_identity_for_live_bot
-from mindroom.embedder_health import check_embedder_health, handle_embedder_config_reload
+from mindroom.embeddings.embedder_health import check_embedder_health, handle_embedder_config_reload
 from mindroom.entity_resolution import (
     DuplicateManagedEntityIdentityError,
     MissingManagedEntityAccountError,
@@ -33,6 +41,8 @@ from mindroom.entity_resolution import (
 )
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.event_loop_stall import EventLoopStallDetector, start_event_loop_stall_detector
+from mindroom.file_locks import release_file_lock, try_exclusive_file_lock
+from mindroom.heap_probe import start_heap_type_probe
 from mindroom.hooks import (
     EVENT_CONFIG_RELOADED,
     ConfigReloadedContext,
@@ -43,15 +53,19 @@ from mindroom.hooks import (
     build_hook_room_state_querier,
     emit,
 )
-from mindroom.knowledge import KnowledgeRefreshScheduler, reconcile_knowledge_mode_transition_states
+from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
+from mindroom.knowledge.status import reconcile_knowledge_mode_transition_states
 from mindroom.knowledge.watch import KnowledgeSourceWatcher
-from mindroom.legacy_session_migration import run_legacy_session_migration_after_ready
+from mindroom.legacy_state_root_records import migrate_state_root_records
 from mindroom.matrix.client_room_admin import get_joined_rooms, get_room_members, invite_to_room
 from mindroom.matrix.health import reset_matrix_sync_health
 from mindroom.matrix.identity import managed_account_user_id
-from mindroom.matrix.rooms import ensure_all_rooms_exist, ensure_root_space, ensure_user_in_rooms
-from mindroom.matrix.stale_stream_cleanup import (
-    recover_stale_streaming_messages,
+from mindroom.matrix.provisioning_heartbeat import run_provisioning_heartbeat
+from mindroom.matrix.rooms import (
+    ensure_all_rooms_exist,
+    ensure_root_space,
+    ensure_user_in_rooms,
+    reconcile_managed_rooms,
 )
 from mindroom.matrix.state import load_rooms, resolve_room_aliases
 from mindroom.matrix.users import (
@@ -64,11 +78,13 @@ from mindroom.matrix.users import (
     preflight_managed_account_provisioning,
 )
 from mindroom.matrix_identifiers import extract_server_name_from_homeserver
+from mindroom.matrix_rtc.call_manager import preload_matrix_call_dependencies
 from mindroom.mcp.manager import MCPServerManager
 from mindroom.mcp.registry import mcp_tool_name
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.memory import MemoryAutoFlushWorker, auto_flush_enabled
-from mindroom.private_storage_migration import migrate_private_storage
+from mindroom.private_storage.legacy_private_storage import migrate_private_storage
+from mindroom.response_activity import ResponseIdentity
 from mindroom.response_admission import ResponseAdmissionGate
 from mindroom.runtime_shutdown import (
     ENTITY_REMOVED_SHUTDOWN,
@@ -85,10 +101,10 @@ from mindroom.runtime_state import (
     set_runtime_ready,
     set_runtime_starting,
 )
-from mindroom.scheduling_executor import set_scheduling_hook_registry
-from mindroom.startup_errors import PermanentStartupError
+from mindroom.scheduling.executor import set_scheduling_hook_registry
+from mindroom.skill_learning.runner import SkillReviewRunner
+from mindroom.startup_errors import EventJournalHoldLostError, PermanentStartupError
 from mindroom.startup_maintenance import StartupMaintenanceController
-from mindroom.tool_approval import shutdown_approval_runtime
 from mindroom.tool_system.plugins import (
     PluginReloadResult,
     apply_prepared_plugin_reload,
@@ -98,6 +114,8 @@ from mindroom.tool_system.plugins import (
     reload_plugins,
 )
 from mindroom.tool_system.skills import clear_skill_cache, get_skill_snapshot
+from mindroom.usage.legacy_usage_storage import migrate_usage_storage
+from mindroom.workers.backends.legacy_state_root_mounts import retire_state_root_worker_mounts
 from mindroom.workers.runtime import (
     clear_worker_validation_snapshot_cache,
     lease_configured_primary_worker_manager,
@@ -108,14 +126,19 @@ from mindroom.workers.runtime import (
 from . import file_watcher
 from .bot import AgentBot, TeamBot, create_bot_for_entity
 from .config.main import Config, load_config
-from .credentials_sync import sync_env_to_credentials
-from .event_journal_open import OpenEventJournal, bind_event_journal, open_event_journal
+from .credentials.sync import sync_env_to_credentials
+from .event_journal.opening import OpenEventJournal, bind_event_journal, open_event_journal
 from .logging_config import get_logger, setup_logging
+from .orchestration.computer_runtime import ComputerRuntimeCoordinator
 from .orchestration.config_lifecycle import ConfigReloadLifecycle
 from .orchestration.config_updates import build_config_update_plan, configured_entity_names
+from .orchestration.config_warnings import warn_about_config_risks
 from .orchestration.external_trigger_runtime import ExternalTriggerRuntimeCoordinator
 from .orchestration.plugin_watch import PluginWatchState, watch_plugins_task
-from .orchestration.rooms import get_room_user_ids_to_invite, get_root_space_user_ids_to_invite
+from .orchestration.rooms import (
+    get_room_user_ids_to_invite,
+    get_root_space_user_ids_to_invite,
+)
 from .orchestration.runtime import (
     STARTUP_RETRY_INITIAL_DELAY_SECONDS,
     STARTUP_RETRY_MAX_DELAY_SECONDS,
@@ -144,9 +167,11 @@ if TYPE_CHECKING:
 
     import nio
 
+    from mindroom.config.reload_status import ConfigReloadStatus
     from mindroom.desktop.identity import DesktopControllerIdentity
     from mindroom.event_journal import ApprovalContinuation, ApprovalDeliveryView
     from mindroom.hooks import HookMatrixAdmin, HookMessageSender, HookRoomStatePutter, HookRoomStateQuerier
+    from mindroom.matrix.room_reconciliation import RoomStateSnapshot
 
     from .constants import RuntimePaths
     from .event_journal import EventJournalStore
@@ -177,6 +202,7 @@ _AUXILIARY_TASK_RESTART_INITIAL_DELAY_SECONDS = 1.0
 _AUXILIARY_TASK_RESTART_MAX_DELAY_SECONDS = 30.0
 _EMBEDDED_API_SHUTDOWN_GRACE_SECONDS = 5.0
 _DEFERRED_RESPONSE_DIAGNOSTIC_INTERVAL_SECONDS = 5.0
+_EVENT_JOURNAL_HOLD_CHECK_SECONDS = 30.0
 
 
 async def _gather_periodic_shutdown_phase(
@@ -329,6 +355,7 @@ class _SignalAwareUvicornServer(uvicorn.Server):
         super().__init__(config)
         self._shutdown_requested = shutdown_requested
         self._on_started = on_started
+        self.received_signal_name: str | None = None
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         """Publish the API address only after Uvicorn successfully binds it."""
@@ -352,11 +379,9 @@ class _SignalAwareUvicornServer(uvicorn.Server):
         """Mirror Uvicorn signal handling and surface shutdown to the orchestrator."""
         del frame
         signal_number = int(sig)
-        logger.info(
-            "embedded_api_server_signal_received",
-            signal_number=signal_number,
-            signal_name=_signal_name(signal_number),
-        )
+        # A signal handler can interrupt a log write, which is not reentrant, so it
+        # only records the signal; the serve loop's exit log reports it.
+        self.received_signal_name = _signal_name(signal_number)
         if self._shutdown_requested is not None:
             self._shutdown_requested.set()
         if self.should_exit and signal_number == int(signal.SIGINT):
@@ -377,6 +402,7 @@ class _MultiAgentOrchestrator:
     # The one journal every bot in this process borrows a store from, opened on
     # first use and closed after the last bot stops.
     _open_journal: OpenEventJournal | None = field(default=None, init=False, repr=False)
+    _journal_held: bool = field(default=False, init=False, repr=False)
     running: bool = field(default=False, init=False)
     config: Config | None = field(default=None, init=False)
     _sync_tasks: dict[str, asyncio.Task] = field(default_factory=dict, init=False)
@@ -384,6 +410,8 @@ class _MultiAgentOrchestrator:
     _permanently_failed_entities: set[str] = field(default_factory=set, init=False)
     _memory_auto_flush_worker: MemoryAutoFlushWorker | None = field(default=None, init=False)
     _memory_auto_flush_task: asyncio.Task | None = field(default=None, init=False)
+    _skill_reviews: SkillReviewRunner = field(init=False, repr=False)
+    _automations: AutomationRunner = field(init=False, repr=False)
     _todo_poke_runtime: TodoPokeRuntimeCoordinator = field(init=False, repr=False)
     _thread_export_runner: WorkspaceThreadExportRunner = field(init=False, repr=False)
     config_reload: ConfigReloadLifecycle = field(init=False)
@@ -395,8 +423,9 @@ class _MultiAgentOrchestrator:
     _dispatch_recovery_requested: bool = field(default=False, init=False, repr=False)
     _response_admission_gate: ResponseAdmissionGate = field(default_factory=ResponseAdmissionGate, init=False)
     _mcp_catalog_change_task_owner: object = field(default_factory=object, init=False, repr=False)
-    _pending_replacement_recovery_room_ids: dict[str, set[str]] = field(default_factory=dict, init=False)
+    _pending_mcp_catalog_restarts: dict[str, asyncio.Task[None]] = field(default_factory=dict, init=False, repr=False)
     plugin_watch: PluginWatchState = field(init=False)
+    agent_cli_registry: TurnToolRegistry = field(default_factory=TurnToolRegistry, init=False)
     _knowledge_refresh_scheduler: KnowledgeRefreshScheduler = field(init=False)
     _knowledge_source_watcher: KnowledgeSourceWatcher = field(init=False)
     _hook_registry_state: HookRegistryState = field(
@@ -411,6 +440,7 @@ class _MultiAgentOrchestrator:
         init=False,
         repr=False,
     )
+    _computer_runtime: ComputerRuntimeCoordinator = field(init=False, repr=False)
     _external_trigger_runtime: ExternalTriggerRuntimeCoordinator = field(init=False, repr=False)
     _approval_transport: ApprovalMatrixTransport = field(init=False, repr=False)
     _startup_maintenance: StartupMaintenanceController = field(init=False, repr=False)
@@ -430,15 +460,28 @@ class _MultiAgentOrchestrator:
         self._knowledge_source_watcher = KnowledgeSourceWatcher(self._knowledge_refresh_scheduler)
         self.agent_reply_membership_sync = AgentReplyMembershipSync(self.agent_reply_memberships)
         self.plugin_watch = PluginWatchState(runtime_paths=self.runtime_paths)
+        self._computer_runtime = ComputerRuntimeCoordinator(
+            runtime_paths=self.runtime_paths,
+            api_enabled=self.api_enabled,
+            agent_reply_memberships=self.agent_reply_memberships,
+        )
         self._external_trigger_runtime = ExternalTriggerRuntimeCoordinator(
             runtime_paths=self.runtime_paths,
             api_enabled=self.api_enabled,
             agent_reply_memberships=self.agent_reply_memberships,
         )
+        self._skill_reviews = SkillReviewRunner(self.runtime_paths, lambda agent_name: self.agent_bots.get(agent_name))
+        self._automations = AutomationRunner(
+            runtime_paths=self.runtime_paths,
+            config_provider=lambda: self.config,
+            bot_provider=lambda entity_name: self.agent_bots.get(entity_name),
+            definition_provider=lambda name: self.hook_registry.automations.get(name),
+        )
         self._todo_poke_runtime = TodoPokeRuntimeCoordinator(
             runtime_paths=self.runtime_paths,
             config_provider=lambda: self.config,
             bot_provider=lambda entity_name: self.agent_bots.get(entity_name),
+            agent_reply_memberships=self.agent_reply_memberships,
         )
         self._thread_export_runner = WorkspaceThreadExportRunner(
             WorkspaceThreadExportDeps(
@@ -446,6 +489,7 @@ class _MultiAgentOrchestrator:
                 config_provider=lambda: self.config,
                 bot_provider=lambda entity_name: self.agent_bots.get(entity_name),
                 response_admission_gate=self._response_admission_gate,
+                agent_reply_memberships=self.agent_reply_memberships,
             ),
         )
         self._script_runtime = build_script_runtime(
@@ -471,28 +515,27 @@ class _MultiAgentOrchestrator:
             config_update_lock=self._config_update_lock,
         )
         self._approval_transport = ApprovalMatrixTransport(
-            runtime_paths=self.runtime_paths,
             bot_provider=lambda agent_name: self.agent_bots.get(agent_name),
-            cards_provider=self._approval_cards,
+        )
+        self._approval_recovery = ApprovalRecovery(
+            deliver_unavailable_notice=self._approval_transport.deliver_unavailable_notice,
             journal_provider=self._shared_journal_store,
             entity_configured=lambda name: (
                 self.config is not None and (name in self.config.agents or name in self.config.teams)
             ),
             entity_permanently_unavailable=lambda name: name in self._permanently_failed_entities,
             recover_unavailable_final=self._recover_unavailable_final,
+            cancel_delegations=lambda continuation, reason: cancel_approval_delegations(
+                continuation,
+                config=self._require_config(),
+                runtime_paths=self.runtime_paths,
+                reason=reason,
+            ),
         )
         self._startup_maintenance = StartupMaintenanceController(
-            recover_stale_streams=lambda bots, config, startup_cutoff_ms, scanned_room_ids: (
-                self._recover_stale_streams_after_restart(
-                    bots,
-                    config,
-                    startup_cutoff_ms,
-                    scanned_room_ids,
-                )
-            ),
             setup_rooms_and_memberships=self._setup_startup_rooms_and_memberships,
             sync_runtime_support=lambda config: self._sync_runtime_support_services(config, start_watcher=True),
-            mark_runtime_support_ready=lambda: self._approval_transport.mark_startup_runtime_support_ready(),
+            mark_runtime_support_ready=lambda: self._approval_recovery.mark_startup_runtime_support_ready(),
         )
 
     @property
@@ -510,10 +553,28 @@ class _MultiAgentOrchestrator:
         """Return the process-local background-script lifecycle collaborator."""
         return self._script_runtime
 
+    def active_call_identities(self) -> list[ResponseIdentity]:
+        """Return one identity per voice call that any bot has joined or is joining."""
+        return [
+            ResponseIdentity(responder=entity_name, requester_id=requester_id)
+            for entity_name, bot in self.agent_bots.items()
+            for requester_id in bot.active_call_requesters
+        ]
+
     @property
     def knowledge_refresh_scheduler(self) -> KnowledgeRefreshScheduler:
         """Return the orchestrator-owned background knowledge refresh scheduler."""
         return self._knowledge_refresh_scheduler
+
+    @property
+    def skill_reviews(self) -> SkillReviewRunner:
+        """Return the orchestrator-owned runner of automatic skill reviews."""
+        return self._skill_reviews
+
+    @property
+    def automations(self) -> AutomationRunner:
+        """Return the orchestrator-owned runner of automations."""
+        return self._automations
 
     def entity_first_sync_complete(self, entity_name: str) -> bool | None:
         """Return first-sync readiness for the current entity generation."""
@@ -674,10 +735,23 @@ class _MultiAgentOrchestrator:
             update_runtime_state=False,
         )
         self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
+        self._computer_runtime.bind_if_ready(self.config, self.agent_bots)
 
     def _configure_approval_store_transport(self) -> None:
         """Bind approval transport hooks to the current shared runtime services."""
-        self._approval_transport.bind_approval_runtime()
+        transport = self._approval_transport
+        initialize_approval_store(
+            self.runtime_paths,
+            prepare_event=transport.prepare_approval_event,
+            send_delivery=transport.send_approval_delivery,
+            resolve_delivery=transport.resolve_approval_delivery,
+            resolve_action_delivery=transport.resolve_approval_action_delivery,
+            cards=self._approval_cards(),
+            transport_sender=transport.transport_sender_id,
+            sending_device=transport.transport_device_id,
+            continuation_ready=transport.wake_continuation_sources,
+            recovery=self._approval_recovery,
+        )
 
     async def _ensure_user_account(self, config: Config) -> None:
         """Ensure a user account exists, creating one if necessary.
@@ -848,13 +922,19 @@ class _MultiAgentOrchestrator:
 
     async def _run_scheduled_turn_dispatch_recovery(self) -> None:
         """Drain readiness signals without blocking a Matrix sync callback."""
+
+        async def recover() -> None:
+            if not self._runtime_ready_event.is_set():
+                return
+            await self._recover_ready_turn_journal_events()
+
         current_task = asyncio.current_task()
         try:
             while self._dispatch_recovery_requested:
                 self._dispatch_recovery_requested = False
                 await run_with_retry(
                     "Recovering ready turn dispatch obligations",
-                    self._recover_ready_turn_journal_events,
+                    recover,
                     update_runtime_state=False,
                 )
         finally:
@@ -894,7 +974,7 @@ class _MultiAgentOrchestrator:
                     start_status = await self._try_start_bot_once(entity_name, bot)
                 if start_status is None:
                     self._permanently_failed_entities.add(entity_name)
-                    await self._approval_transport.reconcile_unavailable_entities({entity_name})
+                    await self._approval_recovery.reconcile_unavailable_entities({entity_name})
                     return
                 if start_status:
                     self._permanently_failed_entities.discard(entity_name)
@@ -913,9 +993,8 @@ class _MultiAgentOrchestrator:
                             permanent_error_check=is_permanent_startup_error,
                             update_runtime_state=False,
                         )
-                    if config is not None:
-                        await self._recover_pending_replacement_rooms(config)
                     self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
+                    self._computer_runtime.bind_if_ready(self.config, self.agent_bots)
                     return
 
                 attempt += 1
@@ -967,6 +1046,7 @@ class _MultiAgentOrchestrator:
         self._configure_approval_store_transport()
         await self._sync_memory_auto_flush_worker()
         await self._todo_poke_runtime.sync()
+        self._automations.start()
         self._thread_export_runner.start()
         if self.running:
             # Startup queues its own pass once the bots are up; a reload
@@ -1319,12 +1399,14 @@ class _MultiAgentOrchestrator:
         logger.info("Initializing multi-agent system...")
 
         config = await asyncio.to_thread(load_config, self.runtime_paths, tolerate_plugin_load_errors=True)
+        preload_matrix_call_dependencies(config)
         hook_registry = await asyncio.to_thread(self._build_hook_registry, config)
         entity_names = configured_entity_names(config)
         self._preflight_account_provisioning(config, entity_names=entity_names, include_internal_user=True)
         await self._prepare_user_account(config, update_runtime_state=True)
         entity_users = await self._prepare_entity_accounts(config, entity_names)
         self.config = config
+        warn_about_config_risks(config, self.runtime_paths)
         self.agent_reply_memberships.invalidate(config, reason="initial_config")
         await self._bind_event_journal()
         self._activate_hook_registry(hook_registry)
@@ -1398,6 +1480,13 @@ class _MultiAgentOrchestrator:
             return None
         return build_hook_matrix_admin(router_bot.client, self.runtime_paths, config=self.config)
 
+    def running_entity_client(self, entity_name: str) -> nio.AsyncClient | None:
+        """Return the Matrix client of one running managed entity."""
+        bot = self.agent_bots.get(entity_name)
+        if bot is None or not bot.running:
+            return None
+        return bot.client
+
     def _log_degraded_startup(self, failed_agents: list[str]) -> None:
         """Log degraded startup status for failed non-router bots."""
         if failed_agents:
@@ -1411,118 +1500,6 @@ class _MultiAgentOrchestrator:
             return
         logger.info("All agent bots started successfully")
 
-    async def _recover_stale_streams_after_restart(
-        self,
-        bots: list[AgentBot | TeamBot],
-        config: Config,
-        startup_cutoff_ms: int | None,
-        scanned_room_ids: set[str],
-        *,
-        target_room_ids: set[str] | None = None,
-    ) -> None:
-        """Recover interrupted responses from one concurrent room scan."""
-        actors: dict[str, nio.AsyncClient] = {}
-        for bot in bots:
-            if bot.client is None or not bot.agent_user.user_id:
-                continue
-            actors[bot.agent_user.user_id] = bot.client
-        if not actors:
-            return
-        router_bot = self._router_bot()
-
-        principals = {bot.agent_name: bot.journal_principal() for bot in bots if bot.client is not None}
-
-        async def response_is_owned(agent_name: str, room_id: str, event_id: str) -> bool:
-            principal = principals.get(agent_name)
-            return principal is not None and await principal.owns_matrix_response(room_id=room_id, event_id=event_id)
-
-        result = await recover_stale_streaming_messages(
-            actors,
-            resume_client=router_bot.client if router_bot is not None else None,
-            response_is_owned=response_is_owned,
-            config=config,
-            runtime_paths=self.runtime_paths,
-            startup_cutoff_ms=startup_cutoff_ms,
-            scanned_room_ids=scanned_room_ids,
-            target_room_ids=target_room_ids,
-        )
-        logger.info(
-            "Completed stale stream recovery",
-            room_count=result.room_count,
-            cleaned_count=result.cleaned_count,
-            resumed_count=result.resumed_count,
-        )
-
-    def _capture_replacement_recovery_rooms(
-        self,
-        replaced_bots: dict[str, AgentBot | TeamBot],
-    ) -> None:
-        """Retain interrupted rooms after their old bot generation stops."""
-        for entity_name, bot in replaced_bots.items():
-            room_ids = set(bot.pending_sync_restart_retry_room_ids)
-            if room_ids:
-                self._pending_replacement_recovery_room_ids.setdefault(entity_name, set()).update(room_ids)
-
-    def _replacement_bots(self, entity_names: set[str]) -> dict[str, AgentBot | TeamBot]:
-        """Retain bot references across replacement shutdown."""
-        return {
-            entity_name: self.agent_bots[entity_name] for entity_name in entity_names if entity_name in self.agent_bots
-        }
-
-    def _restore_pending_replacement_rooms(
-        self,
-        claimed_room_ids: dict[str, frozenset[str]],
-        scanned_room_ids: set[str],
-    ) -> None:
-        """Requeue claimed handoffs that were not successfully scanned."""
-        for entity_name, room_ids in claimed_room_ids.items():
-            unscanned_room_ids = room_ids - scanned_room_ids
-            if unscanned_room_ids:
-                self._pending_replacement_recovery_room_ids.setdefault(entity_name, set()).update(unscanned_room_ids)
-
-    async def _recover_pending_replacement_rooms(self, config: Config) -> None:
-        """Recover captured interruption markers through currently running replacements."""
-        if not self._pending_replacement_recovery_room_ids:
-            return
-        if not config.defaults.auto_resume_after_restart:
-            self._pending_replacement_recovery_room_ids.clear()
-            return
-
-        router_bot = self._router_bot()
-        if router_bot is None or not router_bot.running:
-            return
-        recovery_bots = [
-            bot
-            for bot in self._running_bots_for_entities(self._pending_replacement_recovery_room_ids)
-            if bot.client is not None and bot.agent_user.user_id
-        ]
-        if not recovery_bots:
-            return
-        claimed_room_ids = {
-            bot.agent_name: frozenset(self._pending_replacement_recovery_room_ids[bot.agent_name])
-            for bot in recovery_bots
-        }
-        for entity_name, room_ids in claimed_room_ids.items():
-            pending_room_ids = self._pending_replacement_recovery_room_ids.get(entity_name)
-            if pending_room_ids is None:
-                continue
-            pending_room_ids.difference_update(room_ids)
-            if not pending_room_ids:
-                del self._pending_replacement_recovery_room_ids[entity_name]
-        scanned_room_ids: set[str] = set()
-        try:
-            await self._recover_stale_streams_after_restart(
-                recovery_bots,
-                config,
-                None,
-                scanned_room_ids,
-                target_room_ids=set().union(*claimed_room_ids.values()),
-            )
-        except BaseException:
-            self._restore_pending_replacement_rooms(claimed_room_ids, set())
-            raise
-        self._restore_pending_replacement_rooms(claimed_room_ids, scanned_room_ids)
-
     def _resolve_bot_room_aliases(self, bots: list[AgentBot | TeamBot], config: Config) -> None:
         """Resolve currently known room aliases into each bot's configured room IDs."""
         for bot in bots:
@@ -1533,7 +1510,8 @@ class _MultiAgentOrchestrator:
         """Handle bot-ready notifications through the public runtime protocol."""
         if bot.agent_name == ROUTER_AGENT_NAME:
             self._router_reply_memberships_live_sync_ready.set()
-        await self._approval_transport.handle_bot_ready(bot)
+        if bot.agent_name == ROUTER_AGENT_NAME and bot.running and bot.client is not None:
+            await self._approval_recovery.mark_router_ready()
         self._schedule_ready_turn_dispatch_recovery()
 
     def invalidate_agent_reply_memberships(self, *, reason: str) -> None:
@@ -1586,6 +1564,7 @@ class _MultiAgentOrchestrator:
             return
         await self.agent_reply_memberships.refresh(config, self.runtime_paths, router_bot.client)
         self.agent_reply_membership_sync.record_authoritative_refresh(config)
+        self._schedule_ready_turn_dispatch_recovery()
         for bot in self.agent_bots.values():
             bot.schedule_pending_invite_reconciliation()
         await self.revoke_reply_authorized_calls()
@@ -1594,12 +1573,20 @@ class _MultiAgentOrchestrator:
         for bot in self.agent_bots.values():
             bot.schedule_reply_authorized_call_reconciliation()
 
+    async def _end_unconfigured_entity_replies(self, config: Config) -> None:
+        """End the replies of entities removed while MindRoom was stopped; no bot finishes them."""
+        configured = {ROUTER_AGENT_NAME, *config.agents, *config.teams}
+        await self._shared_journal_store().end_entity_replies(
+            lambda entity_name: entity_name not in configured,
+            now_ns=time.time_ns(),
+        )
+
     async def _start_runtime(self) -> None:
         """Run the startup sequence before handing off to the sync loops."""
         runtime_shutdown_event = self._reset_runtime_shutdown_event()
         self._runtime_ready_event.clear()
         self._router_reply_memberships_live_sync_ready.clear()
-        self._approval_transport.reset_startup_cleanup_gate()
+        self._approval_recovery.reset_startup_cleanup_gate()
         phase_started = log_startup_phase_started("wait_for_matrix_homeserver")
         await wait_for_matrix_homeserver(runtime_paths=self.runtime_paths)
         log_startup_phase_finished("wait_for_matrix_homeserver", phase_started)
@@ -1627,6 +1614,7 @@ class _MultiAgentOrchestrator:
         )
 
         config = self._require_config()
+        await self._end_unconfigured_entity_replies(config)
         self._log_mcp_degraded_entities(config)
         self._resolve_bot_room_aliases(started_bots, config)
         phase_started = log_startup_phase_started("bind_runtime_support")
@@ -1645,18 +1633,19 @@ class _MultiAgentOrchestrator:
                 self._start_sync_task(bot.agent_name, bot)
             log_startup_phase_finished("start_matrix_sync_loops", phase_started)
 
-            startup_cutoff_ms = int(time.time() * 1000)
-            self._startup_maintenance.start(started_bots, config, startup_cutoff_ms=startup_cutoff_ms)
+            self._startup_maintenance.start(started_bots, config)
             room_membership_policy_configured = self.agent_reply_memberships.needs_refresh(config)
             if room_membership_policy_configured:
-                set_runtime_starting("Establishing Matrix room memberships")
-                await self._startup_maintenance.wait_for_rooms_and_memberships()
+                set_runtime_starting("Waiting for the router's first Matrix sync")
 
             if runtime_shutdown_event.is_set():
                 return
 
-            # Publish semantic callbacks only after room-backed reply grants and
-            # the router's initial owned sync have both been established.
+            # Publish semantic callbacks once the router's initial owned sync has
+            # rebuilt room-backed reply grants from Matrix. Room setup keeps
+            # running in the background: a grant room it has not joined or
+            # created yet stays pending, and its sources replay after setup
+            # refreshes the grants.
             sync_ready = await self._wait_for_initial_membership_sync(
                 runtime_shutdown_event,
                 room_membership_policy_configured=room_membership_policy_configured,
@@ -1671,6 +1660,7 @@ class _MultiAgentOrchestrator:
                 check_embedder_health(config, self.runtime_paths, reason="startup"),
                 name="embedder_startup_health_check",
             )
+            self.config_reload.record_applied(config)
             set_runtime_ready()
             self._runtime_ready_event.set()
             self._schedule_ready_turn_dispatch_recovery()
@@ -1727,6 +1717,7 @@ class _MultiAgentOrchestrator:
         await self._prepare_user_account(new_config, update_runtime_state=not self.running)
         await self._prepare_entity_accounts(new_config, entity_names)
         self.config = new_config
+        warn_about_config_risks(new_config, self.runtime_paths)
         self.agent_reply_memberships.invalidate(new_config, reason="initial_config_reload")
         self._activate_hook_registry(hook_registry)
         await self._sync_mcp_manager(new_config)
@@ -1794,8 +1785,8 @@ class _MultiAgentOrchestrator:
     async def _remove_deleted_entities(self, removed_entities: set[str]) -> None:
         """Leave rooms before canceling ingestion and releasing removed entities."""
         self._external_trigger_runtime.unbind_for_entity_changes(removed_entities)
+        self._computer_runtime.unbind_for_entity_changes(removed_entities)
         for entity_name in removed_entities:
-            self._pending_replacement_recovery_room_ids.pop(entity_name, None)
             await self._cancel_bot_start_task(entity_name)
 
             bot = self.agent_bots.get(entity_name)
@@ -1805,7 +1796,7 @@ class _MultiAgentOrchestrator:
         # A frozen successful FINAL must be recovered while the original
         # sender and its lifecycle collaborators still exist. Router fallback
         # may settle only continuations that never acquired FINAL ownership.
-        await self._approval_transport.reconcile_unavailable_entities(removed_entities)
+        await self._approval_recovery.reconcile_unavailable_entities(removed_entities)
 
         for entity_name in removed_entities:
             bot = self.agent_bots.get(entity_name)
@@ -1819,6 +1810,9 @@ class _MultiAgentOrchestrator:
             if bot is not None:
                 await bot.stop(shutdown_intent=ENTITY_REMOVED_SHUTDOWN)
                 self.agent_bots.pop(entity_name, None)
+        if removed_entities:
+            # No bot remains to finish their replies.
+            await self._shared_journal_store().end_entity_replies(removed_entities.__contains__, now_ns=time.time_ns())
 
     async def _stop_entities_before_mcp_sync(
         self,
@@ -1837,14 +1831,13 @@ class _MultiAgentOrchestrator:
             return set()
 
         self._external_trigger_runtime.unbind_for_entity_changes(affected_entities)
-        replaced_bots = self._replacement_bots(affected_entities)
+        self._computer_runtime.unbind_for_entity_changes(affected_entities)
         for entity_name in affected_entities:
             await self._cancel_bot_start_task(entity_name)
         await self._stop_runtime_entities(
             affected_entities,
             restart_entities=affected_entities & set(configured_entity_names(new_config)),
         )
-        self._capture_replacement_recovery_rooms(replaced_bots)
         return affected_entities
 
     async def _restart_changed_entities(
@@ -1858,9 +1851,9 @@ class _MultiAgentOrchestrator:
             plan.entities_to_restart | plan.new_entities | plan.removed_entities,
         )
         entities_to_stop = plan.entities_to_restart - (already_stopped_entities or set())
-        replaced_bots = self._replacement_bots(plan.entities_to_restart)
         if entities_to_stop:
             self._external_trigger_runtime.unbind_for_entity_changes(entities_to_stop)
+            self._computer_runtime.unbind_for_entity_changes(entities_to_stop)
             for entity_name in entities_to_stop:
                 await self._cancel_bot_start_task(entity_name)
             await self._stop_runtime_entities(
@@ -1868,7 +1861,6 @@ class _MultiAgentOrchestrator:
                 restart_entities=entities_to_stop & plan.configured_entities,
             )
 
-        self._capture_replacement_recovery_rooms(replaced_bots)
         entities_to_recreate = plan.entities_to_restart & plan.configured_entities
         changed_entities = entities_to_recreate | plan.new_entities
         start_results = await self._create_and_start_entities(
@@ -1879,11 +1871,10 @@ class _MultiAgentOrchestrator:
 
         removed_restarted_entities = plan.entities_to_restart - plan.configured_entities
         for entity_name in removed_restarted_entities:
-            self._pending_replacement_recovery_room_ids.pop(entity_name, None)
             self.agent_bots.pop(entity_name, None)
 
         await self._remove_deleted_entities(plan.removed_entities)
-        await self._approval_transport.reconcile_unavailable_entities(
+        await self._approval_recovery.reconcile_unavailable_entities(
             set(start_results.permanently_failed_entities),
         )
         self._schedule_ready_turn_dispatch_recovery()
@@ -1891,31 +1882,41 @@ class _MultiAgentOrchestrator:
 
     async def _handle_mcp_catalog_change(self, server_id: str) -> None:
         """Restart entities that reference one changed MCP catalog."""
-        config = self.config
-        if not self.running or config is None:
-            return
-        if not config.get_entities_referencing_tools({mcp_tool_name(server_id)}):
-            clear_worker_validation_snapshot_cache()
-            return
-        await self.config_reload.apply_with_response_admission(
-            partial(self._apply_mcp_catalog_change, server_id),
-            operation_name="MCP catalog restart",
-            request_is_current=lambda: self.running and self.config is not None,
-        )
+        try:
+            config = self.config
+            if not self.running or config is None:
+                return
+            if not config.get_entities_referencing_tools({mcp_tool_name(server_id)}):
+                clear_worker_validation_snapshot_cache()
+                return
+            await self.config_reload.apply_with_response_admission(
+                partial(self._apply_mcp_catalog_change, server_id),
+                operation_name="MCP catalog restart",
+                request_is_current=lambda: self.running and self.config is not None,
+            )
+        finally:
+            # A restart that ends without applying must not absorb later changes.
+            if self._pending_mcp_catalog_restarts.get(server_id) is asyncio.current_task():
+                del self._pending_mcp_catalog_restarts[server_id]
 
     async def _notify_mcp_catalog_change(self, server_id: str) -> None:
         """Schedule a catalog restart so an admitted MCP call can release first."""
-        if not self.running:
+        # A queued restart reads the catalog only when it applies, so it already covers this change.
+        if not self.running or server_id in self._pending_mcp_catalog_restarts:
             return
-        create_background_task(
+        self._pending_mcp_catalog_restarts[server_id] = create_background_task(
             self._handle_mcp_catalog_change(server_id),
             name=f"mcp_catalog_change:{server_id}",
             owner=self._mcp_catalog_change_task_owner,
+            # A tool call can report the change, and the bots this restarts must not inherit its turn's context.
+            context=Context(),
         )
 
     async def _apply_mcp_catalog_change(self, server_id: str) -> None:
         """Apply one MCP catalog-triggered entity replacement."""
         async with self._config_update_lock:
+            # This restart reads the catalog next, so changes reported from here on need their own restart.
+            self._pending_mcp_catalog_restarts.pop(server_id, None)
             if not self.running or self.config is None:
                 return
             clear_worker_validation_snapshot_cache()
@@ -1927,37 +1928,45 @@ class _MultiAgentOrchestrator:
                 server_id=server_id,
                 entities=sorted(changed_entities),
             )
-            self._permanently_failed_entities.difference_update(changed_entities)
-            self._external_trigger_runtime.unbind_for_entity_changes(changed_entities)
-            replaced_bots = self._replacement_bots(changed_entities)
-            for entity_name in changed_entities:
-                await self._cancel_bot_start_task(entity_name)
-            await self._stop_runtime_entities(
-                changed_entities,
-                restart_entities=changed_entities,
-            )
-            self._capture_replacement_recovery_rooms(replaced_bots)
-            start_results = await self._create_and_start_entities(
-                changed_entities,
-                self.config,
-                start_sync_tasks=True,
-            )
-            self._schedule_ready_turn_dispatch_recovery()
-            if start_results.started_bots:
-                await self._setup_rooms_and_memberships(start_results.started_bots)
-            await self._recover_pending_replacement_rooms(self.config)
-            self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
-            for entity_name in start_results.retryable_entities:
-                await self._schedule_bot_start_retry(entity_name)
-            if start_results.permanently_failed_entities:
-                await self._approval_transport.reconcile_unavailable_entities(
-                    start_results.permanently_failed_entities,
+            # Startup maintenance holds the bots it started with, so replay it with the replacements.
+            replay_startup_maintenance = await self._startup_maintenance.cancel()
+            try:
+                self._permanently_failed_entities.difference_update(changed_entities)
+                self._external_trigger_runtime.unbind_for_entity_changes(changed_entities)
+                self._computer_runtime.unbind_for_entity_changes(changed_entities)
+                for entity_name in changed_entities:
+                    await self._cancel_bot_start_task(entity_name)
+                await self._stop_runtime_entities(
+                    changed_entities,
+                    restart_entities=changed_entities,
                 )
-                logger.warning(
-                    "MCP catalog restart left some bots disabled",
-                    server_id=server_id,
-                    entities=start_results.permanently_failed_entities,
+                start_results = await self._create_and_start_entities(
+                    changed_entities,
+                    self.config,
+                    start_sync_tasks=True,
                 )
+                self._schedule_ready_turn_dispatch_recovery()
+                if start_results.started_bots:
+                    await self._setup_rooms_and_memberships(start_results.started_bots)
+                self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
+                self._computer_runtime.bind_if_ready(self.config, self.agent_bots)
+                for entity_name in start_results.retryable_entities:
+                    await self._schedule_bot_start_retry(entity_name)
+                if start_results.permanently_failed_entities:
+                    await self._approval_recovery.reconcile_unavailable_entities(
+                        start_results.permanently_failed_entities,
+                    )
+                    logger.warning(
+                        "MCP catalog restart left some bots disabled",
+                        server_id=server_id,
+                        entities=start_results.permanently_failed_entities,
+                    )
+            finally:
+                if replay_startup_maintenance and self.running and self.config is not None:
+                    self._startup_maintenance.restart_after_runtime_replacement(
+                        config=self.config,
+                        running_bots=self._running_startup_maintenance_bots,
+                    )
 
     async def _reconcile_post_update_rooms(
         self,
@@ -1968,8 +1977,10 @@ class _MultiAgentOrchestrator:
         bots_to_setup = self._running_bots_for_entities(changed_entities | plan.entities_to_reconcile_rooms)
         if bots_to_setup or plan.mindroom_user_changed or plan.room_access_changed or plan.authorization_changed:
             await self._setup_rooms_and_memberships(bots_to_setup)
-        if plan.matrix_space_changed or plan.room_metadata_changed:
+        elif plan.matrix_space_changed or plan.room_metadata_changed:
             room_ids = await self._ensure_rooms_exist()
+            if plan.room_metadata_changed:
+                await self._reconcile_managed_rooms(room_ids)
             await self._ensure_root_space(room_ids)
 
     async def _prepare_accounts_for_config_update(self, new_config: Config, plan: ConfigUpdatePlan) -> None:
@@ -2004,14 +2015,36 @@ class _MultiAgentOrchestrator:
             start_watcher=self.running,
             previous_config=current_config,
         )
-        await self._approval_transport.mark_startup_runtime_support_ready()
+        await self._approval_recovery.mark_startup_runtime_support_ready()
         self._external_trigger_runtime.bind_if_ready(new_config, self.agent_bots)
+        self._computer_runtime.bind_if_ready(new_config, self.agent_bots)
         await self._emit_config_reloaded(
             new_config=new_config,
             changed_entities=changed_entities,
             added_entities=added_entities,
             removed_entities=removed_entities,
             plugin_changes=plugin_changes,
+        )
+
+    async def _restart_refreshed_mcp_dependents(
+        self,
+        plan: ConfigUpdatePlan,
+        changed_server_ids: set[str],
+    ) -> ConfigUpdatePlan:
+        """Restart entities using MCP catalogs that the config apply refreshed."""
+        if not changed_server_ids:
+            return plan
+        if not plan.requires_response_drain:
+            # Replies may still be running, so restart dependents behind their own drain.
+            for server_id in sorted(changed_server_ids):
+                await self._notify_mcp_catalog_change(server_id)
+            return plan
+        return replace(
+            plan,
+            entities_to_restart=plan.entities_to_restart
+            | plan.new_config.get_entities_referencing_tools(
+                {mcp_tool_name(server_id) for server_id in changed_server_ids},
+            ),
         )
 
     async def _apply_config_update_plan(
@@ -2059,15 +2092,10 @@ class _MultiAgentOrchestrator:
                 "updating_config_authorization",
                 platform_administrator_ids=new_config.administrators,
             )
+            warn_about_config_risks(new_config, self.runtime_paths)
+            self._computer_runtime.unbind()
             await self._external_trigger_runtime.sync_api_config_snapshot(new_config)
-            if changed_runtime_mcp_servers:
-                plan = replace(
-                    plan,
-                    entities_to_restart=plan.entities_to_restart
-                    | new_config.get_entities_referencing_tools(
-                        {mcp_tool_name(server_id) for server_id in changed_runtime_mcp_servers},
-                    ),
-                )
+            plan = await self._restart_refreshed_mcp_dependents(plan, changed_runtime_mcp_servers)
             await self._update_unchanged_bots(plan)
             if router_invite_policy_changed and ROUTER_AGENT_NAME not in plan.entities_to_restart:
                 router_bot = self.agent_bots.get(ROUTER_AGENT_NAME)
@@ -2078,7 +2106,7 @@ class _MultiAgentOrchestrator:
                 await self._finalize_config_reload(
                     new_config=new_config,
                     current_config=current_config,
-                    changed_entities=set(),
+                    changed_entities=plan.live_updated_entities,
                     added_entities=plan.added_entities,
                     removed_entities=plan.removed_entities,
                     plugin_changes=plugin_changes,
@@ -2090,7 +2118,6 @@ class _MultiAgentOrchestrator:
                 already_stopped_entities=pre_stopped_mcp_entities,
             )
             await self._reconcile_post_update_rooms(plan, changed_entities)
-            await self._recover_pending_replacement_rooms(new_config)
 
             for entity_name in retryable_entities:
                 await self._schedule_bot_start_retry(entity_name)
@@ -2104,7 +2131,7 @@ class _MultiAgentOrchestrator:
             await self._finalize_config_reload(
                 new_config=new_config,
                 current_config=current_config,
-                changed_entities=changed_entities,
+                changed_entities=changed_entities | plan.live_updated_entities,
                 added_entities=plan.added_entities,
                 removed_entities=plan.removed_entities,
                 plugin_changes=plugin_changes,
@@ -2118,7 +2145,7 @@ class _MultiAgentOrchestrator:
         finally:
             await self._script_runtime.complete_worker_replacement()
             if replay_startup_maintenance and self.running and self.config is not None:
-                self._startup_maintenance.restart_after_config_reload(
+                self._startup_maintenance.restart_after_runtime_replacement(
                     config=self.config,
                     running_bots=self._running_startup_maintenance_bots,
                 )
@@ -2157,24 +2184,15 @@ class _MultiAgentOrchestrator:
                     self.runtime_paths,
                 )
 
-        # First invitation and join pass for rooms the router already manages.
-        await self._ensure_room_invitations()
-        await _ensure_internal_user_memberships()
-        await asyncio.gather(*(bot.ensure_rooms() for bot in bots))
-
-        # Existing invite-only rooms may only become manageable after the router joins.
-        # Rerun room reconciliation so topic and access policy updates apply in that case.
-        if any(bot.agent_name == ROUTER_AGENT_NAME for bot in bots):
-            room_ids = await self._ensure_rooms_exist()
-            await self._ensure_root_space(room_ids)
-
-        # Retry invitations once the router has completed its first join pass.
-        await self._ensure_room_invitations()
+        # Join the router before policy and invitations, including existing private rooms.
+        for bot in bots:
+            if bot.agent_name == ROUTER_AGENT_NAME:
+                await bot.ensure_rooms()
+        snapshots = await self._reconcile_managed_rooms(room_ids)
+        await self._ensure_room_invitations(snapshots)
         await _ensure_internal_user_memberships()
 
-        follow_up_bots = [bot for bot in bots if bot.agent_name != ROUTER_AGENT_NAME]
-        if follow_up_bots:
-            await asyncio.gather(*(bot.ensure_rooms() for bot in follow_up_bots))
+        await asyncio.gather(*(bot.ensure_rooms() for bot in bots if bot.agent_name != ROUTER_AGENT_NAME))
 
         await self.refresh_agent_reply_memberships()
 
@@ -2194,6 +2212,13 @@ class _MultiAgentOrchestrator:
         room_ids = await ensure_all_rooms_exist(router_bot.client, config, self.runtime_paths)
         logger.info("ensured_room_existence", room_count=len(room_ids))
         return room_ids
+
+    async def _reconcile_managed_rooms(self, room_ids: dict[str, str]) -> dict[str, RoomStateSnapshot]:
+        """Wire the router's fresh policy reconciliation into startup and reload."""
+        router = self._router_bot()
+        if router is None or router.client is None:
+            return {}
+        return await reconcile_managed_rooms(router.client, self._require_config(), self.runtime_paths, room_ids)
 
     async def _ensure_root_space(self, room_ids: dict[str, str] | None = None) -> None:
         """Ensure the optional root Matrix Space exists and link the current managed rooms."""
@@ -2261,39 +2286,6 @@ class _MultiAgentOrchestrator:
         else:
             logger.warning(failure_message, **(log_context or {}))
 
-    async def _invite_internal_user_to_rooms(
-        self,
-        config: Config,
-        joined_rooms: list[str],
-    ) -> str | None:
-        """Invite the configured internal user to all joined rooms when needed."""
-        router_bot = self._router_bot()
-        if router_bot is None:
-            return None
-        assert router_bot.client is not None
-
-        server_name = extract_server_name_from_homeserver(
-            constants.runtime_matrix_homeserver(runtime_paths=self.runtime_paths),
-            runtime_paths=self.runtime_paths,
-        )
-        user_id = managed_account_user_id(INTERNAL_USER_ACCOUNT_KEY, server_name, self.runtime_paths)
-        if config.mindroom_user is None or user_id is None:
-            return None
-
-        for room_id in joined_rooms:
-            room_members = await get_room_members(router_bot.client, room_id)
-            if room_members is None:
-                logger.warning("room_invitations_skipped_members_unavailable", room_id=room_id)
-                continue
-            await self._invite_user_if_missing(
-                room_id,
-                user_id,
-                room_members,
-                success_message=f"Invited user {user_id} to room {room_id}",
-                failure_message=f"Failed to invite user {user_id} to room {room_id}",
-            )
-        return user_id
-
     async def _invite_authorized_users_to_room(
         self,
         room_id: str,
@@ -2326,7 +2318,7 @@ class _MultiAgentOrchestrator:
                 failure_message=f"Failed to invite {bot_user_id} to room {room_id}",
             )
 
-    async def _ensure_room_invitations(self) -> None:
+    async def _ensure_room_invitations(self, snapshots: dict[str, RoomStateSnapshot] | None = None) -> None:
         """Ensure all agents and the internal user are invited to their configured rooms.
 
         The router client performs these invitations because it has admin privileges
@@ -2346,20 +2338,34 @@ class _MultiAgentOrchestrator:
         if not joined_rooms:
             return
 
-        internal_user_id = await self._invite_internal_user_to_rooms(config, joined_rooms)
+        server_name = extract_server_name_from_homeserver(
+            constants.runtime_matrix_homeserver(runtime_paths=self.runtime_paths),
+            runtime_paths=self.runtime_paths,
+        )
+        internal_user_id = (
+            managed_account_user_id(INTERNAL_USER_ACCOUNT_KEY, server_name, self.runtime_paths)
+            if config.mindroom_user is not None
+            else None
+        )
 
         for room_id in joined_rooms:
             configured_bots = configured_bot_user_ids_for_room(config, room_id, self.runtime_paths)
-            if not configured_bots and not is_configured_room(config, room_id, self.runtime_paths):
+            managed = bool(configured_bots) or is_configured_room(config, room_id, self.runtime_paths)
+            if not managed and internal_user_id is None:
                 continue
 
-            current_members = await get_room_members(router_bot.client, room_id)
+            snapshot = (snapshots or {}).get(room_id)
+            current_members = (
+                snapshot.present_user_ids()
+                if snapshot is not None
+                else await get_room_members(router_bot.client, room_id)
+            )
             if current_members is None:
                 logger.warning("room_invitations_skipped_members_unavailable", room_id=room_id)
                 continue
-            authorized_user_ids = get_room_user_ids_to_invite(config, room_id, self.runtime_paths)
+            authorized_user_ids = get_room_user_ids_to_invite(config, room_id, self.runtime_paths) if managed else set()
             if internal_user_id is not None:
-                authorized_user_ids.discard(internal_user_id)
+                authorized_user_ids.add(internal_user_id)
             await self._invite_authorized_users_to_room(room_id, current_members, authorized_user_ids)
             if configured_bots:
                 await self._invite_configured_bots_to_room(room_id, current_members, configured_bots)
@@ -2375,12 +2381,24 @@ class _MultiAgentOrchestrator:
         re-answer a past that already happened.
         """
         config = self._require_config()
-        await bind_event_journal(
-            self._shared_journal_store(),
+        store = self._shared_journal_store()
+        identity = await bind_event_journal(
+            store,
             journal_config=config.event_journal,
             runtime_paths=self.runtime_paths,
             storage_path=self.storage_path,
         )
+        # Storage roots bound to one database share its identity: a second
+        # runtime against it would answer every message again.
+        if not await store.hold_exclusively(identity):
+            msg = "Another MindRoom runtime is already using this event journal"
+            raise PermanentStartupError(msg)
+        self._journal_held = True
+
+    async def event_journal_still_held(self) -> bool:
+        """Return whether this runtime still holds the journal it claimed; true before it claims one."""
+        journal = self._open_journal
+        return journal is None or not self._journal_held or await journal.store.still_held()
 
     def _shared_journal_store(self) -> EventJournalStore:
         """Return the one journal store every bot in this process borrows.
@@ -2406,17 +2424,20 @@ class _MultiAgentOrchestrator:
     async def stop(self) -> None:  # noqa: C901, PLR0912, PLR0915
         """Stop all agent bots."""
         self.running = False
+        self._runtime_ready_event.clear()
+        for bot in self.agent_bots.values():
+            bot.begin_process_shutdown()
+        self.agent_cli_registry.close()
         self.hook_registry = HookRegistry.empty()
         set_scheduling_hook_registry(self.hook_registry)
-        self.invalidate_agent_reply_memberships(reason="shutdown")
         if self._runtime_shutdown_event is not None:
             self._runtime_shutdown_event.set()
         self._external_trigger_runtime.unbind()
+        self._computer_runtime.unbind()
         try:
             await _run_shutdown_step("script_runtime", self._script_runtime.shutdown())
         except Exception:
             logger.exception("Background script runtime shutdown failed")
-        await _run_shutdown_step("approval_transport", self._approval_transport.close())
         await _run_shutdown_step("approval_runtime", shutdown_approval_runtime())
         await _run_shutdown_step("config_reload", self.config_reload.cancel())
         owner = self._mcp_catalog_change_task_owner
@@ -2436,6 +2457,8 @@ class _MultiAgentOrchestrator:
         await _run_shutdown_step("todo_poke", self._todo_poke_runtime.stop())
         await _run_shutdown_step("thread_exports", self._thread_export_runner.stop())
         await _run_shutdown_step("memory_auto_flush", self._stop_memory_auto_flush_worker())
+        await _run_shutdown_step("skill_reviews", self._skill_reviews.stop())
+        await _run_shutdown_step("automations", self._automations.stop())
         await _run_shutdown_step("knowledge_source_watchers", self._knowledge_source_watcher.shutdown())
         await _run_shutdown_step("knowledge_refresh", self._knowledge_refresh_scheduler.shutdown())
         await _run_shutdown_step("bot_start_tasks", self._cancel_bot_start_tasks())
@@ -2502,12 +2525,14 @@ class _MultiAgentOrchestrator:
                 phase_cancellations.append(cancellation)
         pending_response_owner_count = sum(bot.pending_response_owner_count for bot in self.agent_bots.values())
         pending_response_phase_counts = _aggregate_response_phase_counts(self.agent_bots.values())
+        callback_cleanup_pending = any(bot.deferred_stop_required is True for bot in stopping_bots)
         await _run_shutdown_step("attachment_cleanup", wait_for_attachment_cleanup_tasks())
         # Last, because every bot borrows it: closing it earlier would pull the
         # store out from under a bot still draining its outbox.
         journal_failures: list[BaseException] = []
-        if self._open_journal is not None and pending_response_owner_count == 0:
+        if self._open_journal is not None and pending_response_owner_count == 0 and not callback_cleanup_pending:
             journal, self._open_journal = self._open_journal, None
+            self._journal_held = False
             close_results, cancellation = await _run_shutdown_step(
                 "event_journal",
                 gather_shutdown_phase(journal.close()),
@@ -2515,7 +2540,7 @@ class _MultiAgentOrchestrator:
             if cancellation is not None:
                 phase_cancellations.append(cancellation)
             journal_failures.extend(result for result in close_results if isinstance(result, BaseException))
-        elif pending_response_owner_count > 0:
+        elif pending_response_owner_count > 0 or callback_cleanup_pending:
             logger.warning(
                 "orchestrator_shared_journal_close_deferred",
                 live_response_owner_count=pending_response_owner_count,
@@ -2550,6 +2575,7 @@ class _MultiAgentOrchestrator:
         ]
         if failures:
             raise failures[0]
+        self.invalidate_agent_reply_memberships(reason="shutdown")
         logger.info("All agent bots stopped")
 
 
@@ -2617,7 +2643,7 @@ async def _watch_skills_task(orchestrator: _MultiAgentOrchestrator) -> None:
             logger.info("Skills changed; cache cleared")
 
 
-async def _run_api_server(
+async def _run_api_server(  # noqa: PLR0915 - the primary API and script-gateway listener share one lifecycle
     host: str,
     port: int,
     log_level: str,
@@ -2628,15 +2654,29 @@ async def _run_api_server(
     *,
     thread_export_runner: WorkspaceThreadExportRunner | None = None,
     leave_matrix_room: Callable[[str, str], Awaitable[bool]] | None = None,
+    response_admission_gate: ResponseAdmissionGate | None = None,
+    active_calls: Callable[[], list[ResponseIdentity]] | None = None,
+    config_reload_status: Callable[[], ConfigReloadStatus] | None = None,
+    agent_reply_memberships: AgentReplyMembershipIndex | None = None,
+    agent_cli_registry: TurnToolRegistry | None = None,
 ) -> None:
     """Run the bundled dashboard/API server as an asyncio task."""
     from mindroom.api import main as api_main  # noqa: PLC0415
+    from mindroom.api.agent_cli import bind_agent_cli_registry  # noqa: PLC0415
+    from mindroom.api.script_gateway import serve_script_gateway_listener  # noqa: PLC0415
 
     api_server = _EmbeddedApiServerContext(host=host, port=port)
     api_main.initialize_api_app(api_main.app, runtime_paths)
+    bind_agent_cli_registry(api_main.app, agent_cli_registry)
     api_state = api_main.config_lifecycle.app_state(api_main.app)
     api_state.thread_export_runner = thread_export_runner
     api_state.leave_matrix_room = leave_matrix_room
+    api_state.response_admission_gate = response_admission_gate
+    api_state.active_calls = active_calls
+    api_state.active_script_runs = script_runtime.active_runs if script_runtime is not None else None
+    api_state.config_reload_status = config_reload_status
+    if agent_reply_memberships is not None:
+        api_state.agent_reply_memberships = agent_reply_memberships
     if script_runtime is not None:
         api_main.bind_script_runtime(
             api_main.app,
@@ -2662,12 +2702,25 @@ async def _run_api_server(
     logger.info("embedded_api_server_starting", **api_server.log_context())
     try:
         try:
-            await server.serve()
+            async with serve_script_gateway_listener(
+                runtime_paths,
+                host=host,
+                broker=None if script_runtime is None else script_runtime.broker,
+                log_level=log_level,
+                agent_cli_registry=agent_cli_registry,
+            ):
+                await server.serve()
         except SystemExit as exc:
             _raise_embedded_api_server_exit(api_server, reason="server.serve() raised SystemExit", cause=exc)
     finally:
+        bind_agent_cli_registry(api_main.app, None)
         api_state.thread_export_runner = None
         api_state.leave_matrix_room = None
+        api_state.response_admission_gate = None
+        api_state.active_calls = None
+        api_state.active_script_runs = None
+        api_state.config_reload_status = None
+        api_state.agent_reply_memberships = AgentReplyMembershipIndex()
         if script_runtime is not None:
             await script_runtime.unbind_api()
             api_main.unbind_script_runtime(api_main.app)
@@ -2679,6 +2732,7 @@ async def _run_api_server(
         shutdown_expected=shutdown_expected,
         server_should_exit=server.should_exit,
         server_force_exit=server.force_exit,
+        received_signal=server.received_signal_name,
     )
     if not shutdown_expected:
         _raise_embedded_api_server_exit(
@@ -2911,9 +2965,9 @@ async def _finish_runtime_shutdown(
     finally:
         for task in auxiliary_tasks:
             task.cancel()
-        for task in auxiliary_tasks:
-            with suppress(asyncio.CancelledError):
-                await task
+        # Auxiliary tasks are non-critical and log their own failures, so none may skip the remaining cleanup
+        # or replace the error that ended the runtime.
+        await asyncio.gather(*auxiliary_tasks, return_exceptions=True)
         if stall_detector is not None:
             stall_detector.stop()
         reset_matrix_sync_health()
@@ -2957,22 +3011,62 @@ def _sync_credentials_and_prepare_storage(runtime_paths: RuntimePaths, storage_p
     storage_path.mkdir(parents=True, exist_ok=True)
 
 
-def _schedule_legacy_session_migration(
+async def _watch_event_journal_hold(
+    orchestrator: _MultiAgentOrchestrator,
+    shutdown_requested: asyncio.Event,
+    hold_lost: asyncio.Event,
+) -> None:
+    """Stop the runtime once it no longer holds its event journal, before another runtime can take it over."""
+    while not shutdown_requested.is_set():
+        await asyncio.sleep(_EVENT_JOURNAL_HOLD_CHECK_SECONDS)
+        if not await orchestrator.event_journal_still_held():
+            logger.error("event_journal_hold_lost")
+            hold_lost.set()
+            shutdown_requested.set()
+            return
+
+
+def _start_auxiliary_tasks(
     orchestrator: _MultiAgentOrchestrator,
     runtime_paths: RuntimePaths,
-    log_level: str,
-) -> asyncio.Task[None]:
-    """Schedule migration against the resolved session root behind readiness."""
-    session_storage_path = constants.resolve_session_state_root(runtime_paths.storage_root, runtime_paths)
-    return asyncio.create_task(
-        run_legacy_session_migration_after_ready(
-            orchestrator._runtime_ready_event,
-            session_storage_path,
-            log_level=log_level,
-            runtime_paths=runtime_paths,
+    shutdown_requested: asyncio.Event,
+    journal_hold_lost: asyncio.Event,
+) -> list[asyncio.Task]:
+    """Start the non-critical background tasks that run beside the orchestrator."""
+    # First, so an invalid probe interval fails before any task exists that shutdown could not cancel.
+    heap_probe = start_heap_type_probe(runtime_paths)
+    auxiliary_specs = [
+        (
+            "config watcher",
+            lambda: _watch_config_task(orchestrator.config_path, orchestrator),
+            "config_watcher_supervisor",
         ),
-        name="legacy_session_migration",
+        ("plugins watcher", lambda: watch_plugins_task(orchestrator), "plugins_watcher_supervisor"),
+        ("skills watcher", lambda: _watch_skills_task(orchestrator), "skills_watcher_supervisor"),
+    ]
+    tasks = [
+        asyncio.create_task(
+            _run_auxiliary_task_forever(
+                task_name,
+                operation,
+                should_restart=lambda: not shutdown_requested.is_set(),
+            ),
+            name=supervisor_name,
+        )
+        for task_name, operation, supervisor_name in auxiliary_specs
+    ]
+    tasks.append(
+        create_background_task(
+            _watch_event_journal_hold(orchestrator, shutdown_requested, journal_hold_lost),
+            name="event_journal_hold_watch",
+        ),
     )
+    # The heartbeat ends by itself for unpaired or rejected installs, so it must not be restarted;
+    # create_background_task logs an unexpected failure as soon as it happens.
+    tasks.append(create_background_task(run_provisioning_heartbeat(runtime_paths), name="provisioning_heartbeat"))
+    if heap_probe is not None:
+        tasks.append(heap_probe)
+    return tasks
 
 
 async def main(
@@ -2983,12 +3077,39 @@ async def main(
     api_port: int = 8765,
     api_host: str = "0.0.0.0",  # noqa: S104
 ) -> None:
-    """Main entry point for the multi-agent bot system."""
+    """Main entry point for the multi-agent bot system; one runtime per storage root.
+
+    Two runtimes on one storage root would both answer every message and take
+    each other's replies over, so the second refuses to start.
+    """
+    runtime_lock = try_exclusive_file_lock(tracking_dir(runtime_paths) / "runtime.lock")
+    if runtime_lock is None:
+        msg = f"Another MindRoom is already running with the storage at {runtime_paths.storage_root}"
+        raise PermanentStartupError(msg)
+    try:
+        await _run_runtime(log_level, runtime_paths, api=api, api_port=api_port, api_host=api_host)
+    finally:
+        release_file_lock(runtime_lock)
+
+
+async def _run_runtime(  # noqa: PLR0915
+    log_level: str,
+    runtime_paths: RuntimePaths,
+    *,
+    api: bool,
+    api_port: int,
+    api_host: str,
+) -> None:
+    """Run the multi-agent bot system until it stops."""
     await migrate_private_storage(runtime_paths)
+    await migrate_state_root_records(runtime_paths)
+    await migrate_usage_storage(runtime_paths)
+    await migrate_tool_credential_defaults(runtime_paths)
     storage_path = runtime_paths.storage_root
     orchestrator: _MultiAgentOrchestrator | None = None
     auxiliary_tasks: list[asyncio.Task] = []
     shutdown_requested = asyncio.Event()
+    journal_hold_lost = asyncio.Event()
     api_server = _EmbeddedApiServerContext(host=api_host, port=api_port)
     orchestrator_task: asyncio.Task[None] | None = None
     shutdown_wait_task: asyncio.Task[bool] | None = None
@@ -3007,33 +3128,14 @@ async def main(
         # Credential synchronization and storage setup are synchronous. Keep the
         # ordered unit off-loop while retaining exception propagation to startup.
         await run_blocking_until_complete(_sync_credentials_and_prepare_storage, runtime_paths, storage_path)
+        await run_blocking_until_complete(retire_state_root_worker_mounts, runtime_paths)
 
         logger.info("Starting orchestrator...")
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths, api_enabled=api)
         set_runtime_starting()
-        auxiliary_specs = [
-            (
-                "config watcher",
-                lambda: _watch_config_task(orchestrator.config_path, orchestrator),
-                "config_watcher_supervisor",
-            ),
-            ("plugins watcher", lambda: watch_plugins_task(orchestrator), "plugins_watcher_supervisor"),
-            ("skills watcher", lambda: _watch_skills_task(orchestrator), "skills_watcher_supervisor"),
-        ]
-
-        for task_name, operation, supervisor_name in auxiliary_specs:
-            auxiliary_tasks.append(
-                asyncio.create_task(
-                    _run_auxiliary_task_forever(
-                        task_name,
-                        operation,
-                        should_restart=lambda: not shutdown_requested.is_set(),
-                    ),
-                    name=supervisor_name,
-                ),
-            )
-
-        auxiliary_tasks.append(_schedule_legacy_session_migration(orchestrator, runtime_paths, log_level))
+        auxiliary_tasks.extend(
+            _start_auxiliary_tasks(orchestrator, runtime_paths, shutdown_requested, journal_hold_lost),
+        )
 
         if api:
             api_task = asyncio.create_task(
@@ -3047,6 +3149,11 @@ async def main(
                     shutdown_requested,
                     thread_export_runner=orchestrator._thread_export_runner,
                     leave_matrix_room=orchestrator.leave_matrix_room,
+                    response_admission_gate=orchestrator._response_admission_gate,
+                    active_calls=orchestrator.active_call_identities,
+                    config_reload_status=lambda: orchestrator.config_reload.status,
+                    agent_reply_memberships=orchestrator.agent_reply_memberships,
+                    agent_cli_registry=orchestrator.agent_cli_registry,
                 ),
                 name="api_server",
             )
@@ -3096,3 +3203,7 @@ async def main(
             cleanup_task,
             shutdown_was_requested=shutdown_was_requested,
         )
+    if journal_hold_lost.is_set():
+        # Exiting with a failure lets a supervisor that restarts only on failure bring the runtime back.
+        msg = "MindRoom stopped because it no longer holds its event journal"
+        raise EventJournalHoldLostError(msg)

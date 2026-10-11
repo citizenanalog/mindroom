@@ -29,7 +29,7 @@ Support requester-isolated and shared runtime execution without building one ful
 - `context_files` must resolve inside the agent's canonical workspace.
 - File-backed agent memory must use the canonical workspace root rather than a separate per-agent subdirectory model.
 - `worker_scope` does not change which files are authoritative.
-- `shared`, `user_agent`, and unscoped dedicated execution for agent A must only be able to see agent A's canonical state root plus their own worker runtime root.
+- `shared`, `user_agent`, and unscoped dedicated execution for agent A must only be able to see agent A's canonical workspace plus their own worker runtime root.
 - `user` is different.
 - If `user` remains supported for filesystem-capable worker tools, it is explicitly a per-requester multi-agent workstation mode rather than an agent-isolated mode.
 - `base_dir`, current working directory, and other tool init hints are convenience defaults rather than security boundaries.
@@ -55,7 +55,7 @@ Dedicated Kubernetes workers are provisioned today and rely on the same agent-ow
 Phase 4 remains in progress as provider hardening, operator guidance, metrics, and broader rollout validation continue.
 Spotify and Home Assistant remain shared-only.
 Those integrations are supported only for agents without worker routing or with `worker_scope=shared`.
-The Google-backed `gmail`, `google_calendar`, `google_docs`, `google_drive`, and `google_sheets` tools now use per-provider OAuth credentials.
+The Google-backed `gmail`, `google_calendar`, `google_docs`, `google_drive`, `google_sheets`, and `google_tasks` tools now use per-provider OAuth credentials.
 The dashboard can manage scoped Google OAuth tokens and editable Google tool settings for selected `user` and `user_agent` agents when a trusted Matrix requester identity is available.
 Generic dashboard credential management remains limited to unscoped agents and agents with `worker_scope=shared`.
 The `/v1` API remains intentionally restricted to unscoped agents and agents with `worker_scope=shared` until trusted requester identity is solved.
@@ -109,7 +109,7 @@ The `/v1` API remains intentionally restricted to unscoped agents and agents wit
 - Unscoped dedicated execution still uses the same canonical state root for the addressed agent.
 - `shared`, `user`, `user_agent`, and unscoped dedicated execution differ in runtime isolation and reuse.
 - They do not change which files are authoritative for the agent.
-- `shared`, `user_agent`, and unscoped dedicated execution for agent A must only expose agent A's canonical state root plus the runtime's own worker root.
+- `shared`, `user_agent`, and unscoped dedicated execution for agent A must only expose agent A's canonical workspace plus the runtime's own worker root.
 - `user` is therefore a trust-sharing mode rather than an agent-level filesystem isolation boundary for filesystem-capable worker tools.
 - Multiple agents may run inside that runtime.
 - Those agents may access each other's mounted files inside that runtime.
@@ -296,9 +296,9 @@ The target credentials model is:
 
 OAuth-heavy dashboard integrations used to be an explicit exception to isolated worker scopes.
 Spotify and Home Assistant remain shared-only.
-The Google-backed `gmail`, `google_calendar`, `google_docs`, `google_drive`, and `google_sheets` tools now use scoped per-provider OAuth credentials.
+The Google-backed `gmail`, `google_calendar`, `google_docs`, `google_drive`, `google_sheets`, and `google_tasks` tools now use scoped per-provider OAuth credentials.
 The credential-backed `homeassistant` tool also stays local even for `worker_scope=shared` rather than being routed through the sandbox runner.
-Google-backed `gmail`, `google_calendar`, `google_docs`, `google_drive`, and `google_sheets` tools use scoped per-provider OAuth credentials and stay in the primary runtime rather than running through the sandbox runner.
+Google-backed `gmail`, `google_calendar`, `google_docs`, `google_drive`, `google_sheets`, and `google_tasks` tools use scoped per-provider OAuth credentials and stay in the primary runtime rather than running through the sandbox runner.
 This keeps worker runtimes from needing Google OAuth client secrets while Google OAuth stays on the scoped provider model.
 Dashboard credential management follows the same product boundary more generally.
 The dashboard may read, write, and disconnect scoped Google OAuth token services and editable Google tool settings for selected `user` and `user_agent` agents when the request is bound to a Matrix requester identity.
@@ -341,8 +341,8 @@ The local provider should support introspection of active workers and cleanup of
 The Kubernetes provider is implemented against the worker backend contract introduced in Phase 3.
 The current implementation creates dedicated worker Deployments and Services, propagates the shared sandbox token, and waits for readiness before returning a worker handle.
 The current implementation already provisions dedicated worker Deployments and Services and routes them through the canonical agent-state model.
-For `shared`, `user_agent`, and unscoped dedicated execution, the Kubernetes backend now mounts only the addressed agent root plus the worker runtime root.
-`user` intentionally remains broader and mounts the shared `agents/` tree as a multi-agent workstation mode.
+For `shared`, `user_agent`, and unscoped dedicated execution, the Kubernetes backend now mounts only the addressed agent workspace plus the worker runtime root.
+`user` intentionally remains broader as a multi-agent workstation mode, but only mounts the workspaces of non-private `worker_scope: user` agents plus the requester's own private workspaces.
 Idle cleanup currently scales workers to zero while preserving state and deletes the per-worker Service.
 The long-term architecture may still move this behavior behind an external controller, but that is no longer a prerequisite for shipping the current provider model.
 Each Kubernetes worker still needs durable runtime storage for caches plus access to the canonical state roots it executes against, as well as an authenticated internal endpoint.
@@ -365,7 +365,7 @@ The default local-only set includes:
 - Tools that schedule or orchestrate background work globally.
 - Tools that delegate to sub-agents using primary runtime orchestration.
 
-Concrete current examples include `scheduler`, `subagents`, and self-configuration flows.
+Concrete current examples include `scheduler`, self-configuration flows.
 
 ## Background Processes
 
@@ -578,7 +578,7 @@ The highest-value target is to make `shared`, `user_agent`, and unscoped dedicat
 - `src/mindroom/tool_system/worker_routing.py` is the source of truth for execution identity, scope semantics, worker keys, and the worker-path plumbing that must stay aligned with canonical agent-owned state and per-agent visibility rules.
 - `src/mindroom/tool_system/metadata.py` is the source of truth for per-tool default execution targets and for the built-in default worker-routing policy.
 - `src/mindroom/agents.py` already targets canonical agent-owned state and should stay aligned with the no-copy, workspace-relative contract.
-- `src/mindroom/credentials.py` is now scope-aware and remains the place where runtime credential ownership rules should continue to consolidate.
+- `src/mindroom/credentials/manager.py` is now scope-aware and remains the place where runtime credential ownership rules should continue to consolidate.
 - `src/mindroom/api/openai_compat.py` keeps enforcing conservative `/v1` scope eligibility and trusted requester identity rules.
 - `src/mindroom/api/sandbox_runner.py` is one of the main places that still needs tighter runtime filesystem visibility rules for agent-isolated scopes.
 - `src/mindroom/tool_system/sandbox_proxy.py` should resolve worker handles through the worker manager and stay free of provider-specific assumptions.

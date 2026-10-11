@@ -40,11 +40,13 @@ from mindroom.matrix.journal_ingress import (
 )
 from mindroom.matrix.media import MATRIX_MEDIA_EVENT_TYPES, MatrixMediaEvent
 from mindroom.pending_event_worker import PendingEventWorker
+from mindroom.runtime_shutdown import GENERIC_SHUTDOWN
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from mindroom.event_journal import DispatchView, InteractiveSelection
+    from mindroom.runtime_shutdown import RuntimeShutdownIntent
 
 from mindroom.event_journal import JournalEvent
 
@@ -86,6 +88,8 @@ class JournalCallbacks:
     on_approval_continuation: _ApprovalContinuationCallback
     source_has_live_owner: Callable[[str], bool]
     turn_has_live_claim: Callable[[str], bool]
+    # Delivers what replies left waiting to replay a settled source owe Matrix.
+    replies_ended: Callable[[tuple[str, ...]], None]
     on_rtc: _RtcCallback | None = None
 
 
@@ -114,6 +118,7 @@ class JournalDispatcher:
             handle=self._run_event,
             runtime_generation=self.runtime_generation,
             deferral_is_live=self._deferral_is_live,
+            replies_ended=self.callbacks.replies_ended,
         )
 
     def start(self) -> None:
@@ -129,12 +134,25 @@ class JournalDispatcher:
         """Signal that newly admitted work is waiting."""
         self._worker.wake()
 
-    async def stop(self) -> None:
+    async def stop(self, *, shutdown_intent: RuntimeShutdownIntent = GENERIC_SHUTDOWN) -> None:
         """Stop draining, leaving unfinished work pending for the next start."""
-        await self._worker.stop()
+        await self._worker.stop(shutdown_intent=shutdown_intent)
+
+    def begin_shutdown(self, *, shutdown_intent: RuntimeShutdownIntent) -> None:
+        """Close semantic admission before the runtime withdraws its capabilities."""
+        self._worker.begin_shutdown(shutdown_intent=shutdown_intent)
+
+    @property
+    def pending_task_count(self) -> int:
+        """Return callback and pump owners still holding runtime resources."""
+        return self._worker.pending_task_count
+
+    async def wait_stopped(self, *, timeout_seconds: float) -> bool:
+        """Bound callback cleanup without releasing unfinished owners."""
+        return await self._worker.wait_stopped(timeout_seconds=timeout_seconds)
 
     async def drain_once(self) -> int:
-        """Run everything currently pending to completion.
+        """Run currently eligible pending work, respecting room retry cooldowns.
 
         This is the explicit recovery entry point, so it releases turn replay.
         What it deliberately does not do is forget which sources are in flight.
@@ -340,7 +358,7 @@ class JournalDispatcher:
     async def settle_intentionally_ignored_turn_sources(self, event_ids: tuple[str, ...]) -> None:
         """Settle turn-backed events that produced no dispatch payload."""
         self._release_sources(event_ids)
-        await self.store.settle_many(event_ids)
+        self.callbacks.replies_ended(await self.store.settle_many(event_ids))
 
     async def settle_running_event_intentionally_ignored(self) -> None:
         """Settle the current callback's event before releasing an authorization fence."""
@@ -350,14 +368,14 @@ class JournalDispatcher:
             raise RuntimeError(msg)
         await self.settle_intentionally_ignored_turn_sources((event.event_id,))
 
-    def retry_turn_source(self, event_id: str) -> None:
+    def retry_turn_source(self, room_id: str, event_id: str) -> None:
         """Return one undelivered turn source to the worker."""
-        self.retry_turn_sources((event_id,))
+        self.retry_turn_sources(room_id, (event_id,))
 
-    def retry_turn_sources(self, event_ids: tuple[str, ...]) -> None:
+    def retry_turn_sources(self, room_id: str, event_ids: tuple[str, ...]) -> None:
         """Return several undelivered turn sources to the worker."""
         self._release_sources(event_ids)
-        self._worker.wake()
+        self._worker.wake(room_id=room_id)
 
     def _release_sources(self, event_ids: tuple[str, ...]) -> None:
         """Release worker ownership and forget any deferred-reaction markers."""

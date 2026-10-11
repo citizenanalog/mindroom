@@ -27,9 +27,11 @@ main() entry
 │ 1. Parse config  │
 │    (Pydantic)    │
 │ 2. Load plugins  │
-│ 3. Create "user" │
-│    Matrix account│
-│    (mindroom_user)│
+│ 3. Create the    │
+│    internal user │
+│    (only when    │
+│    mindroom_user │
+│    is configured)│
 │ 4. Prepare       │
 │    entity Matrix │
 │    accounts      │
@@ -43,50 +45,49 @@ main() entry
 │ ─────────────────│
 │ 1. try_start()   │
 │    each bot      │
-│ 2. Setup rooms   │
-│    & memberships │
-│ 3. Create sync   │
+│ 2. Create sync   │
 │    tasks         │
+│ 3. Background    │
+│    room setup    │
 └────────┬─────────┘
          │
          ▼
-┌──────────────────────────────────────┐
-│  Auxiliary Tasks (auto-restart)      │
-│ ─────────────────────────────────────│
-│ • config watcher (file polling)      │
-│ • skills watcher (skill cache)       │
-│ • API server (if enabled)            │
-│  (each wrapped in                    │
-│   _run_auxiliary_task_forever)        │
-└───────────────┬──────────────────────┘
-                │
-                ▼
-┌──────────────────────────────────────┐
-│  Bot Sync Tasks (asyncio.gather)     │
-│ ─────────────────────────────────────│
-│ • One sync loop per bot              │
-│ • sync_forever_with_restart()        │
-│ • Awaited until shutdown             │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│ Auxiliary watchers (auto-restart)         │
+│ • config, plugins, and skills             │
+│ • _run_auxiliary_task_forever             │
+└─────────────────────┬─────────────────────┘
+                      │
+                      ▼
+┌───────────────────────────────────────────┐
+│ Runtime completion monitor                │
+│ • asyncio.wait(..., FIRST_COMPLETED)      │
+│ • orchestrator, shutdown, optional API    │
+│ • unexpected API exit fails the runtime   │
+└───────────────────────────────────────────┘
 ```
 
 **Key details:**
 
 - **Entity order**: Router first, then agents, then teams
-- **Room setup** (`_setup_rooms_and_memberships`): Router creates rooms, invites agents, teams, and users, then bots join
+- **Room setup** (`_setup_rooms_and_memberships`): Resolve/create rooms and the root Space, join the router, reconcile managed policy once, then invite and join the remaining identities
+- **Runtime lifetime**: The orchestrator waits for explicit shutdown while individual bot sync tasks can be replaced; the completion monitor does not await only the original sync-task generation.
 - **Sync loops**: Each bot runs `sync_forever_with_restart()` with automatic retry; `matrix_sync.mode: classic` uses Classic `/v3/sync`, while `sliding` uses MSC4186 Simplified Sliding Sync on a homeserver advertising `org.matrix.simplified_msc3575`
 - **Internal user identity**: `mindroom_user.username` is the account-creation request; runtime authorization uses the persisted actual Matrix ID
 
-## Session Storage Upgrades
+Each room setup pass reconciles managed room policy (name, topic, power levels, encryption, join rules, root Space children, and invitations) against fresh room-state reads.
+No configuration hash or persisted state cache suppresses remote drift checks on the next startup or relevant config update.
+A required power-level write rereads current grants so intervening administrator changes are preserved.
+Room setup runs one full pass; transport retries stay with nio, and returned administrative failures are retried on the next setup attempt.
 
-After the runtime becomes ready, MindRoom checks session databases for Agno 2 run blobs off the event loop.
-A child process starts only when legacy data exists, then migrates and verifies each session in its own transaction.
-The runtime remains available throughout.
-Logs report each table's total, progress every 100 sessions, and completion.
-Invalid or conflicting blobs stay intact on the compatibility read path and are reported for a later retry.
+## Session Storage Recovery
 
-The legacy column is cleared for successfully migrated sessions and retained for compatibility reads when migration fails.
-Removing the column is a separate explicit cleanup because changing a live SQLite table can block writes.
+Before opening an owned session database, `session_storage_preflight.py` checks any existing session table for the required Agno columns.
+If any are missing, it moves the whole `sessions/` directory, including SQLite journals and sidecars, to a unique `sessions.incompatible-*` sibling and recreates `sessions/` with its original permissions; see [Incompatible session databases](../deployment/storage.md#incompatible-session-databases) for the operator view.
+Only session storage is archived; learning, authored files, credentials, and Matrix encryption keys stay in place.
+Permission failures, corruption, unexpected schema objects, and unsafe paths raise errors instead of triggering an archive.
+Compatible Agno 2 and mixed-schema session data stays readable through Agno's compatibility reads, with no background conversion.
+Run upgrades while MindRoom is stopped so recovery cannot overlap active session writers.
 
 ## Runtime Replacement Admission
 
@@ -97,27 +98,37 @@ The MCP manager callback schedules an orchestrator-owned background task so the 
 1. On a config change, `ConfigReloadLifecycle.request_reload()` queues a debounced reload.
 2. On an MCP catalog change, the orchestrator returns immediately when no configured entity references that server, while still clearing the worker validation snapshot cache.
    The dependent-entity check runs again under the config update lock immediately before replacement.
+   Each server has at most one queued catalog replacement, and changes reported before it takes the config update lock are covered by it.
 3. Config reloads and MCP catalog replacements serialize behind one global admission owner; MCP replacements enter through `ConfigReloadLifecycle.apply_with_response_admission()`.
 4. Sampling the in-flight count and closing the shared `ResponseAdmissionGate` happen atomically, so a new response cannot race the decision to apply.
    The gate covers Matrix-driven response lifecycles, external-trigger delivery, call admission, and requester-driven call operations.
    Text and router planning, commands, edit regeneration, interactive selections, visible router voice echoes, calls, and external triggers perform their final reply-policy check after admission and retain the slot through their direct side effect or response-runner handoff.
    The OpenAI-compatible API in `mindroom.api.openai_compat` remains outside this gate because it does not use Matrix reply authorization.
-   Config loading keeps response admission open; after current responses drain, the gate closes for diff planning and publication.
+   Config loading and diff planning keep response admission open; after current responses drain, the gate closes for publication.
    Holding the gate while loading would block responses for validation work that cannot affect the live runtime.
 5. While the gate is closed, a response waits before taking a lifecycle lock, incrementing the in-flight count, or publishing a placeholder.
-   The gate is global and covers the whole apply window regardless of how narrow the plan turns out to be.
+   The gate is global and covers the whole apply window, including a config apply that skipped the drain.
    When the apply finishes, responses owned by unchanged or replacement runtimes compete for admission normally.
 6. A runtime being replaced wakes its pre-admission waiters with `ResponseAdmissionRefusedError`.
    The refusal leaves the admitted source pending in the event journal so the replacement runtime can replay it.
    The refusal path performs no Matrix I/O, so replacement shutdown cannot stall on an untimed send.
-   Auto-resume messages received by replacement bots during the apply wait for the gate to reopen instead of being dropped.
-   Before emitting a resume relay, history recovery requires a nonretired attempted outbox delivery binding the target response to the current principal and room membership.
-   A send with no known response event remains the responsibility of existing outbox and pending-source recovery.
+   Replies the forced apply cancels are left pending the same way, so the replacement runtime replays them and continues each in its existing message.
 7. If responses never drain, either replacement flow stops deferring after 600 seconds and closes the gate over still-running responses.
    This bounded forced apply prevents a busy install from starving config or MCP replacement forever.
-8. For config reloads, `ConfigReloadLifecycle._update_config()` loads and validates the new config while admission remains open, then `build_config_update_plan()` computes targeted restarts and in-place reconciliations after the gate closes.
-9. The orchestrator applies the resulting plan: changed entities are replaced, unchanged bots receive the new config, and room-only changes reconcile memberships in place without restarting receive loops.
-   Call-enabled agents are conservatively replaced after any authored config change because active call tooling captures the full authored config snapshot.
+8. For config reloads, `ConfigReloadLifecycle._update_config()` loads and validates the new config, then `build_config_update_plan()` computes targeted restarts and in-place reconciliations, all while admission remains open.
+   The bot inventory changes only under the replacement admission lock the reload already holds, so the plan stays exact through the drain.
+   When `ConfigUpdatePlan.requires_response_drain` is false, the reload skips the drain and the runtime-replacement hook and closes the gate at once for the swap; admitted responses and thread exports keep running, and responses read the new config wherever they read it live.
+   That requires a plan that creates, restarts, removes, and re-rooms no entity and changes no reply-authorization input: `administrators`, `authorization`, `bot_accounts`, `mindroom_user`, `room_defaults`, `rooms`, agent and team `access`, `router.access`, `router.accept_invites`, `personal_rooms`, or `external_trigger_policy`.
+   Keeping the drain for these inputs stops a policy change from committing between an admitted reply's authorization decision and the response it permits.
+   Partial-publication repairs always drain, and MCP catalogs refreshed during a skipped-drain apply restart their dependents through the drained MCP catalog path instead of inline.
+9. The orchestrator applies the resulting plan: entities whose startup inputs changed are replaced, every other bot receives the new config in place, and room-only changes reconcile memberships in place without restarting receive loops.
+   An agent's startup inputs are `display_name`, which login sets as its Matrix profile name, `accept_invites`, which decides the invited rooms a bot loads when it is built, `private`, which fixes the storage and session identity of private state, and two facts about its effective tools: whether they include `desktop`, whose pairing receiver registers at startup, and which MCP tools they hold, because startup holds an agent back while a required MCP server it uses is unavailable.
+   A team's startup inputs are `display_name` and `accept_invites`, and a bot that is not running restarts on any change to its entity's entry, so an edit retries its failed startup.
+   Bots read every other entity field from the live config where they use it; `_AGENT_LIVE_FIELDS` and `_TEAM_LIVE_FIELDS` in `config_updates.py` list them, a field missing from both lists restarts its entity, and a test requires every `AgentConfig` and `TeamConfig` field to be classified.
+   `config:reloaded` reports entities updated in place in `changed_entities` with the replaced and new ones.
+   A call-enabled agent is replaced when its own call setup changes: its `calls.agents` entry, the profile it uses, a model that profile references, `calls.enabled`, or `calls.livekit_service_url`.
+   Otherwise `CallManager.update_config()` hands the new config to later calls, but an agent with a call in progress is replaced after any authored config change, ending that call, because the call's tools, prompt, and approval policy were built from the config it joined with.
+   A replaced bot whose reply outlives the bounded shutdown drain is still replaced with the rest of its batch, because its stop releases every resource and leaves the cancelled reply pending for the replacement to replay; any other stop failure still keeps the old bot registered and fails the reload.
 10. Removed entities prepare their response runtime for shutdown, reconcile approval work, and call `leave_rooms()` while ingestion remains active; the orchestrator then cancels the receive loop and stops the bot.
 11. New and restarted bots go through room setup.
 12. The gate reopens once the apply finishes, whether it succeeded, failed, or was cancelled, and deferred responses may then start.
@@ -126,54 +137,58 @@ Skills are watched separately via `_watch_skills_task()` with cache invalidation
 
 ## Orchestration Subpackage
 
-The `src/mindroom/orchestration/` subpackage contains helpers extracted from the monolithic orchestrator:
+The `src/mindroom/orchestration/` subpackage holds the orchestrator's helpers:
 
 - **`runtime.py`** — Sync loop helpers: `sync_forever_with_restart()` with exponential backoff capped at 60 seconds, `cancel_task()`, and `create_logged_task()` for safe asyncio task creation.
 - **`config_lifecycle.py`** — Debounced config-reload and shared replacement-admission lifecycle: `ConfigReloadLifecycle` owns reload queueing, serialized global response draining for config and MCP replacements, and the load → diff → plan sequencing that dispatches config plans back to the orchestrator.
-- **`config_updates.py`** — Config diffing and reload planning: `build_config_update_plan()` computes a `ConfigUpdatePlan` by calling `_identify_entities_to_restart()`, which diffs old and new configs using `model_dump(exclude_none=True)`.
+- **`config_updates.py`** — Config diffing and reload planning: `build_config_update_plan()` diffs the old and new configs into a `ConfigUpdatePlan` of entity restarts and in-place reconciliations.
 - **`plugin_watch.py`** — Plugin hot-reload watcher: `watch_plugins_task()` polls configured plugin roots, with `PluginWatchState` owning the watcher baselines and dirty-state revision.
 - **`rooms.py`** — Room invitation helpers: `get_authorized_user_ids_to_invite()` and `get_root_space_user_ids_to_invite()` compute which users should be invited to managed rooms and the root Matrix space.
 
-### Runtime Resolution
+## Subagent Ownership
 
-Agent and team materialization is handled by dedicated top-level modules (not inside the `orchestration/` subpackage):
+`run_subagent` starts a separate child conversation; `continue_subagent` starts another turn in that same conversation.
+The child uses the normal agent response envelope, so its history, tools, and model behavior follow the existing runtime.
+Native Matrix approval pauses retain the parent wait and exact child run rather than keeping a Python call alive.
 
-- **`src/mindroom/runtime_resolution.py`** — Resolves `ResolvedAgentRuntime` (the full set of runtime parameters for one agent instance) including `ResolvedKnowledgeBinding` for knowledge base attachment.
-- **`src/mindroom/team_exact_members.py`** — Resolves `ResolvedExactTeamMembers` for team materialization via `materialize_exact_requested_team_members()`.
-- **`src/mindroom/agent_policy.py`** — Resolves canonical execution policies and private-team eligibility derived from authored agent config.
-- **`src/mindroom/model_loading.py`** — Owns `get_model_instance()` and provider-specific model loader selection.
-- **`src/mindroom/ai_runtime.py`** — Owns agent-run input copying and queued-notice hooks used during execution.
-- **`src/mindroom/provider_media_fallback.py`** — Owns provider-boundary inline-media retry and process-local capability learning per model route.
-- **`src/mindroom/agent_storage.py`** — Owns agent session and learning SQLite storage construction helpers.
-- **`src/mindroom/agent_descriptions.py`** — Owns shared agent description rendering used by routing and delegation.
-- **`src/mindroom/runtime_state.py`** — Shared runtime readiness state with `set_runtime_starting()`, `set_runtime_ready()`, and `set_runtime_failed()` used by health endpoints.
+The runtime lives in the `src/mindroom/delegation/` package, with explicit imports between its modules.
+
+| Module | Owns |
+| --- | --- |
+| `custom_tools/delegate.py` | Agent-facing tool schemas and direct invocation |
+| `ai.py` | `run_delegated_child_response`, supplied as a typed callback to the native driver |
+| `delegation/execution.py` | Parent waits, approval gates, child approval projection, and parent continuation |
+| `delegation/lifecycle.py` | Child preparation, attempt identity, outcome transitions, and publication to storage and audit |
+| `delegation/recovery.py` | Abandoned-turn reconciliation and recursive cancellation from retained Agno runs |
+| `delegation/sessions.py` | Scoped handle reads, atomic reservations, snapshots, and liveness locks |
+| `delegation/audit.py` / `delegation/records.py` | Workspace audit projections, event logs, transcripts, and receipts |
+| `delegation/state.py` | Serializable runtime state and the child-runner protocol |
+| `delegation/hooks.py` | Persisted plugin hook phases across approval continuations |
+| `delegation/storage.py` | Frozen storage bindings for retained runs |
+
+Both direct and native invocation use the same child preparation and lifecycle owner.
+The native driver receives its response runner explicitly and does not construct the agent-facing toolkit.
+Handle reads do not recover or execute children; recovery runs above storage under a liveness lock.
+Audit snapshots do not settle child state or finish audit records; the lifecycle owner publishes terminal outcomes.
+Editable workspace receipts never grant continuation authority.
+A retained Agno run identifies the exact attempt; the lifecycle owner derives its outcome before publishing storage and audit projections.
+Tach dependency rules and isolated import tests enforce these directions.
+
+See [Agent Delegation](../tools/agent-orchestration.md#agent-delegation) for configuration, tool arguments, audit paths, and user-visible behavior.
 
 ## Message Handling
 
 Correctness-critical timeline callbacks cross durable journal admission before ordinary callbacks run, and background dispatch workers then process committed work without blocking the sync loop.
 
-**Inbound message flow:**
-
-1. `matrix/durable_ingestion.py` converts nio batches using `matrix/journal_ingress.py`, commits their application effects in one transaction, then acknowledges after ordered hooks.
-2. `journal_dispatch.py` and `pending_event_worker.py` dispatch admitted or recovered work.
-3. `turn_controller.py` runs ingress validation, normalization, conversation resolution, receipt ordering, and coalescing.
-4. `text_ingress_dispatch.py` and `turn_policy.py` decide whether to ignore, route, execute a command, or respond.
-5. `response_runner.py` and `response_turn.py` execute the selected agent or team.
-6. `delivery_gateway.py` sends or edits the Matrix response and `TurnStore` records durable terminal truth.
-
-**Message edits**: When a user edits a message that already received an agent response, the agent regenerates its response for the updated content.
-The agent edits its own previous reply in place rather than sending a new message.
-Edits from other agents are ignored, and the feature requires that the turn's `anchor_event_id` is recorded in the `TurnStore`.
+See [Data Flow](index.md#data-flow) for the inbound path from Matrix sync to a recorded turn.
+See [Message Edits](../configuration/threads.md#message-edits) for how edits to handled messages are processed.
 
 **`_on_media_message`**: Handles media events (images, videos, files, and audio).
 Downloads and decrypts media data, then processes it through the selected responder.
-When no agent or team is mentioned, routing selects the appropriate agent or team, similar to text messages.
 
 **`_on_reaction`**: Handles `ReactionEvent` for the interactive Q&A system (e.g., confirming or rejecting agent suggestions) and config confirmation workflows.
 
-**Routing** (when no agent or team is mentioned): Router narrows candidates from room configuration or joined MindRoom entities, filters them by sender permissions, lets one remaining candidate answer directly, and uses `suggest_responder_for_message()` only when multiple candidates remain.
-In threads where multiple non-agent users have posted, routing is skipped entirely — an explicit `@mention` is required.
-Non-MindRoom bots listed in `bot_accounts` are excluded from this detection.
+**Routing** (when no agent or team is mentioned): the router picks a responder as described in [How Routing Works](../configuration/router.md#how-routing-works), calling `suggest_responder_for_message()` only when several eligible candidates remain.
 
 ## Concurrency
 
@@ -185,7 +200,7 @@ Non-MindRoom bots listed in `bot_accounts` are excluded from this detection.
 - Each of those lifecycle events logs `restart_reason_category` and `resulting_action`, so `matrix_sync_transport_restart` is distinguishable from `matrix_agent_response_runtime_shutdown` in logs
 - Admitted callbacks are dispatched as background work and remain durably retryable until settled
 - `TurnStore`, backed by the durable handled-turn ledger, prevents duplicate replies
-- `StopManager` handles cancellation of in-progress responses
+- Reply records own each in-progress response, and the span registry cancels exactly the span a Stop reaches (see [Reply Messages](reply-messages.md))
 
 ### Graceful Shutdown
 

@@ -13,10 +13,16 @@ from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
     ORIGINAL_SENDER_KEY,
     SCHEDULED_HISTORY_LIMIT_KEY,
+    SCHEDULED_MODEL_KEY,
     VOICE_RAW_AUDIO_FALLBACK_KEY,
     VOICE_TRANSCRIPT_KEY,
 )
-from mindroom.dispatch_source import VOICE_SOURCE_KIND, is_voice_event
+from mindroom.dispatch_source import (
+    SCHEDULED_SOURCE_KIND,
+    SILENT_SCHEDULE_SOURCE_KIND,
+    VOICE_SOURCE_KIND,
+    is_voice_event,
+)
 from mindroom.matrix.media import is_audio_message_event, is_matrix_media_dispatch_event
 from mindroom.matrix.rooms import is_dm_room
 from mindroom.response_admission import ResponseAdmissionRefusedError, admitted_response_decision
@@ -37,7 +43,7 @@ if TYPE_CHECKING:
 
     import nio
 
-    from mindroom.coalescing_batch import PreparedTurn
+    from mindroom.coalescing.batch import PreparedTurn
     from mindroom.commands.parsing import Command
     from mindroom.dispatch_handoff import (
         DispatchEvent,
@@ -212,7 +218,6 @@ async def _prepare_text_dispatch(
         handled_turn=canonicalize_turn_record(
             handled_turn,
             requester_id=prepared.dispatch.requester_user_id,
-            correlation_id=prepared.dispatch.correlation_id,
         ),
         command=command,
         dispatch=prepared.dispatch,
@@ -230,7 +235,12 @@ def _parsed_command_for_event(
 ) -> Command | None:
     if media_events:
         return None
-    if ingress_metadata is not None and ingress_metadata.source_kind == VOICE_SOURCE_KIND:
+    # Scheduled fires carry their creator as requester, but an agent can write their text.
+    if ingress_metadata is not None and ingress_metadata.source_kind in {
+        VOICE_SOURCE_KIND,
+        SCHEDULED_SOURCE_KIND,
+        SILENT_SCHEDULE_SOURCE_KIND,
+    }:
         return None
     if is_audio_message_event(event) or is_voice_event(
         event,
@@ -266,9 +276,22 @@ async def _blocked_before_plan(
         await visible_responses.settle_source_events_ignored(prepared.handled_turn)
         return True
 
+    coalescing_key = prepared.turn.ingress.coalescing_key
     may_be_superseded = (
         prepared.dispatch.envelope.origin.may_be_superseded_by_newer_requester_turn
         and prepared.handled_turn.replay_sources_all_from_requester(requester_user_id)
+        # While another run still waits in the queue, whether another
+        # requester's follow-ups, an entity's reply written for this
+        # requester, or this requester's message for another participant, a
+        # newer message from this requester may only be answered after it, so
+        # letting it absorb this turn would answer out of receipt order or not at all.
+        and not (
+            coalescing_key is not None
+            and controller.deps.coalescing_gate.queues_other_run(
+                coalescing_key,
+                requester_user_id,
+            )
+        )
     )
     if prepared.replay_guard.degraded:
         skips_turn = await controller._has_newer_unresponded_journal_thread_event(
@@ -294,7 +317,7 @@ async def _blocked_before_plan(
             may_be_superseded_by_newer_requester_turn=may_be_superseded,
         )
     if skips_turn:
-        await visible_responses.settle_source_events_ignored(prepared.handled_turn)
+        return await visible_responses.settle_superseded_turn(prepared.handled_turn)
     return skips_turn
 
 
@@ -326,6 +349,8 @@ def _attachment_parts(
         extra_content[ORIGINAL_SENDER_KEY] = requester_user_id
     if prepared.dispatch.scheduled_history_budget is not None:
         extra_content[SCHEDULED_HISTORY_LIMIT_KEY] = prepared.dispatch.scheduled_history_budget.limit
+    if prepared.dispatch.scheduled_model is not None:
+        extra_content[SCHEDULED_MODEL_KEY] = prepared.dispatch.scheduled_model
     return message_attachment_ids, trusted_attachment_ids, extra_content
 
 
@@ -410,10 +435,6 @@ async def _apply_turn_plan(  # noqa: C901
         controller.deps.turn_store.release_pending_turn_claim(turn_claim)
 
     async def response_recovery_ready() -> bool:
-        if prepared.dispatch.target.resolved_thread_id is not None and controller.deps.interrupted_turn_rooms.contains(
-            prepared.event.event_id,
-        ):
-            return True
         return await controller.deps.response_recovery_ready(handled_turn)
 
     response_task = controller.deps.response_runner.track_inbox_response(
@@ -436,9 +457,12 @@ async def _apply_turn_plan(  # noqa: C901
             release_response_claim,
         ),
         name=f"inbox_response:{prepared.event.event_id}",
+        room_id=room.room_id,
         recovery_proof_ready=response_recovery_ready,
         on_failure=lambda: (
-            controller.deps.retry_dispatch_sources(handled_turn.source_event_ids) if response_started.is_set() else None
+            controller.deps.retry_dispatch_sources(room.room_id, handled_turn.source_event_ids)
+            if response_started.is_set()
+            else None
         ),
         on_terminal=release_response_claim,
         source_event_ids=handled_turn.source_event_ids,

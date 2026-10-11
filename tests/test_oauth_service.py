@@ -4,24 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import multiprocessing
 import shutil
 import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import httpx
 import pytest
+from google.auth.exceptions import TransportError as GoogleTransportError
+from requests import exceptions as requests_exceptions
 
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
-from mindroom.credentials import (
+from mindroom.credentials.manager import (
     get_runtime_credentials_manager,
-    save_scoped_credentials,
     scoped_credentials_path,
 )
-from mindroom.oauth import credential_lifecycle, credential_store, reset_execution
+from mindroom.oauth import credential_lifecycle, credential_store, providers, reset_execution
 from mindroom.oauth.credential_binding import (
     OAuthCredentialBindingParseError,
     oauth_credential_binding,
@@ -48,6 +52,13 @@ from mindroom.oauth.providers import (
 )
 from mindroom.oauth.service import OAUTH_RESET_REQUIRED_REASON, oauth_connection_required
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from tests.oauth_test_utils import (
+    DelayedTokenEndpointOutcome,
+    corrupt_oauth_credential_payload,
+    publish_oauth_credentials,
+    rotated_token_response,
+    serve_token_endpoint,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -86,6 +97,7 @@ class _FakeOAuthProvider:
     requester_scoped_credentials = False
     scopes: tuple[str, ...] = ()
     claim_validator = None
+    token_url = "https://oauth.example.test/token"  # noqa: S105
 
     def __init__(self, refresh: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any] | None]]) -> None:
         self._refresh = refresh
@@ -115,12 +127,15 @@ class _FakeOAuthProvider:
         _code: str,
         _runtime_paths: RuntimePaths,
         *,
+        token_url: str,
         code_verifier: str | None = None,
     ) -> OAuthTokenResult:
         assert code_verifier is None
+        assert token_url == self.token_url
         return OAuthTokenResult(
             token_data={
                 "token": "callback-access",
+                "token_uri": token_url,
                 "client_id": "public-client",
                 "scopes": [],
             },
@@ -173,6 +188,7 @@ def _credentials(token: str, refresh_token: str, *, expires_at: float) -> dict[s
     return {
         "token": token,
         "refresh_token": refresh_token,
+        "token_uri": _FakeOAuthProvider.token_url,
         "client_id": "public-client",
         "scopes": [],
         "expires_at": expires_at,
@@ -199,8 +215,8 @@ def _context(
 
 
 def _save(context: OAuthCredentialContext, credentials: dict[str, Any]) -> None:
-    save_scoped_credentials(
-        context.provider.credential_service,
+    publish_oauth_credentials(
+        context.provider,
         credentials,
         credentials_manager=context.credentials_manager,
         worker_target=context.worker_target,
@@ -522,7 +538,7 @@ async def test_blocked_sync_provider_callback_does_not_block_different_scope(
             callback_started.set()
             release_callback.wait()
 
-    monkeypatch.setattr("mindroom.oauth.providers.AsyncOAuth2Client", TokenClient)
+    monkeypatch.setattr("authlib.integrations.httpx_client.AsyncOAuth2Client", TokenClient)
     provider = OAuthProvider(
         id="demo_provider",
         display_name="Demo Provider",
@@ -555,6 +571,7 @@ async def test_blocked_sync_provider_callback_does_not_block_different_scope(
             alice,
             "code",
             None,
+            token_url=alice.provider.token_url,
             expected_connection_generation=connection_generation,
         ),
     )
@@ -646,12 +663,12 @@ def test_sqlite_state_requires_explicit_connection_generation(tmp_path: Path) ->
 
 @pytest.mark.parametrize("encrypted", [False, True], ids=("plaintext", "encrypted"))
 @pytest.mark.asyncio
-async def test_reset_deletes_unreadable_scoped_file_and_allows_reconnect(
+async def test_reset_deletes_unreadable_sqlite_credentials_and_allows_reconnect(
     tmp_path: Path,
     *,
     encrypted: bool,
 ) -> None:
-    """Reset must remove the exact file even when credential decoding fails."""
+    """Reset must clear current SQLite credentials even when decoding fails."""
 
     async def unused_refresh(_credentials: Mapping[str, Any]) -> None:
         return None
@@ -672,21 +689,17 @@ async def test_reset_deletes_unreadable_scoped_file_and_allows_reconnect(
         credentials_manager=credentials_manager,
         worker_target=_worker_target(),
     )
-    credentials_path = scoped_credentials_path(
-        context.provider.credential_service,
-        credentials_manager=context.credentials_manager,
-        worker_target=context.worker_target,
-    )
-    credentials_path.parent.mkdir(parents=True, exist_ok=True)
-    credentials_path.write_bytes(b"not-a-readable-credential")
+    _save(context, _credentials(ACCESS_0, CHAIN_0, expires_at=FUTURE_EXPIRES_AT))
+    corrupt_oauth_credential_payload(_oauth_credential_database_path(context), b"not-a-readable-credential")
 
     assert await credential_lifecycle.reset_oauth_credentials(context) is True
-    assert not credentials_path.exists()
+    assert _load(context) is None
 
     reconnected = await exchange_and_store_oauth_credentials(
         context,
         "replacement-code",
         None,
+        token_url=context.provider.token_url,
         expected_connection_generation=_connection_generation(context),
     )
     assert reconnected["token"] == "callback-access"  # noqa: S105
@@ -694,8 +707,8 @@ async def test_reset_deletes_unreadable_scoped_file_and_allows_reconnect(
 
 
 @pytest.mark.asyncio
-async def test_wrong_encryption_key_does_not_poison_legacy_oauth_adoption(tmp_path: Path) -> None:
-    """An unreadable legacy credential must remain adoptable after the correct key is restored."""
+async def test_wrong_encryption_key_does_not_poison_sqlite_oauth_credentials(tmp_path: Path) -> None:
+    """An unreadable SQLite credential remains readable after the correct key is restored."""
 
     async def unused_refresh(_credentials: Mapping[str, Any]) -> None:
         return None
@@ -714,13 +727,8 @@ async def test_wrong_encryption_key_does_not_poison_legacy_oauth_adoption(tmp_pa
         credentials_manager=get_runtime_credentials_manager(correct_runtime_paths),
         worker_target=worker_target,
     )
-    legacy_credentials = _credentials(ACCESS_0, CHAIN_0, expires_at=FUTURE_EXPIRES_AT)
-    _save(correct_context, legacy_credentials)
-    credentials_path = scoped_credentials_path(
-        provider.credential_service,
-        credentials_manager=correct_context.credentials_manager,
-        worker_target=worker_target,
-    )
+    credentials = _credentials(ACCESS_0, CHAIN_0, expires_at=FUTURE_EXPIRES_AT)
+    _save(correct_context, credentials)
     wrong_runtime_paths = _runtime_paths(
         tmp_path,
         process_env={"MINDROOM_CREDENTIALS_ENCRYPTION_KEY": wrong_key},
@@ -734,10 +742,9 @@ async def test_wrong_encryption_key_does_not_poison_legacy_oauth_adoption(tmp_pa
     with pytest.raises(OAuthProviderError, match="credentials could not be loaded"):
         await load_oauth_credentials_snapshot(wrong_context)
 
-    assert not credentials_path.exists()
     assert ACCESS_0.encode() not in _oauth_credential_database_path(wrong_context).read_bytes()
     snapshot = await load_oauth_credentials_snapshot(correct_context)
-    assert snapshot.credentials == legacy_credentials
+    assert snapshot.credentials == credentials
     assert _oauth_credential_database_path(correct_context).exists()
 
 
@@ -757,6 +764,7 @@ async def test_completed_reset_operation_cannot_delete_later_callback_credential
         context,
         "replacement-code",
         None,
+        token_url=context.provider.token_url,
         expected_connection_generation=_connection_generation(context),
     )
 
@@ -782,6 +790,7 @@ async def test_completed_browser_reset_replay_skips_mcp_retirement(
         context,
         "replacement-code",
         None,
+        token_url=context.provider.token_url,
         expected_connection_generation=_connection_generation(context),
     )
     retirement_entered = False
@@ -820,6 +829,7 @@ async def test_stale_approved_reset_cannot_delete_reconnected_credentials(tmp_pa
         context,
         "replacement-code",
         None,
+        token_url=context.provider.token_url,
         expected_connection_generation=approved_generation,
     )
 
@@ -847,7 +857,7 @@ async def test_direct_resets_do_not_retain_replay_tombstones(tmp_path: Path) -> 
     assert await credential_lifecycle.reset_oauth_credentials(context) is True
     assert await credential_lifecycle.reset_oauth_credentials(context) is False
     async with credential_store.oauth_credential_transaction(context) as transaction:
-        assert transaction.reset_operation_result("direct:unknown") is None
+        assert (await transaction.reset_operation_result("direct:unknown")) is None
         await transaction.commit()
 
 
@@ -890,6 +900,7 @@ async def test_callback_waits_for_refresh_and_preserves_rotated_refresh_token(tm
             context,
             "code",
             None,
+            token_url=context.provider.token_url,
             expected_connection_generation=issued_connection_generation,
         ),
     )
@@ -948,6 +959,7 @@ async def test_callback_advances_connection_generation_and_rejects_second_callba
         context,
         "first-code",
         None,
+        token_url=context.provider.token_url,
         expected_connection_generation=issued_connection_generation,
     )
 
@@ -958,6 +970,7 @@ async def test_callback_advances_connection_generation_and_rejects_second_callba
             context,
             "second-code",
             None,
+            token_url=context.provider.token_url,
             expected_connection_generation=issued_connection_generation,
         )
 
@@ -1028,6 +1041,102 @@ async def test_snapshot_cancellation_while_waiting_for_lock_returns_promptly(
 
 
 @pytest.mark.asyncio
+async def test_blocked_storage_does_not_block_another_credential_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A blocked disk operation must leave the OAuth owner free for another scope."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    async def unused_refresh(_credentials: Mapping[str, Any]) -> None:
+        return None
+
+    first = _context(tmp_path / "first", _FakeOAuthProvider(unused_refresh))
+    second = _context(tmp_path / "second", _FakeOAuthProvider(unused_refresh))
+    _save(first, _credentials(ACCESS_0, CHAIN_0, expires_at=FUTURE_EXPIRES_AT))
+    _save(second, _credentials(ACCESS_0, CHAIN_0, expires_at=FUTURE_EXPIRES_AT))
+    first_path = credential_store._oauth_credential_database_path(first)
+    original_prepare = credential_store._prepare_database_path
+
+    def blocked_prepare(path: Path) -> None:
+        if path == first_path:
+            entered.set()
+            assert release.wait(5), "Storage gate was not released"
+        original_prepare(path)
+
+    monkeypatch.setattr(credential_store, "_prepare_database_path", blocked_prepare)
+    blocked = asyncio.create_task(credential_lifecycle.load_oauth_credentials_snapshot(first))
+    unrelated: asyncio.Task | None = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        unrelated = asyncio.create_task(credential_lifecycle.load_oauth_credentials_snapshot(second))
+        completed, _ = await asyncio.wait({unrelated}, timeout=1)
+        assert unrelated in completed, "Unrelated credential scope waited behind blocked storage"
+        assert unrelated.result().credentials is not None
+        assert not blocked.done()
+    finally:
+        release.set()
+        await blocked
+        if unrelated is not None:
+            await unrelated
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancellation_during_sqlite_commit_preserves_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An admitted token rotation must finish COMMIT before repeated cancellation escapes."""
+    entered = threading.Event()
+    release = threading.Event()
+    rotations: list[str] = []
+    committed: list[bool] = []
+
+    async def refresh(credentials: Mapping[str, Any]) -> dict[str, Any]:
+        rotations.append(credentials["refresh_token"])
+        return _credentials(f"access-{CHAIN_1}", CHAIN_1, expires_at=FUTURE_EXPIRES_AT)
+
+    context = _context(tmp_path, _FakeOAuthProvider(refresh))
+    _save(context, _credentials(ACCESS_0, CHAIN_0, expires_at=1.0))
+    original_connect = sqlite3.connect
+
+    class ObservedConnection(sqlite3.Connection):
+        published = False
+
+        def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+            if sql.lstrip().startswith("UPDATE oauth_credential_state"):
+                self.published = True
+            publishing_commit = sql == "COMMIT" and self.published
+            if publishing_commit:
+                entered.set()
+                assert release.wait(5), "Commit gate was not released"
+            result = super().execute(sql, parameters)
+            if publishing_commit:
+                committed.append(True)
+            return result
+
+    monkeypatch.setattr(sqlite3, "connect", partial(original_connect, factory=ObservedConnection))
+    refreshing = asyncio.create_task(refresh_oauth_credentials_with_result(context))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        refreshing.cancel()
+        await asyncio.sleep(0)
+        refreshing.cancel()
+        await asyncio.sleep(0)
+        assert not refreshing.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await refreshing
+    assert rotations == [CHAIN_0]
+    assert committed == [True]
+    stored = _load(context)
+    assert stored is not None
+    assert stored["refresh_token"] == CHAIN_1
+
+
+@pytest.mark.asyncio
 async def test_refresh_publishes_rotation_before_propagating_cancellation(tmp_path: Path) -> None:
     """A remotely rotated refresh grant is committed before cancellation escapes."""
     provider_rotated = threading.Event()
@@ -1073,6 +1182,7 @@ async def test_reset_generation_rejects_a_callback_that_was_issued_before_reset(
             context,
             "stale-code",
             None,
+            token_url=context.provider.token_url,
             expected_connection_generation=stale_generation,
         )
 
@@ -1233,6 +1343,245 @@ async def test_nonterminal_refresh_failure_preserves_credentials_and_bounds_logs
     _assert_no_token_values_logged(logger)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transport_error", "expected_diagnostics"),
+    [
+        pytest.param(
+            httpx.ConnectTimeout("secret-transport-detail"),
+            {"transport_error_category": "timeout", "transport_error_type": "ConnectTimeout"},
+            id="connect-timeout",
+        ),
+        pytest.param(
+            httpx.ReadTimeout("secret-transport-detail"),
+            {"transport_error_category": "timeout", "transport_error_type": "ReadTimeout"},
+            id="read-timeout",
+        ),
+        pytest.param(
+            type("secret-provider-class", (httpx.ReadTimeout,), {})("secret-transport-detail"),
+            {"transport_error_category": "timeout", "transport_error_type": "ReadTimeout"},
+            id="provider-subclass-name-is-not-logged",
+        ),
+        pytest.param(
+            httpx.ConnectError("secret-transport-detail"),
+            {"transport_error_category": "network", "transport_error_type": "NetworkError"},
+            id="connect-error",
+        ),
+        pytest.param(
+            requests_exceptions.ReadTimeout("secret-transport-detail"),
+            {"transport_error_category": "timeout", "transport_error_type": "ReadTimeout"},
+            id="google-requests-timeout",
+        ),
+        pytest.param(
+            json.JSONDecodeError("secret-transport-detail", "secret-response-body", 0),
+            {"transport_error_category": "invalid_response", "transport_error_type": "JSONDecodeError"},
+            id="non-json-response",
+        ),
+        pytest.param(
+            UnicodeDecodeError("utf-8", b"secret-response-body", 0, 1, "secret-transport-detail"),
+            {"transport_error_category": "invalid_response", "transport_error_type": "UnicodeDecodeError"},
+            id="non-utf8-response",
+        ),
+        pytest.param(
+            TimeoutError("secret-transport-detail"),
+            {"transport_error_category": "timeout", "transport_error_type": "TimeoutError"},
+            id="refresh-deadline",
+        ),
+    ],
+)
+async def test_refresh_failure_logs_safe_transport_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    transport_error: Exception,
+    expected_diagnostics: dict[str, object],
+) -> None:
+    """Provider wrappers retain bounded transport diagnostics without leaking their details."""
+    logger = _CapturingLogger()
+    monkeypatch.setattr(credential_lifecycle, "logger", logger)
+    cause = transport_error
+    if isinstance(cause, requests_exceptions.RequestException):
+        cause = GoogleTransportError("secret-google-detail")
+        cause.__cause__ = transport_error
+
+    async def refresh(_credentials: Mapping[str, Any]) -> dict[str, Any]:
+        message = f"secret-provider-detail {CHAIN_0}"
+        raise OAuthProviderError(message) from cause
+
+    context = _context(tmp_path, _FakeOAuthProvider(refresh))
+    original = _credentials(ACCESS_0, CHAIN_0, expires_at=1.0)
+    _save(context, original)
+
+    with pytest.raises(OAuthProviderError) as exc_info:
+        await refresh_oauth_credentials_with_result(context)
+
+    assert type(exc_info.value) is OAuthProviderError
+    assert _load(context) == original
+    diagnostics = logger.warning_calls[0][1]
+    assert expected_diagnostics.items() <= diagnostics.items()
+    assert "secret-" not in repr(logger.warning_calls)
+    _assert_no_token_values_logged(logger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("repeat_seconds", "expected_grants"),
+    [
+        pytest.param(0.4, 2, id="repeat-succeeds"),
+        pytest.param(1.5, 3, id="repeat-exceeds-deadline"),
+    ],
+)
+async def test_repeat_after_lost_refresh_response_releases_lock_before_waiting_caller_gives_up(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repeat_seconds: float,
+    expected_grants: int,
+) -> None:
+    """Scaled 1:10: a full read timeout plus the repeat must still let a same-credential lock waiter succeed."""
+    scale = 0.1
+    monkeypatch.setattr(
+        credential_store,
+        "_LOCK_WAIT_TIMEOUT_SECONDS",
+        credential_store._LOCK_WAIT_TIMEOUT_SECONDS * scale,
+    )
+    monkeypatch.setattr(providers, "_REFRESH_GRANT_DEADLINE_SECONDS", providers._REFRESH_GRANT_DEADLINE_SECONDS * scale)
+    monkeypatch.setattr(providers, "_REFRESH_REPEAT_MIN_SECONDS", providers._REFRESH_REPEAT_MIN_SECONDS * scale)
+    first_attempt = DelayedTokenEndpointOutcome(
+        providers._DEFAULT_AUTHORIZE_TIMEOUT_SECONDS * scale,
+        lambda request: httpx.ReadTimeout("timed out", request=request),
+    )
+    first_request = threading.Event()
+    presented = serve_token_endpoint(
+        monkeypatch,
+        [
+            first_attempt,
+            DelayedTokenEndpointOutcome(repeat_seconds, rotated_token_response()),
+            rotated_token_response(),
+        ],
+        request_received=first_request,
+    )
+    provider = OAuthProvider(
+        id="demo_provider",
+        display_name="Demo Provider",
+        authorization_url="https://oauth.example.test/authorize",
+        token_url=_FakeOAuthProvider.token_url,
+        scopes=(),
+        credential_service="demo_oauth",
+        client_config_services=("demo_oauth_client",),
+        token_endpoint_auth_method="none",  # noqa: S106
+        allow_empty_scopes=True,
+    )
+    context = _context(tmp_path, cast("_FakeOAuthProvider", provider))
+    original = _credentials(ACCESS_0, CHAIN_0, expires_at=1.0)
+    _save(context, original)
+
+    first = asyncio.create_task(refresh_oauth_credentials_with_result(context))
+    await asyncio.to_thread(first_request.wait)
+    waiting = asyncio.create_task(refresh_oauth_credentials_with_result(context))
+    first_outcome, waiting_result = await asyncio.gather(first, waiting, return_exceptions=True)
+
+    assert isinstance(waiting_result, credential_lifecycle.OAuthCredentialsRefreshResult)
+    assert waiting_result.credentials is not None
+    assert waiting_result.credentials["refresh_token"] == "rotated-refresh-token"  # noqa: S105
+    assert _load(context) == waiting_result.credentials
+    if expected_grants == 2:
+        assert isinstance(first_outcome, credential_lifecycle.OAuthCredentialsRefreshResult)
+        assert first_outcome.credentials == waiting_result.credentials
+        assert waiting_result.refreshed is False
+    else:
+        assert type(first_outcome) is OAuthProviderError
+        assert waiting_result.refreshed is True
+    assert presented == [CHAIN_0] * expected_grants
+
+
+def test_refresh_failure_diagnostics_ignore_unrecognized_cyclic_causes() -> None:
+    """An unknown exception cannot spoof a known transport name or cause an endless traversal."""
+    error = type("ReadTimeout", (RuntimeError,), {})("secret-provider-detail")
+    error.__cause__ = error
+
+    assert credential_lifecycle._oauth_refresh_failure_diagnostics(error) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status_code", "oauth_error"), [(429, None), (503, None), (400, "invalid_grant")])
+async def test_refresh_failure_logs_http_status_without_provider_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status_code: int,
+    oauth_error: str | None,
+) -> None:
+    """HTTP status remains visible without request/response contents or changed invalidation."""
+    logger = _CapturingLogger()
+    monkeypatch.setattr(credential_lifecycle, "logger", logger)
+    request = httpx.Request("POST", "https://provider.example/token?secret=query", content=b"secret-request")
+    response = httpx.Response(status_code, request=request, content=b"secret-response")
+    transport_error = httpx.HTTPStatusError("secret-transport-detail", request=request, response=response)
+
+    async def refresh(_credentials: Mapping[str, Any]) -> dict[str, Any]:
+        message = "secret-provider-detail"
+        raise OAuthProviderError(message, oauth_error=oauth_error) from transport_error
+
+    context = _context(tmp_path, _FakeOAuthProvider(refresh))
+    original = _credentials(ACCESS_0, CHAIN_0, expires_at=1.0)
+    _save(context, original)
+
+    with pytest.raises(OAuthProviderError) as exc_info:
+        await refresh_oauth_credentials_with_result(context)
+
+    assert isinstance(exc_info.value, OAuthRefreshRejectedError) is (oauth_error is not None)
+    assert _load(context) == (None if oauth_error is not None else original)
+    diagnostics = logger.warning_calls[0][1]
+    assert diagnostics["transport_error_category"] == "http_status"
+    assert diagnostics["transport_error_type"] == "HTTPStatusError"
+    assert diagnostics["http_status_code"] == status_code
+    assert "secret" not in repr(logger.warning_calls)
+    assert "provider.example" not in repr(logger.warning_calls)
+    _assert_no_token_values_logged(logger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attribute", ["response", "status_code"])
+@pytest.mark.parametrize("oauth_error", [None, "invalid_grant"], ids=["transient", "terminal"])
+async def test_refresh_failure_preserves_oauth_error_when_status_metadata_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    attribute: str,
+    oauth_error: str | None,
+) -> None:
+    """Broken diagnostic properties cannot replace the refresh error or change invalidation."""
+    logger = _CapturingLogger()
+    monkeypatch.setattr(credential_lifecycle, "logger", logger)
+    request = httpx.Request("POST", "https://provider.example/token?secret=query")
+    response = httpx.Response(503, request=request)
+    transport_error = httpx.HTTPStatusError("secret-transport-detail", request=request, response=response)
+
+    def unreadable_metadata(_self: object) -> None:
+        message = "secret-metadata-detail"
+        raise RuntimeError(message)
+
+    metadata_owner = type(transport_error) if attribute == "response" else type(response)
+    monkeypatch.setattr(metadata_owner, attribute, property(unreadable_metadata), raising=False)
+
+    async def refresh(_credentials: Mapping[str, Any]) -> dict[str, Any]:
+        message = "secret-provider-detail"
+        raise OAuthProviderError(message, oauth_error=oauth_error) from transport_error
+
+    context = _context(tmp_path, _FakeOAuthProvider(refresh))
+    original = _credentials(ACCESS_0, CHAIN_0, expires_at=1.0)
+    _save(context, original)
+
+    with pytest.raises(OAuthProviderError, match="OAuth credential refresh failed") as exc_info:
+        await refresh_oauth_credentials_with_result(context)
+
+    assert isinstance(exc_info.value, OAuthRefreshRejectedError) is (oauth_error is not None)
+    assert _load(context) == (None if oauth_error is not None else original)
+    diagnostics = logger.warning_calls[0][1]
+    assert diagnostics["transport_error_category"] == "http_status"
+    assert diagnostics["transport_error_type"] == "HTTPStatusError"
+    assert "http_status_code" not in diagnostics
+    assert "secret" not in repr(logger.warning_calls)
+    _assert_no_token_values_logged(logger)
+
+
 def test_sync_refresh_uses_same_scope_transaction(tmp_path: Path) -> None:
     """The synchronous provider adapter delegates persistence to the lifecycle."""
     caller_thread = threading.get_ident()
@@ -1301,6 +1650,7 @@ async def test_sync_refresh_rejects_changed_connection_generation_before_adapter
         context,
         "account-b-code",
         None,
+        token_url=context.provider.token_url,
         expected_connection_generation=account_a_generation,
     )
     adapter_called = False

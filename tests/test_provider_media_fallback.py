@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from contextvars import Context
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
@@ -11,20 +15,31 @@ from agno.exceptions import ModelProviderError, ModelRateLimitError, RetryableMo
 from agno.media import Audio, File, Image, Video
 from agno.models.anthropic import Claude
 from agno.models.base import Model
+from agno.models.cerebras import Cerebras
+from agno.models.groq import Groq
 from agno.models.message import Message
+from agno.models.ollama import Ollama
+from agno.models.openai import OpenAIChat, OpenAIResponses
 from agno.models.response import ModelResponse
+from agno.tools.function import ToolResult
+from starlette.responses import StreamingResponse
 
-from mindroom import claude_stream_retry
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE, ModelSafeguardRefusalError
-from mindroom.model_loading import get_model_instance
-from mindroom.provider_media_fallback import reset_model_media_capability_cache
+from mindroom.prompts import INLINE_MEDIA_FALLBACK_PROMPT
+from mindroom.providers import media_fallback as provider_media_fallback
+from mindroom.providers import stream_retry as provider_stream_retry
+from mindroom.providers.media_fallback import install_provider_media_fallback, reset_model_media_capability_cache
+from mindroom.providers.model_loading import get_model_instance
+from mindroom.tool_system.context_bound_streams import close_async_stream
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
     from pathlib import Path
+
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 
 @dataclass
@@ -82,7 +97,7 @@ def _messages_from_call(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 
 def _provider_error(status_code: int = 400) -> ModelProviderError:
-    return ModelProviderError(message="inline media is unsupported", status_code=status_code)
+    return ModelProviderError(message="text-only is not a multimodal model", status_code=status_code)
 
 
 def _media_message() -> Message:
@@ -104,6 +119,99 @@ def _image_message() -> Message:
     )
 
 
+@pytest.mark.parametrize(
+    ("provider", "api", "supported"),
+    [
+        ("openai_codex", None, True),
+        ("openai", "responses", True),
+        ("anthropic", None, True),
+        ("openai", "chat_completions", True),
+        ("future_provider", None, True),
+        ("cerebras", None, False),
+    ],
+)
+def test_tool_image_guard_reports_adapter_support(
+    provider: str,
+    api: str | None,
+    supported: bool,
+) -> None:
+    """Primary tool image delivery fails explicitly only on known omitted adapters."""
+    context = SimpleNamespace(
+        active_model_name="default",
+        current_config=Config(
+            models={"default": ModelConfig(provider=provider, id="test-model", api=api)},
+        ),
+    )
+    result = ToolResult(
+        content='{"attachment_id":"att_view","view_status":"ready"}',
+        images=[Image(content=b"image", mime_type="image/png")],
+    )
+
+    guarded = provider_media_fallback.guard_tool_image_result(
+        context=cast("ToolRuntimeContext", context),
+        result=result,
+    )
+
+    assert isinstance(guarded, ToolResult)
+    receipt = json.loads(guarded.content)
+    assert receipt["attachment_id"] == "att_view"
+    if supported:
+        assert guarded is result
+        assert guarded.images
+        assert receipt["view_status"] == "ready"
+    else:
+        assert guarded.images is None
+        assert receipt["view_status"] == "unsupported"
+        assert "model adapter" in receipt["message"]
+
+
+def test_media_fallback_marks_view_receipt_unsupported() -> None:
+    """A provider rejection cannot leave a stripped image marked ready."""
+    message = Message(
+        role="tool",
+        content='{"attachment_id":"att_view","view_status":"ready"}',
+        images=[Image(content=b"image", mime_type="image/png")],
+    )
+
+    stripped = provider_media_fallback._without_inline_media(message, frozenset({"image"}))
+
+    assert stripped.images is None
+    receipt = json.loads(str(stripped.content))
+    assert receipt["attachment_id"] == "att_view"
+    assert receipt["view_status"] == "unsupported"
+    assert "rejected" in receipt["message"]
+
+
+def test_media_fallback_marks_receipt_before_synthetic_viewed_image() -> None:
+    """Stripping Agno's synthetic media follow-up also updates its tool receipt."""
+    messages = [
+        Message(
+            role="tool",
+            content='{"attachment_id":"att_view","view_status":"ready"}',
+            tool_call_id="fc_view",
+        ),
+        Message(
+            role="user",
+            content="The tool call above generated the attached media.",
+            images=[Image(id="mindroom_viewed_123", content=b"image", mime_type="image/png")],
+        ),
+    ]
+
+    _args, kwargs = provider_media_fallback._call_without_media_kinds(
+        (),
+        {"messages": messages},
+        messages,
+        frozenset({"image"}),
+        "Continue without media.",
+    )
+
+    stripped = cast("list[Message]", kwargs["messages"])
+    assert stripped[1].images is None
+    receipt = json.loads(str(stripped[0].content))
+    assert receipt["view_status"] == "unsupported"
+    assert stripped[2].content == "[Inline media unavailable for this model]\nContinue without media."
+
+
 def _load[LoadedModel](model: LoadedModel, tmp_path: Path) -> LoadedModel:
     config = bind_runtime_paths(
         Config(
@@ -113,7 +221,7 @@ def _load[LoadedModel](model: LoadedModel, tmp_path: Path) -> LoadedModel:
         ),
         test_runtime_paths(tmp_path),
     )
-    with patch("mindroom.model_loading._create_model_for_provider", return_value=cast("Model", model)):
+    with patch("mindroom.providers.model_loading._create_model_for_provider", return_value=cast("Model", model)):
         loaded = get_model_instance(config, runtime_paths_for(config))
     return cast("LoadedModel", loaded)
 
@@ -121,6 +229,143 @@ def _load[LoadedModel](model: LoadedModel, tmp_path: Path) -> LoadedModel:
 async def _consume_into(chunks: list[ModelResponse], stream: AsyncIterator[ModelResponse]) -> None:
     async for chunk in stream:
         chunks.append(chunk)  # noqa: PERF401 - Preserve chunks emitted before the failure.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+async def test_prefetched_media_request_stream_completes_across_asgi_tasks(spec_version: str) -> None:
+    """Prefetching must not pin provider request cleanup to the endpoint's task."""
+    model = _FakeModel()
+
+    async def provider() -> AsyncIterator[ModelResponse]:
+        yield ModelResponse(content="reply")
+
+    stream = provider_media_fallback._ainvoke_stream_in_request_scope(model, provider)
+    first = await anext(stream)
+
+    async def body() -> AsyncIterator[str]:
+        yield str(first.content)
+        async for chunk in stream:
+            yield str(chunk.content)
+
+    async def receive() -> dict[str, object]:
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    sent: list[dict[str, object]] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    await StreamingResponse(body())(
+        {"type": "http", "asgi": {"spec_version": spec_version}},
+        receive,
+        send,
+    )
+
+    assert [message["body"] for message in sent if message["type"] == "http.response.body"] == [b"reply", b""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["exhaust", "close", "cancel"])
+async def test_media_request_state_binds_factory_pulls_and_cleanup_across_tasks(finish: str) -> None:
+    """One state survives task handoff without leaking into its consumer's context."""
+    model = _FakeModel()
+    observed: list[provider_media_fallback._MediaFallbackRequestState | None] = []
+    reading = asyncio.Event()
+
+    async def chunks() -> AsyncIterator[ModelResponse]:
+        try:
+            observed.append(provider_media_fallback._request_state(model))
+            yield ModelResponse(content="first")
+            observed.append(provider_media_fallback._request_state(model))
+            if finish == "cancel":
+                reading.set()
+                await asyncio.Event().wait()
+            yield ModelResponse(content="second")
+        finally:
+            observed.append(provider_media_fallback._request_state(model))
+
+    def factory() -> AsyncIterator[ModelResponse]:
+        observed.append(provider_media_fallback._request_state(model))
+        return chunks()
+
+    stream = provider_media_fallback._ainvoke_stream_in_request_scope(model, factory)
+    assert (await anext(stream)).content == "first"
+    assert provider_media_fallback._request_state(model) is None
+
+    if finish == "close":
+        await asyncio.create_task(close_async_stream(stream), context=Context())
+    else:
+        remaining: list[ModelResponse] = []
+        task = asyncio.create_task(_consume_into(remaining, stream), context=Context())
+        if finish == "cancel":
+            await reading.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+            assert [chunk.content for chunk in remaining] == ["second"]
+
+    assert observed[0] is not None
+    assert all(state is observed[0] for state in observed)
+    assert len(observed) == (3 if finish == "close" else 4)
+    assert provider_media_fallback._request_state(model) is None
+
+
+@pytest.mark.asyncio
+async def test_interleaved_media_request_streams_keep_separate_states() -> None:
+    """Suspended streams sharing a model must not inherit each other's fallback state."""
+    model = _FakeModel()
+    states: list[provider_media_fallback._MediaFallbackRequestState] = []
+
+    async def provider() -> AsyncIterator[ModelResponse]:
+        state = provider_media_fallback._request_state(model)
+        assert state is not None
+        states.append(state)
+        yield ModelResponse(content="first")
+        assert provider_media_fallback._request_state(model) is state
+        yield ModelResponse(content="second")
+
+    first = provider_media_fallback._ainvoke_stream_in_request_scope(model, provider)
+    await anext(first)
+    second = provider_media_fallback._ainvoke_stream_in_request_scope(model, provider)
+    await anext(second)
+
+    assert states[0] is not states[1]
+    await anext(first)
+    await anext(second)
+    await close_async_stream(second)
+    await close_async_stream(first)
+    assert provider_media_fallback._request_state(model) is None
+
+
+@pytest.mark.asyncio
+async def test_nested_media_request_stream_reuses_outer_state() -> None:
+    """Nested calls for the active model share fallback decisions with their parent."""
+    model = _FakeModel()
+
+    async def nested() -> AsyncIterator[ModelResponse]:
+        state = provider_media_fallback._request_state(model)
+        assert state is not None
+        state.removed_kinds = frozenset({"image"})
+        yield ModelResponse(content="nested")
+
+    async def provider() -> AsyncIterator[ModelResponse]:
+        state = provider_media_fallback._request_state(model)
+        async for chunk in provider_media_fallback._ainvoke_stream_in_request_scope(model, nested):
+            yield chunk
+        assert provider_media_fallback._request_state(model) is state
+        assert state is not None
+        assert state.removed_kinds == frozenset({"image"})
+
+    stream = provider_media_fallback._ainvoke_stream_in_request_scope(model, provider)
+    assert (await anext(stream)).content == "nested"
+    remaining: list[ModelResponse] = []
+    await asyncio.create_task(_consume_into(remaining, stream), context=Context())
+    assert remaining == []
+    assert provider_media_fallback._request_state(model) is None
 
 
 @pytest.mark.asyncio
@@ -147,6 +392,55 @@ async def test_loaded_model_retries_once_without_inline_media_and_preserves_atta
     assert retry_messages[-1].temporary is True
     assert "Inline media unavailable for this model" in str(retry_messages[-1].content)
     assert original == original_snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_class", "removed"),
+    [
+        (OpenAIResponses, {"audio", "video"}),
+        (OpenAIChat, {"video"}),
+        (Claude, {"audio", "video"}),
+        (Ollama, {"audio", "file", "video"}),
+        (Groq, {"audio", "file", "video"}),
+        (Cerebras, {"audio", "image", "file", "video"}),
+    ],
+)
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_adapter_omissions_are_visible_to_the_model(
+    model_class: type[Model],
+    removed: set[str],
+    streaming: bool,
+) -> None:
+    """Adapters that silently omit a media kind must instead send fallback guidance."""
+    model = model_class(id="adapter-test")
+    provider_calls: list[list[Message]] = []
+
+    async def invoke(messages: list[Message]) -> ModelResponse:
+        provider_calls.append(messages)
+        return ModelResponse(content="use another tool")
+
+    async def stream(messages: list[Message]) -> AsyncIterator[ModelResponse]:
+        yield await invoke(messages)
+
+    model.ainvoke = invoke
+    model.ainvoke_stream = stream
+    install_provider_media_fallback(model, fallback_prompt=INLINE_MEDIA_FALLBACK_PROMPT)
+    original = _media_message()
+    if streaming:
+        _ = [chunk async for chunk in model.ainvoke_stream(messages=[original])]
+    else:
+        await model.ainvoke(messages=[original])
+
+    assert len(provider_calls) == 1
+    sent, guidance = provider_calls[0]
+    sent_media = {"audio": sent.audio, "image": sent.images, "file": sent.files, "video": sent.videos}
+    assert {kind for kind, media in sent_media.items() if media is None} == removed
+    assert "Inline media unavailable" in str(guidance.content)
+    assert "att_123" in str(sent.content)
+    assert original.audio
+    assert original.videos
+    assert original.files
 
 
 @pytest.mark.asyncio
@@ -384,6 +678,32 @@ async def test_outer_streaming_retry_never_reattaches_rejected_media(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_media_fallback_survives_empty_chunks_and_task_handoffs() -> None:
+    """Non-content yields must preserve stripped media through the outer retry."""
+    model = _FakeModel(
+        retries=1,
+        delay_between_retries=0,
+        streaming_outcomes=[
+            [ModelResponse(), _provider_error()],
+            [ModelResponse(), _provider_error(503)],
+            [ModelResponse(content="recovered")],
+        ],
+    )
+    install_provider_media_fallback(model, fallback_prompt=INLINE_MEDIA_FALLBACK_PROMPT)
+    stream = model._ainvoke_stream_with_retry(messages=[_image_message()])
+    chunks: list[ModelResponse] = []
+    while True:
+        try:
+            chunks.append(await asyncio.create_task(anext(stream), context=Context()))
+        except StopAsyncIteration:
+            break
+
+    assert [chunk.content for chunk in chunks] == [None, None, "recovered"]
+    assert [bool(call[0].images) for call in model.streaming_calls] == [True, False, False]
+    assert model.closed_streams == 3
+
+
+@pytest.mark.asyncio
 async def test_stream_retry_with_guidance_keeps_media_and_does_not_teach_route(tmp_path: Path) -> None:
     """Streaming guidance retries stay media-bearing and leave the route unknown."""
     guidance = "Retry with a valid function call."
@@ -432,7 +752,7 @@ async def test_loaded_claude_keeps_media_removed_during_transient_stream_retry(
             yield item
 
     vars(model)["ainvoke_stream"] = fake_ainvoke_stream
-    monkeypatch.setattr(claude_stream_retry, "_RETRY_BASE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(provider_stream_retry, "_RETRY_BASE_DELAY_SECONDS", 0.0)
     loaded = _load(model, tmp_path)
 
     chunks = [
@@ -474,6 +794,7 @@ async def test_loaded_model_does_not_replay_a_stream_after_output(tmp_path: Path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cross_context", [False, True])
 @pytest.mark.parametrize(
     "error",
     [
@@ -487,7 +808,11 @@ async def test_loaded_model_does_not_replay_a_stream_after_output(tmp_path: Path
         ),
     ],
 )
-async def test_outer_streaming_retry_does_not_replay_after_output(tmp_path: Path, error: Exception) -> None:
+async def test_outer_streaming_retry_does_not_replay_after_output(
+    tmp_path: Path,
+    error: Exception,
+    cross_context: bool,
+) -> None:
     """Agno's outer retry paths must not replay a stream after output escapes."""
     model = _load(
         _FakeModel(
@@ -502,8 +827,12 @@ async def test_outer_streaming_retry_does_not_replay_after_output(tmp_path: Path
     )
 
     chunks: list[ModelResponse] = []
+    stream = model._ainvoke_stream_with_retry(messages=[_media_message()])
+    chunks.append(await anext(stream))
+    consume = _consume_into(chunks, stream)
+    continuation = asyncio.create_task(consume, context=Context()) if cross_context else consume
     with pytest.raises(ModelProviderError):
-        await _consume_into(chunks, model._ainvoke_stream_with_retry(messages=[_media_message()]))
+        await continuation
 
     assert [chunk.content for chunk in chunks] == ["prefix"]
     assert len(model.streaming_calls) == 1
@@ -549,13 +878,24 @@ async def test_media_free_stream_does_not_replay_after_output_on_guidance_error(
         ModelProviderError(message="payload too large", status_code=413),
         ModelProviderError(message="server unavailable", status_code=503),
         RuntimeError("request entity too large"),
+        RuntimeError("unknown provider failure"),
+        ModelProviderError(
+            message="Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+            "'message': 'messages.0.content.1.image.source.base64.data: Could not process image'}}",
+            status_code=400,
+        ),
+        ModelProviderError(
+            message="You uploaded an unsupported image. Please make sure your image is valid.",
+            status_code=400,
+        ),
+        ModelProviderError(message="Image does not match the provided media type image/png", status_code=400),
     ],
 )
 async def test_successful_retry_after_non_capability_failure_does_not_teach_route(
     tmp_path: Path,
     error: Exception,
 ) -> None:
-    """Size and transient failures retry once but cannot prove media is unsupported."""
+    """Failures that do not name a missing input capability retry once but cannot prove media is unsupported."""
     model = _load(
         _FakeModel(
             blocking_outcomes=[
@@ -576,12 +916,70 @@ async def test_successful_retry_after_non_capability_failure_does_not_teach_rout
 
 
 @pytest.mark.asyncio
-async def test_untyped_failure_retries_once_and_teaches_after_success(tmp_path: Path) -> None:
-    """Fallback does not depend on provider-specific error wording or exception type."""
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Error code: 400 - [{'error': {'code': 400, 'message': "
+        "'The message size (74029796 bytes) exceeds 30.000MB limit.', 'status': 'FAILED_PRECONDITION'}}]",
+        "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': "
+        "\"messages.4.content.3.document.source.base64.media_type: Input should be 'application/pdf'\"}}",
+        "Invalid file data: 'input[7].content[1].file_data'. Expected a base64-encoded data URL with a valid "
+        "file MIME type, but got unsupported MIME type 'application/zip'.",
+    ],
+    ids=["request_size", "claude_document_type", "openai_file_type"],
+)
+async def test_one_rejected_file_does_not_strip_later_pdfs_for_the_route(tmp_path: Path, message: str) -> None:
+    """A rejection naming one file's size or type cannot prove the route rejects every file."""
     model = _load(
         _FakeModel(
             blocking_outcomes=[
-                RuntimeError("unknown provider failure"),
+                ModelProviderError(message=message, status_code=400),
+                ModelResponse(content="recovered"),
+                ModelResponse(content="read the pdf"),
+            ],
+        ),
+        tmp_path,
+    )
+    archive_turn = Message(
+        role="user",
+        content='Unpack this.\n[attachments: att_zip (file, "bundle.zip")]',
+        files=[File(content=b"PK\x03\x04", mime_type="application/zip", filename="bundle.zip")],
+    )
+    pdf_turn = Message(
+        role="user",
+        content='Summarize this.\n[attachments: att_pdf (file, "report.pdf")]',
+        files=[File(content=b"%PDF-1.4", mime_type="application/pdf", filename="report.pdf")],
+    )
+
+    await model.ainvoke(messages=[archive_turn])
+    await model.ainvoke(messages=[pdf_turn])
+
+    assert model.blocking_calls[1][0].files is None
+    pdf_call = model.blocking_calls[2]
+    assert pdf_call[0].files
+    assert len(pdf_call) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+        "'message': 'claude-text-only does not support image input.'}}",
+        "Error code: 400 - {'error': {'message': 'Invalid content type. image_url is only supported by certain "
+        "models.', 'type': 'invalid_request_error', 'param': 'messages.[0].content.[1].type'}}",
+        "Error code: 400 - {'object': 'error', 'message': 'text-only is not a multimodal model'}",
+        "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj",
+        "Error code: 404 - {'error': {'message': 'No endpoints found that support image input', 'code': 404}}",
+    ],
+    ids=["anthropic", "openai", "vllm", "llama_cpp", "openrouter"],
+)
+async def test_capability_rejection_teaches_route_after_success(tmp_path: Path, message: str) -> None:
+    """A rejection naming the missing input capability lets later requests skip the failed call."""
+    model = _load(
+        _FakeModel(
+            blocking_outcomes=[
+                RuntimeError(message),
                 ModelResponse(content="recovered"),
                 ModelResponse(content="next"),
             ],

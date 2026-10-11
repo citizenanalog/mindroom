@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from mindroom.config.schema_hints import dashboard_hint
 from mindroom.runtime_env_policy import is_runtime_database_url_env_name
 
 if TYPE_CHECKING:
@@ -37,6 +38,16 @@ class MatrixSyncConfig(BaseModel):
             "Timeline event limit for each room requested through Simplified Sliding Sync. Sliding positions are"
             " connection-scoped, so this also bounds how many per-room events a restarted connection can replay."
         ),
+    )
+    max_response_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1,
+        description="Maximum HTTP response size in bytes for each durable Matrix sync session.",
+    )
+    max_pending_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description="Maximum encoded pending output size in bytes for each durable Matrix sync session.",
     )
 
 
@@ -117,6 +128,7 @@ class EventJournalConfig(BaseModel):
         description=(
             "PostgreSQL connection URL for the durable Matrix event journal. Prefer database_url_env for secrets."
         ),
+        json_schema_extra=dashboard_hint(secret=True),
     )
     database_url_env: str = Field(
         default="MINDROOM_EVENT_CACHE_DATABASE_URL",

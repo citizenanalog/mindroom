@@ -22,20 +22,44 @@ from mindroom.config.access import (
     RoomJoinPolicy,
     validate_concrete_matrix_user_ids,
 )
+from mindroom.config.automations import AutomationList  # noqa: TC001
 from mindroom.config.knowledge import KnowledgeGitConfig  # noqa: TC001
+from mindroom.config.legacy_fields import reject_legacy_agent_fields
 from mindroom.config.memory import AgentMemorySearchConfig, MemoryBackend  # noqa: TC001
+from mindroom.config.mid_turn import MidTurnConfig  # noqa: TC001
 from mindroom.config.models import (
     AgentLearningMode,
     CompactionOverrideConfig,
+    FileAccess,
     ToolConfigEntry,
     validate_unique_tool_entries,
 )
+from mindroom.config.participation import ParticipationConfig  # noqa: TC001
+from mindroom.config.schema_hints import dashboard_hint
+from mindroom.config.skill_learning import SkillLearningConfig
 from mindroom.config.validation import duplicate_items, validate_history_limit_choice
 from mindroom.constants import OWNER_MATRIX_USER_ID_PLACEHOLDER
 from mindroom.tool_system.worker_routing import WorkerScope, agent_workspace_relative_path
 
 _PrivateWorkerScope = Literal["user", "user_agent"]
-_RESERVED_PRIVATE_ROOT_FIRST_PARTS = frozenset({"sessions", "learning", "knowledge_db", "chroma"})
+# Everything the primary writes beside a private workspace in its private state root;
+# tests/test_private_root_reservations.py enumerates the writers. Workers mount only
+# the private workspace, so it must never be, or contain, one of these.
+_RESERVED_PRIVATE_ROOT_FIRST_PARTS = frozenset(
+    {
+        ".sessions-recovery.lock",
+        "agent_modes.json",
+        "agent_modes.lock",
+        "browser",
+        "browser-profiles",
+        "calls",
+        "chroma",
+        "knowledge_db",
+        "learning",
+        "memory_files",
+        "sessions",
+    },
+)
 
 
 def _validate_safe_relative_path(
@@ -208,7 +232,11 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     display_name: str = Field(description="Human-readable name for the agent")
-    role: str = Field(default="", description="Description of the agent's purpose")
+    role: str = Field(
+        default="",
+        description="Description of the agent's purpose",
+        json_schema_extra=dashboard_hint(multiline=True),
+    )
     tools: list[ToolConfigEntry] = Field(
         default_factory=list,
         description="List of tool entries with optional inline per-agent overrides",
@@ -219,7 +247,23 @@ class AgentConfig(BaseModel):
     )
     skills: list[str] = Field(default_factory=list, description="List of skill names")
     instructions: list[str] = Field(default_factory=list, description="Agent instructions")
-    rooms: list[str] = Field(default_factory=list, description="List of room IDs or names to auto-join")
+    minimal_instructions: list[str] = Field(
+        default_factory=list,
+        description="Always-present minimal mode instructions",
+    )
+    rooms: list[str] = Field(
+        default_factory=list,
+        description="List of room IDs or names to auto-join",
+        json_schema_extra=dashboard_hint(reference="room"),
+    )
+    participation: ParticipationConfig | None = Field(
+        default=None,
+        description="Opt-in adaptive participation in existing multi-human threads across all rooms",
+    )
+    mid_turn: MidTurnConfig | None = Field(
+        default=None,
+        description="Opt-in judgments for messages queued during this agent's response across all rooms",
+    )
     access: ResponderAccessConfig | None = Field(
         default=None,
         description="Optional membership-based conversation access policy",
@@ -228,9 +272,20 @@ class AgentConfig(BaseModel):
         default_factory=list,
         description="Concrete Matrix user IDs allowed to manage this agent's credentials",
     )
+    mcp_gateway_shared_credentials: bool = Field(
+        default=False,
+        description=(
+            "Let users who may use this agent call its tools through the MCP gateway even though its worker scope "
+            "is shared or unset, so every caller runs them with the agent's shared credentials and worker, "
+            "without the agent's instructions; agents with per-user scopes are available without it"
+        ),
+    )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,
-        description="Whether this agent accepts all, no, or matching inviter room invites",
+        description=(
+            "true accepts every room invite to this agent, false accepts none, and a list accepts only "
+            "invites from matching inviter Matrix IDs or glob patterns"
+        ),
     )
     markdown: bool | None = Field(default=None, description="Whether to use markdown formatting")
     learning: bool | None = Field(default=None, description="Enable Agno Learning (defaults to true when omitted)")
@@ -238,7 +293,11 @@ class AgentConfig(BaseModel):
         default=None,
         description="Learning mode for Agno Learning: always (automatic) or agentic (tool-driven)",
     )
-    model: str = Field(default="default", description="Model name")
+    model: str = Field(
+        default="default",
+        description="Configured model alias used for this agent's replies",
+        json_schema_extra=dashboard_hint(reference="model"),
+    )
     memory_backend: MemoryBackend | None = Field(
         default=None,
         description=(
@@ -279,6 +338,7 @@ class AgentConfig(BaseModel):
     room_thread_modes: dict[str, Literal["thread", "room"]] = Field(
         default_factory=dict,
         description="Per-room thread mode overrides keyed by room alias/name or Matrix room ID",
+        json_schema_extra=dashboard_hint(key_reference="room"),
     )
     num_history_runs: int | None = Field(
         default=None,
@@ -302,6 +362,11 @@ class AgentConfig(BaseModel):
         ge=0,
         description="Max tool call messages replayed from history (per-agent override)",
     )
+    max_tool_calls_per_turn: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum tool calls one turn may execute (per-agent override)",
+    )
     show_tool_calls: bool | None = Field(
         default=None,
         description="Whether to show tool call details inline in responses (per-agent override)",
@@ -314,13 +379,26 @@ class AgentConfig(BaseModel):
         default=None,
         description="Worker runtime reuse mode for routed tools: shared, user, or user_agent. user reuses one runtime per requester across agents and is not an agent-level filesystem isolation boundary",
     )
+    file_access: FileAccess | None = Field(
+        default=None,
+        description="Per-agent override of defaults.file_access (None = inherit the default)",
+    )
     allow_self_config: bool | None = Field(
         default=None,
         description="Allow this agent to modify its own configuration via a tool",
     )
+    automations: AutomationList | None = Field(
+        default=None,
+        description="Automations for this agent, built-in such as prompt_curation or from a plugin; omitted inherits defaults.automations",
+    )
+    skill_learning: SkillLearningConfig = Field(
+        default_factory=SkillLearningConfig,
+        description="Opt-in background reviews that create and maintain learned skills in this agent's workspace",
+    )
     delegate_to: list[str] = Field(
         default_factory=list,
-        description="List of agent names this agent can delegate tasks to via tool calls",
+        description="Allowed agents for run_subagent and continue_subagent, including this agent when explicitly listed",
+        json_schema_extra=dashboard_hint(reference="agent"),
     )
 
     @property
@@ -365,36 +443,7 @@ class AgentConfig(BaseModel):
     @classmethod
     def reject_legacy_agent_fields(cls, data: object) -> object:
         """Reject removed legacy fields to prevent silent misconfiguration."""
-        if isinstance(data, dict):
-            if "knowledge_base" in data:
-                msg = "Agent field 'knowledge_base' was removed. Use 'knowledge_bases' (list) instead."
-                raise ValueError(msg)
-            if "memory_dir" in data:
-                msg = "Agent field 'memory_dir' was removed. Use 'context_files' and memory.backend=file instead."
-                raise ValueError(msg)
-            if "memory_file_path" in data:
-                msg = (
-                    "Agent field 'memory_file_path' was removed. File-backed agent memory now lives in the "
-                    "canonical agent workspace root; keep memory_backend=file and configure context_files "
-                    "relative to that workspace."
-                )
-                raise ValueError(msg)
-            if "sandbox_tools" in data:
-                msg = "Agent field 'sandbox_tools' was removed. Use 'worker_tools' instead."
-                raise ValueError(msg)
-            if "allowed_toolkits" in data:
-                msg = (
-                    "Agent field 'allowed_toolkits' was removed. Expand toolkit/preset/bundle entries into individual "
-                    "tools before applying per-tool defer flags in tools."
-                )
-                raise ValueError(msg)
-            if "initial_toolkits" in data:
-                msg = (
-                    "Agent field 'initial_toolkits' was removed. Expand toolkit/preset/bundle entries into individual "
-                    "tools before applying per-tool initial flags in tools."
-                )
-                raise ValueError(msg)
-        return data
+        return reject_legacy_agent_fields(data)
 
     @field_validator("thread_exports", mode="before")
     @classmethod
@@ -439,18 +488,36 @@ class TeamConfig(BaseModel):
     """Configuration for a team of agents."""
 
     display_name: str = Field(description="Human-readable name for the team")
-    role: str = Field(description="Description of the team's purpose")
-    agents: list[str] = Field(min_length=1, description="List of agent names that compose this team")
-    rooms: list[str] = Field(default_factory=list, description="List of room IDs or names to auto-join")
+    role: str = Field(
+        description="Description of the team's purpose",
+        json_schema_extra=dashboard_hint(multiline=True),
+    )
+    agents: list[str] = Field(
+        min_length=1,
+        description="List of agent names that compose this team",
+        json_schema_extra=dashboard_hint(reference="agent"),
+    )
+    rooms: list[str] = Field(
+        default_factory=list,
+        description="List of room IDs or names to auto-join",
+        json_schema_extra=dashboard_hint(reference="room"),
+    )
     access: ResponderAccessConfig | None = Field(
         default=None,
         description="Optional membership-based conversation access policy",
     )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,
-        description="Whether this team accepts all, no, or matching inviter room invites",
+        description=(
+            "true accepts every room invite to this team, false accepts none, and a list accepts only "
+            "invites from matching inviter Matrix IDs or glob patterns"
+        ),
     )
-    model: str | None = Field(default="default", description="Default model for this team (optional)")
+    model: str | None = Field(
+        default="default",
+        description="Configured model alias used for this team's replies",
+        json_schema_extra=dashboard_hint(reference="model"),
+    )
     mode: str = Field(default="coordinate", description="Team collaboration mode: coordinate or collaborate")
     compaction: CompactionOverrideConfig | None = Field(
         default=None,
@@ -470,6 +537,11 @@ class TeamConfig(BaseModel):
         default=None,
         ge=0,
         description="Max tool call messages replayed from team history",
+    )
+    max_tool_calls_per_turn: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum tool calls the team coordinator may execute in one turn, delegations included (per-team override)",
     )
 
     @field_validator("agents")

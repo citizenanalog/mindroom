@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -13,6 +16,7 @@ from agno.models.message import Message
 from agno.run.agent import RunOutput
 from agno.run.team import TeamRunOutput
 from agno.session.agent import AgentSession
+from agno.session.summary import SessionSummary
 from agno.session.team import TeamSession
 
 from mindroom.agent_storage import (
@@ -231,7 +235,7 @@ def test_rejected_owner_mismatch_write_is_reported(tmp_path: Path) -> None:
 
 
 def test_bulk_upsert_preserves_updated_at_when_asked(tmp_path: Path) -> None:
-    """The per-row path stamps updated_at with now; preserve_updated_at must undo that."""
+    """Bulk writes preserve the caller's timestamp only when requested."""
     storage = _storage(tmp_path)
     db_path = tmp_path / "sessions" / "code.db"
     try:
@@ -253,6 +257,67 @@ def test_bulk_upsert_preserves_updated_at_when_asked(tmp_path: Path) -> None:
     assert stamped[0].updated_at != 123
     assert isinstance(preserved[0], AgentSession)
     assert preserved[0].updated_at == 123
+
+
+@pytest.mark.parametrize("session_type", [SessionType.AGENT, SessionType.TEAM])
+@pytest.mark.parametrize("bulk", [False, True])
+def test_session_json_is_written_once_and_legacy_json_still_loads(
+    tmp_path: Path,
+    session_type: SessionType,
+    bulk: bool,
+) -> None:
+    """New session fields are JSON objects; pre-upgrade string-encoded objects still load."""
+    storage = _storage(tmp_path)
+    db_path = tmp_path / "sessions" / "code.db"
+    session_data = {"session_state": {"topic": "café", "enabled": True}}
+    metadata = {"requester": "@alice:example.test", "nested": {"count": 2}}
+    entity_data = {"name": "Code", "description": "Helpful assistant"}
+    summary = SessionSummary(summary="Earlier discussion", topics=["weather"])
+    session_class = AgentSession if session_type == SessionType.AGENT else TeamSession
+    session = session_class(
+        session_id="json-session",
+        user_id="@alice:example.test",
+        session_data=session_data,
+        metadata=metadata,
+        summary=summary,
+        created_at=1_700_000_000,
+    )
+    if isinstance(session, AgentSession):
+        session.agent_data = entity_data
+    else:
+        session.team_data = entity_data
+    expected = (
+        session_data,
+        metadata,
+        entity_data if session_type == SessionType.AGENT else None,
+        entity_data if session_type == SessionType.TEAM else None,
+        {"summary": "Earlier discussion", "topics": ["weather"]},
+    )
+    select_json = "SELECT session_data, metadata, agent_data, team_data, summary FROM code_sessions"
+    try:
+        if bulk:
+            assert len(storage.upsert_sessions([session])) == 1
+        else:
+            assert storage.upsert_session(session) is not None
+        with sqlite3.connect(db_path) as connection:
+            stored = connection.execute(select_json).fetchone()
+            assert tuple(json.loads(value) if value is not None else None for value in stored) == expected
+            connection.execute(
+                "UPDATE code_sessions SET session_data = ?, metadata = ?, agent_data = ?, team_data = ?, summary = ?",
+                tuple(json.dumps(value) if value is not None else None for value in stored),
+            )
+        loaded = storage.get_session("json-session", session_type)
+        assert isinstance(loaded, session_class)
+        assert loaded.session_data == session_data
+        assert loaded.metadata == metadata
+        assert loaded.summary == summary
+        assert (loaded.agent_data if isinstance(loaded, AgentSession) else loaded.team_data) == entity_data
+        assert storage.upsert_session(loaded) is not None
+        with sqlite3.connect(db_path) as connection:
+            rewritten = connection.execute(select_json).fetchone()
+        assert tuple(json.loads(value) if value is not None else None for value in rewritten) == expected
+    finally:
+        storage.close()
 
 
 def test_fresh_state_database_gets_no_session_tables(tmp_path: Path) -> None:
@@ -301,7 +366,7 @@ def test_legacy_runs_blob_is_merged_into_reads_and_deletions_stick(tmp_path: Pat
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
     finally:
         connection.close()
-    assert [run["run_id"] for run in json.loads(json.loads(blob))] == ["run-1", "run-3"]
+    assert [run["run_id"] for run in json.loads(blob)] == ["run-1", "run-3"]
     # Opening a pre-existing file must not let agno's connect listener switch it to WAL.
     assert journal_mode == ("delete",)
 
@@ -430,7 +495,19 @@ def test_delete_runs_scrubs_legacy_blob_descendants_too(tmp_path: Path) -> None:
         (blob,) = connection.execute("SELECT runs FROM code_sessions WHERE session_id = 'session-1'").fetchone()
     finally:
         connection.close()
-    assert [run["run_id"] for run in json.loads(json.loads(blob))] == ["team2"]
+    assert [run["run_id"] for run in json.loads(blob)] == ["team2"]
+
+
+def test_runs_without_removes_every_descendant() -> None:
+    """Grandchildren leave with their root even when stored before it."""
+    runs = [
+        RunOutput(run_id="unrelated"),
+        RunOutput(run_id="child", parent_run_id="root"),
+        RunOutput(run_id="grandchild", parent_run_id="child"),
+        RunOutput(run_id="root"),
+    ]
+
+    assert [run.run_id for run in runs_without(runs, ["root"])] == ["unrelated"]
 
 
 def test_runs_without_drops_a_child_that_has_no_run_id() -> None:
@@ -475,4 +552,83 @@ def test_delete_runs_tolerates_malformed_legacy_blob_entries(tmp_path: Path) -> 
         (blob,) = connection.execute("SELECT runs FROM code_sessions WHERE session_id = 'session-1'").fetchone()
     finally:
         connection.close()
-    assert json.loads(json.loads(blob)) == legacy_runs[2:]
+    assert json.loads(blob) == legacy_runs[2:]
+
+
+def test_cache_diagnostics_count_history_without_retaining_closed_adapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counts cover current adapters, not closed stores or private conversation identifiers."""
+    from structlog.testing import capture_logs  # noqa: PLC0415
+
+    from mindroom import agent_storage  # noqa: PLC0415
+
+    # Scope diagnostics to this test's adapters; other tests may retain an
+    # otherwise unreachable Agno adapter cycle until the next GC collection.
+    monkeypatch.setattr(agent_storage, "_CACHE_DIAGNOSTICS", weakref.WeakKeyDictionary())
+    monkeypatch.setattr(agent_storage, "_CACHE_DIAGNOSTICS_NEXT_REPORT", 0.0, raising=False)
+    first = _storage(tmp_path / "first")
+    second = _storage(tmp_path / "second")
+    try:
+        seed_session(first, _session("private-first", ["r1", "r2"]))
+        seed_session(second, _session("private-second", ["r3"]))
+        with capture_logs() as logs:
+            get_agent_session(first, "private-first")
+            get_agent_session(second, "private-second")
+        summaries = [entry for entry in logs if entry["event"] == "conversation_cache_summary"]
+        assert len(summaries) == 1
+        assert summaries[0]["observed_cached_runs"] == 2
+        first.close()
+        monkeypatch.setattr(agent_storage, "_CACHE_DIAGNOSTICS_NEXT_REPORT", 0.0)
+        with capture_logs() as logs:
+            get_agent_session(second, "private-second")
+        summary = next(entry for entry in logs if entry["event"] == "conversation_cache_summary")
+        assert summary["adapters"] == 1
+        assert summary["observed_cached_sessions"] == 1
+        assert summary["observed_cached_runs"] == 1
+        assert "private" not in str(summary)
+    finally:
+        first.close()
+        second.close()
+
+
+def test_cache_diagnostics_ignore_read_finishing_after_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read paused before publishing cannot restore a closed adapter's snapshot."""
+    from mindroom import agent_storage  # noqa: PLC0415
+
+    storage = _storage(tmp_path)
+    seed_session(storage, _session("s1", ["r1"]))
+    report_started = threading.Event()
+    resume_report = threading.Event()
+    report_cache_counts = storage._report_cache_counts
+
+    def paused_report() -> None:
+        report_started.set()
+        assert resume_report.wait(timeout=5)
+        report_cache_counts()
+
+    monkeypatch.setattr(storage, "_report_cache_counts", paused_report)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        read = executor.submit(get_agent_session, storage, "s1")
+        try:
+            assert report_started.wait(timeout=5)
+            storage.close()
+            resume_report.set()
+            loaded = read.result(timeout=5)
+            assert loaded is not None
+            assert [run.run_id for run in loaded.runs or []] == ["r1"]
+            with agent_storage._CACHE_DIAGNOSTICS_LOCK:
+                assert storage not in agent_storage._CACHE_DIAGNOSTICS
+            # Disposing SQLAlchemy's pool still permits later SQL reads, but
+            # explicit close ends this adapter's diagnostic lifetime.
+            assert get_agent_session(storage, "s1") is not None
+            with agent_storage._CACHE_DIAGNOSTICS_LOCK:
+                assert storage not in agent_storage._CACHE_DIAGNOSTICS
+        finally:
+            resume_report.set()
+            read.result(timeout=5)
+            storage.close()

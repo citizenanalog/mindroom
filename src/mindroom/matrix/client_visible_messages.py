@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import nio
-from nio.api import RelationshipType
 from typing_extensions import TypeIs
 
 from mindroom.constants import STREAM_STATUS_KEY
@@ -21,7 +19,6 @@ from mindroom.matrix.message_content import (
     extract_edit_body,
     resolve_event_source_content,
 )
-from mindroom.matrix.sidecar_content import holds_unresolved_sidecar
 from mindroom.matrix.visible_body import bundled_visible_body_preview, visible_body_from_event_source
 
 if TYPE_CHECKING:
@@ -248,126 +245,6 @@ async def extract_visible_edit_body(
         event_source,
         client,
         trusted_sender_ids=_resolved_trusted_sender_ids(config, runtime_paths, trusted_sender_ids),
-    )
-
-
-def _is_replacement_for_event(
-    event_source: dict[str, Any],
-    *,
-    sender: str,
-    event_id: str,
-) -> bool:
-    """Return whether one replacement belongs to the event being recovered."""
-    event_info = EventInfo.from_event(event_source)
-    return event_source.get("sender") == sender and event_info.is_edit and event_info.original_event_id == event_id
-
-
-async def _latest_relation_or_original_body(
-    client: nio.AsyncClient,
-    *,
-    room_id: str,
-    event_id: str,
-    event: VisibleRoomMessage,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    trusted_sender_ids: Collection[str] | None,
-) -> str | None:
-    """Read the newest valid replacement relation, or the original body."""
-    relations = client.room_get_event_relations(
-        room_id,
-        event_id,
-        RelationshipType.replacement,
-        direction=nio.MessageDirection.back,
-    )
-    async with contextlib.aclosing(relations):
-        async for candidate in relations:
-            if candidate.sender != event.sender:
-                continue
-            replacement = candidate
-            if isinstance(replacement, nio.MegolmEvent):
-                if client.olm is None:
-                    return None
-                try:
-                    replacement = client.decrypt_event(replacement)
-                except nio.EncryptionError:
-                    return None
-            if isinstance(replacement, nio.RedactedEvent):
-                continue
-            if not is_visible_room_message(replacement):
-                return None
-            if not _is_replacement_for_event(
-                replacement.source,
-                sender=event.sender,
-                event_id=event_id,
-            ):
-                continue
-            body, content = await extract_visible_edit_body(
-                replacement.source,
-                client,
-                config=config,
-                runtime_paths=runtime_paths,
-                trusted_sender_ids=trusted_sender_ids,
-            )
-            return None if content is not None and holds_unresolved_sidecar(content) else body
-
-    resolved_source, body = await resolve_visible_event_source(
-        event.source,
-        client,
-        fallback_body=room_message_fallback_body(event),
-        config=config,
-        runtime_paths=runtime_paths,
-        trusted_sender_ids=trusted_sender_ids,
-    )
-    resolved_content = resolved_source.get("content")
-    if not isinstance(resolved_content, Mapping) or holds_unresolved_sidecar(resolved_content):
-        return None
-    return body
-
-
-async def fetch_latest_visible_body(
-    client: nio.AsyncClient,
-    *,
-    room_id: str,
-    event_id: str,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    trusted_sender_ids: Collection[str] | None = None,
-) -> str | None:
-    """Fetch an event's authoritative latest visible body, failing closed."""
-    response = await client.room_get_event(room_id, event_id)
-    if not isinstance(response, nio.RoomGetEventResponse):
-        return None
-    event = response.event
-    if not is_visible_room_message(event):
-        return None
-    event_source = event.source if isinstance(event.source, dict) else None
-    if event_source is None:
-        return None
-    replacements = bundled_replacement_candidates(event_source)
-    for replacement in replacements:
-        if not _is_replacement_for_event(
-            replacement,
-            sender=event.sender,
-            event_id=event_id,
-        ):
-            continue
-        body, content = await extract_visible_edit_body(
-            replacement,
-            client,
-            config=config,
-            runtime_paths=runtime_paths,
-            trusted_sender_ids=trusted_sender_ids,
-        )
-        return None if content is not None and holds_unresolved_sidecar(content) else body
-
-    return await _latest_relation_or_original_body(
-        client,
-        room_id=room_id,
-        event_id=event_id,
-        event=event,
-        config=config,
-        runtime_paths=runtime_paths,
-        trusted_sender_ids=trusted_sender_ids,
     )
 
 
@@ -624,6 +501,10 @@ class ThreadEditCandidates:
         """Return every original event ID some candidate claims to replace."""
         return list(self._by_original_and_sender)
 
+    def __len__(self) -> int:
+        """Return how many candidates are kept, one per original and sender."""
+        return sum(len(by_sender) for by_sender in self._by_original_and_sender.values())
+
     def winner_for(
         self,
         original_event_id: str,
@@ -649,7 +530,7 @@ class ThreadEditCandidates:
 
 
 async def apply_latest_edits_to_messages(
-    client: nio.AsyncClient,
+    client: nio.AsyncClient | None,
     *,
     messages_by_event_id: dict[str, ResolvedVisibleMessage],
     edit_candidates: ThreadEditCandidates,
@@ -771,7 +652,6 @@ __all__ = [
     "bundled_replacement_candidates",
     "extract_visible_edit_body",
     "extract_visible_message",
-    "fetch_latest_visible_body",
     "is_visible_room_message",
     "message_preview",
     "replace_visible_message",

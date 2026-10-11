@@ -9,7 +9,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,6 +23,7 @@ from mindroom.constants import RuntimePaths
 from mindroom.message_target import MessageTarget
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.script_runs import manager as manager_module
+from mindroom.script_runs.compatibility import SCRIPT_PROTOCOL_VERSION
 from mindroom.script_runs.manager import (
     ScriptRunLimits,
     ScriptRunManager,
@@ -34,6 +35,8 @@ from mindroom.script_runs.worker_client import (
     WorkerScriptCancel,
     WorkerScriptStatus,
 )
+from mindroom.shell.execution import ShellRunResult
+from mindroom.tool_system.sandbox_proxy import runner_config_snapshot
 from mindroom.tool_system.worker_routing import agent_workspace_root_path, worker_root_path
 from mindroom.workers.backends.static_runner import StaticSandboxRunnerBackend
 from mindroom.workers.models import ScriptResourceProfileName, WorkerHandle, WorkerSpec
@@ -164,6 +167,12 @@ class _WorkerBackend:
     def script_resource_profiles(self) -> dict[str, object] | None:
         return self.resource_profiles_payload
 
+    def script_recovery_signature(self) -> str:
+        return "stable-worker-authority"
+
+    def script_resource_recovery_authority(self, resource_profile: str | None) -> dict[str, object]:
+        return {"profile": resource_profile, "requests": {}, "limits": {}}
+
     def ensure_worker(
         self,
         spec: WorkerSpec,
@@ -204,7 +213,14 @@ class _WorkerBackend:
         del now
         return []
 
-    def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
+    def record_failure(
+        self,
+        worker_key: str,
+        failure_reason: str,
+        *,
+        now: float | None = None,
+        **_kwargs: object,
+    ) -> WorkerHandle:
         del failure_reason, now
         return self.handles[worker_key]
 
@@ -221,6 +237,7 @@ class _WorkerClient:
     store: ScriptRunStore
     launch_paths: dict[str, tuple[Path, Path]] = field(default_factory=dict)
     launch_state_scope_worker_keys: list[str | None] = field(default_factory=list)
+    launch_config_snapshots: list[dict[str, object] | None] = field(default_factory=list)
     cancel_observed_revocation: bool = False
     cancel_forces: list[bool] = field(default_factory=list)
     cancel_handles: list[str] = field(default_factory=list)
@@ -242,11 +259,15 @@ class _WorkerClient:
         run_id: str,
         source_digest: str,
         gateway_url: str,
+        max_runtime_seconds: int,
         state_scope_worker_key: str | None = None,
         private_agent_names: tuple[str, ...] | None = None,
+        config_snapshot: dict[str, object] | None = None,
     ) -> None:
         del source_digest, gateway_url, private_agent_names
+        assert max_runtime_seconds > 0
         self.launch_state_scope_worker_keys.append(state_scope_worker_key)
+        self.launch_config_snapshots.append(config_snapshot)
         starting = self.store.get_run(run_id)
         assert starting.state is ScriptRunState.STARTING
         assert starting.worker_id == worker.worker_id
@@ -328,6 +349,38 @@ def _manager(
         cancellation_poll_interval_seconds=0,
     )
     return manager, backend, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_name", ["kubernetes", "docker"])
+async def test_launch_persists_recovery_contract_only_for_kubernetes(tmp_path: Path, backend_name: str) -> None:
+    """Only isolated Kubernetes launches opt into preserving the process on primary restart."""
+    manager, backend, _client = _manager(tmp_path, backend=backend_name, isolated_script_gateway=True)
+    backend.backend_name = backend_name
+    context = _context(tmp_path, backend=backend_name, isolated_script_gateway=True)
+
+    run = await manager.run(context, source="print('ok')\n")
+
+    assert run.state is ScriptRunState.RUNNING
+    assert (run.recovery_signature is not None) is (backend_name == "kubernetes")
+    assert ScriptRunStore(context.runtime_paths).get_run(run.run_id).recovery_signature == run.recovery_signature
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_name", ["kubernetes", "docker"])
+async def test_launch_sends_live_config_only_to_seeded_workers(tmp_path: Path, backend_name: str) -> None:
+    """Kubernetes script workers mount no config, so the launch carries the allowlisted live config fields."""
+    manager, backend, client = _manager(tmp_path, backend=backend_name, isolated_script_gateway=True)
+    backend.backend_name = backend_name
+    context = _context(tmp_path, backend=backend_name, isolated_script_gateway=True)
+
+    run = await manager.run(context, source="print('ok')\n")
+
+    assert run.state is ScriptRunState.RUNNING
+    expected = runner_config_snapshot(context.runtime_paths, context.config) if backend_name == "kubernetes" else None
+    assert client.launch_config_snapshots == [expected]
+    if expected is not None:
+        assert set(expected["agents"]) == {"watcher", "analyzer"}
 
 
 async def _wait_for_cancel_request(manager: ScriptRunManager, run_id: str) -> None:
@@ -519,6 +572,27 @@ async def test_launch_persists_backend_admitted_after_global_launch_gate(
 
 
 @pytest.mark.asyncio
+async def test_local_launch_keeps_workspace_code_out_of_the_shim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shim runs from the workspace, so neither its cwd nor its `HOME` may reach `sys.path`."""
+    manager, _backend, _client = _manager(tmp_path, mode="local")
+    launched_argv: list[list[str]] = []
+
+    async def launch_local(*_args: object, **kwargs: object) -> ShellRunResult:
+        launched_argv.append(list(cast("list[str]", kwargs["argv"])))
+        return ShellRunResult(message="Started background process", handle=str(kwargs["handle"]))
+
+    monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
+    monkeypatch.setattr(manager_module, "run_command_via_supervisor", launch_local)
+
+    await manager.run(_context(tmp_path, mode="local"), source="print('ok')\n")
+
+    assert [argv[:5] for argv in launched_argv] == [[sys.executable, "-P", "-s", "-m", "mindroom.script_runs.shim"]]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["all", "local"])
 async def test_shutdown_fence_drains_admitted_launch_and_rejects_racing_launch(
     tmp_path: Path,
@@ -534,11 +608,11 @@ async def test_shutdown_fence_drains_admitted_launch_and_rejects_racing_launch(
         client.launch_release = release_launch
     else:
 
-        async def launch_local(*_args: object, **_kwargs: object) -> str:
+        async def launch_local(*_args: object, **_kwargs: object) -> ShellRunResult:
             launch_entered.set()
             await release_launch.wait()
             handle = str(_kwargs["handle"])
-            return f"Started background process\nHandle: {handle}"
+            return ShellRunResult(message="Started background process", handle=handle)
 
         monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
         monkeypatch.setattr(manager_module, "run_command_via_supervisor", launch_local)
@@ -833,6 +907,58 @@ async def test_launch_admission_remains_fenced_until_every_reconciliation_owner_
 
 
 @pytest.mark.asyncio
+async def test_cancelled_reconciliation_drain_reopens_launch_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation after acquiring a fence releases it without cancelling an admitted launch."""
+    manager, _backend, _client = _manager(tmp_path)
+    await manager._admit_launch()
+    drain_started = asyncio.Event()
+    wait_for_drain = manager._launches_drained.wait
+
+    async def observe_drain() -> bool:
+        drain_started.set()
+        return await wait_for_drain()
+
+    monkeypatch.setattr(manager._launches_drained, "wait", observe_drain)
+    reconciliation = asyncio.create_task(manager.begin_startup_reconciliation())
+    await drain_started.wait()
+    reconciliation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconciliation
+    await manager._release_launch_admission()
+
+    launched = await manager.run(_context(tmp_path), source="print('ok')\n")
+    assert launched.state is ScriptRunState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reconciliation_contender_preserves_existing_fence(tmp_path: Path) -> None:
+    """A caller cancelled before acquiring ownership cannot release another caller's fence."""
+    manager, _backend, _client = _manager(tmp_path)
+    await manager.begin_startup_reconciliation()
+    contender_started = asyncio.Event()
+
+    async def begin_contender() -> None:
+        contender_started.set()
+        await manager.begin_startup_reconciliation()
+
+    async with manager._launch_admission_lock:
+        contender = asyncio.create_task(begin_contender())
+        await contender_started.wait()
+        contender.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await contender
+
+    with pytest.raises(ScriptRunManagerError, match="reconciliation is in progress"):
+        await manager.run(_context(tmp_path), source="print('blocked')\n")
+    await manager.end_startup_reconciliation()
+    launched = await manager.run(_context(tmp_path), source="print('ok')\n")
+    assert launched.state is ScriptRunState.RUNNING
+
+
+@pytest.mark.asyncio
 async def test_worker_keys_are_requester_and_agent_scoped(tmp_path: Path) -> None:
     """Different owners cannot share a user-agent worker or its run directory."""
     manager, _backend, _client = _manager(tmp_path)
@@ -908,6 +1034,8 @@ async def test_concurrent_scripts_use_run_pinned_worker_roots_and_routes(tmp_pat
             "run_id": broad.run_id,
             "worker_key": broad.worker_key,
             "source_digest": broad.source_digest,
+            "max_runtime_seconds": broad.max_runtime_seconds,
+            "protocol_version": SCRIPT_PROTOCOL_VERSION,
             "gateway_url": "http://primary.test/api/script-gateway",
             "private_agent_names": [],
         },
@@ -919,6 +1047,8 @@ async def test_concurrent_scripts_use_run_pinned_worker_roots_and_routes(tmp_pat
             "run_id": broad.run_id,
             "worker_key": narrow.worker_key,
             "source_digest": broad.source_digest,
+            "max_runtime_seconds": broad.max_runtime_seconds,
+            "protocol_version": SCRIPT_PROTOCOL_VERSION,
             "gateway_url": "http://primary.test/api/script-gateway",
             "private_agent_names": [],
         },
@@ -1013,7 +1143,7 @@ async def test_unsafe_local_launch_rejects_uncontained_platform_before_durable_w
     """Unsafe-local scripts fail closed when supervisor hard-crash containment is unavailable."""
     manager, backend, _client = _manager(tmp_path, mode="off")
     monkeypatch.setattr(manager_module, "background_script_supervision_supported", lambda: False, raising=False)
-    launch = AsyncMock(return_value=f"Handle: shell:{'a' * 32}")
+    launch = AsyncMock(return_value=ShellRunResult(message="Started background process", handle=f"shell:{'a' * 32}"))
     monkeypatch.setattr(manager_module, "run_command_via_supervisor", launch)
 
     with pytest.raises(ScriptRunManagerError, match="Linux"):
@@ -1100,10 +1230,10 @@ async def test_post_spawn_store_read_failure_signals_local_process_before_failin
     killed_handles: list[str] = []
     original_get_run = manager.store.get_run
 
-    async def launch_local(*_args: object, **_kwargs: object) -> str:
+    async def launch_local(*_args: object, **_kwargs: object) -> ShellRunResult:
         nonlocal spawned
         spawned = True
-        return f"Handle: shell:{manager.store.list_runs()[0].run_id.removeprefix('script-')}"
+        return ShellRunResult(message="Started background process", handle=str(_kwargs["handle"]))
 
     def fail_first_post_spawn_read(run_id: str) -> ScriptRunRecord:
         nonlocal failed_read
@@ -1157,10 +1287,10 @@ async def test_post_spawn_task_cancellation_signals_local_process_before_propaga
     killed_handles: list[str] = []
     original_get_run = manager.store.get_run
 
-    async def launch_local(*_args: object, **_kwargs: object) -> str:
+    async def launch_local(*_args: object, **_kwargs: object) -> ShellRunResult:
         nonlocal spawned
         spawned = True
-        return f"Handle: shell:{manager.store.list_runs()[0].run_id.removeprefix('script-')}"
+        return ShellRunResult(message="Started background process", handle=str(_kwargs["handle"]))
 
     def block_first_post_spawn_read(run_id: str) -> ScriptRunRecord:
         nonlocal blocked_read
@@ -1431,8 +1561,8 @@ async def test_local_cancel_waits_for_snapshot_write_and_removes_capability(
         assert release_write.wait(timeout=5)
         return original_write_snapshot(*args, **kwargs)
 
-    async def launch_local(*_args: object, **kwargs: object) -> str:
-        return f"Started background process\nHandle: {kwargs['handle']}"
+    async def launch_local(*_args: object, **kwargs: object) -> ShellRunResult:
+        return ShellRunResult(message="Started background process", handle=str(kwargs["handle"]))
 
     monkeypatch.setattr(manager_module, "_write_snapshot", blocked_write_snapshot)
     monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
@@ -2086,18 +2216,18 @@ async def test_partial_snapshot_cleanup_preserves_original_launch_error(
 ) -> None:
     """A token-write failure remains the launch error after partial snapshot cleanup."""
     manager, _backend, _client = _manager(tmp_path)
-    original_write = manager_module._write_private_file
+    original_write = manager_module.write_file_within_root
     calls = 0
 
-    def fail_token_write(path: Path, content: bytes) -> None:
+    def fail_token_write(root: Path, relative_path: Path, payload: bytes, **kwargs: object) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             message = "token write denied"
             raise PermissionError(message)
-        original_write(path, content)
+        original_write(root, relative_path, payload, **kwargs)
 
-    monkeypatch.setattr(manager_module, "_write_private_file", fail_token_write)
+    monkeypatch.setattr(manager_module, "write_file_within_root", fail_token_write)
 
     with pytest.raises(PermissionError, match="token write denied"):
         await manager.run(_context(tmp_path), source="print('ok')\n")
@@ -2378,7 +2508,10 @@ async def test_explicit_local_mode_uses_existing_supervisor_and_marks_run_unsafe
         tail: int,
         timeout: float,  # noqa: ASYNC109
         handle: str | None = None,
-    ) -> str:
+        max_runtime_seconds: float | None = None,
+    ) -> ShellRunResult:
+        assert max_runtime_seconds is not None
+        assert max_runtime_seconds > 0
         observed.update(
             socket_path=socket_path,
             namespace=namespace,
@@ -2392,7 +2525,7 @@ async def test_explicit_local_mode_uses_existing_supervisor_and_marks_run_unsafe
         assert handle is not None
         starting = manager.store.list_runs(include_finished=False)[0]
         assert handle == f"shell:{starting.run_id.removeprefix('script-')}"
-        return f"Started background process\nHandle: {handle}"
+        return ShellRunResult(message="Started background process", handle=handle)
 
     monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
     monkeypatch.setattr(manager_module, "run_command_via_supervisor", launch_local)
@@ -2451,10 +2584,13 @@ async def test_local_snapshot_workspace_resolution_does_not_block_the_event_loop
         tail: int,
         timeout: float,  # noqa: ASYNC109
         handle: str | None = None,
-    ) -> str:
+        max_runtime_seconds: float | None = None,
+    ) -> ShellRunResult:
+        assert max_runtime_seconds is not None
+        assert max_runtime_seconds > 0
         del namespace, argv, env, cwd, tail, timeout
         assert handle is not None
-        return f"Started background process\nHandle: {handle}"
+        return ShellRunResult(message="Started background process", handle=handle)
 
     monkeypatch.setattr(manager_module, "_agent_workspace", blocking_workspace)
     monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
@@ -2488,9 +2624,9 @@ async def test_local_launch_rechecks_durable_intent_immediately_before_spawn(
         manager.store.request_cancel(run_id, reason="cancelled during snapshot")
         return paths
 
-    async def launch_local(*_args: object, **_kwargs: object) -> str:
+    async def launch_local(*_args: object, **_kwargs: object) -> ShellRunResult:
         launch_calls.append("called")
-        return "unexpected launch"
+        return ShellRunResult(message="unexpected launch")
 
     monkeypatch.setattr(manager_module, "_write_snapshot", snapshot_then_cancel)
     monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
@@ -2513,7 +2649,7 @@ async def test_ambiguous_local_launch_failure_remains_retryable_until_exit(
     killed_handles: list[str] = []
     termination_confirmed = False
 
-    async def failed_launch(*_args: object, **_kwargs: object) -> str:
+    async def failed_launch(*_args: object, **_kwargs: object) -> ShellRunResult:
         message = "launch response lost"
         raise RuntimeError(message)
 
@@ -2581,12 +2717,15 @@ async def test_local_launch_adopts_cancellation_before_running_transition(
         tail: int,
         timeout: float,  # noqa: ASYNC109
         handle: str | None = None,
-    ) -> str:
+        max_runtime_seconds: float | None = None,
+    ) -> ShellRunResult:
+        assert max_runtime_seconds is not None
+        assert max_runtime_seconds > 0
         del namespace, argv, env, cwd, tail, timeout
         assert handle is not None
         launch_entered.set()
         await launch_release.wait()
-        return f"Started background process\nHandle: {handle}"
+        return ShellRunResult(message="Started background process", handle=handle)
 
     def kill_local(
         _socket_path: str,
@@ -2648,12 +2787,15 @@ async def test_local_launch_does_not_publish_running_after_unconfirmed_cancel(
         tail: int,
         timeout: float,  # noqa: ASYNC109
         handle: str | None = None,
-    ) -> str:
+        max_runtime_seconds: float | None = None,
+    ) -> ShellRunResult:
+        assert max_runtime_seconds is not None
+        assert max_runtime_seconds > 0
         del namespace, argv, env, cwd, tail, timeout
         assert handle is not None
         launch_entered.set()
         await launch_release.wait()
-        return f"Started background process\nHandle: {handle}"
+        return ShellRunResult(message="Started background process", handle=handle)
 
     def kill_local(
         _socket_path: str,
@@ -2698,3 +2840,22 @@ async def test_local_launch_does_not_publish_running_after_unconfirmed_cancel(
     process_exited = True
     reconciled = await manager.reconcile_durable(run_id=starting.run_id)
     assert reconciled.state is ScriptRunState.CANCELLED
+
+
+@pytest.mark.parametrize("planted", ["linked_mindroom_dir", "linked_script_runs_dir"])
+def test_snapshot_write_refuses_linked_workspace_directories(tmp_path: Path, planted: str) -> None:
+    """A run snapshot and its capability never land where a planted workspace link points."""
+    workspace = tmp_path / "workspace"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    workspace.mkdir()
+    if planted == "linked_mindroom_dir":
+        (workspace / ".mindroom").symlink_to(elsewhere, target_is_directory=True)
+    else:
+        (workspace / ".mindroom").mkdir()
+        (workspace / ".mindroom" / "script-runs").symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(OSError, match=r"Too many levels|Not a directory"):
+        manager_module._write_snapshot(workspace, f"script-{'a' * 32}", source=b"print('ok')\n", token="secret")  # noqa: S106
+
+    assert list(elsewhere.iterdir()) == []

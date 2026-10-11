@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import venv
@@ -57,6 +58,15 @@ class LocalWorkerStatePaths:
     cache_dir: Path
     metadata_dir: Path
     metadata_file: Path
+
+    @property
+    def tmp_dir(self) -> Path:
+        """Return the disk-backed temp directory for tool subprocesses.
+
+        Dedicated workers keep `/tmp` on a small in-memory tmpfs, so large temporary
+        files such as pip's downloaded wheels go to the worker's state mount instead.
+        """
+        return self.cache_dir / "tmp"
 
 
 @dataclass
@@ -138,6 +148,7 @@ def local_worker_state_paths_from_handle(handle: WorkerHandle) -> LocalWorkerSta
 def _ensure_local_worker_directories(paths: LocalWorkerStatePaths) -> None:
     paths.workspace.mkdir(parents=True, exist_ok=True)
     paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    paths.tmp_dir.mkdir(exist_ok=True)
     paths.metadata_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -147,8 +158,23 @@ def _ensure_local_worker_state(paths: LocalWorkerStatePaths) -> None:
     if (paths.venv_dir / "bin" / "python").exists():
         return
 
-    builder = venv.EnvBuilder(with_pip=True, system_site_packages=True)
-    builder.create(paths.venv_dir)
+    try:
+        _create_local_worker_venv(paths.venv_dir)
+    except Exception:
+        # Creation writes the interpreter before seeding pip. A failed seed must
+        # leave the next request able to retry without deleting user packages.
+        (paths.venv_dir / "bin" / "python").unlink(missing_ok=True)
+        raise
+
+
+def _create_local_worker_venv(venv_dir: Path) -> None:
+    """Seed pip from the interpreter's bundled wheel without index access."""
+    uv_path = shutil.which("uv")
+    bundled_pip_dir = Path(sysconfig.get_path("stdlib")) / "ensurepip" / "_bundled"
+    if uv_path is None or not any(bundled_pip_dir.glob("pip-*.whl")):
+        venv.EnvBuilder(with_pip=True, system_site_packages=True).create(venv_dir)
+        return
+    _create_uv_worker_venv(venv_dir, uv_path=uv_path, bundled_pip_dir=bundled_pip_dir)
 
 
 def _ensure_local_script_worker_state(paths: LocalWorkerStatePaths) -> None:
@@ -161,8 +187,32 @@ def _ensure_local_script_worker_state(paths: LocalWorkerStatePaths) -> None:
     if uv_path is None:
         msg = "uv is required to prepare run-scoped script workers."
         raise WorkerBackendError(msg)
+    _create_uv_worker_venv(paths.venv_dir, uv_path=uv_path)
+
+
+def _create_uv_worker_venv(
+    venv_dir: Path,
+    *,
+    uv_path: str,
+    bundled_pip_dir: Path | None = None,
+) -> None:
+    """Create a worker environment with optional offline pip seeding."""
     env = dict(os.environ)
     env.pop("UV_VENV_SEED", None)
+    # Worker-owned packages must not alias other environments or the uv cache.
+    seed_args = (
+        [
+            "--seed",
+            "--no-index",
+            "--find-links",
+            str(bundled_pip_dir),
+            "--allow-existing",
+            "--link-mode",
+            "copy",
+        ]
+        if bundled_pip_dir is not None
+        else []
+    )
     subprocess.run(
         [
             uv_path,
@@ -174,7 +224,8 @@ def _ensure_local_script_worker_state(paths: LocalWorkerStatePaths) -> None:
             "--system-site-packages",
             "--python",
             sys.executable,
-            str(paths.venv_dir),
+            *seed_args,
+            str(venv_dir),
         ],
         check=True,
         env=env,
@@ -312,8 +363,16 @@ class _LocalWorkerBackend:
 
         return filter_and_sort_worker_handles(cleaned_workers, True)
 
-    def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
+    def record_failure(
+        self,
+        worker_key: str,
+        failure_reason: str,
+        *,
+        now: float | None = None,
+        startup_count: int | None = None,
+    ) -> WorkerHandle:
         """Persist one local worker failure."""
+        del startup_count  # This backend never replaces a worker behind an in-flight request.
         timestamp = time.time() if now is None else now
         paths = _local_worker_state_paths(worker_key, worker_root=self.worker_root)
         worker_lock = self._worker_lock(paths)

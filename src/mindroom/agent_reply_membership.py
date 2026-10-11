@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -12,15 +13,22 @@ from mindroom.access_policy import resolve_responder_access
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.logging_config import get_logger
 from mindroom.matrix.state import matrix_state_for_runtime
-from mindroom.requester_identity import resolve_human_requester_alias
+from mindroom.requester_identity import equivalent_requester_ids
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
 logger = get_logger(__name__)
+
+# Every bot syncs on its own, so the bot answering a message can see its sender join before the
+# router's sync applies that join here. A denial then waits this long for the router to catch up.
+_JOIN_LAG_GRACE_SECONDS = 15.0
+# A finished wait is remembered this long, so each wait stays bounded and a later join gets a fresh one.
+_JOIN_LAG_RETENTION_SECONDS = 4 * _JOIN_LAG_GRACE_SECONDS
+_JOIN_LAG_MAX_TRACKED = 4096
 
 type _ResponderMembershipPolicySignature = tuple[str, bool, tuple[str, ...]]
 type _AgentReplyMembershipPolicySignature = tuple[_ResponderMembershipPolicySignature, ...]
@@ -80,16 +88,22 @@ class _AgentReplyMembershipSnapshot:
     policy_signature: _AgentReplyMembershipPolicySignature | None = None
     rooms: tuple[_GrantRoomMembership, ...] = ()
     refresh_required: bool = True
+    # Refresh supplies the exact joined set; local uncertainty adds only the
+    # affected room until the next refresh. None means discovery is unknown.
+    possible_joined_room_ids: frozenset[str] | None = None
 
 
 class AgentReplyMembershipIndex:
     """Own the process-local membership state used by reply authorization."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._snapshot = _AgentReplyMembershipSnapshot()
         self._desired_signature: _AgentReplyMembershipPolicySignature | None = None
         self._epoch = 0
         self._refresh_lock = asyncio.Lock()
+        # (room ID, requester) to when a denial first waited for the router's view of that join.
+        self._join_lag_started: dict[tuple[str, str], float] = {}
+        self._clock = clock
 
     @property
     def snapshot(self) -> _AgentReplyMembershipSnapshot:
@@ -141,6 +155,73 @@ class AgentReplyMembershipIndex:
             and _raw_membership_matches_sender(room.raw_joined_user_ids, sender_id, config, runtime_paths)
             for room in snapshot.rooms
         )
+
+    def awaits_router_join(
+        self,
+        sender_id: str,
+        room_id: str,
+        observed_joined_user_ids: frozenset[str],
+        *,
+        room_keys: Sequence[str],
+        current_room: bool,
+        config: Config,
+        runtime_paths: RuntimePaths,
+    ) -> bool:
+        """Return whether a denial in this room should wait briefly for the router to apply a join.
+
+        ``observed_joined_user_ids`` is the answering bot's own roster for the room. It never grants
+        access: the snapshot stays the only grant, and this only defers settling a denial while a
+        ready snapshot of the same room lacks a sender that bot has already seen join. The wait is
+        bounded per room and requester, so a sender whose join never arrives cannot stall the room.
+        """
+        snapshot = self._snapshot
+        if snapshot.policy_signature != _agent_reply_membership_policy_signature(config):
+            return False
+        grant_room_keys = frozenset(room_keys)
+        if not any(
+            room.ready and room.room_id == room_id and (current_room or room.room_key in grant_room_keys)
+            for room in snapshot.rooms
+        ):
+            return False
+        key = (room_id, sender_id)
+        if not _raw_membership_matches_sender(observed_joined_user_ids, sender_id, config, runtime_paths):
+            self._join_lag_started.pop(key, None)  # this bot saw them leave, so a later join waits afresh
+            return False
+        now = self._clock()
+        started = self._join_lag_started.get(key)
+        if started is None or now - started >= _JOIN_LAG_RETENTION_SECONDS:
+            self._join_lag_started = {
+                tracked: first
+                for tracked, first in self._join_lag_started.items()
+                if now - first < _JOIN_LAG_RETENTION_SECONDS
+            }
+            if len(self._join_lag_started) >= _JOIN_LAG_MAX_TRACKED:
+                return False
+            self._join_lag_started[key] = started = now
+        return now - started < _JOIN_LAG_GRACE_SECONDS
+
+    def grants_pending(
+        self,
+        config: Config,
+        *,
+        joined_rooms: Sequence[str],
+        current_room_id: str | None,
+    ) -> bool:
+        """Return whether any relevant grant still lacks authoritative membership."""
+        if not joined_rooms and current_room_id is None:
+            return False
+        snapshot = self._snapshot
+        if snapshot.policy_signature != _agent_reply_membership_policy_signature(config):
+            return True
+        ready_keys = {room.room_key for room in snapshot.rooms if room.ready}
+        if any(room_key not in ready_keys for room_key in joined_rooms):
+            return True
+        if current_room_id is None:
+            return False
+        # Another responder's unready named row cannot override proven absence.
+        if snapshot.possible_joined_room_ids is not None and current_room_id not in snapshot.possible_joined_room_ids:
+            return False
+        return not any(room.ready for room in snapshot.rooms if room.room_id == current_room_id)
 
     def invalidate(self, config: Config, *, reason: str) -> None:
         """Revoke every room-backed grant until an authoritative refresh succeeds."""
@@ -223,6 +304,11 @@ class AgentReplyMembershipIndex:
             self._snapshot,
             rooms=tuple(updated_rooms),
             refresh_required=True,
+            possible_joined_room_ids=(
+                None
+                if self._snapshot.possible_joined_room_ids is None
+                else self._snapshot.possible_joined_room_ids | {room_id}
+            ),
         )
         logged_rooms = matching_rooms or (updated_rooms[-1],)
         for matched_room in logged_rooms:
@@ -323,12 +409,16 @@ class AgentReplyMembershipIndex:
         if len(updated_rooms_tuple) > len(snapshot.rooms):
             changed_room_keys.append(None)
 
-        if not changed_room_keys:
+        possible_joined_room_ids = (
+            None if snapshot.possible_joined_room_ids is None else snapshot.possible_joined_room_ids | {room_id}
+        )
+        if not changed_room_keys and possible_joined_room_ids == snapshot.possible_joined_room_ids:
             return False
         self._snapshot = replace(
             snapshot,
             rooms=updated_rooms_tuple,
             refresh_required=any(not room.ready for room in updated_rooms_tuple),
+            possible_joined_room_ids=possible_joined_room_ids,
         )
         for room_key in changed_room_keys:
             logger.info(
@@ -423,6 +513,7 @@ async def _build_authoritative_snapshot(
         policy_signature=signature,
         rooms=frozen_rooms,
         refresh_required=(joined_room_ids is None or any(not room.ready for room in frozen_rooms)),
+        possible_joined_room_ids=joined_room_ids,
     )
 
 
@@ -511,7 +602,7 @@ async def _authoritative_joined_room_ids(client: nio.AsyncClient) -> frozenset[s
         logger.warning(
             "agent_reply_control_client_joined_rooms_failed",
             readiness="unready",
-            error=str(exc),
+            error=type(exc).__name__,
         )
         return None
     if isinstance(response, nio.JoinedRoomsResponse):
@@ -541,7 +632,7 @@ async def _authoritative_room_members(
             room_key=room_key,
             room_id=room_id,
             readiness="unready",
-            error=str(exc),
+            error=type(exc).__name__,
         )
         return None
     if not isinstance(response, nio.JoinedMembersResponse):
@@ -563,16 +654,7 @@ def _raw_membership_matches_sender(
     runtime_paths: RuntimePaths,
 ) -> bool:
     """Match one canonical human requester against the raw Matrix membership roster."""
-    canonical_sender = resolve_human_requester_alias(sender_id, config, runtime_paths)
-    equivalent_user_ids = {
-        canonical_sender,
-        *(
-            alias
-            for alias in config.authorization.aliases.get(canonical_sender, ())
-            if resolve_human_requester_alias(alias, config, runtime_paths) == canonical_sender
-        ),
-    }
-    return not raw_user_ids.isdisjoint(equivalent_user_ids)
+    return not raw_user_ids.isdisjoint(equivalent_requester_ids(sender_id, config, runtime_paths))
 
 
 def _unready_room(room_key: str | None, room_id: str | None, *, reason: str) -> _GrantRoomMembership:

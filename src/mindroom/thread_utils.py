@@ -12,6 +12,7 @@ from mindroom.entity_resolution import entity_identity_registry
 from mindroom.matrix.mentions import resolve_mentioned_user_ids_from_text
 from mindroom.matrix.room_membership import room_membership_is_complete
 from mindroom.matrix.visible_body import visible_content_from_content
+from mindroom.requester_identity import is_human_requester_id, resolve_human_requester_alias
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -180,17 +181,22 @@ def has_multiple_non_agent_users_in_thread(
     thread_history: Sequence[ResolvedVisibleMessage],
     config: Config,
     runtime_paths: RuntimePaths,
+    *,
+    current_sender_id: str | None = None,
 ) -> bool:
     """Return True when more than one non-agent user has posted in the thread.
 
     Senders that are MindRoom agents or listed in ``config.bot_accounts`` are
-    excluded from the count.
+    excluded from the count. Human bridge aliases count as their canonical
+    identity, without changing the original message sender.
     """
     non_agent_senders: set[str] = set()
+    if current_sender_id and is_human_requester_id(current_sender_id, config, runtime_paths):
+        non_agent_senders.add(resolve_human_requester_alias(current_sender_id, config, runtime_paths))
     for msg in thread_history:
         sender = msg.sender
-        if sender and not _is_bot_or_agent(sender, config, runtime_paths):
-            non_agent_senders.add(sender)
+        if sender and is_human_requester_id(sender, config, runtime_paths):
+            non_agent_senders.add(resolve_human_requester_alias(sender, config, runtime_paths))
             if len(non_agent_senders) > 1:
                 return True
     return False
@@ -216,7 +222,12 @@ def thread_requires_explicit_agent_targeting(
     )
     if sender_visible_responders:
         return True
-    return has_multiple_non_agent_users_in_thread(thread_history, config, runtime_paths)
+    return has_multiple_non_agent_users_in_thread(
+        thread_history,
+        config,
+        runtime_paths,
+        current_sender_id=sender_id,
+    )
 
 
 def filter_thread_agents_for_sender(
@@ -229,18 +240,17 @@ def filter_thread_agents_for_sender(
     available_responders_in_room: Sequence[MatrixID] | None = None,
 ) -> list[MatrixID]:
     """Return participating agents that may reply within the sender and room responder boundary."""
-    sender_visible_agents = authorization.filter_responders_by_sender_permissions(
+    if available_responders_in_room is not None:
+        # This pool already includes the current room's authorization decision.
+        available_responder_ids = {responder.full_id for responder in available_responders_in_room}
+        return [agent for agent in agents_in_thread if agent.full_id in available_responder_ids]
+    return authorization.filter_responders_by_sender_permissions(
         agents_in_thread,
         sender_id,
         config,
         runtime_paths,
         membership_index,
     )
-    if available_responders_in_room is None:
-        return sender_visible_agents
-
-    available_responder_ids = {responder.full_id for responder in available_responders_in_room}
-    return [agent for agent in sender_visible_agents if agent.full_id in available_responder_ids]
 
 
 def get_all_mentioned_agents_in_thread(
@@ -329,6 +339,7 @@ def decide_agent_response(
     sender_id: str,
     available_responders_in_room: list[MatrixID] | None = None,
     agents_in_thread: Sequence[MatrixID] | None = None,
+    require_resolved_membership: bool = False,
 ) -> AgentResponseDecision:
     """Decide if an agent should respond to a message individually.
 
@@ -348,6 +359,7 @@ def decide_agent_response(
         sender_id: Sender Matrix ID used for per-agent reply permissions
         available_responders_in_room: Optional precomputed sender-visible responders for the room
         agents_in_thread: Optional precomputed agents that have participated in the thread
+        require_resolved_membership: Retain durable work when this responder has an unresolved grant
 
     """
     if not authorization.is_sender_allowed_for_agent_reply_in_room(
@@ -357,6 +369,7 @@ def decide_agent_response(
         room.room_id,
         runtime_paths,
         membership_index,
+        require_resolved_membership=require_resolved_membership,
     ):
         return AgentResponseDecision(False, "sender_not_allowed")
 

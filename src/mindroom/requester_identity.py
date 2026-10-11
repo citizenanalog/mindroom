@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
-_INTERNAL_USER_ENTITY_NAME = "user"
+INTERNAL_USER_ENTITY_NAME = "user"
 
 
 def runtime_matrix_domain(runtime_paths: RuntimePaths) -> str:
@@ -28,20 +28,18 @@ def mindroom_user_id(config: Config, runtime_paths: RuntimePaths) -> str | None:
     if config.mindroom_user is None:
         return None
     return managed_account_user_id(
-        managed_account_key(_INTERNAL_USER_ENTITY_NAME),
+        managed_account_key(INTERNAL_USER_ENTITY_NAME),
         runtime_matrix_domain(runtime_paths),
         runtime_paths,
     )
 
 
-def is_human_requester_id(
+def is_managed_entity_id(
     user_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> bool:
-    """Return whether one Matrix user ID represents a human requester."""
-    if user_id in config.bot_accounts:
-        return False
+    """Return whether one Matrix user ID is a configured router, agent, or team account."""
     domain = runtime_matrix_domain(runtime_paths)
     for entity_name in [ROUTER_AGENT_NAME, *config.agents, *config.teams]:
         persisted_user_id = managed_account_user_id(managed_account_key(entity_name), domain, runtime_paths)
@@ -50,11 +48,32 @@ def is_human_requester_id(
             domain,
         ).full_id
         if user_id in {persisted_user_id, generated_user_id}:
-            return False
+            return True
+    return False
+
+
+def is_human_requester_id(
+    user_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> bool:
+    """Return whether one Matrix user ID represents a human requester."""
+    if user_id in config.bot_accounts or is_managed_entity_id(user_id, config, runtime_paths):
+        return False
+    domain = runtime_matrix_domain(runtime_paths)
     if config.mindroom_user is None:
         return True
     configured_internal_user_id = MatrixID.from_username(config.mindroom_user.username, domain).full_id
     return user_id not in {mindroom_user_id(config, runtime_paths), configured_internal_user_id}
+
+
+def is_access_checked_requester_id(
+    user_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> bool:
+    """Return whether responder access applies to one requester: a human or a configured bot account."""
+    return user_id in config.bot_accounts or is_human_requester_id(user_id, config, runtime_paths)
 
 
 def resolve_human_requester_alias(
@@ -69,3 +88,20 @@ def resolve_human_requester_alias(
     if not is_human_requester_id(canonical_user_id, config, runtime_paths):
         return user_id
     return canonical_user_id
+
+
+def equivalent_requester_ids(
+    user_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> set[str]:
+    """Return the resolved requester and its permitted human bridge aliases."""
+    canonical_user_id = resolve_human_requester_alias(user_id, config, runtime_paths)
+    return {
+        canonical_user_id,
+        *(
+            alias
+            for alias in config.authorization.aliases.get(canonical_user_id, ())
+            if resolve_human_requester_alias(alias, config, runtime_paths) == canonical_user_id
+        ),
+    }

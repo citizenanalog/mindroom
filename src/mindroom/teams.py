@@ -32,44 +32,61 @@ from agno.team import Team
 from agno.utils.string import url_safe_string
 from pydantic import BaseModel, Field
 
-from mindroom import ai_runtime, model_loading
+from mindroom import ai_runtime
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.agent_storage import get_team_session
 from mindroom.agents import create_agent, enable_all_history_replay
+from mindroom.ai import run_delegated_child_response
 from mindroom.ai_run_metadata import (
+    accumulate_model_request_metrics,
     build_ai_run_metadata_content,
     build_model_request_metrics_fallback,
     build_prepared_history_metadata_content,
 )
-from mindroom.approval_receipt import install_approval_receipt_hooks
+from mindroom.approval.receipt import install_approval_receipt_hooks
+from mindroom.approval.tool_owners import (
+    approval_denial_context,
+    record_approval_denials,
+    required_approval_tool_names,
+    toolkit_owners_for_agents,
+    validate_approval_tool_owners,
+)
 from mindroom.authorization import get_available_responders_in_room
 from mindroom.constants import (
     MATRIX_SEEN_EVENT_IDS_METADATA_KEY,
     ROUTER_AGENT_NAME,
     is_silent_schedule_no_report_response,
 )
+from mindroom.delegation.execution import drive_delegation_stream, drive_delegations, has_delegation_state
+from mindroom.delegation.state import DelegationState
 from mindroom.entity_resolution import entity_identity_registry
-from mindroom.error_handling import get_user_friendly_error_message
+from mindroom.error_handling import get_user_friendly_error_message, run_error_event_text
 from mindroom.execution_preparation import (
     ThreadHistoryRenderLimits,
     prepare_bound_team_run_context,
     render_prepared_messages_text,
 )
+from mindroom.helper_usage import helper_usage_context, record_system_usage
+from mindroom.history.agno_compat_message_builder import apply_patch as install_message_builder_patch
 from mindroom.history.interrupted_replay import (
     split_interrupted_tool_trace,
     tool_execution_call_id,
 )
+from mindroom.history.native import restore_native_history
 from mindroom.history.prompt_tokens import team_tool_definition_payloads_for_logging
-from mindroom.history.runtime import (
+from mindroom.history.runtime import note_prepared_history_timing
+from mindroom.history.session_context import (
     ScopeSessionContext,
     close_team_runtime_state_dbs,
-    note_prepared_history_timing,
     open_bound_scope_session_context,
+    open_resolved_scope_session_context,
     resolve_bound_team_scope_context,
 )
 from mindroom.history.storage import update_scope_seen_event_ids
+from mindroom.history.team_scope import ad_hoc_team_scope_id
+from mindroom.history.types import HistoryScope
 from mindroom.hooks import render_enrichment_block, render_system_enrichment_block, render_transient_context
-from mindroom.knowledge import KnowledgeAvailabilityDetail, resolve_agent_knowledge_access
+from mindroom.knowledge.utils import KnowledgeAvailabilityDetail, resolve_agent_knowledge_access
 from mindroom.llm_request_logging import (
     bind_llm_request_log_context,
     build_llm_request_log_context,
@@ -77,8 +94,10 @@ from mindroom.llm_request_logging import (
     stream_with_llm_request_log_context,
 )
 from mindroom.logging_config import get_logger
+from mindroom.matrix.message_builder import opens_with_markdown_block
 from mindroom.media_inputs import MediaInputs
 from mindroom.metadata_merge import deep_merge_metadata
+from mindroom.providers import model_loading
 from mindroom.response_turn import (
     AttemptResolved,
     BlockingAttemptResolution,
@@ -93,20 +112,23 @@ from mindroom.response_turn import (
     StreamingTurnAdapter,
     TurnPartialSnapshot,
     TurnSinks,
-    apply_exact_approval_decisions,
+    apply_local_approval_decisions,
     build_matrix_run_metadata,
     paused_attempt_from_event,
     paused_attempt_from_response,
     run_blocking_response_turn,
     stream_response_turn,
 )
+from mindroom.system_prompt import render_date_context
 from mindroom.team_exact_members import (
     ResolvedExactTeamMembers,
     materialize_exact_requested_team_members,
     resolve_live_shared_agent_names,
     resolve_team_materializable_agent_names,
 )
+from mindroom.thread_models import resolve_thread_model_override
 from mindroom.timing import emit_timing_event
+from mindroom.tool_call_budget import install_model_call_cap
 from mindroom.tool_system.events import (
     StreamingToolTracker,
     StructuredStreamChunk,
@@ -125,16 +147,19 @@ if TYPE_CHECKING:
     from agno.db.base import BaseDb
     from agno.metrics import RunMetrics
     from agno.models.response import ToolExecution
+    from agno.run.requirement import RunRequirement
 
     from mindroom.config.main import Config, ResolvedRuntimeModel
     from mindroom.constants import RuntimePaths
+    from mindroom.event_journal import ApprovalCall
     from mindroom.history.turn_recorder import TurnRecorder
-    from mindroom.history.types import CompactionLifecycle, HistoryScope, PreparedHistoryState
+    from mindroom.history.types import CompactionLifecycle, PreparedHistoryState
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.matrix.identity import MatrixID
     from mindroom.response_turn import EmptyRunDiscard, TurnRunState
     from mindroom.runtime_protocols import OrchestratorRuntime
+    from mindroom.streaming import ProgressPublisher
     from mindroom.timing import DispatchPipelineTiming
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
@@ -228,6 +253,10 @@ class _TeamModeDecision(BaseModel):
     reasoning: str = Field(description="Brief explanation of why this mode was chosen")
 
 
+_TEAM_HEADER_PREFIX = "🤝 **Team Response** ("
+_TEAM_HEADER_END = "):\n\n"
+
+
 def _format_team_header(agent_names: list[str]) -> str:
     """Format the team response header.
 
@@ -238,7 +267,15 @@ def _format_team_header(agent_names: list[str]) -> str:
         Formatted header string
 
     """
-    return f"🤝 **Team Response** ({', '.join(agent_names)}):\n\n"
+    return f"{_TEAM_HEADER_PREFIX}{', '.join(agent_names)}{_TEAM_HEADER_END}"
+
+
+def strip_team_display(text: str) -> str:
+    """Remove the display-only header and no-consensus note from a visible team reply."""
+    if text.startswith(_TEAM_HEADER_PREFIX):
+        _header, separator, body = text.partition(_TEAM_HEADER_END)
+        text = body if separator else text
+    return text.removesuffix(_format_no_consensus_note()).rstrip()
 
 
 def _format_member_contribution(agent_name: str, content: str, indent: int = 0) -> str:
@@ -255,7 +292,9 @@ def _format_member_contribution(agent_name: str, content: str, indent: int = 0) 
     """
     indent_str = "  " * indent
     first_line = content.lstrip().splitlines()[0] if content.strip() else ""
-    separator = "\n\n" if is_visible_tool_marker_line(first_line) else " "
+    # Content that opens with a tool marker or a block such as a table needs its own paragraph to render.
+    own_paragraph = is_visible_tool_marker_line(first_line) or opens_with_markdown_block(content)
+    separator = "\n\n" if own_paragraph else " "
     return f"{indent_str}**{agent_name}**:{separator}{content}"
 
 
@@ -401,7 +440,6 @@ class _TeamStreamPresentation:
         show_tool_calls: bool,
         state: Mapping[str, object] | None,
         tool_trace: Sequence[ToolTraceEntry],
-        prior_response_text: str,
     ) -> _TeamStreamPresentation:
         """Restore a durable structured snapshot without interpreting its rendered Markdown."""
         if state is None or state.get("kind") != "team_stream" or state.get("version") != 2:
@@ -473,9 +511,6 @@ class _TeamStreamPresentation:
             tool_trace=list(deepcopy(tool_trace)),
         )
         restored.separate_next_scopes.update(restored_separators)
-        if restored.render_body() != prior_response_text:
-            msg = "Team continuation presentation snapshot does not match its response text"
-            raise RuntimeError(msg)
         return restored
 
     def to_state(self) -> dict[str, object]:
@@ -1116,6 +1151,7 @@ async def _select_team_mode(
             telemetry=False,
         )
         response = await agent.arun(prompt, session_id="team_mode_decision")
+        await record_system_usage(response, runtime_paths=runtime_paths, kind="team_mode")
         decision = response.content
         if isinstance(decision, _TeamModeDecision):
             logger.info("team_mode_decided", mode=decision.mode, reasoning=decision.reasoning)
@@ -1793,6 +1829,7 @@ def _build_team_run_metadata_content(
             response.metrics,
             response.member_responses if isinstance(response, TeamRunOutput) else (),
         ),
+        context_metrics=response.metrics,
         context_input_tokens=prepared_execution.prepared_history.prepared_context_tokens,
         tool_count=tool_count,
         prepared_history=prepared_execution.prepared_history,
@@ -1815,19 +1852,18 @@ class _TeamStreamUsage:
             self.latest_model_id = event.model
         if event.model_provider:
             self.latest_model_provider = event.model_provider
-        self._add("input_tokens", event.input_tokens)
-        self._add("output_tokens", event.output_tokens)
-        self._add("total_tokens", event.total_tokens)
-        self._add("reasoning_tokens", event.reasoning_tokens)
-        self._add("cache_read_tokens", event.cache_read_tokens)
-        self._add("cache_write_tokens", event.cache_write_tokens)
-        if self.first_token_latency is None and isinstance(event.time_to_first_token, (int, float)):
-            self.first_token_latency = float(event.time_to_first_token)
-
-    def _add(self, field_name: str, value: int | None) -> None:
-        if isinstance(value, int):
-            self.observed_fields.add(field_name)
-            self.request_metric_totals[field_name] = self.request_metric_totals.get(field_name, 0) + value
+        self.first_token_latency = accumulate_model_request_metrics(
+            self.request_metric_totals,
+            self.observed_fields,
+            input_tokens=event.input_tokens,
+            output_tokens=event.output_tokens,
+            total_tokens=event.total_tokens,
+            reasoning_tokens=event.reasoning_tokens,
+            cache_read_tokens=event.cache_read_tokens,
+            cache_write_tokens=event.cache_write_tokens,
+            time_to_first_token=event.time_to_first_token,
+            first_token_latency=self.first_token_latency,
+        )
 
     def fallback_payload(self) -> dict[str, Any] | None:
         """Return the aggregate usage payload built from the tracked requests."""
@@ -1870,6 +1906,7 @@ def _build_streamed_team_run_metadata_content(
         model=usage.latest_model_id,
         model_provider=usage.latest_model_provider,
         metrics=aggregated if aggregated is not None else fallback_payload,
+        context_metrics=completed_run_event.metrics if completed_run_event is not None else None,
         metrics_fallback=fallback_payload if aggregated is not None else None,
         context_input_tokens=prepared_execution.prepared_history.prepared_context_tokens,
         tool_count=tool_count,
@@ -2043,6 +2080,7 @@ def materialize_exact_team_members(
     dynamic_tool_continuation: bool = False,
     supports_native_tool_approval: bool = False,
     active_model_names: Mapping[str, str] | None = None,
+    required_tool_names: Mapping[str, tuple[str, ...]] | None = None,
 ) -> ResolvedExactTeamMembers:
     """Materialize the exact team-member set without silent fallback.
 
@@ -2094,6 +2132,7 @@ def materialize_exact_team_members(
             refresh_scheduler=refresh_scheduler,
             dynamic_tool_continuation=dynamic_tool_continuation,
             supports_native_tool_approval=supports_native_tool_approval,
+            required_tool_names=(required_tool_names or {}).get(agent_name, ()),
         )
 
     team_members = materialize_exact_requested_team_members(
@@ -2257,9 +2296,12 @@ def _create_team_instance(
         model,
         notice_text=config.get_prompt("QUEUED_MESSAGE_NOTICE_TEXT"),
     )
-    history_settings = config.resolve_entity(
+    # The team budget caps the coordinator's own calls; members carry their own.
+    install_model_call_cap(model, entity_name=configured_team_name or team_display_name)
+    team_scope = config.resolve_entity(
         configured_team_name if configured_team_name is not None and configured_team_name in config.teams else None,
-    ).history_settings
+    )
+    history_settings = team_scope.history_settings
     team_id = _resolve_team_instance_id(
         agents=agents,
         config=config,
@@ -2275,6 +2317,7 @@ def _create_team_instance(
         agent.add_history_to_context = False
         agent.add_session_summary_to_context = False
 
+    install_message_builder_patch()
     team_members: list[Agent | Team] = [*agents]
     team = Team(
         members=team_members,
@@ -2288,8 +2331,13 @@ def _create_team_instance(
         num_history_runs=history_settings.policy.num_history_runs,
         num_history_messages=history_settings.policy.num_history_messages,
         max_tool_calls_from_history=history_settings.max_tool_calls_from_history,
+        tool_call_limit=team_scope.max_tool_calls_per_turn,
         store_history_messages=False,
         show_members_responses=True,
+        additional_context=render_date_context(
+            config.timezone,
+            datetime_context_template=config.get_prompt("DATETIME_CONTEXT_TEMPLATE"),
+        ),
         debug_mode=False,
         telemetry=False,
         # Agno will automatically list members with their names, roles, and tools
@@ -2345,8 +2393,17 @@ def resolve_team_turn_models(
     runtime_paths: RuntimePaths,
     *,
     thread_id: str | None = None,
+    active_model_name: str | None = None,
 ) -> TeamTurnModelSelection:
     """Freeze the coordinator and member model aliases in one synchronous snapshot."""
+    # A configured team's access reaches its members, so its thread override governs them during its turns.
+    if active_model_name is None and thread_id is not None and team_name in config.teams:
+        active_model_name = resolve_thread_model_override(runtime_paths, thread_id, config=config).active.get(team_name)
+    if active_model_name is not None:
+        return TeamTurnModelSelection(
+            team_model_name=active_model_name,
+            member_model_names=dict.fromkeys(member_names, active_model_name),
+        )
     return TeamTurnModelSelection(
         team_model_name=select_model_for_team(
             team_name,
@@ -2411,16 +2468,34 @@ def _apply_team_continuation_event(event: object, presentation: _TeamStreamPrese
         presentation.complete_tool("team", event.tool)
 
 
+async def _publish_team_presentation(
+    progress: ProgressPublisher | None,
+    presentation: _TeamStreamPresentation,
+) -> None:
+    """Show the team continuation's current document in the reply it resumes."""
+    if progress is not None:
+        await progress(
+            StructuredStreamChunk(content=presentation.render_body(), tool_trace=presentation.tool_trace),
+        )
+
+
 async def _collect_team_continuation(
     events: AsyncIterator[object],
     presentation: _TeamStreamPresentation,
+    *,
+    progress: ProgressPublisher | None,
 ) -> TeamRunOutput:
     """Collect one team continuation stream and return its terminal run output."""
     response: TeamRunOutput | None = None
+    error_event: TeamRunErrorEvent | None = None
     content_delta_scopes: set[str] = set()
+    await _publish_team_presentation(progress, presentation)
     async for event in events:
         if isinstance(event, TeamRunOutput):
             response = event
+        elif isinstance(event, TeamRunErrorEvent):
+            # An error output can retain earlier text; the event has the failure.
+            error_event = event
         else:
             if isinstance(event, AgentRunContentEvent) and event.content:
                 member_id = presentation.resolve_member_id(event.agent_id, event.agent_name)
@@ -2428,6 +2503,9 @@ async def _collect_team_continuation(
             elif isinstance(event, TeamRunContentEvent) and event.content:
                 content_delta_scopes.add("team")
             _apply_team_continuation_event(event, presentation)
+            await _publish_team_presentation(progress, presentation)
+    if error_event is not None and (response is None or response.status == RunStatus.error):
+        raise RuntimeError(run_error_event_text(error_event, entity_label="Team"))
     if response is None:
         msg = "Team continuation returned an unexpected result"
         raise TypeError(msg)
@@ -2480,6 +2558,95 @@ def _continued_team_pause(
     )
 
 
+def _team_approval_events(
+    team: Team,
+    persisted: TeamRunOutput,
+    *,
+    configured_team_name: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    execution_identity: ToolExecutionIdentity,
+    user_id: str,
+    members: ResolvedExactTeamMembers,
+    refresh_scheduler: KnowledgeRefreshScheduler | None,
+    decisions: dict[str, bool],
+    denial_reasons: dict[str, str | None],
+    approval_calls: Sequence[ApprovalCall],
+    requirements: list[RunRequirement],
+) -> AsyncIterator[object]:
+    """Resume either the retained child wait or the team's own exact tools."""
+    delegated = has_delegation_state(persisted)
+    if delegated:
+
+        async def retained_run_events() -> AsyncIterator[TeamRunOutput]:
+            yield persisted
+
+        events = retained_run_events()
+    else:
+        persisted.requirements = list(requirements)
+        events = team.acontinue_run(
+            run_response=persisted,
+            requirements=requirements,
+            session_id=persisted.session_id,
+            user_id=user_id,
+            metadata=deepcopy(persisted.metadata),
+            stream=True,
+            stream_events=True,
+            yield_run_output=True,
+        )
+    return drive_delegation_stream(
+        team,
+        events,
+        run_child=run_delegated_child_response,
+        agent_name=configured_team_name,
+        config=config,
+        runtime_paths=runtime_paths,
+        execution_identity=execution_identity,
+        refresh_scheduler=refresh_scheduler,
+        decisions=decisions if delegated else None,
+        denial_reasons=denial_reasons if delegated else None,
+        approval_calls=approval_calls if delegated else (),
+        member_config_names=_delegation_member_names(members),
+    )
+
+
+def _member_approval_denials(
+    member_id: str | None,
+    calls: Mapping[str, ApprovalCall],
+    requirements: Sequence[RunRequirement],
+) -> dict[str, list[ApprovalCall]]:
+    """Bind denied member calls to their persisted native run identities."""
+    calls_by_run: dict[str, list[ApprovalCall]] = {}
+    for requirement in requirements:
+        tool = requirement.tool_execution
+        call = calls.get(tool.tool_call_id or "") if tool is not None else None
+        if call is None or call.invoking_agent != member_id or requirement.member_agent_id != member_id:
+            continue
+        if not requirement.member_run_id:
+            msg = "Saved member approval has no paused run identity; retry the request"
+            raise RuntimeError(msg)
+        calls_by_run.setdefault(requirement.member_run_id, []).append(call)
+    return calls_by_run
+
+
+def _approval_history_scope(
+    member_names: tuple[str, ...],
+    configured_team_name: str,
+    config: Config,
+    execution_identity: ToolExecutionIdentity,
+    retained_scope: HistoryScope | None,
+) -> HistoryScope | None:
+    """Resolve retained team storage before reconstructing member executables."""
+    if retained_scope is not None:
+        return retained_scope
+    scope_id = (
+        configured_team_name
+        if configured_team_name in config.teams
+        else ad_hoc_team_scope_id(member_names, config.agents, requester_user_id=execution_identity.requester_id)
+    )
+    return HistoryScope(kind="team", scope_id=scope_id) if scope_id is not None else None
+
+
 async def continue_paused_team_run(
     *,
     member_names: tuple[str, ...],
@@ -2496,47 +2663,77 @@ async def continue_paused_team_run(
     denial_reasons: dict[str, str | None],
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     member_model_names: Mapping[str, str] | None = None,
+    approval_calls: Sequence[ApprovalCall] = (),
     history_scope: HistoryScope | None = None,
-    prior_response_text: str = "",
     prior_tool_trace: Sequence[ToolTraceEntry] = (),
     prior_presentation_state: Mapping[str, object] | None = None,
     show_tool_calls: bool = True,
     tool_trace_collector: list[ToolTraceEntry] | None = None,
+    progress: ProgressPublisher | None,
 ) -> CompletedApprovalRun | PausedAttempt:
-    """Rebuild a team and continue its exact persisted paused run."""
-    members = await asyncio.to_thread(
-        materialize_exact_team_members,
-        list(member_names),
-        config=config,
-        runtime_paths=runtime_paths,
-        execution_identity=execution_identity,
-        session_id=session_id,
-        refresh_scheduler=refresh_scheduler,
-        dynamic_tool_continuation=True,
-        supports_native_tool_approval=True,
-        active_model_names=member_model_names,
-    )
-    for member in members.agents:
-        if member.model is not None:
-            install_approval_receipt_hooks(member.model, member.fallback_config)
+    """Rebuild a team and continue its exact persisted paused run.
+
+    ``progress``, when given, shows the resumed document live in the reply
+    being continued; the terminal delivery stays with the caller.
+    """
     stack = ExitStack()
     scope: ScopeSessionContext | None = None
     team: Team | None = None
+    members: ResolvedExactTeamMembers | None = None
     try:
         scope = stack.enter_context(
-            open_bound_scope_session_context(
-                agents=members.agents,
+            open_resolved_scope_session_context(
+                agent_name=min(member_names, default=configured_team_name),
                 session_id=session_id,
                 runtime_paths=runtime_paths,
                 config=config,
                 execution_identity=execution_identity,
-                team_name=configured_team_name,
-                scope=history_scope,
+                scope=_approval_history_scope(
+                    member_names,
+                    configured_team_name,
+                    config,
+                    execution_identity,
+                    history_scope,
+                ),
             ),
         )
         if scope is None:
             msg = "Paused team history is no longer available"
             raise RuntimeError(msg)
+        session = scope.session
+        persisted = session.get_run(run_id) if isinstance(session, TeamSession) else None
+        if not isinstance(persisted, TeamRunOutput) or persisted.status != RunStatus.paused:
+            msg = f"Paused team run {run_id!r} is no longer available"
+            raise RuntimeError(msg)
+        delegation = DelegationState.from_metadata(persisted.metadata)
+        local_calls = () if delegation.pending_child_id is not None else approval_calls
+        approved_calls = tuple(call for call in local_calls if decisions.get(call.tool_call_id))
+        async with asyncio.TaskGroup() as recovery:
+            required_tool_tasks = {
+                name: recovery.create_task(
+                    required_approval_tool_names(
+                        name,
+                        tuple(call for call in approved_calls if call.invoking_agent == name),
+                        config=config,
+                        runtime_paths=runtime_paths,
+                        execution_identity=execution_identity,
+                    ),
+                )
+                for name in member_names
+            }
+        members = await asyncio.to_thread(
+            materialize_exact_team_members,
+            list(member_names),
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+            session_id=session_id,
+            refresh_scheduler=refresh_scheduler,
+            dynamic_tool_continuation=True,
+            supports_native_tool_approval=True,
+            active_model_names=member_model_names,
+            required_tool_names={name: task.result() for name, task in required_tool_tasks.items()},
+        )
         team = build_materialized_team_instance(
             requested_agent_names=list(member_names),
             agents=members.agents,
@@ -2550,41 +2747,61 @@ async def continue_paused_team_run(
         )
         if team.model is not None:
             install_approval_receipt_hooks(team.model, team.fallback_config)
-        session = await team.aget_session(session_id=session_id, user_id=user_id)
-        persisted = None if session is None else session.get_run(run_id)
-        if not isinstance(persisted, TeamRunOutput) or persisted.status != RunStatus.paused:
-            msg = f"Paused team run {run_id!r} is no longer available"
-            raise RuntimeError(msg)
-        requirements = apply_exact_approval_decisions(
-            persisted.requirements or (),
+        restore_native_history(team.model, persisted_run=persisted, session=session)
+        requirements = apply_local_approval_decisions(
+            persisted,
             decisions=decisions,
             denial_reasons=denial_reasons,
         )
+        continuation_stream = _team_approval_events(
+            team,
+            persisted,
+            configured_team_name=configured_team_name,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+            user_id=user_id,
+            members=members,
+            refresh_scheduler=refresh_scheduler,
+            decisions=decisions,
+            denial_reasons=denial_reasons,
+            approval_calls=approval_calls,
+            requirements=requirements,
+        )
+        validate_approval_tool_owners(members.agents, approved_calls, requirements)
+        denied_calls = {call.tool_call_id: call for call in local_calls if not decisions.get(call.tool_call_id)}
+        for member in members.agents:
+            stack.enter_context(
+                approval_denial_context(member, _member_approval_denials(member.id, denied_calls, requirements)),
+            )
+            if member.model is not None:
+                install_approval_receipt_hooks(member.model, member.fallback_config)
         presentation = _TeamStreamPresentation.restore(
             config_names=member_names,
             show_tool_calls=show_tool_calls,
             state=prior_presentation_state,
             tool_trace=prior_tool_trace,
-            prior_response_text=prior_response_text,
         )
-        continuation_stream = team.acontinue_run(
-            run_response=persisted,
-            requirements=requirements,
-            session_id=session_id,
-            user_id=user_id,
-            metadata=deepcopy(persisted.metadata),
-            stream=True,
-            stream_events=True,
-            yield_run_output=True,
+        record_approval_denials(
+            team,
+            persisted,
+            tuple(
+                call
+                for call in local_calls
+                if call.invoking_agent == configured_team_name and not decisions.get(call.tool_call_id)
+            ),
         )
-        continued = await _collect_team_continuation(
-            cast("AsyncIterator[object]", continuation_stream),
-            presentation,
-        )
+        with helper_usage_context(scope):
+            continued = await _collect_team_continuation(
+                continuation_stream,
+                presentation,
+                progress=progress,
+            )
         paused = paused_attempt_from_response(
             continued,
             fallback_session_id=session_id,
             fallback_run_id=run_id,
+            toolkit_owners=toolkit_owners_for_agents(members.agents),
         )
         if paused is not None:
             return _continued_team_pause(presentation, paused)
@@ -2606,21 +2823,22 @@ async def continue_paused_team_run(
                 model=continued.model,
                 model_provider=continued.model_provider,
                 metrics=_aggregate_team_usage_metrics(continued.metrics, continued.member_responses),
+                context_metrics=continued.metrics,
                 tool_count=len(_collect_team_tool_executions(continued)),
             ),
         )
     finally:
-        _register_team_notice_storage(
-            scope_context=scope,
-            session_id=session_id,
-            entity_name=configured_team_name,
-        )
-        close_team_runtime_state_dbs(
-            agents=members.agents,
-            team_db=cast("BaseDb | None", team.db) if team is not None else None,
-            shared_scope_storage=scope.storage if scope is not None else None,
-        )
-        stack.close()
+        with stack:
+            _register_team_notice_storage(
+                scope_context=scope,
+                session_id=session_id,
+                entity_name=configured_team_name,
+            )
+            close_team_runtime_state_dbs(
+                agents=members.agents if members is not None else [],
+                team_db=cast("BaseDb | None", team.db) if team is not None else None,
+                shared_scope_storage=scope.storage if scope is not None else None,
+            )
 
 
 async def prepare_materialized_team_execution(
@@ -2702,6 +2920,16 @@ async def prepare_materialized_team_execution(
         prepared_history=prepared_history,
         runtime_model_name=runtime_model.model_name,
     )
+
+
+def _delegation_member_names(members: ResolvedExactTeamMembers) -> dict[str, str]:
+    """Bind provider and configured member identities to the exact caller allowlist."""
+    return {
+        identity: config_name
+        for config_name, member in zip(members.requested_agent_names, members.agents, strict=True)
+        for identity in (config_name, url_safe_string(config_name), member.id)
+        if identity
+    }
 
 
 async def team_response(  # noqa: C901, PLR0915
@@ -2845,7 +3073,7 @@ async def team_response(  # noqa: C901, PLR0915
             runtime_paths=orchestrator.runtime_paths,
             runtime_model=attempt_runtime_model,
             response_sender_id=response_sender_id,
-            current_sender_id=user_id,
+            current_sender_id=ctx.current_sender_id or user_id,
             current_timestamp_ms=continuation_state.active_current_timestamp_ms,
             current_event_id=continuation_state.active_current_event_id,
             current_prompt_is_structured=continuation_state.active_current_prompt_is_structured,
@@ -2882,8 +3110,11 @@ async def team_response(  # noqa: C901, PLR0915
                     metadata=run_metadata,
                 ),
             ):
+                prepared_input = list(current_run_input)
+                if pipeline_timing is not None:
+                    pipeline_timing.mark_model_request()
                 return await team.arun(
-                    list(current_run_input),
+                    prepared_input,
                     session_id=ctx.session_id,
                     run_id=current_run_id,
                     user_id=user_id,
@@ -2899,9 +3130,21 @@ async def team_response(  # noqa: C901, PLR0915
                 active_model_name=attempt_runtime_model.model_name,
                 operation=lambda: _run(ai_runtime.copy_run_input(run_input), attempt_run_id),
             )
+            if isinstance(response, (TeamRunOutput, RunOutput)):
+                response = await drive_delegations(
+                    team,
+                    response,
+                    run_child=run_delegated_child_response,
+                    agent_name=configured_team_name or team_name,
+                    config=config,
+                    runtime_paths=orchestrator.runtime_paths,
+                    execution_identity=execution_identity,
+                    refresh_scheduler=orchestrator.knowledge_refresh_scheduler,
+                    member_config_names=_delegation_member_names(attempt_members),
+                )
         except Exception as e:
             logger.exception("team_response_failed", agents=agent_list)
-            error_text = get_user_friendly_error_message(e, team_name)
+            error_text = get_user_friendly_error_message(e, team_name, runtime_paths=orchestrator.runtime_paths)
             return ExcludedAttempt(RunStatus.error, error_text, run_id=attempt_run_id)
 
         if isinstance(response, (TeamRunOutput, RunOutput)) and is_errored_run_output(response):
@@ -2933,6 +3176,7 @@ async def team_response(  # noqa: C901, PLR0915
                 response,
                 fallback_session_id=ctx.session_id,
                 fallback_run_id=attempt_run_id,
+                toolkit_owners=toolkit_owners_for_agents(attempt_agents),
             )
             if paused_attempt is not None:
                 return replace(
@@ -2954,6 +3198,7 @@ async def team_response(  # noqa: C901, PLR0915
                 response_text = get_user_friendly_error_message(
                     Exception(str(response.content or "Unknown team error")),
                     team_name,
+                    runtime_paths=orchestrator.runtime_paths,
                 )
             elif original_status is not RunStatus.cancelled:
                 response_text = _format_terminal_team_response(
@@ -3077,7 +3322,11 @@ async def team_response(  # noqa: C901, PLR0915
         release_attempt_entity=_release_team_attempt_members,
         close_runtime_dbs=_close_team_attempt_dbs,
         finalize_attempt=_finalize_team_attempt,
-        unexpected_error_text=lambda e: get_user_friendly_error_message(e, team_name),
+        unexpected_error_text=lambda e: get_user_friendly_error_message(
+            e,
+            team_name,
+            runtime_paths=orchestrator.runtime_paths,
+        ),
         discard_empty_run=discard_team_empty_run,
     )
     return await run_blocking_response_turn(
@@ -3102,6 +3351,7 @@ async def _team_response_stream_raw(
     session_id: str | None = None,
     run_id: str | None = None,
     user_id: str | None = None,
+    pipeline_timing: DispatchPipelineTiming | None = None,
 ) -> AsyncIterator[Any]:
     """Yield raw team events (for structured live rendering). Falls back to a final response.
 
@@ -3126,10 +3376,14 @@ async def _team_response_stream_raw(
         logger.debug("team_member", agent=agent.name)
 
     try:
+        prepared_input = ai_runtime.copy_run_input(prompt)
+        if pipeline_timing is not None:
+            pipeline_timing.mark_model_request()
         return team.arun(
-            ai_runtime.copy_run_input(prompt),
+            prepared_input,
             stream=True,
             stream_events=True,
+            yield_run_output=True,
             session_id=session_id,
             run_id=run_id,
             user_id=user_id,
@@ -3291,7 +3545,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
             runtime_paths=orchestrator.runtime_paths,
             runtime_model=attempt_runtime_model,
             response_sender_id=response_sender_id,
-            current_sender_id=user_id,
+            current_sender_id=ctx.current_sender_id or user_id,
             current_timestamp_ms=continuation_state.active_current_timestamp_ms,
             current_event_id=continuation_state.active_current_event_id,
             current_prompt_is_structured=continuation_state.active_current_prompt_is_structured,
@@ -3391,7 +3645,32 @@ async def team_response_stream(  # noqa: C901, PLR0915
         paused_resolution: PausedAttempt | None = None
         usage = _TeamStreamUsage()
 
+        def _interrupted_metadata(
+            status: RunStatus,
+            event_run_id: str | None,
+            event_session_id: str | None,
+        ) -> dict[str, Any] | None:
+            if run_metadata_collector is None:
+                return None
+            return _build_streamed_team_run_metadata_content(
+                config=config,
+                prepared_execution=prepared_execution,
+                completed_run_event=None,
+                usage=usage,
+                run_id=event_run_id or attempt_run_id,
+                session_id=event_session_id or ctx.session_id,
+                status=status,
+                tool_count=len(completed_tool_executions),
+            )
+
         ai_runtime.note_attempt_run_id(run_id_callback, attempt_run_id)
+        request_context = _team_request_log_context(
+            ctx,
+            team_name=configured_team_name or team_label,
+            prompt=continuation_state.active_prompt,
+            run_input=attempt_run_input,
+            metadata=run_metadata,
+        )
 
         raw_stream = await ai_runtime.run_attempt_with_model(
             attempt_model_runtime,
@@ -3404,30 +3683,46 @@ async def team_response_stream(  # noqa: C901, PLR0915
                 session_id=ctx.session_id,
                 run_id=attempt_run_id,
                 user_id=user_id,
+                pipeline_timing=pipeline_timing,
             ),
         )
         raw_stream = ai_runtime.stream_attempt_with_model(
             attempt_model_runtime,
-            raw_stream,
+            drive_delegation_stream(
+                team,
+                raw_stream,
+                run_child=run_delegated_child_response,
+                agent_name=configured_team_name or team_label,
+                config=config,
+                runtime_paths=orchestrator.runtime_paths,
+                execution_identity=execution_identity,
+                refresh_scheduler=orchestrator.knowledge_refresh_scheduler,
+                member_config_names=_delegation_member_names(attempt_members),
+            ),
             active_model_name=attempt_runtime_model.model_name,
         )
         raw_stream = _capture_stream_interrupt(
             stream_with_llm_request_log_context(
                 cast("AsyncGenerator[Any, None]", raw_stream),
-                request_context=_team_request_log_context(
-                    ctx,
-                    team_name=configured_team_name or team_label,
-                    prompt=continuation_state.active_prompt,
-                    run_input=attempt_run_input,
-                    metadata=run_metadata,
-                ),
+                request_context=request_context,
             ),
         )
         bound_team_id = run.scope_context.scope.scope_id if run.scope_context is not None else team.id or ""
         async for event in raw_stream:
             # Agno treats a stream closed at its pause event as cancellation and
             # can overwrite the paused run. Drain its short post-pause tail first.
+            # The retained run also carries child ownership and storage bindings
+            # that the pause event cannot represent.
             if paused_resolution is not None:
+                if isinstance(event, TeamRunOutput) and _is_bound_team_output(event, team_id=bound_team_id):
+                    retained_pause = paused_attempt_from_response(
+                        event,
+                        fallback_session_id=ctx.session_id,
+                        fallback_run_id=attempt_run_id,
+                        toolkit_owners=toolkit_owners_for_agents(attempt_agents),
+                    )
+                    if retained_pause is not None:
+                        paused_resolution = retained_pause
                 continue
             if isinstance(event, (TeamRunOutput, RunOutput)):
                 if isinstance(event, TeamRunOutput) and not _is_bound_team_output(event, team_id=bound_team_id):
@@ -3465,11 +3760,13 @@ async def team_response_stream(  # noqa: C901, PLR0915
 
                 if is_errored_run_output(event):
                     error_text = str(event.content or "Unknown team error")
-                    if run_metadata_collector is not None and event_metadata_content is not None:
-                        run_metadata_collector.update(event_metadata_content)
                     _record_interrupted_team_turn()
-                    yield get_user_friendly_error_message(Exception(error_text), team_label)
-                    yield AttemptResolved(HandledAttempt())
+                    yield get_user_friendly_error_message(
+                        Exception(error_text),
+                        team_label,
+                        runtime_paths=orchestrator.runtime_paths,
+                    )
+                    yield AttemptResolved(HandledAttempt(metadata_content=event_metadata_content))
                     return
 
                 if event.status == RunStatus.paused:
@@ -3540,46 +3837,29 @@ async def team_response_stream(  # noqa: C901, PLR0915
                 if event.team_id and event.team_id != bound_team_id:
                     continue
                 error_text = event.content or "Unknown team error"
-                if run_metadata_collector is not None:
-                    run_metadata_collector.update(
-                        _build_streamed_team_run_metadata_content(
-                            config=config,
-                            prepared_execution=prepared_execution,
-                            completed_run_event=None,
-                            usage=usage,
-                            run_id=event.run_id or attempt_run_id,
-                            session_id=event.session_id or ctx.session_id,
-                            status=RunStatus.error,
-                            tool_count=len(completed_tool_executions),
-                        ),
-                    )
                 _record_interrupted_team_turn()
-                yield get_user_friendly_error_message(Exception(error_text), team_label)
-                yield AttemptResolved(HandledAttempt())
+                yield get_user_friendly_error_message(
+                    Exception(error_text),
+                    team_label,
+                    runtime_paths=orchestrator.runtime_paths,
+                )
+                yield AttemptResolved(
+                    HandledAttempt(
+                        metadata_content=_interrupted_metadata(RunStatus.error, event.run_id, event.session_id),
+                    ),
+                )
                 return
 
             if isinstance(event, TeamRunCancelledEvent):
                 if event.team_id and event.team_id != bound_team_id:
                     continue
-                cancelled_metadata_content: dict[str, Any] | None = None
-                if run_metadata_collector is not None:
-                    cancelled_metadata_content = _build_streamed_team_run_metadata_content(
-                        config=config,
-                        prepared_execution=prepared_execution,
-                        completed_run_event=None,
-                        usage=usage,
-                        run_id=event.run_id or attempt_run_id,
-                        session_id=event.session_id or ctx.session_id,
-                        status=RunStatus.cancelled,
-                        tool_count=len(completed_tool_executions),
-                    )
                 yield AttemptResolved(
                     ExcludedAttempt(
                         reason=event.reason,
                         partial_text=_current_canonical_partial_text(),
                         completed_tools=tuple(completed_tools),
                         interrupted_tools=tuple(pending.trace_entry for pending in pending_tools),
-                        metadata_content=cancelled_metadata_content,
+                        metadata_content=_interrupted_metadata(RunStatus.cancelled, event.run_id, event.session_id),
                     ),
                 )
                 return
@@ -3591,20 +3871,10 @@ async def team_response_stream(  # noqa: C901, PLR0915
                     event,
                     fallback_session_id=ctx.session_id,
                     fallback_run_id=attempt_run_id,
+                    toolkit_owners=toolkit_owners_for_agents(attempt_agents),
                 )
                 if paused_attempt is not None:
-                    paused_attempt = _continued_team_pause(presentation, paused_attempt)
-                    if paused_attempt.response_text:
-                        yield StructuredStreamChunk(
-                            content=paused_attempt.response_text,
-                            tool_trace=list(paused_attempt.tool_trace),
-                            presentation_state=paused_attempt.response_presentation_state,
-                        )
-                    paused_resolution = replace(
-                        paused_attempt,
-                        runtime_model_name=prepared_execution.runtime_model_name,
-                        team_member_model_names=tuple(sorted(holder.member_model_names.items())),
-                    )
+                    paused_resolution = paused_attempt
                     continue
                 yield AttemptResolved(
                     ExcludedAttempt(
@@ -3615,6 +3885,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
                         interrupted_tools=tuple(pending.trace_entry for pending in pending_tools),
                         session_id=event.session_id,
                         run_id=event.run_id or attempt_run_id,
+                        metadata_content=_interrupted_metadata(RunStatus.paused, event.run_id, event.session_id),
                     ),
                 )
                 return
@@ -3696,7 +3967,20 @@ async def team_response_stream(  # noqa: C901, PLR0915
                 )
 
         if paused_resolution is not None:
-            yield AttemptResolved(paused_resolution)
+            paused_resolution = _continued_team_pause(presentation, paused_resolution)
+            if paused_resolution.response_text:
+                yield StructuredStreamChunk(
+                    content=paused_resolution.response_text,
+                    tool_trace=list(paused_resolution.tool_trace),
+                    presentation_state=paused_resolution.response_presentation_state,
+                )
+            yield AttemptResolved(
+                replace(
+                    paused_resolution,
+                    runtime_model_name=prepared_execution.runtime_model_name,
+                    team_member_model_names=tuple(sorted(holder.member_model_names.items())),
+                ),
+            )
             return
         if emitted_output and ctx.reply_to_event_id:
             _persist_bound_seen_event_ids(
@@ -3777,7 +4061,11 @@ async def team_response_stream(  # noqa: C901, PLR0915
         close_runtime_dbs=_close_team_attempt_dbs,
         finalize_attempt=_finalize_team_stream_attempt,
         make_text_chunk=lambda text: text,
-        unexpected_error_text=lambda e: get_user_friendly_error_message(e, team_label),
+        unexpected_error_text=lambda e: get_user_friendly_error_message(
+            e,
+            team_label,
+            runtime_paths=orchestrator.runtime_paths,
+        ),
         discard_empty_run=discard_team_empty_run,
     )
     response_stream = stream_response_turn(
@@ -3821,6 +4109,7 @@ __all__ = [
     "resolve_team_turn_models",
     "select_ad_hoc_team_mode",
     "select_model_for_team",
+    "strip_team_display",
     "team_response",
     "team_response_stream",
 ]

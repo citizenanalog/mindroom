@@ -1,4 +1,4 @@
-"""Durable grant metadata and exact personal connection ownership."""
+"""Durable grant metadata and exact user connection ownership."""
 
 from __future__ import annotations
 
@@ -7,34 +7,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import sqlite3
-
-
-def migrate_lifecycle(connection: sqlite3.Connection) -> None:
-    """Preserve existing absolute deadlines and leave unknown creation/activity dates null."""
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(grants)")}
-    if "idle_expires_at" in columns:
-        return
-    for declaration in (
-        "created_at REAL",
-        "last_used_at REAL",
-        "last_activity_at REAL",
-        "idle_expires_at REAL",
-        "account_id TEXT",
-    ):
-        connection.execute("ALTER TABLE grants ADD COLUMN " + declaration)
-    connection.execute("UPDATE grants SET idle_expires_at = expires_at")
-    connection.execute("ALTER TABLE pending ADD COLUMN account_id TEXT")
-    for statement in (
-        "CREATE INDEX grants_idle_expiry ON grants(idle_expires_at)",
-        "CREATE INDEX grants_account ON grants(account_id)",
-        "CREATE INDEX pending_account ON pending(account_id)",
-        "CREATE INDEX capabilities_access_expiry ON capabilities(expires_at) WHERE kind = 'access'",
-        """CREATE INDEX grants_owner ON grants(requester_id,
-            json_extract(payload, '$.authenticated_user_id'), json_extract(payload, '$.agent_name'),
-            json_extract(payload, '$.resource'))""",
-        "CREATE INDEX pending_owner ON pending(requester_id, authenticated_user_id, agent_name)",
-    ):
-        connection.execute(statement)
 
 
 def touch_grant(
@@ -61,18 +33,18 @@ def owned_grants(
     *,
     requester_id: str,
     authenticated_user_id: str,
-    agent_name: str,
+    account_id: str | None,
     resource: str,
     active_at: float | None = None,
     accounts_required: bool = False,
     after: str | None = None,
     limit: int | None = None,
 ) -> list[sqlite3.Row]:
-    """Match canonical and original identities plus the exact agent and resource context."""
+    """Match canonical and original identities plus the exact account and resource context."""
     query = """SELECT * FROM grants WHERE requester_id = ?
         AND json_extract(payload, '$.authenticated_user_id') = ?
-        AND json_extract(payload, '$.agent_name') = ? AND json_extract(payload, '$.resource') = ?"""
-    values: list[Any] = [requester_id, authenticated_user_id, agent_name, resource]
+        AND account_id IS ? AND json_extract(payload, '$.resource') = ?"""
+    values: list[Any] = [requester_id, authenticated_user_id, account_id, resource]
     if active_at is not None:
         query += """ AND revoked = 0 AND expires_at > ? AND idle_expires_at > ?
             AND ((? = 0 AND account_id IS NULL) OR (? = 1 AND EXISTS (

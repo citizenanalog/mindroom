@@ -27,8 +27,8 @@ This makes the local state transition atomic instead of reconstructing it after 
 11. Replaying a completed browser reset returns its original result and cannot delete a later connection.
 12. Resetting unreadable credentials never requires decoding their stored payload.
 13. Credential payloads use the existing `CredentialsManager` codec and active encryption policy before entering SQLite.
-14. Encrypted legacy ciphertext remains recoverable when the correct key returns.
-15. Plaintext legacy bytes are never copied into SQLite while credential encryption is enabled.
+14. Current encrypted SQLite credentials remain recoverable when the correct key returns.
+15. Legacy OAuth JSON bytes never enter the authoritative SQLite store.
 16. Request actor identity remains raw for room and membership checks.
 17. Credential identity is canonicalized only while resolving `OAuthCredentialContext`.
 18. Every provider token service ends with `_oauth`, which keeps OAuth tokens out of worker credential mirrors.
@@ -43,7 +43,7 @@ This makes the local state transition atomic instead of reconstructing it after 
 
 ### SQLite credential store
 
-`src/mindroom/oauth/credential_store.py` owns the database schema, scope binding, legacy adoption, transaction admission, payload encoding, revision updates, reset receipts, file permissions, and SQLite durability settings.
+`src/mindroom/oauth/credential_store.py` owns the database schema, scope binding, transaction admission, payload encoding, revision updates, reset receipts, file permissions, and SQLite durability settings.
 The store uses rollback-journal mode, `synchronous=EXTRA`, a zero SQLite busy timeout, and bounded cancellable asynchronous retry around lock admission.
 Commit retry remains inside the same transaction, so a reader-blocked commit never repeats provider I/O.
 The database and its directory are private to the runtime user.
@@ -84,6 +84,7 @@ Requester-scoped actions require the original authenticated browser user, while 
 3. Read and validate the credential snapshot.
 4. Return before the provider adapter when the credential is missing or unusable.
 5. Call the provider adapter while retaining the transaction; the adapter may determine locally that refresh is unnecessary.
+   When a grant's response is lost after the request was sent, the adapter repeats it once, and both attempts share one deadline below the store's lock-wait timeout.
 6. Publish a rotation or atomically clear a terminally rejected credential.
 7. Commit once.
 
@@ -95,8 +96,8 @@ Later same-scope callers observe the committed rotation and do not consume the s
 2. Enter a cancellation-safe lifecycle operation.
 3. Acquire the same SQLite transaction used by refresh.
 4. Compare the pending connection generation with the current generation.
-5. Exchange the authorization code and validate claims.
-6. Preserve an existing refresh token only for the same verified external identity and OAuth client.
+5. Exchange the authorization code at the token endpoint recorded in the pending state, then validate claims.
+6. Preserve an existing refresh token only for the same verified external identity, OAuth client, and token endpoint.
 7. Publish the credential and advance both revisions.
 8. Commit before propagating cancellation.
 
@@ -124,16 +125,15 @@ Cancellation during reset commit rolls the transaction back unless commit alread
 After a successful reset commit, the durable result remains recoverable by operation ID while cancellation propagates to the caller.
 SQLite provides the crash boundary for payload, revisions, and reset receipt together.
 
-## Legacy adoption
+## Legacy credential files
 
-The first transaction for a scope adopts its existing OAuth credential JSON into SQLite.
-Readable credentials are normalized and encoded with the active credential encryption policy.
-Unreadable encrypted ciphertext is retained as an unreadable payload so restoring the key can recover it.
-Unreadable plaintext is represented as present but without storing the secret bytes when encryption is enabled.
-Generations and reset do not decode the payload, so a corrupt credential remains resettable.
-Legacy credential and sidecar files are removed only after their bytes are durably adopted into SQLite or an explicit reset or replacement commits.
-When encryption is enabled and a plaintext legacy credential cannot be adopted, its file remains available for operator recovery until an explicit reset or replacement commits.
-If encryption is disabled before that commit, the retained plaintext file is adopted into the unencrypted store and the legacy file is then removed.
+The SQLite store is authoritative for OAuth credentials.
+The first access to a missing store initializes an empty credential row without reading JSON.
+Legacy OAuth credential JSON and sidecar files are ignored and left unchanged.
+Connections that exist only in JSON require reconnect, which publishes the new credential through a committed SQLite transaction under the active encryption policy.
+Changing the encryption setting never imports a legacy JSON credential.
+Current unreadable SQLite ciphertext remains in SQLite so restoring the correct key can recover it.
+Generations and reset do not decode the current SQLite payload, so a corrupt credential remains resettable.
 
 ## Verification
 

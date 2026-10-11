@@ -16,10 +16,11 @@ from mindroom.config.main import Config
 from mindroom.config.models import CompactionConfig, CompactionOverrideConfig, DefaultsConfig, ModelConfig
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.history.policy import resolve_history_execution_plan
-from mindroom.history.runtime import close_team_runtime_state_dbs, resolve_agent_preparation_inputs
+from mindroom.history.runtime import resolve_agent_preparation_inputs
+from mindroom.history.session_context import close_team_runtime_state_dbs
 from mindroom.matrix.users import AgentMatrixUser
-from mindroom.model_loading import get_model_instance
 from mindroom.orchestrator import _MultiAgentOrchestrator
+from mindroom.providers.model_loading import get_model_instance
 from mindroom.teams import TeamMode, build_materialized_team_instance, materialize_exact_team_members
 from tests.bot_helpers import make_test_agent_bot, make_test_team_bot
 from tests.conftest import TEST_PASSWORD, bind_runtime_paths, orchestrator_runtime_paths, write_config_yaml
@@ -74,7 +75,7 @@ async def runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncItera
             "config": config,
             "runtime_paths": runtime_paths,
         }
-        bot = make_test_team_bot(**kwargs, team_model="other") if name == "team" else make_test_agent_bot(**kwargs)
+        bot = make_test_team_bot(**kwargs) if name == "team" else make_test_agent_bot(**kwargs)
         bot.orchestrator = orchestrator
         bot.running = True
         orchestrator.agent_bots[name] = bot
@@ -171,7 +172,7 @@ async def test_model_reload_updates_next_response_without_restarting_bots(
             static_prompt_tokens=0,
         ).execution_plan
         assert before.replay_window_tokens == 4000
-        assert not before.destructive_compaction_available
+        assert not before.text_compaction_available
 
         new = old.model_copy(deep=True)
         new.models["default"].context_window = 64000
@@ -203,7 +204,7 @@ async def test_model_reload_updates_next_response_without_restarting_bots(
             ).execution_plan
             assert after.replay_window_tokens == 64000
             assert after.compaction_context_window == 64000
-            assert after.destructive_compaction_available
+            assert after.text_compaction_available
 
 
 @pytest.mark.asyncio
@@ -265,4 +266,30 @@ async def test_context_window_reload_preserves_explicit_replay_cap(runtime: _Mul
     plan = _history_plan(runtime.config, "general")
     assert plan.replay_window_tokens == 3000
     assert plan.compaction_context_window == 64000
-    assert plan.destructive_compaction_available
+    assert plan.text_compaction_available
+
+
+@pytest.mark.asyncio
+async def test_agent_and_team_edits_reach_the_next_response_without_restarting_bots(
+    runtime: _MultiAgentOrchestrator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Instruction, model, tool, and team mode edits reach running bots and the config:reloaded hook."""
+    emit_config_reloaded = AsyncMock()
+    monkeypatch.setattr(runtime, "_emit_config_reloaded", emit_config_reloaded)
+    old = runtime.config
+    assert old is not None
+    new = old.model_copy(deep=True)
+    new.agents["general"].instructions = ["Answer in one sentence."]
+    new.agents["general"].model = "other"
+    new.agents["general"].tools = ["calculator"]
+    new.teams["team"].mode = "collaborate"
+    await _reload(runtime, new)
+
+    with _materialize(runtime) as (agent, _member, _team, _router):
+        assert agent.model is not None
+        assert agent.model.id == "other-model"
+        assert "Answer in one sentence." in agent.instructions
+        assert "calculator" in {tool.name for tool in agent.tools}
+    assert runtime.agent_bots["team"].config.teams["team"].mode == "collaborate"
+    assert emit_config_reloaded.await_args.kwargs["changed_entities"] == {"general", "team"}

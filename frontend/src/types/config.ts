@@ -14,9 +14,13 @@ export const SHARED_CONTEXT_FILE_PLACEHOLDER = "SOUL.md";
 export interface ModelConfig {
   provider: ProviderType;
   id: string;
+  display_name?: string | null;
+  icon?: string | null;
   api?: "responses" | "chat_completions" | null;
   context_window?: number | null;
+  stream_idle_timeout_seconds?: number | null;
   host?: string; // For ollama
+  api_key?: string | null; // Model-specific key from config.yaml
   extra_kwargs?: Record<string, unknown>; // Additional provider-specific parameters
 }
 
@@ -35,6 +39,7 @@ export interface MemoryConfig {
   file?: {
     path?: string | null;
     max_entrypoint_lines?: number;
+    max_entrypoint_tokens?: number;
   };
   search?: {
     mode?: MemorySearchMode;
@@ -243,6 +248,7 @@ export interface Agent {
   num_history_messages?: number | null; // Max messages from history (mutually exclusive with num_history_runs)
   compress_tool_results?: boolean; // Compress tool results in history
   max_tool_calls_from_history?: number | null; // Max tool call messages replayed from history
+  max_tool_calls_per_turn?: number | null; // Max tool calls one turn may execute
   allow_self_config?: boolean; // Allow agent to modify its own configuration via a tool
 }
 
@@ -254,11 +260,12 @@ export interface Team {
   rooms: string[];
   access?: ResponderAccessConfig;
   mode: "coordinate" | "collaborate";
-  model?: string; // Optional team-specific model
+  model?: string | null; // Optional team-specific model; explicit null is invalid at runtime
   compaction?: CompactionConfig | null; // Per-team required-compaction overrides
   num_history_runs?: number | null; // Number of prior scoped runs to include as team history
   num_history_messages?: number | null; // Max team-scoped history messages (mutually exclusive with num_history_runs)
   max_tool_calls_from_history?: number | null; // Max tool call messages replayed from team history
+  max_tool_calls_per_turn?: number | null; // Max tool calls one turn may execute
 }
 
 export type TeamConfig = Omit<Team, "id" | "rooms"> & {
@@ -316,7 +323,7 @@ export interface Config {
   knowledge_bases?: Record<string, KnowledgeBaseConfig>;
   models: Record<string, ModelConfig>;
   agents: Record<string, Omit<Agent, "id">>;
-  defaults: {
+  defaults?: {
     markdown: boolean;
     learning?: boolean;
     learning_mode?: LearningMode;
@@ -332,6 +339,7 @@ export interface Config {
     num_history_messages?: number | null;
     compress_tool_results?: boolean;
     max_tool_calls_from_history?: number | null;
+    max_tool_calls_per_turn?: number; // Default per-turn tool-call budget (1000)
     allow_self_config?: boolean;
   };
   router: {
@@ -342,7 +350,6 @@ export interface Config {
   room_defaults?: RoomDefaultsConfig; // Defaults for managed Matrix rooms
   room_models?: Record<string, string>; // Room-specific model overrides for teams
   teams?: Record<string, TeamConfig>; // Teams configuration
-  tools?: Record<string, unknown>; // Tool configurations
   voice?: VoiceConfig; // Voice configuration
 }
 

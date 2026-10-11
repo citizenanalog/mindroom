@@ -34,21 +34,21 @@ class _LoopClock:
 
     def __init__(self) -> None:
         self.now = 0.0
-        self.scheduled: list[tuple[float, Callable[[float], None], float]] = []
+        self.scheduled: list[tuple[float, Callable[..., None], tuple[float, ...]]] = []
 
     def time(self) -> float:
         return self.now
 
-    def call_at(self, when: float, callback: Callable[[float], None], scheduled_loop_time: float) -> object:
-        self.scheduled.append((when, callback, scheduled_loop_time))
+    def call_at(self, when: float, callback: Callable[..., None], *args: float) -> object:
+        self.scheduled.append((when, callback, args))
         return object()
 
     def next_scheduled_time(self) -> float:
         return self.scheduled[0][0]
 
     def run_next(self) -> None:
-        _, callback, scheduled_loop_time = self.scheduled.pop(0)
-        callback(scheduled_loop_time)
+        _, callback, args = self.scheduled.pop(0)
+        callback(*args)
 
 
 class _FakeFrame:
@@ -168,6 +168,95 @@ def test_scheduler_lag_heartbeat_rearms_from_actual_time_after_stall() -> None:
     loop.now = 1.36
     loop.run_next()
     assert loop.next_scheduled_time() == pytest.approx(1.41)
+
+
+def test_scheduler_lag_summary_timestamps_the_worst_sample_and_resets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worst delay keeps its own overdue interval, even after smaller samples."""
+    detector = _detector()
+    loop = _LoopClock()
+    detector._loop = loop
+    detector._scheduler_lag_window_started_at = 0.0
+    monkeypatch.setattr(event_loop_stall.time, "time", lambda: 1_700_000_000.0 + loop.now)
+    detector._schedule_heartbeat(1.0)
+
+    with capture_logs() as logs:
+        for lag_seconds in (0.25, 0.6, 0.01):
+            loop.now = loop.next_scheduled_time() + lag_seconds
+            loop.run_next()
+        detector._report_scheduler_lag(60.0)
+        loop.now = loop.next_scheduled_time() + 0.01
+        loop.run_next()
+        detector._report_scheduler_lag(120.0)
+
+    assert logs[0]["max_ms"] == 600.0
+    assert logs[0]["max_lag_scheduled_at"] == "2023-11-14T22:13:21.270+00:00"
+    assert logs[0]["max_lag_observed_at"] == "2023-11-14T22:13:21.870+00:00"
+    assert logs[1]["max_ms"] == 10.0
+    assert logs[1]["max_lag_scheduled_at"] == "2023-11-14T22:13:21.920+00:00"
+    assert logs[1]["max_lag_observed_at"] == "2023-11-14T22:13:21.930+00:00"
+
+
+def test_scheduler_lag_preserves_scheduled_time_across_clock_adjustment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wall-clock jump while overdue must not rewrite the original scheduled time."""
+    detector = _detector()
+    loop = _LoopClock()
+    detector._loop = loop
+    wall_clock = SimpleNamespace(now=1_700_000_000.0)
+    monkeypatch.setattr(event_loop_stall.time, "time", lambda: wall_clock.now)
+    detector._schedule_heartbeat(1.0)
+    loop.now = 1.4
+    wall_clock.now = 1_700_003_601.4
+
+    with capture_logs() as logs:
+        loop.run_next()
+        detector._report_scheduler_lag(60.0)
+
+    assert logs[0]["max_ms"] == 400.0
+    assert logs[0]["max_lag_scheduled_at"] == "2023-11-14T22:13:21.000+00:00"
+    assert logs[0]["max_lag_observed_at"] == "2023-11-14T23:13:21.400+00:00"
+
+
+def test_separate_stalls_share_a_stack_capture_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated short stalls retain lifecycle logs without repeatedly sampling stacks."""
+    detector = _detector(repeat_log_interval_seconds=1.0)
+    captures: list[None] = []
+
+    def capture_frames() -> dict:
+        captures.append(None)
+        return {}
+
+    monkeypatch.setattr(event_loop_stall.sys, "_current_frames", capture_frames)
+    with capture_logs() as logs:
+        for last_beat, detected_at, recovered_at in ((1.0, 1.2, 1.3), (1.3, 1.5, 1.6), (2.0, 2.2, 2.3)):
+            heartbeat = event_loop_stall._Heartbeat(monotonic_seconds=last_beat, process_cpu_seconds=0.0)
+            detector._note_stalled(detected_at, heartbeat)
+            detector._note_stall_ended(recovered_at)
+
+    detected = [entry for entry in logs if entry["event"] == "event_loop_stall_detected"]
+    assert [entry["stack_capture_suppressed"] for entry in detected] == [False, True, False]
+    assert "stack" not in detected[1]
+    assert len(captures) == 2
+    ended = [entry for entry in logs if entry["event"] == "event_loop_stall_ended"]
+    assert [entry["stall_duration_seconds"] for entry in ended] == [0.3, 0.3, 0.3]
+
+
+def test_suppressed_stall_captures_a_stack_when_budget_recovers() -> None:
+    """A new long stall can get a stack after its initial capture was suppressed."""
+    detector = _detector(repeat_log_interval_seconds=1.0)
+    first = event_loop_stall._Heartbeat(monotonic_seconds=1.0, process_cpu_seconds=0.0)
+    second = event_loop_stall._Heartbeat(monotonic_seconds=1.3, process_cpu_seconds=0.0)
+    with capture_logs() as logs:
+        detector._note_stalled(1.2, first)
+        detector._note_stall_ended(1.3)
+        detector._note_stalled(1.5, second)
+        detector._note_stalled(2.0, second)
+        detector._note_stalled(2.2, second)
+
+    ongoing = [entry for entry in logs if entry["event"] == "event_loop_stall_ongoing"]
+    assert len(ongoing) == 1
+    assert ongoing[0]["stack_capture_suppressed"] is False
+    assert "stack" in ongoing[0]
+    assert ongoing[0]["stalled_for_seconds"] == 0.9
 
 
 @pytest.mark.asyncio
@@ -485,3 +574,124 @@ async def test_start_helper_honors_disable_knob() -> None:
     assert detector is not None
     assert detector.threshold_seconds == _DEFAULT_EVENT_LOOP_STALL_THRESHOLD_SECONDS
     detector.stop()
+
+
+def test_gc_timing_is_deferred_and_keeps_collecting_thread_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collection callbacks never log; their captured clocks survive deferred reporting."""
+    detector = _detector()
+    detector._gc_tracking = True
+    monotonic = iter((10.0, 12.0))
+    cpu = iter((3.0, 4.5))
+    monkeypatch.setattr(event_loop_stall.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(event_loop_stall.time, "thread_time", lambda: next(cpu))
+    with capture_logs() as logs:
+        detector._gc_callback("start", {"generation": 2})
+        detector._gc_callback("stop", {"generation": 2, "collected": 7, "uncollectable": 1})
+        assert logs == []
+        detector._report_gc()
+        detector._report_gc()
+    assert len(logs) == 1
+    assert logs[0]["event"] == "event_loop_gc_collection"
+    assert logs[0]["duration_seconds"] == 2.0
+    assert logs[0]["thread_cpu_seconds"] == 1.5
+    assert logs[0]["generation"] == 2
+    assert logs[0]["collected"] == 7
+    assert logs[0]["uncollectable"] == 1
+    assert logs[0]["thread_ident"] == threading.get_ident()
+
+
+def test_gc_records_are_bounded_and_report_overflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unavailable watcher cannot accumulate unbounded diagnostic records."""
+    detector = _detector()
+    detector._gc_tracking = True
+    ticks = iter(float(i) for i in range(600))
+    monkeypatch.setattr(event_loop_stall.time, "monotonic", lambda: next(ticks))
+    for _ in range(300):
+        detector._gc_callback("start", {"generation": 0})
+        detector._gc_callback("stop", {"generation": 0, "collected": 0, "uncollectable": 0})
+    with capture_logs() as logs:
+        detector._report_gc()
+    collections = [entry for entry in logs if entry["event"] == "event_loop_gc_collection"]
+    overflow = [entry for entry in logs if entry["event"] == "event_loop_gc_records_dropped"]
+    assert 0 < len(collections) < 300
+    assert sum(entry["count"] for entry in overflow) + len(collections) == 300
+
+
+@pytest.mark.asyncio
+async def test_gc_callback_follows_detector_lifecycle() -> None:
+    """Stopping diagnostics removes only its callback and drops incomplete collection state."""
+    import gc  # noqa: PLC0415
+
+    detector = _detector()
+    existing = list(gc.callbacks)
+    detector.start()
+    try:
+        assert detector._gc_callback in gc.callbacks
+        detector._gc_callback("start", {"generation": 2})
+    finally:
+        detector.stop()
+    assert gc.callbacks == existing
+    with capture_logs() as logs:
+        detector._gc_callback("stop", {"generation": 2, "collected": 1, "uncollectable": 0})
+        detector._report_gc()
+    assert logs == []
+
+
+def test_gc_overflow_count_survives_watcher_draining_during_record_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queue that was full before a concurrent drain has not lost its next record."""
+    detector = _detector()
+    detector._gc_tracking = True
+    ticks = iter(float(i) for i in range(2 * (event_loop_stall._MAX_GC_RECORDS + 1)))
+    monkeypatch.setattr(event_loop_stall.time, "monotonic", lambda: next(ticks))
+    for _ in range(event_loop_stall._MAX_GC_RECORDS):
+        detector._gc_callback("start", {"generation": 0})
+        detector._gc_callback("stop", {"generation": 0, "collected": 0, "uncollectable": 0})
+    record_type = event_loop_stall._GcCollection
+
+    def create_after_drain(*args: object) -> object:
+        detector._report_gc()
+        return record_type(*args)
+
+    monkeypatch.setattr(event_loop_stall, "_GcCollection", create_after_drain)
+    with capture_logs() as logs:
+        detector._gc_callback("start", {"generation": 0})
+        detector._gc_callback("stop", {"generation": 0, "collected": 0, "uncollectable": 0})
+        detector._report_gc()
+    assert len([entry for entry in logs if entry["event"] == "event_loop_gc_collection"]) == 129
+    assert not any(entry["event"] == "event_loop_gc_records_dropped" for entry in logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ["running", "stopped", "stopped_before_start"])
+async def test_detector_rejects_repeated_or_stopped_start_without_leaking_callback(lifecycle: str) -> None:
+    """Rejected starts must neither replace owned resources nor retain global GC callbacks."""
+    import gc  # noqa: PLC0415
+
+    detector = _detector()
+    existing_callbacks = list(gc.callbacks)
+    first_thread = None
+    try:
+        if lifecycle != "stopped_before_start":
+            detector.start()
+            first_thread = detector._thread
+        if lifecycle != "running":
+            detector.stop()
+        thread = detector._thread
+        heartbeat = detector._heartbeat_handle
+        callbacks = list(gc.callbacks)
+        with pytest.raises(RuntimeError, match="only be started once"):
+            detector.start()
+        assert detector._thread is thread
+        assert detector._heartbeat_handle is heartbeat
+        assert gc.callbacks == callbacks
+        detector.stop()
+        assert gc.callbacks == existing_callbacks
+    finally:
+        detector.stop()
+        # Keep the red regression run from leaving a callback or watcher behind.
+        while detector._gc_callback in gc.callbacks:
+            gc.callbacks.remove(detector._gc_callback)
+        if first_thread is not None:
+            first_thread.join(timeout=2.0)

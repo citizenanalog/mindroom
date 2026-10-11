@@ -17,7 +17,7 @@ from mindroom.config.main import Config
 from mindroom.constants import SILENT_SCHEDULE_NO_REPLY_TOKEN
 from mindroom.custom_tools.scheduler import SchedulerTools
 from mindroom.message_target import MessageTarget
-from mindroom.scheduling import SchedulingRuntime, _extract_mentioned_agents_from_text
+from mindroom.scheduling.tasks import SchedulingRuntime, _extract_mentioned_agents_from_text
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
     build_scheduling_runtime_from_tool_runtime_context,
@@ -112,6 +112,9 @@ async def test_scheduler_tool_uses_shared_backend() -> None:
     matrix_admin = object()
     context = _make_context(config, matrix_admin=matrix_admin)
 
+    current_config = config
+    context = replace(context, config_provider=lambda: current_config)
+
     with (
         patch(
             "mindroom.custom_tools.scheduler.schedule_task",
@@ -125,15 +128,20 @@ async def test_scheduler_tool_uses_shared_backend() -> None:
             new_thread=True,
             silent=True,
         )
-        limited_result = await tools.schedule("every 25 minutes poll the queue", new_thread=False, history_limit=0)
+        limited_result = await tools.schedule(
+            "every 25 minutes poll the queue",
+            new_thread=False,
+            history_limit=0,
+            model="cheap",
+        )
 
     assert result == "✅ Scheduled"
     assert new_thread_result == "✅ Scheduled"
     assert limited_result == "✅ Scheduled"
     assert mock_schedule.await_count == 3
-    first_call = mock_schedule.await_args_list[0].kwargs
-    second_call = mock_schedule.await_args_list[1].kwargs
-    third_call = mock_schedule.await_args_list[2].kwargs
+    first_call = mock_schedule.await_args_list[0].kwargs.copy()
+    second_call = mock_schedule.await_args_list[1].kwargs.copy()
+    third_call = mock_schedule.await_args_list[2].kwargs.copy()
     expected_runtime = SchedulingRuntime(
         client=context.client,
         config=context.config,
@@ -144,8 +152,16 @@ async def test_scheduler_tool_uses_shared_backend() -> None:
         agent_reply_memberships=context.agent_reply_memberships,
         responder_candidates_for_room=context.responder_candidates_for_current_room,
     )
+    config_providers = []
+    for call_kwargs in (first_call, second_call, third_call):
+        runtime = call_kwargs.pop("runtime")
+        assert replace(runtime, config_provider=None) == expected_runtime
+        assert runtime.config_provider is not None
+        assert runtime.config_provider() is config
+        config_providers.append(runtime.config_provider)
+    current_config = config.model_copy(deep=True)
+    assert all(config_provider() is current_config for config_provider in config_providers)
     assert first_call == {
-        "runtime": expected_runtime,
         "room_id": context.room_id,
         "thread_id": context.resolved_thread_id,
         "scheduled_by": context.requester_id,
@@ -153,9 +169,9 @@ async def test_scheduler_tool_uses_shared_backend() -> None:
         "new_thread": False,
         "history_limit": None,
         "silent": None,
+        "model": None,
     }
     assert second_call == {
-        "runtime": expected_runtime,
         "room_id": context.room_id,
         "thread_id": context.resolved_thread_id,
         "scheduled_by": context.requester_id,
@@ -163,9 +179,9 @@ async def test_scheduler_tool_uses_shared_backend() -> None:
         "new_thread": True,
         "history_limit": None,
         "silent": True,
+        "model": None,
     }
     assert third_call == {
-        "runtime": expected_runtime,
         "room_id": context.room_id,
         "thread_id": context.resolved_thread_id,
         "scheduled_by": context.requester_id,
@@ -173,6 +189,7 @@ async def test_scheduler_tool_uses_shared_backend() -> None:
         "new_thread": False,
         "history_limit": 0,
         "silent": None,
+        "model": "cheap",
     }
 
 
@@ -266,6 +283,9 @@ async def test_edit_schedule_tool_calls_backend() -> None:
     config = _bind_runtime_paths(Config(agents={"general": AgentConfig(display_name="General Agent")}))
     context = _make_context(config)
 
+    current_config = config
+    context = replace(context, config_provider=lambda: current_config)
+
     with (
         patch(
             "mindroom.custom_tools.scheduler.edit_scheduled_task",
@@ -280,7 +300,7 @@ async def test_edit_schedule_tool_calls_backend() -> None:
             history_limit=5,
             silent=True,
         )
-        visible_result = await tools.edit_schedule("task123", "make it visible", silent=False)
+        visible_result = await tools.edit_schedule("task123", "make it visible", silent=False, model="cheap")
 
     assert "Updated" in result
     assert "Updated" in limited_result
@@ -295,8 +315,19 @@ async def test_edit_schedule_tool_calls_backend() -> None:
         responder_candidates_for_room=context.responder_candidates_for_current_room,
     )
     assert mock_edit.await_count == 3
-    assert mock_edit.await_args_list[0].kwargs == {
-        "runtime": expected_runtime,
+    first_call = mock_edit.await_args_list[0].kwargs.copy()
+    second_call = mock_edit.await_args_list[1].kwargs.copy()
+    third_call = mock_edit.await_args_list[2].kwargs.copy()
+    config_providers = []
+    for call_kwargs in (first_call, second_call, third_call):
+        runtime = call_kwargs.pop("runtime")
+        assert replace(runtime, config_provider=None) == expected_runtime
+        assert runtime.config_provider is not None
+        assert runtime.config_provider() is config
+        config_providers.append(runtime.config_provider)
+    current_config = config.model_copy(deep=True)
+    assert all(config_provider() is current_config for config_provider in config_providers)
+    assert first_call == {
         "room_id": context.room_id,
         "task_id": "task123",
         "full_text": "tomorrow at 9am check deployment",
@@ -304,9 +335,9 @@ async def test_edit_schedule_tool_calls_backend() -> None:
         "thread_id": context.resolved_thread_id,
         "history_limit": None,
         "silent": None,
+        "model": None,
     }
-    assert mock_edit.await_args_list[1].kwargs == {
-        "runtime": expected_runtime,
+    assert second_call == {
         "room_id": context.room_id,
         "task_id": "task123",
         "full_text": "keep the same schedule",
@@ -314,9 +345,9 @@ async def test_edit_schedule_tool_calls_backend() -> None:
         "thread_id": context.resolved_thread_id,
         "history_limit": 5,
         "silent": True,
+        "model": None,
     }
-    assert mock_edit.await_args_list[2].kwargs == {
-        "runtime": expected_runtime,
+    assert third_call == {
         "room_id": context.room_id,
         "task_id": "task123",
         "full_text": "make it visible",
@@ -324,6 +355,7 @@ async def test_edit_schedule_tool_calls_backend() -> None:
         "thread_id": context.resolved_thread_id,
         "history_limit": None,
         "silent": False,
+        "model": "cheap",
     }
 
 
@@ -373,6 +405,7 @@ async def test_list_schedules_tool_calls_backend() -> None:
     mock_list.assert_awaited_once_with(
         client=context.client,
         room_id=context.room_id,
+        runtime_paths=context.runtime_paths,
         thread_id=context.resolved_thread_id,
         config=context.config,
     )
@@ -426,6 +459,7 @@ async def test_cancel_schedule_tool_calls_backend() -> None:
         client=context.client,
         room_id=context.room_id,
         task_id="task123",
+        runtime_paths=context.runtime_paths,
         matrix_admin=matrix_admin,
     )
 

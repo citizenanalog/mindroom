@@ -8,6 +8,8 @@ from urllib.parse import quote
 
 import httpx
 
+from mindroom.http_error_detail import error_detail_from_response
+from mindroom.script_runs.compatibility import SCRIPT_PROTOCOL_VERSION
 from mindroom.workers.models import WorkerHandle, worker_api_endpoint
 
 _TOKEN_HEADER = "x-mindroom-sandbox-token"  # noqa: S105
@@ -66,21 +68,29 @@ class ScriptWorkerClient:
         run_id: str,
         source_digest: str,
         gateway_url: str,
+        max_runtime_seconds: int,
         state_scope_worker_key: str | None = None,
         private_agent_names: tuple[str, ...] | None = None,
+        config_snapshot: dict[str, object] | None = None,
     ) -> None:
-        """Launch the run's fixed source snapshot under its derived handle."""
+        """Launch the run's fixed source snapshot under its derived handle.
+
+        ``config_snapshot`` holds the live config fields runners resolve; workers mount no config and resolve agents only from it.
+        """
         data = await self._request(
             worker,
             method="POST",
             url=worker_api_endpoint(worker, "script-run"),
             json={
+                "protocol_version": SCRIPT_PROTOCOL_VERSION,
                 "run_id": run_id,
                 "worker_key": worker.worker_key,
                 "state_scope_worker_key": state_scope_worker_key,
                 "source_digest": source_digest,
                 "gateway_url": gateway_url,
+                "max_runtime_seconds": max_runtime_seconds,
                 "private_agent_names": list(private_agent_names) if private_agent_names is not None else None,
+                "config_snapshot": config_snapshot,
             },
         )
         self._raise_structured_failure(data)
@@ -173,7 +183,11 @@ class ScriptWorkerClient:
             message = f"Worker script request failed: {exc}"
             raise ScriptWorkerError(message, failure_kind="worker") from exc
         if response.status_code >= 400:
-            detail = _response_error(response)
+            # Validation errors echo rejected request values, such as the launch's config snapshot.
+            detail = error_detail_from_response(
+                response,
+                fallback=f"Worker script request failed with status {response.status_code}.",
+            )
             request_failure = response.status_code in {400, 413, 422}
             raise ScriptWorkerError(detail, failure_kind="tool" if request_failure else "worker")
         try:
@@ -194,18 +208,3 @@ class ScriptWorkerClient:
         kind: Literal["tool", "worker"] = "tool" if failure_kind == "tool" else "worker"
         error = data.get("error")
         raise ScriptWorkerError(str(error or "Worker script operation failed."), failure_kind=kind)
-
-
-def _response_error(response: httpx.Response) -> str:
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
-    if isinstance(payload, dict):
-        detail = payload.get("detail")
-        if isinstance(detail, str) and detail:
-            return detail
-        error = payload.get("error")
-        if isinstance(error, str) and error:
-            return error
-    return response.text.strip() or f"Worker script request failed with status {response.status_code}."

@@ -13,19 +13,20 @@ noticed.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
-from mindroom.history_recovery import (
+from mindroom.event_journal.history_recovery import (
     HistoryRecoveryOutcome,
     HistoryRecoveryState,
     RoomHistoryRecovery,
 )
 from mindroom.logging_config import get_logger
 
-from . import approvals, membership_hooks
+from . import approval_continuations, approvals, membership_hooks, replies, reply_messages
 from .identity import decode_thread_id, encode_thread_id
 from .models import (
     TURN_BACKED_KINDS,
@@ -47,10 +48,12 @@ from .models import (
     RoomMembershipPosition,
     SemanticConsumer,
 )
-from .projection import ProjectedEvent, project
+from .projection import ProjectedEvent, is_tombstoned, project
 from .schema import PENDING_STATE, SETTLED_STATE
 
 if TYPE_CHECKING:
+    from mindroom.turn_record import TurnRecord
+
     from .backend import Row, Transaction
 
 logger = get_logger(__name__)
@@ -663,6 +666,7 @@ def _advance_membership_epoch(
         room_id=room_id,
         reason="Approval transport left the room.",
     )
+    reply_messages.depart_room(transaction, principal_id, room_id, now_ns=time.time_ns())
     transaction.execute(
         """
         UPDATE matrix_delivery_outbox AS delivery SET retired = 1
@@ -686,22 +690,13 @@ def _advance_membership_epoch(
     )
     # A paused run owns exactly the source rows this fence is about to settle.
     # Delete the aggregate first so no durable continuation survives with no
-    # runnable source. Its call and source rows cascade.
+    # runnable source. Its call rows cascade.
     transaction.execute(
-        """
+        f"""
         DELETE FROM approval_continuations
         WHERE principal_id = ?
-          AND EXISTS (
-              SELECT 1
-              FROM approval_continuation_sources AS sources
-              JOIN journal_events AS events
-                ON events.principal_id = sources.principal_id
-               AND events.event_id = sources.event_id
-              WHERE sources.principal_id = approval_continuations.principal_id
-                AND sources.approval_id = approval_continuations.approval_id
-                AND events.room_id = ?
-          )
-        """,
+          AND {approval_continuations.holds_source_in_room("approval_continuations")}
+        """,  # noqa: S608 - a fixed SQL fragment, not input
         (principal_id, room_id),
     )
     # Turn-backed work still pending from the membership that just ended can
@@ -803,7 +798,7 @@ def admit(
     into the raw-event cache this design exists to remove, at roughly half a
     kilobyte for every message the bot has ever seen.
     """
-    epoch = current_membership_epoch(transaction, principal_id, event.room_id)
+    epoch = _claim_membership_state(transaction, principal_id, event.room_id).membership_epoch
     actionable = event.event_class is EventClass.ACTIONABLE
     row = transaction.fetchone(
         """
@@ -867,6 +862,12 @@ def _project_admitted_event(
             room_id=projected.room_id,
             event_id=tombstoned_event_id,
         )
+        replies.end_replies_of_deleted_source(
+            transaction,
+            principal_id,
+            room_id=projected.room_id,
+            event_id=tombstoned_event_id,
+        )
 
 
 def _settle_tombstoned_turn_source(
@@ -890,8 +891,8 @@ def _settle_tombstoned_turn_source(
         WHERE principal_id = ? AND room_id = ? AND event_id = ? AND state = ?
           AND kind IN ({kind_placeholders})
           AND NOT EXISTS (
-              SELECT 1 FROM approval_continuation_sources
-              WHERE principal_id = ? AND event_id = ?
+              SELECT 1 FROM {approval_continuations.HELD_SOURCES}
+              WHERE held_source.principal_id = ? AND held_source.event_id = ?
           )
         """,  # noqa: S608 - placeholders are generated, values are still bound
         (SETTLED_STATE, principal_id, room_id, event_id, PENDING_STATE, *kinds, principal_id, event_id),
@@ -952,6 +953,7 @@ def pending(
     principal_id: str,
     *,
     limit: int,
+    room_id: str | None = None,
     after_receipt_order: int | None = None,
     runtime_generation: str = "unmanaged",
 ) -> PendingPage:
@@ -973,6 +975,7 @@ def pending(
         transaction,
         principal_id,
         limit=limit,
+        room_id=room_id,
         after_receipt_order=after_receipt_order,
         runtime_generation=runtime_generation,
     )
@@ -984,6 +987,7 @@ def _pending_page(
     *,
     limit: int,
     after_receipt_order: int | None,
+    room_id: str | None = None,
     kind: EventKind | None = None,
     runtime_generation: str = "unmanaged",
 ) -> PendingPage:
@@ -998,6 +1002,7 @@ def _pending_page(
         transaction,
         principal_id,
         limit=limit,
+        room_id=room_id,
         after_receipt_order=after_receipt_order,
         kind=kind,
         runtime_generation=runtime_generation,
@@ -1022,39 +1027,44 @@ def _pending_rows(
     *,
     limit: int,
     after_receipt_order: int | None,
+    room_id: str | None = None,
     kind: EventKind | None = None,
     runtime_generation: str = "unmanaged",
 ) -> tuple[Row, ...]:
     """Return one raw page of pending rows, in receipt order."""
     cursor_clause = "" if after_receipt_order is None else " AND receipt_order > ?"
     cursor_params: tuple[object, ...] = () if after_receipt_order is None else (after_receipt_order,)
+    room_clause = "" if room_id is None else " AND events.room_id = ?"
+    room_params: tuple[object, ...] = () if room_id is None else (room_id,)
     kind_clause = "" if kind is None else " AND kind = ?"
     kind_params: tuple[object, ...] = () if kind is None else (kind.value,)
-    continuation_joins = """
-        LEFT JOIN approval_continuation_sources AS approval_sources
-          ON approval_sources.principal_id = events.principal_id
-         AND approval_sources.event_id = events.event_id
-        LEFT JOIN approval_continuations AS continuations
-         ON continuations.principal_id = approval_sources.principal_id
-         AND continuations.approval_id = approval_sources.approval_id
+    continuation_joins = f"""
+        LEFT JOIN ({approval_continuations.HELD_SOURCES})
+          ON held_source.principal_id = events.principal_id
+         AND held_source.event_id = events.event_id
+        LEFT JOIN reply_spans AS claim_span
+          ON claim_span.principal_id = continuations.principal_id
+         AND claim_span.span_id = continuations.claim_span_id
     """
+    # A claim this instance's span holds keeps its sources until its FINAL
+    # exists; one an older instance left goes to recovery.
     continuation_clause = """
           AND (
-            approval_sources.approval_id IS NULL
+            continuations.approval_id IS NULL
             OR (
-              approval_sources.source_ordinal = 0
+              held_source.ordinal = 0
               AND (
-                continuations.state IN ('ready', 'failing')
+                continuations.state = 'failing'
                 OR (
                   continuations.state = 'waiting'
                   AND continuations.runtime_generation IS NOT NULL
                   AND continuations.runtime_generation <> ?
                 )
                 OR (
-                  continuations.state = 'claimed'
+                  continuations.state = 'ready'
                   AND (
-                    continuations.runtime_generation IS NULL
-                    OR continuations.runtime_generation <> ?
+                    continuations.claim_span_id IS NULL
+                    OR claim_span.bot_generation <> ?
                     OR EXISTS (
                       SELECT 1 FROM matrix_delivery_outbox AS approval_final
                       WHERE approval_final.principal_id = events.principal_id
@@ -1073,11 +1083,11 @@ def _pending_rows(
         SELECT {_EVENT_JOURNAL_COLUMNS} FROM journal_events AS events
         {continuation_joins}
         WHERE events.principal_id = ? AND events.state = 'pending'
-          {continuation_clause}{kind_clause}{cursor_clause}
+          {continuation_clause}{kind_clause}{room_clause}{cursor_clause}
         ORDER BY events.receipt_order
         LIMIT ?
         """,  # noqa: S608 - a fixed column list and fixed clauses, not input
-        (principal_id, *continuation_params, *kind_params, *cursor_params, limit),
+        (principal_id, *continuation_params, *kind_params, *room_params, *cursor_params, limit),
     )
 
 
@@ -1179,6 +1189,49 @@ def is_pending(transaction: Transaction, principal_id: str, event_id: str) -> bo
     return row is not None
 
 
+def source_has_redaction_handoff(
+    transaction: Transaction,
+    principal_id: str,
+    event_id: str,
+    captured: TurnRecord,
+    current: TurnRecord | None,
+    redaction_target: Callable[[JournalEvent], str | None],
+) -> bool:
+    """Prove the source's redaction is durably tombstoned in the ledger or still owed by its callback.
+
+    Session history needs no handoff: each response removes history derived from tombstoned events.
+    """
+    source = transaction.fetchone(
+        "SELECT room_id FROM journal_events WHERE principal_id = ? AND event_id = ? AND state = 'settled'",
+        (principal_id, event_id),
+    )
+    if source is None or not is_tombstoned(transaction, principal_id, source["room_id"], event_id):
+        return False
+    if captured.conversation_target is not None and captured.conversation_target.room_id != source["room_id"]:
+        return False
+    if current is not None and event_id in current.redacted_source_event_ids:
+        return current.conversation_target is None or current.conversation_target.room_id == source["room_id"]
+    return _has_pending_redaction(transaction, principal_id, source["room_id"], event_id, redaction_target)
+
+
+def _has_pending_redaction(
+    transaction: Transaction,
+    principal_id: str,
+    room_id: str,
+    event_id: str,
+    redaction_target: Callable[[JournalEvent], str | None],
+) -> bool:
+    """Read callback ownership and decode it within the source's recovery transaction."""
+    callbacks = transaction.fetchall(
+        f"""
+        SELECT {_JOURNAL_COLUMNS} FROM journal_events
+        WHERE principal_id = ? AND room_id = ? AND state = 'pending' AND kind = ?
+        """,  # noqa: S608 - fixed columns, bound values
+        (principal_id, room_id, EventKind.REDACTION.value),
+    )
+    return any(redaction_target(callback) == event_id for callback in _decode_rows(callbacks))
+
+
 def sources_settled_by_departure(
     transaction: Transaction,
     principal_id: str,
@@ -1201,7 +1254,7 @@ def sources_settled_by_departure(
     )
 
 
-def settle(transaction: Transaction, principal_id: str, event_id: str) -> None:
+def _settle(transaction: Transaction, principal_id: str, event_id: str) -> None:
     """Mark one event's semantic work terminal and release its replay payload.
 
     The payload is cleared rather than the row deleted: the row is the proof
@@ -1230,7 +1283,7 @@ def settle(transaction: Transaction, principal_id: str, event_id: str) -> None:
 def settle_many(transaction: Transaction, principal_id: str, event_ids: tuple[str, ...]) -> None:
     """Settle several events that one terminal turn accounted for."""
     for event_id in event_ids:
-        settle(transaction, principal_id, event_id)
+        _settle(transaction, principal_id, event_id)
 
 
 def unsettled_event_ids(transaction: Transaction, principal_id: str) -> frozenset[str]:
@@ -1295,7 +1348,7 @@ def claim_semantic_consumer(
         and EventKind(row["kind"]) is EventKind.REACTION
         and int(row["membership_epoch"]) != current_membership_epoch(transaction, principal_id, row["room_id"])
     ):
-        settle(transaction, principal_id, event_id)
+        _settle(transaction, principal_id, event_id)
         return None
     return claimed
 

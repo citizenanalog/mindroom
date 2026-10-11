@@ -9,6 +9,7 @@ only ever happened to share a sync callback with.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -19,10 +20,12 @@ import pytest
 
 from mindroom.background_tasks import create_background_task, wait_for_background_tasks
 from mindroom.cancellation import SYNC_RESTART_CANCEL_MSG, current_task_is_process_shutdown
+from mindroom.config.plugin import PluginEntryConfig
 from mindroom.dispatch_callback_outcome import TurnDispatchOutcome
 from mindroom.event_journal import EventClass, EventKind
-from mindroom.hooks import EVENT_AGENT_STARTED
-from mindroom.runtime_shutdown import ORDERLY_SHUTDOWN, SYNC_RESTART_SHUTDOWN
+from mindroom.hooks import EVENT_AGENT_STARTED, HookRegistry, hook
+from mindroom.runtime_shutdown import ORDERLY_SHUTDOWN, SYNC_RESTART_SHUTDOWN, ShutdownBudget
+from mindroom.turn_record import TurnRecord
 from tests.journal_helpers import admit_dispatch_event
 from tests.threading_helpers import (
     ThreadingBehaviorTestBase,
@@ -150,6 +153,62 @@ class TestBotSyncLifecycle(ThreadingBehaviorTestBase):
         assert bot._ingestion_session is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["lookup", "write", "timeout", "system_exit"])
+    async def test_required_startup_hook_failure_stops_before_room_reconciliation(
+        self,
+        bot: AgentBot,
+        failure: str,
+    ) -> None:
+        """Failed room ownership initialization must close startup before cleanup."""
+        later_hook = AsyncMock()
+
+        @hook(EVENT_AGENT_STARTED, priority=10, timeout_ms=5, required=True)
+        async def retain_rooms(_ctx: object) -> None:
+            if failure == "timeout":
+                await asyncio.sleep(60)
+            if failure == "system_exit":
+                raise SystemExit(1)
+            msg = f"retention {failure} failed"
+            raise OSError(msg)
+
+        @hook(EVENT_AGENT_STARTED, priority=20)
+        async def backfill(_ctx: object) -> None:
+            await later_hook()
+
+        bot.hook_registry = HookRegistry.from_plugins(
+            [
+                SimpleNamespace(
+                    name="room-owner",
+                    discovered_hooks=(retain_rooms, backfill),
+                    discovered_automations=(),
+                    plugin_order=0,
+                    entry_config=PluginEntryConfig(path="./plugins/room-owner"),
+                ),
+            ],
+        )
+        client = _make_client_mock(user_id="@mindroom_general:localhost")
+        session = AsyncMock()
+        with (
+            patch.object(bot, "ensure_user_account", AsyncMock()),
+            patch(
+                "mindroom.bot.login_agent_owned_session",
+                AsyncMock(return_value=SimpleNamespace(client=client, session=session)),
+            ),
+            patch.object(bot, "_set_avatar_if_available", AsyncMock()),
+            patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
+            pytest.raises(RuntimeError, match="Required startup hook") as error,
+        ):
+            await bot.start()
+
+        expected_cause = {"timeout": TimeoutError, "system_exit": SystemExit}.get(failure, OSError)
+        assert isinstance(error.value.__cause__, expected_cause)
+        later_hook.assert_not_awaited()
+        client.close.assert_awaited_once()
+        session.close.assert_awaited_once()
+        assert bot.client is None
+        assert not bot.running
+
+    @pytest.mark.asyncio
     async def test_approval_recovery_retains_owned_store_until_final_send_finishes(self, bot: AgentBot) -> None:
         """A recovery-only FINAL reuses restored owned state and releases both ownership lanes."""
         bot.client = None
@@ -217,7 +276,7 @@ class TestBotSyncLifecycle(ThreadingBehaviorTestBase):
 
     @pytest.mark.asyncio
     async def test_live_redaction_tombstones_the_source_it_names(self, bot: AgentBot) -> None:
-        """The redaction callback owes exactly one thing: the durable tombstone."""
+        """The redaction callback owes exactly one thing: the durable tombstone, scoped to its room."""
         room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_agent:localhost")
         redaction_event = MagicMock(spec=nio.RedactionEvent)
         redaction_event.redacts = "$source:localhost"
@@ -228,7 +287,66 @@ class TestBotSyncLifecycle(ThreadingBehaviorTestBase):
         ) as mark_source_redacted:
             await bot._on_redaction(room, redaction_event)
 
-        mark_source_redacted.assert_called_once_with("$source:localhost")
+        mark_source_redacted.assert_called_once_with("$source:localhost", room_id="!test:localhost")
+
+    @pytest.mark.asyncio
+    async def test_running_bot_prunes_stale_handled_turns_without_a_restart(self, bot: AgentBot) -> None:
+        """Ledger retention must keep applying while sync runs, not only at startup."""
+        await bot._turn_store.warm()
+        ledger = bot._turn_store._ledger
+        now = time.time()
+        await ledger.record_handled_turn(TurnRecord.create(["$old:localhost"], timestamp=now - 40 * 24 * 60 * 60))
+        await ledger.record_handled_turn(TurnRecord.create(["$recent:localhost"], timestamp=now))
+
+        async def publish_frame() -> None:
+            await bot._run_sync_response_side_effects(first_sync_response=False)
+            await wait_for_background_tasks(timeout=1.0, owner=bot._runtime_view)
+
+        with (
+            patch.object(bot, "_refresh_agent_reply_memberships_if_needed", AsyncMock()),
+            patch.object(bot, "_schedule_delivery_recovery"),
+        ):
+            await publish_frame()
+            assert bot._turn_store.get_turn_record("$old:localhost") is not None
+
+            bot._next_handled_turn_cleanup_at = 0.0
+            await publish_frame()
+
+        assert bot._turn_store.get_turn_record("$old:localhost") is None
+        assert bot._turn_store.get_turn_record("$recent:localhost") is not None
+
+    @pytest.mark.asyncio
+    async def test_handled_turn_cleanup_stops_at_sync_shutdown(self, bot: AgentBot) -> None:
+        """Shutdown cancels a running retention pass and schedules no further ones."""
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_cleanup(**_kwargs: object) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with (
+            patch.object(bot, "_refresh_agent_reply_memberships_if_needed", AsyncMock()),
+            patch.object(bot, "_schedule_delivery_recovery"),
+            patch.object(bot._turn_store, "cleanup", side_effect=blocked_cleanup) as cleanup,
+        ):
+            bot._next_handled_turn_cleanup_at = 0.0
+            await bot._run_sync_response_side_effects(first_sync_response=False)
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+
+            bot._sync_shutdown_budget = ShutdownBudget.start(0.01)
+            await asyncio.wait_for(bot.prepare_for_sync_shutdown(), timeout=2.0)
+            assert cancelled.is_set()
+
+            bot._next_handled_turn_cleanup_at = 0.0
+            await bot._run_sync_response_side_effects(first_sync_response=False)
+            assert await wait_for_background_tasks(timeout=0.2, owner=bot._runtime_view)
+
+        assert cleanup.await_count == 1
 
     @pytest.mark.asyncio
     async def test_wait_for_background_tasks_owner_scope_isolated(self, bot: AgentBot) -> None:

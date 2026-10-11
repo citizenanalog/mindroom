@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -21,6 +21,7 @@ from httpx import ASGITransport, AsyncClient
 import mindroom.workers.runtime as workers_runtime_module
 from mindroom.api.script_gateway import bind_script_tool_broker
 from mindroom.api.script_gateway import router as script_gateway_router
+from mindroom.approval.tool_approval import BackgroundScriptToolOrigin
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths
 from mindroom.event_journal import BackgroundApprovalDecision
@@ -38,11 +39,13 @@ from mindroom.orchestration.script_runtime import (
 from mindroom.script_runs.broker import ScriptRuntimeUnavailableError, ScriptToolBroker
 from mindroom.script_runs.manager import ScriptRunManager, ScriptRunManagerError
 from mindroom.script_runs.models import (
+    ScriptCallState,
     ScriptRunRecord,
     ScriptRunState,
     ScriptToolGrant,
     script_worker_key_for_run,
 )
+from mindroom.script_runs.recovery import script_recovery_signature, verified_script_recovery_signature
 from mindroom.script_runs.store import (
     ScriptCallNotFoundError,
     ScriptRunNotFoundError,
@@ -54,7 +57,6 @@ from mindroom.script_runs.worker_client import (
     WorkerScriptCancel,
     WorkerScriptStatus,
 )
-from mindroom.tool_approval import BackgroundScriptToolOrigin
 from mindroom.tool_system.worker_routing import (
     build_agent_toolkit_worker_target,
     build_tool_execution_identity,
@@ -289,10 +291,13 @@ class _BlockingLaunchWorkerClient(_TerminatingWorkerClient):
         run_id: str,
         source_digest: str,
         gateway_url: str,
+        max_runtime_seconds: int,
         state_scope_worker_key: str | None = None,
         private_agent_names: tuple[str, ...] | None = None,
+        config_snapshot: dict[str, object] | None = None,
     ) -> None:
-        del run_id, source_digest, gateway_url, state_scope_worker_key, private_agent_names
+        del run_id, source_digest, gateway_url, state_scope_worker_key, private_agent_names, config_snapshot
+        assert max_runtime_seconds > 0
         self.launch_entered.set()
         await self.release_launch.wait()
 
@@ -411,10 +416,11 @@ class _StartupAdmissionResolver:
     """Expose any inherited call that reaches execution during startup cleanup."""
 
     execution_attempts: int = 0
+    authorized: bool | None = True
 
-    def is_authorized(self, run: ScriptRunRecord, *, config: Config | None = None) -> bool:
+    def is_authorized(self, run: ScriptRunRecord, *, config: Config | None = None) -> bool | None:
         del run, config
-        return True
+        return self.authorized
 
     def resolve(self, run: ScriptRunRecord, *, correlation_id: str) -> None:
         del run, correlation_id
@@ -472,6 +478,9 @@ def _stored_run_pinned_to_worker(
     *,
     run_id: str,
     worker_backend_locator: str = "locator-a",
+    recovery_signature: str | None = None,
+    state: ScriptRunState = ScriptRunState.RUNNING,
+    started_at: str | None = None,
 ) -> ScriptRunRecord:
     run = _run(runtime_paths, run_id=run_id, state=ScriptRunState.STARTING)
     assert run.worker_key is not None
@@ -480,11 +489,13 @@ def _stored_run_pinned_to_worker(
             run,
             worker_key=script_worker_key_for_run(run.worker_key, run_id),
             worker_backend_locator=worker_backend_locator,
+            recovery_signature=recovery_signature,
+            started_at=started_at,
         ),
     )
     return store.transition_run(
         created.run_id,
-        state=ScriptRunState.RUNNING,
+        state=state,
         worker_id="worker-1",
     )
 
@@ -527,7 +538,7 @@ def _worker_replacement_scenario(
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     runtime = ScriptRuntimeLifecycle(
         runtime_paths=runtime_paths,
@@ -837,9 +848,456 @@ async def test_lifecycle_activates_after_both_agent_registry_and_api_are_ready(t
     assert bound_managers == [manager, None]
 
 
+@dataclass
+class _RecoveringBackend(_Backend):
+    backend_name: str = "kubernetes"
+    signature: str = "worker-authority-v1"
+
+    def script_recovery_signature(self) -> str:
+        return self.signature
+
+    def script_resource_recovery_authority(self, resource_profile: str | None) -> dict[str, object]:
+        return {"profile": resource_profile, "requests": {}, "limits": {}}
+
+
+@dataclass
+class _DigestOnlyRecoveringBackend(_Backend):
+    backend_name: str = "kubernetes"
+
+    def script_recovery_signature(self) -> str:
+        return "worker-authority-v1"
+
+
+def _recovery_scenario(
+    tmp_path: Path,
+    *,
+    state: ScriptRunState = ScriptRunState.RUNNING,
+    started_at: str | None = None,
+) -> tuple[ScriptRuntimeLifecycle, ScriptRunRecord, _RecoveringBackend, _TerminatingWorkerClient]:
+    paths = replace(
+        _runtime_paths(tmp_path),
+        process_env={
+            "MINDROOM_SANDBOX_EXECUTION_MODE": "all",
+            "MINDROOM_SCRIPT_GATEWAY_ISOLATED": "true",
+            "MINDROOM_SCRIPT_GATEWAY_URL": "http://primary.test/api/script-gateway",
+        },
+    )
+    config = _config()
+    store = ScriptRunStore(paths)
+    backend = _RecoveringBackend([])
+    gateway_url = "http://primary.test/api/script-gateway"
+    signature = script_recovery_signature(
+        backend=backend,
+        config=config,
+        agent_name="watcher",
+        gateway_url=gateway_url,
+    )
+    assert signature is not None
+    run = _stored_run_pinned_to_worker(
+        store,
+        paths,
+        run_id=f"script-{'a' * 32}",
+        recovery_signature=signature,
+        state=state,
+        started_at=started_at,
+    )
+    backend.handles = [_worker(run)]
+    resolver = _StartupAdmissionResolver()
+    broker = ScriptToolBroker(store=store, runtime_resolver=resolver)
+    client = _TerminatingWorkerClient()
+    manager = ScriptRunManager(
+        store=store,
+        broker=broker,
+        worker_client=client,
+        worker_backend=backend,
+        gateway_url=gateway_url,
+        cancellation_grace_seconds=0,
+    )
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=paths,
+        store=store,
+        broker=broker,
+        manager=manager,
+        resolver=resolver,
+        config_provider=lambda: config,
+        worker_lease_provider=lambda locator: _Lease(backend) if locator in {None, "locator-a"} else None,
+    )
+    runtime.bind_api(gateway_url)
+    return runtime, run, backend, client
+
+
 @pytest.mark.asyncio
-async def test_startup_revokes_and_retires_inherited_running_process(tmp_path: Path) -> None:
-    """A new application process never adopts an inherited running script."""
+@pytest.mark.parametrize("state", [ScriptRunState.STARTING, ScriptRunState.RUNNING])
+async def test_startup_adopts_compatible_script_without_recreating_worker(
+    tmp_path: Path,
+    state: ScriptRunState,
+) -> None:
+    """A live worker keeps its process and authority when the primary is reconstructed."""
+    runtime, run, backend, client = _recovery_scenario(tmp_path, state=state)
+    try:
+        await runtime.start()
+        durable = runtime.store.get_run(run.run_id)
+        assert durable.state is ScriptRunState.RUNNING
+        assert durable.cancel_requested_at is None
+        assert durable.worker_id == run.worker_id
+        assert client.exited is False
+        assert runtime.broker._call_admission_open.is_set()
+        assert set(backend.actions) == {f"touch:{run.worker_key}"}
+    finally:
+        await runtime.shutdown()
+    assert client.exited is False
+    assert runtime.store.get_run(run.run_id).cancel_requested_at is None
+
+
+@pytest.mark.asyncio
+async def test_incomplete_kubernetes_recovery_backend_cannot_mint_or_adopt_authority(tmp_path: Path) -> None:
+    """A digest without selected-resource authority cannot claim recoverable ownership."""
+    paths = replace(
+        _runtime_paths(tmp_path),
+        process_env={
+            "MINDROOM_SANDBOX_EXECUTION_MODE": "all",
+            "MINDROOM_SCRIPT_GATEWAY_ISOLATED": "true",
+            "MINDROOM_SCRIPT_GATEWAY_URL": "http://primary.test/api/script-gateway",
+        },
+    )
+    config = _config()
+    backend = _DigestOnlyRecoveringBackend([])
+    gateway_url = "http://primary.test/api/script-gateway"
+    minted_signature = script_recovery_signature(
+        backend=backend,
+        config=config,
+        agent_name="watcher",
+        gateway_url=gateway_url,
+    )
+    store = ScriptRunStore(paths)
+    run = _stored_run_pinned_to_worker(
+        store,
+        paths,
+        run_id=f"script-{'c' * 32}",
+        recovery_signature=minted_signature or f"v2:{'0' * 64}",
+    )
+    backend.handles = [_worker(run)]
+    client = _TerminatingWorkerClient()
+    resolver = _StartupAdmissionResolver()
+    broker = ScriptToolBroker(store=store, runtime_resolver=resolver)
+    manager = ScriptRunManager(
+        store=store,
+        broker=broker,
+        worker_client=client,
+        worker_backend=backend,
+        gateway_url=gateway_url,
+        cancellation_grace_seconds=0,
+    )
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=paths,
+        store=store,
+        broker=broker,
+        manager=manager,
+        resolver=resolver,
+        config_provider=lambda: config,
+        worker_lease_provider=lambda _locator: _Lease(backend),
+    )
+    runtime.bind_api(gateway_url)
+
+    try:
+        await runtime.start()
+        assert minted_signature is None
+        assert store.get_run(run.run_id).state is ScriptRunState.INTERRUPTED
+        assert client.exited is True
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_active_runs_classify_unfinished_runs_with_the_startup_adoption_rule(tmp_path: Path) -> None:
+    """Activity lists every unfinished run read-only and marks only runs restart startup would adopt."""
+    runtime, adoptable, _backend, client = _recovery_scenario(tmp_path)
+    paths = runtime.runtime_paths
+    legacy = _stored_run_pinned_to_worker(runtime.store, paths, run_id=f"script-{'b' * 32}")
+    cancelling = _stored_run_pinned_to_worker(
+        runtime.store,
+        paths,
+        run_id=f"script-{'c' * 32}",
+        recovery_signature=adoptable.recovery_signature,
+    )
+    runtime.store.request_cancel(cancelling.run_id, reason="Cancelled by owner.")
+    stale = _stored_run_pinned_to_worker(
+        runtime.store,
+        paths,
+        run_id=f"script-{'e' * 32}",
+        recovery_signature=f"v2:{'0' * 64}",
+    )
+    finished = _stored_run_pinned_to_worker(runtime.store, paths, run_id=f"script-{'d' * 32}")
+    runtime.store.transition_run(finished.run_id, state=ScriptRunState.EXITED, exit_code=0)
+    await runtime._refresh_worker_backend()
+    before = {run.run_id: run for run in runtime.store.list_runs()}
+
+    active = await runtime.active_runs()
+
+    assert {run.run_id: run.recoverable for run in active} == {
+        adoptable.run_id: True,
+        legacy.run_id: False,
+        cancelling.run_id: False,
+        stale.run_id: False,
+    }
+    assert {(run.responder, run.requester_id) for run in active} == {("watcher", "@alice:example.test")}
+    assert {run.run_id: run for run in runtime.store.list_runs()} == before
+    assert client.exited is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [False, None])
+async def test_active_runs_treat_unconfirmed_owner_authorization_as_interruptible(
+    tmp_path: Path,
+    authorized: bool | None,
+) -> None:
+    """Startup only adopts a run whose owner is confirmed, so activity must not call it recoverable."""
+    runtime, run, _backend, client = _recovery_scenario(tmp_path)
+    await runtime._refresh_worker_backend()
+    runtime.resolver.authorized = authorized
+
+    active = await runtime.active_runs()
+
+    assert [(info.run_id, info.recoverable) for info in active] == [(run.run_id, False)]
+    assert client.exited is False
+
+
+@pytest.mark.asyncio
+async def test_active_runs_treat_an_unresolved_worker_backend_as_interruptible(tmp_path: Path) -> None:
+    """Without the run's owning backend the recovery signature cannot be verified."""
+    runtime, run, _backend, _client = _recovery_scenario(tmp_path)
+
+    active = await runtime.active_runs()
+
+    assert [(info.run_id, info.recoverable) for info in active] == [(run.run_id, False)]
+
+
+def test_recovery_requires_a_persisted_signature(tmp_path: Path) -> None:
+    """An unavailable historical digest cannot match a missing durable authority record."""
+    runtime, run, backend, _client = _recovery_scenario(tmp_path)
+    assert (
+        verified_script_recovery_signature(
+            run=replace(run, recovery_signature=None),
+            backend=backend,
+            config=_config(),
+            gateway_url=runtime.manager.gateway_url,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_adopts_script_after_compatible_delegation_change(tmp_path: Path) -> None:
+    """An unrelated delegation edit leaves the run's process authority unchanged."""
+    runtime, run, _backend, client = _recovery_scenario(tmp_path)
+    runtime.config_provider = lambda: Config(
+        agents={
+            "watcher": {
+                "display_name": "Watcher",
+                "tools": ["script", "calculator"],
+                "delegate_to": ["watcher"],
+            },
+        },
+        defaults={"tools": []},
+    )
+
+    try:
+        await runtime.start()
+        durable = runtime.store.get_run(run.run_id)
+        assert durable.state is ScriptRunState.RUNNING
+        assert durable.cancel_requested_at is None
+        assert client.exited is False
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_worker_and_settles_orphaned_calls(tmp_path: Path) -> None:
+    """Detaching the primary does not revoke the run or replay accepted calls."""
+    runtime, run, backend, client = _recovery_scenario(tmp_path)
+    runtime._current_worker_lease = _Lease(backend)
+    runtime.store.claim_call(
+        run_id=run.run_id,
+        call_id="accepted-before-restart",
+        grant=ScriptToolGrant("calculator", "add"),
+        arguments_digest="arguments-digest",
+    )
+
+    await runtime.shutdown()
+
+    durable = runtime.store.get_run(run.run_id)
+    assert durable.state is ScriptRunState.RUNNING
+    assert durable.cancel_requested_at is None
+    assert client.exited is False
+    assert backend.handles == [_worker(run)]
+    assert runtime.store.get_call(run.run_id, "accepted-before-restart").state is ScriptCallState.INDETERMINATE
+
+
+@pytest.mark.asyncio
+async def test_startup_interrupts_recovery_contract_mismatch(tmp_path: Path) -> None:
+    """An offline worker authority change cannot preserve the old process grant."""
+    runtime, run, backend, client = _recovery_scenario(tmp_path)
+    backend.signature = "changed-worker-authority"
+    try:
+        await runtime.start()
+        assert runtime.store.get_run(run.run_id).state is ScriptRunState.INTERRUPTED
+        assert client.exited is True
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_records_missing_recoverable_worker_as_interrupted(tmp_path: Path) -> None:
+    """Worker loss never causes script source to be automatically relaunched."""
+    runtime, run, backend, _client = _recovery_scenario(tmp_path)
+    backend.handles.clear()
+    try:
+        await runtime.start()
+        assert runtime.store.get_run(run.run_id).state is ScriptRunState.INTERRUPTED
+        assert backend.handles == []
+        assert runtime.broker._call_admission_open.is_set()
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "private_scope",
+        "worker_scope",
+        "knowledge_mount",
+        "worker_credentials",
+        "script_tool",
+        "gateway",
+        "gateway_isolation",
+        "explicit_gateway",
+    ],
+)
+async def test_startup_rejects_changed_script_recovery_scope(tmp_path: Path, change: str) -> None:
+    """A surviving process cannot retain authority across incompatible offline changes."""
+    runtime, run, _backend, client = _recovery_scenario(tmp_path)
+    if change == "private_scope":
+        runtime.config_provider = lambda: _config(private=True)
+    elif change == "worker_scope":
+        runtime.config_provider = lambda: Config(
+            agents={"watcher": {"display_name": "Watcher", "tools": ["script", "calculator"]}},
+            defaults={"tools": [], "worker_scope": "user_agent"},
+        )
+    elif change == "knowledge_mount":
+        runtime.config_provider = lambda: Config(
+            agents={
+                "watcher": {
+                    "display_name": "Watcher",
+                    "tools": ["script", "calculator"],
+                    "knowledge_bases": ["documents"],
+                },
+            },
+            knowledge_bases={"documents": {"path": "knowledge/documents"}},
+            defaults={"tools": []},
+        )
+    elif change == "worker_credentials":
+        runtime.config_provider = lambda: Config(
+            agents={"watcher": {"display_name": "Watcher", "tools": ["script", "calculator"]}},
+            defaults={"tools": [], "worker_grantable_credentials": ["github"]},
+        )
+    elif change == "script_tool":
+        config = _config()
+        config.agents["watcher"].tools = ["calculator"]
+        runtime.config_provider = lambda: config
+    elif change == "gateway_isolation":
+        runtime.runtime_paths = replace(runtime.runtime_paths, process_env={"MINDROOM_SANDBOX_EXECUTION_MODE": "all"})
+    elif change == "explicit_gateway":
+        runtime.runtime_paths = replace(
+            runtime.runtime_paths,
+            process_env={
+                "MINDROOM_SANDBOX_EXECUTION_MODE": "all",
+                "MINDROOM_SCRIPT_GATEWAY_ISOLATED": "true",
+                "MINDROOM_PUBLIC_URL": "http://primary.test",
+            },
+        )
+    else:
+        runtime.bind_api("http://different-primary.test/api/script-gateway")
+    try:
+        await runtime.start()
+        assert runtime.store.get_run(run.run_id).state is ScriptRunState.INTERRUPTED
+        assert client.exited is True
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_keeps_unreachable_recoverable_worker_pending(tmp_path: Path) -> None:
+    """A temporary status outage must not revoke a surviving process or open the gateway."""
+    runtime, run, backend, client = _recovery_scenario(tmp_path)
+    runtime.manager.worker_client = _FailingStatusWorkerClient()
+    try:
+        await runtime.start()
+        assert runtime.store.get_run(run.run_id).cancel_requested_at is None
+        assert len(backend.handles) == 1
+        assert runtime.broker._call_admission_open.is_set() is False
+        runtime.manager.worker_client = client
+        await runtime._complete_pass()
+        assert runtime.broker._call_admission_open.is_set()
+        assert runtime.store.get_run(run.run_id).state is ScriptRunState.RUNNING
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [False, None])
+async def test_recovery_requires_live_owner_authorization(tmp_path: Path, authorized: bool | None) -> None:
+    """Unresolved membership waits for a live bot; confirmed removal interrupts the process."""
+    runtime, run, _backend, client = _recovery_scenario(tmp_path)
+    resolver = _StartupAdmissionResolver(authorized=authorized)
+    runtime.resolver = resolver
+    try:
+        await runtime.start()
+        durable = runtime.store.get_run(run.run_id)
+        if authorized is False:
+            assert durable.state is ScriptRunState.INTERRUPTED
+            assert client.exited is True
+        else:
+            assert durable.cancel_requested_at is None
+            assert runtime.broker._call_admission_open.is_set() is False
+            resolver.authorized = True
+            await runtime._complete_pass()
+            assert runtime.broker._call_admission_open.is_set()
+            assert client.exited is False
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired", [False, True])
+async def test_startup_never_preserves_cancelled_or_expired_script(tmp_path: Path, expired: bool) -> None:
+    """A recovery marker cannot override durable cancellation or the original runtime budget."""
+    started_at = (datetime.now(UTC) - timedelta(days=2)).isoformat() if expired else None
+    runtime, run, _backend, client = _recovery_scenario(tmp_path, started_at=started_at)
+    if not expired:
+        runtime.store.request_cancel(run.run_id, reason="Cancelled by owner.")
+    try:
+        await runtime.start()
+        durable = runtime.store.get_run(run.run_id)
+        assert durable.cancel_requested_at is not None
+        assert durable.finished_at is not None
+        assert client.exited is True
+    finally:
+        await runtime.shutdown()
+
+
+def test_keepalive_failure_aborts_cleanup_for_active_scripts(tmp_path: Path) -> None:
+    """Worker maintenance cannot proceed with stale idle timestamps after keepalive fails."""
+    runtime, _run_record, backend, _client = _recovery_scenario(tmp_path)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(backend, "touch_worker", MagicMock(side_effect=WorkerBackendError("temporary API failure")))
+        with pytest.raises(WorkerBackendError, match="temporary API failure"):
+            runtime.touch_live_workers(backend)
+
+
+@pytest.mark.asyncio
+async def test_startup_revokes_and_retires_legacy_running_process(tmp_path: Path) -> None:
+    """A legacy run without a recovery contract retains interruption semantics."""
     runtime_paths = _runtime_paths(tmp_path)
     store = ScriptRunStore(runtime_paths)
     run = _stored_run_pinned_to_worker(store, runtime_paths, run_id=f"script-{'9' * 32}")
@@ -1634,7 +2092,7 @@ async def test_generation_replacement_interrupts_active_worker_script_before_rel
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script", "calculator"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     committed_config = old_config
     identities: list[str | None] = []
@@ -1663,8 +2121,8 @@ async def test_generation_replacement_interrupts_active_worker_script_before_rel
     await _reconcile_once(runtime)
     await runtime.apply_update_plan(_plan(old_config, new_config))
 
-    assert first.released is True
-    assert runtime._current_worker_lease is None
+    assert first.released is False
+    assert runtime._current_worker_lease is first
 
     committed_config = new_config
     await runtime.complete_worker_replacement()
@@ -1679,9 +2137,150 @@ async def test_generation_replacement_interrupts_active_worker_script_before_rel
     assert settlement_resolver.settled_runs == [run.run_id]
     assert release_observations == [durable]
     assert old_backend.actions[-2:] == [f"retire:{run.worker_key}", "release"]
+    assert first.released is True
     assert runtime._current_worker_lease is second
-    assert runtime._worker_replacement_pending is False
-    assert identities == ["backend-generation-a", "backend-generation-b"]
+    assert runtime._worker_replacement_phase == "idle"
+    assert identities == ["backend-generation-a", "backend-generation-b", "backend-generation-b"]
+
+
+@pytest.mark.asyncio
+async def test_generation_replacement_preserves_compatible_active_worker_script(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A manager refresh keeps a run whose owner-specific process authority is unchanged."""
+    runtime_paths = _runtime_paths(tmp_path)
+    store = ScriptRunStore(runtime_paths)
+    old_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "tools": ["script"], "delegate_to": []}},
+        defaults={"tools": [], "worker_scope": "user_agent"},
+    )
+    new_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "tools": ["script"], "delegate_to": ["watcher"]}},
+        defaults={"tools": [], "worker_scope": "user_agent"},
+    )
+    old_backend = _RecoveringBackend([])
+    recovery_signature = script_recovery_signature(
+        backend=old_backend,
+        config=old_config,
+        agent_name="watcher",
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    assert recovery_signature is not None
+    run = _stored_run_pinned_to_worker(
+        store,
+        runtime_paths,
+        run_id=f"script-{'5' * 32}",
+        recovery_signature=recovery_signature,
+    )
+    old_backend.handles = [_worker(run)]
+    first = _Lease(old_backend)
+    second = _Lease(_RecoveringBackend([_worker(run)]))
+    broker = _broker_lifecycle_stub()
+    manager = ScriptRunManager(
+        store=store,
+        broker=broker,  # type: ignore[arg-type]
+        worker_client=_TerminatingWorkerClient(),  # type: ignore[arg-type]
+        worker_backend=old_backend,
+        gateway_url="http://primary.test/api/script-gateway",
+        cancellation_grace_seconds=0,
+    )
+    committed_config = old_config
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, config: "new" if config is new_config else "old",
+    )
+    leases = iter((first, second))
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=store,
+        broker=broker,  # type: ignore[arg-type]
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=lambda: committed_config,
+        worker_lease_provider=lambda _locator: next(leases),
+    )
+    runtime.bind_api("http://primary.test/api/script-gateway")
+
+    await _reconcile_once(runtime)
+    await runtime.apply_update_plan(_plan(old_config, new_config))
+    durable = store.get_run(run.run_id)
+    assert durable.cancel_requested_at is None
+    assert durable.state is ScriptRunState.RUNNING
+    assert first.released is False
+    assert runtime._current_worker_lease is first
+    assert runtime._worker_backend_for(run) is old_backend
+    broker.close_call_admission.assert_called_once_with()
+    broker.open_call_admission.assert_not_called()
+
+    committed_config = new_config
+    await runtime.complete_worker_replacement()
+    assert runtime._current_worker_lease is second
+    assert runtime._worker_backend_for(run) is second.manager
+    assert first.released is True
+    assert store.get_run(run.run_id).state is ScriptRunState.RUNNING
+    broker.open_call_admission.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_generation_replacement_interrupts_compatible_nonrecoverable_worker_before_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A backend whose release removes processes cannot retain an otherwise compatible run."""
+    runtime_paths = _runtime_paths(tmp_path)
+    store = ScriptRunStore(runtime_paths)
+    run = _stored_run_pinned_to_worker(store, runtime_paths, run_id=f"script-{'6' * 32}")
+    old_backend = _Backend([_worker(run)])
+    release_observations: list[ScriptRunRecord] = []
+    first = _Lease(old_backend, on_release=lambda: release_observations.append(store.get_run(run.run_id)))
+    second = _Lease(_Backend([]))
+    broker = ScriptToolBroker(store=store, runtime_resolver=_ApprovalSettlementResolver())
+    manager = ScriptRunManager(
+        store=store,
+        broker=broker,
+        worker_client=_TerminatingWorkerClient(),  # type: ignore[arg-type]
+        worker_backend=old_backend,
+        gateway_url="http://primary.test/api/script-gateway",
+        cancellation_grace_seconds=0,
+        cancellation_poll_interval_seconds=0,
+    )
+    old_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "tools": ["script"], "delegate_to": []}},
+        defaults={"tools": [], "worker_scope": "user_agent"},
+    )
+    new_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "tools": ["script"], "delegate_to": ["watcher"]}},
+        defaults={"tools": [], "worker_scope": "user_agent"},
+    )
+    committed_config = old_config
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, config: "new" if config is new_config else "old",
+    )
+    leases = iter((first, second))
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=store,
+        broker=broker,
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=lambda: committed_config,
+        worker_lease_provider=lambda _locator: next(leases),
+    )
+
+    await _reconcile_once(runtime)
+    await runtime.apply_update_plan(_plan(old_config, new_config))
+    durable = store.get_run(run.run_id)
+    assert durable.state is ScriptRunState.INTERRUPTED
+    assert durable.cancellation_reason == "Worker configuration changed during configuration reload."
+    assert first.released is False
+
+    committed_config = new_config
+    await runtime.complete_worker_replacement()
+    assert first.released is True
+    assert release_observations == [durable]
+    assert runtime._current_worker_lease is second
 
 
 @pytest.mark.asyncio
@@ -1704,7 +2303,7 @@ async def test_generation_replacement_aborts_before_every_run_has_durable_revoca
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script", "calculator"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     monkeypatch.setattr(
         "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
@@ -1716,6 +2315,7 @@ async def test_generation_replacement_aborts_before_every_run_has_durable_revoca
         request_revocation=request_revocation,
         revoke=AsyncMock(),
         reconcile_durable=AsyncMock(),
+        gateway_url="http://primary.test/api/script-gateway",
     )
     runtime = ScriptRuntimeLifecycle(
         runtime_paths=runtime_paths,
@@ -1766,7 +2366,7 @@ async def test_generation_replacement_aborts_when_broker_ownership_cannot_close(
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     monkeypatch.setattr(
         "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
@@ -1797,7 +2397,7 @@ async def test_generation_replacement_aborts_when_broker_ownership_cannot_close(
     assert resolver.settlement_attempts == [run.run_id, run.run_id]
     assert runtime._current_worker_lease is lease
     assert lease.released is False
-    assert runtime._worker_replacement_pending is False
+    assert runtime._worker_replacement_phase == "idle"
 
 
 @pytest.mark.asyncio
@@ -1894,7 +2494,7 @@ async def test_transient_broker_failure_uses_successful_retry_for_worker_replace
     assert durable.output == "terminated output"
     assert worker_client.cancel_forces == [False, True]
     assert resolver.settlement_attempts == 2
-    assert lease.released is True
+    assert lease.released is False
 
 
 @pytest.mark.asyncio
@@ -1921,7 +2521,7 @@ async def test_generation_replacement_aborts_when_process_reconciliation_fails(
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     monkeypatch.setattr(
         "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
@@ -1947,7 +2547,7 @@ async def test_generation_replacement_aborts_when_process_reconciliation_fails(
     assert resolver.settled_runs == [run.run_id]
     assert runtime._current_worker_lease is lease
     assert lease.released is False
-    assert runtime._worker_replacement_pending is False
+    assert runtime._worker_replacement_phase == "idle"
 
 
 @pytest.mark.asyncio
@@ -1983,7 +2583,7 @@ async def test_generation_replacement_aborts_when_reconciliation_leaves_a_worker
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     monkeypatch.setattr(
         "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
@@ -2009,7 +2609,7 @@ async def test_generation_replacement_aborts_when_reconciliation_leaves_a_worker
     assert resolver.settled_runs == [run.run_id]
     assert runtime._current_worker_lease is lease
     assert lease.released is False
-    assert runtime._worker_replacement_pending is False
+    assert runtime._worker_replacement_phase == "idle"
 
 
 @pytest.mark.asyncio
@@ -2023,7 +2623,7 @@ async def test_generation_replacement_drains_an_admitted_launch_before_snapshott
     old_config = _config()
     new_config = Config(
         agents={"watcher": {"display_name": "Watcher", "role": "updated", "tools": ["script", "calculator"]}},
-        defaults={"tools": []},
+        defaults={"tools": [], "worker_scope": "user_agent"},
     )
     committed_config = old_config
     backend = _LaunchingBackend(runtime_paths)
@@ -2089,13 +2689,14 @@ async def test_generation_replacement_drains_an_admitted_launch_before_snapshott
     assert durable.cancel_requested_at is not None
     assert durable.state is ScriptRunState.INTERRUPTED
     assert settlement_resolver.settled_runs == [run.run_id]
-    assert runtime._worker_replacement_pending is True
+    assert runtime._worker_replacement_phase == "preparing"
 
     backend_available = False
     await runtime.complete_worker_replacement()
-    assert runtime._worker_replacement_pending is False
+    assert runtime._worker_replacement_phase == "committed"
+    assert runtime._current_worker_lease is lease
 
-    with pytest.raises(ScriptRunManagerError, match="worker backend is unavailable"):
+    with pytest.raises(ScriptRunManagerError, match="runtime reconciliation is in progress"):
         await manager.run(context, source="print('unavailable')\n")
     assert [stored.run_id for stored in store.list_runs()] == [run.run_id]
 
@@ -2215,7 +2816,7 @@ async def test_cancelled_completion_reopens_admission_before_a_blocked_lease_rel
         worker_lease_provider=lambda _locator: None,
     )
     runtime._current_worker_lease = lease
-    runtime._worker_replacement_pending = True
+    runtime._worker_replacement_phase = "preparing"
 
     completion = asyncio.create_task(runtime.complete_worker_replacement())
     try:
@@ -2224,7 +2825,7 @@ async def test_cancelled_completion_reopens_admission_before_a_blocked_lease_rel
         with pytest.raises(asyncio.CancelledError):
             await completion
 
-        assert runtime._worker_replacement_pending is False
+        assert runtime._worker_replacement_phase == "idle"
         assert manager.worker_backend is None
         assert runtime._current_worker_lease is None
         with pytest.raises(ScriptRunManagerError, match="worker backend is unavailable"):
@@ -2252,6 +2853,68 @@ async def test_cancelled_completion_reopens_admission_before_a_blocked_lease_rel
 
     assert await asyncio.to_thread(release_finished.wait, 1)
     assert lease.released is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_completion_finishes_post_publication_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cancellation after fence drain cannot strand admission or the retired lease."""
+    runtime_paths = _runtime_paths(tmp_path)
+    old_lease = _Lease(_Backend([]))
+    new_lease = _Lease(_Backend([]))
+    broker = MagicMock()
+    manager = ScriptRunManager(
+        store=ScriptRunStore(runtime_paths),
+        broker=broker,
+        worker_client=MagicMock(),
+        worker_backend=old_lease.manager,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    await manager.begin_startup_reconciliation()
+    fence_ended = asyncio.Event()
+    finish_end_call = asyncio.Event()
+    original_end = ScriptRunManager.end_startup_reconciliation
+
+    async def observed_end(target: ScriptRunManager) -> None:
+        await original_end(target)
+        fence_ended.set()
+        await finish_end_call.wait()
+
+    monkeypatch.setattr(ScriptRunManager, "end_startup_reconciliation", observed_end)
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, _config: "configured",
+    )
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=manager.store,
+        broker=broker,
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=_config,
+        worker_lease_provider=lambda _locator: new_lease,
+    )
+    runtime.bind_api("http://primary.test/api/script-gateway")
+    runtime._current_worker_lease = old_lease
+    runtime._reload_launch_fence_started = True
+    runtime._worker_replacement_phase = "preparing"
+
+    completion = asyncio.create_task(runtime.complete_worker_replacement())
+    await asyncio.wait_for(fence_ended.wait(), timeout=1)
+    completion.cancel()
+    finish_end_call.set()
+    with pytest.raises(asyncio.CancelledError):
+        await completion
+
+    assert runtime._current_worker_lease is new_lease
+    assert runtime._worker_replacement_phase == "idle"
+    assert runtime._reload_launch_fence_started is False
+    assert manager._startup_reconciliation_owners == 0
+    broker.open_call_admission.assert_called_once_with()
+    assert await asyncio.to_thread(old_lease.release_event.wait, 1)
+    assert old_lease.released is True
 
 
 @pytest.mark.asyncio
@@ -2343,6 +3006,396 @@ async def test_worker_replacement_completion_uses_the_config_visible_at_completi
     await runtime.complete_worker_replacement()
     assert acquired_for == [old_config, old_config, new_config]
     assert runtime._current_worker_lease is new_lease
+
+
+@pytest.mark.asyncio
+async def test_replacement_handoff_serializes_a_second_config_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One counted fence covers each generation while an older committed handoff is blocked."""
+    runtime_paths = _runtime_paths(tmp_path)
+    old_config = _config()
+    first_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "role": "first", "tools": ["script", "calculator"]}},
+        defaults={"tools": []},
+    )
+    second_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "role": "second", "tools": ["script", "calculator"]}},
+        defaults={"tools": []},
+    )
+    committed_config = old_config
+    old_lease = _Lease(_Backend([]))
+    first_lease = _Lease(_Backend([]))
+    second_lease = _Lease(_Backend([]))
+    first_acquire_started = threading.Event()
+    allow_first_acquire = threading.Event()
+    provider_calls = 0
+
+    def provider(_locator: str | None) -> _Lease:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            return old_lease
+        if provider_calls == 2:
+            first_acquire_started.set()
+            assert allow_first_acquire.wait(timeout=5)
+            return first_lease
+        return second_lease
+
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, config: None if config is None else config.agents["watcher"].role,
+    )
+    broker = _broker_lifecycle_stub()
+    manager = ScriptRunManager(
+        store=ScriptRunStore(runtime_paths),
+        broker=broker,  # type: ignore[arg-type]
+        worker_client=MagicMock(),
+        worker_backend=None,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=manager.store,
+        broker=broker,  # type: ignore[arg-type]
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=lambda: committed_config,
+        worker_lease_provider=provider,
+    )
+    runtime.bind_api("http://primary.test/api/script-gateway")
+    await _reconcile_once(runtime)
+    await runtime.apply_update_plan(_plan(old_config, first_config))
+    committed_config = first_config
+
+    first_completion = asyncio.create_task(runtime.complete_worker_replacement())
+    assert await asyncio.to_thread(first_acquire_started.wait, 1)
+    second_preparation = asyncio.create_task(runtime.apply_update_plan(_plan(first_config, second_config)))
+    await asyncio.sleep(0)
+    assert second_preparation.done() is False
+    assert manager._startup_reconciliation_owners == 1
+    assert runtime._worker_replacement_phase == "committed"
+
+    allow_first_acquire.set()
+    await first_completion
+    await second_preparation
+    assert runtime._worker_replacement_phase == "preparing"
+    assert runtime._worker_config_epoch == 1
+    assert manager._startup_reconciliation_owners == 1
+    assert runtime._current_worker_lease is first_lease
+
+    committed_config = second_config
+    await runtime.complete_worker_replacement()
+    assert runtime._worker_replacement_phase == "idle"
+    assert runtime._worker_config_epoch == 2
+    assert manager._startup_reconciliation_owners == 0
+    assert runtime._current_worker_lease is second_lease
+    assert provider_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_maintenance_retries_the_same_timed_out_replacement_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slow committed acquisition keeps its epoch and is adopted by maintenance."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _config()
+    old_lease = _Lease(_Backend([]))
+    replacement_lease = _Lease(_Backend([]))
+    acquire_started = threading.Event()
+    allow_acquire = threading.Event()
+    provider_calls = 0
+
+    def provider(_locator: str | None) -> _Lease:
+        nonlocal provider_calls
+        provider_calls += 1
+        acquire_started.set()
+        assert allow_acquire.wait(timeout=5)
+        return replacement_lease
+
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, _config: "configured",
+    )
+    manager = ScriptRunManager(
+        store=ScriptRunStore(runtime_paths),
+        broker=MagicMock(),
+        worker_client=MagicMock(),
+        worker_backend=old_lease.manager,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=manager.store,
+        broker=MagicMock(),
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=lambda: config,
+        worker_lease_provider=provider,
+        pass_timeout_seconds=0.05,
+    )
+    runtime._current_worker_lease = old_lease
+    runtime._worker_replacement_phase = "preparing"
+
+    await runtime.complete_worker_replacement()
+    assert acquire_started.is_set()
+    assert runtime._worker_replacement_phase == "committed"
+    assert runtime._worker_config_epoch == 1
+    assert runtime._current_worker_lease is old_lease
+
+    allow_acquire.set()
+    pending = runtime._pending_worker_lease
+    assert pending is not None
+    await asyncio.wait_for(asyncio.shield(pending.task), timeout=1)
+    await _reconcile_once(runtime)
+    assert runtime._worker_replacement_phase == "idle"
+    assert runtime._worker_config_epoch == 1
+    assert runtime._current_worker_lease is replacement_lease
+    assert provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_nested_preparation_restores_committed_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed newer plan leaves the older committed handoff retryable under its one fence."""
+    runtime_paths = _runtime_paths(tmp_path)
+    store = ScriptRunStore(runtime_paths)
+    manager = ScriptRunManager(
+        store=store,
+        broker=MagicMock(),
+        worker_client=MagicMock(),
+        worker_backend=None,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    await manager.begin_startup_reconciliation()
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=store,
+        broker=MagicMock(),
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=_config,
+        worker_lease_provider=lambda _locator: None,
+    )
+    runtime._reload_launch_fence_started = True
+    runtime._worker_replacement_phase = "committed"
+    old_config = _config()
+    new_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "role": "new", "tools": ["script", "calculator"]}},
+        defaults={"tools": [], "worker_scope": "user_agent"},
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, config: "new" if config is new_config else "old",
+    )
+    monkeypatch.setattr(store, "list_runs", MagicMock(side_effect=ScriptRunStoreError("store unavailable")))
+
+    with pytest.raises(ScriptRunStoreError, match="store unavailable"):
+        await runtime.apply_update_plan(_plan(old_config, new_config))
+
+    assert runtime._worker_replacement_phase == "committed"
+    assert runtime._reload_launch_fence_started is True
+    assert manager._startup_reconciliation_owners == 1
+
+
+@pytest.mark.asyncio
+async def test_maintenance_cannot_commit_a_new_preparation_queued_ahead_of_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stale maintenance retry cannot publish a later reload before its caller commits config."""
+    runtime_paths = _runtime_paths(tmp_path)
+    old_config = _config()
+    new_config = Config(
+        agents={"watcher": {"display_name": "Watcher", "role": "new", "tools": ["script", "calculator"]}},
+        defaults={"tools": []},
+    )
+    committed_config = old_config
+    old_lease = _Lease(_Backend([]))
+    replacement_lease = _Lease(_Backend([]))
+    provider_configs: list[Config] = []
+    apply_pass_started = asyncio.Event()
+    finish_apply_pass = asyncio.Event()
+
+    def provider(_locator: str | None) -> _Lease:
+        provider_configs.append(committed_config)
+        return replacement_lease
+
+    async def blocked_apply_pass(_runtime: ScriptRuntimeLifecycle, **_kwargs: object) -> None:
+        apply_pass_started.set()
+        await finish_apply_pass.wait()
+
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, config: "new" if config is new_config else "old",
+    )
+    manager = ScriptRunManager(
+        store=ScriptRunStore(runtime_paths),
+        broker=MagicMock(),
+        worker_client=MagicMock(),
+        worker_backend=old_lease.manager,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    await manager.begin_startup_reconciliation()
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=manager.store,
+        broker=MagicMock(),
+        manager=manager,
+        resolver=SimpleNamespace(
+            resolve=MagicMock(),
+            is_authorized=MagicMock(return_value=True),
+            prune_approvals=AsyncMock(return_value=True),
+        ),
+        config_provider=lambda: committed_config,
+        worker_lease_provider=provider,
+    )
+    runtime._current_worker_lease = old_lease
+    runtime._reload_launch_fence_started = True
+    runtime._worker_replacement_phase = "committed"
+    monkeypatch.setattr(ScriptRuntimeLifecycle, "_apply_update_pass", blocked_apply_pass)
+
+    await runtime._worker_refresh_lock.acquire()
+    apply_task = asyncio.create_task(runtime.apply_update_plan(_plan(old_config, new_config)))
+    await asyncio.sleep(0)
+    maintenance_task = asyncio.create_task(runtime._reconcile_pass())
+    await asyncio.sleep(0)
+    runtime._worker_refresh_lock.release()
+    try:
+        await asyncio.wait_for(apply_pass_started.wait(), timeout=1)
+        await asyncio.wait_for(maintenance_task, timeout=1)
+
+        assert provider_configs == []
+        assert runtime._worker_replacement_phase == "preparing"
+        assert runtime._current_worker_lease is old_lease
+        assert manager._startup_reconciliation_owners == 1
+
+        finish_apply_pass.set()
+        await apply_task
+        committed_config = new_config
+        await runtime.complete_worker_replacement()
+        assert provider_configs == [new_config]
+        assert runtime._current_worker_lease is replacement_lease
+    finally:
+        finish_apply_pass.set()
+        await asyncio.gather(apply_task, maintenance_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_plugin_preparation_suspends_an_older_committed_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Maintenance cannot end a shared fence while a plugin-only update is preparing."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _config()
+    old_lease = _Lease(_Backend([]))
+    replacement_lease = _Lease(_Backend([]))
+    provider_calls = 0
+    apply_pass_started = asyncio.Event()
+    finish_apply_pass = asyncio.Event()
+
+    def provider(_locator: str | None) -> _Lease:
+        nonlocal provider_calls
+        provider_calls += 1
+        return replacement_lease
+
+    async def blocked_apply_pass(_runtime: ScriptRuntimeLifecycle, **_kwargs: object) -> None:
+        apply_pass_started.set()
+        await finish_apply_pass.wait()
+
+    monkeypatch.setattr(
+        "mindroom.orchestration.script_runtime.configured_primary_worker_manager_identity",
+        lambda _paths, _config: "configured",
+    )
+    monkeypatch.setattr(ScriptRuntimeLifecycle, "_apply_update_pass", blocked_apply_pass)
+    manager = ScriptRunManager(
+        store=ScriptRunStore(runtime_paths),
+        broker=MagicMock(),
+        worker_client=MagicMock(),
+        worker_backend=old_lease.manager,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    await manager.begin_startup_reconciliation()
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=manager.store,
+        broker=MagicMock(),
+        manager=manager,
+        resolver=SimpleNamespace(
+            resolve=MagicMock(),
+            is_authorized=MagicMock(return_value=True),
+            prune_approvals=AsyncMock(return_value=True),
+        ),
+        config_provider=lambda: config,
+        worker_lease_provider=provider,
+    )
+    runtime._current_worker_lease = old_lease
+    runtime._reload_launch_fence_started = True
+    runtime._worker_replacement_phase = "committed"
+    runtime._worker_config_epoch = 4
+
+    apply_task = asyncio.create_task(runtime.apply_update_plan(_plan(config, config), plugins_changed=True))
+    await asyncio.wait_for(apply_pass_started.wait(), timeout=1)
+    try:
+        await runtime._reconcile_pass()
+
+        assert provider_calls == 0
+        assert runtime._worker_replacement_phase == "preparing_retry"
+        assert runtime._worker_config_epoch == 4
+        assert runtime._current_worker_lease is old_lease
+        assert manager._startup_reconciliation_owners == 1
+        with pytest.raises(ScriptRunManagerError, match="runtime reconciliation is in progress"):
+            await manager._admit_launch()
+
+        finish_apply_pass.set()
+        await apply_task
+        await runtime.complete_worker_replacement()
+        assert provider_calls == 1
+        assert runtime._worker_replacement_phase == "idle"
+        assert runtime._worker_config_epoch == 4
+        assert runtime._current_worker_lease is replacement_lease
+        assert manager._startup_reconciliation_owners == 0
+        await manager._admit_launch()
+        await manager._release_launch_admission()
+    finally:
+        finish_apply_pass.set()
+        await asyncio.gather(apply_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stale_maintenance_retry_cannot_release_an_idle_generation_fence(tmp_path: Path) -> None:
+    """Only an explicit completion may release a fence without a committed replacement."""
+    manager = ScriptRunManager(
+        store=ScriptRunStore(_runtime_paths(tmp_path)),
+        broker=MagicMock(),
+        worker_client=MagicMock(),
+        worker_backend=None,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    await manager.begin_startup_reconciliation()
+    broker = MagicMock()
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=_runtime_paths(tmp_path),
+        store=manager.store,
+        broker=broker,
+        manager=manager,
+        resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
+        config_provider=_config,
+        worker_lease_provider=lambda _locator: None,
+    )
+    runtime.bind_api("http://primary.test/api/script-gateway")
+    runtime._reload_launch_fence_started = True
+
+    await runtime._retry_committed_worker_replacement()
+
+    assert runtime._reload_launch_fence_started is True
+    assert manager._startup_reconciliation_owners == 1
+    broker.open_call_admission.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2577,21 +3630,22 @@ async def test_cancelled_late_backend_build_cannot_publish_after_final_shutdown(
     """Final shutdown fences a provider thread even after its asyncio owner is cancelled."""
     workers_runtime_module._reset_primary_worker_manager()
     runtime_paths = _runtime_paths(tmp_path)
-    build_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    build_started = asyncio.Event()
     release_build = threading.Event()
-    manager_shutdown = threading.Event()
+    manager_shutdown = asyncio.Event()
 
     class _LateManager:
         shutdown_calls = 0
 
         def shutdown(self) -> None:
             self.shutdown_calls += 1
-            manager_shutdown.set()
+            loop.call_soon_threadsafe(manager_shutdown.set)
 
     late_manager = _LateManager()
 
     def build_manager(*_args: object, **_kwargs: object) -> WorkerBackend:
-        build_started.set()
+        loop.call_soon_threadsafe(build_started.set)
         assert release_build.wait(timeout=5)
         return cast("WorkerBackend", late_manager)
 
@@ -2625,24 +3679,24 @@ async def test_cancelled_late_backend_build_cannot_publish_after_final_shutdown(
             proxy_token=None,
             storage_root=runtime_paths.storage_root,
         ),
-        pass_timeout_seconds=0.01,
     )
-    runtime.bind_api("http://primary.test/api/script-gateway")
+    acquisition = None
 
     try:
         await runtime.start()
-        assert await asyncio.to_thread(build_started.wait, 1)
-        acquisition_task = runtime._pending_worker_lease_task
-        assert acquisition_task is not None
+        runtime.bind_api("http://primary.test/api/script-gateway")
+        await build_started.wait()
+        acquisition = runtime._pending_worker_lease
+        assert acquisition is not None
         await runtime.shutdown(timeout_seconds=0.01)
-        acquisition_task.cancel()
+        acquisition.task.cancel()
         with suppress(asyncio.CancelledError):
-            await acquisition_task
+            await acquisition.task
 
         workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
         release_build.set()
 
-        assert await asyncio.to_thread(manager_shutdown.wait, 1)
+        await manager_shutdown.wait()
         assert workers_runtime_module._PRIMARY_WORKER_MANAGER_ENTRY is None
         assert workers_runtime_module._RETIRED_PRIMARY_WORKER_MANAGER_ENTRIES == []
         assert late_manager.shutdown_calls == 1
@@ -2650,13 +3704,14 @@ async def test_cancelled_late_backend_build_cannot_publish_after_final_shutdown(
         workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
         assert late_manager.shutdown_calls == 1
     finally:
+        pending_acquisition = acquisition or runtime._pending_worker_lease
+        await runtime.shutdown(timeout_seconds=0.01)
+        workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
         release_build.set()
-        with workers_runtime_module._PRIMARY_WORKER_MANAGER_CONDITION:
-            active_entry = workers_runtime_module._PRIMARY_WORKER_MANAGER_ENTRY
-            if active_entry is not None:
-                active_entry.active_leases = 0
-            for retired_entry in workers_runtime_module._RETIRED_PRIMARY_WORKER_MANAGER_ENTRIES:
-                retired_entry.active_leases = 0
+        if pending_acquisition is not None:
+            await asyncio.gather(pending_acquisition.task, return_exceptions=True)
+        if build_started.is_set():
+            await manager_shutdown.wait()
         workers_runtime_module._reset_primary_worker_manager()
 
 
@@ -2668,16 +3723,17 @@ async def test_cancelled_published_worker_lease_handoff_releases_after_final_shu
     """Cancellation after publication cannot strand the executor-owned lease delivery."""
     workers_runtime_module._reset_primary_worker_manager()
     runtime_paths = _runtime_paths(tmp_path)
-    lease_published = threading.Event()
+    loop = asyncio.get_running_loop()
+    lease_published = asyncio.Event()
     release_provider = threading.Event()
-    manager_shutdown = threading.Event()
+    manager_shutdown = asyncio.Event()
 
     class _PublishedManager:
         shutdown_calls = 0
 
         def shutdown(self) -> None:
             self.shutdown_calls += 1
-            manager_shutdown.set()
+            loop.call_soon_threadsafe(manager_shutdown.set)
 
     published_manager = _PublishedManager()
 
@@ -2699,7 +3755,7 @@ async def test_cancelled_published_worker_lease_handoff_releases_after_final_shu
             proxy_token=None,
             storage_root=runtime_paths.storage_root,
         )
-        lease_published.set()
+        loop.call_soon_threadsafe(lease_published.set)
         assert release_provider.wait(timeout=5)
         return lease
 
@@ -2722,15 +3778,15 @@ async def test_cancelled_published_worker_lease_handoff_releases_after_final_shu
         ),
         config_provider=_config,
         worker_lease_provider=lease_provider,
-        pass_timeout_seconds=0.01,
     )
-    runtime.bind_api("http://primary.test/api/script-gateway")
+    acquisition = None
 
     try:
         await runtime.start()
-        assert await asyncio.to_thread(lease_published.wait, 1)
-        acquisition_task = runtime._pending_worker_lease_task
-        assert acquisition_task is not None
+        runtime.bind_api("http://primary.test/api/script-gateway")
+        await lease_published.wait()
+        acquisition = runtime._pending_worker_lease
+        assert acquisition is not None
 
         workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
         with workers_runtime_module._PRIMARY_WORKER_MANAGER_CONDITION:
@@ -2739,25 +3795,26 @@ async def test_cancelled_published_worker_lease_handoff_releases_after_final_shu
             assert workers_runtime_module._RETIRED_PRIMARY_WORKER_MANAGER_ENTRIES[0].active_leases == 1
 
         await runtime.shutdown(timeout_seconds=0.01)
-        acquisition_task.cancel()
+        acquisition.task.cancel()
         with suppress(asyncio.CancelledError):
-            await acquisition_task
+            await acquisition.task
         release_provider.set()
 
-        assert await asyncio.to_thread(manager_shutdown.wait, 1)
+        await manager_shutdown.wait()
         assert workers_runtime_module._RETIRED_PRIMARY_WORKER_MANAGER_ENTRIES == []
         assert published_manager.shutdown_calls == 1
 
         workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
         assert published_manager.shutdown_calls == 1
     finally:
+        pending_acquisition = acquisition or runtime._pending_worker_lease
+        await runtime.shutdown(timeout_seconds=0.01)
+        workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
         release_provider.set()
-        with workers_runtime_module._PRIMARY_WORKER_MANAGER_CONDITION:
-            active_entry = workers_runtime_module._PRIMARY_WORKER_MANAGER_ENTRY
-            if active_entry is not None:
-                active_entry.active_leases = 0
-            for retired_entry in workers_runtime_module._RETIRED_PRIMARY_WORKER_MANAGER_ENTRIES:
-                retired_entry.active_leases = 0
+        if pending_acquisition is not None:
+            await asyncio.gather(pending_acquisition.task, return_exceptions=True)
+        if lease_published.is_set():
+            await manager_shutdown.wait()
         workers_runtime_module._reset_primary_worker_manager()
 
 
@@ -3272,24 +4329,33 @@ async def test_blocking_retired_lease_release_cannot_stall_reconciliation(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_reload_timeout_aborts_after_durably_revoking_all_removed_owner_runs(tmp_path: Path) -> None:
-    """A stuck process confirmation aborts the reload after durable revocation has completed."""
+async def test_cancelled_reload_preserves_completed_durable_and_broker_revocation(tmp_path: Path) -> None:
+    """Cancellation at stuck process reconciliation preserves prior revocation and clears the launch fence."""
     runtime_paths = _runtime_paths(tmp_path)
     store = ScriptRunStore(runtime_paths)
     first = _stored_run(store, runtime_paths)
     second = _stored_run(store, runtime_paths, run_id="run-2")
     never = asyncio.Event()
+    broker_revoked = asyncio.Event()
+    process_reconciliation_started = asyncio.Event()
     broker_revocations: list[str] = []
+    end_startup_reconciliation = AsyncMock()
 
     def request_revocation(run_id: str, *, reason: str) -> ScriptRunRecord:
         return store.request_cancel(run_id, reason=reason)
 
     async def revoke(run_id: str, *, reason: str) -> ScriptRunRecord:
+        assert store.get_run(first.run_id).cancel_requested_at is not None
+        assert store.get_run(second.run_id).cancel_requested_at is not None
+        revoked = store.request_cancel(run_id, reason=reason)
         broker_revocations.append(run_id)
-        return store.request_cancel(run_id, reason=reason)
+        if set(broker_revocations) == {first.run_id, second.run_id}:
+            broker_revoked.set()
+        return revoked
 
     async def reconcile_revoked_process(*, run_id: str) -> ScriptRunRecord:
         if run_id == first.run_id:
+            process_reconciliation_started.set()
             await never.wait()
         return store.get_run(run_id)
 
@@ -3304,7 +4370,7 @@ async def test_reload_timeout_aborts_after_durably_revoking_all_removed_owner_ru
         broker=MagicMock(),
         manager=SimpleNamespace(
             begin_startup_reconciliation=AsyncMock(),
-            end_startup_reconciliation=AsyncMock(),
+            end_startup_reconciliation=end_startup_reconciliation,
             request_revocation=request_revocation,
             revoke=revoke,
             reconcile_revoked_process=reconcile_revoked_process,
@@ -3313,15 +4379,25 @@ async def test_reload_timeout_aborts_after_durably_revoking_all_removed_owner_ru
         resolver=SimpleNamespace(resolve=MagicMock(), is_authorized=MagicMock(return_value=True)),
         config_provider=lambda: current,
         worker_lease_provider=lambda _locator: None,
-        pass_timeout_seconds=0.2,
     )
 
-    with pytest.raises(RuntimeError, match="Background script reload did not durably revoke every active run"):
-        await runtime.apply_update_plan(_plan(current, Config(defaults={"tools": []})))
+    reload_task = asyncio.create_task(runtime.apply_update_plan(_plan(current, Config(defaults={"tools": []}))))
+    try:
+        await broker_revoked.wait()
+        await process_reconciliation_started.wait()
+        assert runtime._reload_launch_fence_started is True
+        reload_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reload_task
 
-    assert store.get_run(first.run_id).cancel_requested_at is not None
-    assert store.get_run(second.run_id).cancel_requested_at is not None
-    assert set(broker_revocations) == {first.run_id, second.run_id}
+        assert store.get_run(first.run_id).cancel_requested_at is not None
+        assert store.get_run(second.run_id).cancel_requested_at is not None
+        assert set(broker_revocations) == {first.run_id, second.run_id}
+        assert runtime._reload_launch_fence_started is False
+        end_startup_reconciliation.assert_awaited_once()
+    finally:
+        reload_task.cancel()
+        await asyncio.gather(reload_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -3651,3 +4727,69 @@ async def test_live_resolver_rebuilds_exact_context_and_worker_authority(
     assert built_target.resolved_thread_id == run.thread_root_event_id
     approvals.request_background_approval.assert_awaited_once()
     await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reload_drain_restores_broker_and_launch_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation after fence acquisition cannot strand either admission gate."""
+    runtime_paths = _runtime_paths(tmp_path)
+    store = ScriptRunStore(runtime_paths)
+    resolver = _StartupAdmissionResolver()
+    broker = ScriptToolBroker(store=store, runtime_resolver=resolver)
+    broker.open_call_admission()
+    manager = ScriptRunManager(
+        store=store,
+        broker=broker,
+        worker_client=MagicMock(),
+        worker_backend=None,
+        gateway_url="http://primary.test/api/script-gateway",
+    )
+    runtime = ScriptRuntimeLifecycle(
+        runtime_paths=runtime_paths,
+        store=store,
+        broker=broker,
+        manager=manager,
+        resolver=resolver,
+        config_provider=_config,
+        worker_lease_provider=lambda _locator: None,
+    )
+    admitted_launch_released = False
+    reload_task: asyncio.Task[None] | None = None
+    await manager._admit_launch()
+
+    drain_started = asyncio.Event()
+    wait_for_drain = manager._launches_drained.wait
+
+    async def observe_drain() -> bool:
+        drain_started.set()
+        return await wait_for_drain()
+
+    monkeypatch.setattr(manager._launches_drained, "wait", observe_drain)
+
+    try:
+        reload_task = asyncio.create_task(
+            runtime.apply_update_plan(_plan(_config(), _config()), plugins_changed=True),
+        )
+        await asyncio.wait_for(drain_started.wait(), timeout=1)
+        reload_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reload_task
+
+        await manager._release_launch_admission()
+        admitted_launch_released = True
+
+        assert manager._startup_reconciliation_owners == 0
+        assert broker._call_admission_open.is_set()
+        await manager._admit_launch()
+        await manager._release_launch_admission()
+    finally:
+        if reload_task is not None and not reload_task.done():
+            reload_task.cancel()
+            await asyncio.gather(reload_task, return_exceptions=True)
+        if not admitted_launch_released:
+            await manager._release_launch_admission()
+        while manager._startup_reconciliation_owners:
+            await manager.end_startup_reconciliation()

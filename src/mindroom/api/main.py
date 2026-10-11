@@ -6,7 +6,6 @@ import threading
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal
-from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +14,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mindroom import constants, file_watcher
 from mindroom.agent_policy import build_agent_policy_seeds, resolve_agent_policy_index
+from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.api import config_lifecycle
-from mindroom.api.auth import ApiAuthState, verify_user  # noqa: F401
+from mindroom.api.agent_cli import router as agent_cli_router
+from mindroom.api.auth import ApiAuthState, public_origin, verify_user  # noqa: F401
 from mindroom.api.auth import router as auth_router
+from mindroom.api.computers import active_computer_worker_keys, rebind_computer_runtime
+from mindroom.api.computers import router as computers_router
 from mindroom.api.config_lifecycle import ApiSnapshot, ApiState, ConfigLoadResult  # noqa: F401
+from mindroom.api.config_reload import router as config_reload_router
+from mindroom.api.config_schema import router as config_schema_router
 from mindroom.api.connections import router as connections_router
 
 # Import routers
@@ -33,25 +38,35 @@ from mindroom.api.matrix_operations import router as matrix_router
 from mindroom.api.mcp_gateway import gateway_cors_origins, gateway_lifespan, install_gateway_routes
 from mindroom.api.oauth import router as oauth_router
 from mindroom.api.openai_compat import router as openai_compat_router
+from mindroom.api.provider_setup import router as provider_setup_router
 from mindroom.api.report_publishing import public_router as report_publishing_public_router
+from mindroom.api.request_body_limit import RequestBodyLimitMiddleware
+from mindroom.api.response_activity import router as response_activity_router
 from mindroom.api.schedules import router as schedules_router
 from mindroom.api.script_gateway import bind_script_tool_broker
 from mindroom.api.script_gateway import router as script_gateway_router
 from mindroom.api.skills import router as skills_router
 from mindroom.api.thread_exports import router as thread_exports_router
 from mindroom.api.tools import router as tools_router
+from mindroom.api.usage import router as usage_router
+from mindroom.api.usage_export import close_usage_export_runner
 from mindroom.api.workers import router as workers_router
 from mindroom.background_tasks import run_blocking_until_complete
-from mindroom.credentials_sync import sync_env_to_credentials
-from mindroom.embedder_health import get_embedder_failure
-from mindroom.knowledge import KnowledgeRefreshScheduler, reconcile_knowledge_mode_transition_states
+from mindroom.credentials.legacy_tool_credentials import migrate_tool_credential_defaults
+from mindroom.credentials.sync import sync_env_to_credentials
+from mindroom.embeddings.embedder_health import get_embedder_failure
+from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
+from mindroom.knowledge.status import reconcile_knowledge_mode_transition_states
 from mindroom.knowledge.watch import KnowledgeSourceWatcher
+from mindroom.legacy_state_root_records import migrate_state_root_records
 from mindroom.logging_config import get_logger
 from mindroom.matrix.decrypt_failure import e2ee_stats
 from mindroom.matrix.health import get_matrix_sync_health_snapshot
 from mindroom.orchestration.runtime import matrix_ingestion_grace_seconds, matrix_sync_startup_timeout_seconds
-from mindroom.private_storage_migration import migrate_private_storage
+from mindroom.private_storage.legacy_private_storage import migrate_private_storage
 from mindroom.runtime_state import get_runtime_state
+from mindroom.usage.legacy_usage_storage import migrate_usage_storage
+from mindroom.worker_computer.auth import computer_origins
 from mindroom.workers.backend import maintain_workers
 from mindroom.workers.runtime import lease_configured_primary_worker_manager
 
@@ -59,9 +74,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
     from pathlib import Path
 
-    from starlette.types import ASGIApp, Receive, Scope, Send
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.main import Config
     from mindroom.external_triggers.store import TriggerDeliverySnapshot
     from mindroom.response_admission import ResponseAdmissionGate
@@ -111,11 +125,23 @@ class _RuntimeDashboardCorsMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         middleware = self._middleware_for_current_runtime(scope.get("path", ""))
-        await middleware(scope, receive, send)
+        if scope.get("path", "").startswith("/api/computers"):
+
+            async def no_store_send(message: Message) -> None:
+                if message["type"] == "http.response.start":
+                    message["headers"] = [
+                        (key, value) for key, value in message.get("headers", []) if key.lower() != b"cache-control"
+                    ]
+                    message["headers"].append((b"cache-control", b"no-store"))
+                await send(message)
+
+            await middleware(scope, receive, no_store_send)
+        else:
+            await middleware(scope, receive, send)
 
     def _middleware_for_current_runtime(self, path: str) -> CORSMiddleware:
         paths = self._current_runtime_paths()
-        origins = gateway_cors_origins(paths, path)
+        origins = computer_origins(paths) if path.startswith("/api/computers") else gateway_cors_origins(paths, path)
         settings = (
             _DashboardCorsSettings(origins, allow_credentials=False, expose_headers=("WWW-Authenticate",))
             if origins is not None
@@ -207,6 +233,7 @@ def _cleanup_workers_once(
     *,
     runtime_config: Config | None = None,
     touch_live_workers: Callable[[WorkerBackend], None] | None = None,
+    computer_worker_keys: frozenset[str] = frozenset(),
 ) -> int:
     """Run one idle-worker cleanup pass when a backend is configured."""
     worker_lease = lease_configured_primary_worker_manager(
@@ -218,6 +245,8 @@ def _cleanup_workers_once(
     with worker_lease as worker_manager:
         if touch_live_workers is not None:
             touch_live_workers(worker_manager)
+        for worker_key in computer_worker_keys:
+            worker_manager.touch_worker(worker_key)
         maintenance = maintain_workers(worker_manager)
     if maintenance.cleaned:
         logger.info(
@@ -265,6 +294,7 @@ async def _worker_cleanup_loop(
                     runtime_paths,
                     runtime_config=runtime_config,
                     touch_live_workers=config_lifecycle.app_state(api_app).script_worker_keepalive,
+                    computer_worker_keys=active_computer_worker_keys(api_app),
                 )
             except Exception:
                 logger.exception("Background worker cleanup failed")
@@ -294,6 +324,7 @@ def initialize_api_app(api_app: FastAPI, runtime_paths: constants.RuntimePaths) 
         app_state.thread_export_runner = None
         app_state.leave_matrix_room = None
         app_state.external_trigger_runtime = None
+        app_state.agent_reply_memberships = AgentReplyMembershipIndex()
         app_state.script_worker_keepalive = None
         bind_script_tool_broker(api_app, None)
         app_state.api_state = ApiState(
@@ -322,10 +353,15 @@ def initialize_api_app(api_app: FastAPI, runtime_paths: constants.RuntimePaths) 
             current_snapshot.source_fingerprint if current_snapshot.runtime_paths == runtime_paths else None
         )
         source_files = current_snapshot.source_files if current_snapshot.runtime_paths == runtime_paths else None
+        uses_includes = current_snapshot.uses_includes if current_snapshot.runtime_paths == runtime_paths else None
         if current_snapshot.runtime_paths != runtime_paths:
             app_state.thread_export_runner = None
             app_state.leave_matrix_room = None
             app_state.external_trigger_runtime = None
+            app_state.agent_reply_memberships = AgentReplyMembershipIndex()
+            app_state.computer_runtime = None
+            if app_state.computer_sessions is not None:
+                app_state.computer_sessions.close_all()
             app_state.script_worker_keepalive = None
             bind_script_tool_broker(api_app, None)
         previous_state.snapshot = config_lifecycle._published_snapshot(
@@ -337,6 +373,7 @@ def initialize_api_app(api_app: FastAPI, runtime_paths: constants.RuntimePaths) 
             config_load_result=config_load_result,
             source_fingerprint=source_fingerprint,
             source_files=source_files,
+            uses_includes=uses_includes,
         )
     config_lifecycle.register_api_app(api_app)
 
@@ -475,10 +512,13 @@ async def _watch_config(
 
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915
     """Manage application startup and shutdown."""
     runtime_paths = _app_runtime_paths(_app)
     await migrate_private_storage(runtime_paths)
+    await migrate_state_root_records(runtime_paths)
+    await migrate_usage_storage(runtime_paths)
+    await migrate_tool_credential_defaults(runtime_paths)
     await asyncio.to_thread(constants.ensure_writable_config_path, create_minimal=True, runtime_paths=runtime_paths)
     app_state = config_lifecycle.app_state(_app)
     preload_snapshot = _app_context(_app)
@@ -496,6 +536,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             )
         else:
             app_state.external_trigger_runtime = None
+    rebind_computer_runtime(_app, preload_snapshot, loaded=loaded)
     logger.info(
         "Initialized API runtime config",
         config_path=str(runtime_paths.config_path),
@@ -527,6 +568,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     async with gateway_lifespan(_app):
         yield
 
+    if app_state.computer_sessions is not None:
+        app_state.computer_sessions.close_all()
+    app_state.computer_runtime = None
     stop_event.set()
     watch_task.cancel()
     worker_cleanup_task.cancel()
@@ -538,6 +582,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await standalone_knowledge_source_watcher.shutdown()
     if api_owned_knowledge_refresh_scheduler is not None:
         await api_owned_knowledge_refresh_scheduler.shutdown()
+    close_usage_export_runner(_app)
 
 
 def bind_orchestrator_knowledge_refresh_scheduler(
@@ -587,23 +632,14 @@ def _api_docs_kwargs(runtime_paths: constants.RuntimePaths) -> dict[str, str | N
     return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
 
 
-def _origin_from_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    parsed = urlsplit(value.strip())
-    if not parsed.scheme or not parsed.netloc:
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
 def _api_cors_origins(runtime_paths: constants.RuntimePaths) -> list[str]:
     """Return hosted browser origins allowed to make credentialed API calls."""
     return list(
         dict.fromkeys(
             origin
             for origin in (
-                _origin_from_url(runtime_paths.env_value("MINDROOM_PUBLIC_URL")),
-                _origin_from_url(runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL")),
+                public_origin(runtime_paths.env_value("MINDROOM_PUBLIC_URL")),
+                public_origin(runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL")),
             )
             if origin is not None
         ),
@@ -655,6 +691,8 @@ app = FastAPI(
     openapi_url=_api_docs["openapi_url"],
 )
 initialize_api_app(app, _runtime_paths)
+# Added before CORS, so a 413 still carries the dashboard's CORS headers.
+app.add_middleware(RequestBodyLimitMiddleware)
 _add_dashboard_cors_middleware(app, _runtime_paths)
 
 
@@ -721,20 +759,27 @@ app.include_router(auth_router)
 app.include_router(connections_router)
 install_gateway_routes(app)
 app.include_router(credentials_router, dependencies=[Depends(verify_user)])
+app.include_router(provider_setup_router, dependencies=[Depends(verify_user)])
 app.include_router(homeassistant_router, dependencies=[Depends(verify_user)])
 app.include_router(integrations_router, dependencies=[Depends(verify_user)])
 app.include_router(matrix_router, dependencies=[Depends(verify_user)])
 app.include_router(thread_exports_router, dependencies=[Depends(verify_user)])
+app.include_router(response_activity_router)  # Aggregate operational probe, like health/readiness.
+app.include_router(config_reload_router)  # Requires its own operator bearer key.
+app.include_router(config_schema_router, dependencies=[Depends(verify_user)])
 app.include_router(oauth_router)
 app.include_router(schedules_router, dependencies=[Depends(verify_user)])
 app.include_router(knowledge_router, dependencies=[Depends(verify_user)])
 app.include_router(skills_router, dependencies=[Depends(verify_user)])
 app.include_router(tools_router, dependencies=[Depends(verify_user)])
+app.include_router(usage_router)  # Routes require dashboard, signed personal, or dedicated service authentication.
 app.include_router(workers_router, dependencies=[Depends(verify_user)])
 app.include_router(openai_compat_router)  # Uses its own bearer auth, not verify_user
 app.include_router(report_publishing_public_router)
 app.include_router(external_triggers_router)
+app.include_router(computers_router)
 app.include_router(script_gateway_router)
+app.include_router(agent_cli_router)
 app.include_router(dynamic_workflows_router, dependencies=[Depends(verify_user)])
 
 

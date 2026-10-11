@@ -13,6 +13,7 @@ from agno.run.team import TeamRunOutput
 from agno.session.team import TeamSession
 from agno.team import Team as AgnoTeam
 
+from mindroom import reply_lifecycle as rl
 from mindroom.agent_storage import get_team_session
 from mindroom.config.models import ModelConfig
 from mindroom.constants import MATRIX_RESPONSE_EVENT_ID_METADATA_KEY
@@ -37,6 +38,7 @@ from mindroom.response_runner import (
     ResponseRequest,
     ResponseRunner,
 )
+from mindroom.response_sources import ResponseSources
 from mindroom.room_model_overrides import set_room_model_override
 from mindroom.teams import TeamIntent, TeamMemberStatus, TeamMode, TeamOutcome, TeamResolution, TeamResolutionMember
 from mindroom.thread_summary import thread_summary_message_count_hint
@@ -56,6 +58,7 @@ from tests.bot_helpers import (
     make_mock_agent_user,
     make_test_agent_bot,
     make_test_team_bot,
+    unique_room_send_responses,
 )
 from tests.conftest import (
     TEST_PASSWORD,
@@ -69,6 +72,7 @@ from tests.conftest import (
     unwrap_extracted_collaborator,
 )
 from tests.identity_helpers import entity_ids
+from tests.response_attempt_helpers import install_direct_response_admission
 from tests.response_runner_helpers import _PersistenceSeamProbe
 
 if TYPE_CHECKING:
@@ -107,8 +111,8 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
             config=config,
             runtime_paths=runtime_paths,
-            team_mode="coordinate",
         )
+        install_direct_response_admission(bot)
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
         bot.orchestrator = MagicMock(
@@ -118,6 +122,10 @@ class TestAgentBot(AgentBotTestBase):
         )
         runner = unwrap_extracted_collaborator(bot._response_runner)
         request = ResponseRequest(
+            sources=ResponseSources(
+                pending_event_ids=("$source",),
+                logical_source_event_ids=("$source",),
+            ),
             thread_history=[],
             user_id="@user:localhost",
             prompt="team prompt",
@@ -269,6 +277,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             await coordinator.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="team prompt",
@@ -282,6 +294,74 @@ class TestAgentBot(AgentBotTestBase):
         response_kwargs = mock_team_response.await_args.kwargs
         assert response_kwargs["model_name"] == "large"
         assert response_kwargs["member_model_names"] == {"calculator": "large", "general": "large"}
+
+    @pytest.mark.asyncio
+    async def test_scheduled_model_overrides_coordinator_and_members(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+    ) -> None:
+        """A schedule model applies to both coordinator and members despite room defaults."""
+        config = self._config_for_storage(tmp_path)
+        config.defaults.show_stop_button = False
+        config.models["large"] = ModelConfig(provider="test", id="large-model")
+        config.models["cheap"] = ModelConfig(provider="test", id="cheap-model")
+        runtime_paths = runtime_paths_for(config)
+        set_room_model_override(
+            runtime_paths,
+            room_id="!test:localhost",
+            model_name="large",
+            set_by="@admin:localhost",
+        )
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot.client = _make_matrix_client_mock()
+        bot.orchestrator = MagicMock(current_config=config, config=config, runtime_paths=runtime_paths)
+        coordinator = unwrap_extracted_collaborator(bot._response_runner)
+        original_prepare_admitted_turn = coordinator._prepare_admitted_locked_turn
+        matrix_ids = entity_ids(config, runtime_paths)
+        mock_team_response = AsyncMock(return_value="Team reply")
+
+        async def change_room_default_during_preparation(*args: object, **kwargs: object) -> ResponseRequest | None:
+            set_room_model_override(
+                runtime_paths,
+                room_id="!test:localhost",
+                model_name="default",
+                set_by="@admin:localhost",
+            )
+            return await original_prepare_admitted_turn(*args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch.object(coordinator, "_prepare_admitted_locked_turn", new=change_room_default_during_preparation),
+            patch(
+                "mindroom.delivery_gateway.send_message_outcome",
+                new=AsyncMock(side_effect=delivered_matrix_side_effect("$team")),
+            ),
+            patch_response_runner_module(
+                typing_indicator=_noop_typing_indicator,
+                should_use_streaming=AsyncMock(return_value=False),
+                team_response=mock_team_response,
+            ),
+        ):
+            await coordinator.generate_team_response_helper(
+                ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
+                    thread_history=[],
+                    user_id="@user:localhost",
+                    prompt="team prompt",
+                    response_envelope=_hook_envelope(body="team prompt", source_event_id="$team-root"),
+                    correlation_id="corr-team",
+                    scheduled_model="cheap",
+                ),
+                team_agents=[matrix_ids["calculator"], matrix_ids["general"]],
+                team_mode="collaborate",
+            )
+
+        response_kwargs = mock_team_response.await_args.kwargs
+        assert response_kwargs["model_name"] == "cheap"
+        assert response_kwargs["member_model_names"] == {"calculator": "cheap", "general": "cheap"}
 
     @pytest.mark.asyncio
     async def test_team_model_snapshot_is_complete_before_streaming_check_yields(
@@ -328,6 +408,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="team prompt",
@@ -369,6 +453,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [before_hook, after_hook])])
         bot.orchestrator = MagicMock(
@@ -394,6 +479,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="team prompt",
@@ -424,6 +513,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot.orchestrator = MagicMock(
             current_config=config,
@@ -449,6 +539,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="team prompt",
@@ -471,6 +565,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot.orchestrator = MagicMock(
             current_config=config,
@@ -497,6 +592,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="Summarize the latest invoice.",
@@ -529,6 +628,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot.orchestrator = MagicMock(
             current_config=config,
@@ -556,6 +656,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$team-root",),
+                        logical_source_event_ids=("$team-root",),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="What time is it?",
@@ -596,6 +700,7 @@ class TestAgentBot(AgentBotTestBase):
         config.defaults.show_stop_button = False
         runtime_paths = runtime_paths_for(config)
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot.orchestrator = MagicMock(
             current_config=config,
@@ -635,6 +740,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=(envelope.source_event_id,),
+                        logical_source_event_ids=(envelope.source_event_id,),
+                    ),
                     thread_history=[],
                     user_id="@user:localhost",
                     prompt="team prompt",
@@ -670,7 +779,6 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
             config=config,
             runtime_paths=runtime_paths,
-            team_mode="coordinate",
         )
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
@@ -708,10 +816,13 @@ class TestAgentBot(AgentBotTestBase):
         ):
             delivery_resolution = await bot._run_regenerated_response(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Team, summarize this thread",
                     thread_history=[],
                     existing_event_id="$existing",
-                    existing_event_is_placeholder=True,
                     user_id="@alice:localhost",
                     response_envelope=_hook_envelope(body="hello", source_event_id="$event", thread_id="$thread"),
                     correlation_id="corr-nonteam-fallback",
@@ -742,7 +853,6 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
             config=config,
             runtime_paths=runtime_paths,
-            team_mode="coordinate",
         )
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
@@ -803,6 +913,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             result = await bot._run_regenerated_response(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Team, summarize this thread",
                     thread_history=[],
                     user_id="@alice:localhost",
@@ -823,14 +937,8 @@ class TestAgentBot(AgentBotTestBase):
         assert result == "$reject"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("retry_source", "expected_memory_calls"), [(None, 1), ("$event", 0)])
-    async def test_generate_team_response_queues_memory_before_helper_failure(
-        self,
-        tmp_path: Path,
-        retry_source: str | None,
-        expected_memory_calls: int,
-    ) -> None:
-        """Initial edits queue memory, while restart retries reuse that durable input."""
+    async def test_generate_team_response_queues_memory_before_helper_failure(self, tmp_path: Path) -> None:
+        """A team response queues its memory save before the helper runs, so a failing helper keeps it."""
 
         async def fake_store_conversation_memory(*args: object, **kwargs: object) -> None:
             store_calls.append((args, kwargs))
@@ -852,7 +960,7 @@ class TestAgentBot(AgentBotTestBase):
             return task
 
         async def fail_helper(*_args: object, **_kwargs: object) -> str:
-            assert any(name.startswith("memory_save_team_") for name in scheduled_names) is (retry_source is None)
+            assert any(name.startswith("memory_save_team_") for name in scheduled_names)
             msg = "boom"
             raise RuntimeError(msg)
 
@@ -864,7 +972,6 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
             config=config,
             runtime_paths=runtime_paths,
-            team_mode="coordinate",
         )
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
@@ -898,6 +1005,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             await bot._run_regenerated_response(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Team, summarize this thread",
                     thread_history=[],
                     user_id="@alice:localhost",
@@ -909,15 +1020,14 @@ class TestAgentBot(AgentBotTestBase):
                         user_id="@alice:localhost",
                         agent_name=bot.agent_name,
                     ),
-                    sync_restart_retry_source_event_id=retry_source,
                 ),
             )
 
         if scheduled_tasks:
             await asyncio.gather(*scheduled_tasks)
 
-        assert len(store_calls) == expected_memory_calls
-        assert sum(name.startswith("memory_save_team_") for name in scheduled_names) == expected_memory_calls
+        assert len(store_calls) == 1
+        assert sum(name.startswith("memory_save_team_") for name in scheduled_names) == 1
 
     @pytest.mark.asyncio
     async def test_team_generate_response_uses_shared_thread_summary_helper_for_summary_gate(
@@ -960,7 +1070,6 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
             config=config,
             runtime_paths=runtime_paths,
-            team_mode="coordinate",
         )
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
@@ -1006,6 +1115,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             await bot._run_regenerated_response(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Team, summarize this thread",
                     thread_history=thread_history,
                     user_id="@alice:localhost",
@@ -1077,7 +1190,6 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
             config=config,
             runtime_paths=runtime_paths,
-            team_mode="coordinate",
         )
         _wrap_extracted_collaborators(bot)
         bot.client = _make_matrix_client_mock()
@@ -1128,6 +1240,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._run_regenerated_response(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Team, summarize this thread",
                     thread_history=[],
                     user_id="@alice:localhost",
@@ -1212,6 +1328,8 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
+        # The startup placeholder lands, binding the reply's event.
+        unique_room_send_responses(bot.client, prefix="$placeholder")
         bot.orchestrator = MagicMock()
         mock_team_response = AsyncMock()
         with (
@@ -1240,11 +1358,13 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Continue",
                     thread_history=[],
                     user_id="@alice:localhost",
-                    existing_event_id="$placeholder",
-                    existing_event_is_placeholder=True,
                     response_envelope=_hook_envelope(
                         body="Continue",
                         source_event_id="$event",
@@ -1260,7 +1380,10 @@ class TestAgentBot(AgentBotTestBase):
         assert _visible_response_event_id(resolution) == "$placeholder"
         mock_team_response.assert_not_awaited()
         send_kwargs = mock_send_streaming_response.await_args.kwargs
-        assert send_kwargs["existing_event_id"] == "$placeholder"
+        # The stream adopts the placeholder this turn's reply created.
+        reply = await bot._reply_runtime.store.replies.for_sources(("$event",))
+        assert reply is not None
+        assert send_kwargs["existing_event_id"] == reply.event_id is not None
         assert send_kwargs["adopt_existing_placeholder"] is True
 
     @pytest.mark.asyncio
@@ -1287,8 +1410,6 @@ class TestAgentBot(AgentBotTestBase):
         bot.orchestrator = MagicMock()
         bot._redact_message_event = AsyncMock(return_value=True)
         replace_delivery_gateway_deps(bot, redact_message_event=bot._redact_message_event)
-        add_stop_button = AsyncMock(return_value=None)
-        bot.stop_manager.add_stop_button = add_stop_button
         mock_team_response = AsyncMock(return_value="Finding")
         mock_team_response_stream = MagicMock(side_effect=fake_team_response_stream)
 
@@ -1308,6 +1429,10 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(return_value="$response"),
             ) as edit_text,
             patch(
+                "mindroom.delivery_gateway.DeliveryGateway.add_reply_stop_button",
+                new=AsyncMock(),
+            ) as add_stop_button,
+            patch(
                 "mindroom.delivery_gateway.send_streaming_response",
                 new=AsyncMock(
                     return_value=StreamTransportOutcome(
@@ -1321,6 +1446,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Check for updates",
                     thread_history=[],
                     user_id="@alice:localhost",
@@ -1385,6 +1514,10 @@ class TestAgentBot(AgentBotTestBase):
         ):
             await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$ad-hoc-silent-run",),
+                        logical_source_event_ids=("$ad-hoc-silent-run",),
+                    ),
                     prompt="Check for updates",
                     thread_history=[],
                     user_id="@alice:localhost",
@@ -1471,11 +1604,14 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Continue",
                     thread_history=[],
                     user_id="@alice:localhost",
                     existing_event_id="$placeholder",
-                    existing_event_is_placeholder=True,
                     response_envelope=_hook_envelope(
                         body="Continue",
                         source_event_id="$event",
@@ -1496,7 +1632,7 @@ class TestAgentBot(AgentBotTestBase):
         mock_agent_user: AgentMatrixUser,
         tmp_path: Path,
     ) -> None:
-        """Suppressed team placeholder responses should not leak the redacted placeholder id."""
+        """A suppressed team answer leaves no reply event behind and reports none."""
 
         @hook(EVENT_MESSAGE_BEFORE_RESPONSE)
         async def before_hook(ctx: BeforeResponseContext) -> None:
@@ -1519,11 +1655,13 @@ class TestAgentBot(AgentBotTestBase):
         ):
             resolution = await bot._response_runner.generate_team_response_helper(
                 ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$event",),
+                        logical_source_event_ids=("$event",),
+                    ),
                     prompt="Continue",
                     thread_history=[],
                     user_id="@alice:localhost",
-                    existing_event_id="$placeholder",
-                    existing_event_is_placeholder=True,
                     response_envelope=_hook_envelope(
                         body="Continue",
                         source_event_id="$event",
@@ -1536,8 +1674,9 @@ class TestAgentBot(AgentBotTestBase):
             )
 
         assert resolution is None
-        bot._redact_message_event.assert_awaited_once_with(
-            room_id="!test:localhost",
-            event_id="$placeholder",
-            reason="Suppressed placeholder response",
-        )
+        reply = await bot._reply_runtime.store.replies.for_sources(("$event",))
+        assert reply is not None
+        assert reply.state is rl.ReplyState.GONE
+        # Nothing was shown, so nothing is left to redact.
+        assert reply.event_id is None
+        bot._redact_message_event.assert_not_awaited()

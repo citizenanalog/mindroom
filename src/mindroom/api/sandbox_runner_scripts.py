@@ -8,7 +8,7 @@ import re
 import secrets
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -19,16 +19,20 @@ from mindroom.api import sandbox_env_assembly, sandbox_exec, sandbox_worker_prep
 from mindroom.api.sandbox_runner import (
     app_runner_token,
     app_runtime_paths,
+    request_runtime_config,
     resolve_script_state_workspace,
     validate_runner_token,
 )
+from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
 from mindroom.constants import CONTROL_STATE_PATH_ENV
+from mindroom.path_confinement import resolve_path_within_root
+from mindroom.script_runs.compatibility import SCRIPT_PROTOCOL_VERSION
 from mindroom.script_runs.models import (
     script_run_id_from_worker_key,
     script_worker_key_for_run,
     supervisor_handle_for_run,
 )
-from mindroom.shell_supervisor import (
+from mindroom.shell.supervisor import (
     ShellSupervisorStartupError,
     background_script_supervision_supported,
     check_command_via_supervisor,
@@ -40,16 +44,17 @@ from mindroom.shell_supervisor import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
-    from typing import Any
 
     from starlette.responses import Response
     from starlette.types import Message
 
-_MAX_REQUEST_BYTES = 16 * 1024
+    from mindroom.config.main import Config
+
+# Launch requests carry the primary's live config snapshot, which dominates their size.
+_MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _MAX_SOURCE_BYTES = 128 * 1024
 _MAX_TOKEN_BYTES = 4096
 _RUN_ID_PATTERN = r"script-[0-9a-f]{32}"
-_LAUNCH_HANDLE_RE = re.compile(r"^Handle: (shell:[0-9a-f]{32})$", re.MULTILINE)
 
 __all__ = [
     "SandboxScriptCancelResponse",
@@ -95,11 +100,10 @@ async def _bounded_replay_request(request: Request) -> Request:
         if content_length > _MAX_REQUEST_BYTES:
             raise HTTPException(status_code=413, detail="Script worker request is too large.")
 
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(chunk) > _MAX_REQUEST_BYTES - len(body):
-            raise HTTPException(status_code=413, detail="Script worker request is too large.")
-        body.extend(chunk)
+    try:
+        body = await collect_bounded_bytes(request.stream(), max_bytes=_MAX_REQUEST_BYTES)
+    except ByteLimitExceededError as exc:
+        raise HTTPException(status_code=413, detail="Script worker request is too large.") from exc
 
     original_receive = request.receive
     replayed = False
@@ -108,7 +112,7 @@ async def _bounded_replay_request(request: Request) -> Request:
         nonlocal replayed
         if not replayed:
             replayed = True
-            return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": False}
         return await original_receive()
 
     return Request(request.scope, replay_receive)
@@ -138,6 +142,16 @@ def _validate_run_id(value: str) -> str:
 _RunId = Annotated[str, AfterValidator(_validate_run_id)]
 
 
+def _validate_protocol_version(value: int) -> int:
+    if value != SCRIPT_PROTOCOL_VERSION:
+        message = f"Input should be {SCRIPT_PROTOCOL_VERSION}"
+        raise ValueError(message)
+    return value
+
+
+_ProtocolVersion = Annotated[int, Field(strict=True), AfterValidator(_validate_protocol_version)]
+
+
 router = APIRouter(
     prefix="/api/sandbox-runner/scripts",
     tags=["sandbox-runner"],
@@ -151,12 +165,15 @@ class SandboxScriptRunRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    protocol_version: _ProtocolVersion
     run_id: _RunId
     worker_key: str = Field(min_length=1, max_length=1024)
     state_scope_worker_key: str | None = Field(default=None, min_length=1, max_length=1024)
     source_digest: str = Field(min_length=64, max_length=64, pattern=r"[0-9a-f]{64}")
     gateway_url: str = Field(min_length=1, max_length=2048)
+    max_runtime_seconds: int = Field(gt=0, strict=True)
     private_agent_names: list[str] | None = Field(default=None, max_length=128)
+    config_snapshot: dict[str, Any] | None = None
 
 
 class SandboxScriptControlRequest(BaseModel):
@@ -222,6 +239,7 @@ def _normalized_worker_key(request: Request, worker_key: str) -> str:
 
 def _prepare_worker(
     request: Request,
+    config: Config,
     *,
     worker_key: str,
     private_agent_names: list[str] | None,
@@ -233,6 +251,7 @@ def _prepare_worker(
             worker_key=normalized_worker_key,
             tool_init_overrides={},
             runtime_paths=runtime_paths,
+            agent_policies=config.get_agent_policies(),
             private_agent_names=(frozenset(private_agent_names) if private_agent_names is not None else None),
             runner_token=app_runner_token(request.app),
         )
@@ -258,7 +277,14 @@ def _workspace_file(
         metadata = resolved.stat()
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"{label} is unavailable in the worker workspace.") from exc
-    if not resolved.is_relative_to(workspace.resolve()) or not stat.S_ISREG(metadata.st_mode):
+    try:
+        resolved = resolve_path_within_root(workspace, resolved, symlinks="internal", strict=True)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be a regular file inside the worker workspace.",
+        ) from None
+    if not stat.S_ISREG(metadata.st_mode):
         raise HTTPException(status_code=400, detail=f"{label} must be a regular file inside the worker workspace.")
     if metadata.st_size <= 0 or metadata.st_size > byte_limit:
         raise HTTPException(status_code=400, detail=f"{label} exceeds its supported size.")
@@ -285,6 +311,7 @@ def _script_snapshot_paths(workspace: Path, run_id: str) -> tuple[Path, Path]:
 
 def _script_execution_workspace(
     request: Request,
+    config: Config,
     payload: SandboxScriptRunRequest,
     *,
     snapshot_workspace: Path,
@@ -302,6 +329,7 @@ def _script_execution_workspace(
     try:
         return resolve_script_state_workspace(
             request.app,
+            config,
             state_scope_worker_key=state_scope_worker_key,
             agent_name=state_scope_worker_key.rsplit(":", maxsplit=1)[-1],
             private_agent_names=frozenset(payload.private_agent_names or ()),
@@ -339,13 +367,6 @@ def _validate_source_digest(source_path: Path, expected_digest: str) -> None:
     actual_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
     if not secrets.compare_digest(actual_digest, expected_digest):
         raise HTTPException(status_code=400, detail="Script source digest does not match the launch receipt.")
-
-
-def _parse_launch_message(message: str, *, expected_handle: str) -> SandboxScriptRunResponse:
-    match = _LAUNCH_HANDLE_RE.search(message)
-    if match is not None and match.group(1) == expected_handle:
-        return SandboxScriptRunResponse(ok=True)
-    return SandboxScriptRunResponse(ok=False, error=message, failure_kind="worker")
 
 
 def _parse_status_message(message: str) -> SandboxScriptStatusResponse:
@@ -388,15 +409,17 @@ async def run_script_in_worker(request: Request, payload: SandboxScriptRunReques
             error="Background scripts require Linux process-group containment.",
             failure_kind="worker",
         )
+    config = request_runtime_config(request.app, payload.config_snapshot)
     prepared = _prepare_worker(
         request,
+        config,
         worker_key=payload.worker_key,
         private_agent_names=payload.private_agent_names,
     )
     snapshot_workspace = prepared.paths.workspace.resolve()
     source_path, token_path = _script_snapshot_paths(snapshot_workspace, payload.run_id)
     _validate_source_digest(source_path, payload.source_digest)
-    workspace = _script_execution_workspace(request, payload, snapshot_workspace=snapshot_workspace)
+    workspace = _script_execution_workspace(request, config, payload, snapshot_workspace=snapshot_workspace)
     script_environment = _script_environment(
         payload,
         workspace=workspace,
@@ -421,17 +444,21 @@ async def run_script_in_worker(request: Request, payload: SandboxScriptRunReques
         socket_path = await asyncio.to_thread(ensure_shell_supervisor)
     except ShellSupervisorStartupError as exc:
         return SandboxScriptRunResponse(ok=False, error=str(exc), failure_kind="worker")
-    message = await run_command_via_supervisor(
+    supervisor_handle = supervisor_handle_for_run(payload.run_id)
+    result = await run_command_via_supervisor(
         socket_path,
         namespace=_script_namespace(payload.worker_key, payload.run_id),
-        argv=[python_executable, "-m", "mindroom.script_runs.shim", str(source_path), str(token_path)],
+        argv=[python_executable, "-P", "-s", "-m", "mindroom.script_runs.shim", str(source_path), str(token_path)],
         env=environment,
         cwd=str(workspace),
         tail=200,
         timeout=0,
-        handle=supervisor_handle_for_run(payload.run_id),
+        handle=supervisor_handle,
+        max_runtime_seconds=payload.max_runtime_seconds,
     )
-    return _parse_launch_message(message, expected_handle=supervisor_handle_for_run(payload.run_id))
+    if result.handle != supervisor_handle:
+        return SandboxScriptRunResponse(ok=False, error=result.message, failure_kind="worker")
+    return SandboxScriptRunResponse(ok=True)
 
 
 @router.get("/{run_id}", response_model=SandboxScriptStatusResponse)

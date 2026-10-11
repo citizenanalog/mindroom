@@ -1,63 +1,45 @@
 """Atomic SQLite storage for one canonical OAuth credential scope."""
 
+# LEGACY_COMPAT: Retired OAuth JSON credentials and generation/lock sidecars.
+# Legacy format: generic JSON OAuth credentials and adjacent generation/lock sidecars.
+# Last legacy release: v2026.8.79; authoritative SQLite storage introduced in v2026.8.80.
+# Handling: adoption ended after v2026.9.48; obsolete files stay untouched and reconnect is required.
+# Coverage: tests/test_oauth_credential_store.py::test_json_only_credentials_and_sidecars_are_ignored.
+
 from __future__ import annotations
 
 import asyncio
 import os
-import re
 import secrets
 import sqlite3
 import stat
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from cryptography.exceptions import InvalidTag
 
-from mindroom.credential_policy import is_oauth_token_service
-from mindroom.credentials import scoped_credentials_path
+from mindroom.background_tasks import run_blocking_until_complete, run_coroutine_until_complete
+from mindroom.credentials.manager import scoped_credentials_path
 from mindroom.durable_write import fsync_directory_durable
-from mindroom.logging_config import get_logger
+from mindroom.oauth import legacy_credentials
 from mindroom.oauth.providers import OAuthProviderError
-from mindroom.tool_system.worker_routing import resolve_worker_target
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
+    from pathlib import Path
 
-    from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
-    from mindroom.oauth.providers import OAuthProvider
-    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
+    from mindroom.oauth.credential_store_types import OAuthCredentialStoreContext
 
-
-logger = get_logger(__name__)
 
 _SCHEMA_VERSION = 1
 _LOCK_RETRY_SECONDS = 0.05
 _LOCK_WAIT_TIMEOUT_SECONDS = 30.0
-_LEGACY_PUBLICATION_KEY = "_mindroom_oauth_publication"
 _T = TypeVar("_T")
 
 
 class OAuthCredentialUnreadableError(OAuthProviderError):
     """Signal that a stored OAuth credential exists but cannot be decoded."""
-
-
-class _OAuthCredentialStoreContext(Protocol):
-    """Fields the store needs from the lifecycle's canonical scope."""
-
-    @property
-    def runtime_paths(self) -> RuntimePaths: ...
-
-    @property
-    def provider(self) -> OAuthProvider: ...
-
-    @property
-    def credentials_manager(self) -> CredentialsManager: ...
-
-    @property
-    def worker_target(self) -> ResolvedWorkerTarget | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,27 +59,82 @@ class _OAuthStoredCredentialSnapshot:
     connection_generation: str
 
 
-@dataclass(frozen=True, slots=True)
-class _LegacyCredentialPayload:
-    """One legacy credential prepared for atomic SQLite adoption."""
+class _OAuthDatabase:
+    """Serialize drained disk operations for one connection across worker threads."""
 
-    payload: bytes | None
-    present: bool
-    unreadable: bool
+    def __init__(self) -> None:
+        self._connection: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Return the handle while its owning storage context is open."""
+        assert self._connection is not None
+        return self._connection
+
+    async def run(self, operation: Callable[..., _T], *args: object) -> _T:
+        """Complete one operation before another operation or cancellation can proceed."""
+        async with self._lock:
+            return await run_blocking_until_complete(operation, *args)
+
+    def open(self, context: OAuthCredentialStoreContext) -> None:
+        """Record the opened handle before cancellation can reach its owner."""
+        database_path = _oauth_credential_database_path(context)
+        _prepare_database_path(database_path)
+        self._connection = sqlite3.connect(
+            database_path,
+            isolation_level=None,
+            timeout=0,
+            check_same_thread=False,
+        )
+        self.connection.row_factory = sqlite3.Row
+
+    def close(self) -> None:
+        """Roll back and close the handle on a worker, including partial initialization."""
+        if self._connection is not None:
+            try:
+                _rollback_connection(self.connection)
+            finally:
+                self.connection.close()
+                self._connection = None
+
+
+@asynccontextmanager
+async def _open_oauth_database(context: OAuthCredentialStoreContext) -> AsyncIterator[_OAuthDatabase]:
+    database = _OAuthDatabase()
+    try:
+        await database.run(database.open, context)
+        yield database
+    finally:
+        await run_coroutine_until_complete(database.run(database.close))
+
+
+def _rollback_connection(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        connection.execute("ROLLBACK")
 
 
 class _OAuthCredentialReader:
     """One read-only view of a committed per-scope credential state."""
 
-    def __init__(self, context: _OAuthCredentialStoreContext, connection: sqlite3.Connection) -> None:
+    def __init__(self, context: OAuthCredentialStoreContext, database: _OAuthDatabase) -> None:
         self._context = context
-        self._connection = connection
+        self._database = database
+        self._connection = database.connection
 
-    def generations(self) -> _OAuthStoredGenerations:
+    async def generations(self) -> _OAuthStoredGenerations:
+        """Read revisions without blocking the OAuth event loop."""
+        return await self._database.run(self._generations)
+
+    def _generations(self) -> _OAuthStoredGenerations:
         """Read revisions without decoding credential bytes."""
         return _stored_generations(_state_row(self._connection))
 
-    def snapshot(self) -> _OAuthStoredCredentialSnapshot:
+    async def snapshot(self) -> _OAuthStoredCredentialSnapshot:
+        """Read credentials without blocking the OAuth event loop."""
+        return await self._database.run(self._snapshot)
+
+    def _snapshot(self) -> _OAuthStoredCredentialSnapshot:
         """Decode the last committed credential snapshot without rewriting it."""
         row = _state_row(self._connection)
         return _OAuthStoredCredentialSnapshot(
@@ -106,9 +143,9 @@ class _OAuthCredentialReader:
             connection_generation=str(row["connection_generation"]),
         )
 
-    def reset_operation_result(self, operation_id: str) -> bool | None:
-        """Return a completed reset receipt without mutating the store."""
-        return _reset_operation_result(self._connection, operation_id)
+    async def reset_operation_result(self, operation_id: str) -> bool | None:
+        """Read a reset receipt without blocking the OAuth event loop."""
+        return await self._database.run(_reset_operation_result, self._connection, operation_id)
 
 
 class OAuthCredentialTransaction:
@@ -116,21 +153,26 @@ class OAuthCredentialTransaction:
 
     def __init__(
         self,
-        context: _OAuthCredentialStoreContext,
-        connection: sqlite3.Connection,
-        *,
-        legacy_cleanup_deferred: bool,
+        context: OAuthCredentialStoreContext,
+        database: _OAuthDatabase,
     ) -> None:
         self._context = context
-        self._connection = connection
-        self._legacy_cleanup_deferred = legacy_cleanup_deferred
-        self._cleanup_legacy_on_commit = False
+        self._database = database
+        self._connection = database.connection
 
-    def generations(self) -> _OAuthStoredGenerations:
+    async def generations(self) -> _OAuthStoredGenerations:
+        """Read revisions without blocking the OAuth event loop."""
+        return await self._database.run(self._generations)
+
+    def _generations(self) -> _OAuthStoredGenerations:
         """Read revisions without decoding credential bytes."""
         return _stored_generations(_state_row(self._connection))
 
-    def snapshot(self) -> _OAuthStoredCredentialSnapshot:
+    async def snapshot(self) -> _OAuthStoredCredentialSnapshot:
+        """Read credentials without blocking the OAuth event loop."""
+        return await self._database.run(self._snapshot)
+
+    def _snapshot(self) -> _OAuthStoredCredentialSnapshot:
         """Read and decode the current credential snapshot."""
         row = _state_row(self._connection)
         credentials = self._decode_credentials(row)
@@ -140,19 +182,27 @@ class OAuthCredentialTransaction:
             connection_generation=str(row["connection_generation"]),
         )
 
-    def publish(
+    async def publish(
         self,
         credentials: Mapping[str, Any],
         *,
         advance_connection_generation: bool,
     ) -> _OAuthStoredCredentialSnapshot:
+        """Publish one atomic credential revision without blocking the event loop."""
+        return await self._database.run(self._publish, credentials, advance_connection_generation)
+
+    def _publish(
+        self,
+        credentials: Mapping[str, Any],
+        advance_connection_generation: bool,
+    ) -> _OAuthStoredCredentialSnapshot:
         """Replace credentials and advance their authoritative revisions."""
-        generations = self.generations()
+        generations = self._generations()
         generation = secrets.token_hex(32)
         connection_generation = (
             secrets.token_hex(32) if advance_connection_generation else generations.connection_generation
         )
-        published = _without_legacy_publication(credentials)
+        published = legacy_credentials.without_legacy_publication(credentials)
         payload = self._context.credentials_manager.encode_credentials(
             self._context.provider.credential_service,
             published,
@@ -166,18 +216,21 @@ class OAuthCredentialTransaction:
             """,
             (payload, generation, connection_generation),
         )
-        self._cleanup_legacy_on_commit = self._legacy_cleanup_deferred
         return _OAuthStoredCredentialSnapshot(
             credentials=published,
             generation=generation,
             connection_generation=connection_generation,
         )
 
-    def reset_operation_result(self, operation_id: str) -> bool | None:
-        """Return a completed stable reset receipt without mutating credentials."""
-        return _reset_operation_result(self._connection, operation_id)
+    async def reset_operation_result(self, operation_id: str) -> bool | None:
+        """Read a reset receipt without blocking the OAuth event loop."""
+        return await self._database.run(_reset_operation_result, self._connection, operation_id)
 
-    def reset(
+    async def reset(self, operation_id: str | None) -> bool:
+        """Delete credentials without blocking the OAuth event loop."""
+        return await self._database.run(self._reset, operation_id)
+
+    def _reset(
         self,
         operation_id: str | None,
     ) -> bool:
@@ -201,17 +254,15 @@ class OAuthCredentialTransaction:
                 """,
                 (operation_id, int(credential_existed)),
             )
-        self._cleanup_legacy_on_commit = self._legacy_cleanup_deferred
         return credential_existed
 
     async def commit(self) -> None:
         """Durably commit, retrying a reader-blocked commit in this transaction."""
         await _retry_sqlite_lock(
-            lambda: self._connection.execute("COMMIT"),
+            lambda: self._connection.execute("COMMIT").close(),
             operation="commit",
+            database=self._database,
         )
-        if self._cleanup_legacy_on_commit:
-            _cleanup_legacy_files(self._context)
 
     def _decode_credentials(self, row: sqlite3.Row) -> dict[str, Any] | None:
         normalized = _decode_credentials(self._context, row)
@@ -234,7 +285,6 @@ class OAuthCredentialTransaction:
                 """,
                 (encoded,),
             )
-            self._cleanup_legacy_on_commit = self._legacy_cleanup_deferred
         return normalized
 
 
@@ -264,7 +314,7 @@ def _reset_operation_result(connection: sqlite3.Connection, operation_id: str) -
 
 
 def _decode_credentials(
-    context: _OAuthCredentialStoreContext,
+    context: OAuthCredentialStoreContext,
     row: sqlite3.Row,
 ) -> dict[str, Any] | None:
     """Decode and normalize one stored payload without mutating its transaction."""
@@ -282,71 +332,57 @@ def _decode_credentials(
     except (OSError, TypeError, ValueError, InvalidTag) as exc:
         msg = "Stored OAuth credentials could not be loaded"
         raise OAuthCredentialUnreadableError(msg) from exc
-    return _without_legacy_publication(credentials)
+    return legacy_credentials.without_legacy_publication(credentials)
 
 
-def _oauth_credential_database_path(context: _OAuthCredentialStoreContext) -> Path:
+def _oauth_credential_database_path(context: OAuthCredentialStoreContext) -> Path:
     """Return the private SQLite path for one canonical OAuth credential scope."""
-    legacy_path = _legacy_credential_path(context)
-    return legacy_path.with_name(f"{legacy_path.stem}.sqlite3")
+    credential_path = scoped_credentials_path(
+        context.provider.credential_service,
+        credentials_manager=context.credentials_manager,
+        worker_target=context.worker_target,
+    )
+    return credential_path.with_name(f"{credential_path.stem}.sqlite3")
 
 
 @asynccontextmanager
 async def oauth_credential_transaction(
-    context: _OAuthCredentialStoreContext,
+    context: OAuthCredentialStoreContext,
 ) -> AsyncIterator[OAuthCredentialTransaction]:
     """Acquire one cancellable cross-process transaction for a credential scope."""
-    database_path = _oauth_credential_database_path(context)
-    _prepare_database_path(database_path)
-    connection = sqlite3.connect(database_path, isolation_level=None, timeout=0)
-    connection.row_factory = sqlite3.Row
-    try:
-        await _set_synchronous_extra(connection)
-        await _enter_delete_journal(connection)
-        await _begin_immediate(connection)
-        legacy_cleanup_deferred = await _initialize_store(context, connection)
-        if not legacy_cleanup_deferred:
-            _cleanup_legacy_files(context)
-        await _begin_immediate(connection)
-        transaction = OAuthCredentialTransaction(
-            context,
-            connection,
-            legacy_cleanup_deferred=legacy_cleanup_deferred,
-        )
-        yield transaction
-    finally:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        connection.close()
+    async with _open_oauth_database(context) as database:
+        await _set_synchronous_extra(database)
+        await _enter_delete_journal(database)
+        await _begin_immediate(database)
+        await _initialize_store(context, database)
+        await _begin_immediate(database)
+        yield OAuthCredentialTransaction(context, database)
 
 
 @asynccontextmanager
 async def oauth_credential_reader(
-    context: _OAuthCredentialStoreContext,
+    context: OAuthCredentialStoreContext,
 ) -> AsyncIterator[_OAuthCredentialReader]:
     """Read the last committed state without contending with an admitted writer."""
-    database_path = _oauth_credential_database_path(context)
-    _prepare_database_path(database_path)
-    if await _reader_requires_write_preparation(context, database_path):
-        async with oauth_credential_transaction(context) as transaction:
-            await transaction.commit()
-    connection = sqlite3.connect(database_path, isolation_level=None, timeout=0)
-    connection.row_factory = sqlite3.Row
-    try:
-        await _begin_read(connection)
-        _validate_initialized_store(context, connection)
-        yield _OAuthCredentialReader(context, connection)
-    finally:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        connection.close()
+    async with _open_oauth_database(context) as database:
+        if await _reader_requires_write_preparation(context, database):
+            async with oauth_credential_transaction(context) as transaction:
+                await transaction.commit()
+        await _begin_read(database)
+        await database.run(_validate_initialized_store, context, database.connection)
+        yield _OAuthCredentialReader(context, database)
 
 
-async def _initialize_store(
-    context: _OAuthCredentialStoreContext,
+async def _initialize_store(context: OAuthCredentialStoreContext, database: _OAuthDatabase) -> None:
+    await database.run(_initialize_store_state, context, database.connection)
+    await _commit_connection(database)
+
+
+def _initialize_store_state(
+    context: OAuthCredentialStoreContext,
     connection: sqlite3.Connection,
-) -> bool:
-    """Create and bind one database, adopting legacy credentials exactly once."""
+) -> None:
+    """Create and bind one authoritative SQLite credential database."""
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS oauth_credential_state (
@@ -383,9 +419,7 @@ async def _initialize_store(
     row = connection.execute(
         "SELECT * FROM oauth_credential_state WHERE singleton = 1",
     ).fetchone()
-    legacy_adoption: _LegacyCredentialPayload | None = None
     if row is None:
-        legacy = _legacy_credential_payload(context)
         connection.execute(
             """
             INSERT INTO oauth_credential_state(
@@ -402,99 +436,45 @@ async def _initialize_store(
                 expected_binding["routing_agent_name"],
                 secrets.token_hex(32),
                 secrets.token_hex(32),
-                legacy.payload,
-                int(legacy.present),
-                int(legacy.unreadable),
+                None,
+                0,
+                0,
             ),
         )
-        if legacy.present:
-            legacy_adoption = legacy
     else:
         _validate_scope_binding(context, connection, row)
-        legacy_adoption = _adopt_deferred_legacy_payload(context, connection, row)
-    legacy_cleanup_deferred = _legacy_cleanup_must_be_deferred(connection)
-    await _commit_connection(connection)
-    if legacy_adoption is not None:
-        logger.info(
-            "oauth_legacy_credentials_adopted",
-            provider_id=context.provider.id,
-            credential_service=context.provider.credential_service,
-            credential_present=legacy_adoption.present,
-            credential_unreadable=legacy_adoption.unreadable,
-        )
-    return legacy_cleanup_deferred
-
-
-def _adopt_deferred_legacy_payload(
-    context: _OAuthCredentialStoreContext,
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
-) -> _LegacyCredentialPayload | None:
-    """Adopt a retained legacy payload once the active codec can represent it."""
-    legacy = _deferred_legacy_payload(context, row)
-    if legacy is None:
-        return None
-    connection.execute(
-        """
-        UPDATE oauth_credential_state
-        SET credential_payload = ?, credential_unreadable = ?,
-            generation = ?, connection_generation = ?
-        WHERE singleton = 1
-        """,
-        (
-            legacy.payload,
-            int(legacy.unreadable),
-            secrets.token_hex(32),
-            secrets.token_hex(32),
-        ),
-    )
-    return legacy
-
-
-def _deferred_legacy_payload(
-    context: _OAuthCredentialStoreContext,
-    row: sqlite3.Row,
-) -> _LegacyCredentialPayload | None:
-    """Return retained legacy bytes that the active codec can now represent."""
-    if (
-        not bool(row["credential_present"])
-        or not bool(row["credential_unreadable"])
-        or row["credential_payload"] is not None
-    ):
-        return None
-    legacy = _legacy_credential_payload(context)
-    return legacy if legacy.present and legacy.payload is not None else None
 
 
 async def _reader_requires_write_preparation(
-    context: _OAuthCredentialStoreContext,
-    database_path: Path,
+    context: OAuthCredentialStoreContext,
+    database: _OAuthDatabase,
 ) -> bool:
-    """Return whether a reader needs store creation or deferred legacy adoption."""
-    connection = sqlite3.connect(database_path, isolation_level=None, timeout=0)
-    connection.row_factory = sqlite3.Row
+    """Return whether a reader needs store creation."""
     try:
-        await _begin_read(connection)
-        table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_credential_state'",
-        ).fetchone()
-        if table is None:
-            return True
-        row = connection.execute(
-            "SELECT * FROM oauth_credential_state WHERE singleton = 1",
-        ).fetchone()
-        if row is None:
-            return True
-        _validate_initialized_store(context, connection, row=row)
-        return _deferred_legacy_payload(context, row) is not None
+        await _begin_read(database)
+        return await database.run(_reader_requires_initialization, context, database.connection)
     finally:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        connection.close()
+        await run_coroutine_until_complete(database.run(_rollback_connection, database.connection))
+
+
+def _reader_requires_initialization(
+    context: OAuthCredentialStoreContext,
+    connection: sqlite3.Connection,
+) -> bool:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_credential_state'",
+    ).fetchone()
+    if table is None:
+        return True
+    row = connection.execute("SELECT * FROM oauth_credential_state WHERE singleton = 1").fetchone()
+    if row is None:
+        return True
+    _validate_initialized_store(context, connection, row=row)
+    return False
 
 
 def _validate_initialized_store(
-    context: _OAuthCredentialStoreContext,
+    context: OAuthCredentialStoreContext,
     connection: sqlite3.Connection,
     *,
     row: sqlite3.Row | None = None,
@@ -518,7 +498,7 @@ def _validate_initialized_store(
 
 
 def _validate_scope_binding(
-    context: _OAuthCredentialStoreContext,
+    context: OAuthCredentialStoreContext,
     connection: sqlite3.Connection,
     row: sqlite3.Row,
 ) -> None:
@@ -526,7 +506,7 @@ def _validate_scope_binding(
     actual_binding = {key: str(row[key]) for key in expected_binding}
     if actual_binding == expected_binding:
         return
-    legacy_key = _compatible_legacy_worker_key(context, connection)
+    legacy_key = legacy_credentials.compatible_legacy_worker_key(context, connection)
     if legacy_key is not None:
         expected_binding["worker_key"] = legacy_key
     if actual_binding != expected_binding:
@@ -534,112 +514,62 @@ def _validate_scope_binding(
         raise OAuthProviderError(msg)
 
 
-def _compatible_legacy_worker_key(
-    context: _OAuthCredentialStoreContext,
-    connection: sqlite3.Connection,
-) -> str | None:
-    """Read legacy requester bindings at stable raw-identity paths without migrating them.
-
-    The requester encoding upgrade changed worker keys but left these stores in place.
-    Accept only lossless legacy spellings and retain the stored binding for rollback.
-    """
-    target = context.worker_target
-    manager = context.credentials_manager
-    if (
-        target is None
-        or target.worker_scope not in {"user", "user_agent"}
-        or not is_oauth_token_service(context.provider.credential_service)
-        or manager.current_worker_key is not None
-        or manager.storage_root != context.runtime_paths.storage_root
-    ):
-        return None
-    identity = target.execution_identity
-    if identity is None or not identity.requester_id:
-        return None
-    requester = identity.requester_id
-    legacy_requester = re.sub(r"[^a-zA-Z0-9._:@+-]+", "_", requester.strip()).strip("_") or "default"
-    if legacy_requester != requester:
-        return None
-    canonical_target = resolve_worker_target(
-        target.worker_scope,
-        target.routing_agent_name,
-        execution_identity=identity,
-        private_agent_names=target.private_agent_names,
-    )
-    if canonical_target != target:
-        return None
-    # Raw requester/agent hashes own legacy stores; never search or adopt worker directories.
-    # Old bindings cannot distinguish a misfiled database from a colliding legacy identity.
-    credential_path = _legacy_credential_path(context)
-    canonical_path = credential_path.with_name(f"{credential_path.stem}.sqlite3")
-    database_path = next(row[2] for row in connection.execute("PRAGMA database_list") if row[1] == "main")
-    if Path(database_path).absolute() != canonical_path.absolute():
-        return None
-    assert canonical_target.worker_key is not None
-    return canonical_target.worker_key.replace(
-        f":{target.worker_scope}:~{requester}",
-        f":{target.worker_scope}:{requester}",
-        1,
-    )
-
-
-async def _commit_connection(connection: sqlite3.Connection) -> None:
-    await _retry_sqlite_lock(lambda: connection.execute("COMMIT"), operation="commit")
-
-
-def _legacy_cleanup_must_be_deferred(connection: sqlite3.Connection) -> bool:
-    """Keep the legacy source when its bytes were deliberately not adopted."""
-    row = connection.execute(
-        """
-        SELECT credential_payload, credential_present, credential_unreadable
-        FROM oauth_credential_state
-        WHERE singleton = 1
-        """,
-    ).fetchone()
-    return (
-        row is not None
-        and bool(row["credential_present"])
-        and bool(row["credential_unreadable"])
-        and row["credential_payload"] is None
-    )
-
-
-async def _begin_immediate(connection: sqlite3.Connection) -> None:
-    await _retry_sqlite_lock(lambda: connection.execute("BEGIN IMMEDIATE"), operation="write lock")
-
-
-async def _begin_read(connection: sqlite3.Connection) -> None:
-    connection.execute("BEGIN")
+async def _commit_connection(database: _OAuthDatabase) -> None:
     await _retry_sqlite_lock(
-        lambda: connection.execute("PRAGMA user_version").fetchone(),
+        lambda: database.connection.execute("COMMIT").close(),
+        operation="commit",
+        database=database,
+    )
+
+
+async def _begin_immediate(database: _OAuthDatabase) -> None:
+    await _retry_sqlite_lock(
+        lambda: database.connection.execute("BEGIN IMMEDIATE").close(),
+        operation="write lock",
+        database=database,
+    )
+
+
+async def _begin_read(database: _OAuthDatabase) -> None:
+    await database.run(lambda: database.connection.execute("BEGIN").close())
+    await _retry_sqlite_lock(
+        lambda: database.connection.execute("PRAGMA user_version").fetchone(),
         operation="read lock",
+        database=database,
     )
 
 
-async def _set_synchronous_extra(connection: sqlite3.Connection) -> None:
+async def _set_synchronous_extra(database: _OAuthDatabase) -> None:
     await _retry_sqlite_lock(
-        lambda: connection.execute("PRAGMA synchronous = EXTRA"),
+        lambda: database.connection.execute("PRAGMA synchronous = EXTRA").close(),
         operation="durability configuration",
+        database=database,
     )
 
 
-async def _enter_delete_journal(connection: sqlite3.Connection) -> None:
+async def _enter_delete_journal(database: _OAuthDatabase) -> None:
     mode = await _retry_sqlite_lock(
-        lambda: str(connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]).lower(),
+        lambda: str(database.connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]).lower(),
         operation="journal-mode configuration",
+        database=database,
     )
     if mode != "delete":
         msg = "OAuth credential store requires SQLite rollback-journal mode"
         raise OAuthProviderError(msg)
 
 
-async def _retry_sqlite_lock(operation_call: Callable[[], _T], *, operation: str) -> _T:
-    """Retry transient SQLite contention within one bounded admission window."""
+async def _retry_sqlite_lock(
+    operation_call: Callable[[], _T],
+    *,
+    operation: str,
+    database: _OAuthDatabase,
+) -> _T:
+    """Retry transient SQLite contention without occupying a thread between attempts."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _LOCK_WAIT_TIMEOUT_SECONDS
     while True:
         try:
-            return operation_call()
+            return await database.run(operation_call)
         except sqlite3.OperationalError as exc:
             if not _sqlite_lock_error(exc):
                 raise
@@ -700,61 +630,7 @@ def _validate_existing_database_path(database_path: Path) -> os.stat_result:
     return database_stat
 
 
-def _legacy_credential_payload(context: _OAuthCredentialStoreContext) -> _LegacyCredentialPayload:
-    legacy_path = _legacy_credential_path(context)
-    try:
-        raw = legacy_path.read_bytes()
-    except FileNotFoundError:
-        return _LegacyCredentialPayload(payload=None, present=False, unreadable=False)
-    manager = context.credentials_manager
-    try:
-        credentials = manager.decode_credentials(context.provider.credential_service, raw)
-    except (OSError, TypeError, ValueError, InvalidTag):
-        retain_payload = not manager.credentials_encryption_enabled or manager.payload_is_encrypted(raw)
-        return _LegacyCredentialPayload(
-            payload=raw if retain_payload else None,
-            present=True,
-            unreadable=True,
-        )
-    normalized = _without_legacy_publication(credentials)
-    return _LegacyCredentialPayload(
-        payload=manager.encode_credentials(context.provider.credential_service, normalized),
-        present=True,
-        unreadable=False,
-    )
-
-
-def _legacy_credential_path(context: _OAuthCredentialStoreContext) -> Path:
-    return scoped_credentials_path(
-        context.provider.credential_service,
-        credentials_manager=context.credentials_manager,
-        worker_target=context.worker_target,
-    )
-
-
-def _cleanup_legacy_files(context: _OAuthCredentialStoreContext) -> None:
-    credential_path = _legacy_credential_path(context)
-    paths = (
-        credential_path,
-        credential_path.with_name(f"{credential_path.name}.oauth-generation.json"),
-        credential_path.with_name(f"{credential_path.name}.oauth-operation.lock"),
-        credential_path.with_name(f"{credential_path.name}.oauth-refresh.lock"),
-    )
-    for path in paths:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            logger.warning(
-                "oauth_legacy_credential_cleanup_failed",
-                provider_id=context.provider.id,
-                credential_service=context.provider.credential_service,
-                error_type=type(exc).__name__,
-            )
-
-
-def _scope_binding(context: _OAuthCredentialStoreContext) -> dict[str, str]:
+def _scope_binding(context: OAuthCredentialStoreContext) -> dict[str, str]:
     worker_target = context.worker_target
     worker_scope = (
         worker_target.worker_scope if worker_target is not None and worker_target.worker_scope else "unscoped"
@@ -771,12 +647,6 @@ def _scope_binding(context: _OAuthCredentialStoreContext) -> dict[str, str]:
         "worker_key": worker_target.worker_key if worker_target is not None and worker_target.worker_key else "",
         "routing_agent_name": routing_agent_name,
     }
-
-
-def _without_legacy_publication(credentials: Mapping[str, Any]) -> dict[str, Any]:
-    result = dict(credentials)
-    result.pop(_LEGACY_PUBLICATION_KEY, None)
-    return result
 
 
 def _sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:

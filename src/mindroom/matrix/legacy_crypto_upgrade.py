@@ -19,6 +19,15 @@ logger = get_logger(__name__)
 
 _LEGACY_TRANSPORT_TABLES = ("pendingtimelineevents", "syncrecoverygaps", "syncrecoveryabandonedrooms", "synctokens")
 
+# LEGACY_COMPAT: Crypto stores with retired transport recovery tables.
+# Legacy format: Dependency-owned 0.40 crypto store with pre-durable transport recovery tables.
+# Last legacy release: v2026.9.28; replacement: v2026.9.29 selected dependency 1.0 durable ingestion.
+# Handling: Validate the retained account pickle, then retire pending recovery rows and legacy sync tokens in one
+# transaction under the file lease while preserving identity, trust, and keys.
+# Coverage: tests/test_legacy_crypto_upgrade.py::test_owned_startup_retires_legacy_recovery_without_changing_keys,
+# tests/test_legacy_crypto_upgrade.py::test_legacy_sync_checkpoint_is_not_adopted,
+# tests/test_legacy_crypto_upgrade.py::test_crypto_retirement_authenticates_the_configured_pickle_key.
+
 
 def retire_legacy_crypto_recovery(
     database_path: Path,

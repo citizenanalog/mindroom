@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -13,19 +15,22 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
-from mindroom import shell_supervisor as shell_supervisor_module
 from mindroom.api import sandbox_runner as sandbox_runner_module
 from mindroom.api import sandbox_runner_scripts as sandbox_runner_scripts_module
 from mindroom.api.sandbox_runner_app import app as sandbox_runner_app
 from mindroom.api.sandbox_runner_scripts import _script_namespace
 from mindroom.api.sandbox_runner_scripts import router as sandbox_runner_scripts_router
 from mindroom.api.sandbox_worker_prep import prepare_worker_request
+from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.script_runs.models import script_worker_key_for_run
-from mindroom.shell_supervisor import ShellSupervisorStartupError, _ShellSupervisorManager
-from mindroom.tool_system.worker_routing import _private_instance_state_root_path
+from mindroom.shell import supervisor as shell_supervisor_module
+from mindroom.shell.supervisor import ShellSupervisorStartupError, _ShellSupervisorManager
+from mindroom.tool_system.sandbox_proxy import runner_config_snapshot
+from mindroom.tool_system.worker_routing import private_instance_scope_root_path
 from mindroom.workers.backends import local as local_workers_module
 
 if TYPE_CHECKING:
@@ -37,7 +42,7 @@ _WORKER_KEY = "v1:test:shared:scripts"
 _SUPERVISOR_HANDLE = f"shell:{'a' * 32}"
 
 
-def _fake_local_worker_venv_create(_self: object, venv_dir: Path) -> None:
+def _fake_local_worker_venv_create(venv_dir: Path) -> None:
     bin_dir = venv_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     (bin_dir / "python").symlink_to(Path(sys.executable))
@@ -51,7 +56,7 @@ def runner_client(
     """Provide an authenticated runner with one real isolated supervisor."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "models:\n  default:\n    provider: openai\n    id: gpt-5.4\nagents: {}\nrouter:\n  model: default\n",
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\nagents: {}\nrouter:\n  model: default\n",
         encoding="utf-8",
     )
     runtime_paths = resolve_runtime_paths(
@@ -62,7 +67,7 @@ def runner_client(
             SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_root"]: str(tmp_path / "dedicated-worker"),
         },
     )
-    monkeypatch.setattr(local_workers_module.venv.EnvBuilder, "create", _fake_local_worker_venv_create)
+    monkeypatch.setattr(local_workers_module, "_create_local_worker_venv", _fake_local_worker_venv_create)
     monkeypatch.setattr(local_workers_module, "_local_worker_manager", None)
     monkeypatch.setattr(local_workers_module, "_local_worker_manager_config", None)
     sandbox_runner_module.initialize_sandbox_runner_app(
@@ -75,6 +80,7 @@ def runner_client(
         worker_key=_WORKER_KEY,
         tool_init_overrides={},
         runtime_paths=runtime_paths,
+        agent_policies={},
         runner_token=_TOKEN,
     )
     supervisor = _ShellSupervisorManager()
@@ -103,11 +109,60 @@ def _write_run_files(workspace: Path, run_id: str, source: str) -> tuple[str, st
 def _run_payload(workspace: Path, *, run_id: str, source: str) -> dict[str, object]:
     _source_path, _token_path, source_digest = _write_run_files(workspace, run_id, source)
     return {
+        "protocol_version": 1,
         "run_id": run_id,
         "worker_key": _WORKER_KEY,
         "source_digest": source_digest,
         "gateway_url": "http://primary:8765/api/script-gateway",
+        "max_runtime_seconds": 3600,
     }
+
+
+@pytest.mark.parametrize("protocol_version", [0, 2])
+def test_worker_script_endpoint_rejects_mismatched_protocol_version(
+    runner_client: tuple[TestClient, Path],
+    protocol_version: int,
+) -> None:
+    """A worker must reject launches from an incompatible script protocol."""
+    client, workspace = runner_client
+    payload = _run_payload(workspace, run_id=f"script-{'0' * 32}", source="print('no')\n")
+    payload["protocol_version"] = protocol_version
+
+    response = client.post("/api/sandbox-runner/scripts/run", headers=_HEADERS, json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "value_error"
+
+
+@pytest.mark.parametrize(
+    ("max_runtime_seconds", "error_type"),
+    [
+        (0, "greater_than"),
+        (-1, "greater_than"),
+        (1.5, "int_type"),
+        (True, "int_type"),
+        (float("inf"), "int_type"),
+        (float("nan"), "int_type"),
+    ],
+)
+def test_worker_script_launch_rejects_invalid_maximum_runtime(
+    max_runtime_seconds: object,
+    error_type: str,
+) -> None:
+    """The worker accepts only finite positive integer process deadlines."""
+    with pytest.raises(ValidationError) as exc_info:
+        sandbox_runner_scripts_module.SandboxScriptRunRequest.model_validate(
+            {
+                "protocol_version": 1,
+                "run_id": f"script-{'0' * 32}",
+                "worker_key": _WORKER_KEY,
+                "source_digest": "a" * 64,
+                "gateway_url": "http://primary:8765/api/script-gateway",
+                "max_runtime_seconds": max_runtime_seconds,
+            },
+        )
+
+    assert exc_info.value.errors()[0]["type"] == error_type
 
 
 def test_worker_script_endpoint_narrow_request_derives_fixed_snapshot_paths(
@@ -321,7 +376,7 @@ agents:
 models:
   default:
     provider: openai
-    id: gpt-5.4
+    id: gpt-6-astra
 router:
   model: default
 """.lstrip(),
@@ -336,7 +391,7 @@ router:
             SANDBOX_RUNTIME_ENV_BY_KEY["shared_storage_root"]: str(shared_storage_root),
         },
     )
-    monkeypatch.setattr(local_workers_module.venv.EnvBuilder, "create", _fake_local_worker_venv_create)
+    monkeypatch.setattr(local_workers_module, "_create_local_worker_venv", _fake_local_worker_venv_create)
     monkeypatch.setattr(local_workers_module, "_local_worker_manager", None)
     monkeypatch.setattr(local_workers_module, "_local_worker_manager_config", None)
     app = FastAPI()
@@ -351,17 +406,13 @@ router:
         worker_key=worker_key,
         tool_init_overrides={},
         runtime_paths=runtime_paths,
+        agent_policies={},
         private_agent_names=frozenset({"watcher"}),
         runner_token=_TOKEN,
     )
     private_workspace = (
-        _private_instance_state_root_path(
-            shared_storage_root,
-            worker_key=state_scope_worker_key,
-            agent_name="watcher",
-        )
-        / "private-workspace"
-    )
+        private_instance_scope_root_path(shared_storage_root, state_scope_worker_key) / "watcher"
+    ) / "private-workspace"
     private_workspace.mkdir(parents=True)
     hook_path = private_workspace / ".mindroom" / "worker-env.sh"
     hook_path.parent.mkdir(parents=True)
@@ -384,11 +435,13 @@ router:
             "/api/sandbox-runner/scripts/run",
             headers=_HEADERS,
             json={
+                "protocol_version": 1,
                 "run_id": run_id,
                 "worker_key": worker_key,
                 "state_scope_worker_key": state_scope_worker_key,
                 "source_digest": source_digest,
                 "gateway_url": "http://primary:8765/api/script-gateway",
+                "max_runtime_seconds": 3600,
                 "private_agent_names": ["watcher"],
             },
         )
@@ -415,6 +468,134 @@ router:
             f"private-workspace|{private_workspace}"
         )
         assert not (prepared.paths.workspace / "script-result.txt").exists()
+    finally:
+        supervisor.shutdown()
+
+
+def test_worker_script_does_not_load_workspace_code_into_its_launchers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace files must not replace MindRoom's script launchers or inject site code into them."""
+    run_id = f"script-{'b' * 32}"
+    state_scope_worker_key = "v1:test:user_agent:@victim:example.test:watcher"
+    worker_key = script_worker_key_for_run(state_scope_worker_key, run_id)
+    shared_storage_root = tmp_path / "storage"
+    dedicated_root = tmp_path / "dedicated-worker"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+agents:
+  watcher:
+    display_name: Watcher
+    role: Watch for changes.
+    model: default
+    memory_backend: file
+    worker_scope: user_agent
+models:
+  default:
+    provider: openai
+    id: gpt-6-astra
+router:
+  model: default
+""".lstrip(),
+        encoding="utf-8",
+    )
+    runtime_paths = resolve_runtime_paths(
+        config_path=config_path,
+        storage_path=dedicated_root,
+        process_env={
+            SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"]: worker_key,
+            SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_root"]: str(dedicated_root),
+            SANDBOX_RUNTIME_ENV_BY_KEY["shared_storage_root"]: str(shared_storage_root),
+        },
+    )
+    monkeypatch.setattr(local_workers_module, "_create_local_worker_venv", _fake_local_worker_venv_create)
+    monkeypatch.setattr(local_workers_module, "_local_worker_manager", None)
+    monkeypatch.setattr(local_workers_module, "_local_worker_manager_config", None)
+    app = FastAPI()
+    app.include_router(sandbox_runner_scripts_router)
+    sandbox_runner_module.initialize_sandbox_runner_app(
+        app,
+        runtime_paths,
+        config=sandbox_runner_module._runtime_config_or_empty(runtime_paths),
+        runner_token=_TOKEN,
+    )
+    prepared = prepare_worker_request(
+        worker_key=worker_key,
+        tool_init_overrides={},
+        runtime_paths=runtime_paths,
+        agent_policies={},
+        private_agent_names=frozenset(),
+        runner_token=_TOKEN,
+    )
+    shared_workspace = shared_storage_root / "agents" / "watcher" / "workspace"
+    (shared_workspace / "mindroom").mkdir(parents=True)
+    (shared_workspace / "mindroom" / "__init__.py").write_text(
+        "from pathlib import Path\nPath.cwd().joinpath('planted-package-ran').touch()\n",
+        encoding="utf-8",
+    )
+    (shared_workspace / "helper.py").write_text('VALUE = "helper-value"\n', encoding="utf-8")
+    user_site = subprocess.run(
+        [sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+        env={**os.environ, "HOME": str(shared_workspace.resolve())},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    Path(user_site).mkdir(parents=True)
+    (Path(user_site) / "planted.pth").write_text(
+        "import pathlib; pathlib.Path.cwd().joinpath('planted-pth-ran').touch()\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "import helper\n"
+        "workspace = Path(os.environ['MINDROOM_SCRIPT_WORKSPACE_ROOT'])\n"
+        "workspace.joinpath('script-result.txt').write_text(helper.VALUE, encoding='utf-8')\n"
+    )
+    _source_path, _token_path, source_digest = _write_run_files(prepared.paths.workspace, run_id, source)
+    supervisor = _ShellSupervisorManager()
+    monkeypatch.setattr(shell_supervisor_module, "_manager", supervisor)
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/api/sandbox-runner/scripts/run",
+            headers=_HEADERS,
+            json={
+                "protocol_version": 1,
+                "run_id": run_id,
+                "worker_key": worker_key,
+                "state_scope_worker_key": state_scope_worker_key,
+                "source_digest": source_digest,
+                "gateway_url": "http://primary:8765/api/script-gateway",
+                "max_runtime_seconds": 3600,
+                "private_agent_names": [],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+
+        deadline = time.monotonic() + 5
+        status = client.get(
+            f"/api/sandbox-runner/scripts/{run_id}",
+            headers=_HEADERS,
+            params={"worker_key": worker_key},
+        )
+        while status.json()["state"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = client.get(
+                f"/api/sandbox-runner/scripts/{run_id}",
+                headers=_HEADERS,
+                params={"worker_key": worker_key},
+            )
+
+        assert status.json()["state"] == "exited"
+        assert status.json()["exit_code"] == 0
+        assert (shared_workspace / "script-result.txt").read_text(encoding="utf-8") == "helper-value"
+        assert not (shared_workspace / "planted-package-ran").exists()
+        assert not (shared_workspace / "planted-pth-ran").exists()
     finally:
         supervisor.shutdown()
 
@@ -480,8 +661,10 @@ def test_worker_script_endpoint_rejects_unapproved_environment_name(
 
 def test_worker_script_endpoint_rejects_oversized_request(
     runner_client: tuple[TestClient, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The worker must reject oversized control bodies before process launch."""
+    monkeypatch.setattr(sandbox_runner_scripts_module, "_MAX_REQUEST_BYTES", 16 * 1024)
     client, workspace = runner_client
     payload = _run_payload(workspace, run_id=f"script-{'2' * 32}", source="print('no')\n")
     payload["environment"] = {"MINDROOM_SCRIPT_GATEWAY_URL": f"http://primary.test/{'x' * 20_000}"}
@@ -494,8 +677,10 @@ def test_worker_script_endpoint_rejects_oversized_request(
 @pytest.mark.asyncio
 async def test_worker_script_endpoint_stops_reading_chunked_body_over_limit(
     runner_client: tuple[TestClient, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The body boundary must stop receiving chunks as soon as the limit is crossed."""
+    monkeypatch.setattr(sandbox_runner_scripts_module, "_MAX_REQUEST_BYTES", 16 * 1024)
     _client, _workspace = runner_client
     consumed_chunks: list[int] = []
 
@@ -541,20 +726,24 @@ async def test_shared_runner_authenticates_before_revealing_script_topology(tmp_
         unauthenticated = await client.post(
             "/api/sandbox-runner/scripts/run",
             json={
+                "protocol_version": 1,
                 "run_id": f"script-{'a' * 32}",
                 "worker_key": _WORKER_KEY,
                 "source_digest": "0" * 64,
                 "gateway_url": "http://primary:8765/api/script-gateway",
+                "max_runtime_seconds": 3600,
             },
         )
         authenticated = await client.post(
             "/api/sandbox-runner/scripts/run",
             headers=_HEADERS,
             json={
+                "protocol_version": 1,
                 "run_id": f"script-{'a' * 32}",
                 "worker_key": _WORKER_KEY,
                 "source_digest": "0" * 64,
                 "gateway_url": "http://primary:8765/api/script-gateway",
+                "max_runtime_seconds": 3600,
             },
         )
 
@@ -603,7 +792,7 @@ def test_worker_script_endpoint_rejects_mismatched_dedicated_worker_key(tmp_path
     previous_context = getattr(sandbox_runner_app.state, "sandbox_runner_context", None)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "models:\n  default:\n    provider: openai\n    id: gpt-5.4\nagents: {}\nrouter:\n  model: default\n",
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\nagents: {}\nrouter:\n  model: default\n",
         encoding="utf-8",
     )
     runtime_paths = resolve_runtime_paths(
@@ -627,10 +816,12 @@ def test_worker_script_endpoint_rejects_mismatched_dedicated_worker_key(tmp_path
         "/api/sandbox-runner/scripts/run",
         headers=_HEADERS,
         json={
+            "protocol_version": 1,
             "run_id": f"script-{'4' * 32}",
             "worker_key": "worker-b",
             "source_digest": "a" * 64,
             "gateway_url": "http://primary.test/api/script-gateway",
+            "max_runtime_seconds": 3600,
         },
     )
 
@@ -717,3 +908,239 @@ def test_worker_script_endpoints_use_runner_authentication(
     )
 
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("layout", ["missing", "linked", "mounted"])
+def test_script_state_workspace_is_only_the_mounted_workspace(tmp_path: Path, layout: str) -> None:
+    """Script workers use the mounted workspace as is and never create a stand-in or follow a replacement."""
+    state_scope_worker_key = "v1:test:user_agent:@alice:localhost:watcher"
+    shared_storage_root = tmp_path / "storage"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "agents:\n  watcher:\n    display_name: Watcher\n    private:\n      per: user_agent\n"
+        "      root: private-workspace\nmodels:\n  default:\n    provider: openai\n    id: gpt-6-astra\n"
+        "router:\n  model: default\n",
+        encoding="utf-8",
+    )
+    runtime_paths = resolve_runtime_paths(
+        config_path=config_path,
+        storage_path=tmp_path / "dedicated-worker",
+        process_env={
+            SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"]: state_scope_worker_key,
+            SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_root"]: str(tmp_path / "dedicated-worker"),
+            SANDBOX_RUNTIME_ENV_BY_KEY["shared_storage_root"]: str(shared_storage_root),
+        },
+    )
+    app = FastAPI()
+    sandbox_runner_module.initialize_sandbox_runner_app(
+        app,
+        runtime_paths,
+        config=sandbox_runner_module._runtime_config_or_empty(runtime_paths),
+        runner_token=_TOKEN,
+    )
+    agent_root = private_instance_scope_root_path(shared_storage_root, state_scope_worker_key) / "watcher"
+    workspace = agent_root / "private-workspace"
+    if layout == "mounted":
+        workspace.mkdir(parents=True)
+    elif layout == "linked":
+        other = tmp_path / "other-instance"
+        other.mkdir()
+        agent_root.mkdir(parents=True)
+        workspace.symlink_to(other, target_is_directory=True)
+
+    def resolve() -> Path:
+        return sandbox_runner_module.resolve_script_state_workspace(
+            app,
+            sandbox_runner_module.app_runtime_config(app),
+            state_scope_worker_key=state_scope_worker_key,
+            agent_name="watcher",
+            private_agent_names=frozenset({"watcher"}),
+        )
+
+    if layout == "mounted":
+        assert resolve() == workspace
+        return
+    with pytest.raises(ValueError, match="not mounted"):
+        resolve()
+    assert workspace.is_symlink() == (layout == "linked")
+    assert agent_root.exists() == (layout == "linked")
+
+
+_LIVE_SCRIPT_STATE_SCOPE = "v1:test:user_agent:@alice:example.test:watcher"
+_LIVE_SCRIPT_RUN_ID = f"script-{'e' * 32}"
+
+
+def _live_primary_script_snapshot(tmp_path: Path, *, private: bool) -> dict[str, object]:
+    """Return what a Kubernetes primary sends for a `watcher` agent created after the worker was seeded."""
+    watcher: dict[str, object] = {"display_name": "Watcher", "tools": ["script"]}
+    if private:
+        watcher["private"] = {"per": "user_agent", "root": "private-workspace"}
+    else:
+        watcher["worker_scope"] = "user_agent"
+    primary_paths = resolve_runtime_paths(
+        config_path=tmp_path / "primary" / "config.yaml",
+        storage_path=tmp_path / "primary" / "storage",
+        process_env={"MINDROOM_WORKER_BACKEND": "kubernetes"},
+    )
+    live_config = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "gpt-6-astra", "api_key": "sk-live-model-key"}},
+            "router": {"model": "default"},
+            # Snapshots grow with the agent count, so launches must fit well past the old 16 KiB body limit.
+            "agents": {
+                "watcher": watcher,
+                **{
+                    f"helper_{index:03d}": {"display_name": f"Helper {index}", "tools": ["shell", "file", "python"]}
+                    for index in range(256)
+                },
+            },
+        },
+        primary_paths,
+    )
+    snapshot = runner_config_snapshot(primary_paths, live_config)
+    assert snapshot is not None
+    assert "sk-live-model-key" not in json.dumps(snapshot)
+    return snapshot
+
+
+@pytest.fixture
+def seeded_script_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TestClient, dict[str, object], Path]]:
+    """Provide a dedicated worker for a private `watcher` script run whose seed config lacks that agent."""
+    worker_key = script_worker_key_for_run(_LIVE_SCRIPT_STATE_SCOPE, _LIVE_SCRIPT_RUN_ID)
+    shared_storage_root = tmp_path / "storage"
+    dedicated_root = tmp_path / "dedicated-worker"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\nagents: {}\nrouter:\n  model: default\n",
+        encoding="utf-8",
+    )
+    runtime_paths = resolve_runtime_paths(
+        config_path=config_path,
+        storage_path=dedicated_root,
+        process_env={
+            SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"]: worker_key,
+            SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_root"]: str(dedicated_root),
+            SANDBOX_RUNTIME_ENV_BY_KEY["shared_storage_root"]: str(shared_storage_root),
+        },
+    )
+    monkeypatch.setattr(local_workers_module, "_create_local_worker_venv", _fake_local_worker_venv_create)
+    monkeypatch.setattr(local_workers_module, "_local_worker_manager", None)
+    monkeypatch.setattr(local_workers_module, "_local_worker_manager_config", None)
+    app = FastAPI()
+    app.include_router(sandbox_runner_scripts_router)
+    sandbox_runner_module.initialize_sandbox_runner_app(
+        app,
+        runtime_paths,
+        config=sandbox_runner_module._runtime_config_or_empty(runtime_paths),
+        runner_token=_TOKEN,
+    )
+    assert "watcher" not in sandbox_runner_module.app_runtime_config(app).agents
+    prepared = prepare_worker_request(
+        worker_key=worker_key,
+        tool_init_overrides={},
+        runtime_paths=runtime_paths,
+        agent_policies={},
+        private_agent_names=frozenset({"watcher"}),
+        runner_token=_TOKEN,
+    )
+    private_workspace = (
+        private_instance_scope_root_path(shared_storage_root, _LIVE_SCRIPT_STATE_SCOPE) / "watcher"
+    ) / "private-workspace"
+    private_workspace.mkdir(parents=True)
+    source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['MINDROOM_SCRIPT_WORKSPACE_ROOT'], 'result.txt').write_text('live', encoding='utf-8')\n"
+    )
+    _source_path, _token_path, source_digest = _write_run_files(prepared.paths.workspace, _LIVE_SCRIPT_RUN_ID, source)
+    payload: dict[str, object] = {
+        "protocol_version": 1,
+        "run_id": _LIVE_SCRIPT_RUN_ID,
+        "worker_key": worker_key,
+        "state_scope_worker_key": _LIVE_SCRIPT_STATE_SCOPE,
+        "source_digest": source_digest,
+        "gateway_url": "http://primary:8765/api/script-gateway",
+        "max_runtime_seconds": 3600,
+        "private_agent_names": ["watcher"],
+    }
+    supervisor = _ShellSupervisorManager()
+    monkeypatch.setattr(shell_supervisor_module, "_manager", supervisor)
+    try:
+        yield TestClient(app), payload, private_workspace
+    finally:
+        supervisor.shutdown()
+
+
+def test_worker_script_runs_agent_known_only_to_primary_config_snapshot(
+    seeded_script_worker: tuple[TestClient, dict[str, object], Path],
+    tmp_path: Path,
+) -> None:
+    """A script for an agent added after the worker was seeded runs in that agent's workspace via the snapshot."""
+    client, payload, private_workspace = seeded_script_worker
+
+    without_snapshot = client.post("/api/sandbox-runner/scripts/run", headers=_HEADERS, json=payload)
+    assert without_snapshot.status_code == 400
+    assert without_snapshot.json()["detail"] == "Script state scope does not resolve an agent workspace."
+
+    snapshot = _live_primary_script_snapshot(tmp_path, private=True)
+    assert len(json.dumps(snapshot)) > 16 * 1024
+    response = client.post(
+        "/api/sandbox-runner/scripts/run",
+        headers=_HEADERS,
+        json={**payload, "config_snapshot": snapshot},
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+    status_url = f"/api/sandbox-runner/scripts/{_LIVE_SCRIPT_RUN_ID}"
+    status_params = {"worker_key": payload["worker_key"]}
+    deadline = time.monotonic() + 5
+    status = client.get(status_url, headers=_HEADERS, params=status_params)
+    while status.json()["state"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = client.get(status_url, headers=_HEADERS, params=status_params)
+    assert status.json()["state"] == "exited"
+    assert status.json()["exit_code"] == 0
+    assert (private_workspace / "result.txt").read_text(encoding="utf-8") == "live"
+
+
+def test_worker_script_enforces_snapshot_agent_visibility(
+    seeded_script_worker: tuple[TestClient, dict[str, object], Path],
+    tmp_path: Path,
+) -> None:
+    """The snapshot decides whether the agent is private, so a private launch for a now-shared agent is refused."""
+    client, payload, private_workspace = seeded_script_worker
+
+    response = client.post(
+        "/api/sandbox-runner/scripts/run",
+        headers=_HEADERS,
+        json={**payload, "config_snapshot": _live_primary_script_snapshot(tmp_path, private=False)},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Script state scope does not match private-agent visibility."
+    assert not (private_workspace / "result.txt").exists()
+
+
+def test_worker_script_rejects_invalid_config_snapshot(
+    seeded_script_worker: tuple[TestClient, dict[str, object], Path],
+    tmp_path: Path,
+) -> None:
+    """An invalid snapshot is rejected instead of falling back to the worker's seed config."""
+    client, payload, _private_workspace = seeded_script_worker
+    snapshot = _live_primary_script_snapshot(tmp_path, private=True)
+    agents = snapshot["agents"]
+    assert isinstance(agents, dict)
+    agents["watcher"]["file_access"] = "everything"
+
+    response = client.post(
+        "/api/sandbox-runner/scripts/run",
+        headers=_HEADERS,
+        json={**payload, "config_snapshot": snapshot},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Invalid config_snapshot:")

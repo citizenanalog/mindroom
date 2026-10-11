@@ -27,6 +27,7 @@ from tests.conftest import (
     test_runtime_paths,
 )
 from tests.identity_helpers import persist_entity_accounts
+from tests.response_attempt_helpers import install_direct_response_admission
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -76,6 +77,7 @@ def setup_test_bot(
         rooms=[room_id],
         enable_streaming=enable_streaming,
     )
+    install_direct_response_admission(bot)
     bot.client = _make_matrix_client_mock()
     install_runtime_journal_support(bot)
     bot._turn_controller.deps.resolver.dispatch_thread_snapshot = AsyncMock(
@@ -178,6 +180,7 @@ class TestStreamingEdits:
         edit_event1.sender = "@user:localhost"
         edit_event1.body = "* @mindroom_calculator:localhost: What's 2+2? Can you show the work?"
         edit_event1.event_id = "$edit1"
+        edit_event1.server_timestamp = 1000
         edit_event1.source = {
             "content": {
                 "body": "* @mindroom_calculator:localhost: What's 2+2? Can you show the work?",
@@ -205,6 +208,7 @@ class TestStreamingEdits:
         edit_event2.sender = "@user:localhost"
         edit_event2.body = "* @mindroom_calculator:localhost: What's 2+2? Can you show the work step by step?"
         edit_event2.event_id = "$edit2"
+        edit_event2.server_timestamp = 2000
         edit_event2.source = {
             "content": {
                 "body": "* @mindroom_calculator:localhost: What's 2+2? Can you show the work step by step?",

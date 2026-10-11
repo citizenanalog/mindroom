@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from agno.session.agent import AgentSession
     from agno.session.team import TeamSession
 
-    from mindroom.history.runtime import ScopeSessionContext
+    from mindroom.history.session_context import ScopeSessionContext
 
 _INTERRUPTED_REPLAY_STATE_KEY = "mindroom_replay_state"
 _ORIGINAL_STATUS_KEY = "mindroom_original_status"
@@ -188,6 +188,25 @@ def _render_interrupted_replay_content(snapshot: InterruptedReplaySnapshot) -> s
     if retained_tool_context:
         parts.append(retained_tool_context)
     return "\n\n".join(parts)
+
+
+def render_stopped_attempt(
+    *,
+    partial_text: str,
+    completed_tools: Sequence[ToolTraceEntry],
+    interrupted_tools: Sequence[ToolTraceEntry],
+) -> str:
+    """Render what one stopped attempt showed, worded as its interrupted replay record would be."""
+    return _render_interrupted_replay_content(
+        build_interrupted_replay_snapshot(
+            user_message=None,
+            user_message_is_structured=False,
+            partial_text=partial_text,
+            completed_tools=completed_tools,
+            interrupted_tools=interrupted_tools,
+            run_metadata=None,
+        ),
+    )
 
 
 def _interrupted_replay_metadata(snapshot: InterruptedReplaySnapshot) -> dict[str, Any]:

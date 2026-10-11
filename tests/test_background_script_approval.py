@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Literal
 
 import pytest
 
-from mindroom.approval_manager import _ApprovalManager
+from mindroom.approval.manager import ApprovalManager
+from mindroom.approval.tool_approval import BackgroundScriptToolOrigin
 from mindroom.config.agent import AgentConfig
 from mindroom.event_journal import (
     ApprovalCardReservation,
@@ -21,7 +22,6 @@ from mindroom.event_journal import (
 )
 from mindroom.script_runs.broker import ScriptToolBroker, ScriptToolCallRequest
 from mindroom.script_runs.models import ScriptCallState, ScriptToolGrant
-from mindroom.tool_approval import BackgroundScriptToolOrigin
 from tests.conftest import test_runtime_paths
 from tests.journal_membership_helpers import admit_room_membership
 from tests.test_script_run_manager import _context as _manager_context
@@ -31,9 +31,19 @@ from tests.test_script_tool_broker import _call_through_gateway, _RuntimeResolve
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from mindroom.event_journal.store import PrincipalStore
+
+# A background approval waiter rereads its durable decision once a second, so a
+# settlement can take a whole poll interval to reach it.
+_SETTLED_DECISION_WAIT_SECONDS = 5.0
+
 
 @pytest.mark.asyncio
-async def test_launch_preapproval_does_not_expand_from_live_script_config(tmp_path: Path) -> None:
+@pytest.mark.parametrize("worker_tools", [[], None], ids=["explicit-local", "missing-static-proxy"])
+async def test_launch_preapproval_does_not_expand_from_live_script_config(
+    tmp_path: Path,
+    worker_tools: list[str] | None,
+) -> None:
     """A live allowlist added after launch cannot bypass Matrix approval."""
     manager, _backend, worker_client = _manager(tmp_path)
     launch_context = _manager_context(tmp_path)
@@ -44,6 +54,8 @@ async def test_launch_preapproval_does_not_expand_from_live_script_config(tmp_pa
     live_watcher = AgentConfig(
         display_name="Watcher",
         worker_scope="user_agent",
+        # Tool routing remains independent of the faked script-process worker.
+        worker_tools=worker_tools,
         tools=["calculator", {"script": {"allowed_tools": ["calculator"]}}],
     )
     live_config = launch_context.config.model_copy(
@@ -69,8 +81,17 @@ async def test_launch_preapproval_does_not_expand_from_live_script_config(tmp_pa
 
     receipt = await _call_through_gateway(broker, request, token_path.read_text(encoding="utf-8"))
 
-    assert receipt.state is ScriptCallState.COMPLETED
     assert approval_events == [f"approval:{durable_run.run_id}:live-allowlist"]
+    if worker_tools is None:
+        assert receipt.state is ScriptCallState.FAILED
+        assert receipt.error == {
+            "kind": "tool_failure",
+            "message": "MINDROOM_SANDBOX_PROXY_URL must be set when sandbox proxying is enabled.",
+            "retryable": False,
+        }
+    else:
+        assert receipt.state is ScriptCallState.COMPLETED
+        assert receipt.result == '{"operation": "addition", "result": 3}'
 
 
 def _origin(*, run_id: str = "run-1", call_id: str = "call-1") -> BackgroundScriptToolOrigin:
@@ -90,7 +111,7 @@ async def _approval_manager(
     fail_final: bool = False,
     unique_event_ids: bool = False,
     expected_initial_count: int = 1,
-) -> tuple[_ApprovalManager, EventJournalStore, asyncio.Event]:
+) -> tuple[ApprovalManager, EventJournalStore, asyncio.Event]:
     journal = EventJournalStore.open_sqlite(tmp_path / database_name)
     cards = journal.principal("router@shared")
     initial_sent = asyncio.Event()
@@ -115,7 +136,7 @@ async def _approval_manager(
             raise RuntimeError(message)
         return f"$terminal:{delivery.delivery_id}" if unique_event_ids else "$terminal"
 
-    manager = _ApprovalManager(
+    manager = ApprovalManager(
         test_runtime_paths(tmp_path),
         prepare_event=prepare_event,
         send_delivery=send,
@@ -178,11 +199,30 @@ async def test_background_approval_fails_closed_when_room_departure_is_fenced(tm
     ["approved", "denied"],
 )
 async def test_background_script_approval_uses_exact_matrix_actor_and_first_decision(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     status: Literal["approved", "denied"],
 ) -> None:
     """Only the exact Matrix actor can commit the first decision for one call."""
     manager, journal, initial_sent = await _approval_manager(tmp_path)
+    cards = journal.principal("router@shared")
+    read_started = asyncio.Event()
+    decision_committed = asyncio.Event()
+    original_read = type(cards).background_approval_decision
+    decision_task: asyncio.Task[BackgroundApprovalDecision] | None = None
+
+    async def read_after_commit(
+        principal: PrincipalStore,
+        *,
+        run_id: str,
+        call_id: str,
+    ) -> BackgroundApprovalDecision | None:
+        if asyncio.current_task() is decision_task and principal is manager.cards:
+            read_started.set()
+            await decision_committed.wait()
+        return await original_read(principal, run_id=run_id, call_id=call_id)
+
+    monkeypatch.setattr(type(cards), "background_approval_decision", read_after_commit)
     decision_task = asyncio.create_task(
         manager.request_background_approval(
             origin=_origin(),
@@ -197,8 +237,9 @@ async def test_background_script_approval_uses_exact_matrix_actor_and_first_deci
         ),
     )
     try:
-        await asyncio.wait_for(initial_sent.wait(), timeout=1.0)
+        await initial_sent.wait()
         stored = await _wait_for_pending_card(journal)
+        await read_started.wait()
         assert stored.target_kind == "background_script"
         wrong_actor = await manager.handle_card_response(
             room_id="!room:localhost",
@@ -210,6 +251,7 @@ async def test_background_script_approval_uses_exact_matrix_actor_and_first_deci
         )
         assert wrong_actor.consumed is False
         assert decision_task.done() is False
+        assert await cards.background_approval_decision(run_id="run-1", call_id="call-1") is None
 
         result = await manager.handle_card_response(
             room_id="!room:localhost",
@@ -220,8 +262,12 @@ async def test_background_script_approval_uses_exact_matrix_actor_and_first_deci
             authorize_responder=lambda _entity_name: True,
         )
         assert result.consumed is True
-        assert result.resolved is True
-        decision = await asyncio.wait_for(decision_task, timeout=1.0)
+        committed = await cards.background_approval_decision(run_id="run-1", call_id="call-1")
+        assert committed is not None
+        assert committed.status == status
+        assert committed.reason == "operator decision"
+        decision_committed.set()
+        decision = await decision_task
         assert decision.status == status
         assert decision.reason == "operator decision"
         assert await journal.principal("router@shared").is_terminal_approval_card(
@@ -237,7 +283,6 @@ async def test_background_script_approval_uses_exact_matrix_actor_and_first_deci
             authorize_responder=lambda _entity_name: True,
         )
         assert repeated.consumed is True
-        assert repeated.resolved is False
         persisted = await journal.principal("router@shared").background_approval_decision(
             run_id="run-1",
             call_id="call-1",
@@ -338,7 +383,7 @@ async def test_cancelled_background_call_is_denied_retired_and_pruned_with_run(t
             _origin(),
             reason="Background script ownership was cancelled.",
         )
-        decision = await asyncio.wait_for(decision_task, timeout=1.0)
+        decision = await asyncio.wait_for(decision_task, timeout=_SETTLED_DECISION_WAIT_SECONDS)
 
         assert settled is True
         assert decision.status == "denied"
@@ -439,7 +484,7 @@ async def test_run_settlement_denies_only_pending_calls_without_revisiting_histo
             "run-1",
             reason="Background script ownership was cancelled.",
         )
-        decision = await asyncio.wait_for(pending_run_task, timeout=1.0)
+        decision = await asyncio.wait_for(pending_run_task, timeout=_SETTLED_DECISION_WAIT_SECONDS)
 
         assert settled == 1
         assert decision.status == "denied"

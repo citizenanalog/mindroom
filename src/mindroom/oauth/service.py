@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.oauth.credential_binding import (
     OAuthCredentialBinding,
     OAuthCredentialBindingParseError,
@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 OAUTH_CONNECT_TOKEN_TTL_MINUTES = 10
 OAUTH_ACCESS_REJECTED_REASON = "access_rejected"
-OAUTH_REFRESH_FAILED_REASON = "refresh_failed"
 OAUTH_REFRESH_REJECTED_REASON = "refresh_rejected"
 OAUTH_MISSING_WRITE_SCOPE_REASON = "missing_write_scope"
 OAUTH_RESET_REQUIRED_REASON = "reset_required"
@@ -38,17 +37,18 @@ _OAUTH_CONNECT_TOKEN_KIND = "conversation_oauth_connect"  # noqa: S105
 _GOOGLE_SERVICE_ACCOUNT_PROVIDER_IDS = frozenset(
     {
         "google_calendar",
+        "google_cloud",
         "google_docs",
         "google_drive",
         "google_gmail",
         "google_sheets",
+        "google_tasks",
     },
 )
 __all__ = [
     "OAUTH_ACCESS_REJECTED_REASON",
     "OAUTH_CONNECT_TOKEN_TTL_MINUTES",
     "OAUTH_MISSING_WRITE_SCOPE_REASON",
-    "OAUTH_REFRESH_FAILED_REASON",
     "OAUTH_REFRESH_REJECTED_REASON",
     "OAUTH_RESET_REQUIRED_REASON",
     "OAuthConnectTarget",
@@ -296,7 +296,7 @@ def oauth_connection_required(
     if reason == OAUTH_RESET_REQUIRED_REASON:
         instruction = (
             f"{context.provider.display_name} credentials for this requester cannot be read. "
-            "Use the authenticated MindRoom dashboard's Integrations page to reset this provider connection, "
+            "Use the Tools tab of the authenticated MindRoom dashboard to reset this provider connection, "
             "then reconnect and retry the request."
         )
         return OAuthConnectionRequired(
@@ -312,12 +312,6 @@ def oauth_connection_required(
     )
     if reason in {OAUTH_ACCESS_REJECTED_REASON, OAUTH_REFRESH_REJECTED_REASON}:
         instruction = build_oauth_reconnect_instruction(context.provider, connect_url, retry_safe=retry_safe)
-    elif reason == OAUTH_REFRESH_FAILED_REASON:
-        instruction = (
-            f"{context.provider.display_name} OAuth session for this agent could not be refreshed. "
-            "Retry the request. If refresh continues to fail, reconnect with this MindRoom link, then retry: "
-            f"{connect_url}"
-        )
     elif reason == OAUTH_MISSING_WRITE_SCOPE_REASON:
         instruction = (
             f"{context.provider.display_name} reconnect required to grant write access. "

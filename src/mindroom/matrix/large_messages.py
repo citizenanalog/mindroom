@@ -11,13 +11,11 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 import nio
-from nio import crypto
 
 from mindroom.constants import (
+    ACTING_REQUESTER_KEY,
     AI_RUN_METADATA_KEY,
     ATTACHMENT_IDS_KEY,
-    DURABLE_FINAL_OUTCOME_KEY,
-    DURABLE_FINAL_OUTCOME_VERSION,
     HOOK_MESSAGE_RECEIVED_DEPTH_KEY,
     HOOK_SOURCE_KEY,
     ORIGINAL_SENDER_KEY,
@@ -34,9 +32,10 @@ from mindroom.constants import (
     VOICE_RAW_AUDIO_FALLBACK_KEY,
     VOICE_TRANSCRIPT_KEY,
 )
+from mindroom.legacy_delivery_payloads import DURABLE_FINAL_OUTCOME_KEY, without_inline_final_result
 from mindroom.logging_config import get_logger
 from mindroom.matrix.encrypted_event_metadata import encryption_visible_metadata
-from mindroom.matrix.media import upload_content_uri, upload_media_bytes
+from mindroom.matrix.media import prepare_media_upload, upload_content_uri, upload_media_bytes
 from mindroom.matrix.message_builder import markdown_to_html
 
 if TYPE_CHECKING:
@@ -46,11 +45,12 @@ logger = get_logger(__name__)
 
 # Conservative limits accounting for Matrix overhead
 _NORMAL_MESSAGE_LIMIT = 55000  # ~55KB for regular messages
-_EDIT_MESSAGE_LIMIT = 27000  # ~27KB for edits (they roughly double in size)
+EDIT_MESSAGE_SIZE_LIMIT = 27000  # ~27KB for edits (they roughly double in size)
 _LARGE_MESSAGE_PREVIEW_OVERHEAD_BYTES = 5000  # Reserve room for Matrix relation and preview metadata.
 _PASSTHROUGH_CONTENT_KEYS = frozenset(
     {
         "m.mentions",
+        ACTING_REQUESTER_KEY,
         HOOK_SOURCE_KEY,
         SKIP_MENTIONS_KEY,
         SOURCE_KIND_KEY,
@@ -82,7 +82,8 @@ _MEGOLM_MAX_MESSAGE_INDEX_VARINT_BYTES = 5
 _MEGOLM_BASE64_KEY_LENGTH = 43
 _UNREPRESENTABLE_MESSAGE_ERROR = "Large message cannot fit within the Matrix event limit after sidecar preparation"
 _OVERSIZED_NONTERMINAL_STREAMING_EDIT_MIN_INTERVAL_SECONDS = 5.0
-_oversized_nonterminal_streaming_edit_sent_at: dict[tuple[str, str], float] = {}
+_OVERSIZED_NONTERMINAL_STREAMING_EDIT_BYTES_PER_SECOND = 4096
+_oversized_nonterminal_streaming_edit_next_allowed_at: dict[tuple[str, str], float] = {}
 
 
 class MatrixEventTooLargeError(ValueError):
@@ -151,32 +152,6 @@ def _wrap_large_edit(
 def _copy_inline_streaming_preview_metadata(source_content: dict[str, Any], target_content: dict[str, Any]) -> None:
     """Copy metadata that should remain inline on rich streaming previews."""
     _copy_preview_metadata(source_content, target_content)
-
-
-def _without_local_recovery_data(content: dict[str, Any]) -> dict[str, Any]:
-    """Return event content without semantic results that belong only in the outbox."""
-    replacement = content.get("m.new_content")
-    compatibility_marker = {"version": DURABLE_FINAL_OUTCOME_VERSION}
-    outer_has_result = (
-        DURABLE_FINAL_OUTCOME_KEY in content and content[DURABLE_FINAL_OUTCOME_KEY] != compatibility_marker
-    )
-    nested_has_result = (
-        isinstance(replacement, dict)
-        and DURABLE_FINAL_OUTCOME_KEY in replacement
-        and replacement[DURABLE_FINAL_OUTCOME_KEY] != compatibility_marker
-    )
-    if not outer_has_result and not nested_has_result:
-        return content
-
-    sanitized = dict(content)
-    if outer_has_result:
-        sanitized.pop(DURABLE_FINAL_OUTCOME_KEY, None)
-    if isinstance(replacement, dict):
-        sanitized_replacement = dict(replacement)
-        if nested_has_result:
-            sanitized_replacement.pop(DURABLE_FINAL_OUTCOME_KEY, None)
-        sanitized["m.new_content"] = sanitized_replacement
-    return sanitized
 
 
 def _room_is_encrypted(client: nio.AsyncClient, room_id: str | None) -> bool:
@@ -316,11 +291,11 @@ def _is_nonterminal_stream_content(content: dict[str, Any]) -> bool:
 def _prune_expired_oversized_nonterminal_streaming_edit_rate_limits(now: float) -> None:
     expired_keys = [
         key
-        for key, sent_at in _oversized_nonterminal_streaming_edit_sent_at.items()
-        if now - sent_at >= _OVERSIZED_NONTERMINAL_STREAMING_EDIT_MIN_INTERVAL_SECONDS
+        for key, next_allowed_at in _oversized_nonterminal_streaming_edit_next_allowed_at.items()
+        if now >= next_allowed_at
     ]
     for key in expired_keys:
-        _oversized_nonterminal_streaming_edit_sent_at.pop(key, None)
+        _oversized_nonterminal_streaming_edit_next_allowed_at.pop(key, None)
 
 
 def should_send_oversized_nonterminal_streaming_edit(
@@ -329,23 +304,30 @@ def should_send_oversized_nonterminal_streaming_edit(
     original_event_id: str,
     edit_content: dict[str, Any],
 ) -> bool:
-    """Return whether one oversized non-terminal streaming edit may be sent now."""
+    """Return whether one oversized non-terminal streaming edit may be sent now, at a size-proportional cadence."""
     if not original_event_id or not is_edit_message(edit_content):
         return True
 
     source_content = edit_content.get("m.new_content")
     if not isinstance(source_content, dict) or not _is_nonterminal_stream_content(source_content):
         return True
-    if calculate_event_size(edit_content) <= _EDIT_MESSAGE_LIMIT:
+
+    event_size = calculate_event_size(edit_content)
+    if event_size <= EDIT_MESSAGE_SIZE_LIMIT:
         return True
 
     key = (room_id, original_event_id)
     now = monotonic()
     _prune_expired_oversized_nonterminal_streaming_edit_rate_limits(now)
-    last_sent_at = _oversized_nonterminal_streaming_edit_sent_at.get(key)
-    if last_sent_at is not None and now - last_sent_at < _OVERSIZED_NONTERMINAL_STREAMING_EDIT_MIN_INTERVAL_SECONDS:
+    if key in _oversized_nonterminal_streaming_edit_next_allowed_at:
         return False
-    _oversized_nonterminal_streaming_edit_sent_at[key] = now
+    # Each allowed oversized edit uploads a fresh full-content sidecar, so the
+    # wait grows with its size and bounds the average upload rate per stream.
+    min_interval = max(
+        _OVERSIZED_NONTERMINAL_STREAMING_EDIT_MIN_INTERVAL_SECONDS,
+        event_size / _OVERSIZED_NONTERMINAL_STREAMING_EDIT_BYTES_PER_SECOND,
+    )
+    _oversized_nonterminal_streaming_edit_next_allowed_at[key] = now + min_interval
     return True
 
 
@@ -616,10 +598,6 @@ async def _upload_text_as_mxc(
 
     """
     text_bytes = text.encode("utf-8")
-    file_info = {
-        "size": len(text_bytes),
-        "mimetype": mimetype,
-    }
 
     if mimetype == "text/html":
         filename = "message.html"
@@ -631,36 +609,20 @@ async def _upload_text_as_mxc(
     if room_encrypted is None:
         room_encrypted = _room_is_encrypted(client, room_id)
 
-    if room_encrypted:
-        # Encrypt the content for E2EE room
-        try:
-            upload_data, encryption_keys = crypto.attachments.encrypt_attachment(text_bytes)
-
-            # Store encryption info for the file
-            file_info = {
-                "url": "",  # Will be set after upload
-                "key": encryption_keys["key"],
-                "iv": encryption_keys["iv"],
-                "hashes": encryption_keys["hashes"],
-                "v": "v2",
-                "mimetype": mimetype,
-                "size": len(text_bytes),
-            }
-        except Exception:
-            logger.exception("Failed to encrypt attachment")
-            return None, None
-    else:
-        upload_data = text_bytes
-
-    enc_filename = f"{filename}.enc" if room_encrypted else filename
+    try:
+        prepared = prepare_media_upload(text_bytes, filename=filename, mimetype=mimetype, encrypt=room_encrypted)
+        file_info = prepared.encrypted_file_content(url="") or prepared.info()
+    except Exception:
+        logger.exception("Failed to encrypt attachment")
+        return None, None
 
     try:
         # nio.upload returns Tuple[Union[UploadResponse, UploadError], Optional[Dict[str, Any]]]
         upload_result, _encryption_dict = await upload_media_bytes(
             client,
-            upload_data,
-            content_type="application/octet-stream" if room_encrypted else mimetype,
-            filename=enc_filename,
+            prepared.data,
+            content_type=prepared.content_type,
+            filename=prepared.filename,
         )
 
         # Check if upload was successful
@@ -904,9 +866,9 @@ async def prepare_large_message(
         when this coroutine completed without yielding.
 
     """
-    content = _without_local_recovery_data(content)
+    content = without_inline_final_result(content)
     is_edit = is_edit_message(content)
-    size_limit = _EDIT_MESSAGE_LIMIT if is_edit else _NORMAL_MESSAGE_LIMIT
+    size_limit = EDIT_MESSAGE_SIZE_LIMIT if is_edit else _NORMAL_MESSAGE_LIMIT
     if room_encrypted is None:
         room_encrypted = _room_is_encrypted(client, room_id)
     encrypted_delivery_safe = room_encrypted or prepare_for_encrypted_delivery

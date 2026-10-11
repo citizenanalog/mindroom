@@ -5,21 +5,23 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from contextvars import ContextVar
-from dataclasses import dataclass
 from functools import wraps
 from html import unescape
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from agno.tools import github as agno_github_module
 from agno.tools.github import GithubTools as AgnoGithubTools
-from agno.utils import log as agno_log_module
 from github import Auth, Github, GithubException
 from github.GithubRetry import GithubRetry
 from github.Requester import Requester
 
 from mindroom.config.main import Config  # noqa: TC001  # resolved by tool contract introspection
-from mindroom.credentials import CredentialsManager  # noqa: TC001  # resolved by tool contract introspection
+from mindroom.credentials.manager import CredentialsManager  # noqa: TC001  # resolved by tool contract introspection
+from mindroom.custom_tools.agno_compat_github_errors import (
+    call_with_provider_failure_capture,
+    install_provider_log_filter,
+    is_provider_detail_log,
+    record_provider_failure,
+)
 from mindroom.logging_config import get_logger
 from mindroom.oauth.client import active_oauth_credential_context
 from mindroom.oauth.credential_lifecycle import (
@@ -58,28 +60,14 @@ logger = get_logger(__name__)
 _PENDING_ACCESS_TOKEN = "mindroom-oauth-connection-pending"  # noqa: S105
 _SANITIZED_OAUTH_REFRESH_ERROR_MESSAGE = "OAuth credential refresh failed"
 _SANITIZED_GITHUB_PROVIDER_ERROR_MESSAGE = "GitHub request failed"
-_AGNO_GITHUB_PROVIDER_DETAIL_LOG_PREFIXES = (
-    "Error getting actual open issues:",
-    "Error getting open PRs count:",
-    "Error processing individual PR:",
-    "Error getting recent open PRs:",
-    "Error calculating PR metrics:",
-    "Error getting contributors:",
-    "Error decoding file content:",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _GithubProviderFailure:
-    """Typed provider failure captured before Agno serializes the exception."""
-
-    status_code: int | None
-
-
-_github_provider_failure: ContextVar[_GithubProviderFailure | None] = ContextVar(
-    "github_provider_failure",
-    default=None,
-)
+# Fixed hints stand in for provider-controlled error text, which never reaches the agent.
+_GITHUB_PROVIDER_STATUS_HINTS = {
+    403: "this GitHub connection lacks permission for the request, or GitHub rate-limited it",
+    404: (
+        "the requested repository, ref, path, issue, or other resource does not exist, "
+        "or this GitHub connection cannot access it"
+    ),
+}
 
 
 def _github_exception_status_code(exc: GithubException) -> int | None:
@@ -89,8 +77,18 @@ def _github_exception_status_code(exc: GithubException) -> int | None:
     return None
 
 
+def _github_provider_error_result(status_code: int | None) -> str:
+    if status_code is None:
+        return json.dumps({"error": _SANITIZED_GITHUB_PROVIDER_ERROR_MESSAGE})
+    message = f"{_SANITIZED_GITHUB_PROVIDER_ERROR_MESSAGE} with HTTP {status_code}"
+    hint = _GITHUB_PROVIDER_STATUS_HINTS.get(status_code)
+    if hint is not None:
+        message = f"{message}: {hint}"
+    return json.dumps({"error": message})
+
+
 def _record_github_provider_failure(exc: GithubException) -> None:
-    _github_provider_failure.set(_GithubProviderFailure(_github_exception_status_code(exc)))
+    record_provider_failure(_github_exception_status_code(exc))
 
 
 class _GithubProviderFailureRequester(Requester):
@@ -183,27 +181,13 @@ class _SanitizeGithubProviderLogFilter(logging.Filter):
                 record.exc_info = None
                 record.exc_text = None
                 record.stack_info = None
-        elif isinstance(record.msg, str) and record.msg.startswith(_AGNO_GITHUB_PROVIDER_DETAIL_LOG_PREFIXES):
+        elif is_provider_detail_log(record):
             record.msg = "GitHub provider detail suppressed"
             record.args = ()
         return True
 
 
-def _install_github_log_sanitizers() -> None:
-    upstream_loggers = {
-        agno_github_module.logger,
-        agno_log_module.logger,
-        agno_log_module.agent_logger,
-        agno_log_module.team_logger,
-        agno_log_module.workflow_logger,
-        logging.getLogger("github.GithubRetry"),
-    }
-    for upstream_logger in upstream_loggers:
-        if not any(isinstance(log_filter, _SanitizeGithubProviderLogFilter) for log_filter in upstream_logger.filters):
-            upstream_logger.addFilter(_SanitizeGithubProviderLogFilter())
-
-
-_install_github_log_sanitizers()
+install_provider_log_filter(_SanitizeGithubProviderLogFilter, retry_logger=logging.getLogger("github.GithubRetry"))
 
 
 class _GithubThreadState(threading.local):
@@ -234,17 +218,7 @@ def _normalized_access_token(value: object) -> str | None:
 
 def _sanitized_github_exception_result(exc: GithubException) -> str:
     _record_github_provider_failure(exc)
-    return json.dumps({"error": _SANITIZED_GITHUB_PROVIDER_ERROR_MESSAGE})
-
-
-def _is_serialized_github_error_result(result: object) -> bool:
-    if not isinstance(result, str):
-        return False
-    try:
-        payload = json.loads(result)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(payload, dict) and set(payload) == {"error"} and isinstance(payload["error"], str)
+    return _github_provider_error_result(_github_exception_status_code(exc))
 
 
 class GithubTools(AgnoGithubTools):
@@ -389,13 +363,8 @@ class GithubTools(AgnoGithubTools):
                     self._ensure_authenticated()
                 except OAuthConnectionRequired as exc:
                     return json.dumps(oauth_connection_required_payload(exc))
-                failure_token = _github_provider_failure.set(None)
-                try:
-                    result = _entrypoint(*args, **kwargs)
-                    provider_failure = _github_provider_failure.get()
-                finally:
-                    _github_provider_failure.reset(failure_token)
-                if provider_failure is None or not _is_serialized_github_error_result(result):
+                result, provider_failure = call_with_provider_failure_capture(_entrypoint, *args, **kwargs)
+                if provider_failure is None:
                     return result
                 status_code = provider_failure.status_code
                 logger.warning(
@@ -411,7 +380,7 @@ class GithubTools(AgnoGithubTools):
                             self._connection_required(reason=OAUTH_ACCESS_REJECTED_REASON),
                         ),
                     )
-                return json.dumps({"error": _SANITIZED_GITHUB_PROVIDER_ERROR_MESSAGE})
+                return _github_provider_error_result(status_code)
 
             function.entrypoint = oauth_entrypoint
             setattr(self, function.name, oauth_entrypoint)
@@ -565,7 +534,8 @@ class GithubTools(AgnoGithubTools):
         """Search for issues and pull requests while restoring escaped operators."""
         return super().search_issues_and_prs(
             query=unescape(query),
-            state=state,
+            # GitHub search has no state:all qualifier and returns nothing for it.
+            state=None if state == "all" else state,
             type_filter=type_filter,
             repo=repo,
             user=user,

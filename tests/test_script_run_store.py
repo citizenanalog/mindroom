@@ -55,6 +55,20 @@ def _new_run(*, token_hash: str | None = None) -> ScriptRunRecord:
     )
 
 
+def test_run_store_preserves_recovery_contract_across_reopen(runtime_paths: RuntimePaths) -> None:
+    """Restart can recover the launch contract without granting recovery to older rows."""
+    store = ScriptRunStore(runtime_paths)
+    recoverable = replace(_new_run(), recovery_signature="launch-contract-digest")
+    legacy = replace(_new_run(), run_id="legacy-run")
+    store.create_run(recoverable)
+    store.create_run(legacy)
+
+    reopened = ScriptRunStore(runtime_paths)
+
+    assert reopened.get_run(recoverable.run_id).recovery_signature == "launch-contract-digest"
+    assert reopened.get_run(legacy.run_id).recovery_signature is None
+
+
 def test_run_store_claims_one_logical_call_once(runtime_paths: RuntimePaths) -> None:
     """A retry with the same logical call returns its original claim."""
     store = ScriptRunStore(runtime_paths)
@@ -124,29 +138,43 @@ def test_run_store_migrates_existing_table_for_resource_snapshots(runtime_paths:
         connection.execute(
             """
             INSERT INTO script_runs (
-                run_id, agent_name, owner_user_id, room_id,
+                run_id, agent_name, owner_user_id, room_id, thread_root_event_id,
                 execution_identity_json, source_digest, grants_json, token_hash,
-                preapprove_launch_grants, local_unsafe,
+                preapprove_launch_grants, worker_key, worker_id, worker_backend_locator,
+                snapshot_locator, name, local_unsafe,
                 max_tool_calls_per_minute, max_runtime_seconds,
-                state, created_at, output
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                state, created_at, started_at, finished_at, exit_code, error, output,
+                cancel_requested_at, cancellation_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "legacy-run",
                 "watcher",
                 "@alice:example.test",
                 "!room:example.test",
-                "{}",
+                "$thread-root",
+                '{"requester_id":"@alice:example.test"}',
                 "source-digest",
-                "[]",
+                '[["website","read_url"]]',
                 "capability-digest",
-                0,
-                0,
-                30,
-                3600,
-                "starting",
+                1,
+                "worker-key",
+                "worker-id",
+                "sandbox://worker",
+                "snapshot://legacy",
+                "Nightly check",
+                1,
+                17,
+                3_600,
+                "exited",
                 "2026-08-20T00:00:00Z",
-                "",
+                "2026-08-20T00:00:01Z",
+                "2026-08-20T00:00:10Z",
+                0,
+                None,
+                "legacy output",
+                None,
+                None,
             ),
         )
         connection.commit()
@@ -155,8 +183,35 @@ def test_run_store_migrates_existing_table_for_resource_snapshots(runtime_paths:
 
     store = ScriptRunStore(runtime_paths)
     legacy = store.get_run("legacy-run")
+    expected_legacy = ScriptRunRecord(
+        run_id="legacy-run",
+        agent_name="watcher",
+        owner_user_id="@alice:example.test",
+        room_id="!room:example.test",
+        thread_root_event_id="$thread-root",
+        execution_identity={"requester_id": "@alice:example.test"},
+        source_digest="source-digest",
+        grants=(ScriptToolGrant("website", "read_url"),),
+        token_hash="capability-digest",  # noqa: S106
+        preapprove_launch_grants=True,
+        worker_key="worker-key",
+        worker_id="worker-id",
+        worker_backend_locator="sandbox://worker",
+        snapshot_locator="snapshot://legacy",
+        name="Nightly check",
+        local_unsafe=True,
+        max_tool_calls_per_minute=17,
+        max_runtime_seconds=3_600,
+        state=ScriptRunState.EXITED,
+        created_at="2026-08-20T00:00:00Z",
+        started_at="2026-08-20T00:00:01Z",
+        finished_at="2026-08-20T00:00:10Z",
+        exit_code=0,
+        output="legacy output",
+    )
     profiled = replace(
         _new_run(),
+        recovery_signature="new-worker-contract",
         resource_profile="standard",
         resource_requests={"cpu": "250m", "memory": "512Mi"},
         resource_limits={"cpu": "1", "memory": "2Gi"},
@@ -164,10 +219,11 @@ def test_run_store_migrates_existing_table_for_resource_snapshots(runtime_paths:
 
     store.create_run(profiled)
 
-    assert legacy.resource_profile is None
-    assert legacy.resource_requests == {}
-    assert legacy.resource_limits == {}
+    assert legacy == expected_legacy
     assert store.get_run(profiled.run_id) == profiled
+    reopened = ScriptRunStore(runtime_paths)
+    assert reopened.get_run("legacy-run") == expected_legacy
+    assert reopened.get_run(profiled.run_id) == profiled
 
 
 def test_write_transaction_closes_connection_when_begin_fails(
