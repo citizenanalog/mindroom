@@ -24,9 +24,9 @@ from mindroom.api.egress_status import (
     PresetsResponse,
     audit_logs_response,
     effective_services,
-    egress_oauth_provider,
     egress_oauth_status,
     egress_service_status,
+    oauth_provider_of_service,
     presets_response,
     rule_summaries,
     unavailable_egress_oauth_status,
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from mindroom.config.egress_broker import EgressService
     from mindroom.config.main import Config
     from mindroom.egress_broker.secrets import OAuthStatus
+    from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 router = APIRouter(prefix="/api/egress-broker", tags=["egress-broker"])
@@ -189,10 +190,19 @@ def _resolve_scope_and_service(
     return target, worker_target, service
 
 
-def _scope_worker_target(request: Request, agent_name: str | None) -> ResolvedWorkerTarget | None:
-    """Return the worker target of the selected scope, the one the status listing uses for the same service."""
+def _config_service_provider(request: Request, name: str, agent_name: str | None, *, connecting: bool) -> OAuthProvider:
+    """Return the OAuth provider of a config service for the connect and disconnect routes of the selected scope.
+
+    A service the config does not define is a 404; `oauth_provider_of_service` judges the rest for the scope's worker
+    target, the one the status listing uses for the same service.
+    """
     target = resolve_request_credentials_target(request, agent_name=agent_name)
-    return worker_target_for_credentials_target(target)
+    worker_target = worker_target_for_credentials_target(target)
+    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    service = config.egress_broker.services.get(name) if config is not None else None
+    if service is None:
+        raise HTTPException(404, "Service is not configured")
+    return oauth_provider_of_service(request, service, worker_target, connecting=connecting)
 
 
 @router.get("/services", response_model=ServicesResponse)
@@ -261,7 +271,7 @@ async def connect_service_account(
     replaces personal accounts for that provider or the scope's sandbox is shared by several requesters, where the
     broker never uses a requester's own account unless the service opts in.
     """
-    provider = egress_oauth_provider(request, name, _scope_worker_target(request, agent_name), connecting=True)
+    provider = _config_service_provider(request, name, agent_name, connecting=True)
     return await oauth.connect(provider.id, request, agent_name=agent_name)
 
 
@@ -275,7 +285,7 @@ async def disconnect_service_account(
 
     Raises 404 like the connect route, and 409 where the scope's sandbox is shared by several requesters.
     """
-    provider = egress_oauth_provider(request, name, _scope_worker_target(request, agent_name), connecting=False)
+    provider = _config_service_provider(request, name, agent_name, connecting=False)
     return await oauth.disconnect(provider.id, request, agent_name=agent_name)
 
 

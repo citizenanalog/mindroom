@@ -341,25 +341,6 @@ def service_oauth_provider(snapshot: ApiSnapshot, service: EgressService | None)
     return load_oauth_providers_for_snapshot(snapshot).get(service.oauth_provider)
 
 
-def egress_oauth_provider(
-    request: Request,
-    service_name: str,
-    worker_target: ResolvedWorkerTarget | None,
-    *,
-    connecting: bool,
-    headers: Mapping[str, str] | None = None,
-) -> OAuthProvider:
-    """Return the OAuth provider of a configured egress service for the admin connect and disconnect routes.
-
-    A service the config does not define is a 404; see `oauth_provider_of_service` for the rest.
-    """
-    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
-    service = config.egress_broker.services.get(service_name) if config is not None else None
-    if service is None:
-        raise HTTPException(404, "Service is not configured", headers=headers)
-    return oauth_provider_of_service(request, service, worker_target, connecting=connecting, headers=headers)
-
-
 def oauth_provider_of_service(
     request: Request,
     service: EgressService,
