@@ -4146,6 +4146,7 @@ depends_on = [
     "mindroom.background_tasks",
     "mindroom.logging_config",
     "mindroom.matrix_rtc.voice_agent",
+    "mindroom.timing",
 ]
 
 [[modules]]
