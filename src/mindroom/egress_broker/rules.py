@@ -105,8 +105,9 @@ class Route:
     def refusal_body(self, *, host: str, path: str, manage_url: str | None, scope: ScopeInfo) -> dict[str, object]:
         """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it.
 
-        On a shared or unscoped agent (`scope`), its message names who can change the limit instead of the user: the
-        agent's credential managers for one of the scope's own services, an administrator for the operator's.
+        Its message names who can change the limit: an administrator for the operator's service, whatever the scope,
+        and for one of the scope's own services the user on a personal agent, or on a shared or unscoped agent
+        (`scope`) its credential managers.
         """
         if self.refusal is None:
             msg = "Route is not refused."
@@ -120,8 +121,8 @@ class Route:
             service=self.restricted_by,
             service_label=self.restricted_by_label,
             shared=scope.shared,
-            # Without managers the shared text names an administrator, the only one who edits the operator's config.
-            managers=() if self.restricted_by_operator else scope.managers,
+            managers=scope.managers,
+            by_operator=self.restricted_by_operator,
             manage_url=manage_url,
         )
 

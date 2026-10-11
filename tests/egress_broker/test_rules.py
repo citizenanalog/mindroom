@@ -559,7 +559,7 @@ def test_a_restrict_only_service_never_injects() -> None:
 
 
 def test_shared_agent_refusal_names_an_administrator_for_an_operator_limit_and_managers_for_their_own() -> None:
-    """Managers can change a shared agent's own limit, but only an administrator the operator's restricting service."""
+    """Managers or the user can change the agent's own limit, but only an administrator the operator's service."""
     rules = _merged(
         {"op": EgressService(restrict_to_rules=True, display_name="Ops API", rules=[_rule("api.example.com", "/op")])},
         {"mine": _limit(_rule("api.example.com", "/op/mine"), display_name="My limit")},
@@ -582,8 +582,10 @@ def test_shared_agent_refusal_names_an_administrator_for_an_operator_limit_and_m
         "api.example.com/op/else is outside the paths My limit allows for this agent. "
         "Only its credential managers (@alice:example.org) can change this, at manage_url."
     )
-    # A personal agent's user is asked either way, as before.
+    # On a personal agent the user is asked to change their own limit, and an administrator the operator's.
     body = by_operator.refusal_body(host="api.example.com", path="/other", manage_url=None, scope=personal)
+    assert body["message"].endswith("Only an administrator can change this, at manage_url.")
+    body = by_user.refusal_body(host="api.example.com", path="/op/else", manage_url=None, scope=personal)
     assert body["message"].endswith("Ask the user to add it at manage_url if the agent needs it.")
 
 

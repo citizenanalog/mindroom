@@ -299,7 +299,7 @@ async def test_operator_restriction_refuses_paths_only_a_user_rule_lists(
             "service": "op",
             "manage_url": "https://m.test/connections/egress",
             "message": "localhost/echo is outside the paths op allows for this agent. "
-            "Ask the user to add it at manage_url if the agent needs it.",
+            "Only an administrator can change this, at manage_url.",
         },
     )
     assert allowed.status_code == 200
@@ -535,7 +535,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
         "service": "svc",
         "manage_url": "https://m.test/connections/egress",
         "message": "localhost/echo is outside the paths svc allows for this agent. "
-        "Ask the user to add it at manage_url if the agent needs it.",
+        "Only an administrator can change this, at manage_url.",
     }
     assert http_upstream.hits == []
     [record] = await audit_records(audit, 1)

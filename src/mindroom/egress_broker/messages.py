@@ -54,7 +54,7 @@ _SHARED_WITHOUT_MANAGERS = (
 )
 _PATH_OUTSIDE = "{host}{path} is outside the paths {service} allows for this agent. "
 _PATH_SHARED = _PATH_OUTSIDE + "Only its credential managers ({managers}) can change this, at manage_url."
-_PATH_SHARED_WITHOUT_MANAGERS = _PATH_OUTSIDE + "Only an administrator can change this, at manage_url."
+_PATH_ADMINISTRATOR = _PATH_OUTSIDE + "Only an administrator can change this, at manage_url."
 # The spec words `bad_request` for the ambiguous-path refusal; a request the broker cannot read at all has no path.
 _MALFORMED = "The request is malformed and was refused."
 
@@ -71,13 +71,23 @@ class ScopeInfo:
     managers: tuple[str, ...]
 
 
-def _template(code: str, *, path: str | None, managers: Sequence[str], shared: bool, connectable: bool) -> str:
+def _template(
+    code: str,
+    *,
+    path: str | None,
+    managers: Sequence[str],
+    shared: bool,
+    connectable: bool,
+    by_operator: bool,
+) -> str:
     if code == "credential_not_configured" and connectable:
         return _CONNECTABLE
     if code == "credential_not_configured" and shared:
         return _SHARED if managers else _SHARED_WITHOUT_MANAGERS
+    if code == "path_not_allowed" and (by_operator or (shared and not managers)):
+        return _PATH_ADMINISTRATOR
     if code == "path_not_allowed" and shared:
-        return _PATH_SHARED if managers else _PATH_SHARED_WITHOUT_MANAGERS
+        return _PATH_SHARED
     if code == "bad_request" and path is None:
         return _MALFORMED
     try:
@@ -98,6 +108,7 @@ def refusal_body(
     managers: Sequence[str] | None = None,
     shared: bool = False,
     connectable: bool = False,
+    by_operator: bool = False,
     **extra: object,
 ) -> dict[str, object]:
     """Return the JSON body for a refusal: its `error` code, `message`, `service` and `provider` when given, and `extra`.
@@ -106,11 +117,19 @@ def refusal_body(
     hold a secret, and `service_label` (a display name) names the service there instead of `service`.
     For `credential_not_configured`, `connectable` offers connecting an account as well as adding a key, and
     otherwise a `shared` scope names its `managers` (or an administrator when there are none); a `shared`
-    `path_not_allowed` names them as the ones who can change the limit. A `bad_request` with a `path` is the
-    ambiguous-path refusal; without one, the request itself was malformed. Raises ValueError for a code without a
-    text and KeyError when the text needs a value that was not given.
+    `path_not_allowed` names them as the ones who can change the limit. A `path_not_allowed` set by the operator's
+    service (`by_operator`) names an administrator whatever the scope, since only an administrator edits it.
+    A `bad_request` with a `path` is the ambiguous-path refusal; without one, the request itself was malformed.
+    Raises ValueError for a code without a text and KeyError when the text needs a value that was not given.
     """
-    template = _template(code, path=path, managers=managers or (), shared=shared, connectable=connectable)
+    template = _template(
+        code,
+        path=path,
+        managers=managers or (),
+        shared=shared,
+        connectable=connectable,
+        by_operator=by_operator,
+    )
     values = {
         "host": host,
         "path": None if path is None else path.split("?", 1)[0],

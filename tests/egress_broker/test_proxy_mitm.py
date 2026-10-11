@@ -366,7 +366,7 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
         "service": "svc",
         "manage_url": MANAGE_URL,
         "message": "localhost/ok is outside the paths svc allows for this agent. "
-        "Ask the user to add it at manage_url if the agent needs it.",
+        "Only an administrator can change this, at manage_url.",
     }
     assert tls_upstream.hits == ["/echo"]
     assert broker.resolved == ["svc"]

@@ -159,6 +159,34 @@ def test_path_not_allowed_names_the_display_name_and_on_shared_agents_who_can_ch
     assert {personal["service"], shared["service"], unmanaged["service"]} == {"github-limited"}
 
 
+@pytest.mark.parametrize(
+    ("shared", "managers"),
+    [(False, ()), (True, ("@alice:example.org",)), (True, ())],
+    ids=["personal", "shared-with-managers", "shared-without-managers"],
+)
+def test_path_not_allowed_by_the_operator_names_an_administrator_whatever_the_scope(
+    shared: bool,
+    managers: tuple[str, ...],
+) -> None:
+    """Only an administrator edits the operator's services, so neither the user nor the managers are sent to do it."""
+    body = refusal_body(
+        "path_not_allowed",
+        host="api.github.com",
+        path="/user",
+        service="github",
+        service_label="GitHub",
+        shared=shared,
+        managers=managers,
+        by_operator=True,
+    )
+
+    assert body["message"] == (
+        "api.github.com/user is outside the paths GitHub allows for this agent. "
+        "Only an administrator can change this, at manage_url."
+    )
+    assert set(body) == {"error", "service", "message"}
+
+
 def test_path_in_a_message_never_includes_the_query() -> None:
     """A query can hold a secret the client sent, so the message names the path without it."""
     body = refusal_body(
