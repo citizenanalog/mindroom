@@ -153,8 +153,8 @@ def test_query_string_is_never_stored(tmp_path: Path, log: AuditLog, sample_reco
     assert b"/v1/data" in db_bytes
 
 
-def test_filters_and_limit_clamp(log: AuditLog, sample_record: AuditRecord) -> None:
-    """Query filters work and limit is clamped to 1..1000."""
+def test_filters_and_limit(log: AuditLog, sample_record: AuditRecord) -> None:
+    """Query filters work and limit caps the number of records."""
     # Record several entries with different attributes
     now = datetime.now(UTC)
     for i in range(10):
@@ -191,16 +191,6 @@ def test_filters_and_limit_clamp(log: AuditLog, sample_record: AuditRecord) -> N
     results = log.query(agent_name="agent_0", host="host_0.example.com")
     assert len(results) > 0
     assert all(r.agent_name == "agent_0" and r.host == "host_0.example.com" for r in results)
-
-    # Test limit clamping
-    # Limit of 0 should be clamped to 1
-    results = log.query(limit=0)
-    assert len(results) == 1
-
-    # Limit of 2000 should be clamped to 1000
-    # (we only have 10 records, but verify the SQL query is constructed correctly)
-    results = log.query(limit=2000)
-    assert len(results) == 10  # all records since we only have 10
 
     # Normal limit
     results = log.query(limit=3)

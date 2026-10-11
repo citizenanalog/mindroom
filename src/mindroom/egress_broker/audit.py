@@ -45,14 +45,7 @@ class AuditLog:
         retention_days: int = 30,
         max_rows: int = 100_000,
     ) -> None:
-        """Initialize audit log at the given path.
-
-        Args:
-            path: Path to SQLite database file (created with mode 0600)
-            retention_days: Records older than this are pruned
-            max_rows: Maximum rows to keep after pruning by age
-
-        """
+        """Open or create the SQLite log at `path` (mode 0600); pruning keeps `retention_days` and `max_rows`."""
         self._path = path
         self._retention_days = retention_days
         self._max_rows = max_rows
@@ -102,15 +95,7 @@ class AuditLog:
         self._conn.commit()
 
     def record(self, rec: AuditRecord) -> None:
-        """Record an audit entry.
-
-        Query strings are stripped from the path before storage.
-        Prunes old records every 1000 inserts.
-
-        Args:
-            rec: Audit record to store
-
-        """
+        """Store `rec` without the path's query string; every 1000th insert prunes old records."""
         # Strip query string from path
         path_without_query = rec.path.split("?", 1)[0]
 
@@ -156,24 +141,7 @@ class AuditLog:
         service: str | None = None,
         limit: int = 200,
     ) -> list[AuditRecord]:
-        """Query audit records with optional filters.
-
-        Returns records newest first.
-
-        Args:
-            agent_name: Filter by agent name
-            requester_id: Filter by the requester the worker token carried, an exact match
-            host: Filter by host
-            service: Filter by service
-            limit: Maximum records to return (clamped to 1..1000)
-
-        Returns:
-            List of audit records, newest first
-
-        """
-        # Clamp limit to 1..1000
-        clamped_limit = max(1, min(limit, 1000))
-
+        """Return up to `limit` records matching every given filter exactly, newest first; callers bound `limit`."""
         # Build query with filters
         conditions = []
         params = []
@@ -203,43 +171,17 @@ class AuditLog:
             ORDER BY at DESC
             LIMIT ?
         """  # noqa: S608 - where_clause is constructed from hardcoded conditions only
-        params.append(clamped_limit)
+        params.append(limit)
 
         with self._lock:
             cursor = self._conn.execute(query, params)
             rows = cursor.fetchall()
 
-        # Convert rows to AuditRecord objects
-        return [
-            AuditRecord(
-                at=datetime.fromisoformat(row[0]).replace(tzinfo=UTC),
-                kind=row[1],
-                scope=row[2],
-                agent_name=row[3],
-                requester_id=row[4],
-                method=row[5],
-                host=row[6],
-                path=row[7],
-                service=row[8],
-                status=row[9],
-                bytes_up=row[10],
-                bytes_down=row[11],
-                duration_ms=row[12],
-                code=row[13],
-            )
-            for row in rows
-        ]
+        # The SELECT lists the columns in AuditRecord's field order.
+        return [AuditRecord(datetime.fromisoformat(row[0]).replace(tzinfo=UTC), *row[1:]) for row in rows]
 
     def prune(self) -> int:
-        """Prune old records.
-
-        First deletes records older than retention_days,
-        then trims to max_rows newest records.
-
-        Returns:
-            Number of rows deleted
-
-        """
+        """Delete records older than `retention_days`, then all but the newest `max_rows`; return how many went."""
         with self._lock:
             return self._prune_unlocked()
 
