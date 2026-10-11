@@ -777,6 +777,49 @@ def public_origin(public_url: str | None) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+_DASHBOARD_CORS_ALLOWED_ORIGINS_ENV = "MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS"
+_DASHBOARD_CORS_ALLOW_ALL_ORIGINS_ENV = "MINDROOM_DASHBOARD_CORS_ALLOW_ALL_ORIGINS"
+_DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS = (
+    "http://localhost:3003",
+    "http://localhost:5173",
+    "http://127.0.0.1:3003",
+    "http://127.0.0.1:5173",
+)
+
+
+def _hosted_browser_origins(runtime_paths: RuntimePaths) -> list[str]:
+    """Return hosted browser origins allowed to make credentialed API calls."""
+    return list(
+        dict.fromkeys(
+            origin
+            for origin in (
+                public_origin(runtime_paths.env_value("MINDROOM_PUBLIC_URL")),
+                public_origin(runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL")),
+            )
+            if origin is not None
+        ),
+    )
+
+
+def dashboard_cors_origins(runtime_paths: RuntimePaths) -> tuple[str, ...]:
+    """Return the browser origins the dashboard API serves cross-origin; `("*",)` when every origin is allowed.
+
+    `MINDROOM_DASHBOARD_CORS_ALLOW_ALL_ORIGINS` allows every origin. Otherwise
+    `MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS` lists them; unset, a hosted instance allows its own origins and any
+    other instance the local development servers.
+    """
+    if runtime_paths.env_flag(_DASHBOARD_CORS_ALLOW_ALL_ORIGINS_ENV):
+        return ("*",)
+    configured_origins = runtime_paths.env_value(_DASHBOARD_CORS_ALLOWED_ORIGINS_ENV)
+    if configured_origins is None:
+        hosted_origins = tuple(_hosted_browser_origins(runtime_paths))
+        if hosted_origins:
+            return hosted_origins
+        return _DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS
+    origins = tuple(origin for origin in (part.strip() for part in configured_origins.split(",")) if origin)
+    return origins or _DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS
+
+
 def _platform_redirect_target(request: Request, auth_settings: _ApiAuthSettings, next_path: str | None) -> str:
     origin = public_origin(auth_settings.public_url)
     if origin is None:

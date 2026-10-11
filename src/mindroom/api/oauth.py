@@ -7,17 +7,18 @@ import re
 from dataclasses import dataclass, replace
 from html import escape
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from mindroom.api import config_lifecycle
-from mindroom.api.auth import authenticate_user, login_redirect_for_request, verify_user
+from mindroom.api.auth import authenticate_user, dashboard_cors_origins, login_redirect_for_request, verify_user
 from mindroom.api.credentials_oauth_flows import (
     consume_pending_oauth_request,
     issue_pending_oauth_state,
+    pending_oauth_opener_origin,
     pending_oauth_state_requires_browser_user,
 )
 from mindroom.api.credentials_target import (
@@ -307,6 +308,8 @@ async def _issue_authorization_url(
             code_verifier=code_verifier,
             token_url=endpoints.token_url,
             browser_user_required=connect_target is None or connect_target.binding.worker_scope != "shared",
+            # The page that started the flow, so the popup's last page can tell it how the flow ended.
+            opener_origin=_validated_opener_origin(request.headers.get("origin"), provider, runtime_paths),
         )
         auth_url = await provider.authorization_uri_async(
             runtime_paths,
@@ -646,25 +649,42 @@ def _oauth_browser_page(
     )
 
 
-def _opener_notice_script(provider_id: str, status: Literal["connected", "cancelled", "error"]) -> str:
+@dataclass(frozen=True)
+class _OpenerNotice:
+    """Whom a popup's last page tells how the flow ended: a registered provider's opener, at its origin if known.
+
+    `opener_origin` is the validated origin of the page that started the flow (`_validated_opener_origin`).
+    """
+
+    provider_id: str
+    opener_origin: str | None = None
+
+
+def _opener_notice_script(notice: _OpenerNotice, status: Literal["connected", "cancelled", "error"]) -> str:
     """Return page script that tells the popup's opener how the flow ended, then closes the popup after a moment.
 
-    The message goes only to the page's own origin, MindRoom's, so only a MindRoom page that opened the popup
-    (the Connections page or the dashboard) can read it. A page without such an opener, for example one opened from
-    a chat link, stays open so its text can be read.
+    The message goes to the opener origin the flow recorded, else to the page's own origin, never to `*`, so only a
+    MindRoom page that opened the popup (the Connections page or the dashboard) can read it. On its own origin the
+    page posts only to a same-origin opener: one opened from a chat link, or from no page, stays open so its text can
+    be read. A recorded origin of another MindRoom host cannot be checked that way, as the opener is cross-origin.
     """
-    message = {"type": _OAUTH_OPENER_MESSAGE_TYPE, "status": status, "provider": provider_id}
+    message = {"type": _OAUTH_OPENER_MESSAGE_TYPE, "status": status, "provider": notice.provider_id}
     return f"""
+      const mindroomTarget = {_script_json(notice.opener_origin)} || window.location.origin;
       let mindroomOpener = null;
       try {{
-        if (window.opener && !window.opener.closed && window.opener.location.origin === window.location.origin) {{
+        if (
+          window.opener &&
+          !window.opener.closed &&
+          (mindroomTarget !== window.location.origin || window.opener.location.origin === window.location.origin)
+        ) {{
           mindroomOpener = window.opener;
         }}
       }} catch (error) {{
         // Another site opened this window; it can neither read the message nor show the outcome.
       }}
       if (mindroomOpener) {{
-        mindroomOpener.postMessage({_script_json(message)}, window.location.origin);
+        mindroomOpener.postMessage({_script_json(message)}, mindroomTarget);
         window.setTimeout(() => window.close(), {_OAUTH_POPUP_CLOSE_DELAY_MS});
       }}"""
 
@@ -674,44 +694,76 @@ def _oauth_browser_error_response(
     *,
     status_code: int,
     title: str | None = None,
-    provider_id: str | None = None,
+    notice: _OpenerNotice | None = None,
     outcome: Literal["cancelled", "error"] = "error",
 ) -> HTMLResponse:
     """Render a browser-readable OAuth error without exposing a raw API payload.
 
     Without a `title`, the page is a reset or conflict page: 409 means the connection changed under the request.
-    With a registered `provider_id`, the page also tells its MindRoom opener the `outcome` (`_opener_notice_script`).
+    With a `notice`, the page also tells its MindRoom opener the `outcome` (`_opener_notice_script`).
     """
     if title is None:
         title = "OAuth connection changed" if status_code == 409 else "OAuth reset unavailable"
-    script = "" if provider_id is None else _opener_notice_script(provider_id, outcome)
+    script = "" if notice is None else _opener_notice_script(notice, outcome)
     return _oauth_browser_page(title, message, tone="error", status_code=status_code, script=script)
 
 
-def _registered_provider_id(request: Request, provider_id: str) -> str | None:
-    """Return `provider_id` when the registry has it, so a page names only a real provider, never other URL text."""
+def _allowed_opener_origins(provider: OAuthProvider, runtime_paths: RuntimePaths) -> frozenset[str]:
+    """Return the origins a popup's last page may post to: its completion origin and the dashboard's CORS origins.
+
+    The dashboard's CORS `*` allows every origin to call the API, never to receive this message, so it adds none.
+    """
+    origins = {_oauth_success_origin(provider, runtime_paths)}
+    origins.update(origin for origin in dashboard_cors_origins(runtime_paths) if origin != "*")
+    return frozenset(origins)
+
+
+def _validated_opener_origin(origin: str | None, provider: OAuthProvider, runtime_paths: RuntimePaths) -> str | None:
+    """Return `origin` when a popup's last page may post to it (`_allowed_opener_origins`), else None."""
+    return origin if origin in _allowed_opener_origins(provider, runtime_paths) else None
+
+
+def _request_notice(request: Request, provider_id: str) -> _OpenerNotice | None:
+    """Return the notice for a page answering `request` itself: a registered provider, at the request's own Origin.
+
+    An unknown provider gets none, so a page names only a real provider, never other URL text.
+    """
     try:
-        provider, _runtime_paths = _load_provider(request, provider_id)
+        provider, runtime_paths = _load_provider(request, provider_id)
     except _UnknownOAuthProviderError:
         return None
-    return provider.id
+    origin = _validated_opener_origin(request.headers.get("origin"), provider, runtime_paths)
+    return _OpenerNotice(provider.id, origin)
 
 
-def _oauth_flow_error_response(exc: HTTPException, *, provider_id: str | None) -> HTMLResponse:
+def _callback_notice(request: Request, provider_id: str) -> _OpenerNotice | None:
+    """Return the notice for a callback page: a registered provider, at the opener origin its pending state recorded.
+
+    The state is read, never consumed, so this works before the callback is handled and for a refusal of it.
+    """
+    try:
+        provider, runtime_paths = _load_provider(request, provider_id)
+    except _UnknownOAuthProviderError:
+        return None
+    recorded = pending_oauth_opener_origin(request, provider.id, request.query_params.get("state"))
+    return _OpenerNotice(provider.id, _validated_opener_origin(recorded, provider, runtime_paths))
+
+
+def _oauth_flow_error_response(exc: HTTPException, *, notice: _OpenerNotice | None) -> HTMLResponse:
     """Show a refusal of the browser's own OAuth step (authorize or callback) as a page for the popup.
 
-    An unknown provider in the URL gets a fixed text, so the page never repeats text from the URL. `provider_id` is
-    the registered provider whose opener hears of the error, if any.
+    An unknown provider in the URL gets a fixed text, so the page never repeats text from the URL. `notice` says whose
+    opener hears of the error, if anyone's.
     """
     title = "OAuth connection changed" if exc.status_code == 409 else "Account connection failed"
     message = "Unknown OAuth provider." if isinstance(exc, _UnknownOAuthProviderError) else str(exc.detail)
-    return _oauth_browser_error_response(message, status_code=exc.status_code, title=title, provider_id=provider_id)
+    return _oauth_browser_error_response(message, status_code=exc.status_code, title=title, notice=notice)
 
 
 _OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,64}")
 
 
-def _oauth_provider_error_response(error: str, *, provider_id: str | None) -> HTMLResponse:
+def _oauth_provider_error_response(error: str, *, notice: _OpenerNotice | None) -> HTMLResponse:
     """Show the provider's own `error` for the callback; only a plain OAuth error code is repeated, never free text.
 
     `access_denied` means the user declined at the provider, so the page and its opener hear that they cancelled.
@@ -722,16 +774,11 @@ def _oauth_provider_error_response(error: str, *, provider_id: str | None) -> HT
             _OAUTH_CANCELLED_MESSAGE,
             status_code=400,
             title="Authorization cancelled",
-            provider_id=provider_id,
+            notice=notice,
             outcome="cancelled",
         )
     message = "OAuth provider returned an error" + (f": {code}" if code else "") + ". Nothing was connected."
-    return _oauth_browser_error_response(
-        message,
-        status_code=400,
-        title="Account connection failed",
-        provider_id=provider_id,
-    )
+    return _oauth_browser_error_response(message, status_code=400, title="Account connection failed", notice=notice)
 
 
 def _oauth_success_origin(provider: OAuthProvider, runtime_paths: RuntimePaths) -> str:
@@ -763,7 +810,7 @@ async def authorize(
     try:
         return await _authorize(provider_id, request, agent_name=agent_name, connect_token=connect_token)
     except HTTPException as exc:
-        return _oauth_flow_error_response(exc, provider_id=_registered_provider_id(request, provider_id))
+        return _oauth_flow_error_response(exc, notice=_request_notice(request, provider_id))
 
 
 async def _authorize(
@@ -938,21 +985,27 @@ async def reset_and_authorize(
 
 
 @router.get("/{provider_id}/success", response_class=HTMLResponse)
-async def success(provider_id: str, request: Request) -> HTMLResponse:
-    """Signal OAuth completion to the dashboard popup opener."""
+async def success(provider_id: str, request: Request, opener_origin: str | None = None) -> HTMLResponse:
+    """Signal OAuth completion to the dashboard popup opener, at `opener_origin` when it is an allowed origin."""
     await _require_oauth_api_user(request)
-    provider, _runtime_paths = _load_provider(request, provider_id)
-    return _oauth_success_response(provider)
+    provider, runtime_paths = _load_provider(request, provider_id)
+    return _oauth_success_response(provider, _validated_opener_origin(opener_origin, provider, runtime_paths))
 
 
-def _oauth_success_response(provider: OAuthProvider) -> HTMLResponse:
+def _oauth_success_response(provider: OAuthProvider, opener_origin: str | None) -> HTMLResponse:
     """Render a browser-readable OAuth completion response that also tells the popup's opener."""
     return _oauth_browser_page(
         f"{provider.display_name} connected",
         f"{provider.display_name} is connected. You can close this window.",
         tone="success",
-        script=_opener_notice_script(provider.id, "connected"),
+        script=_opener_notice_script(_OpenerNotice(provider.id, opener_origin), "connected"),
     )
+
+
+def _success_redirect_url(provider: OAuthProvider, runtime_paths: RuntimePaths, opener_origin: str | None) -> str:
+    """Return the success page URL, carrying the flow's opener origin for the page to post to."""
+    url = oauth_success_redirect_url(provider, runtime_paths)
+    return url if opener_origin is None else f"{url}?{urlencode({'opener_origin': opener_origin})}"
 
 
 async def _store_callback_credentials(
@@ -1052,16 +1105,18 @@ async def callback(provider_id: str, request: Request) -> Response:
     The provider sends the browser here, so every refusal, a cancelled authorization included, is a page the popup
     can show, with the same status as the JSON error would have had.
     """
+    # Read before handling, which consumes the state that recorded the opener's origin.
+    notice = _callback_notice(request, provider_id)
     error = request.query_params.get("error")
     if error:
-        return _oauth_provider_error_response(error, provider_id=_registered_provider_id(request, provider_id))
+        return _oauth_provider_error_response(error, notice=notice)
     try:
-        return await _handle_callback(provider_id, request)
+        return await _handle_callback(provider_id, request, notice)
     except HTTPException as exc:
-        return _oauth_flow_error_response(exc, provider_id=_registered_provider_id(request, provider_id))
+        return _oauth_flow_error_response(exc, notice=notice)
 
 
-async def _handle_callback(provider_id: str, request: Request) -> Response:
+async def _handle_callback(provider_id: str, request: Request, notice: _OpenerNotice | None) -> Response:
     code = request.query_params.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="No authorization code received")
@@ -1083,11 +1138,12 @@ async def _handle_callback(provider_id: str, request: Request) -> Response:
             state=state,
         )
     except OAuthCredentialConflictError:
-        return _oauth_browser_error_response(_OAUTH_STALE_CONNECTION_MESSAGE, status_code=409, provider_id=provider.id)
+        return _oauth_browser_error_response(_OAUTH_STALE_CONNECTION_MESSAGE, status_code=409, notice=notice)
 
+    opener_origin = notice.opener_origin if notice is not None else None
     if not dashboard_flow:
-        return _oauth_success_response(provider)
-    return RedirectResponse(url=oauth_success_redirect_url(provider, runtime_paths))
+        return _oauth_success_response(provider, opener_origin)
+    return RedirectResponse(url=_success_redirect_url(provider, runtime_paths, opener_origin))
 
 
 @router.get("/{provider_id}/status")

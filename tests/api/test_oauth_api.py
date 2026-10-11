@@ -2325,13 +2325,113 @@ def test_success_page_signals_oauth_completion_to_popup_opener(tmp_path: Path) -
     _expect_opener_notice(response, provider_id=provider.id, status="connected")
 
 
-def _expect_opener_notice(response: Any, *, provider_id: str, status: str) -> None:  # noqa: ANN401
-    """The page posts its outcome to a MindRoom opener on its own origin only, then closes after a short delay."""
+def _expect_opener_notice(
+    response: Any,  # noqa: ANN401
+    *,
+    provider_id: str,
+    status: str,
+    opener_origin: str | None = None,
+) -> None:
+    """The page posts its outcome to the recorded opener origin, else its own, never `*`, then closes after a moment.
+
+    On its own origin it posts only to a same-origin opener.
+    """
     message = json.dumps({"type": "mindroom-oauth", "status": status, "provider": provider_id})
-    assert f"mindroomOpener.postMessage({message}, window.location.origin);" in response.text
-    assert "window.opener.location.origin === window.location.origin" in response.text
+    assert f"const mindroomTarget = {json.dumps(opener_origin)} || window.location.origin;" in response.text
+    assert f"mindroomOpener.postMessage({message}, mindroomTarget);" in response.text
+    assert (
+        "(mindroomTarget !== window.location.origin || window.opener.location.origin === window.location.origin)"
+    ) in response.text
     assert "window.setTimeout(() => window.close(), 1500);" in response.text
     assert '"*"' not in response.text
+
+
+_SPLIT_ORIGIN = "https://dashboard.example.test"
+# A dashboard on another origin authenticates with the API key, as cookies would fail the same-origin check.
+_DASHBOARD_BEARER = {"Authorization": "Bearer test-key"}
+
+
+def _split_origin_app(tmp_path: Path) -> FastAPI:
+    """Serve the API on its default origin while the dashboard, an allowed CORS origin, runs on another one."""
+    runtime_paths = _runtime_paths(
+        tmp_path,
+        {
+            "TEST_OAUTH_CLIENT_ID": "client-id",
+            "TEST_OAUTH_CLIENT_SECRET": "client-secret",
+            constants.OWNER_MATRIX_USER_ID_ENV: "@alice:example.org",
+            "MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS": _SPLIT_ORIGIN,
+        },
+    )
+    return _make_test_app(runtime_paths, _config_payload())
+
+
+@pytest.mark.parametrize(
+    ("origin", "recorded"),
+    [(_SPLIT_ORIGIN, _SPLIT_ORIGIN), ("https://evil.example", None), (None, None)],
+    ids=["allowed-split-origin", "origin-outside-the-allowed-set", "no-origin"],
+)
+def test_callback_pages_post_to_the_validated_origin_that_started_the_flow(
+    tmp_path: Path,
+    origin: str | None,
+    recorded: str | None,
+) -> None:
+    """A dashboard on another allowed origin hears how its popup ended; an origin outside the set is never targeted."""
+    api_app = _split_origin_app(tmp_path)
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app, headers=_DASHBOARD_BEARER) as client:
+            headers = {} if origin is None else {"Origin": origin}
+            connected = client.post(f"/api/oauth/{provider.id}/connect?agent_name=general", headers=headers)
+            assert connected.status_code == 200, connected.text
+            state = _state_from_auth_url(connected.json()["auth_url"])
+            cancelled = client.get(f"/api/oauth/{provider.id}/callback?error=access_denied&state={state}")
+
+    _expect_opener_notice(cancelled, provider_id=provider.id, status="cancelled", opener_origin=recorded)
+    assert "evil.example" not in cancelled.text
+
+
+def test_dashboard_callback_carries_the_opener_origin_to_the_success_page(tmp_path: Path) -> None:
+    """The callback's redirect names the recorded origin, and the success page posts there only if it is allowed."""
+    api_app = _split_origin_app(tmp_path)
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app, headers=_DASHBOARD_BEARER) as client:
+            connected = client.post(
+                f"/api/oauth/{provider.id}/connect?agent_name=general",
+                headers={"Origin": _SPLIT_ORIGIN},
+            )
+            state = _state_from_auth_url(connected.json()["auth_url"])
+            with patch("mindroom.api.oauth._complete_oauth_callback", return_value=True):
+                redirected = client.get(
+                    f"/api/oauth/{provider.id}/callback?code=test-code&state={state}",
+                    follow_redirects=False,
+                )
+            location = urlparse(redirected.headers["location"])
+            success = client.get(f"{location.path}?{location.query}")
+            forged = client.get(f"/api/oauth/{provider.id}/success?opener_origin=https://evil.example")
+
+    assert redirected.status_code == 307
+    assert parse_qs(location.query) == {"opener_origin": [_SPLIT_ORIGIN]}
+    _expect_opener_notice(success, provider_id=provider.id, status="connected", opener_origin=_SPLIT_ORIGIN)
+    _expect_opener_notice(forged, provider_id=provider.id, status="connected")
+    assert "evil.example" not in forged.text
+
+
+def test_cors_wildcard_never_becomes_a_message_target(tmp_path: Path) -> None:
+    """Allowing every origin for CORS does not let any of them receive the popup's message."""
+    runtime_paths = _runtime_paths(tmp_path, {"MINDROOM_DASHBOARD_CORS_ALLOW_ALL_ORIGINS": "true"})
+    api_app = _make_test_app(runtime_paths, _config_payload())
+    provider = _fake_provider()
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            _login(client)
+            response = client.get(f"/api/oauth/{provider.id}/success?opener_origin=https://anywhere.example")
+
+    _expect_opener_notice(response, provider_id=provider.id, status="connected")
+    assert "anywhere.example" not in response.text
 
 
 def _expect_styled_oauth_page(response: Any, *, status: int, message: str) -> None:  # noqa: ANN401
@@ -3358,6 +3458,7 @@ async def test_callback_maps_locked_connection_generation_race_to_conflict(
     monkeypatch.setattr(oauth_api, "_require_oauth_api_user", AsyncMock())
     monkeypatch.setattr(oauth_api, "_load_provider", lambda *_args: (provider, runtime_paths))
     monkeypatch.setattr(oauth_api, "pending_oauth_state_requires_browser_user", lambda *_args: True)
+    monkeypatch.setattr(oauth_api, "pending_oauth_opener_origin", lambda *_args: None)
     monkeypatch.setattr(oauth_api, "consume_pending_oauth_request", lambda *_args: pending)
     monkeypatch.setattr(oauth_api, "_resolve_oauth_credentials_target", lambda *_args, **_kwargs: target)
     monkeypatch.setattr(oauth_api, "_verify_pending_target_binding", AsyncMock())
@@ -3410,6 +3511,7 @@ async def test_callback_hides_provider_controlled_exchange_error(
     monkeypatch.setattr(oauth_api, "_require_oauth_api_user", AsyncMock())
     monkeypatch.setattr(oauth_api, "_load_provider", lambda *_args: (provider, runtime_paths))
     monkeypatch.setattr(oauth_api, "pending_oauth_state_requires_browser_user", lambda *_args: True)
+    monkeypatch.setattr(oauth_api, "pending_oauth_opener_origin", lambda *_args: None)
     monkeypatch.setattr(oauth_api, "consume_pending_oauth_request", lambda *_args: pending)
     monkeypatch.setattr(oauth_api, "_resolve_oauth_credentials_target", lambda *_args, **_kwargs: target)
     monkeypatch.setattr(oauth_api, "_verify_pending_target_binding", AsyncMock())
@@ -4255,6 +4357,7 @@ async def test_callback_saves_exchanged_credentials_before_propagating_cancellat
     monkeypatch.setattr(oauth_api, "_require_oauth_api_user", allow_request)
     monkeypatch.setattr(oauth_api, "_load_provider", lambda *_args: (provider, runtime_paths))
     monkeypatch.setattr(oauth_api, "pending_oauth_state_requires_browser_user", lambda *_args: True)
+    monkeypatch.setattr(oauth_api, "pending_oauth_opener_origin", lambda *_args: None)
     monkeypatch.setattr(oauth_api, "consume_pending_oauth_request", lambda *_args: pending)
     monkeypatch.setattr(oauth_api, "_resolve_oauth_credentials_target", lambda *_args, **_kwargs: target)
     monkeypatch.setattr(oauth_api, "_verify_pending_target_binding", AsyncMock())
@@ -4328,6 +4431,7 @@ async def test_callback_finishes_target_verification_after_state_consumption_bef
     monkeypatch.setattr(oauth_api, "_require_oauth_api_user", AsyncMock())
     monkeypatch.setattr(oauth_api, "_load_provider", lambda *_args: (provider, runtime_paths))
     monkeypatch.setattr(oauth_api, "pending_oauth_state_requires_browser_user", lambda *_args: True)
+    monkeypatch.setattr(oauth_api, "pending_oauth_opener_origin", lambda *_args: None)
     monkeypatch.setattr(oauth_api, "consume_pending_oauth_request", lambda *_args: pending)
     monkeypatch.setattr(oauth_api, "_resolve_oauth_credentials_target", lambda *_args, **_kwargs: target)
     monkeypatch.setattr(oauth_api, "_verify_pending_target_binding", verify)

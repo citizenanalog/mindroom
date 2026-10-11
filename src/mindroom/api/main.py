@@ -17,7 +17,7 @@ from mindroom.agent_policy import build_agent_policy_seeds, resolve_agent_policy
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.api import config_lifecycle
 from mindroom.api.agent_cli import router as agent_cli_router
-from mindroom.api.auth import ApiAuthState, public_origin, verify_user  # noqa: F401
+from mindroom.api.auth import ApiAuthState, dashboard_cors_origins, public_origin, verify_user  # noqa: F401
 from mindroom.api.auth import router as auth_router
 from mindroom.api.computers import active_computer_worker_keys, rebind_computer_runtime
 from mindroom.api.computers import router as computers_router
@@ -86,18 +86,10 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 _WORKER_CLEANUP_INTERVAL_ENV = "MINDROOM_WORKER_CLEANUP_INTERVAL_SECONDS"
-_DASHBOARD_CORS_ALLOWED_ORIGINS_ENV = "MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS"
-_DASHBOARD_CORS_ALLOW_ALL_ORIGINS_ENV = "MINDROOM_DASHBOARD_CORS_ALLOW_ALL_ORIGINS"
 _DASHBOARD_CORS_EXPOSE_HEADERS = (
     config_lifecycle.CONFIG_GENERATION_HEADER,
     config_lifecycle.CONFIG_USES_INCLUDES_HEADER,
     config_lifecycle.CONFIG_PENDING_RESTART_HEADER,
-)
-_DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS = (
-    "http://localhost:3003",
-    "http://localhost:5173",
-    "http://127.0.0.1:3003",
-    "http://127.0.0.1:5173",
 )
 
 
@@ -634,44 +626,10 @@ def _api_docs_kwargs(runtime_paths: constants.RuntimePaths) -> dict[str, str | N
     return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
 
 
-def _api_cors_origins(runtime_paths: constants.RuntimePaths) -> list[str]:
-    """Return hosted browser origins allowed to make credentialed API calls."""
-    return list(
-        dict.fromkeys(
-            origin
-            for origin in (
-                public_origin(runtime_paths.env_value("MINDROOM_PUBLIC_URL")),
-                public_origin(runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL")),
-            )
-            if origin is not None
-        ),
-    )
-
-
 def _dashboard_cors_settings(runtime_paths: constants.RuntimePaths) -> _DashboardCorsSettings:
-    """Return dashboard CORS settings for one runtime context."""
-    if runtime_paths.env_flag(_DASHBOARD_CORS_ALLOW_ALL_ORIGINS_ENV):
-        return _DashboardCorsSettings(allow_origins=("*",), allow_credentials=False)
-
-    configured_origins = runtime_paths.env_value(_DASHBOARD_CORS_ALLOWED_ORIGINS_ENV)
-    if configured_origins is None:
-        hosted_origins = tuple(_api_cors_origins(runtime_paths))
-        if hosted_origins:
-            return _DashboardCorsSettings(allow_origins=hosted_origins, allow_credentials=True)
-
-    origins = _parse_dashboard_cors_allowed_origins(configured_origins)
-    return _DashboardCorsSettings(
-        allow_origins=origins,
-        allow_credentials="*" not in origins,
-    )
-
-
-def _parse_dashboard_cors_allowed_origins(configured_origins: str | None) -> tuple[str, ...]:
-    """Parse a comma-separated dashboard CORS origin list."""
-    if configured_origins is None:
-        return _DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS
-    origins = tuple(origin for origin in (part.strip() for part in configured_origins.split(",")) if origin)
-    return origins or _DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS
+    """Return dashboard CORS settings for one runtime context; credentials are never allowed with `*`."""
+    origins = dashboard_cors_origins(runtime_paths)
+    return _DashboardCorsSettings(allow_origins=origins, allow_credentials="*" not in origins)
 
 
 def _add_dashboard_cors_middleware(api_app: FastAPI, runtime_paths: constants.RuntimePaths) -> None:

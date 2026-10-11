@@ -6034,7 +6034,7 @@ def test_platform_runtime_restricts_cors_origins(tmp_path: Path) -> None:
         },
     )
 
-    assert main._api_cors_origins(runtime_paths) == [
+    assert auth._hosted_browser_origins(runtime_paths) == [
         "https://tenant42.example.test",
         "https://app.example.test",
     ]
