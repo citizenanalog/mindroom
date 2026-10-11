@@ -59,14 +59,20 @@ def allowed_client_origins(paths: RuntimePaths, env_name: str) -> tuple[str, ...
         return ()
 
 
-async def _homeserver_binds_audience(client: aiohttp.ClientSession, homeserver: str) -> bool:
+async def _homeserver_binds_audience(
+    client: aiohttp.ClientSession,
+    homeserver: str,
+    *,
+    refresh: bool = False,
+) -> bool:
     """Read whether the homeserver advertises audience-bound OpenID tokens, caching each answer for 10 minutes.
 
     A failed or malformed answer is not cached, so the next verification retries.
     It keeps the last known answer, or counts as unsupported when there is none.
+    `refresh` bypasses a fresh cached answer.
     """
     cached = _audience_support.get(homeserver)
-    if cached is not None and monotonic() < cached[0]:
+    if not refresh and cached is not None and monotonic() < cached[0]:
         return cached[1]
     last_known = cached is not None and cached[1]
     try:
@@ -89,19 +95,43 @@ async def _homeserver_binds_audience(client: aiohttp.ClientSession, homeserver: 
     return supported
 
 
+def _bound_params(paths: RuntimePaths, token: MatrixOpenIDToken) -> dict[str, str]:
+    audience = normalized_origin(paths.env_value("MINDROOM_PUBLIC_URL"))
+    if audience is None:
+        raise MatrixOpenIDError(503, "Set MINDROOM_PUBLIC_URL to verify bound Matrix OpenID tokens.")
+    return {"access_token": token.access_token, _AUDIENCE_PARAM: audience}
+
+
 async def _userinfo_params(
     client: aiohttp.ClientSession,
     paths: RuntimePaths,
     homeserver: str,
     token: MatrixOpenIDToken,
 ) -> dict[str, str]:
-    params = {"access_token": token.access_token}
     if await _homeserver_binds_audience(client, homeserver):
-        audience = normalized_origin(paths.env_value("MINDROOM_PUBLIC_URL"))
-        if audience is None:
-            raise MatrixOpenIDError(503, "Set MINDROOM_PUBLIC_URL to verify bound Matrix OpenID tokens.")
-        params[_AUDIENCE_PARAM] = audience
-    return params
+        return _bound_params(paths, token)
+    return {"access_token": token.access_token}
+
+
+async def _read_userinfo(
+    client: aiohttp.ClientSession,
+    homeserver: str,
+    params: dict[str, str],
+) -> bytes | None:
+    """Return the userinfo body, None on 401, and raise for any other failure."""
+    async with client.get(
+        homeserver + "/_matrix/federation/v1/openid/userinfo",
+        params=params,
+        allow_redirects=False,
+    ) as response:
+        if response.status >= 500 or response.status == 429:
+            raise MatrixOpenIDError(503, "Matrix OpenID verifier is unavailable.")
+        if response.status == 401:
+            return None
+        if response.status != 200:
+            raise MatrixOpenIDError(401, "Matrix OpenID verification failed.")
+        # StreamReader.read(n) may return a partial response; read to EOF with a hard cap.
+        return await collect_bounded_bytes(response.content.iter_chunked(4096), max_bytes=16384)
 
 
 async def verify_matrix_openid(token: MatrixOpenIDToken, paths: RuntimePaths) -> str:
@@ -118,23 +148,27 @@ async def verify_matrix_openid(token: MatrixOpenIDToken, paths: RuntimePaths) ->
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as client:
             params = await _userinfo_params(client, paths, homeserver, token)
-            async with client.get(
-                homeserver + "/_matrix/federation/v1/openid/userinfo",
-                params=params,
-                allow_redirects=False,
-            ) as response:
-                if response.status >= 500 or response.status == 429:
-                    raise MatrixOpenIDError(503, "Matrix OpenID verifier is unavailable.")
-                if response.status != 200:
-                    if _AUDIENCE_PARAM in params and response.status == 401:
-                        logger.warning(
-                            "Bound Matrix OpenID token refused by the homeserver",
-                            audience=params[_AUDIENCE_PARAM],
-                        )
-                    raise MatrixOpenIDError(401, "Matrix OpenID verification failed.")
-                # StreamReader.read(n) may return a partial response; read to EOF with a hard cap.
-                body = await collect_bounded_bytes(response.content.iter_chunked(4096), max_bytes=16384)
-                payload = json.loads(body)
+            body = await _read_userinfo(client, homeserver, params)
+            if (
+                body is None
+                and _AUDIENCE_PARAM not in params
+                and await _homeserver_binds_audience(
+                    client,
+                    homeserver,
+                    refresh=True,
+                )
+            ):
+                # The cached capability predates the homeserver turning binding on, so retry once with the audience.
+                params = _bound_params(paths, token)
+                body = await _read_userinfo(client, homeserver, params)
+            if body is None:
+                if _AUDIENCE_PARAM in params:
+                    logger.warning(
+                        "Bound Matrix OpenID token refused by the homeserver",
+                        audience=params[_AUDIENCE_PARAM],
+                    )
+                raise MatrixOpenIDError(401, "Matrix OpenID verification failed.")
+            payload = json.loads(body)
     except ByteLimitExceededError:
         raise MatrixOpenIDError(401, "Invalid Matrix OpenID response.") from None
     except (aiohttp.ClientError, TimeoutError):

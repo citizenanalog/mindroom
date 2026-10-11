@@ -291,6 +291,36 @@ async def test_failed_refresh_keeps_the_last_known_capability(
 
 
 @pytest.mark.asyncio
+async def test_unbound_401_rechecks_the_capability_and_retries_with_the_audience(
+    homeserver: tuple[ComputerPeer, RuntimePaths],
+) -> None:
+    """A cached False predating a Tuwunel upgrade does not lock out bound tokens until the cache expires."""
+    peer, paths = homeserver
+    await verify_matrix_openid(TOKEN, paths)
+    assert (peer.versions_calls, peer.userinfo_audiences) == (1, [None])
+    peer.advertise_audience = True
+    peer.expected_audience = AUDIENCE
+    assert await verify_matrix_openid(TOKEN, paths) == "@alice:example.org"
+    assert (peer.versions_calls, peer.userinfo_audiences) == (2, [None, None, AUDIENCE])
+    await verify_matrix_openid(TOKEN, paths)
+    assert (peer.versions_calls, peer.userinfo_audiences[-1]) == (2, AUDIENCE)
+
+
+@pytest.mark.asyncio
+async def test_unbound_401_with_capability_still_false_refreshes_once(
+    homeserver: tuple[ComputerPeer, RuntimePaths],
+) -> None:
+    """A real 401 costs exactly one extra `/versions` call and is not retried."""
+    peer, paths = homeserver
+    await verify_matrix_openid(TOKEN, paths)
+    peer.expected_audience = AUDIENCE
+    with pytest.raises(MatrixOpenIDError, match=r"^Matrix OpenID verification failed\.$") as error:
+        await verify_matrix_openid(TOKEN, paths)
+    assert error.value.status_code == 401
+    assert (peer.versions_calls, peer.userinfo_audiences) == (2, [None, None])
+
+
+@pytest.mark.asyncio
 async def test_unreachable_versions_endpoint_falls_back(tmp_path: Path) -> None:
     """A homeserver that cannot be reached for `/versions` is unbound and surfaces the userinfo outage."""
     paths = resolve_runtime_paths(
