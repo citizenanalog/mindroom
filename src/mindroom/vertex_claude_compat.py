@@ -99,6 +99,8 @@ class MindroomVertexAIClaude(ClaudeProviderCompat, VertexAIClaude):
         compress_tool_results: bool = False,
     ) -> AsyncIterator[ModelResponse]:
         """Replay only reasoning Vertex can verify, on every streaming request including tool-loop requests."""
+        # A new attempt starts without an earlier attempt's start usage.
+        self.take_unfinished_stream_usage()
         async for response in super().ainvoke_stream(
             self._request_messages(messages),
             assistant_message,

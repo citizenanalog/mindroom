@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+from agno.metrics import MessageMetrics
 from agno.models.message import Message
 from anthropic.lib.streaming import ParsedMessageStopEvent
 from anthropic.types import Message as AnthropicMessage
@@ -100,3 +103,20 @@ def test_safeguard_refusal_is_not_retryable_by_agno() -> None:
     )
 
     assert model._is_retryable_error(error) is False
+
+
+@pytest.mark.asyncio
+async def test_stream_attempt_forgets_earlier_start_usage() -> None:
+    """A Stop before a retry sends its request must not settle the earlier attempt's start usage."""
+    model = _model()
+    model._stream_start_usage = MessageMetrics(input_tokens=1200, cache_read_tokens=48000)
+
+    def stopped_before_sending(_messages: list[Message]) -> list[Message]:
+        raise asyncio.CancelledError
+
+    model._request_messages = stopped_before_sending  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in model.ainvoke_stream(_tool_loop_messages(), Message(role="assistant")):
+            pass
+
+    assert model.take_unfinished_stream_usage() is None
