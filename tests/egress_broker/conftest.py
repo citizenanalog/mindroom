@@ -629,6 +629,13 @@ async def audit_records(audit: AuditLog, count: int) -> list[AuditRecord]:
     return records
 
 
+async def assert_audited(audit: AuditLog, **expected: object) -> AuditRecord:
+    """Wait for the one audit record, check each field named in `expected` equals it exactly, and return the record."""
+    [record] = await audit_records(audit, 1)
+    assert {name: getattr(record, name) for name in expected} == expected
+    return record
+
+
 @dataclass(frozen=True)
 class RawResponse:
     """A response head (and Content-Length body) read straight off a proxy socket."""

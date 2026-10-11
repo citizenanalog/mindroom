@@ -22,6 +22,7 @@ from tests.egress_broker.conftest import (
     DEFAULT_CLAIMS,
     MALFORMED,
     PROXY_AUTHENTICATION_REQUIRED,
+    assert_audited,
     audit_records,
     connect_request,
     free_port,
@@ -313,9 +314,7 @@ async def test_unmatched_host_denied_under_deny_policy(
     assert response.headers["content-type"] == "application/json"
     assert response.headers["connection"] == "close"
     assert response.json() == _host_not_allowed("github", "openai")
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.host, record.method) == ("denied", 403, "localhost", "CONNECT")
-    assert record.code == "host_not_allowed"
+    await assert_audited(audit, kind="denied", status=403, host="localhost", method="CONNECT", code="host_not_allowed")
 
 
 @pytest.mark.asyncio
@@ -412,9 +411,7 @@ async def test_plain_http_matched_rule_requires_tls(
         "message": "Credentials are only added over HTTPS. Use https:// for localhost.",
     }
     assert http_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.service, record.status, record.path) == ("denied", "svc", 403, "/echo")
-    assert record.code == "tls_required"
+    await assert_audited(audit, kind="denied", service="svc", status=403, path="/echo", code="tls_required")
 
 
 @pytest.mark.asyncio
@@ -436,10 +433,17 @@ async def test_plain_http_unmatched_path_on_rule_host_forwards_unmodified(
     assert "proxy-authorization" not in echoed["headers"]
     assert echoed["headers"]["host"] == [f"localhost:{http_upstream.port}"]
     assert echoed["query"] == {"page": "2"}
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.service, record.status, record.path) == ("request", None, 200, "/echo")
-    assert record.code is None
-    assert (record.scope, record.agent_name, record.requester_id) == ("user_agent", "code", "@alice:example.org")
+    await assert_audited(
+        audit,
+        kind="request",
+        service=None,
+        status=200,
+        path="/echo",
+        code=None,
+        scope="user_agent",
+        agent_name="code",
+        requester_id="@alice:example.org",
+    )
 
 
 @pytest.mark.asyncio
@@ -467,9 +471,7 @@ async def test_plain_http_ambiguous_path_on_rule_host_gets_400(
     }
     assert http_upstream.hits == []
     assert broker.resolved == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path, record.service) == ("denied", 400, target, None)
-    assert record.code == "bad_request"
+    await assert_audited(audit, kind="denied", status=400, path=target, service=None, code="bad_request")
 
 
 @pytest.mark.asyncio
@@ -487,10 +489,8 @@ async def test_plain_http_ambiguous_path_on_host_without_rules_is_forwarded(
     # The fake upstream does not resolve dot segments, so its 404 shows the path arrived exactly as sent.
     assert response.status == 404
     assert http_upstream.hits == ["/private/../echo"]
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path) == ("request", 404, "/private/../echo")
     # The upstream's own 404 is a forwarded answer, not a refusal.
-    assert record.code is None
+    await assert_audited(audit, kind="request", status=404, path="/private/../echo", code=None)
 
 
 @pytest.mark.asyncio
@@ -519,9 +519,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
         "Only an administrator can change this, at manage_url.",
     }
     assert http_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path, record.service) == ("denied", 403, "/echo", "svc")
-    assert record.code == "path_not_allowed"
+    await assert_audited(audit, kind="denied", status=403, path="/echo", service="svc", code="path_not_allowed")
 
 
 @pytest.mark.asyncio
@@ -684,9 +682,7 @@ async def test_plain_http_streamed_body_over_limit_gets_413(
 
     assert response.status == 413
     assert response.json() == BODY_TOO_LARGE
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status) == ("request", 413)
-    assert record.code == "request_body_too_large"
+    await assert_audited(audit, kind="request", status=413, code="request_body_too_large")
 
 
 @pytest.mark.asyncio
@@ -776,9 +772,7 @@ async def test_plain_http_unreachable_upstream_gets_502(
 
     assert response.status_code == 502
     assert response.json() == {"error": "upstream_unreachable", "message": "localhost could not be reached."}
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path) == ("request", 502, "/echo")
-    assert record.code == "upstream_unreachable"
+    await assert_audited(audit, kind="request", status=502, path="/echo", code="upstream_unreachable")
 
 
 @pytest.mark.asyncio
@@ -795,19 +789,19 @@ async def test_tunnel_audited_without_query(
     assert (await client.get(tls_upstream.url("/echo?token=abc"))).status_code == 200
     await client.aclose()
 
-    [record] = await audit_records(audit, 1)
-
-    assert (record.kind, record.host, record.path, record.method, record.status) == (
-        "tunnel",
-        "localhost",
-        "",
-        "CONNECT",
-        200,
+    record = await assert_audited(
+        audit,
+        kind="tunnel",
+        host="localhost",
+        path="",
+        method="CONNECT",
+        status=200,
+        service=None,
+        scope="user_agent",
     )
-    assert record.service is None
+
     assert record.bytes_up > 0
     assert record.bytes_down > 0
-    assert record.scope == "user_agent"
 
 
 @pytest.mark.asyncio

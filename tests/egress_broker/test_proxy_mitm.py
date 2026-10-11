@@ -33,6 +33,7 @@ from tests.egress_broker.conftest import (
     DEFAULT_CLAIMS,
     MALFORMED,
     PROXY_AUTHENTICATION_REQUIRED,
+    assert_audited,
     audit_records,
     connect_request,
     env_without_proxies,
@@ -143,17 +144,17 @@ async def test_injects_bearer_and_client_never_sees_secret(
     assert "proxy-authorization" not in seen.headers
     assert SECRET not in response.text
     assert not [value for value in response.headers.values() if SECRET in value]
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.method, record.host, record.path, record.service, record.status) == (
-        "request",
-        "GET",
-        "localhost",
-        "/ok",
-        "svc",
-        200,
-    )
     # A forwarded request has no refusal code, whatever the upstream answered.
-    assert record.code is None
+    await assert_audited(
+        audit,
+        kind="request",
+        method="GET",
+        host="localhost",
+        path="/ok",
+        service="svc",
+        status=200,
+        code=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -222,9 +223,7 @@ async def test_host_mismatch_is_refused(
     }
     assert tls_upstream.hits == []
     assert broker.resolved == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.host, record.path) == ("denied", 403, "localhost", "/echo")
-    assert record.code == "host_mismatch"
+    await assert_audited(audit, kind="denied", status=403, host="localhost", path="/echo", code="host_mismatch")
 
 
 @pytest.mark.asyncio
@@ -274,9 +273,7 @@ async def test_non_origin_form_target_is_refused(
     assert response.json() == MALFORMED
     assert tls_upstream.hits == []
     assert broker.resolved == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path) == ("denied", 400, "")
-    assert record.code == "bad_request"
+    await assert_audited(audit, kind="denied", status=400, path="", code="bad_request")
 
 
 @pytest.mark.asyncio
@@ -312,9 +309,7 @@ async def test_ambiguous_path_on_rule_host_is_refused(
     assert response.json() == AMBIGUOUS_PATH
     assert tls_upstream.hits == []
     assert broker.resolved == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path, record.service) == ("denied", 400, target, None)
-    assert record.code == "bad_request"
+    await assert_audited(audit, kind="denied", status=400, path=target, service=None, code="bad_request")
 
 
 @pytest.mark.asyncio
@@ -526,9 +521,14 @@ async def test_missing_secret_returns_403_with_manage_url(
         "message": "No svc key is set for this agent. Ask the user to add one at manage_url, then retry.",
     }
     assert tls_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.service, record.path) == ("denied", 403, "svc", "/echo")
-    assert record.code == "credential_not_configured"
+    await assert_audited(
+        audit,
+        kind="denied",
+        status=403,
+        service="svc",
+        path="/echo",
+        code="credential_not_configured",
+    )
 
 
 @pytest.mark.asyncio
@@ -570,9 +570,7 @@ async def test_missing_secret_offers_oauth_connect_link(
     }
     assert "one-time-token" not in str(response.json()["message"])
     assert tls_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.service) == ("denied", 403, "svc")
-    assert record.code == "credential_not_configured"
+    await assert_audited(audit, kind="denied", status=403, service="svc", code="credential_not_configured")
 
 
 @pytest.mark.asyncio
@@ -656,9 +654,14 @@ async def test_oauth_reconnect_required_gets_403_without_reaching_upstream(
     assert response.status_code == 403
     assert response.json() == expected
     assert tls_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.service, record.path) == ("denied", 403, "svc", "/echo")
-    assert record.code == "oauth_connection_required"
+    await assert_audited(
+        audit,
+        kind="denied",
+        status=403,
+        service="svc",
+        path="/echo",
+        code="oauth_connection_required",
+    )
     assert "one-time-token" not in repr(logs)
 
 
@@ -689,9 +692,7 @@ async def test_oauth_refresh_outage_gets_retryable_503(
         "Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url.",
     }
     assert tls_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.service, record.path) == ("request", 503, "svc", "/echo")
-    assert record.code == "oauth_refresh_failed"
+    await assert_audited(audit, kind="request", status=503, service="svc", path="/echo", code="oauth_refresh_failed")
 
 
 @pytest.mark.asyncio
@@ -805,9 +806,7 @@ async def test_upstream_unreachable_gets_502(
 
     assert response.status_code == 502
     assert response.json() == LOCALHOST_UNREACHABLE
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path, record.service) == ("request", 502, "/echo", "svc")
-    assert record.code == "upstream_unreachable"
+    await assert_audited(audit, kind="request", status=502, path="/echo", service="svc", code="upstream_unreachable")
 
 
 @pytest.mark.asyncio
@@ -855,9 +854,7 @@ async def test_blocked_upstream_gets_403(
         "message": "localhost resolves to a private or internal address, which agents may not reach.",
     }
     assert tls_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status) == ("denied", 403)
-    assert record.code == "destination_blocked"
+    await assert_audited(audit, kind="denied", status=403, code="destination_blocked")
 
 
 @pytest.mark.asyncio
@@ -886,8 +883,7 @@ async def test_websocket_upgrade_spliced_with_injection(
 
     [seen] = tls_upstream.requests
     assert seen.headers["authorization"] == [f"Bearer {SECRET}"]
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path, record.service) == ("request", 101, "/ws", "svc")
+    record = await assert_audited(audit, kind="request", status=101, path="/ws", service="svc")
     assert record.bytes_up > 0
     assert record.bytes_down > 0
 
@@ -911,8 +907,7 @@ async def test_websocket_splice_ends_when_client_closes(
     assert switched.status == 101
     assert switched.headers["upgrade"].lower() == "websocket"
     # The tunnel is audited only after the splice ends, so the record proves the upstream side was closed.
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status) == ("request", 101)
+    await assert_audited(audit, kind="request", status=101)
 
 
 @pytest.mark.asyncio
@@ -1207,8 +1202,7 @@ async def test_secret_with_line_break_gets_502_without_leaking(
 
     assert (response.status_code, response.json()) == (502, BROKER_ERROR)
     assert tls_upstream.hits == []
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.service) == ("request", 502, "svc")
+    await assert_audited(audit, kind="request", status=502, service="svc")
     assert {"event": "egress_broker_secret_unusable", "log_level": "warning", "service": "svc"} in logs
     assert SECRET not in repr(logs)
 
@@ -1336,8 +1330,7 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
 
     assert response.status == 413
     assert response.json() == BODY_TOO_LARGE
-    [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.service) == ("request", 413, "svc")
+    await assert_audited(audit, kind="request", status=413, service="svc")
 
 
 @pytest.mark.asyncio
