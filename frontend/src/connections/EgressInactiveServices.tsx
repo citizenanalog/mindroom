@@ -2,14 +2,7 @@ import { useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "./ConfirmDialog";
 import type { EgressInactiveReason, EgressInactiveService } from "./types";
 
 const REASON_TEXT: Record<EgressInactiveReason, string> = {
@@ -90,27 +83,14 @@ function InactiveServiceRow({
         </Alert>
       )}
       {onDelete && (
-        <Dialog
+        <ConfirmDialog
           open={confirming}
-          onOpenChange={(open) => !open && setConfirming(false)}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Delete inactive {service.name}?</DialogTitle>
-              <DialogDescription>
-                {DELETE_TEXT[service.reason]}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setConfirming(false)}>
-                Cancel
-              </Button>
-              <Button variant="destructive" onClick={() => void remove()}>
-                Delete
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          title={`Delete inactive ${service.name}?`}
+          description={DELETE_TEXT[service.reason]}
+          confirmLabel="Delete"
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void remove()}
+        />
       )}
     </li>
   );
