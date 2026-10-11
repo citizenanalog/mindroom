@@ -27,17 +27,19 @@ from agno.session.summary import SessionSummary
 from agno.team import Team
 from agno.tools.function import Function
 
+from mindroom import helper_usage
 from mindroom.agent_storage import create_session_storage, get_agent_session, get_team_session
 from mindroom.agents import create_agent
 from mindroom.agno_compat_model_hooks import install_request_preparation
 from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
 from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY as _NOTICE_KEY
+from mindroom.helper_usage import HelperUsageOwner
 from mindroom.history import agno_compat_message_builder, archive, mid_turn_compaction
 from mindroom.history.agno_compat_message_builder import built_request_session
 from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
 from mindroom.history.replay import compaction_summary_message, is_compaction_summary
-from mindroom.history.storage import read_scope_state, set_force_compaction_state
+from mindroom.history.storage import new_scope_session, read_scope_state, set_force_compaction_state
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState
 from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
 from mindroom.providers.synthetic_model import SyntheticModel
@@ -782,6 +784,44 @@ async def test_run_local_summary_usage_is_recorded(tmp_path: Path, summary_calls
     summaries = [json.loads(row) for row in rows if json.loads(row).get("kind") == "compaction_summary"]
     assert len(summaries) == len(summary_calls.inputs) >= 1
     assert all(summary["metrics"]["input_tokens"] == 7 for summary in summaries)
+
+
+@pytest.mark.asyncio
+async def test_run_local_summary_usage_goes_to_the_replys_usage_owner(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    db_file = str(tmp_path / "owner.db")
+
+    def owner_storage() -> SqliteDb:
+        return SqliteDb(db_file=db_file, session_table="owner_sessions")
+
+    owner = HelperUsageOwner(
+        storage_factory=owner_storage,
+        session_id="owner-session",
+        initial_session=new_scope_session(session_id="owner-session", scope_id="crew", is_team=True),
+    )
+    token = helper_usage._HELPER_USAGE_OWNER.set(owner)
+    try:
+        # A team member keeps no storage of its own; the reply's owner records its summary usage.
+        await _run(_agent(_ToolLoopModel(tool_rounds=5), config, paths), "Do the task")
+    finally:
+        helper_usage._HELPER_USAGE_OWNER.reset(token)
+
+    storage = owner_storage()
+    try:
+        with storage.db_engine.begin() as connection:
+            rows = connection.exec_driver_sql("SELECT session_id, usage_data FROM owner_sessions_usage").all()
+    finally:
+        storage.close()
+    summaries = [
+        (session_id, json.loads(data))
+        for session_id, data in rows
+        if json.loads(data).get("kind") == "compaction_summary"
+    ]
+    assert len(summaries) == len(summary_calls.inputs) >= 1
+    assert {session_id for session_id, _ in summaries} == {"owner-session"}
 
 
 @pytest.mark.asyncio
