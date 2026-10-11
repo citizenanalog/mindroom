@@ -117,6 +117,12 @@
           "title": "Credential Managers",
           "type": "array"
         },
+        "mcp_gateway_shared_credentials": {
+          "default": false,
+          "description": "Let users who may use this agent call its tools through the MCP gateway even though its worker scope is shared or unset, so every caller runs them with the agent's shared credentials and worker, without the agent's instructions; agents with per-user scopes are available without it",
+          "title": "Mcp Gateway Shared Credentials",
+          "type": "boolean"
+        },
         "accept_invites": {
           "anyOf": [
             {
@@ -3006,6 +3012,19 @@
           "description": "Judge with the OpenAI Decisions API; uses the OpenAI API key",
           "title": "Provider",
           "type": "string"
+        },
+        "credentials_service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Credential service holding the OpenAI API key; defaults to the OpenAI provider credential, which may hold a proxy key that api.openai.com rejects",
+          "title": "Credentials Service"
         }
       },
       "required": [

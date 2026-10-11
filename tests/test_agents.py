@@ -59,6 +59,7 @@ from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths, resolve_runtime_paths
 from mindroom.credentials import CredentialsManager, get_runtime_credentials_manager, load_scoped_credentials
+from mindroom.delegation.state import SubagentPersona
 from mindroom.entity_resolution import managed_entity_power_user_ids_for_room
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.history.session_context import close_team_runtime_state_dbs
@@ -4224,6 +4225,35 @@ def test_create_agent_hides_apply_patch_with_hidden_file_edits(tmp_path: Path, h
     }
     assert "read_file" in names
     assert not names & {"apply_patch", "edit_file", "write_file"}
+
+
+def test_persona_that_names_only_apply_patch_keeps_it(tmp_path: Path) -> None:
+    """A persona hides the functions it does not name, but not apply_patch for the edit tools it left out."""
+    config = _test_config()
+    config.agents["general"].tools = ["coding"]
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _bind_runtime_paths(config, runtime_paths)
+
+    agent = create_agent(
+        "general",
+        config,
+        runtime_paths,
+        execution_identity=None,
+        persona=SubagentPersona(
+            source_kind="inline",
+            source_name="",
+            system_prompt="Edit files with patches.",
+            tools=("coding.apply_patch",),
+        ),
+    )
+
+    names = {
+        name
+        for toolkit in agent.tools or []
+        if isinstance(toolkit, Toolkit)
+        for name in (*toolkit.functions, *toolkit.async_functions)
+    }
+    assert names & {"apply_patch", "edit_file", "read_file", "write_file"} == {"apply_patch"}
 
 
 @pytest.mark.parametrize(

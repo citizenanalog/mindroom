@@ -40,6 +40,7 @@ import structlog
 import yaml
 from agno.models.base import Model
 from agno.models.response import ModelResponse
+from agno.utils import log as agno_log
 from aioresponses import aioresponses
 from structlog.testing import ReturnLoggerFactory
 from structlog.typing import BindableLogger, Context, Processor, WrappedLogger
@@ -73,6 +74,7 @@ from mindroom.dispatch_handoff import (
 )
 from mindroom.dispatch_source import ScheduledHistoryBudget
 from mindroom.edit_regenerator import EditRegenerator
+from mindroom.entity_resolution import persisted_bot_user_ids
 from mindroom.event_journal import (
     AdmissionResult,
     ConversationPage,
@@ -85,6 +87,7 @@ from mindroom.event_journal import (
     MatrixDelivery,
     MatrixDeliveryView,
     PendingTurnView,
+    PermanentDeliveryFailure,
     PrincipalStore,
     ProjectedEvent,
     RelationView,
@@ -94,7 +97,7 @@ from mindroom.event_journal import (
 from mindroom.event_journal import reads as journal_reads
 from mindroom.event_journal.outbox import matrix_delivery_payload
 from mindroom.final_delivery import FinalDeliveryOutcome
-from mindroom.handled_turns import _reset_handled_turn_ledger_runtime
+from mindroom.handled_turns import TurnRecord, _reset_handled_turn_ledger_runtime
 from mindroom.history.runtime import (
     finalize_history_preparation,
     prepare_scope_history,
@@ -138,6 +141,7 @@ from mindroom.thread_utils import decide_agent_response
 from mindroom.turn_controller import TurnController, _DispatchPreparation, _ReplayGuardContext
 from mindroom.turn_origin import TurnOrigin, classify_turn_origin
 from mindroom.turn_policy import PreparedDispatch, TurnPolicy
+from mindroom.turn_record import canonicalize_turn_record
 from mindroom.turn_store import TurnStore
 from mindroom.user_stop_reconciliation import UserStopReconciler
 from mindroom.visible_response_reconciliation import VisibleResponseReconciler
@@ -156,7 +160,6 @@ if TYPE_CHECKING:
     from mindroom.event_journal import EventJournalStore
     from mindroom.event_journal.backend import Backend, Operation
     from mindroom.matrix_rtc.call_manager import CallManager
-    from mindroom.response_sources import ResponseAttempt
     from mindroom.streaming import StreamingResponse
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
@@ -170,7 +173,7 @@ _POSTGRES_STARTUP_TIMEOUT_SECONDS = 30
 # breaks against a glibc server. The journal's server is therefore glibc.
 _POSTGRES_JOURNAL_RUN_ID_STASH_KEY = pytest.StashKey[str]()
 _POSTGRES_JOURNAL_CONTAINER_PREFIX = "mindroom-postgres-journal-test-"
-_POSTGRES_JOURNAL_IMAGE = "postgres:16"
+_POSTGRES_JOURNAL_IMAGE = "mirror.gcr.io/library/postgres:16"
 _POSTGRES_JOURNAL_LOCALE = "en_US.utf8"
 
 # `postgres:16` declares `VOLUME /var/lib/postgresql/data`, so every container
@@ -1336,6 +1339,22 @@ def serve_conversation_reader(
     reader.read_strict.return_value = page
 
 
+class _NoReplyRecords:
+    """Reply records of an outbox that never writes a reply row."""
+
+    async def with_pending_work(self) -> tuple[object, ...]:
+        return ()
+
+    async def for_event(self, _event_id: str) -> None:
+        return None
+
+    async def for_sources(self, _event_ids: tuple[str, ...]) -> None:
+        return None
+
+    async def load(self, _reply_id: str) -> None:
+        return None
+
+
 class FakeOutbox:
     """An in-memory outbox with the real claim-before-send semantics.
 
@@ -1347,7 +1366,6 @@ class FakeOutbox:
 
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], MatrixDelivery] = {}
-        self.response_attempts: dict[str, ResponseAttempt] = {}
         # What each acknowledgement carried alongside it, so a test can
         # assert the terminal record and the acknowledgement are one write.
         self.acknowledged_terminal_turns: list[tuple[str, TerminalTurnWrite | None]] = []
@@ -1363,6 +1381,11 @@ class FakeOutbox:
     def principal_id(self) -> str:
         """Return the principal this in-memory delivery store represents."""
         return "agent@alice"
+
+    @property
+    def replies(self) -> _NoReplyRecords:
+        """Return the reply records this outbox never writes."""
+        return _NoReplyRecords()
 
     async def membership_epoch(self, room_id: str) -> int:
         """Return the fake room's current membership epoch."""
@@ -1382,7 +1405,6 @@ class FakeOutbox:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
-        response_attempt: "ResponseAttempt | None" = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
         settle_source_event_ids: tuple[str, ...] = (),
@@ -1407,11 +1429,6 @@ class FakeOutbox:
         to settle them in; whether the settlement really shares this
         transaction is pinned against the real backends.
         """
-        if response_attempt is not None:
-            existing_attempt = self.response_attempts.setdefault(delivery_id, response_attempt)
-            if existing_attempt != response_attempt:
-                message = "Conflicting response attempt identity"
-                raise ValueError(message)
         if settle_source_event_ids:
             self.handed_over.append(settle_source_event_ids)
         membership_epoch = await self.membership_epoch(room_id)
@@ -1527,18 +1544,18 @@ class FakeOutbox:
         delivery_id: str,
         stage: DeliveryStage,
         reason: str,
-    ) -> str | None:
-        """Stop retrying one definitively refused immutable payload, or return its ACK."""
+    ) -> PermanentDeliveryFailure:
+        """Stop retrying one definitively refused immutable payload, or report its ACK."""
         if not reason:
             msg = "A permanent Matrix delivery failure requires a reason"
             raise ValueError(msg)
         key = (delivery_id, stage.value)
         row = self.rows.get(key)
         if row is None or row.acknowledged_event_id is not None:
-            return None if row is None else row.acknowledged_event_id
+            return PermanentDeliveryFailure(acknowledged_event_id=None if row is None else row.acknowledged_event_id)
         if not row.retired and not row.permanently_failed:
             self.rows[key] = replace(row, permanent_failure_reason=reason)
-        return None
+        return PermanentDeliveryFailure()
 
     async def retire_matrix_delivery(
         self,
@@ -1580,7 +1597,7 @@ class FakeOutbox:
             # First-writer-wins, like the real store: a loser is told the event
             # the row already names rather than its own, and told it bound
             # nothing -- which stays true even when the two events are equal.
-            return DeliveryAcknowledgement(settled_event_id=already, bound=False)
+            return DeliveryAcknowledgement(settled_event_id=already)
         self.rows[key] = replace(
             self.rows[key],
             acknowledged_event_id=event_id,
@@ -1588,7 +1605,7 @@ class FakeOutbox:
         )
         self.acknowledged_terminal_turns.append((delivery_id, terminal_turn))
         self.acknowledged_projections.append(delivered_projections)
-        return DeliveryAcknowledgement(settled_event_id=event_id, bound=True, terminal_turn=terminal_turn)
+        return DeliveryAcknowledgement(settled_event_id=event_id, terminal_turn=terminal_turn)
 
     async def unacknowledged_matrix_deliveries(
         self,
@@ -1696,7 +1713,6 @@ class DiesAfterAcknowledgement:
         thread_id: str | None,
         payload: Mapping[str, object],
         result: Mapping[str, object] | None = None,
-        response_attempt: "ResponseAttempt | None" = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
         settle_source_event_ids: tuple[str, ...] = (),
@@ -1710,7 +1726,6 @@ class DiesAfterAcknowledgement:
             thread_id=thread_id,
             payload=payload,
             result=result,
-            response_attempt=response_attempt,
             event_type=event_type,
             edits_event_id=edits_event_id,
             settle_source_event_ids=settle_source_event_ids,
@@ -1759,8 +1774,8 @@ class DiesAfterAcknowledgement:
         delivery_id: str,
         stage: DeliveryStage,
         reason: str,
-    ) -> str | None:
-        """Stop retrying one definitively refused immutable payload, or return its ACK."""
+    ) -> PermanentDeliveryFailure:
+        """Stop retrying one definitively refused immutable payload, or report its ACK."""
         return await self.inner.record_permanent_matrix_delivery_failure(
             delivery_id=delivery_id,
             stage=stage,
@@ -2504,17 +2519,42 @@ def replace_response_runner_deps(bot: RuntimeBot, **changes: object) -> Response
     return rebuilt
 
 
+async def finish_edit_regenerations(bot: RuntimeBot) -> None:
+    """Wait for the regenerations edits started off the room's lane, as a test checks their effects."""
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    await asyncio.gather(*tuple(runner._inbox_response_tasks), return_exceptions=True)
+
+
+def journal_edit_regenerator_deps(bot: RuntimeBot, principal: PrincipalStore) -> dict[str, object]:
+    """Return the edit regenerator collaborators that read ``principal``, for a test that moved the bot's replies there."""
+
+    async def later_human_message(record: TurnRecord) -> bool:
+        target = record.conversation_target
+        assert target is not None
+        return await principal.later_message_exists(
+            room_id=target.room_id,
+            thread_id=target.resolved_thread_id,
+            source_event_ids=record.source_event_ids,
+            excluded_senders=persisted_bot_user_ids(bot.runtime_paths),
+            whole_room=bot._room_scope_is_single_conversation(target.room_id),
+        )
+
+    return {
+        "generate_response": bot._run_regenerated_response,
+        "reply_for_sources": principal.replies.for_sources,
+        "later_human_message": later_human_message,
+    }
+
+
 def replace_edit_regenerator_deps(bot: RuntimeBot, **changes: object) -> EditRegenerator:
     """Rebuild the edit regenerator after swapping captured collaborators."""
     install_runtime_journal_support(bot)
     regenerator = unwrap_extracted_collaborator(bot._edit_regenerator)
     regenerator_field_names = set(regenerator.deps.__dataclass_fields__)
-    rebuilt_changes = {
-        name: value for name, value in changes.items() if name in regenerator_field_names or name == "logger"
-    }
-    if "logger" in rebuilt_changes:
-        logger = rebuilt_changes.pop("logger")
-        rebuilt_changes["get_logger"] = lambda logger=logger: logger
+    store_field_names = set(unwrap_extracted_collaborator(bot._turn_store).deps.__dataclass_fields__)
+    unknown = set(changes) - regenerator_field_names - store_field_names
+    assert not unknown, f"not an edit regenerator or turn store collaborator: {sorted(unknown)}"
+    rebuilt_changes = {name: value for name, value in changes.items() if name in regenerator_field_names}
     if "receipt_order" not in rebuilt_changes:
         receipt_orders = count(1)
 
@@ -2522,7 +2562,6 @@ def replace_edit_regenerator_deps(bot: RuntimeBot, **changes: object) -> EditReg
             return next(receipt_orders)
 
         rebuilt_changes["receipt_order"] = next_receipt_order
-    store_field_names = set(unwrap_extracted_collaborator(bot._turn_store).deps.__dataclass_fields__)
     store_changes = {name: value for name, value in changes.items() if name in store_field_names}
     if store_changes:
         replace_turn_store_deps(bot, **store_changes)
@@ -2665,7 +2704,6 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
         replace(
             user_stop_reconciler.deps,
             turn_store=rebuilt_changes["turn_store"],
-            response_runner=rebuilt_changes["response_runner"],
             delivery_gateway=rebuilt_changes["delivery_gateway"],
         ),
     )
@@ -2680,10 +2718,8 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
         runtime_paths=rebuilt.deps.runtime_paths,
         agent_name=rebuilt.deps.agent_name,
         turn_policy=rebuilt.deps.turn_policy,
-        turn_store=rebuilt.deps.turn_store,
         user_stop_reconciler=bot._user_stop_reconciler,
         ingress=rebuilt.deps.ingress,
-        stop_manager=bot.stop_manager,
         reserve_prompt_ingress_order=rebuilt.reserve_prompt_ingress_order,
         enqueue_interactive_selection=rebuilt.enqueue_interactive_selection,
         config_confirmation=replace(
@@ -2791,6 +2827,15 @@ def install_send_response_mock(bot: RuntimeBot, send_response: AsyncMock) -> Non
     replace_response_runner_deps(bot, delivery_gateway=bot._delivery_gateway)
 
 
+async def record_turn_answered(bot: RuntimeBot, request: ResponseRequest) -> None:
+    """Settle a faked response's sources and record its turn answered, as a real reply's records do."""
+    await bot._journal_dispatcher.store.settle_many(request.sources.pending_event_ids)
+    turn_store = unwrap_extracted_collaborator(bot._turn_store)
+    record = turn_store.get_turn_record(request.sources.logical_source_event_ids[0])
+    if record is not None:
+        await turn_store.publish_completed_turn(canonicalize_turn_record(record, completed=True))
+
+
 def install_generate_response_mock(bot: RuntimeBot, generate_response: AsyncMock) -> None:
     """Route response execution through one envelope-explicit generate-response mock."""
     wrap_extracted_collaborators(bot, "_response_runner")
@@ -2813,7 +2858,6 @@ def install_generate_response_mock(bot: RuntimeBot, generate_response: AsyncMock
             prompt=request.prompt,
             thread_history=request.thread_history,
             existing_event_id=request.existing_event_id,
-            existing_event_is_placeholder=request.existing_event_is_placeholder,
             user_id=request.user_id,
             media=request.media,
             attachment_ids=attachment_ids,
@@ -2824,7 +2868,10 @@ def install_generate_response_mock(bot: RuntimeBot, generate_response: AsyncMock
             correlation_id=request.correlation_id,
             matrix_run_metadata=request.matrix_run_metadata,
         )
-        return _resolved_event_id_from_test_result(result)
+        event_id = _resolved_event_id_from_test_result(result)
+        if event_id is not None:
+            await record_turn_answered(bot, request)
+        return event_id
 
     bot._response_runner.generate_response = AsyncMock(side_effect=_generate)
     replace_turn_controller_deps(bot, response_runner=bot._response_runner)
@@ -2892,8 +2939,21 @@ def _isolate_structlog_configuration(
     _configure_quiet_structlog()
     if request.node.path.name != "test_logging_config.py":
         monkeypatch.setattr(structlog, "configure", _configure_uncached_structlog)
+    # `setup_logging` reroutes Agno's loggers; give later tests on this worker Agno's own setup back.
+    agno_loggers = [
+        (agno_logger, agno_logger.handlers[:], agno_logger.filters[:], agno_logger.level, agno_logger.propagate)
+        for agno_logger in (agno_log.agent_logger, agno_log.team_logger, agno_log.workflow_logger)
+    ]
+    # Team and workflow runs repoint Agno's default logger, and `log_info` and friends follow it.
+    agno_default_logger = agno_log.logger
     yield
     _configure_quiet_structlog()
+    for agno_logger, handlers, filters, level, propagate in agno_loggers:
+        agno_logger.handlers[:] = handlers
+        agno_logger.filters[:] = filters
+        agno_logger.setLevel(level)
+        agno_logger.propagate = propagate
+    agno_log.logger = agno_default_logger
 
 
 @pytest.fixture(autouse=True)
