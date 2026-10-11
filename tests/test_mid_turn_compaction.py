@@ -1302,6 +1302,53 @@ async def test_failure_after_part_of_the_turn_committed_rolls_the_turn_back(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stop", [RuntimeError, asyncio.CancelledError])
+async def test_rolling_back_a_partial_compaction_keeps_an_earlier_one(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: type[BaseException],
+) -> None:
+    config, paths = _config(tmp_path, summary_context_window=6_000)
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(storage, _session("session-1"))
+    attempts: list[int] = []
+    first_summary: list[str | None] = []
+    original_compact = mid_turn_compaction.compact_scope_mid_turn
+
+    async def counted_compaction(**kwargs: Any) -> object:  # noqa: ANN401
+        attempts.append(0)
+        if len(attempts) == 2:
+            generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
+            first_summary.append(generation.summary if generation is not None else None)
+        return await original_compact(**kwargs)
+
+    async def fail_second_chunk_of_second_attempt(**kwargs: Any) -> SessionSummary:  # noqa: ANN401
+        attempts[-1] += 1
+        if len(attempts) == 2 and attempts[-1] == 2:
+            summary_calls.inputs.append(kwargs["summary_input"])
+            raise stop
+        return await summary_calls(**kwargs)
+
+    monkeypatch.setattr(mid_turn_compaction, "compact_scope_mid_turn", counted_compaction)
+    monkeypatch.setattr("mindroom.history.compaction.generate_compaction_summary", fail_second_chunk_of_second_attempt)
+
+    agent = _scoped_agent(_ToolLoopModel(tool_rounds=14), config, paths, storage)
+    if stop is asyncio.CancelledError:
+        with pytest.raises(asyncio.CancelledError):
+            await _run_in_session(agent, "Do the task")
+    else:
+        await _run_in_session(agent, "Do the task")
+
+    assert len(attempts) >= 2
+    assert attempts[1] == 2
+    assert first_summary[0] is not None
+    generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert generation is not None
+    assert generation.summary == first_summary[0]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_after_part_of_the_turn_committed_rolls_the_turn_back(
     tmp_path: Path,
     summary_calls: _SummaryCalls,

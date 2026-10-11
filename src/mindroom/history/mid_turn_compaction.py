@@ -317,10 +317,10 @@ async def _compact_scope(
             )
         except asyncio.CancelledError:
             # A fully committed turn archived its exchanges, so the request must not resend them.
-            if await _turn_committed(storage, session, scope, run_response, snapshots):
+            if await _turn_committed(storage, session, scope, snapshots):
                 _finish(messages, layout, _scope_summary_message(session), run_response)
             raise
-        committed = await _turn_committed(storage, session, scope, run_response, snapshots)
+        committed = await _turn_committed(storage, session, scope, snapshots)
     finally:
         kept = {run.run_id for run in session.runs or []}
         session.runs = [*(session.runs or []), *(run for run in member_runs if run.run_id not in kept)]
@@ -344,10 +344,9 @@ async def _turn_committed(
     storage: BaseDb,
     session: AgentSession | TeamSession,
     scope: HistoryScope,
-    run_response: RunOutput | TeamRunOutput,
     snapshots: Sequence[RunOutput | TeamRunOutput],
 ) -> bool:
-    """Return whether every snapshot of the turn committed, rolling back a turn that committed only in part."""
+    """Return whether every snapshot of this compaction committed, rolling back one that committed only in part."""
     run_ids = [snapshot.run_id or "" for snapshot in snapshots]
     archived = await run_blocking_until_complete(
         partial(archive.archived_run_ids, storage, session_id=session.session_id, run_ids=run_ids),
@@ -356,7 +355,7 @@ async def _turn_committed(
         return True
     if any(run_id in archived for run_id in run_ids):
         await run_blocking_until_complete(
-            partial(roll_back_running_turn, storage, session, scope, run_response.run_id or ""),
+            partial(roll_back_running_turn, storage, session, scope, run_ids),
         )
     return False
 

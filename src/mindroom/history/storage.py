@@ -589,14 +589,20 @@ def roll_back_running_turn(
     storage: BaseDb,
     session: AgentSession | TeamSession,
     scope: HistoryScope,
-    run_id: str,
+    snapshot_run_ids: Sequence[str],
 ) -> None:
-    """Undo compaction from the first archived snapshot of a still-running run, keeping everything before it.
+    """Undo compaction from the first of these snapshots of a still-running run, keeping everything before it.
 
     A turn's exchanges fold together or not at all, so a compaction that committed only some of them is undone;
-    runs archived earlier in that generation return live, and ``session`` is synced to the stored result.
+    runs archived earlier in that generation return live, earlier compactions of the same run stay, and
+    ``session`` is synced to the stored result.
     """
-    hit = archive.earliest_archived_run(storage, session_id=session.session_id, scope_key=scope.key, run_ids=[run_id])
+    hit = archive.earliest_archived_run(
+        storage,
+        session_id=session.session_id,
+        scope_key=scope.key,
+        run_ids=snapshot_run_ids,
+    )
     if hit is None:
         return
     archive.roll_back_to(storage, session_id=session.session_id, scope_key=scope.key, hit=hit, live_run_ids=())
