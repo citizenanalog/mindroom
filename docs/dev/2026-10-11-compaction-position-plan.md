@@ -1,6 +1,7 @@
 # Positioned mid-turn compaction implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: implement this plan task-by-task with the skill named in **Execution**. Steps use checkbox (`- [ ]`) syntax.
+> **For agentic workers:** REQUIRED SUB-SKILL: implement this plan task-by-task with the skill named in **Execution**.
+> Steps use checkbox (`- [ ]`) syntax.
 
 **Execution:** baspowers:executing-plans — the tasks share one storage contract and are mostly deletions and narrow additions, so one context with a fresh three-model review at the end fits better than per-task subagents.
 
@@ -40,9 +41,11 @@
 - Produces: generations gain nullable `through_run_id TEXT`, `covered_run_ids TEXT`, `event_ids TEXT`, `seen_event_ids TEXT`; archived runs gain nullable `run_index INTEGER`; `archive_runs(..., generation_id: int | None = None)` appends to an existing generation when given and records each run's stored `run_index`; `insert_run_row(..., run_index: int | None = None)` writes an explicit index.
 
 - [ ] **Step 1: Write the failing tests** `test_existing_archive_gains_the_new_columns` (create both tables with the old DDL, ensure them, assert the columns exist and old rows read as unpositioned) and `test_rollback_restores_runs_at_their_original_indexes_after_reopening` (runs `r1`, paused `p`, `x`; archive `r1`; roll back; reopen the database; assert stored order `r1, p`).
-- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_history_archive.py -k "new_columns or original_indexes"`. Expected: both FAIL.
+- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_history_archive.py -k "new_columns or original_indexes"`.
+      Expected: both FAIL.
 - [ ] **Step 3: Implement** the additive DDL (check `PRAGMA table_info`, then `ALTER TABLE ... ADD COLUMN`), index capture inside `archive_runs`' transaction, and restore at the captured index in `roll_back_to`; rows without an index keep appending, under a `LEGACY_COMPAT` marker.
-- [ ] **Step 4: Run** the same command. Expected: PASS; then `tests/test_history_archive.py` and `tests/test_compaction_redaction.py` stay green.
+- [ ] **Step 4: Run** the same command.
+      Expected: PASS; then `tests/test_history_archive.py` and `tests/test_compaction_redaction.py` stay green.
 - [ ] **Step 5: Commit** `feat(history): keep each archived run's original index and add positioned-generation columns`.
 
 ### Task 2: Positioned generations and one invalidation operation
@@ -62,9 +65,11 @@
   - `snapshot_run_id` and `snapshot_origin` are deleted.
 
 - [ ] **Step 1: Write the failing tests** `test_positioned_generation_counts_its_events_as_compacted`, `test_rolling_back_a_positioned_generation_removes_its_position_run`, `test_retiring_summaries_removes_shortened_position_runs`, `test_earliest_dependent_generation_finds_covering_and_positioned_generations`.
-- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_history_archive.py -k "positioned or dependent or shortened"`. Expected: FAIL (missing functions).
+- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_history_archive.py -k "positioned or dependent or shortened"`.
+      Expected: FAIL (missing functions).
 - [ ] **Step 3: Implement** the functions above; the invalidation helper is private and shared by `roll_back_to`, `retire_summaries`, and `clear_to_legacy`.
-- [ ] **Step 4: Run** the same command. Expected: PASS.
+- [ ] **Step 4: Run** the same command.
+      Expected: PASS.
 - [ ] **Step 5: Commit** `feat(history): record positioned generations and invalidate them with their position runs`.
 
 ### Task 3: Reconcile and removal through dependencies
@@ -78,9 +83,11 @@
 - Produces: `reconcile_compaction_state` derives each positioned generation's state from the position run's stored row and its `mindroom_mid_turn_generation` metadata value: applied (materialize its still-live covered runs into it), unapplied (delete it, keep the run), orphaned (invalidate from it); `remove_runs_for_sources` and redaction roll back from `earliest_dependent_generation` of the removed runs; `roll_back_running_turn`, the `keep_last` parameter, and `move_run_to_end` are deleted.
 
 - [ ] **Step 1: Rewrite the snapshot tests as positioned-generation tests**, failing first: edit of the position run, redaction of an event the run consumed before and after the fold and of its reply, redaction of a covered run, each before and after materialization and after a later generation archived the position run; an older paused run survives in order; the round-11 and Greptile scenarios; crash states (no stored position run, older paused row, row reflecting only an earlier fold).
-- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_compaction_redaction.py`. Expected: the new tests FAIL.
+- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_compaction_redaction.py`.
+      Expected: the new tests FAIL.
 - [ ] **Step 3: Implement** the reconcile states and dependency-based removal.
-- [ ] **Step 4: Run** `/work/tmp/pt.sh tests/test_compaction_redaction.py tests/test_history_archive.py tests/test_edit_response_regeneration.py`. Expected: PASS.
+- [ ] **Step 4: Run** `/work/tmp/pt.sh tests/test_compaction_redaction.py tests/test_history_archive.py tests/test_edit_response_regeneration.py`.
+      Expected: PASS.
 - [ ] **Step 5: Commit** `feat(history): reconcile positioned generations and roll back through dependencies`.
 
 ### Task 4: Mid-turn commit of a positioned generation
@@ -94,9 +101,11 @@
 - Produces: `compact_scope_mid_turn(*, storage, session, scope, resolved_inputs, covered_runs, snapshots, through_run_id, before_tokens, config, runtime_paths, compaction_lifecycle) -> CompactionOutcome | None`, which summarizes, emits hooks and notices, records usage, and commits; the hook then sets the summary on Agno's session object, rewrites the request, and records `mindroom_mid_turn_generation`; `compact_scope_history` loses `in_progress`.
 
 - [ ] **Step 1: Update the scoped tests first**: the next reply replays `[summary, position run prompt and tail]` with no summary call and its reconcile archives exactly the covered runs; the session row Agno writes at the run's end holds the new summary; a second fold covers no run twice; a resumed older run covering newer runs; a failure in any chunk leaves request and storage unchanged; a cancellation after the commit still rewrites; folded unseen thread context of a stopped run stays seen; hooks and notice counts.
-- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py`. Expected: the updated tests FAIL.
+- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py`.
+      Expected: the updated tests FAIL.
 - [ ] **Step 3: Implement** the new commit path and delete `_turn_committed`, member-run restore, snapshot archiving, and the `in_progress` plumbing.
-- [ ] **Step 4: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py tests/test_history_compaction_rewrite.py tests/test_compaction_redaction.py`. Expected: PASS.
+- [ ] **Step 4: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py tests/test_history_compaction_rewrite.py tests/test_compaction_redaction.py`.
+      Expected: PASS.
 - [ ] **Step 5: Commit** `feat(history): commit one positioned generation per mid-turn compaction`.
 
 ### Task 5: Reconcile before every continuation
@@ -110,9 +119,11 @@
 - Produces: the continuation builders reconcile the session Agno loaded before calling Agno's builder when the target replays persisted history and has storage; the three recovery paths reconcile before `restore_native_history`.
 
 - [ ] **Step 1: Write the failing tests**: an agent approval resume, a team approval resume, and an automatic continuation after a delegation, each after a mid-turn compaction before the pause, replay one summary and no covered run.
-- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py -k continuation`. Expected: FAIL.
+- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py -k continuation`.
+      Expected: FAIL.
 - [ ] **Step 3: Implement** the builder reconcile (off the event loop in the async builders) and the three recovery calls.
-- [ ] **Step 4: Run** the same command plus `tests/test_history_summary_message.py tests/test_approval_receipt.py`. Expected: PASS.
+- [ ] **Step 4: Run** the same command plus `tests/test_history_summary_message.py tests/test_approval_receipt.py`.
+      Expected: PASS.
 - [ ] **Step 5: Commit** `feat(history): reconcile stored history before every continuation`.
 
 ### Task 6: Fuzz, docs, markers, and Tach
@@ -121,9 +132,11 @@
 - Modify: `tests/test_compaction_fuzz.py`, `docs/architecture/compaction.md`, `docs/architecture/migrations.md`, `docs/architecture/agno-compatibility.md`, `docs/architecture/code-map.md`, `tach.toml`
 
 - [ ] **Step 1: Extend the fuzz test** with positioned compactions, materialization, edits, redactions, retirements, and reopen; invariants: replay is the latest summary plus uncovered runs, no shortened run without its generation, stored order matches creation order.
-- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_compaction_fuzz.py`. Expected: PASS after fixing what it finds.
+- [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_compaction_fuzz.py`.
+      Expected: PASS after fixing what it finds.
 - [ ] **Step 3: Update** the architecture pages and markers for the new columns, the run-index reads and writes, and the deleted snapshot code; run `uv run tach check --dependencies --interfaces`.
-- [ ] **Step 4: Run** pre-commit on all files and the full suite. Expected: green.
+- [ ] **Step 4: Run** pre-commit on all files and the full suite.
+      Expected: green.
 - [ ] **Step 5: Commit** `docs(history): describe positioned generations` and push.
 
 ### Final verification

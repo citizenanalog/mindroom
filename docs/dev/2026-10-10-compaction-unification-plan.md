@@ -1,6 +1,7 @@
 # Compaction Unification Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: implement this plan task-by-task with the skill named in **Execution**. Steps use checkbox (`- [ ]`) syntax.
+> **For agentic workers:** REQUIRED SUB-SKILL: implement this plan task-by-task with the skill named in **Execution**.
+> Steps use checkbox (`- [ ]`) syntax.
 
 **Execution:** baspowers:executing-plans — tasks share one evolving module and many private interfaces, so one implementer keeps them consistent; a fresh-context reviewer checks each task before the next, and three models review the whole branch at the end.
 
