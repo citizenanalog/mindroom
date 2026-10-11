@@ -243,8 +243,6 @@ def test_route_matches_injects_and_forwards_unmatched_paths_without_restriction(
     assert matched.match.service == "github"
     assert matched.refusal is None
     assert unmatched == Route(host_has_rules=True)
-    with pytest.raises(ValueError, match="not refused"):
-        _ = unmatched.refusal_status
 
 
 @pytest.mark.parametrize(
@@ -279,15 +277,6 @@ def test_restrict_to_rules_refuses_unmatched_paths() -> None:
     allowed = _route(config, "api.github.com", 443, "/repos/basnijholt/agent-cli/issues")
     assert allowed.match is not None
     assert _route(config, "example.com", 443, "/user") == Route(host_has_rules=False)
-
-
-def test_a_path_not_allowed_route_must_name_its_restricting_service() -> None:
-    """Without `restricted_by` the refusal's message and audit row would lack the service, so such a route cannot exist."""
-    with pytest.raises(ValueError, match="names the service"):
-        Route(host_has_rules=True, refusal="path_not_allowed")
-    assert Route(host_has_rules=True, refusal="path_not_allowed", restricted_by="svc").refusal_status == 403
-    # Other routes need no restricting service.
-    assert Route(host_has_rules=True, refusal="bad_request").restricted_by is None
 
 
 def test_restrict_to_rules_refuses_graphql_unless_listed() -> None:

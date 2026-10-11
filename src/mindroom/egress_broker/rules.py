@@ -88,19 +88,10 @@ class Route:
     restricted_by_label: str | None = None
     restricted_by_operator: bool = False
 
-    def __post_init__(self) -> None:
-        """Refuse a `path_not_allowed` route that names no restricting service, which its message and audit row need."""
-        if self.refusal == "path_not_allowed" and self.restricted_by is None:
-            msg = "A path_not_allowed route names the service that restricts the host."
-            raise ValueError(msg)
-
     @property
     def refusal_status(self) -> int:
-        """Return the HTTP status that goes with `refusal`; a route that is not refused has none."""
-        if self.refusal is None:
-            msg = "Route is not refused."
-            raise ValueError(msg)
-        return {"bad_request": 400, "path_not_allowed": 403}[self.refusal]
+        """Return the HTTP status that goes with `refusal`, for a refused route."""
+        return 400 if self.refusal == "bad_request" else 403
 
     def refusal_body(self, *, host: str, path: str, manage_url: str | None, scope: ScopeInfo) -> dict[str, object]:
         """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it.
@@ -109,9 +100,6 @@ class Route:
         and for one of the scope's own services the user on a personal agent, or on a shared or unscoped agent
         (`scope`) its credential managers.
         """
-        if self.refusal is None:
-            msg = "Route is not refused."
-            raise ValueError(msg)
         if self.refusal == "bad_request":
             return refusal_body("bad_request", path=path)
         return refusal_body(
@@ -259,7 +247,7 @@ class EgressRules:
     """The rules one requester's traffic matches: the operator's config and its merge with the scope's own services.
 
     The scope's services can narrow operator policy, never widen it. Under `unmatched_hosts: deny` a user rule
-    applies only on hosts the operator's services name (`applicable`). On a host where an operator service sets
+    applies only on hosts the operator's services name (`intercepts`). On a host where an operator service sets
     `restrict_to_rules` a path must match an operator rule, and where one of the scope's services sets it the path
     must also match one of the scope's rules (`route_request`). Top-level settings come from the operator's config.
     """
@@ -277,15 +265,11 @@ class EgressRules:
         """Return what happens to hosts without applicable rules, as the operator configured it."""
         return self.operator.unmatched_hosts
 
-    def applicable(self, host: str, port: int) -> EgressBrokerConfig:
-        """Return the config whose rules apply on `host`:`port`: the operator's alone where `deny` keeps user rules out."""
-        if self.operator.unmatched_hosts == "deny" and not host_has_rules(self.operator, host, port):
-            return self.operator
-        return self.effective
-
     def intercepts(self, host: str, port: int) -> bool:
-        """Return whether a CONNECT to `host`:`port` is intercepted: an applicable rule names it."""
-        return host_has_rules(self.applicable(host, port), host, port)
+        """Return whether a rule applies on `host`:`port`; under `deny` only where an operator rule names it."""
+        if self.operator.unmatched_hosts == "deny" and not host_has_rules(self.operator, host, port):
+            return False
+        return host_has_rules(self.effective, host, port)
 
 
 def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> RuleMatch | None:
@@ -388,8 +372,8 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     | 4   | A user service restricts the host; no user rule matches.          | `refusal="path_not_allowed"` (403) |
     | 5   | Otherwise.                                                        | `match=match_rule(...)`, or None   |
 
-    Row 1 leaves the request to the caller's `unmatched_hosts`, whatever the path. `EgressRules.applicable` decides
-    which rules apply: under `deny` a user rule applies only on a host and port that an operator rule names.
+    Row 1 leaves the request to the caller's `unmatched_hosts`, whatever the path. `EgressRules.intercepts` decides
+    whether rules apply: under `deny` a user rule applies only on a host and port that an operator rule names.
     Row 2 refuses before matching, so path tricks cannot select a different rule.
     Rows 3 and 4 are each party's restriction (`_restriction_refusal`). A service with `restrict_to_rules` or
     `restrict_only` and a rule for the host restricts it; the path must then match one of that party's rules,
@@ -402,21 +386,20 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     apply, since the host has rules.
     """
     host = host.lower()
-    config = rules.applicable(host, port)
-    if not host_has_rules(config, host, port):
+    if not rules.intercepts(host, port):
         return Route(host_has_rules=False)
     if is_ambiguous_path(path):
         return Route(host_has_rules=True, refusal="bad_request")
     operator = rules.operator.services
     # A user service never takes an operator service's name, so the names tell the parties apart.
-    user = {name: service for name, service in config.services.items() if name not in operator}
+    user = {name: service for name, service in rules.effective.services.items() if name not in operator}
     operator_refusal = _restriction_refusal(operator, host, port, path, by_operator=True)
     if operator_refusal is not None:
         return operator_refusal
     user_refusal = _restriction_refusal(user, host, port, path, by_operator=False)
     if user_refusal is not None:
         return user_refusal
-    return Route(host_has_rules=True, match=match_rule(config, host, port, path))
+    return Route(host_has_rules=True, match=match_rule(rules.effective, host, port, path))
 
 
 def _inject_query_param(target: bytes, param_name: str, template: str, secret: str) -> bytes:
