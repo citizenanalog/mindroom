@@ -15,7 +15,7 @@ from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, Egress
 from mindroom.egress_broker import dial
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
 from mindroom.worker_computer.browser_proxy import BrowserEgress, UpstreamTunnelRefusedError, _UpstreamProxy
-from tests.egress_broker.conftest import connect_request, proxy_authorization
+from tests.egress_broker.conftest import connect_request, proxy_authorization, serving
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     import httpx
 
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, ServeFactory, UpstreamCA
+    from tests.egress_broker.conftest import BrokerFactory, RawResponse, UpstreamCA
 
     RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
 
@@ -313,7 +313,7 @@ async def test_loopback_destination_dials_direct_even_with_a_proxy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("host", ["10.0.0.1", "169.254.169.254", "127.0.0.1", "::ffff:10.0.0.1"])
-async def test_blocked_destination_never_contacts_proxy(serve: ServeFactory, host: str) -> None:
+async def test_blocked_destination_never_contacts_proxy(host: str) -> None:
     """The SSRF guard runs before any tunnel, so a blocked destination never reaches the operator proxy."""
     connections = 0
 
@@ -322,11 +322,11 @@ async def test_blocked_destination_never_contacts_proxy(serve: ServeFactory, hos
         connections += 1
         writer.close()
 
-    proxy = _UpstreamProxy("127.0.0.1", await serve(accept), tls=False)
-    policy = DialPolicy(egress=BrowserEgress(http=proxy, https=proxy))
-
-    with pytest.raises(DestinationBlockedError):
-        await open_upstream(host, 443, policy=policy, ssl_context=None)
+    async with serving(accept) as port:
+        proxy = _UpstreamProxy("127.0.0.1", port, tls=False)
+        policy = DialPolicy(egress=BrowserEgress(http=proxy, https=proxy))
+        with pytest.raises(DestinationBlockedError):
+            await open_upstream(host, 443, policy=policy, ssl_context=None)
 
     assert connections == 0
 

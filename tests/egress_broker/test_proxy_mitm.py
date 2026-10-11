@@ -42,6 +42,7 @@ from tests.egress_broker.conftest import (
     proxy_authorization,
     read_raw_response,
     run_command,
+    serving,
     single_rule_config,
     with_user_services,
 )
@@ -813,7 +814,6 @@ async def test_upstream_unreachable_gets_502(
 async def test_untrusted_upstream_certificate_gets_502(
     broker: BrokerFactory,
     proxy_client: ProxyClient,
-    serve: ServeFactory,
 ) -> None:
     """The broker verifies the real upstream; one it cannot verify never receives the secret."""
     await broker(single_rule_config(), secrets={"svc": SECRET})
@@ -824,10 +824,9 @@ async def test_untrusted_upstream_certificate_gets_502(
         writer.close()
 
     # Signed by the broker CA, which the broker's upstream context does not trust.
-    port = await serve(record, ssl_context=broker.ca.server_context("localhost"))
-    client = proxy_client(broker.token())
-
-    response = await client.get(f"https://localhost:{port}/echo")
+    async with serving(record, ssl_context=broker.ca.server_context("localhost")) as port:
+        client = proxy_client(broker.token())
+        response = await client.get(f"https://localhost:{port}/echo")
 
     assert response.status_code == 502
     assert response.json() == LOCALHOST_UNREACHABLE

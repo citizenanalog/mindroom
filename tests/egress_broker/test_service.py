@@ -137,12 +137,13 @@ def _broker_env(port: int, **extra: str) -> dict[str, str]:
     }
 
 
-def _target(
+def _routable_target(
     requester_id: str = "@alice:example.org",
     agent_name: str = "code",
     *,
     scope: WorkerScope | None = "user_agent",
 ) -> ResolvedWorkerTarget:
+    """Return `worker_target`, but with a worker key even for an unscoped call, so the broker can route it."""
     target = worker_target(requester_id, agent_name, scope=scope)
     # An unscoped call has no worker key; it is routed to a worker that its proxy token names.
     return replace(target, worker_key="v1:local:unscoped:code") if target.worker_key is None else target
@@ -210,7 +211,7 @@ async def test_disabled_without_port(
         env = execution_env_for_worker(
             runtime_paths,
             config=config,
-            worker_target=_target(),
+            worker_target=_routable_target(),
         )
         assert env == {}
     assert not (tmp_path / "mindroom_data" / "egress_broker").exists()
@@ -274,7 +275,7 @@ async def test_end_to_end_inject_through_running_service(
     """A worker using only the env from execution_env_for_worker reaches the upstream with the scope's secret."""
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
-    target = _target()
+    target = _routable_target()
     save_secret(manager, target, "github", "s3cret")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
@@ -307,7 +308,7 @@ async def test_missing_secret_reports_manage_url(
         env = execution_env_for_worker(
             runtime_paths,
             config=config,
-            worker_target=_target(),
+            worker_target=_routable_target(),
         )
         response = await get_through(env)
     assert response.status_code == 403
@@ -329,7 +330,7 @@ async def test_unreadable_config_tunnels_without_injection(
     """When the config provider raises, the broker has no rules: traffic is tunnelled and nothing is injected."""
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
-    target = _target()
+    target = _routable_target()
     save_secret(manager, target, "github", "s3cret")
 
     def broken() -> Config | None:
@@ -364,7 +365,7 @@ async def test_last_good_config_survives_unreadable_config(
         return config if state["mode"] == "good" else None
 
     async with serve_egress_broker(runtime_paths, config_provider=provider, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         connect = connect_request(f"localhost:{tls_upstream.port}", authorization=proxy_authorization(_token(env)))
         responses = []
         for mode in ("good", "raise", "none"):
@@ -384,7 +385,7 @@ async def test_placeholder_env_only_when_secret_configured(
     """Placeholders come only from services with a secret in this worker's scope; the proxy env is always set."""
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB, openai=_OPENAI)
-    alice = _target("@alice:example.org")
+    alice = _routable_target("@alice:example.org")
     save_secret(manager, alice, "github", "s3cret")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(
@@ -395,7 +396,7 @@ async def test_placeholder_env_only_when_secret_configured(
         bob_env = execution_env_for_worker(
             runtime_paths,
             config=config,
-            worker_target=_target("@bob:example.org"),
+            worker_target=_routable_target("@bob:example.org"),
         )
     assert alice_env["GH_TOKEN"] == _PLACEHOLDER
     assert "OPENAI_API_KEY" not in alice_env
@@ -413,7 +414,7 @@ async def test_secret_status_failure_skips_only_that_service(
     """A secret store error for one service drops that service's placeholders, logs only names, and spares the call."""
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB, openai=_OPENAI)
-    target = _target()
+    target = _routable_target()
     save_secret(manager, target, "github", "s3cret")
     save_secret(manager, target, "openai", "sk-s3cret")
     real_service_status = service.service_status
@@ -456,7 +457,7 @@ async def test_no_env_without_config_or_claims(
     config = _config(github=_GITHUB)
     no_identity = resolve_worker_target("user_agent", "code", None)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        assert execution_env_for_worker(runtime_paths, config=None, worker_target=_target()) == {}
+        assert execution_env_for_worker(runtime_paths, config=None, worker_target=_routable_target()) == {}
         assert execution_env_for_worker(runtime_paths, config=config, worker_target=None) == {}
         assert (
             execution_env_for_worker(
@@ -522,13 +523,13 @@ async def test_token_ttl_from_env(
         env = execution_env_for_worker(
             runtime_paths,
             config=config,
-            worker_target=_target(),
+            worker_target=_routable_target(),
         )
     signer = TokenSigner.load_or_create(tmp_path / "mindroom_data" / "egress_broker" / "token.key")
     now = time.time()
     claims = signer.verify(_token(env), now=now + 590)
     assert claims is not None
-    assert claims.worker_key == _target().worker_key
+    assert claims.worker_key == _routable_target().worker_key
     assert signer.verify(_token(env), now=now + 610) is None
 
 
@@ -783,7 +784,7 @@ async def test_stored_key_wins_over_oauth_and_its_removal_falls_back_without_res
     """With both sources the stored key is injected; once it is removed the same token gets the OAuth token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
-    target = _target()
+    target = _routable_target()
     save_secret(manager, target, "github", "s3cret")
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
@@ -806,8 +807,12 @@ async def test_placeholder_env_when_only_oauth_is_connected(
     config = _config(github=_GITHUB_OAUTH)
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        bob_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target("@bob:example.org"))
+        alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
+        bob_env = execution_env_for_worker(
+            runtime_paths,
+            config=config,
+            worker_target=_routable_target("@bob:example.org"),
+        )
     assert alice_env["GH_TOKEN"] == _PLACEHOLDER
     assert "alice-oauth" not in str(alice_env)
     assert "GH_TOKEN" not in bob_env
@@ -831,7 +836,7 @@ async def test_requester_scoped_oauth_is_not_used_where_requesters_share_a_worke
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
     _connect_github(manager, "@alice:example.org", "alice-oauth")
-    target = _target(scope=scope)
+    target = _routable_target(scope=scope)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         response = await get_through(env)
@@ -878,7 +883,7 @@ async def test_missing_key_message_names_the_calling_agents_credential_managers(
         agents={"code": {"display_name": "Code", "credential_managers": managers}},
         egress_broker={"services": {"github": _GITHUB}},
     )
-    target = _target(scope=scope)
+    target = _routable_target(scope=scope)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         response = await get_through(env)
@@ -898,8 +903,8 @@ async def test_requester_scoped_oauth_on_a_shared_agent_injects_the_callers_toke
     config = _config(github={**_GITHUB_OAUTH, "oauth_on_shared_workers": True})
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     _connect_github(manager, "@bob:example.org", "bob-oauth")
-    alice = _target(scope="shared")
-    bob = _target("@bob:example.org", scope="shared")
+    alice = _routable_target(scope="shared")
+    bob = _routable_target("@bob:example.org", scope="shared")
     assert alice.worker_key == bob.worker_key
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=alice)
@@ -924,7 +929,7 @@ async def test_requester_scoped_oauth_is_not_used_on_the_static_runner_without_t
     config = _config(github=_GITHUB_OAUTH)
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         response = await get_through(env)
     assert "GH_TOKEN" not in env
     assert response.status_code == 403
@@ -944,7 +949,7 @@ async def test_requester_scoped_oauth_is_used_on_the_static_runner_with_the_opt_
     config = _config(github={**_GITHUB_OAUTH, "oauth_on_shared_workers": True})
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         response = await get_through(env)
     assert env["GH_TOKEN"] == _PLACEHOLDER
     assert response.json()["headers"]["authorization"] == ["Bearer alice-oauth"]
@@ -965,7 +970,7 @@ async def test_concurrent_requests_refresh_an_expired_token_once(
     _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
     presented = serve_token_endpoint(monkeypatch, [DelayedTokenEndpointOutcome(0.3, rotated_token_response())])
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         async with _worker_client(env, tmp_path / "runner") as client:
             responses = await asyncio.gather(*(client.get(tls_upstream.url("/echo")) for _ in range(6)))
     assert [response.json()["headers"]["authorization"] for response in responses] == [
@@ -989,7 +994,7 @@ async def test_revoked_grant_returns_oauth_connection_required(
     _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
     serve_token_endpoint(monkeypatch, [httpx.Response(400, json={"error": "invalid_grant"})])
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         with capture_logs() as logs:
             response = await get_through(env)
     body = response.json()
@@ -1021,7 +1026,7 @@ async def test_missing_connection_returns_connect_url(
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         response = await get_through(env)
     body = response.json()
     assert response.status_code == 403
@@ -1056,7 +1061,7 @@ async def test_provider_outage_is_a_retryable_503_off_the_shared_executor(
         "oauth_provider": "github",
     }
     config = _config(keyed=keyed, github=github)
-    target = _target()
+    target = _routable_target()
     save_secret(manager, target, "keyed", "s3cret")
     _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
     grant_started = threading.Event()
@@ -1110,7 +1115,7 @@ async def test_unconnectable_provider_gives_the_plain_missing_credential_body(
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         response = await get_through(env)
     assert response.status_code == 403
     assert response.json() == _no_key_refusal(_NO_GITHUB_KEY)
@@ -1130,8 +1135,12 @@ async def test_shared_agent_scoped_provider_refusal_has_no_connect_link(
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(drive={**_GITHUB, "oauth_provider": drive.id})
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        shared_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target(scope="shared"))
-        private_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        shared_env = execution_env_for_worker(
+            runtime_paths,
+            config=config,
+            worker_target=_routable_target(scope="shared"),
+        )
+        private_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         shared = await get_through(shared_env)
         private = await get_through(private_env)
     assert shared.status_code == 403
@@ -1157,7 +1166,7 @@ async def test_user_service_injects_its_owners_key_and_leaves_other_requesters_a
     """
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config()
-    alice, bob = _target(), _target("@bob:example.org")
+    alice, bob = _routable_target(), _routable_target("@bob:example.org")
     _save_mine(manager, alice, config, _GITHUB)
     save_secret(manager, alice, "mine", "alice-key")
     save_secret(manager, bob, "mine", "bob-key")
@@ -1189,7 +1198,7 @@ async def test_user_service_edits_apply_to_the_running_broker(
     """Saving a service starts injection and deleting it stops it, from the next request on and without a restart."""
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config()
-    target = _target()
+    target = _routable_target()
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         before = await get_through(env)
@@ -1215,7 +1224,7 @@ async def test_user_service_uses_only_its_scopes_oauth_connection(
     """A user service naming an OAuth provider injects its owner's connected account and nobody else's."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config()
-    alice, bob = _target(), _target("@bob:example.org")
+    alice, bob = _routable_target(), _routable_target("@bob:example.org")
     for target in (alice, bob):
         _save_mine(manager, target, config, _GITHUB_OAUTH)
     _connect_github(manager, "@alice:example.org", "alice-oauth")
@@ -1244,7 +1253,7 @@ async def test_user_service_cannot_open_a_host_under_deny(
     port = free_port()
     runtime_paths = tmp_runtime_paths(**_broker_env(port))
     config = Config(egress_broker={"unmatched_hosts": "deny", "services": {"openai": _OPENAI}})
-    target = _target()
+    target = _routable_target()
     _save_mine(manager, target, config, _GITHUB)
     save_secret(manager, target, "mine", "alice-key")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
@@ -1263,7 +1272,7 @@ async def test_config_placeholders_win_over_user_placeholders(
     """A user service cannot replace a config service's placeholder; its own variables still reach the worker."""
     runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
-    target = _target()
+    target = _routable_target()
     mine = {
         "rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}],
         "placeholder_env": {"GH_TOKEN": "user-value", "MINE_TOKEN": "mine-placeholder"},

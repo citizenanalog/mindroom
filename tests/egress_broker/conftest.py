@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import ipaddress
 import json
 import os
@@ -407,27 +408,41 @@ async def upstreams(upstream_ca: UpstreamCA, tmp_path: Path) -> AsyncIterator[Up
         await server.wait_closed()
 
 
+@contextlib.asynccontextmanager
+async def serving(
+    handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None] | None],
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> AsyncIterator[int]:
+    """Serve `handler` (an `asyncio.start_server` callback) on a loopback port, yielding the port.
+
+    On exit the server is closed and drained, so a test that asserts on what the handler saw can do so after the
+    `async with` block, once nothing more can arrive.
+    """
+    server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=ssl_context)
+    try:
+        yield server.sockets[0].getsockname()[1]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 @pytest_asyncio.fixture
 async def serve() -> AsyncIterator[ServeFactory]:
     """Return ``start(handler, *, ssl_context=None)``: serve `handler` on a loopback port, closed after the test.
 
     `start` returns the port; `handler` is an `asyncio.start_server` callback taking the stream reader and writer.
     """
-    servers: list[asyncio.Server] = []
+    async with contextlib.AsyncExitStack() as stack:
 
-    async def start(
-        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None] | None],
-        *,
-        ssl_context: ssl.SSLContext | None = None,
-    ) -> int:
-        server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=ssl_context)
-        servers.append(server)
-        return server.sockets[0].getsockname()[1]
+        async def start(
+            handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None] | None],
+            *,
+            ssl_context: ssl.SSLContext | None = None,
+        ) -> int:
+            return await stack.enter_async_context(serving(handler, ssl_context=ssl_context))
 
-    yield start
-    for server in servers:
-        server.close()
-        await server.wait_closed()
+        yield start
 
 
 @pytest_asyncio.fixture
