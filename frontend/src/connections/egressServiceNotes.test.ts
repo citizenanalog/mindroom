@@ -7,7 +7,7 @@ import {
   presetPlaceholderWarnings,
   scopeNote,
 } from "./egressServiceNotes";
-import { bearerRule, presets } from "./egressServiceTestKit";
+import { bearerRule, presets } from "@/test/egressServiceTestKit";
 import type { AuthoredEgressService } from "./types";
 
 describe("a placeholder the administrator also sets", () => {

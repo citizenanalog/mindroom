@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { type EgressServiceForm, formFromService } from "./egressServiceForm";
-import { validRule } from "./egressServiceTestKit";
+import { validRule } from "@/test/egressServiceTestKit";
 import {
   coversGithub,
   limitedRepositories,

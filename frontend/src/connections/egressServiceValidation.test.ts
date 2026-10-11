@@ -13,7 +13,7 @@ import {
   errorsFor,
   limits,
   validRule,
-} from "./egressServiceTestKit";
+} from "@/test/egressServiceTestKit";
 import {
   BASIC_RULE_PARTS,
   isBasicField,
@@ -557,10 +557,12 @@ describe("the limits the server sends", () => {
   });
   const noLimits = { ...personal, limits: null };
 
-  it("has a value pattern from Python that reads as a JavaScript regular expression", () => {
-    expect(
-      () => new RegExp(`^(?:${limits.placeholder.value_pattern})$`),
-    ).not.toThrow();
+  it("has name and value patterns from Python that read as JavaScript regular expressions", () => {
+    for (const source of [
+      limits.placeholder.name_pattern,
+      limits.placeholder.value_pattern,
+    ])
+      expect(() => new RegExp(`^(?:${source})$`)).not.toThrow();
   });
 
   it("takes the most rules from the server", () => {
@@ -644,6 +646,28 @@ describe("the limits the server sends", () => {
         optionsWith({}, reserved, operator),
       ),
     ).toEqual([]);
+  });
+
+  it("matches the name pattern from the server against the whole name", () => {
+    const options = optionsWith({}, { name_pattern: "[A-Z]{2}_KEY" });
+    const errors = (name: string) =>
+      errorsFor({ preset: "github" }, withPlaceholder(name), options);
+    expect(errors("MY_KEY")).toEqual([]);
+    for (const name of ["ABC_KEY", "MY_KEY_ID", "_MY_KEY"])
+      expect(errors(name)).toEqual([
+        `${name} is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.`,
+      ]);
+  });
+
+  it("leaves a name pattern it cannot read to the server, and still checks the words", () => {
+    const options = optionsWith({}, { name_pattern: "(" });
+    const errors = (name: string) =>
+      errorsFor({ preset: "github" }, withPlaceholder(name), options);
+    // The server's own pattern refuses a leading underscore.
+    expect(errors("_MY_KEY")).toEqual([]);
+    expect(errors("MY_NAME")).toEqual([
+      "MY_NAME is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
+    ]);
   });
 
   it("matches the value pattern against the whole value", () => {

@@ -22,7 +22,7 @@ import {
   errorsFor,
   basicAuth,
   validRule,
-} from "./egressServiceTestKit";
+} from "@/test/egressServiceTestKit";
 import { validateService } from "./egressServiceValidation";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type { AuthoredEgressService, EgressRule } from "./types";

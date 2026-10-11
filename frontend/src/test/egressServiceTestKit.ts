@@ -4,14 +4,14 @@ import {
   type EgressServiceForm,
   formFromService,
   serializeService,
-} from "./egressServiceForm";
-import { validateService } from "./egressServiceValidation";
+} from "@/connections/egressServiceForm";
+import { validateService } from "@/connections/egressServiceValidation";
 import type {
   AuthoredEgressService,
   EgressLimits,
   EgressPreset,
   EgressRule,
-} from "./types";
+} from "@/connections/types";
 
 /** What the editor model's tests share: the server's presets, the options of each context, and helpers that run a service through the form. */
 

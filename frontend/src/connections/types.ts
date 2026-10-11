@@ -230,6 +230,8 @@ export interface EgressOAuthProviderOption {
 
 /** The rules for the variables a service may set in the sandbox, as the server enforces them. */
 export interface EgressPlaceholderLimits {
+  /** The names a personal service's variable may have, as a regular expression source that must match the whole name. */
+  name_pattern: string;
   /** A personal service's variable needs one of these as a word of its name; in the order the server's message lists them. */
   credential_words: string[];
   /** No word of a personal service's variable may be one of these; in the order the server's message lists them. */

@@ -9,6 +9,7 @@ import {
 } from "./egressServiceForm";
 import {
   PLACEHOLDER_NAME_PATTERN,
+  operatorPlaceholderNameError,
   personalPlaceholderError,
   personalPlaceholderNameError,
   reservedPlaceholderError,
@@ -162,7 +163,7 @@ function placeholderProblems(
       const message =
         options.context === "personal"
           ? limits && personalPlaceholderNameError(name, limits)
-          : `Placeholder name ${name} must match ^[A-Z_][A-Z0-9_]*$`;
+          : operatorPlaceholderNameError(name);
       if (message) add("name", message);
       return;
     }

@@ -13,7 +13,8 @@ import {
   servicesUsingAccount,
   sharesAccount,
 } from "./egressRowStatus";
-import { ServiceLabels, ServiceStatus } from "./EgressServiceStatus";
+import { ServiceLabels } from "./EgressServiceLabels";
+import { ServiceStatus } from "./EgressServiceStatus";
 import { coversGithub } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { type RequestErrorMessages, requestConnection } from "./request";
@@ -29,7 +30,7 @@ export interface ServicePaths {
   accountConnected: (signal: AbortSignal) => Promise<boolean>;
 }
 
-export function EgressServiceRow({
+export function EgressServiceItem({
   paths,
   service,
   onChanged,

@@ -1,6 +1,6 @@
 import type { RowAgent, ServiceEditing } from "./egressRowStatus";
 import { LimitRow } from "./EgressLimitRows";
-import { EgressServiceRow, type ServicePaths } from "./EgressServiceRow";
+import { EgressServiceItem, type ServicePaths } from "./EgressServiceItem";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import type { EgressCredentialList, EgressCredentialService } from "./types";
 
@@ -113,7 +113,7 @@ export function EgressServiceRows({
             serviceEditing={serviceEditing}
           />
         ) : (
-          <EgressServiceRow
+          <EgressServiceItem
             key={service.name}
             paths={servicePathsFor(target, service.name)}
             service={service}

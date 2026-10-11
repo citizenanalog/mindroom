@@ -11,7 +11,7 @@ import {
   applyAuthChoice,
   splitHostInput,
 } from "./egressServiceForm";
-import { type RuleFieldPart } from "./egressServiceValidation";
+import type { RuleFieldPart } from "./egressServiceValidation";
 
 /**
  * The editor's labelled fields and the fields of one rule. The first rule is
