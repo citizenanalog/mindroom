@@ -950,6 +950,19 @@ def test_inject_query_replaces_the_param_and_leaves_headers_alone(
     assert new_target == expected_target
 
 
+def test_inject_query_removes_thousands_of_duplicates_and_keeps_the_rest_in_order() -> None:
+    """Every pair named like the param goes, bare or percent-encoded, and the new pair takes the first one's place."""
+    auth = EgressAuth(type="query", name="key")
+    pairs = ["a=1", "key=old", "", "key", "%6Bey=x", "key=", "keys=1"] * 1000 + ["b=2"]
+    target = ("/v1/x;v=1?" + "&".join(pairs)).encode()
+    expected = ["a=1", "key=s3cret", "", "keys=1"] + ["a=1", "", "keys=1"] * 999 + ["b=2"]
+
+    new_headers, new_target = inject_credentials([], target, auth, "s3cret")
+
+    assert new_headers == []
+    assert new_target == ("/v1/x;v=1?" + "&".join(expected)).encode()
+
+
 def test_inject_replaces_client_authorization() -> None:
     """Credential injection replaces any existing Authorization header."""
     auth = EgressAuth(type="bearer")

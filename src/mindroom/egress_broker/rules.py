@@ -407,9 +407,10 @@ def _inject_query_param(target: bytes, param_name: str, template: str, secret: s
     parsed = urlsplit(target.decode("latin-1"))
     new_param = f"{quote(param_name, safe='')}={quote(template.replace('{secret}', secret), safe='')}"
     pairs = parsed.query.split("&") if parsed.query else []
-    matches = [i for i, pair in enumerate(pairs) if unquote(pair.split("=", 1)[0]) == param_name]
+    matches = {i for i, pair in enumerate(pairs) if unquote(pair.split("=", 1)[0]) == param_name}
     kept = [pair for i, pair in enumerate(pairs) if i not in matches]
-    kept.insert(matches[0] if matches else len(kept), new_param)
+    # Every pair before the first match is kept, so its index in `pairs` is its index in `kept`.
+    kept.insert(min(matches, default=len(kept)), new_param)
     return f"{parsed.path}?{'&'.join(kept)}".encode("latin-1")
 
 
