@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from backend.pricing import Discounts, Product, Trial
 
 
 class InstanceOut(BaseModel):
@@ -23,6 +25,8 @@ class InstanceOut(BaseModel):
     updated_at: str | None = None
     kubernetes_synced_at: str | None = None
     status_hint: str | None = None
+    lifecycle_stopped_at: str | None = None
+    teardown_after: str | None = None
 
 
 class InstancesResponse(BaseModel):
@@ -37,17 +41,17 @@ class SubscriptionOut(BaseModel):
     id: str
     account_id: str
     tier: Literal["free", "byok", "hobby", "pro", "enterprise"]
-    status: Literal["active", "cancelled", "past_due", "trialing", "paused", "incomplete"]
+    status: Literal[
+        "active", "cancelled", "past_due", "trialing", "paused", "incomplete", "incomplete_expired", "unpaid"
+    ]
     stripe_subscription_id: str | None = None
     stripe_customer_id: str | None = None
     current_period_start: str | None = None
     current_period_end: str | None = None
     trial_ends_at: str | None = None
     cancelled_at: str | None = None
-    max_agents: int
-    max_messages_per_day: int
-    max_storage_gb: int
     can_run_instances: bool
+    stripe_subscription_ended: bool
     trial_days_remaining: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -69,35 +73,6 @@ class ProvisionResponse(BaseModel):
     frontend_url: str | None = None
     api_url: str | None = None
     matrix_url: str | None = None
-
-
-class UsageMetricOut(BaseModel):
-    """Usage metric output model."""
-
-    id: str | None = None
-    subscription_id: str
-    metric_date: str
-    messages_sent: int
-    agents_used: int
-    storage_used_gb: float | int
-    created_at: str | None = None
-
-
-class UsageAggregateOut(BaseModel):
-    """Aggregated usage statistics model."""
-
-    model_config = {"populate_by_name": True}
-
-    total_messages: int = Field(alias="totalMessages")
-    total_agents: int = Field(alias="totalAgents")
-    total_storage: float | int = Field(alias="totalStorage")
-
-
-class UsageResponse(BaseModel):
-    """Response model for usage metrics."""
-
-    usage: list[UsageMetricOut]
-    aggregated: UsageAggregateOut
 
 
 class UrlResponse(BaseModel):
@@ -173,6 +148,9 @@ class AccountWithRelationsOut(BaseModel):
     stripe_customer_id: str | None = None  # Optional for free users
     created_at: str  # Required, should always exist
     updated_at: str  # Required, should always exist
+    deleted_at: str | None = None  # Set while a GDPR deletion is pending
+    consent_marketing: bool | None = None
+    consent_analytics: bool | None = None
     subscriptions: list[dict[str, Any]] | None = None  # Can be None from DB
     instances: list[dict[str, Any]] | None = None  # Can be None from DB
 
@@ -196,14 +174,6 @@ class SubscriptionCancelResponse(BaseModel):
     cancelled_at: str | None = None
 
 
-class SubscriptionReactivateResponse(BaseModel):
-    """Subscription reactivation response model."""
-
-    success: bool
-    message: str
-    subscription_id: str | None = None
-
-
 # Pricing Models
 class StripePriceResponse(BaseModel):
     """Stripe price ID response model."""
@@ -211,6 +181,106 @@ class StripePriceResponse(BaseModel):
     price_id: str
     plan: str
     billing_cycle: str
+
+
+class PublicPlan(BaseModel):
+    """One plan as exposed by /pricing/config (prices formatted for display).
+
+    Fields the route always emits are required so the generated frontend types are non-optional.
+    """
+
+    name: str
+    price_monthly: str
+    price_yearly: str
+    description: str
+    features: list[str]
+    recommended: bool
+    included_ai_budget_usd: int
+    requires_customer_provider_keys: bool
+    resource_profile: Literal["small", "pro"]
+    stripe_price_id_monthly: str | None = None
+    stripe_price_id_yearly: str | None = None
+
+
+class PricingConfigResponse(BaseModel):
+    """Public pricing configuration response model."""
+
+    product: Product
+    plans: dict[str, PublicPlan]
+    trial: Trial
+    discounts: Discounts
+
+
+# GDPR Models
+class GdprPersonalData(BaseModel):
+    """Personal data section of a GDPR export."""
+
+    email: str | None = None
+    full_name: str | None = None
+    company_name: str | None = None
+    created_at: str | None = None
+    status: str | None = None
+    tier: str | None = None
+
+
+class GdprThirdPartyProcessor(BaseModel):
+    """Third-party processor disclosure in a GDPR export."""
+
+    name: str
+    purpose: str
+    data_shared: str
+
+
+class GdprExportResponse(BaseModel):
+    """GDPR data export response model."""
+
+    export_date: str
+    account_id: str
+    personal_data: GdprPersonalData
+    subscriptions: list[dict[str, Any]]
+    instances: list[dict[str, Any]]
+    activity_history: list[dict[str, Any]]
+    payments: list[dict[str, Any]]
+    data_processing_purposes: list[str]
+    data_retention_periods: dict[str, str]
+    third_party_processors: list[GdprThirdPartyProcessor]
+
+
+class GdprDeletionResponse(BaseModel):
+    """GDPR deletion request response model (confirmation prompt or scheduled deletion)."""
+
+    status: Literal["confirmation_required", "deletion_scheduled"]
+    message: str
+    warning: str | None = None
+    grace_period_days: int | None = None
+    deletion_date: str | None = None
+    cancellation: str | None = None
+    data_deleted: str | None = None
+    data_retained: str | None = None
+
+
+class GdprConsentState(BaseModel):
+    """Consent flags echoed back after an update."""
+
+    marketing: bool
+    analytics: bool
+    essential: bool
+
+
+class GdprConsentResponse(BaseModel):
+    """GDPR consent update response model."""
+
+    status: str
+    consent: GdprConsentState
+    updated_at: str
+
+
+class GdprCancelDeletionResponse(BaseModel):
+    """GDPR deletion cancellation response model."""
+
+    status: Literal["success", "not_pending"]
+    message: str
+    account_status: str | None = None
 
 
 # Admin Models
@@ -266,10 +336,38 @@ class AdminDashboardMetricsResponse(BaseModel):
     recent_instances: list[dict[str, Any]]
 
 
-class AdminLogoutResponse(BaseModel):
-    """Admin logout response model."""
+class CleanupRunOut(BaseModel):
+    """One recorded run of the nightly cleanup job."""
 
-    success: bool
+    started_at: str
+    finished_at: str
+    ok: bool
+    summary: dict[str, Any]
+
+
+class LifecycleInstanceOut(BaseModel):
+    """An instance as seen by the subscription lifecycle."""
+
+    instance_id: int | str
+    account_id: str | None = None
+    account_email: str | None = None
+    subscription_status: str | None = None
+    status: str
+    lifecycle_stopped_at: str | None = None
+    teardown_after: str | None = None
+    lifecycle_error: str | None = None
+    lifecycle_error_at: str | None = None
+    problem: str | None = None
+
+
+class AdminInstanceLifecycleResponse(BaseModel):
+    """Nightly cleanup health, instances pending teardown, and stuck lifecycle states."""
+
+    cleanup_scheduler_enabled: bool
+    teardown_grace_days: int
+    last_run: CleanupRunOut | None
+    pending_teardown: list[LifecycleInstanceOut]
+    stuck: list[LifecycleInstanceOut]
 
 
 # Webhook Models

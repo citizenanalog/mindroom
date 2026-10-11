@@ -65,6 +65,7 @@ const scopedMockTools = [
 let mockStatusAuthoritative = true;
 const {
   mockUseTools,
+  mockGoogleCloudOnAction,
   mockGoogleDriveOnAction,
   mockGoogleDriveOnDisconnect,
   mockGoogleGmailOnAction,
@@ -74,7 +75,9 @@ const {
   mockPlexOnAction,
   mockPlexOnDisconnect,
   mockGenericOAuthOnAction,
+  mockGenericOAuthOnDisconnect,
   mockGenericOAuthLoadStatus,
+  mockGoogleCloudLoadStatus,
   mockGoogleDriveLoadStatus,
   mockGoogleGmailLoadStatus,
   mockSpotifyLoadStatus,
@@ -82,6 +85,7 @@ const {
   mockEnhancedConfigDialogProps,
 } = vi.hoisted(() => ({
   mockUseTools: vi.fn(),
+  mockGoogleCloudOnAction: vi.fn(),
   mockGoogleDriveOnAction: vi.fn(),
   mockGoogleDriveOnDisconnect: vi.fn(),
   mockGoogleGmailOnAction: vi.fn(),
@@ -91,7 +95,11 @@ const {
   mockPlexOnAction: vi.fn(),
   mockPlexOnDisconnect: vi.fn(),
   mockGenericOAuthOnAction: vi.fn(),
+  mockGenericOAuthOnDisconnect: vi.fn(),
   mockGenericOAuthLoadStatus: vi
+    .fn()
+    .mockResolvedValue({ status: "available", connected: false }),
+  mockGoogleCloudLoadStatus: vi
     .fn()
     .mockResolvedValue({ status: "available", connected: false }),
   mockGoogleDriveLoadStatus: vi
@@ -108,6 +116,26 @@ const {
     .mockResolvedValue({ status: "connected", connected: true }),
   mockEnhancedConfigDialogProps: vi.fn(),
 }));
+
+function googleCloudTool(name: string, displayName: string, field: string) {
+  return {
+    name,
+    display_name: displayName,
+    description: `${displayName} on the shared Google Cloud connection`,
+    icon: "SiGooglecloud",
+    icon_color: "text-blue-600",
+    category: "development",
+    status: "available",
+    setup_type: "oauth",
+    auth_provider: "google_cloud",
+    config_fields: [
+      { name: field, label: field, type: "text", required: true },
+    ],
+    helper_text: null,
+    docs_url: null,
+    dependencies: null,
+  };
+}
 
 function createDeferred() {
   let resolve: () => void = () => undefined;
@@ -148,6 +176,9 @@ vi.mock("@/hooks/useTools", () => ({
     config_fields: tool.config_fields,
     helper_text: tool.helper_text,
     docs_url: tool.docs_url,
+    oauth_fallback_fields: tool.oauth_fallback_fields,
+    manual_auth_configured: tool.manual_auth_configured,
+    environment_auth_configured: tool.environment_auth_configured,
   }),
 }));
 
@@ -201,6 +232,7 @@ vi.mock("./integrations/index", () => ({
       return {
         integration: this.integration,
         onAction: () => mockGenericOAuthOnAction(this.providerId),
+        onDisconnect: () => mockGenericOAuthOnDisconnect(this.providerId),
       };
     }
 
@@ -209,12 +241,29 @@ vi.mock("./integrations/index", () => ({
     }
   },
   integrationProviders: {
+    google_cloud: {
+      getConfig: () => ({
+        integration: {
+          id: "google_cloud",
+          name: "Google Cloud",
+          description: "Connect Google Cloud with read-only access",
+          category: "development",
+          icon: <span>Google Cloud Icon</span>,
+          status: "available",
+          setup_type: "oauth",
+          connected: false,
+        },
+        onAction: mockGoogleCloudOnAction,
+      }),
+      loadStatus: mockGoogleCloudLoadStatus,
+    },
     google_drive: {
       getConfig: () => ({
         integration: {
           id: "google_drive",
           name: "Google Drive",
-          description: "Search and read files from your connected Google Drive",
+          description:
+            "Search, read, upload, and organize files in your connected Google Drive",
           category: "productivity",
           icon: <span>Google Drive Icon</span>,
           status: "available",
@@ -283,9 +332,26 @@ vi.mock("./integrations/index", () => ({
     {
       getConfig: () => ({
         integration: {
+          id: "google_cloud",
+          name: "Google Cloud",
+          description: "Connect Google Cloud with read-only access",
+          category: "development",
+          icon: <span>Google Cloud Icon</span>,
+          status: "available",
+          setup_type: "oauth",
+          connected: false,
+        },
+        onAction: mockGoogleCloudOnAction,
+      }),
+      loadStatus: mockGoogleCloudLoadStatus,
+    },
+    {
+      getConfig: () => ({
+        integration: {
           id: "google_drive",
           name: "Google Drive",
-          description: "Search and read files from your connected Google Drive",
+          description:
+            "Search, read, upload, and organize files in your connected Google Drive",
           category: "productivity",
           icon: <span>Google Drive Icon</span>,
           status: "available",
@@ -357,6 +423,7 @@ describe("Integrations", () => {
     vi.clearAllMocks();
     mockToast.mockReset();
     mockStatusAuthoritative = true;
+    mockGoogleCloudOnAction.mockResolvedValue(undefined);
     mockGoogleDriveOnAction.mockResolvedValue(undefined);
     mockGoogleDriveOnDisconnect.mockResolvedValue(undefined);
     mockGoogleGmailOnAction.mockResolvedValue(undefined);
@@ -366,8 +433,13 @@ describe("Integrations", () => {
     mockPlexOnAction.mockResolvedValue(undefined);
     mockPlexOnDisconnect.mockResolvedValue(undefined);
     mockGenericOAuthOnAction.mockResolvedValue(undefined);
+    mockGenericOAuthOnDisconnect.mockResolvedValue(undefined);
     mockEnhancedConfigDialogProps.mockClear();
     mockGenericOAuthLoadStatus.mockResolvedValue({
+      status: "available",
+      connected: false,
+    });
+    mockGoogleCloudLoadStatus.mockResolvedValue({
       status: "available",
       connected: false,
     });
@@ -418,6 +490,78 @@ describe("Integrations", () => {
     });
   });
 
+  it("discloses Google data handling before connection", async () => {
+    render(<Integrations />);
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText(
+          /By connecting, you authorize this MindRoom installation/,
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getAllByText(
+          /Project maintainers have no automatic access merely because they maintain MindRoom; if they also operate this installation, they may have operator access/,
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getAllByText(
+          /The installation operator and anyone with administrative or filesystem access may be able to access stored credentials and data/,
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getAllByText(
+          /Shared or unscoped agents can use the connected account for any user authorized to invoke them/,
+        ).length,
+      ).toBeGreaterThan(0);
+    });
+    for (const link of screen.getAllByRole("link", {
+      name: "Privacy policy",
+    })) {
+      expect(link).toHaveAttribute(
+        "href",
+        "https://docs.mindroom.chat/privacy/",
+      );
+    }
+  });
+
+  it("discloses data handling for dynamically registered Google OAuth providers", async () => {
+    mockUseTools.mockReturnValue({
+      tools: [
+        ...mockTools,
+        {
+          name: "google_tasks_tool",
+          display_name: "Google Tasks Tool",
+          description: "Manage Google Tasks",
+          icon: "✅",
+          icon_color: null,
+          category: "productivity",
+          status: "available",
+          setup_type: "oauth",
+          config_fields: null,
+          helper_text: null,
+          docs_url: null,
+          dependencies: null,
+          auth_provider: "google_tasks",
+        },
+      ],
+      loading: false,
+      refetch: vi.fn(),
+      statusAuthoritative: true,
+    });
+
+    render(<Integrations />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Google Tasks")).toBeInTheDocument();
+      expect(
+        screen.getAllByText(
+          /Project maintainers have no automatic access merely because they maintain MindRoom/,
+        ),
+      ).toHaveLength(4);
+    });
+  });
+
   it("should display all integration cards", async () => {
     render(<Integrations />);
 
@@ -426,7 +570,7 @@ describe("Integrations", () => {
       expect(screen.getByText("Google Drive")).toBeInTheDocument();
       expect(
         screen.getByText(
-          "Search and read files from your connected Google Drive",
+          "Search, read, upload, and organize files in your connected Google Drive",
         ),
       ).toBeInTheDocument();
       expect(screen.getByText("Spotify")).toBeInTheDocument();
@@ -477,6 +621,149 @@ describe("Integrations", () => {
     });
   });
 
+  it("offers a reset action when OAuth credentials are unreadable", async () => {
+    const refetch = vi.fn();
+    const disconnect = createDeferred();
+    mockGoogleDriveOnDisconnect.mockReturnValueOnce(disconnect.promise);
+    mockUseTools.mockReturnValue({
+      tools: [
+        {
+          name: "google_drive",
+          display_name: "Google Drive",
+          description: "Google Drive with a manual fallback",
+          icon: "Google Drive Icon",
+          icon_color: null,
+          category: "productivity",
+          status: "available",
+          setup_type: "oauth",
+          config_fields: [
+            {
+              name: "credentials_json",
+              label: "Credentials JSON",
+              type: "password",
+              required: false,
+            },
+          ],
+          oauth_fallback_fields: ["credentials_json"],
+          manual_auth_configured: true,
+          helper_text: null,
+          docs_url: null,
+          dependencies: null,
+        },
+      ],
+      loading: false,
+      refetch,
+      statusAuthoritative: true,
+    });
+    global.fetch = vi.fn().mockResolvedValue({ ok: true });
+    mockGoogleDriveLoadStatus.mockResolvedValueOnce({
+      status: "not_connected",
+      connected: false,
+      oauth_client_configured: true,
+      oauth_client_config_service: "google_drive_oauth_client",
+      oauth_reset_required: true,
+      helper_text:
+        "Stored OAuth credentials cannot be read. Reset the connection to reconnect.",
+    });
+
+    render(<Integrations />);
+
+    const resetButton = await screen.findByRole("button", {
+      name: "Reset connection",
+    });
+    expect(
+      screen.queryByRole("button", { name: "Connect with Google Drive" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Stored OAuth credentials cannot be read. Reset the connection to reconnect.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Edit credentials json" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Remove credentials json" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(resetButton);
+
+    await waitFor(() => {
+      expect(mockGoogleDriveOnDisconnect).toHaveBeenCalledOnce();
+      const pendingResetButton = screen.getByRole("button", {
+        name: "Reset connection",
+      });
+      expect(pendingResetButton).toBeDisabled();
+      expect(pendingResetButton.querySelector(".animate-spin")).not.toBeNull();
+    });
+
+    await act(async () => disconnect.resolve());
+
+    await waitFor(() => {
+      expect(refetch).toHaveBeenCalledOnce();
+      expect(mockToast).toHaveBeenCalledWith({
+        title: "Connection reset",
+        description: "Google Drive OAuth has been reset.",
+      });
+    });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("offers reset recovery when no fallback credential is configured", async () => {
+    mockUseTools.mockReturnValue({
+      tools: [
+        {
+          name: "google_drive",
+          display_name: "Google Drive",
+          description: "Google Drive with an optional manual fallback",
+          icon: "Google Drive Icon",
+          icon_color: null,
+          category: "productivity",
+          status: "available",
+          setup_type: "oauth",
+          config_fields: [
+            {
+              name: "credentials_json",
+              label: "Credentials JSON",
+              type: "password",
+              required: false,
+            },
+          ],
+          oauth_fallback_fields: ["credentials_json"],
+          manual_auth_configured: false,
+          helper_text: null,
+          docs_url: null,
+          dependencies: null,
+        },
+      ],
+      loading: false,
+      refetch: vi.fn(),
+      statusAuthoritative: true,
+    });
+    mockGoogleDriveLoadStatus.mockResolvedValueOnce({
+      status: "not_connected",
+      connected: false,
+      oauth_client_configured: true,
+      oauth_reset_required: true,
+      helper_text:
+        "Stored OAuth credentials cannot be read. Reset the connection to reconnect.",
+    });
+
+    render(<Integrations />);
+
+    expect(
+      await screen.findByRole("button", { name: "Reset connection" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Use credentials json" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Stored OAuth credentials cannot be read. Reset the connection to reconnect.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("opens OAuth client config dialog when client config is missing", async () => {
     mockGoogleDriveLoadStatus.mockResolvedValueOnce({
       status: "not_connected",
@@ -511,6 +798,7 @@ describe("Integrations", () => {
       status: "not_connected",
       connected: false,
       oauth_client_configured: true,
+      oauth_custom_client_configured: true,
       oauth_client_config_service: "google_drive_oauth_client",
     });
 
@@ -552,6 +840,7 @@ describe("Integrations", () => {
       status: "not_connected",
       connected: false,
       oauth_client_configured: true,
+      oauth_custom_client_configured: true,
       oauth_client_config_service: "google_oauth_client",
       oauth_client_redirect_uri_supported: false,
     });
@@ -581,6 +870,47 @@ describe("Integrations", () => {
         expect.arrayContaining([
           expect.objectContaining({ name: "redirect_uri" }),
         ]),
+      );
+    });
+  });
+
+  it("offers a custom client without blocking provisioned OAuth", async () => {
+    mockGoogleDriveLoadStatus.mockResolvedValueOnce({
+      status: "available",
+      connected: false,
+      oauth_client_configured: true,
+      oauth_custom_client_configured: false,
+      oauth_client_config_service: "google_drive_oauth_client",
+      oauth_client_redirect_uri_supported: true,
+    });
+
+    render(<Integrations />);
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByRole("button", { name: "Connect" }).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getByRole("button", { name: "Use custom client" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Configure client" }),
+      ).not.toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Use custom client" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/"name":"client_secret"/)).toHaveTextContent(
+        /"required":true/,
+      );
+      expect(mockEnhancedConfigDialogProps).toHaveBeenCalledWith(
+        expect.objectContaining({
+          service: "google_drive_oauth_client",
+          configFields: expect.arrayContaining([
+            expect.objectContaining({ name: "redirect_uri" }),
+          ]),
+        }),
       );
     });
   });
@@ -719,7 +1049,7 @@ describe("Integrations", () => {
     // But the elements might still be in the DOM, just hidden
     // So let's check for visibility instead
     const googleElement = screen.queryByText(
-      "Search and read files from your connected Google Drive",
+      "Search, read, upload, and organize files in your connected Google Drive",
     );
     if (googleElement) {
       // Check if it's hidden (parent tab panel might be hidden)
@@ -983,6 +1313,9 @@ describe("Integrations", () => {
         screen.getByText(/Requester-scoped tool status is preview only/i),
       ).toBeInTheDocument();
     });
+    expect(
+      screen.getByText(/OAuth-backed integrations can be connected/i),
+    ).toBeInTheDocument();
   });
 
   it("hides shared-only integrations for isolating worker scopes", async () => {
@@ -1177,7 +1510,7 @@ describe("Integrations", () => {
       {
         name: "google_drive",
         display_name: "Google Drive",
-        description: "Search and read files from Google Drive",
+        description: "Search, read, upload, and organize files in Google Drive",
         icon: "SiGoogledrive",
         icon_color: "text-green-600",
         category: "productivity",
@@ -1227,6 +1560,92 @@ describe("Integrations", () => {
       expect(screen.getByText("Enhanced Config Dialog")).toBeInTheDocument();
     });
     expect(mockGoogleDriveOnAction).not.toHaveBeenCalled();
+  });
+
+  it("opens the only Google Cloud tool's settings from the Google Cloud card", async () => {
+    mockGoogleCloudLoadStatus.mockResolvedValue({
+      status: "connected",
+      connected: true,
+    });
+    const tools = [
+      googleCloudTool("google_bigquery", "Google BigQuery", "dataset"),
+    ];
+    mockUseTools.mockImplementation(() => ({
+      tools,
+      loading: false,
+      refetch: vi.fn(),
+      statusAuthoritative: true,
+    }));
+
+    render(<Integrations />);
+
+    const cloudCard = await screen.findByText("Google Cloud");
+    expect(screen.queryByText("Google BigQuery")).not.toBeInTheDocument();
+    const editButton = await waitFor(() => {
+      const button = within(
+        cloudCard.closest(".h-full") as HTMLElement,
+      ).getByRole("button", { name: /edit/i });
+      expect(button).not.toBeDisabled();
+      return button;
+    });
+    fireEvent.click(editButton);
+
+    await waitFor(() => {
+      expect(screen.getByText("Service: google_bigquery")).toBeInTheDocument();
+    });
+    expect(mockGoogleCloudOnAction).not.toHaveBeenCalled();
+  });
+
+  it("keeps each tool's own settings card when several tools share Google Cloud", async () => {
+    mockGoogleCloudLoadStatus.mockResolvedValue({
+      status: "connected",
+      connected: true,
+    });
+    const tools = [
+      {
+        ...googleCloudTool("google_bigquery", "Google BigQuery", "dataset"),
+        status: "requires_config",
+      },
+      googleCloudTool("cloud_storage", "Cloud Storage", "project"),
+    ];
+    mockUseTools.mockImplementation(() => ({
+      tools,
+      loading: false,
+      refetch: vi.fn(),
+      statusAuthoritative: true,
+    }));
+
+    render(<Integrations />);
+
+    const cloudCard = (await screen.findByText("Google Cloud")).closest(
+      ".h-full",
+    ) as HTMLElement;
+    await waitFor(() => {
+      expect(
+        within(cloudCard).getByRole("button", { name: /disconnect/i }),
+      ).not.toBeDisabled();
+    });
+    expect(screen.queryByText(/Requires Google Cloud/)).not.toBeInTheDocument();
+
+    for (const [displayName, service, field] of [
+      ["Google BigQuery", "google_bigquery", "dataset"],
+      ["Cloud Storage", "cloud_storage", "project"],
+    ]) {
+      const toolCard = screen.getByText(displayName).closest(".h-full");
+      fireEvent.click(
+        within(toolCard as HTMLElement).getByRole("button", {
+          name: /configure/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(screen.getByText(`Service: ${service}`)).toBeInTheDocument();
+      });
+      expect(mockEnhancedConfigDialogProps).toHaveBeenLastCalledWith({
+        service,
+        configFields: [expect.objectContaining({ name: field })],
+      });
+    }
+    expect(mockGoogleCloudOnAction).not.toHaveBeenCalled();
   });
 
   it("opens Gmail OAuth provider configuration using the Gmail tool service", async () => {
@@ -1336,6 +1755,197 @@ describe("Integrations", () => {
     });
     expect(
       screen.queryByText(/Connect acme_drive first/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers OAuth and manual credentials for providers with a fallback", async () => {
+    mockUseTools.mockReturnValue({
+      tools: [
+        {
+          name: "github",
+          display_name: "GitHub",
+          description: "Manage GitHub repositories",
+          icon: "SiGithub",
+          icon_color: null,
+          category: "developer",
+          status: "requires_config",
+          setup_type: "oauth",
+          auth_provider: "github",
+          config_fields: [
+            {
+              name: "access_token",
+              label: "Access Token",
+              type: "password",
+              required: false,
+            },
+            {
+              name: "base_url",
+              label: "Base URL",
+              type: "url",
+              required: false,
+            },
+          ],
+          oauth_fallback_fields: ["access_token"],
+          manual_auth_configured: false,
+          helper_text: null,
+          docs_url: null,
+          dependencies: null,
+        },
+      ],
+      loading: false,
+      refetch: vi.fn(),
+      statusAuthoritative: true,
+    });
+
+    render(<Integrations />);
+
+    const githubCard = await waitFor(() => {
+      const card = screen.getByText("GitHub").closest(".h-full");
+      expect(card).toBeInstanceOf(HTMLElement);
+      return card as HTMLElement;
+    });
+    expect(
+      within(githubCard).getByRole("button", { name: "Connect with GitHub" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(githubCard).getByRole("button", { name: "Use access token" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Enhanced Config Dialog")).toBeInTheDocument();
+      expect(screen.getByText("Service: github")).toBeInTheDocument();
+    });
+    expect(mockGenericOAuthOnAction).not.toHaveBeenCalled();
+  });
+
+  it("edits and removes a configured OAuth fallback without disconnecting OAuth", async () => {
+    const refetch = vi.fn();
+    mockUseTools.mockReturnValue({
+      tools: [
+        {
+          name: "github",
+          display_name: "GitHub",
+          description: "Manage GitHub repositories",
+          icon: "SiGithub",
+          icon_color: null,
+          category: "developer",
+          status: "available",
+          setup_type: "oauth",
+          auth_provider: "github",
+          config_fields: [
+            {
+              name: "access_token",
+              label: "Access Token",
+              type: "password",
+              required: false,
+            },
+            {
+              name: "base_url",
+              label: "Base URL",
+              type: "url",
+              required: false,
+            },
+          ],
+          oauth_fallback_fields: ["access_token"],
+          manual_auth_configured: true,
+          helper_text: null,
+          docs_url: null,
+          dependencies: null,
+        },
+      ],
+      loading: false,
+      refetch,
+      statusAuthoritative: true,
+    });
+    global.fetch = vi.fn().mockResolvedValue({ ok: true });
+
+    render(<Integrations />);
+
+    const githubCard = await waitFor(() => {
+      const card = screen.getByText("GitHub").closest(".h-full");
+      expect(card).toBeInstanceOf(HTMLElement);
+      return card as HTMLElement;
+    });
+    expect(within(githubCard).getByText("Access Token")).toBeInTheDocument();
+    expect(
+      within(githubCard).getByRole("button", { name: "Edit access token" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(githubCard).getByRole("button", { name: "Remove access token" }),
+    );
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(
+        "http://localhost:8080/api/credentials/github",
+        {
+          method: "DELETE",
+        },
+      );
+      expect(refetch).toHaveBeenCalledTimes(1);
+    });
+    expect(mockGenericOAuthOnDisconnect).not.toHaveBeenCalled();
+  });
+
+  it("reports an environment OAuth fallback without offering to remove it", async () => {
+    mockUseTools.mockReturnValue({
+      tools: [
+        {
+          name: "github",
+          display_name: "GitHub",
+          description: "Manage GitHub repositories",
+          icon: "SiGithub",
+          icon_color: null,
+          category: "developer",
+          status: "available",
+          setup_type: "oauth",
+          auth_provider: "github",
+          config_fields: [
+            {
+              name: "access_token",
+              label: "Access Token",
+              type: "password",
+              required: false,
+            },
+            {
+              name: "base_url",
+              label: "Base URL",
+              type: "url",
+              required: false,
+            },
+          ],
+          oauth_fallback_fields: ["access_token"],
+          manual_auth_configured: false,
+          environment_auth_configured: true,
+          helper_text: null,
+          docs_url: null,
+          dependencies: null,
+        },
+      ],
+      loading: false,
+      refetch: vi.fn(),
+      statusAuthoritative: true,
+    });
+
+    render(<Integrations />);
+
+    const githubCard = await waitFor(() => {
+      const card = screen.getByText("GitHub").closest(".h-full");
+      expect(card).toBeInstanceOf(HTMLElement);
+      return card as HTMLElement;
+    });
+    expect(
+      within(githubCard).getByText("Environment Access Token"),
+    ).toBeInTheDocument();
+    expect(
+      within(githubCard).getByRole("button", { name: "Configure" }),
+    ).toBeInTheDocument();
+    expect(
+      within(githubCard).queryByRole("button", { name: "Connect with GitHub" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(githubCard).queryByRole("button", { name: "Remove access token" }),
     ).not.toBeInTheDocument();
   });
 

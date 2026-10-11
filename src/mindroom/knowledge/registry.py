@@ -13,14 +13,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, ParamSpec, Protocol, TypeVar, cast
 
-import mindroom.knowledge.manager as manager_module
+from mindroom.embeddings.factory import create_configured_embedder, embedder_client_signature
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.index_metadata import (
-    load_index_metadata_payload,
-    optional_metadata_str,
-    parse_index_metadata_fields,
-    write_index_metadata_payload,
+    PublishedIndexState,
+    load_published_index_state,
+    save_published_index_state,
 )
+from mindroom.knowledge.indexing_config import (
+    IndexingSettings,
+    chroma_collection_exists,
+    indexing_settings_key,
+    published_index_settings_compatible,
+    storage_key_for_base,
+)
+from mindroom.knowledge.strict_knowledge import StrictSearchKnowledge
 from mindroom.logging_config import get_logger
 from mindroom.runtime_resolution import resolve_knowledge_binding
 
@@ -35,7 +42,6 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 logger = get_logger(__name__)
-
 # Identity levels:
 # - KnowledgeSourceRoot: one physical source root. It gates source mutation locks and alias fanout.
 # - KnowledgeRefreshTarget: one refresh target. It coalesces background work for a source and base ID.
@@ -49,7 +55,7 @@ class PublishedIndexKey:
     base_id: str
     storage_root: str
     knowledge_path: str
-    indexing_settings: manager_module.IndexingSettings
+    indexing_settings: IndexingSettings
 
 
 @dataclass(frozen=True)
@@ -70,24 +76,6 @@ class KnowledgeSourceRoot:
 
 
 @dataclass(frozen=True)
-class PublishedIndexState:
-    """Persisted state for the published knowledge index."""
-
-    settings: manager_module.IndexingSettings
-    status: Literal["resetting", "indexing", "complete", "failed"]
-    collection: str | None = None
-    last_published_at: str | None = None
-    published_revision: str | None = None
-    indexed_count: int | None = None
-    source_signature: str | None = None
-    refresh_job: Literal["idle", "pending", "running", "failed"] = "idle"
-    reason: str | None = None
-    last_error: str | None = None
-    updated_at: str | None = None
-    last_refresh_at: str | None = None
-
-
-@dataclass(frozen=True)
 class _PublishedIndexHandle:
     """Read handle for the published knowledge index."""
 
@@ -95,6 +83,7 @@ class _PublishedIndexHandle:
     knowledge: Knowledge
     state: PublishedIndexState
     metadata_path: Path
+    embedder_client_signature: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +98,6 @@ class PublishedIndexResolution:
 
 
 class _PublishedIndexVectorDb(Protocol):
-    client: object | None
     collection_name: str
 
     def exists(self) -> bool:
@@ -118,9 +106,9 @@ class _PublishedIndexVectorDb(Protocol):
 
 
 _published_indexes: dict[PublishedIndexKey, _PublishedIndexHandle] = {}
+_CONSECUTIVE_REFRESH_FAILURE_ALERT_THRESHOLD = 3
 _PRIVATE_KNOWLEDGE_BASE_ID_PREFIX = "__agent_private__:"
 _MAX_PRIVATE_PUBLISHED_INDEXES = 128
-_PUBLISHED_INDEX_STATUSES = {"resetting", "indexing", "complete", "failed"}
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
@@ -149,12 +137,13 @@ def _published_index_key_from_binding(
     config: Config,
 ) -> PublishedIndexKey:
     storage_root = binding.storage_root.expanduser().resolve()
-    knowledge_path = binding.knowledge_path.resolve()
+    # The binding already resolved its path; resolving again would follow a link swapped onto it since.
+    knowledge_path = binding.knowledge_path
     return PublishedIndexKey(
         base_id=base_id,
         storage_root=str(storage_root),
         knowledge_path=str(knowledge_path),
-        indexing_settings=manager_module._indexing_settings_key(
+        indexing_settings=indexing_settings_key(
             config,
             storage_root,
             base_id,
@@ -240,79 +229,15 @@ def resolve_refresh_target(
     )
 
 
-def _published_index_storage_path(key: PublishedIndexKey) -> Path:
-    """Return the storage directory for one resolved knowledge base."""
+def published_index_storage_path(key: PublishedIndexKey) -> Path:
+    """Return the private storage directory backing one resolved knowledge base."""
     knowledge_path = Path(key.knowledge_path)
-    return (
-        Path(key.storage_root) / "knowledge_db" / manager_module._base_storage_key(key.base_id, knowledge_path)
-    ).resolve()
+    return (Path(key.storage_root) / "knowledge_db" / storage_key_for_base(key.base_id, knowledge_path)).resolve()
 
 
 def published_index_metadata_path(key: PublishedIndexKey) -> Path:
     """Return the single persisted state file for one knowledge base."""
-    return _published_index_storage_path(key) / "indexing_settings.json"
-
-
-def _coerce_refresh_job(value: object) -> Literal["idle", "pending", "running", "failed"]:
-    if value in {"idle", "pending", "running", "failed"}:
-        return cast('Literal["idle", "pending", "running", "failed"]', value)
-    return "idle"
-
-
-def load_published_index_state(metadata_path: Path) -> PublishedIndexState | None:
-    """Load published index metadata."""
-    payload = load_index_metadata_payload(metadata_path)
-    if payload is None:
-        return None
-    fields = parse_index_metadata_fields(payload, allowed_statuses=_PUBLISHED_INDEX_STATUSES)
-    if fields is None:
-        return None
-    (
-        settings,
-        status,
-        collection,
-        last_published_at,
-        published_revision,
-        indexed_count,
-        source_signature,
-    ) = fields
-    indexing_settings = manager_module.IndexingSettings.from_metadata(settings)
-    if indexing_settings is None:
-        return None
-
-    return PublishedIndexState(
-        settings=indexing_settings,
-        status=cast('Literal["resetting", "indexing", "complete", "failed"]', status),
-        collection=collection,
-        last_published_at=last_published_at,
-        published_revision=published_revision,
-        indexed_count=indexed_count,
-        source_signature=source_signature,
-        refresh_job=_coerce_refresh_job(payload.get("refresh_job")),
-        reason=optional_metadata_str(payload.get("reason")),
-        last_error=optional_metadata_str(payload.get("last_error")),
-        updated_at=optional_metadata_str(payload.get("updated_at")),
-        last_refresh_at=optional_metadata_str(payload.get("last_refresh_at")),
-    )
-
-
-def save_published_index_state(metadata_path: Path, state: PublishedIndexState) -> None:
-    """Atomically persist published index metadata."""
-    write_index_metadata_payload(
-        metadata_path,
-        settings=state.settings.to_metadata(),
-        status=state.status,
-        collection=state.collection,
-        last_published_at=state.last_published_at,
-        published_revision=state.published_revision,
-        indexed_count=state.indexed_count,
-        source_signature=state.source_signature,
-        refresh_job=state.refresh_job,
-        reason=state.reason,
-        last_error=state.last_error,
-        updated_at=state.updated_at,
-        last_refresh_at=state.last_refresh_at,
-    )
+    return published_index_storage_path(key) / "indexing_settings.json"
 
 
 def published_index_refresh_state(
@@ -404,9 +329,18 @@ def mark_published_index_refresh_failed_preserving_last_good(key: PublishedIndex
         reason="refresh_failed",
         last_error=error,
     )
+    consecutive_refresh_failures = (current.consecutive_refresh_failures if current is not None else 0) + 1
+    state = replace(state, consecutive_refresh_failures=consecutive_refresh_failures)
     if current is not None and current.status == "complete":
         state = replace(state, status="complete")
     save_published_index_state(published_index_metadata_path(key), state)
+    if consecutive_refresh_failures >= _CONSECUTIVE_REFRESH_FAILURE_ALERT_THRESHOLD:
+        logger.error(
+            "knowledge_refresh_failing_repeatedly",
+            base_id=key.base_id,
+            consecutive_refresh_failures=consecutive_refresh_failures,
+            last_error=error,
+        )
 
 
 def mark_published_index_refresh_succeeded(key: PublishedIndexKey) -> None:
@@ -423,6 +357,7 @@ def mark_published_index_refresh_succeeded(key: PublishedIndexKey) -> None:
             last_error=None,
             updated_at=_utc_now(),
             last_refresh_at=_utc_now(),
+            consecutive_refresh_failures=0,
         ),
     )
 
@@ -441,14 +376,13 @@ def _build_published_index_vector_db(
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> _PublishedIndexVectorDb:
-    return cast(
-        "_PublishedIndexVectorDb",
-        manager_module.ChromaDb(
-            collection=_state_collection_name(state),
-            path=str(_published_index_storage_path(key)),
-            persistent_client=True,
-            embedder=manager_module._create_embedder(config, runtime_paths),
-        ),
+    from mindroom.knowledge.read_proxy import ChromaReadProxy  # noqa: PLC0415
+
+    return ChromaReadProxy(
+        collection_name=_state_collection_name(state),
+        path=str(published_index_storage_path(key)),
+        embedder=create_configured_embedder(config, runtime_paths),
+        published_settings=state.settings,
     )
 
 
@@ -458,10 +392,11 @@ def _build_published_index_knowledge(
     *,
     config: Config,
     runtime_paths: RuntimePaths,
-) -> Knowledge:
-    return manager_module.Knowledge(
-        vector_db=_build_published_index_vector_db(key, state, config=config, runtime_paths=runtime_paths),
-    )
+) -> Knowledge | None:
+    vector_db = _build_published_index_vector_db(key, state, config=config, runtime_paths=runtime_paths)
+    if not vector_db.exists():
+        return None
+    return StrictSearchKnowledge(vector_db=vector_db)
 
 
 def published_index_collection_exists_for_state(key: PublishedIndexKey, state: PublishedIndexState) -> bool:
@@ -469,7 +404,7 @@ def published_index_collection_exists_for_state(key: PublishedIndexKey, state: P
     if state.status != "complete" or state.collection is None:
         return False
     try:
-        return manager_module.chroma_collection_exists(_published_index_storage_path(key), state.collection)
+        return chroma_collection_exists(published_index_storage_path(key), state.collection)
     except Exception:
         logger.warning(
             "Published knowledge collection existence check failed",
@@ -480,47 +415,8 @@ def published_index_collection_exists_for_state(key: PublishedIndexKey, state: P
         return False
 
 
-def _indexing_settings_query_compatible(
-    published_settings: manager_module.IndexingSettings,
-    current_settings: manager_module.IndexingSettings,
-) -> bool:
-    """Return whether current queries can use a collection from published settings."""
-    return published_settings.query_compatibility_key() == current_settings.query_compatibility_key()
-
-
-def _indexing_settings_corpus_compatible(
-    published_settings: manager_module.IndexingSettings,
-    current_settings: manager_module.IndexingSettings,
-) -> bool:
-    """Return whether published content is safe for the current corpus config."""
-    return published_settings.corpus_compatibility_key() == current_settings.corpus_compatibility_key()
-
-
-def indexing_settings_metadata_equal(
-    published_settings: manager_module.IndexingSettings,
-    current_settings: manager_module.IndexingSettings,
-) -> bool:
-    """Return whether persisted metadata exactly matches current indexing settings."""
-    return published_settings == current_settings
-
-
-def published_index_settings_compatible(
-    published_settings: manager_module.IndexingSettings,
-    current_settings: manager_module.IndexingSettings,
-) -> bool:
-    """Return whether a published index can be queried under the current config."""
-    return _indexing_settings_query_compatible(
-        published_settings,
-        current_settings,
-    ) and _indexing_settings_corpus_compatible(published_settings, current_settings)
-
-
 def _published_index_state_queryable(key: PublishedIndexKey, state: PublishedIndexState) -> bool:
-    return (
-        state.status == "complete"
-        and state.collection is not None
-        and published_index_settings_compatible(state.settings, key.indexing_settings)
-    )
+    return state.queryable_for(key.indexing_settings)
 
 
 def _published_index_availability(
@@ -538,10 +434,13 @@ def _published_index_availability(
         )
     elif state.collection is None and refresh_state == "refresh_failed":
         availability = KnowledgeAvailability.REFRESH_FAILED
-    elif not published_index_settings_compatible(
-        state.settings,
-        key.indexing_settings,
-    ) or not indexing_settings_metadata_equal(state.settings, key.indexing_settings):
+    elif (
+        not published_index_settings_compatible(
+            state.settings,
+            key.indexing_settings,
+        )
+        or state.settings != key.indexing_settings
+    ):
         availability = KnowledgeAvailability.CONFIG_MISMATCH
     elif refresh_state == "refresh_failed":
         availability = KnowledgeAvailability.REFRESH_FAILED
@@ -600,8 +499,6 @@ def _load_queryable_index_from_state(
 ) -> Knowledge | None:
     if not _published_index_state_queryable(key, state):
         return None
-    if not published_index_collection_exists_for_state(key, state):
-        return None
     return _build_published_index_knowledge(key, state, config=config, runtime_paths=runtime_paths)
 
 
@@ -623,36 +520,37 @@ def get_published_index(
     metadata_path = published_index_metadata_path(key)
     state = load_published_index_state(metadata_path)
     availability = _published_index_availability(key=key, state=state, metadata_exists=metadata_path.exists())
+    current_embedder_client_signature = embedder_client_signature(config, runtime_paths)
 
-    index = _published_indexes.get(key)
-    if index is not None:
-        if (
-            state is not None
-            and _cached_index_matches_persisted_state(index, state)
-            and _cached_index_still_queryable(index)
-        ):
-            if index.state != state:
-                index = replace(index, state=state)
-                _published_indexes[key] = index
+    try:
+        index = _published_indexes.get(key)
+        if index is not None:
+            if (
+                index.embedder_client_signature == current_embedder_client_signature
+                and state is not None
+                and _cached_index_matches_persisted_state(index, state)
+                and _cached_index_still_queryable(index)
+            ):
+                if index.state != state:
+                    index = replace(index, state=state)
+                    _published_indexes[key] = index
+                return PublishedIndexResolution(
+                    key=key,
+                    index=index,
+                    state=state,
+                    availability=availability,
+                    schedule_refresh_on_access=binding.incremental_sync_on_access,
+                )
+            _published_indexes.pop(key, None)
+
+        if state is None:
             return PublishedIndexResolution(
                 key=key,
-                index=index,
+                index=None,
                 state=state,
                 availability=availability,
                 schedule_refresh_on_access=binding.incremental_sync_on_access,
             )
-        _published_indexes.pop(key, None)
-
-    if state is None:
-        return PublishedIndexResolution(
-            key=key,
-            index=None,
-            state=state,
-            availability=availability,
-            schedule_refresh_on_access=binding.incremental_sync_on_access,
-        )
-
-    try:
         knowledge = _load_queryable_index_from_state(key, state, config=config, runtime_paths=runtime_paths)
     except Exception:
         logger.warning(
@@ -683,6 +581,7 @@ def get_published_index(
         knowledge=knowledge,
         state=state,
         metadata_path=published_index_metadata_path(key),
+        embedder_client_signature=current_embedder_client_signature,
     )
     _cache_published_index(index)
     return PublishedIndexResolution(
@@ -700,6 +599,7 @@ def _publish_knowledge_index(
     knowledge: Knowledge,
     state: PublishedIndexState,
     metadata_path: Path | None = None,
+    embedder_client_signature: str | None = None,
 ) -> _PublishedIndexHandle:
     """Publish a read handle in this process."""
     _evict_published_indexes_for_refresh_target(refresh_target_for_published_index_key(key))
@@ -708,6 +608,7 @@ def _publish_knowledge_index(
         knowledge=knowledge,
         state=state,
         metadata_path=metadata_path or published_index_metadata_path(key),
+        embedder_client_signature=embedder_client_signature,
     )
     _cache_published_index(index)
     return index
@@ -725,7 +626,13 @@ def publish_knowledge_index_from_state(
     knowledge = _load_queryable_index_from_state(key, state, config=config, runtime_paths=runtime_paths)
     if knowledge is None:
         return None
-    return _publish_knowledge_index(key, knowledge=knowledge, state=state, metadata_path=metadata_path)
+    return _publish_knowledge_index(
+        key,
+        knowledge=knowledge,
+        state=state,
+        metadata_path=metadata_path,
+        embedder_client_signature=embedder_client_signature(config, runtime_paths),
+    )
 
 
 def _same_physical_binding(key: PublishedIndexKey, refresh_target: KnowledgeRefreshTarget) -> bool:

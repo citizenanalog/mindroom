@@ -4,14 +4,13 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import MagicMock
 
 import nio
 import pytest
 from agno.models.response import ToolExecution
 from agno.run.agent import ToolCallCompletedEvent, ToolCallStartedEvent
 
-from mindroom.config.matrix import MatrixDeliveryConfig
 from mindroom.config.models import DefaultsConfig
 from mindroom.constants import (
     AI_RUN_METADATA_KEY,
@@ -23,13 +22,19 @@ from mindroom.constants import (
 from mindroom.matrix.client import edit_message_result, send_message_result
 from mindroom.matrix.large_messages import (
     _NORMAL_MESSAGE_LIMIT,
-    _oversized_nonterminal_streaming_edit_sent_at,
+    calculate_event_size,
     prepare_large_message,
+    should_send_oversized_nonterminal_streaming_edit,
 )
 from mindroom.message_target import MessageTarget
-from mindroom.streaming import ReplacementStreamingResponse, StreamingResponse, send_streaming_response
-from mindroom.streaming_delivery import StreamInputChunk
+from mindroom.streaming import (
+    ReplacementStreamingResponse,
+    StreamingResponse,
+    StreamInputChunk,
+    send_streaming_response,
+)
 from mindroom.tool_system.events import _TOOL_TRACE_KEY, StructuredStreamChunk, ToolTraceEntry
+from tests.conftest import push_stream_chunk
 
 
 class MockClient:
@@ -45,6 +50,8 @@ class MockClient:
         self.messages_sent = []
         self.uploads: list[dict] = []
         self.should_upload_succeed = should_upload_succeed
+        self.olm = None
+        self.device_id = "DEVICE"
 
     async def room_send(
         self,
@@ -56,7 +63,7 @@ class MockClient:
     ) -> MagicMock:
         """Mock sending a message."""
         assert message_type == "m.room.message"
-        assert ignore_unverified_devices is False
+        assert ignore_unverified_devices is True
         self.messages_sent.append(("send", room_id, content))
 
         # Create a mock that passes isinstance check
@@ -86,7 +93,6 @@ class MockConfig:
     def __init__(self) -> None:
         self.agents = {}
         self.defaults = DefaultsConfig()
-        self.matrix_delivery = MatrixDeliveryConfig()
 
 
 def _runtime_paths() -> RuntimePaths:
@@ -108,10 +114,11 @@ async def test_regular_message_under_limit() -> None:
     content = {"body": "Hello world", "msgtype": "m.text"}
 
     # Should pass through unchanged
-    await send_message_result(client, "!room:server", content, config=MockConfig())
+    await send_message_result(client, "!room:server", content)
 
     assert len(client.messages_sent) == 1
     sent_content = client.messages_sent[0][2]
+    assert sent_content is content
     assert sent_content["body"] == "Hello world"
     assert "io.mindroom.long_text" not in sent_content
 
@@ -125,12 +132,11 @@ async def test_regular_message_over_limit() -> None:
     large_text = "x" * 100000
     content = {"body": large_text, "msgtype": "m.text"}
 
-    await send_message_result(client, "!room:server", content, config=MockConfig())
+    await send_message_result(client, "!room:server", content)
 
     assert len(client.messages_sent) == 1
     sent_content = client.messages_sent[0][2]
 
-    # Should be an m.file message
     assert sent_content["msgtype"] == "m.file"
     assert sent_content["filename"] == "message-content.json"
 
@@ -144,8 +150,9 @@ async def test_regular_message_over_limit() -> None:
     assert sent_content["io.mindroom.long_text"]["encoding"] == "matrix_event_content_json"
     assert sent_content["io.mindroom.long_text"]["is_complete_content"] is True
 
-    # Should have file URL
-    assert "url" in sent_content or "file" in sent_content
+    # A room that stays plaintext keeps standard Matrix m.file semantics.
+    assert sent_content["url"].startswith("mxc://server/")
+    assert "file" not in sent_content
 
 
 @pytest.mark.asyncio
@@ -157,7 +164,7 @@ async def test_edit_message_with_lower_threshold() -> None:
     text = "y" * 30000
     content = {"body": text, "msgtype": "m.text", "formatted_body": f"<p>{text}</p>"}
 
-    await edit_message_result(client, "!room:server", "$original", content, text, config=MockConfig())
+    await edit_message_result(client, "!room:server", "$original", content, text)
 
     assert len(client.messages_sent) == 1
     sent_content = client.messages_sent[0][2]
@@ -177,7 +184,7 @@ async def test_large_edit_preserves_mindroom_metadata_in_both_payload_layers() -
     text = "z" * 30000
     extra_content = {
         AI_RUN_METADATA_KEY: {"version": 1, "usage": {"total_tokens": 10}},
-        "io.mindroom.compaction": {"version": 1, "compacted": False},
+        "io.mindroom.compaction": {"version": 3, "compacted": False},
     }
     content = {"body": text, "msgtype": "m.text", "formatted_body": f"<p>{text}</p>"}
 
@@ -187,7 +194,6 @@ async def test_large_edit_preserves_mindroom_metadata_in_both_payload_layers() -
         "$original",
         content,
         text,
-        config=MockConfig(),
         extra_content=extra_content,
     )
 
@@ -199,7 +205,7 @@ async def test_large_edit_preserves_mindroom_metadata_in_both_payload_layers() -
         assert sent_content[key] == value
         assert sent_content["m.new_content"][key] == value
 
-    uploaded_payload = json.loads(client.uploads[0]["data"].read().decode("utf-8"))
+    uploaded_payload = json.loads(client.uploads[0]["data"].read())
     for key, value in extra_content.items():
         assert uploaded_payload["m.new_content"][key] == value
 
@@ -225,7 +231,6 @@ async def test_threaded_edit_strips_nested_relations_from_replacement_payload() 
         "$original",
         content,
         "Updated reply",
-        config=MockConfig(),
     )
 
     assert len(client.messages_sent) == 1
@@ -254,7 +259,7 @@ async def test_streaming_initial_message_under_limit() -> None:
     )
 
     # Small initial content
-    await streaming.update_content("Hello streaming world", client)
+    await push_stream_chunk(streaming, "Hello streaming world", client)
 
     # Should trigger initial send
     assert len(client.messages_sent) == 1
@@ -288,34 +293,6 @@ async def test_streaming_initial_message_over_limit() -> None:
     assert sent_content["msgtype"] == "m.file"
     assert len(sent_content["body"]) < 60000
     assert "io.mindroom.long_text" in sent_content
-
-
-@pytest.mark.asyncio
-async def test_streaming_large_initial_message_records_transformed_content_to_cache() -> None:
-    """Streaming write-through should cache the exact oversized event content Matrix stored."""
-    client = MockClient()
-    config = MockConfig()
-    conversation_cache = AsyncMock()
-    conversation_cache.notify_outbound_message = Mock()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-        conversation_cache=conversation_cache,
-    )
-
-    streaming.accumulated_text = "a" * 60000
-    streaming.last_update = float("-inf")
-
-    await streaming._send_or_edit_message(client, is_final=True)
-
-    sent_content = client.messages_sent[0][2]
-    conversation_cache.notify_outbound_message.assert_called_once_with(
-        "!test:room",
-        "$event_1",
-        sent_content,
-    )
 
 
 @pytest.mark.asyncio
@@ -358,44 +335,21 @@ async def test_streaming_edit_grows_over_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_streaming_large_edit_records_transformed_content_to_cache() -> None:
-    """Streaming edit write-through should cache the exact transformed edit event."""
-    client = MockClient()
-    config = MockConfig()
-    conversation_cache = AsyncMock()
-    conversation_cache.notify_outbound_message = Mock()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-        conversation_cache=conversation_cache,
-    )
-
-    streaming.accumulated_text = "Small start"
-    streaming.last_update = float("-inf")
-    await streaming._send_or_edit_message(client, is_final=False)
-    conversation_cache.notify_outbound_message.reset_mock()
-
-    streaming.accumulated_text = "b" * 35000
-    streaming.last_update = float("-inf")
-
-    await streaming._send_or_edit_message(client, is_final=True)
-
-    edit_content = client.messages_sent[1][2]
-    conversation_cache.notify_outbound_message.assert_called_once_with(
-        "!test:room",
-        "$event_2",
-        edit_content,
-    )
-
-
-@pytest.mark.asyncio
 async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test streaming with multiple edits as message grows."""
-    _oversized_nonterminal_streaming_edit_sent_at.clear()
-    monotonic_values = iter([100.0, 106.0, 112.0])
-    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: next(monotonic_values))
+    now = {"value": 100.0}
+    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: now["value"])
+    cadence_edits: list[dict[str, object]] = []
+
+    def recording_cadence(*, room_id: str, original_event_id: str, edit_content: dict[str, object]) -> bool:
+        cadence_edits.append(edit_content)
+        return should_send_oversized_nonterminal_streaming_edit(
+            room_id=room_id,
+            original_event_id=original_event_id,
+            edit_content=edit_content,
+        )
+
+    monkeypatch.setattr("mindroom.streaming.should_send_oversized_nonterminal_streaming_edit", recording_cadence)
     client = MockClient()
     config = MockConfig()
 
@@ -419,6 +373,10 @@ async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPa
         is_final = label == "Larger"
 
         await streaming._send_or_edit_message(client, is_final=is_final)
+        if cadence_edits:
+            # Wait out the interval the latest in-progress edit reserved; every
+            # oversized edit exceeds 27 KB, so it always outlasts the 5 s floor.
+            now["value"] += calculate_event_size(cadence_edits[-1]) / 4096
 
         # After first, should have event_id
         if label != "Initial":
@@ -428,7 +386,8 @@ async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPa
     assert len(client.messages_sent) == len(sizes)
 
     nonterminal_large_edit = client.messages_sent[-2][2]
-    assert nonterminal_large_edit["m.new_content"]["msgtype"] == "m.text"
+    assert nonterminal_large_edit["msgtype"] == "m.notice"
+    assert nonterminal_large_edit["m.new_content"]["msgtype"] == "m.notice"
     assert nonterminal_large_edit["m.new_content"][STREAM_STATUS_KEY] == STREAM_STATUS_STREAMING
     assert nonterminal_large_edit["m.new_content"]["format"] == "org.matrix.custom.html"
     assert "Streaming preview truncated" in nonterminal_large_edit["m.new_content"]["formatted_body"]

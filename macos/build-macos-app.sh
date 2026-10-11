@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+APP_NAME="MindRoom"
+DISPLAY_NAME="MindRoom"
+INSTALL=false
+CREATE_DMG=false
+
+usage() {
+    cat <<'EOF'
+Usage: macos/build-macos-app.sh [--install] [--dmg]
+
+Build the native Apple silicon macOS app and menu bar companion for MindRoom.
+
+Options:
+  --install   Copy the built app to /Applications and open it.
+  --dmg       Create dist/macos/MindRoom.dmg.
+  -h, --help  Show this help text.
+
+Environment:
+  CODESIGN_IDENTITY  Codesign identity to use. Defaults to ad-hoc signing (-).
+  APP_VERSION        CFBundleShortVersionString to stamp into the app.
+                     Defaults to the current package version when available.
+  BUILD_VERSION      CFBundleVersion to stamp into the app. Defaults to
+                     GITHUB_RUN_NUMBER, then the git commit count.
+  SPARKLE_PUBLIC_ED_KEY
+                     Public EdDSA key for Sparkle updates. If unset, the app
+                     builds without enabling Sparkle update checks.
+  UV_BINARY          uv binary to bundle. Defaults to the uv found on PATH.
+  SKIP_DESKTOP_HELPER_BUILD
+                     Set to 1 to bundle the helper that macos/build-desktop-helper.sh
+                     already built in dist/macos/desktop-helper instead of rebuilding it.
+  INSTALL_DIR        Install destination. Defaults to /Applications.
+  MINDROOM_SKIP_OPEN Set to 1 to skip opening the app after --install.
+  NOTARIZE           Set to 1 to notarize and staple the DMG. Requires --dmg.
+  APPLE_ID           Apple ID email used for notarization.
+  APPLE_APP_SPECIFIC_PASSWORD
+                     App-specific password used by xcrun notarytool.
+  APPLE_TEAM_ID      Apple Developer Team ID used for notarization.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --install)
+            INSTALL=true
+            shift
+            ;;
+        --dmg)
+            CREATE_DMG=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PACKAGE_DIR="$ROOT_DIR/macos/$APP_NAME"
+HELPER_BUILD_DIR="$ROOT_DIR/dist/macos/desktop-helper"
+HELPER_BUILD_SCRIPT="$ROOT_DIR/macos/build-desktop-helper.sh"
+HELPER_VERIFY_SCRIPT="$ROOT_DIR/macos/verify-desktop-helper.sh"
+DIST_DIR="$ROOT_DIR/dist/macos"
+APP_DIR="$DIST_DIR/$APP_NAME.app"
+HELPER_APP="$APP_DIR/Contents/Helpers/MindRoom Desktop Helper.app"
+DMG_STAGING_DIR="$DIST_DIR/dmg-staging"
+DMG_RW_PATH="$DIST_DIR/$APP_NAME-rw.dmg"
+INFO_PLIST="$PACKAGE_DIR/Resources/Info.plist"
+ENTITLEMENTS_PLIST="$PACKAGE_DIR/Resources/MindRoom.entitlements"
+ICON_SOURCE="$PACKAGE_DIR/Resources/MindRoom.icon"
+ICON_BUILD_DIR="$DIST_DIR/icon-assets"
+ICON_INFO_PLIST="$DIST_DIR/icon-info.plist"
+CODESIGN_IDENTITY=${CODESIGN_IDENTITY:--}
+APP_VERSION=${APP_VERSION:-}
+BUILD_VERSION=${BUILD_VERSION:-${GITHUB_RUN_NUMBER:-}}
+UV_BINARY=${UV_BINARY:-$(command -v uv || true)}
+SKIP_DESKTOP_HELPER_BUILD=${SKIP_DESKTOP_HELPER_BUILD:-0}
+INSTALL_DIR=${INSTALL_DIR:-/Applications}
+NOTARIZE=${NOTARIZE:-0}
+SPARKLE_PUBLIC_ED_KEY=${SPARKLE_PUBLIC_ED_KEY:-}
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    echo "The MindRoom app must be built natively on an Apple silicon Mac." >&2
+    exit 1
+fi
+
+for required_tool in swift xcrun xcodebuild lipo; do
+    if ! command -v "$required_tool" >/dev/null 2>&1; then
+        echo "$required_tool is required to build the MindRoom app." >&2
+        exit 1
+    fi
+done
+
+XCODE_VERSION=$(xcodebuild -version | awk '/^Xcode / { print $2 }')
+if [[ "${XCODE_VERSION%%.*}" -lt 26 ]] || ! xcrun --find actool >/dev/null 2>&1; then
+    echo "Xcode 26 or newer is required to compile the light and dark app icons." >&2
+    exit 1
+fi
+
+if [[ -z "$UV_BINARY" || ! -x "$UV_BINARY" ]]; then
+    echo "uv is required so it can be bundled into the app. Set UV_BINARY or install uv." >&2
+    exit 1
+fi
+
+# An Intel uv would need Rosetta, which Apple silicon Macs do not install by default.
+if ! lipo "$UV_BINARY" -verify_arch arm64; then
+    echo "The bundled uv must support Apple silicon: $UV_BINARY" >&2
+    exit 1
+fi
+
+if [[ ! -f "$INFO_PLIST" ]]; then
+    echo "Info.plist is missing: $INFO_PLIST" >&2
+    exit 1
+fi
+
+if [[ ! -f "$ENTITLEMENTS_PLIST" ]]; then
+    echo "Entitlements plist is missing: $ENTITLEMENTS_PLIST" >&2
+    exit 1
+fi
+
+if [[ ! -f "$ICON_SOURCE/icon.json" ]]; then
+    echo "MindRoom icon sources are missing from $PACKAGE_DIR/Resources." >&2
+    exit 1
+fi
+
+if [[ "$NOTARIZE" == "1" && "$CREATE_DMG" != true ]]; then
+    echo "NOTARIZE=1 requires --dmg so there is a distributable artifact to notarize." >&2
+    exit 1
+fi
+
+codesign_args() {
+    printf '%s\0' --force --sign "$CODESIGN_IDENTITY"
+    if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+        printf '%s\0' --timestamp --options runtime
+    fi
+}
+
+sign_executable() {
+    local target="$1"
+    local args=()
+    while IFS= read -r -d '' arg; do
+        args+=("$arg")
+    done < <(codesign_args)
+    codesign "${args[@]}" "$target"
+}
+
+sign_app() {
+    local target="$1"
+    local args=()
+    while IFS= read -r -d '' arg; do
+        args+=("$arg")
+    done < <(codesign_args)
+    codesign --deep --entitlements "$ENTITLEMENTS_PLIST" "${args[@]}" "$target"
+}
+
+first_find_match() {
+    find "$@" -print | sed -n '1p'
+}
+
+resolve_app_version() {
+    local raw_version="$APP_VERSION"
+    if [[ -z "$raw_version" ]]; then
+        raw_version=$(
+            PYPROJECT_PATH="$ROOT_DIR/pyproject.toml" python3 <<'PY' 2>/dev/null || true
+import os
+import pathlib
+import tomllib
+
+pyproject = pathlib.Path(os.environ["PYPROJECT_PATH"])
+print(tomllib.loads(pyproject.read_text())["project"]["version"])
+PY
+        )
+    fi
+    if [[ -z "$raw_version" ]]; then
+        raw_version="0.1.0"
+    fi
+    raw_version="${raw_version#v}"
+    if [[ "$raw_version" =~ ^[0-9]+([.][0-9]+){0,2} ]]; then
+        printf '%s\n' "${BASH_REMATCH[0]}"
+        return
+    fi
+    echo "Could not derive a macOS app version from: $raw_version" >&2
+    exit 1
+}
+
+resolve_build_version() {
+    local build_version="$BUILD_VERSION"
+    if [[ -z "$build_version" ]]; then
+        build_version=$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || true)
+    fi
+    if [[ -z "$build_version" ]]; then
+        build_version=$(date +%Y%m%d%H%M%S)
+    fi
+    build_version=$(printf '%s' "$build_version" | tr -cd '0-9.')
+    if [[ -z "$build_version" || ! "$build_version" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+        echo "Could not derive a numeric macOS app build version from: ${BUILD_VERSION:-unset}" >&2
+        exit 1
+    fi
+    printf '%s\n' "$build_version"
+}
+
+stamp_info_plist() {
+    local app_version
+    local build_version
+    app_version=$(resolve_app_version)
+    build_version=$(resolve_build_version)
+
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $app_version" "$APP_DIR/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_version" "$APP_DIR/Contents/Info.plist"
+    if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+        /usr/libexec/PlistBuddy -c "Delete :SUPublicEDKey" "$APP_DIR/Contents/Info.plist" >/dev/null 2>&1 || true
+        /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$APP_DIR/Contents/Info.plist"
+    fi
+    echo "Stamped app bundle version $app_version ($build_version)"
+}
+
+build_app_icon() {
+    rm -rf "$ICON_BUILD_DIR"
+    mkdir -p "$ICON_BUILD_DIR"
+    xcrun actool "$ICON_SOURCE" \
+        --compile "$ICON_BUILD_DIR" \
+        --app-icon MindRoom \
+        --platform macosx \
+        --target-device mac \
+        --minimum-deployment-target 14.0 \
+        --enable-on-demand-resources NO \
+        --development-region en \
+        --output-partial-info-plist "$ICON_INFO_PLIST" \
+        --output-format human-readable-text --errors --warnings
+}
+
+require_notarization_env() {
+    if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+        echo "A Developer ID signing identity is required when NOTARIZE=1." >&2
+        exit 1
+    fi
+    for variable in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+        if [[ -z "${!variable:-}" ]]; then
+            echo "$variable is required when NOTARIZE=1." >&2
+            exit 1
+        fi
+    done
+}
+
+notarize_dmg() {
+    local dmg_path="$1"
+    local app_path="$2"
+    require_notarization_env
+    xcrun notarytool submit "$dmg_path" \
+        --apple-id "$APPLE_ID" \
+        --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+        --team-id "$APPLE_TEAM_ID" \
+        --wait
+    xcrun stapler staple "$app_path"
+    xcrun stapler validate "$app_path"
+    xcrun stapler staple "$dmg_path"
+    xcrun stapler validate "$dmg_path"
+}
+
+create_drag_install_dmg() {
+    local dmg_path="$1"
+    local staging_size_kb
+    local image_size_mb
+    hdiutil detach "/Volumes/$DISPLAY_NAME" >/dev/null 2>&1 || true
+    rm -rf "$DMG_STAGING_DIR" "$DMG_RW_PATH" "$dmg_path"
+    mkdir -p "$DMG_STAGING_DIR"
+    ditto "$APP_DIR" "$DMG_STAGING_DIR/$APP_NAME.app"
+    ln -s /Applications "$DMG_STAGING_DIR/Applications"
+    staging_size_kb=$(du -sk "$DMG_STAGING_DIR" | awk '{ print $1 }')
+    image_size_mb=$((staging_size_kb / 1024 + 64))
+    hdiutil create "$DMG_RW_PATH" -volname "$DISPLAY_NAME" -size "${image_size_mb}m" -fs HFS+ -ov
+    local attach_output
+    attach_output=$(hdiutil attach "$DMG_RW_PATH" -nobrowse -noautoopen)
+    local volume_path
+    volume_path=$(printf '%s\n' "$attach_output" | awk -F '\t' '/\/Volumes\// { mount=$NF } END { if (mount) print mount; else exit 1 }')
+    ditto "$DMG_STAGING_DIR" "$volume_path"
+    sync
+    hdiutil detach "$volume_path" -force >/dev/null
+    hdiutil convert "$DMG_RW_PATH" -format UDZO -imagekey zlib-level=9 -o "$dmg_path"
+    rm -rf "$DMG_STAGING_DIR" "$DMG_RW_PATH"
+}
+
+quit_running_app() {
+    if ! pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+        return
+    fi
+    osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
+    for _ in {1..20}; do
+        if ! pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+            return
+        fi
+        sleep 0.2
+    done
+    pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+}
+
+SWIFT_BUILD_ARGS=(-c release --package-path "$PACKAGE_DIR" --product "$APP_NAME" --arch arm64)
+
+echo "Building $DISPLAY_NAME..."
+swift build "${SWIFT_BUILD_ARGS[@]}"
+BIN_DIR=$(swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)
+RESOURCE_BUNDLE="$BIN_DIR/${APP_NAME}_${APP_NAME}.bundle"
+EXPECTED_BINARY="$BIN_DIR/$APP_NAME"
+BINARY="$EXPECTED_BINARY"
+
+if [[ ! -x "$BINARY" ]]; then
+    BINARY=$(first_find_match "$PACKAGE_DIR/.build" -type f -name "$APP_NAME" -path "*/release/$APP_NAME")
+    if [[ -n "$BINARY" ]]; then
+        echo "Using fallback built binary: $BINARY"
+    fi
+fi
+
+if [[ ! -x "$BINARY" ]]; then
+    echo "Built binary not found. Expected $EXPECTED_BINARY and found no fallback under $PACKAGE_DIR/.build." >&2
+    exit 1
+fi
+
+if [[ ! -d "$RESOURCE_BUNDLE" ]]; then
+    echo "Built app resources not found: $RESOURCE_BUNDLE" >&2
+    exit 1
+fi
+
+if [[ "$SKIP_DESKTOP_HELPER_BUILD" == "1" ]]; then
+    echo "Using the prebuilt fixed-identity desktop helper..."
+else
+    echo "Building fixed-identity desktop helper..."
+    UV_BINARY="$UV_BINARY" "$HELPER_BUILD_SCRIPT" --output "$HELPER_BUILD_DIR"
+fi
+
+echo "Building app icon..."
+build_app_icon
+
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Frameworks" "$APP_DIR/Contents/Resources/bin" "$APP_DIR/Contents/Helpers"
+
+EXPECTED_SPARKLE_FRAMEWORK="$BIN_DIR/Sparkle.framework"
+SPARKLE_FRAMEWORK="$EXPECTED_SPARKLE_FRAMEWORK"
+if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
+    SPARKLE_FRAMEWORK=$(first_find_match "$PACKAGE_DIR/.build" -type d -name Sparkle.framework -path "*/release/Sparkle.framework")
+    if [[ -n "$SPARKLE_FRAMEWORK" ]]; then
+        echo "Using fallback Sparkle framework: $SPARKLE_FRAMEWORK"
+    fi
+fi
+
+if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
+    echo "Built Sparkle framework not found. Expected $EXPECTED_SPARKLE_FRAMEWORK and found no fallback under $PACKAGE_DIR/.build." >&2
+    exit 1
+fi
+
+cp "$BINARY" "$APP_DIR/Contents/MacOS/$APP_NAME"
+cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Merge '$ICON_INFO_PLIST'" "$APP_DIR/Contents/Info.plist"
+ditto "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+cp "$UV_BINARY" "$APP_DIR/Contents/Resources/bin/uv"
+bash "$ROOT_DIR/macos/bundle-llama-cpp.sh" "$APP_DIR/Contents/Resources/llama.cpp"
+ditto "$ICON_BUILD_DIR" "$APP_DIR/Contents/Resources"
+ditto "$RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/${APP_NAME}_${APP_NAME}.bundle"
+ditto "$HELPER_BUILD_DIR/dist/MindRoom Desktop Helper.app" "$HELPER_APP"
+chmod 755 "$APP_DIR/Contents/MacOS/$APP_NAME" "$APP_DIR/Contents/Resources/bin/uv"
+
+if ! otool -l "$APP_DIR/Contents/MacOS/$APP_NAME" | grep -q '@executable_path/../Frameworks'; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_DIR/Contents/MacOS/$APP_NAME"
+fi
+
+stamp_info_plist
+HELPER_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_DIR/Contents/Info.plist")
+HELPER_BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_DIR/Contents/Info.plist")
+sign_executable "$APP_DIR/Contents/Resources/bin/uv"
+for library in "$APP_DIR/Contents/Resources/llama.cpp/"*.dylib; do
+    if [[ ! -L "$library" ]]; then sign_executable "$library"; fi
+done
+sign_executable "$APP_DIR/Contents/Resources/llama.cpp/llama-server"
+HELPER_INFO="$HELPER_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $HELPER_VERSION" "$HELPER_INFO"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $HELPER_BUILD_VERSION" "$HELPER_INFO"
+sign_app "$HELPER_APP"
+"$HELPER_VERIFY_SCRIPT" "$HELPER_APP"
+sign_app "$APP_DIR"
+
+echo "Built $APP_DIR"
+
+if [[ "$CREATE_DMG" == true ]]; then
+    DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+    create_drag_install_dmg "$DMG_PATH"
+    if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+        codesign --force --sign "$CODESIGN_IDENTITY" --timestamp "$DMG_PATH"
+    fi
+    if [[ "$NOTARIZE" == "1" ]]; then
+        notarize_dmg "$DMG_PATH" "$APP_DIR"
+    fi
+    echo "Built $DMG_PATH"
+fi
+
+if [[ "$INSTALL" == true ]]; then
+    INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
+    mkdir -p "$INSTALL_DIR"
+    quit_running_app
+    rm -rf "$INSTALL_PATH"
+    ditto "$APP_DIR" "$INSTALL_PATH"
+    codesign --verify --deep --strict "$INSTALL_PATH"
+    if [[ "${MINDROOM_SKIP_OPEN:-0}" != "1" ]]; then
+        open "$INSTALL_PATH"
+    fi
+    echo "Installed $INSTALL_PATH"
+fi

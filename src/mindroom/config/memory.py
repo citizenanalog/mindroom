@@ -4,11 +4,60 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from mindroom.config.models import EmbedderConfig
+from mindroom.config.models import EmbedderConfig, normalize_api_key_setting
+from mindroom.config.schema_hints import dashboard_hint
+from mindroom.path_globs import validate_safe_relative_pattern
 
 MemoryBackend = Literal["mem0", "file", "none"]
+_MemorySearchMode = Literal["keyword", "semantic"]
+
+
+def _validate_memory_search_includes(value: list[str]) -> list[str]:
+    """Validate include patterns stay inside the memory root."""
+    normalized = [validate_safe_relative_pattern(pattern, field_name="memory.search.include") for pattern in value]
+    if not normalized:
+        msg = "memory.search.include must contain at least one pattern"
+        raise ValueError(msg)
+    return normalized
+
+
+class MemorySearchConfig(BaseModel):
+    """Search behavior for file-backed memory."""
+
+    mode: _MemorySearchMode = Field(
+        default="keyword",
+        description="Search mode for file-backed memory: keyword or semantic",
+    )
+    include: list[str] = Field(
+        default_factory=lambda: ["memory/**/*.md"],
+        description="Root-relative glob patterns included in file-memory semantic search",
+    )
+    include_entrypoint: bool = Field(
+        default=False,
+        description="When true, include MEMORY.md in file-memory semantic search",
+    )
+
+    @field_validator("include")
+    @classmethod
+    def validate_include_patterns(cls, value: list[str]) -> list[str]:
+        """Validate include patterns stay inside the memory root."""
+        return _validate_memory_search_includes(value)
+
+
+class AgentMemorySearchConfig(BaseModel):
+    """Optional per-agent override for file-backed memory search."""
+
+    mode: _MemorySearchMode | None = Field(default=None, description="Per-agent memory search mode override")
+    include: list[str] | None = Field(default=None, description="Per-agent included memory-search glob patterns")
+    include_entrypoint: bool | None = Field(default=None, description="Per-agent MEMORY.md indexing override")
+
+    @field_validator("include")
+    @classmethod
+    def validate_include_patterns(cls, value: list[str] | None) -> list[str] | None:
+        """Validate include patterns stay inside the memory root."""
+        return None if value is None else _validate_memory_search_includes(value)
 
 
 class _MemoryEmbedderConfig(BaseModel):
@@ -24,8 +73,18 @@ class _MemoryEmbedderConfig(BaseModel):
 class _MemoryLLMConfig(BaseModel):
     """Memory LLM configuration."""
 
-    provider: str = Field(default="ollama", description="LLM provider (ollama, openai, anthropic)")
-    config: dict[str, Any] = Field(default_factory=dict, description="Provider-specific LLM config")
+    provider: str = Field(default="ollama", description="LLM provider (ollama, openai, openrouter, anthropic)")
+    config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Provider-specific LLM config; may include credentials",
+        json_schema_extra=dashboard_hint(secret=True),
+    )
+
+    @field_validator("config")
+    @classmethod
+    def _normalize_api_key(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Trim ``api_key`` like model keys so a blank one counts as unset."""
+        return normalize_api_key_setting(value, "memory.llm.config.api_key")
 
 
 class _MemoryFileConfig(BaseModel):
@@ -43,6 +102,11 @@ class _MemoryFileConfig(BaseModel):
         default=200,
         ge=1,
         description="Maximum number of lines to preload from MEMORY.md",
+    )
+    max_entrypoint_tokens: int = Field(
+        default=50000,
+        ge=1,
+        description="Maximum estimated tokens (characters / 4) of whole lines to preload from MEMORY.md",
     )
 
 
@@ -182,6 +246,10 @@ class MemoryConfig(BaseModel):
     )
     llm: _MemoryLLMConfig | None = Field(default=None, description="LLM configuration for memory")
     file: _MemoryFileConfig = Field(default_factory=_MemoryFileConfig, description="File-backed memory configuration")
+    search: MemorySearchConfig = Field(
+        default_factory=MemorySearchConfig,
+        description="Search behavior for file-backed memory",
+    )
     auto_flush: MemoryAutoFlushConfig = Field(
         default_factory=MemoryAutoFlushConfig,
         description="Background auto-flush behavior for file-backed memory",

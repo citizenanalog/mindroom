@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.sql import SQLTools
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="sql",
+    file_access=ToolFileAccess.UNCONFINED,
+    requires_primary_runtime=True,
     display_name="SQL Tools",
     description="Database query and management tools for SQL databases",
     category=ToolCategory.PRODUCTIVITY,
@@ -23,7 +26,7 @@ if TYPE_CHECKING:
         ConfigField(
             name="db_url",
             label="Db URL",
-            type="url",
+            type="password",
             required=False,
             default=None,
         ),

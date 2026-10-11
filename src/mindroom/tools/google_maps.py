@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.google.maps import GoogleMapTools
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="google_maps",
+    file_access=ToolFileAccess.NONE,
     display_name="Google Maps",
     description="Tools for interacting with Google Maps services including place search, directions, geocoding, and more",
     category=ToolCategory.DEVELOPMENT,

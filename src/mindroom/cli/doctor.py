@@ -11,16 +11,27 @@ from urllib.parse import urlparse
 
 import httpx
 import typer
-from agno.models.vertexai.claude import Claude as VertexAIClaude
-from anthropic import APIStatusError
-from google.auth.exceptions import DefaultCredentialsError, RefreshError
+from rich.markup import escape
 
 from mindroom import constants
 from mindroom.constants import RuntimePaths, env_key_for_provider, runtime_env_path
-from mindroom.embeddings import create_sentence_transformers_embedder
-from mindroom.google_adc import load_google_application_credentials
-from mindroom.matrix.health import matrix_versions_url, response_has_matrix_versions
-from mindroom.model_defaults import OLLAMA_HOST_DEFAULT
+from mindroom.credentials.sync import get_secret_from_env, sync_env_to_credentials
+from mindroom.embeddings.embedder_health import probe_embedder, semantic_embedder_configured
+from mindroom.embeddings.errors import EMBEDDER_UNREACHABLE_DETAIL
+from mindroom.embeddings.signatures import create_sentence_transformers_embedder
+from mindroom.matrix.health import (
+    MSC4186_UNSTABLE_FEATURE,
+    matrix_versions_url,
+    response_advertises_sliding_sync,
+    response_has_matrix_versions,
+)
+from mindroom.matrix.provisioning_env import (
+    local_pairing_required,
+    local_provisioning_client_credentials_from_env,
+    provisioning_url_from_env,
+    registration_token_from_env,
+)
+from mindroom.model_defaults import OLLAMA_HOST_DEFAULT, OPENROUTER_BASE_URL_DEFAULT
 from mindroom.runtime_env_policy import VERTEXAI_CLAUDE_ENV_BY_KEY
 from mindroom.startup_errors import PermanentStartupError
 
@@ -29,12 +40,15 @@ from .config import activate_cli_runtime, console, load_config_quiet
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from anthropic import APIStatusError
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError
+
     from mindroom.config.models import ModelConfig
 
 from mindroom.config.main import CONFIG_LOAD_USER_ERROR_TYPES, Config, iter_config_validation_messages
 
 
-def doctor() -> None:
+def doctor(config_path: Path | None = None, storage_path: Path | None = None) -> None:
     """Check your environment for common issues.
 
     Runs connectivity, configuration, and credential checks in a single pass
@@ -46,8 +60,20 @@ def doctor() -> None:
     failed = 0
     warnings = 0
 
-    runtime_paths = activate_cli_runtime()
+    runtime_paths = activate_cli_runtime(path=config_path, storage_path=storage_path)
     config_path = runtime_paths.config_path
+    console.print(f"[dim]Config directory: {runtime_paths.config_dir}[/dim]")
+
+    # Resolve credentials the way `mindroom run` will: seed/update env-backed
+    # services (EMBEDDER_API_KEY, provider keys, ...) into the shared store so
+    # preflight probes validate the keys the runtime will actually use.
+    # Credential-store failures must not abort the remaining diagnostics, but
+    # they are counted because the general storage check may target another path.
+    try:
+        sync_env_to_credentials(runtime_paths=runtime_paths)
+    except (OSError, ValueError) as exc:
+        console.print(f"[yellow]![/yellow] Could not sync env credentials into the store ({exc})")
+        warnings += 1
 
     # 1. Config file exists
     p, f, w = _run_doctor_step("Checking config file...", lambda: _check_config_exists(config_path))
@@ -56,7 +82,8 @@ def doctor() -> None:
     warnings += w
 
     # 2+. Config validity + provider API key validation (skip if file missing)
-    if config_path.exists():
+    config: Config | None = None
+    if config_path.is_file():
         config, p, f, w = _run_doctor_step(
             "Validating configuration...",
             lambda: _check_config_valid(runtime_paths),
@@ -82,26 +109,55 @@ def doctor() -> None:
             failed += f
             warnings += w
 
-    # 5. Matrix homeserver reachable
-    p, f, w = _run_doctor_step(
-        "Checking Matrix homeserver...",
-        lambda: _check_matrix_homeserver(runtime_paths=runtime_paths),
-    )
-    passed += p
-    failed += f
-    warnings += w
-
-    # 6. Storage directory writable
-    p, f, w = _run_doctor_step("Checking storage...", lambda: _check_storage_writable(runtime_paths))
-    passed += p
-    failed += f
-    warnings += w
+    # 5+. Matrix homeserver, hosted pairing, storage, and encryption stores
+    for message, check in (
+        ("Checking Matrix homeserver...", lambda: _check_matrix_homeserver(runtime_paths=runtime_paths, config=config)),
+        ("Checking pairing...", lambda: _check_pairing(runtime_paths)),
+        ("Checking storage...", lambda: _check_storage_writable(runtime_paths)),
+        ("Checking encryption stores...", lambda: _check_e2ee_stores(runtime_paths)),
+    ):
+        p, f, w = _run_doctor_step(message, check)
+        passed += p
+        failed += f
+        warnings += w
 
     # Summary
     console.print(f"\n{passed} passed, {failed} failed, {warnings} warning{'s' if warnings != 1 else ''}")
 
     if failed > 0:
         raise typer.Exit(1)
+
+
+def _check_e2ee_stores(runtime_paths: RuntimePaths) -> tuple[int, int, int]:
+    """Check persisted Matrix devices have their encryption stores on disk."""
+    from mindroom.matrix.client_session import olm_store_exists  # noqa: PLC0415
+    from mindroom.matrix.state import MatrixState  # noqa: PLC0415
+
+    state = MatrixState.load(runtime_paths=runtime_paths)
+    accounts_with_devices = [
+        (key, account) for key, account in state.accounts.items() if account.device_id and account.domain
+    ]
+    if not accounts_with_devices:
+        console.print("[green]✓[/green] Encryption stores: no persisted Matrix devices yet")
+        return 1, 0, 0
+
+    missing = [
+        (key, account)
+        for key, account in accounts_with_devices
+        if not olm_store_exists(f"@{account.username}:{account.domain}", account.device_id or "", runtime_paths)
+    ]
+    if not missing:
+        count = len(accounts_with_devices)
+        console.print(f"[green]✓[/green] Encryption stores: {count} device store{'s' if count != 1 else ''} present")
+        return 1, 0, 0
+
+    for key, account in missing:
+        console.print(
+            f"[yellow]⚠[/yellow] Encryption store missing for {key} "
+            f"(@{account.username}:{account.domain}, device {account.device_id}); "
+            "MindRoom will log in as a fresh device on next start and old encrypted messages stay unreadable",
+        )
+    return 0, 0, len(missing)
 
 
 def _run_doctor_step[T](message: str, check: Callable[[], T]) -> T:
@@ -112,9 +168,12 @@ def _run_doctor_step[T](message: str, check: Callable[[], T]) -> T:
 
 def _check_config_exists(config_path: Path) -> tuple[int, int, int]:
     """Check config file exists. Returns (passed, failed, warnings)."""
-    if config_path.exists():
+    if config_path.is_file():
         console.print(f"[green]✓[/green] Config file: {config_path}")
         return 1, 0, 0
+    if config_path.exists():
+        console.print(f"[red]✗[/red] Config path is not a file: {config_path}")
+        return 0, 1, 0
     console.print(f"[red]✗[/red] Config file not found: {config_path}")
     return 0, 1, 0
 
@@ -145,16 +204,34 @@ _PROVIDER_VALIDATE_URLS: dict[str, str] = {
     "anthropic": "https://api.anthropic.com/v1/models",
     "openai": "https://api.openai.com/v1/models",
     "google": "https://generativelanguage.googleapis.com/v1beta/models",
-    "openrouter": "https://openrouter.ai/api/v1/models",
+    "openrouter": f"{OPENROUTER_BASE_URL_DEFAULT}/models",
     "deepseek": "https://api.deepseek.com/v1/models",
     "cerebras": "https://api.cerebras.ai/v1/models",
     "groq": "https://api.groq.com/openai/v1/models",
+    # No "zai" entry: Z.ai's paas/v4 OpenAPI spec exposes no GET /models
+    # listing endpoint, so a URL probe would misreport valid keys as broken.
 }
 
 
-def _get_custom_base_url(config: Config, provider: str) -> str | None:
+def _models_using_shared_key(config: Config, env_key: str, runtime_paths: RuntimePaths) -> list[ModelConfig] | None:
+    """Return the models the runtime sends the shared ``env_key`` to, or None when the credential store is unreadable."""
+    # model_loading pulls in the Agno runtime, which doctor only needs once a provider is checked.
+    from mindroom.providers.model_loading import model_uses_own_credential  # noqa: PLC0415
+
+    try:
+        return [
+            model
+            for name, model in config.models.items()
+            if env_key_for_provider(model.provider) == env_key
+            and not model_uses_own_credential(name, model, runtime_paths)
+        ]
+    except (OSError, ValueError):
+        return None
+
+
+def _get_custom_base_url(models: list[ModelConfig], provider: str) -> str | None:
     """Get custom base_url for a provider from model extra_kwargs, if any."""
-    for model in config.models.values():
+    for model in models:
         if model.provider == provider and model.extra_kwargs:
             base_url = model.extra_kwargs.get("base_url")
             if base_url:
@@ -206,6 +283,7 @@ def _with_local_network_hint(detail: str, base_url: str | None) -> str:
         "connection refused",
         "name or service not known",
         "nodename nor servname provided",
+        EMBEDDER_UNREACHABLE_DETAIL,
     )
     if not any(signal in lowered for signal in route_signals):
         return detail
@@ -214,48 +292,6 @@ def _with_local_network_hint(detail: str, base_url: str | None) -> str:
         f"{detail}; local host '{host}' may be unreachable from this Python runtime"
         " (try a reachable LAN IP instead of .local)"
     )
-
-
-def _validate_openai_embeddings_endpoint(
-    api_key: str,
-    base_url: str,
-    model: str,
-) -> tuple[bool | None, str]:
-    """Validate a custom OpenAI-compatible embeddings endpoint with a tiny request."""
-    url = f"{base_url.rstrip('/')}/embeddings"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    payload = {"model": model, "input": "mindroom doctor embedder check"}
-
-    try:
-        resp = httpx.post(url, headers=headers, json=payload, timeout=10)
-    except httpx.HTTPError as exc:
-        return None, str(exc)
-
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code}"
-
-    error_detail: str | None = None
-    try:
-        body = resp.json()
-    except ValueError:
-        error_detail = "invalid JSON response"
-    else:
-        data = body.get("data") if isinstance(body, dict) else None
-        if not isinstance(data, list) or not data:
-            error_detail = "missing embeddings data"
-        else:
-            first_item = data[0]
-            if not isinstance(first_item, dict):
-                error_detail = "invalid embeddings payload"
-            else:
-                embedding = first_item.get("embedding")
-                if not isinstance(embedding, list) or not embedding:
-                    error_detail = "empty embedding vector"
-
-    if error_detail is not None:
-        return False, error_detail
-
-    return True, ""
 
 
 def _validate_provider_key(
@@ -299,13 +335,38 @@ def _classify_vertexai_claude_error(
     | httpx.HTTPError,
 ) -> tuple[bool | None, str]:
     """Classify one Vertex AI Claude validation failure for doctor output."""
+    from anthropic import APIStatusError  # noqa: PLC0415
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError  # noqa: PLC0415
+
     if isinstance(exc, APIStatusError):
-        return False, f"HTTP {exc.status_code}"
+        return False, _vertexai_claude_api_error_detail(exc)
     if isinstance(exc, DefaultCredentialsError):
         return None, str(exc)
     if isinstance(exc, RefreshError):
         return False, str(exc)
     return None, str(exc)
+
+
+def _vertexai_claude_api_error_detail(exc: APIStatusError) -> str:
+    """Turn a Vertex Claude API error into an actionable doctor message.
+
+    Model availability on Vertex is per project and region: a project can have
+    the Vertex AI API enabled yet still 404 on a Claude model when Anthropic
+    models are not enabled in its Model Garden or when the model id form is
+    wrong for Vertex (current-generation ids are bare, e.g. the anthropic
+    default; older ones are dated snapshots with an @ separator).
+    """
+    if exc.status_code == httpx.codes.NOT_FOUND:
+        return (
+            "HTTP 404: model not available in this project/region — verify the Vertex model id form "
+            "(bare current-generation id or dated @ snapshot) and that Anthropic models are enabled "
+            f"in the project's Model Garden ({exc.message})"
+        )
+    if exc.status_code == httpx.codes.FORBIDDEN:
+        if "SERVICE_DISABLED" in exc.message:
+            return "HTTP 403: the Vertex AI API (aiplatform.googleapis.com) is not enabled in this project"
+        return "HTTP 403: permission denied — check the credentials' IAM access to Vertex AI in this project"
+    return f"HTTP {exc.status_code}"
 
 
 def _validate_vertexai_claude_connection(
@@ -316,7 +377,7 @@ def _validate_vertexai_claude_connection(
     extra_kwargs = dict(model_config.extra_kwargs or {})
     project_env = VERTEXAI_CLAUDE_ENV_BY_KEY["project_id"]
     region_env = VERTEXAI_CLAUDE_ENV_BY_KEY["region"]
-    project_id = extra_kwargs.get("project_id") or runtime_paths.env_value(project_env)
+    project_id = extra_kwargs.get("project_id") or get_secret_from_env(project_env, runtime_paths=runtime_paths)
     region = extra_kwargs.get("region") or runtime_paths.env_value(region_env)
     missing = []
     if not project_id:
@@ -329,6 +390,8 @@ def _validate_vertexai_claude_connection(
     client_params = dict(extra_kwargs.get("client_params") or {})
     google_application_credentials = runtime_env_path(runtime_paths, "GOOGLE_APPLICATION_CREDENTIALS")
     if "credentials" not in client_params and google_application_credentials is not None:
+        from mindroom.providers.google_adc import load_google_application_credentials  # noqa: PLC0415
+
         try:
             client_params["credentials"] = load_google_application_credentials(str(google_application_credentials))
         except PermanentStartupError as exc:
@@ -339,6 +402,10 @@ def _validate_vertexai_claude_connection(
     extra_kwargs.setdefault("project_id", project_id)
     extra_kwargs.setdefault("region", region)
     extra_kwargs.setdefault("timeout", 10)
+
+    from agno.models.vertexai.claude import Claude as VertexAIClaude  # noqa: PLC0415
+    from anthropic import APIStatusError  # noqa: PLC0415
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError  # noqa: PLC0415
 
     try:
         model = VertexAIClaude(id=model_config.id, **extra_kwargs)
@@ -469,12 +536,17 @@ def _check_single_provider(
         return 0, 0, 0
     validated_keys.add(env_key)
 
-    api_key = runtime_paths.env_value(env_key)
+    # Models with their own credential never read the shared key. When the credential store is
+    # unreadable that is unknown, so the key counts as needed and only the default endpoint is probed.
+    shared_key_models = _models_using_shared_key(config, env_key, runtime_paths)
+    api_key = get_secret_from_env(env_key, runtime_paths=runtime_paths)
     if not api_key:
-        console.print(f"[yellow]![/yellow] {provider}: {env_key} not set")
-        return 0, 0, 1
+        needs_shared_key = shared_key_models is None or bool(shared_key_models)
+        if needs_shared_key:
+            console.print(f"[yellow]![/yellow] {provider}: {env_key} not set")
+        return 0, 0, int(needs_shared_key)
 
-    base_url = _get_custom_base_url(config, provider)
+    base_url = _get_custom_base_url(shared_key_models or [], provider)
     valid, detail = _validate_provider_key(provider, api_key, base_url)
     return _print_validation(
         valid,
@@ -490,7 +562,7 @@ def _check_memory_config(config: Config, runtime_paths: RuntimePaths) -> tuple[i
     backends = (
         {config.memory.backend}
         if not config.agents
-        else {config.get_agent_memory_backend(agent_name) for agent_name in config.agents}
+        else {config.resolve_entity(agent_name).memory_backend for agent_name in config.agents}
     )
     if "mem0" not in backends:
         if backends == {"none"}:
@@ -500,6 +572,11 @@ def _check_memory_config(config: Config, runtime_paths: RuntimePaths) -> tuple[i
         else:
             labels = "/".join("disabled" if backend == "none" else backend for backend in sorted(backends))
             console.print(f"[green]✓[/green] Memory backend: mixed (per-agent {labels})")
+        # Semantic knowledge bases and file-backend semantic memory search
+        # need the shared embedder even without mem0.
+        if semantic_embedder_configured(config):
+            p, f, w = _check_memory_embedder(config, runtime_paths=runtime_paths)
+            return 1 + p, f, w
         return 1, 0, 0
 
     if len(backends) > 1:
@@ -530,13 +607,9 @@ def _check_memory_llm(config: Config, runtime_paths: RuntimePaths) -> tuple[int,
         return 0, 0, 1
 
     llm_provider = config.memory.llm.provider
-    llm_host = (
-        config.memory.llm.config.get("host")
-        or config.memory.llm.config.get("openai_base_url")
-        or config.memory.llm.config.get("base_url")
-    )
+    llm_base_url = config.memory.llm.config.get("openai_base_url") or config.memory.llm.config.get("base_url")
     if llm_provider == "ollama":
-        host = llm_host or _get_ollama_host(config, runtime_paths=runtime_paths)
+        host = config.memory.llm.config.get("host") or llm_base_url or _get_ollama_host(config, runtime_paths)
         valid, detail = _http_check(f"{host.rstrip('/')}/api/tags")
         return _print_validation(
             valid,
@@ -548,14 +621,17 @@ def _check_memory_llm(config: Config, runtime_paths: RuntimePaths) -> tuple[int,
 
     llm_model = config.memory.llm.config.get("model", "default")
     env_key = env_key_for_provider(llm_provider)
-    api_key = runtime_paths.env_value(env_key) if env_key else None
+    # Mem0 uses an explicit memory.llm.config.api_key instead of the shared key.
+    api_key = config.memory.llm.config.get("api_key") or (
+        get_secret_from_env(env_key, runtime_paths=runtime_paths) if env_key else None
+    )
     if env_key and not api_key:
         console.print(
             f"[yellow]![/yellow] Memory LLM ({llm_provider}): {env_key} not set",
         )
         return 0, 0, 1
-    base_url = llm_host
-    valid, detail = _validate_provider_key(llm_provider, api_key or "", base_url)
+    # The runtime drops host for memory LLMs other than Ollama.
+    valid, detail = _validate_provider_key(llm_provider, api_key or "", llm_base_url)
     return _print_validation(
         valid,
         detail,
@@ -589,23 +665,31 @@ def _check_memory_embedder(config: Config, runtime_paths: RuntimePaths) -> tuple
             f"Memory embedder: sentence_transformers/{emb.config.model} could not validate",
         )
 
+    if emb.provider == "openai":
+        # One real embedding round-trip through the shared probe, which builds
+        # the configured embedder and resolves the key via get_embedder_api_key
+        # (explicit config key > 'embedder' credential > openai fallback).
+        error = probe_embedder(config, runtime_paths)
+        host_suffix = f" ({emb.config.host})" if emb.config.host else ""
+        valid: bool | None = True if error is None else None if error == EMBEDDER_UNREACHABLE_DETAIL else False
+        detail = error or ""
+        if error is not None and emb.config.host:
+            detail = _with_local_network_hint(detail, emb.config.host)
+        return _print_validation(
+            valid,
+            detail,
+            f"Memory embedder: openai/{emb.config.model} embedding round-trip succeeded{host_suffix}",
+            f"Memory embedder: openai/{emb.config.model} embedding request failed{host_suffix}",
+            f"Memory embedder: openai/{emb.config.model} could not reach embeddings endpoint{host_suffix}",
+        )
+
     env_key = env_key_for_provider(emb.provider)
-    api_key = runtime_paths.env_value(env_key) if env_key else None
+    api_key = get_secret_from_env(env_key, runtime_paths=runtime_paths) if env_key else None
     if env_key and not api_key:
         console.print(
             f"[yellow]![/yellow] Memory embedder ({emb.provider}): {env_key} not set",
         )
         return 0, 0, 1
-
-    if emb.provider == "openai" and emb.config.host:
-        valid, detail = _validate_openai_embeddings_endpoint(api_key or "", emb.config.host, emb.config.model)
-        return _print_validation(
-            valid,
-            _with_local_network_hint(detail, emb.config.host),
-            f"Memory embedder: openai/{emb.config.model} embeddings endpoint reachable ({emb.config.host})",
-            f"Memory embedder: openai/{emb.config.model} embeddings endpoint failed ({emb.config.host})",
-            f"Memory embedder: openai/{emb.config.model} could not reach embeddings endpoint ({emb.config.host})",
-        )
 
     base_url = emb.config.host
     valid, detail = _validate_provider_key(emb.provider, api_key or "", base_url)
@@ -631,7 +715,7 @@ def _validate_sentence_transformers_embedder(runtime_paths: RuntimePaths, model:
     return True, ""
 
 
-def _check_matrix_homeserver(runtime_paths: RuntimePaths) -> tuple[int, int, int]:
+def _check_matrix_homeserver(runtime_paths: RuntimePaths, config: Config | None = None) -> tuple[int, int, int]:
     """Check Matrix homeserver reachability. Returns (passed, failed, warnings)."""
     homeserver = constants.runtime_matrix_homeserver(runtime_paths=runtime_paths)
     url = matrix_versions_url(homeserver)
@@ -641,11 +725,46 @@ def _check_matrix_homeserver(runtime_paths: RuntimePaths) -> tuple[int, int, int
         console.print(f"[red]✗[/red] Matrix homeserver unreachable: {homeserver} ({exc})")
         return 0, 1, 0
     if response_has_matrix_versions(response):
+        sliding_configured = config is not None and config.matrix_sync.mode == "sliding"
+        if sliding_configured and not response_advertises_sliding_sync(response):
+            console.print(
+                f"[red]✗[/red] Matrix homeserver does not advertise MSC4186 Simplified Sliding Sync"
+                f" ({MSC4186_UNSTABLE_FEATURE}): {homeserver}."
+                " Set matrix_sync.mode: classic or upgrade the homeserver.",
+            )
+            return 0, 1, 0
         console.print(f"[green]✓[/green] Matrix homeserver: {homeserver}")
         return 1, 0, 0
     detail = f"HTTP {response.status_code}" if not response.is_success else "returned invalid /versions payload"
     console.print(f"[red]✗[/red] Matrix homeserver {detail}: {homeserver}")
     return 0, 1, 0
+
+
+def _check_pairing(runtime_paths: RuntimePaths) -> tuple[int, int, int]:
+    """Check hosted pairing state. Returns (passed, failed, warnings).
+
+    An unpaired hosted install before its first run is normal because `mindroom run` pairs it, so it counts as passed.
+    A warning would keep the macOS app's Check step at "Needs attention" on every first run.
+    """
+    if provisioning_url_from_env(runtime_paths) is None or registration_token_from_env(runtime_paths) is not None:
+        # Without hosted provisioning, or with a registration token, agents register without pairing.
+        return 0, 0, 0
+    try:
+        required = local_pairing_required(runtime_paths)
+        paired = local_provisioning_client_credentials_from_env(runtime_paths) is not None
+    except ValueError as exc:
+        console.print(f"[red]✗[/red] Pairing: {escape(str(exc))}")
+        return 0, 1, 0
+    if required:
+        console.print(
+            "[green]✓[/green] Not paired yet: `mindroom run` will print a link to approve "
+            "with your MindRoom Chat account",
+        )
+        return 1, 0, 0
+    if paired:
+        console.print("[green]✓[/green] Paired with MindRoom Chat")
+        return 1, 0, 0
+    return 0, 0, 0
 
 
 def _check_storage_writable(runtime_paths: RuntimePaths) -> tuple[int, int, int]:

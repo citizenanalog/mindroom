@@ -8,25 +8,31 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import (
+from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
-    register_tool_with_metadata,
 )
+from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tools import (
     compact_context,  # noqa: F401
     delegate,  # noqa: F401
     dynamic_tools,  # noqa: F401
+    dynamic_workflow,  # noqa: F401
     memory,  # noqa: F401
+    report_publishing,  # noqa: F401
     self_config,  # noqa: F401
+    skill_manage,  # noqa: F401
 )
 from mindroom.tools.agentql import agentql_tools
 from mindroom.tools.airflow import airflow_tools
 from mindroom.tools.apify import apify_tools
+from mindroom.tools.approved_egress import approved_egress_tools
 from mindroom.tools.arxiv import arxiv_tools
+from mindroom.tools.atlassian import atlassian_tools
 from mindroom.tools.attachments import attachments_tools
 from mindroom.tools.aws_lambda import aws_lambda_tools
 from mindroom.tools.aws_ses import aws_ses_tools
@@ -35,10 +41,13 @@ from mindroom.tools.bitbucket import bitbucket_tools
 from mindroom.tools.brandfetch import brandfetch_tools
 from mindroom.tools.brightdata import brightdata_tools
 from mindroom.tools.browser import browser_tools
+from mindroom.tools.browser_mcp import browser_mcp_tools
 from mindroom.tools.browserbase import browserbase_tools
 from mindroom.tools.cal_com import cal_com_tools
 from mindroom.tools.calculator import calculator_tools
+from mindroom.tools.callback_manager import callback_manager_tools
 from mindroom.tools.cartesia import cartesia_tools
+from mindroom.tools.chat_ui import chat_ui_tools
 from mindroom.tools.claude_agent import claude_agent_tools
 from mindroom.tools.clickup import clickup_tools
 from mindroom.tools.coding import coding_tools
@@ -48,9 +57,8 @@ from mindroom.tools.confluence import confluence_tools
 from mindroom.tools.crawl4ai import crawl4ai_tools
 from mindroom.tools.csv import csv_tools
 from mindroom.tools.custom_api import custom_api_tools
-from mindroom.tools.dalle import dalle_tools
 from mindroom.tools.daytona import daytona_tools
-from mindroom.tools.desi_vocal import desi_vocal_tools
+from mindroom.tools.desktop import desktop_tools
 from mindroom.tools.discord import discord_tools
 from mindroom.tools.docker import docker_tools
 from mindroom.tools.duckdb import duckdb_tools
@@ -59,6 +67,7 @@ from mindroom.tools.e2b import e2b_tools
 from mindroom.tools.eleven_labs import eleven_labs_tools
 from mindroom.tools.email import email_tools
 from mindroom.tools.exa import exa_tools
+from mindroom.tools.external_trigger_manager import external_trigger_manager_tools
 from mindroom.tools.fal import fal_tools
 from mindroom.tools.file import file_tools
 from mindroom.tools.file_generation import file_generation_tools
@@ -70,12 +79,16 @@ from mindroom.tools.github import github_tools
 from mindroom.tools.gmail import gmail_tools
 from mindroom.tools.google_bigquery import google_bigquery_tools
 from mindroom.tools.google_calendar import google_calendar_tools
+from mindroom.tools.google_docs import google_docs_tools
 from mindroom.tools.google_drive import google_drive_tools
 from mindroom.tools.google_maps import google_maps_tools
+from mindroom.tools.google_scholar import google_scholar_tools
 from mindroom.tools.google_sheets import google_sheets_tools
+from mindroom.tools.google_tasks import google_tasks_tools
 from mindroom.tools.googlesearch import googlesearch_tools
 from mindroom.tools.groq import groq_tools
 from mindroom.tools.hackernews import hackernews_tools
+from mindroom.tools.invite_router import invite_router_tools
 from mindroom.tools.jina import jina_tools
 from mindroom.tools.jira import jira_tools
 from mindroom.tools.linear import linear_tools
@@ -84,12 +97,14 @@ from mindroom.tools.lumalabs import lumalabs_tools
 from mindroom.tools.matrix_api import matrix_api_tools
 from mindroom.tools.matrix_message import matrix_message_tools
 from mindroom.tools.matrix_room import matrix_room_tools
+from mindroom.tools.matrix_voice_message import matrix_voice_message_tools
 from mindroom.tools.mem0 import mem0_tools
 from mindroom.tools.modelslabs import modelslabs_tools
 from mindroom.tools.moviepy_video_tools import moviepy_video_tools
 from mindroom.tools.neo4j import neo4j_tools
 from mindroom.tools.newspaper4k import newspaper4k_tools
 from mindroom.tools.notion import notion_tools
+from mindroom.tools.oauth_connections import oauth_connections_tools
 from mindroom.tools.openai import openai_tools
 from mindroom.tools.openbb import openbb_tools
 from mindroom.tools.openweather import openweather_tools
@@ -105,6 +120,7 @@ from mindroom.tools.replicate import replicate_tools
 from mindroom.tools.resend import resend_tools
 from mindroom.tools.scheduler import scheduler_tools
 from mindroom.tools.scrapegraph import scrapegraph_tools
+from mindroom.tools.script import script_tools
 from mindroom.tools.searxng import searxng_tools
 from mindroom.tools.serpapi import serpapi_tools
 from mindroom.tools.serper import serper_tools
@@ -115,16 +131,21 @@ from mindroom.tools.sleep import sleep_tools
 from mindroom.tools.spider import spider_tools
 from mindroom.tools.spotify import spotify_tools
 from mindroom.tools.sql import sql_tools
-from mindroom.tools.subagents import subagents_tools
 from mindroom.tools.tavily import tavily_tools
 from mindroom.tools.telegram import telegram_tools
+from mindroom.tools.thread_model import thread_model_tools
+from mindroom.tools.thread_move import thread_move_tools
+from mindroom.tools.thread_resolution import thread_resolution_tools
 from mindroom.tools.thread_summary import register_thread_summary_tools
 from mindroom.tools.thread_tags import thread_tags_tools
+from mindroom.tools.todo import todo_tools
 from mindroom.tools.todoist import todoist_tools
 from mindroom.tools.trafilatura import trafilatura_tools
 from mindroom.tools.trello import trello_tools
 from mindroom.tools.twilio import twilio_tools
 from mindroom.tools.unsplash import unsplash_tools
+from mindroom.tools.update_awareness import update_awareness_tools
+from mindroom.tools.usage_stats import usage_stats_tools
 from mindroom.tools.visualization import visualization_tools
 from mindroom.tools.web_browser_tools import web_browser_tools
 from mindroom.tools.webex import webex_tools
@@ -146,7 +167,9 @@ __all__ = [
     "agentql_tools",
     "airflow_tools",
     "apify_tools",
+    "approved_egress_tools",
     "arxiv_tools",
+    "atlassian_tools",
     "attachments_tools",
     "aws_lambda_tools",
     "aws_ses_tools",
@@ -154,11 +177,14 @@ __all__ = [
     "bitbucket_tools",
     "brandfetch_tools",
     "brightdata_tools",
+    "browser_mcp_tools",
     "browser_tools",
     "browserbase_tools",
     "cal_com_tools",
     "calculator_tools",
+    "callback_manager_tools",
     "cartesia_tools",
+    "chat_ui_tools",
     "claude_agent_tools",
     "clickup_tools",
     "coding_tools",
@@ -168,9 +194,8 @@ __all__ = [
     "crawl4ai_tools",
     "csv_tools",
     "custom_api_tools",
-    "dalle_tools",
     "daytona_tools",
-    "desi_vocal_tools",
+    "desktop_tools",
     "discord_tools",
     "docker_tools",
     "duckdb_tools",
@@ -179,6 +204,7 @@ __all__ = [
     "eleven_labs_tools",
     "email_tools",
     "exa_tools",
+    "external_trigger_manager_tools",
     "fal_tools",
     "file_generation_tools",
     "file_tools",
@@ -190,12 +216,16 @@ __all__ = [
     "gmail_tools",
     "google_bigquery_tools",
     "google_calendar_tools",
+    "google_docs_tools",
     "google_drive_tools",
     "google_maps_tools",
+    "google_scholar_tools",
     "google_sheets_tools",
+    "google_tasks_tools",
     "googlesearch_tools",
     "groq_tools",
     "hackernews_tools",
+    "invite_router_tools",
     "jina_tools",
     "jira_tools",
     "linear_tools",
@@ -204,12 +234,14 @@ __all__ = [
     "matrix_api_tools",
     "matrix_message_tools",
     "matrix_room_tools",
+    "matrix_voice_message_tools",
     "mem0_tools",
     "modelslabs_tools",
     "moviepy_video_tools",
     "neo4j_tools",
     "newspaper4k_tools",
     "notion_tools",
+    "oauth_connections_tools",
     "openai_tools",
     "openbb_tools",
     "openweather_tools",
@@ -226,6 +258,7 @@ __all__ = [
     "resend_tools",
     "scheduler_tools",
     "scrapegraph_tools",
+    "script_tools",
     "searxng_tools",
     "serpapi_tools",
     "serper_tools",
@@ -236,15 +269,20 @@ __all__ = [
     "spider_tools",
     "spotify_tools",
     "sql_tools",
-    "subagents_tools",
     "tavily_tools",
     "telegram_tools",
+    "thread_model_tools",
+    "thread_move_tools",
+    "thread_resolution_tools",
     "thread_tags_tools",
+    "todo_tools",
     "todoist_tools",
     "trafilatura_tools",
     "trello_tools",
     "twilio_tools",
     "unsplash_tools",
+    "update_awareness_tools",
+    "usage_stats_tools",
     "visualization_tools",
     "web_browser_tools",
     "webex_tools",
@@ -262,12 +300,13 @@ __all__ = [
 
 @register_tool_with_metadata(
     name="openclaw_compat",
+    file_access=ToolFileAccess.NONE,
     display_name="OpenClaw Compat",
     description="Convenience bundle that implies shell, coding, browser, and other common tools",
     category=ToolCategory.DEVELOPMENT,
     icon="Workflow",
     icon_color="text-orange-500",
-    helper_text="Implies: shell, coding, duckduckgo, website, browser, scheduler, subagents, matrix_message, attachments.",
+    helper_text="Implies: shell, coding, duckduckgo, website, browser, scheduler, matrix_message, attachments, matrix_room.",
 )
 def _openclaw_compat_tools() -> type[Toolkit]:
     """Return an empty toolkit — the real tools are loaded via tool preset expansion."""
@@ -278,6 +317,7 @@ def _openclaw_compat_tools() -> type[Toolkit]:
 
 @register_tool_with_metadata(
     name="homeassistant",
+    file_access=ToolFileAccess.NONE,
     display_name="Home Assistant",
     description="Control and monitor smart home devices",
     category=ToolCategory.SMART_HOME,
@@ -286,6 +326,7 @@ def _openclaw_compat_tools() -> type[Toolkit]:
     dependencies=["httpx"],
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.SPECIAL,
+    requires_primary_runtime=True,
     managed_init_args=(
         ToolManagedInitArg.CREDENTIALS_MANAGER,
         ToolManagedInitArg.WORKER_TARGET,
@@ -336,3 +377,94 @@ def _homeassistant_tools() -> type[Toolkit]:
     from mindroom.custom_tools.homeassistant import HomeAssistantTools
 
     return HomeAssistantTools
+
+
+@register_tool_with_metadata(
+    name="agent_vault_access",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
+    display_name="Agent Vault Access",
+    description="Get a link to manage this agent's passwords and API keys in Agent Vault",
+    category=ToolCategory.INTEGRATIONS,
+    icon="Lock",
+    icon_color="text-amber-600",
+    dependencies=["httpx"],
+    status=ToolStatus.REQUIRES_CONFIG,
+    setup_type=SetupType.SPECIAL,
+    managed_init_args=(
+        ToolManagedInitArg.RUNTIME_PATHS,
+        ToolManagedInitArg.WORKER_TARGET,
+    ),
+    config_fields=[
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_API_URL",
+            label="Agent Vault API URL",
+            type="url",
+            required=True,
+            placeholder="http://agent-vault:14321",
+            description="Base URL of the Agent Vault server API.",
+        ),
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN",
+            label="Agent Vault Admin Token",
+            type="password",
+            required=False,
+            description=(
+                "Instance-owner session or agent token used to create vaults, join them as "
+                "vault-admin (the /join step is owner-only), and grant vault admin access. "
+                "Provide this or the admin token file."
+            ),
+        ),
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN_FILE",
+            label="Agent Vault Admin Token File",
+            type="text",
+            required=False,
+            placeholder="/etc/agent-vault-access/token",
+            description=(
+                "Path to a file holding the admin token, re-read on every call so an in-place "
+                "Secret rotation takes effect without a restart. Takes precedence over the inline token."
+            ),
+        ),
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_UI_BASE_URL",
+            label="Agent Vault UI Base URL",
+            type="url",
+            required=True,
+            placeholder="https://example.com/agent-vault",
+            description="Public base URL of the gated Agent Vault UI.",
+        ),
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_EMAIL_DOMAIN",
+            label="Account Email Domain",
+            type="text",
+            required=True,
+            placeholder="example.com",
+            description="Domain used to map a requester's Matrix localpart to their Agent Vault account email.",
+        ),
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_VAULT_NAME_PREFIX",
+            label="Vault Name Prefix",
+            type="text",
+            required=False,
+            default="agent-vault",
+            description="Prefix used to derive the per-worker vault name; must match workers.kubernetes.agentVault.vaultNamePrefix.",
+        ),
+        ConfigField(
+            name="MINDROOM_AGENT_VAULT_ACCESS_OWNER_EMAIL",
+            label="Agent Vault Owner Email",
+            type="text",
+            required=False,
+            description=(
+                "Agent Vault owner account used by Kubernetes worker init when minting proxy tokens. "
+                "When set, self-service grants keep this account admin on the worker vault too."
+            ),
+        ),
+    ],
+    function_names=("request_vault_access",),
+)
+def _agent_vault_access_tools() -> type[Toolkit]:
+    """Return the Agent Vault self-service access tool."""
+    from mindroom.custom_tools.agent_vault_access import AgentVaultAccessTools
+
+    return AgentVaultAccessTools

@@ -1,0 +1,898 @@
+"""Projected config snapshots for Docker-backed workers."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, cast
+
+import yaml
+
+from mindroom import yaml_io
+from mindroom.config.worker_projection import worker_config_data
+from mindroom.config.yaml_includes import load_yaml_config_source_with_digests
+from mindroom.constants import config_relative_path, resolve_config_relative_path
+from mindroom.logging_config import get_logger
+from mindroom.path_confinement import open_directory_within_root, open_regular_file_at, open_regular_file_within_root
+from mindroom.tool_system.worker_routing import (
+    normalize_worker_key_part,
+    resolved_worker_key_scope,
+    shared_storage_root,
+    worker_key_agent_name,
+    written_by_other_workers,
+)
+from mindroom.workers.backend import WorkerBackendError
+from mindroom.workers.backends._dedicated_worker_common import resolved_agent_policies_from_config_data
+from mindroom.workers.worker_retirement import open_worker_state_root
+from mindroom.workspaces import (
+    iter_local_copy_source_entries,
+    validate_local_copy_source_dir,
+    validate_local_copy_source_path,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
+    from mindroom.agent_policy import ResolvedAgentPolicy
+    from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.worker_routing import WorkerScope
+    from mindroom.workers.backends.docker_config import DockerWorkerBackendConfig
+    from mindroom.workers.backends.local import LocalWorkerStatePaths
+
+logger = get_logger(__name__)
+
+_PROJECTED_ASSETS_DIRNAME = ".mindroom-worker-assets"
+_PROJECTED_CONFIGS_DIRNAME = ".mindroom-worker-config-projections"
+PROJECTED_CONFIGS_DIRNAME = _PROJECTED_CONFIGS_DIRNAME
+_PROJECTION_READY_FILENAME = ".projection-ready"
+
+
+def _container_config_dir(config_path: str) -> str:
+    return str(PurePosixPath(config_path).parent)
+
+
+def _projected_config_value(relative_path: PurePosixPath) -> str:
+    return f"./{relative_path.as_posix()}"
+
+
+def _safe_projection_name(raw_value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_value).strip(".-")
+    return normalized or "item"
+
+
+def _projection_display_name(host_path: Path, *, fallback: str) -> str:
+    return _safe_projection_name(host_path.name or fallback)
+
+
+def _projection_hash(raw_value: str, *, length: int = 8) -> str:
+    return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()[:length]
+
+
+def _projection_path_with_suffix(relative_path: PurePosixPath, *, suffix: str) -> PurePosixPath:
+    if relative_path.suffix:
+        name = f"{relative_path.stem}-{suffix}{relative_path.suffix}"
+    else:
+        name = f"{relative_path.name}-{suffix}"
+    return relative_path.with_name(name)
+
+
+def _ordered_unique_nonempty_strings(values: Iterable[object]) -> tuple[str, ...]:
+    ordered_values: list[str] = []
+    seen_values: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip() or value in seen_values:
+            continue
+        seen_values.add(value)
+        ordered_values.append(value)
+    return tuple(ordered_values)
+
+
+def _plugin_uses_filesystem_path(plugin_path: str, *, runtime_paths: RuntimePaths) -> bool:
+    if plugin_path.startswith(("python:", "pkg:", "module:")):
+        return False
+    candidate = resolve_config_relative_path(plugin_path, runtime_paths=runtime_paths)
+    if candidate.exists():
+        return True
+    unresolved = Path(plugin_path).expanduser()
+    return unresolved.is_absolute() or plugin_path.startswith((".", "~")) or "/" in plugin_path or "\\" in plugin_path
+
+
+def _mode_bits(st_mode: int) -> int:
+    return stat.S_IMODE(st_mode)
+
+
+def _file_state_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    return f"file:{stat.st_size}:{stat.st_mtime_ns}:{_mode_bits(stat.st_mode)}"
+
+
+def _directory_state_fingerprint(path: Path) -> str:
+    root_stat = path.stat()
+    state_entries = [f"root-dir::{_mode_bits(root_stat.st_mode)}"]
+    for asset_path, relative_path in iter_local_copy_source_entries(path):
+        stat = asset_path.stat()
+        kind = "dir" if asset_path.is_dir() else "file"
+        size = 0 if asset_path.is_dir() else stat.st_size
+        state_entries.append(
+            f"{kind}:{relative_path.as_posix()}:{size}:{stat.st_mtime_ns}:{_mode_bits(stat.st_mode)}",
+        )
+    return hashlib.sha256("\0".join(state_entries).encode("utf-8")).hexdigest()
+
+
+def _validated_asset_host_path(host_path: Path) -> Path:
+    try:
+        return validate_local_copy_source_path(
+            host_path,
+            field_name="Docker worker asset",
+        )
+    except ValueError as exc:
+        raise WorkerBackendError(str(exc)) from exc
+
+
+def _path_state_fingerprint(host_path: Path) -> str:
+    resolved_host_path = _validated_asset_host_path(host_path)
+    if resolved_host_path.is_dir():
+        return f"dir:{_directory_state_fingerprint(resolved_host_path)}"
+    return _file_state_fingerprint(resolved_host_path)
+
+
+def _config_sources_state_fingerprint(source_files: frozenset[Path]) -> str | None:
+    """Stat-based cache key over the config file plus every !include file.
+
+    ``None`` when any source file is unreadable, which callers treat as a cache
+    miss so the next load re-derives the source set.
+    """
+    entries = []
+    for path in sorted(source_files):
+        try:
+            entries.append(f"{path.as_posix()}:{_file_state_fingerprint(path)}")
+        except OSError:
+            return None
+    return hashlib.sha256("\0".join(entries).encode("utf-8")).hexdigest()
+
+
+def _compute_path_contents_hash(host_path: Path) -> str:
+    resolved_host_path = _validated_asset_host_path(host_path)
+    hasher = hashlib.sha256()
+    try:
+        if resolved_host_path.is_dir():
+            root_stat = resolved_host_path.stat()
+            hasher.update(f"root-dir:{_mode_bits(root_stat.st_mode)}\0".encode())
+            for asset_path, relative_path in iter_local_copy_source_entries(resolved_host_path):
+                asset_stat = asset_path.stat()
+                if asset_path.is_dir():
+                    hasher.update(f"dir:{relative_path.as_posix()}:{_mode_bits(asset_stat.st_mode)}\0".encode())
+                    continue
+
+                hasher.update(f"file:{relative_path.as_posix()}:{_mode_bits(asset_stat.st_mode)}\0".encode())
+                with asset_path.open("rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+            return hasher.hexdigest()
+
+        file_stat = resolved_host_path.stat()
+        hasher.update(f"file:{_mode_bits(file_stat.st_mode)}\0".encode())
+        with resolved_host_path.open("rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except OSError as exc:
+        msg = f"Failed to read Docker worker asset '{resolved_host_path}': {exc}"
+        raise WorkerBackendError(msg) from exc
+
+
+def _remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
+def _copy_file_from(source_fd: int, destination: Path) -> None:
+    status = os.fstat(source_fd)
+    with os.fdopen(os.dup(source_fd), "rb") as source, destination.open("wb") as output:
+        shutil.copyfileobj(source, output)
+        os.fchmod(output.fileno(), _mode_bits(status.st_mode))
+        os.utime(output.fileno(), ns=(status.st_atime_ns, status.st_mtime_ns))
+
+
+def _copy_directory_tree(source_dir: Path, destination_dir: Path) -> None:
+    """Copy a validated tree through no-follow descriptors, so an entry swapped for a link is refused."""
+    directory_modes: list[tuple[Path, int]] = []
+    with open_directory_within_root(Path(source_dir.anchor), source_dir.relative_to(source_dir.anchor)) as root_fd:
+        for dirpath, _dirnames, filenames, dir_fd in os.fwalk(".", dir_fd=root_fd):
+            target = destination_dir / dirpath
+            target.mkdir(parents=True, exist_ok=True)
+            directory_modes.append((target, _mode_bits(os.fstat(dir_fd).st_mode)))
+            for name in sorted(filenames):
+                source_fd = open_regular_file_at(dir_fd, name)
+                try:
+                    _copy_file_from(source_fd, target / name)
+                finally:
+                    os.close(source_fd)
+    for target, mode in reversed(directory_modes):
+        target.chmod(mode)
+
+
+@dataclass(frozen=True, slots=True)
+class _DockerProjectedConfigAsset:
+    host_path: Path
+    relative_path: PurePosixPath
+
+    @property
+    def is_directory(self) -> bool:
+        return self.host_path.is_dir()
+
+
+@dataclass(frozen=True, slots=True)
+class _DockerProjectedConfig:
+    root: Path
+    projected_yaml: str
+    assets: tuple[_DockerProjectedConfigAsset, ...]
+    ready: bool
+
+
+class DockerProjectionManager:
+    """Build projected config snapshots for dedicated Docker workers."""
+
+    def __init__(
+        self,
+        *,
+        config: DockerWorkerBackendConfig,
+        projected_configs_root: Path,
+        runtime_paths: RuntimePaths,
+    ) -> None:
+        self.config = config
+        self._projected_configs_root = projected_configs_root
+        self._runtime_paths = runtime_paths
+        self._asset_hash_cache: dict[Path, tuple[str, str]] = {}
+        self._config_data_cache: tuple[Path, str | None, dict[str, object], frozenset[Path]] | None = None
+
+    def config_mount_specs(
+        self,
+        paths: LocalWorkerStatePaths,
+        *,
+        worker_key: str | None = None,
+        materialize_projection: bool = True,
+        storage_mounts: Sequence[tuple[Path, str, bool]] = (),
+    ) -> tuple[list[tuple[Path, str, bool]], _DockerProjectedConfig | None]:
+        """Return projected config mount specs plus the selected projection, if any."""
+        if self.config.host_config_path is None:
+            return [], None
+
+        projection = self._projected_config(
+            paths,
+            worker_key=worker_key,
+            materialize=materialize_projection,
+            storage_mounts=storage_mounts,
+        )
+        config_dir = PurePosixPath(_container_config_dir(self.config.config_path))
+        return [(projection.root, str(config_dir), True)], projection
+
+    def _projected_config(
+        self,
+        paths: LocalWorkerStatePaths,
+        *,
+        worker_key: str | None = None,
+        materialize: bool = True,
+        storage_mounts: Sequence[tuple[Path, str, bool]] = (),
+    ) -> _DockerProjectedConfig:
+        """Return the projected config snapshot for one worker root."""
+        host_config_path = self.config.host_config_path
+        if host_config_path is None:
+            msg = "Projected Docker worker config requires a host config path."
+            raise WorkerBackendError(msg)
+
+        config_data = worker_config_data(self._load_host_config_data(host_config_path))
+        resolved_agent_policies = resolved_agent_policies_from_config_data(config_data)
+        asset_paths_by_host: dict[Path, PurePosixPath] = {}
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path] = {}
+        assets: list[_DockerProjectedConfigAsset] = []
+        projected_agent_names = self._projected_agent_names(
+            worker_key=worker_key,
+            resolved_agent_policies=resolved_agent_policies,
+        )
+        projected_knowledge_base_ids = self._projected_knowledge_base_ids(
+            config_data,
+            agent_names=projected_agent_names,
+            resolved_agent_policies=resolved_agent_policies,
+        )
+        self._rewrite_projected_config_paths(
+            config_data,
+            worker_key,
+            projected_agent_names=projected_agent_names,
+            projected_knowledge_base_ids=projected_knowledge_base_ids,
+            asset_paths_by_host=asset_paths_by_host,
+            host_paths_by_relative_asset_path=host_paths_by_relative_asset_path,
+            assets=assets,
+            storage_mounts=storage_mounts,
+        )
+        self._filter_projected_config_data(
+            config_data,
+            projected_agent_names=projected_agent_names,
+            projected_knowledge_base_ids=projected_knowledge_base_ids,
+        )
+
+        projected_yaml = yaml_io.safe_dump(config_data, sort_keys=False, allow_unicode=True)
+        projection_manifest = {
+            "config_yaml": projected_yaml,
+            "config_filename": PurePosixPath(self.config.config_path).name,
+            "assets": [
+                {
+                    "host_path": str(asset.host_path),
+                    "relative_path": asset.relative_path.as_posix(),
+                    "kind": "dir" if asset.is_directory else "file",
+                    "content_hash": self._asset_contents_hash(asset.host_path),
+                }
+                for asset in assets
+            ],
+        }
+        projection_hash = hashlib.sha256(
+            json.dumps(projection_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()[:12]
+        projection_dir = self._worker_projected_configs_root(paths) / f"config-projection-{projection_hash}"
+        projection = _DockerProjectedConfig(
+            root=projection_dir,
+            projected_yaml=projected_yaml,
+            assets=tuple(assets),
+            ready=False,
+        )
+        projection = replace(projection, ready=self._projection_ready(projection))
+        if materialize:
+            self._write_projected_config(projection)
+            self._prune_projected_configs(paths, keep=projection.root)
+            return replace(projection, ready=True)
+        return projection
+
+    def _worker_projected_configs_root(self, paths: LocalWorkerStatePaths) -> Path:
+        """Return the directory containing one worker root's projected config snapshots."""
+        return self._projected_configs_root / paths.root.name
+
+    def current_resolved_agent_policies(self) -> dict[str, ResolvedAgentPolicy]:
+        """Return the current agent-policy view derived from the host config."""
+        host_config_path = self.config.host_config_path
+        if host_config_path is None:
+            return {}
+        return resolved_agent_policies_from_config_data(self._load_host_config_data(host_config_path))
+
+    def retire_worker_projection(self, worker_name: str) -> None:
+        """Remove every projected config snapshot owned by one exact worker root."""
+        with open_worker_state_root(
+            self._projected_configs_root.parent,
+            workers_subpath=(self._projected_configs_root.name,),
+            worker_name=worker_name,
+        ) as projection:
+            projection.remove()
+
+    def _prune_projected_configs(self, paths: LocalWorkerStatePaths, *, keep: Path) -> None:
+        """Remove stale projected config snapshots for one worker root."""
+        projection_root = self._worker_projected_configs_root(paths)
+        projection_root.mkdir(parents=True, exist_ok=True)
+        for sibling in projection_root.iterdir():
+            if sibling == keep:
+                continue
+            _remove_path(sibling)
+
+    def _projection_ready(self, projection: _DockerProjectedConfig) -> bool:
+        projection_root = projection.root
+        required_paths: list[tuple[Path, bool]] = [
+            (projection_root / PurePosixPath(self.config.config_path).name, False),
+            (projection_root / ".env", False),
+            (projection_root / _PROJECTION_READY_FILENAME, False),
+        ]
+        required_paths.extend(
+            (projection_root.joinpath(*asset.relative_path.parts), asset.is_directory) for asset in projection.assets
+        )
+        return all(path.is_dir() if require_directory else path.is_file() for path, require_directory in required_paths)
+
+    def _write_projected_config(self, projection: _DockerProjectedConfig) -> None:
+        if self._projection_ready(projection):
+            return
+
+        if projection.root.exists():
+            _remove_path(projection.root)
+
+        temp_root = projection.root.with_name(
+            f"{projection.root.name}.tmp-{os.getpid()}-{time.time_ns()}",
+        )
+        if temp_root.exists():
+            _remove_path(temp_root)
+
+        try:
+            temp_root.mkdir(parents=True, exist_ok=True)
+            (temp_root / PurePosixPath(self.config.config_path).name).write_text(
+                projection.projected_yaml,
+                encoding="utf-8",
+            )
+            (temp_root / ".env").write_text("", encoding="utf-8")
+            for asset in projection.assets:
+                placeholder_path = temp_root.joinpath(*asset.relative_path.parts)
+                if asset.is_directory:
+                    placeholder_path.mkdir(parents=True, exist_ok=True)
+                    validate_local_copy_source_dir(asset.host_path, field_name="Docker worker asset")
+                    _copy_directory_tree(asset.host_path, placeholder_path)
+                    continue
+                placeholder_path.parent.mkdir(parents=True, exist_ok=True)
+                validate_local_copy_source_path(asset.host_path, field_name="Docker worker asset")
+                with open_regular_file_within_root(
+                    Path(asset.host_path.anchor),
+                    asset.host_path.relative_to(asset.host_path.anchor),
+                ) as source_fd:
+                    _copy_file_from(source_fd, placeholder_path)
+            (temp_root / _PROJECTION_READY_FILENAME).write_text("ready\n", encoding="utf-8")
+            temp_root.replace(projection.root)
+        except Exception:
+            _remove_path(temp_root)
+            raise
+
+    def _load_host_config_data(self, host_config_path: Path) -> dict[str, object]:
+        resolved_host_config_path = host_config_path.expanduser().resolve()
+        cached = self._config_data_cache
+        if (
+            cached is not None
+            and cached[0] == resolved_host_config_path
+            and cached[1] is not None
+            and cached[1] == _config_sources_state_fingerprint(cached[3])
+        ):
+            return copy.deepcopy(cached[2])
+
+        try:
+            data, source_digests, _uses_includes = load_yaml_config_source_with_digests(resolved_host_config_path)
+        except (OSError, yaml.YAMLError, UnicodeError) as exc:
+            msg = f"Failed to read Docker worker config file '{resolved_host_config_path}': {exc}"
+            raise WorkerBackendError(msg) from exc
+        if not isinstance(data, dict):
+            msg = f"Docker worker config file '{resolved_host_config_path}' must contain a YAML object."
+            raise WorkerBackendError(msg)
+        normalized_data = cast("dict[str, object]", data)
+        source_files = frozenset(source_digests)
+        self._config_data_cache = (
+            resolved_host_config_path,
+            _config_sources_state_fingerprint(source_files),
+            copy.deepcopy(normalized_data),
+            source_files,
+        )
+        return copy.deepcopy(normalized_data)
+
+    def _asset_contents_hash(self, host_path: Path) -> str:
+        resolved_host_path = host_path.expanduser().resolve()
+        state_fingerprint = _path_state_fingerprint(resolved_host_path)
+        cached = self._asset_hash_cache.get(resolved_host_path)
+        if cached is not None and cached[0] == state_fingerprint:
+            return cached[1]
+
+        content_hash = _compute_path_contents_hash(resolved_host_path)
+        self._asset_hash_cache[resolved_host_path] = (state_fingerprint, content_hash)
+        return content_hash
+
+    def _rewrite_projected_config_paths(
+        self,
+        config_data: dict[str, object],
+        worker_key: str | None,
+        *,
+        projected_agent_names: tuple[str, ...] | None,
+        projected_knowledge_base_ids: tuple[str, ...] | None,
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+        storage_mounts: Sequence[tuple[Path, str, bool]] = (),
+    ) -> None:
+        self._rewrite_projected_plugin_paths(
+            config_data,
+            asset_paths_by_host,
+            host_paths_by_relative_asset_path,
+            assets,
+        )
+        self._rewrite_projected_knowledge_paths(
+            config_data,
+            projected_knowledge_base_ids,
+            asset_paths_by_host,
+            host_paths_by_relative_asset_path,
+            assets,
+            storage_mounts=storage_mounts,
+        )
+        self._rewrite_projected_agent_paths(
+            config_data,
+            projected_agent_names,
+            asset_paths_by_host,
+            host_paths_by_relative_asset_path,
+            assets,
+        )
+        if worker_key is not None:
+            self._rewrite_unscoped_default_worker_scope(config_data, worker_key)
+
+    def _filter_projected_config_data(
+        self,
+        config_data: dict[str, object],
+        *,
+        projected_agent_names: tuple[str, ...] | None,
+        projected_knowledge_base_ids: tuple[str, ...] | None,
+    ) -> None:
+        raw_agents = config_data.get("agents")
+        if isinstance(raw_agents, dict) and projected_agent_names is not None:
+            agents = cast("dict[str, object]", raw_agents)
+            filtered_agents: dict[str, dict[str, object]] = {}
+            for name in projected_agent_names:
+                agent_data = agents.get(name)
+                if isinstance(agent_data, dict):
+                    filtered_agents[name] = cast("dict[str, object]", agent_data)
+            for agent_data in filtered_agents.values():
+                raw_delegate_to = agent_data.get("delegate_to")
+                if isinstance(raw_delegate_to, list):
+                    agent_data["delegate_to"] = [
+                        target for target in raw_delegate_to if isinstance(target, str) and target in filtered_agents
+                    ]
+            config_data["agents"] = filtered_agents
+
+        raw_knowledge_bases = config_data.get("knowledge_bases")
+        if isinstance(raw_knowledge_bases, dict) and projected_knowledge_base_ids is not None:
+            knowledge_bases = cast("dict[str, object]", raw_knowledge_bases)
+            config_data["knowledge_bases"] = {
+                base_id: knowledge_bases[base_id]
+                for base_id in projected_knowledge_base_ids
+                if base_id in knowledge_bases
+            }
+
+    def _projected_agent_names(
+        self,
+        *,
+        worker_key: str | None,
+        resolved_agent_policies: dict[str, ResolvedAgentPolicy],
+    ) -> tuple[str, ...] | None:
+        if worker_key is None:
+            return None
+
+        worker_scope = resolved_worker_key_scope(worker_key)
+        if worker_scope is None:
+            msg = f"Unsupported worker key for projected agent selection: {worker_key}"
+            raise WorkerBackendError(msg)
+        if worker_scope == "user":
+            user_scoped_agent_names = tuple(
+                agent_name
+                for agent_name, policy in resolved_agent_policies.items()
+                if policy.effective_execution_scope == "user"
+            )
+            if user_scoped_agent_names:
+                return user_scoped_agent_names
+            if not resolved_agent_policies:
+                return None
+            msg = f"Worker key does not match any configured agent policy: {worker_key}"
+            raise WorkerBackendError(msg)
+
+        matching_agent_names = tuple(
+            agent_name
+            for agent_name, policy in resolved_agent_policies.items()
+            if self._worker_key_targets_agent(
+                worker_key,
+                agent_name=agent_name,
+                worker_scope=policy.effective_execution_scope,
+            )
+        )
+        if len(matching_agent_names) > 1:
+            msg = f"Worker key '{worker_key}' has an ambiguous normalized agent name."
+            raise WorkerBackendError(msg)
+        if matching_agent_names:
+            return (matching_agent_names[0],)
+        if not resolved_agent_policies:
+            return None
+        msg = f"Worker key does not match any configured agent policy: {worker_key}"
+        raise WorkerBackendError(msg)
+
+    def _projected_knowledge_base_ids(
+        self,
+        config_data: dict[str, object],
+        *,
+        agent_names: tuple[str, ...] | None,
+        resolved_agent_policies: dict[str, ResolvedAgentPolicy],
+    ) -> tuple[str, ...] | None:
+        if agent_names is None:
+            return None
+
+        raw_agents = config_data.get("agents")
+        if not isinstance(raw_agents, dict):
+            return ()
+
+        agents = cast("dict[object, object]", raw_agents)
+        projected_knowledge_base_ids: list[str] = []
+        for agent_name in agent_names:
+            raw_agent = agents.get(agent_name)
+            if not isinstance(raw_agent, dict):
+                continue
+            raw_knowledge_bases = cast("dict[str, object]", raw_agent).get("knowledge_bases")
+            if not isinstance(raw_knowledge_bases, list):
+                continue
+            projected_knowledge_base_ids.extend(
+                knowledge_base_id for knowledge_base_id in raw_knowledge_bases if isinstance(knowledge_base_id, str)
+            )
+            private_knowledge_base_id = (
+                resolved_agent_policies[agent_name].private_knowledge_base_id
+                if agent_name in resolved_agent_policies
+                else None
+            )
+            if isinstance(private_knowledge_base_id, str):
+                projected_knowledge_base_ids.append(private_knowledge_base_id)
+        return _ordered_unique_nonempty_strings(projected_knowledge_base_ids)
+
+    def _worker_key_targets_agent(
+        self,
+        worker_key: str,
+        *,
+        agent_name: str,
+        worker_scope: WorkerScope | None,
+    ) -> bool:
+        expected_scope = "unscoped" if worker_scope is None else worker_scope
+        actual_scope = resolved_worker_key_scope(worker_key)
+        if actual_scope not in {expected_scope, "user_agent"}:
+            return False
+        encoded_agent_name = worker_key_agent_name(worker_key)
+        if encoded_agent_name is None:
+            return False
+        return encoded_agent_name == normalize_worker_key_part(agent_name)
+
+    def _rewrite_projected_plugin_paths(
+        self,
+        config_data: dict[str, object],
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+    ) -> None:
+        raw_plugins = config_data.get("plugins")
+        if not isinstance(raw_plugins, list):
+            return
+
+        plugins = cast("list[object]", raw_plugins)
+        for index, raw_plugin in enumerate(plugins):
+            raw_plugin_path = self._plugin_path_value(raw_plugin)
+            if raw_plugin_path is None or not _plugin_uses_filesystem_path(
+                raw_plugin_path,
+                runtime_paths=self._runtime_paths,
+            ):
+                continue
+            host_path = config_relative_path(raw_plugin_path, self._runtime_paths)
+            projected_path = self._projected_path_value(
+                host_path,
+                PurePosixPath(
+                    _PROJECTED_ASSETS_DIRNAME,
+                    "plugins",
+                    f"{index:02d}-{_projection_display_name(host_path, fallback=raw_plugin_path)}",
+                ),
+                asset_paths_by_host=asset_paths_by_host,
+                host_paths_by_relative_asset_path=host_paths_by_relative_asset_path,
+                assets=assets,
+            )
+            # Config accepts either `- ./plugin` or `- path: ./plugin`.
+            # Keep mapping metadata intact, but make the worker-visible path point
+            # at the copied projection so plugin validation can run in the worker.
+            if isinstance(raw_plugin, dict):
+                cast("dict[str, object]", raw_plugin)["path"] = projected_path
+            else:
+                plugins[index] = projected_path
+
+    @staticmethod
+    def _plugin_path_value(raw_plugin: object) -> str | None:
+        if isinstance(raw_plugin, str):
+            return raw_plugin
+        if not isinstance(raw_plugin, dict):
+            return None
+        raw_path = cast("dict[str, object]", raw_plugin).get("path")
+        return raw_path if isinstance(raw_path, str) else None
+
+    def _rewrite_projected_knowledge_paths(
+        self,
+        config_data: dict[str, object],
+        projected_knowledge_base_ids: tuple[str, ...] | None,
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+        storage_mounts: Sequence[tuple[Path, str, bool]] = (),
+    ) -> None:
+        raw_knowledge_bases = config_data.get("knowledge_bases")
+        if not isinstance(raw_knowledge_bases, dict):
+            return
+
+        knowledge_bases = cast("dict[object, object]", raw_knowledge_bases)
+        for base_id, raw_knowledge_base in knowledge_bases.items():
+            if not isinstance(base_id, str) or not isinstance(raw_knowledge_base, dict):
+                continue
+            if projected_knowledge_base_ids is not None and base_id not in projected_knowledge_base_ids:
+                continue
+            knowledge_base = cast("dict[str, object]", raw_knowledge_base)
+            raw_path = knowledge_base.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            host_path = config_relative_path(raw_path, self._runtime_paths)
+            projected_path = PurePosixPath(_PROJECTED_ASSETS_DIRNAME, "knowledge_bases", _safe_projection_name(base_id))
+            if not self._knowledge_source_projectable(base_id, host_path, storage_mounts):
+                # The worker sees an empty knowledge folder, as a Kubernetes worker without the mount does.
+                knowledge_base["path"] = _projected_config_value(projected_path)
+                continue
+            knowledge_base["path"] = self._projected_path_value(
+                host_path,
+                projected_path,
+                asset_paths_by_host=asset_paths_by_host,
+                host_paths_by_relative_asset_path=host_paths_by_relative_asset_path,
+                assets=assets,
+                storage_mounts=storage_mounts,
+            )
+
+    def _knowledge_source_projectable(
+        self,
+        base_id: str,
+        host_path: Path,
+        storage_mounts: Sequence[tuple[Path, str, bool]],
+    ) -> bool:
+        """Plan one knowledge source from its configured path, refusing what other workers could redirect."""
+        storage_root = shared_storage_root(self._runtime_paths.storage_root)
+        lexical_path = Path(os.path.normpath(host_path))
+        if not lexical_path.is_relative_to(storage_root) or any(
+            lexical_path.is_relative_to(local_root) for local_root, _worker_root, _read_only in storage_mounts
+        ):
+            return True
+        relative_path = lexical_path.relative_to(storage_root)
+        if written_by_other_workers(relative_path):
+            logger.error("Refusing to project knowledge other sandbox workers write", knowledge_base=base_id)
+            return False
+        try:
+            with open_directory_within_root(storage_root, relative_path.parent) as parent_fd:
+                mode = os.stat(relative_path.name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+        except (OSError, ValueError):
+            mode = 0
+        if stat.S_ISDIR(mode) or stat.S_ISREG(mode):
+            return True
+        logger.warning("Not projecting knowledge that is missing or reached through a link", knowledge_base=base_id)
+        return False
+
+    def _rewrite_projected_agent_paths(
+        self,
+        config_data: dict[str, object],
+        projected_agent_names: tuple[str, ...] | None,
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+    ) -> None:
+        raw_agents = config_data.get("agents")
+        if not isinstance(raw_agents, dict):
+            return
+
+        agents = cast("dict[object, object]", raw_agents)
+        for agent_name, raw_agent in agents.items():
+            if not isinstance(agent_name, str) or not isinstance(raw_agent, dict):
+                continue
+            if projected_agent_names is not None and agent_name not in projected_agent_names:
+                continue
+            agent = cast("dict[str, object]", raw_agent)
+            safe_agent_name = _safe_projection_name(agent_name)
+            agent_dir = PurePosixPath(_PROJECTED_ASSETS_DIRNAME, "agents", safe_agent_name)
+            self._rewrite_projected_private_template_dir(
+                agent,
+                agent_dir,
+                asset_paths_by_host=asset_paths_by_host,
+                host_paths_by_relative_asset_path=host_paths_by_relative_asset_path,
+                assets=assets,
+            )
+
+    def _rewrite_projected_private_template_dir(
+        self,
+        raw_agent: dict[str, object],
+        agent_dir: PurePosixPath,
+        *,
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+    ) -> None:
+        raw_private = raw_agent.get("private")
+        if not isinstance(raw_private, dict):
+            return
+
+        private_config = cast("dict[str, object]", raw_private)
+        raw_template_dir = private_config.get("template_dir")
+        if not isinstance(raw_template_dir, str) or not raw_template_dir.strip():
+            return
+
+        host_path = config_relative_path(raw_template_dir, self._runtime_paths)
+        private_config["template_dir"] = self._projected_path_value(
+            host_path,
+            agent_dir / "private" / "template_dir",
+            asset_paths_by_host=asset_paths_by_host,
+            host_paths_by_relative_asset_path=host_paths_by_relative_asset_path,
+            assets=assets,
+        )
+
+    def _rewrite_unscoped_default_worker_scope(
+        self,
+        config_data: dict[str, object],
+        worker_key: str,
+    ) -> None:
+        if ":unscoped:" not in worker_key:
+            return
+        raw_defaults = config_data.get("defaults")
+        if not isinstance(raw_defaults, dict):
+            return
+        defaults = cast("dict[str, object]", raw_defaults)
+        if defaults.get("worker_scope") is None:
+            return
+        defaults["worker_scope"] = None
+
+    def _projected_path_value(
+        self,
+        host_path: Path,
+        suggested_relative_path: PurePosixPath,
+        *,
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+        storage_mounts: Sequence[tuple[Path, str, bool]] = (),
+    ) -> str:
+        # Mutable agent data already mounted into the worker must not enter the
+        # immutable asset hash, and a path inside a mount maps there without being
+        # resolved, so a link swapped in by worker code never becomes an asset.
+        lexical_host_path = Path(os.path.normpath(host_path.expanduser()))
+        for local_root, worker_root, _read_only in storage_mounts:
+            if lexical_host_path.is_relative_to(local_root):
+                relative = lexical_host_path.relative_to(local_root)
+                return str(PurePosixPath(worker_root).joinpath(*relative.parts))
+        relative_path = self._projected_asset_path(
+            lexical_host_path,
+            suggested_relative_path,
+            asset_paths_by_host=asset_paths_by_host,
+            host_paths_by_relative_asset_path=host_paths_by_relative_asset_path,
+            assets=assets,
+        )
+        return _projected_config_value(relative_path)
+
+    def _projected_asset_path(
+        self,
+        host_path: Path,
+        suggested_relative_path: PurePosixPath,
+        *,
+        asset_paths_by_host: dict[Path, PurePosixPath],
+        host_paths_by_relative_asset_path: dict[PurePosixPath, Path],
+        assets: list[_DockerProjectedConfigAsset],
+    ) -> PurePosixPath:
+        # Assets are recorded and later copied by this lexical path, never its resolved target.
+        resolved_host_path = Path(os.path.normpath(host_path.expanduser().absolute()))
+        if resolved_host_path.exists():
+            _validated_asset_host_path(resolved_host_path)
+        existing_relative_path = asset_paths_by_host.get(resolved_host_path)
+        if existing_relative_path is not None:
+            return existing_relative_path
+
+        relative_path = suggested_relative_path
+        suffix_counter = 0
+        while True:
+            existing_host_path = host_paths_by_relative_asset_path.get(relative_path)
+            if existing_host_path is None or existing_host_path == resolved_host_path:
+                break
+            suffix_source = str(resolved_host_path) if suffix_counter == 0 else f"{resolved_host_path}:{suffix_counter}"
+            relative_path = _projection_path_with_suffix(
+                suggested_relative_path,
+                suffix=_projection_hash(suffix_source),
+            )
+            suffix_counter += 1
+
+        asset_paths_by_host[resolved_host_path] = relative_path
+        host_paths_by_relative_asset_path[relative_path] = resolved_host_path
+        if resolved_host_path.exists():
+            assets.append(
+                _DockerProjectedConfigAsset(
+                    host_path=resolved_host_path,
+                    relative_path=relative_path,
+                ),
+            )
+        return relative_path

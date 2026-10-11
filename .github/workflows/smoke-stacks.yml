@@ -27,25 +27,38 @@ permissions:
   contents: read
   packages: read
 
+# A newer push to the same pull request makes older runs obsolete; other events never share a group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Pull Synapse from mirror.gcr.io; anonymous Docker Hub pulls fail on shared runners.
+      SYNAPSE_IMAGE: mirror.gcr.io/matrixdotorg/synapse:latest
+      INSTANCE_SYNAPSE_IMAGE: mirror.gcr.io/matrixdotorg/synapse:latest
 
     steps:
       - name: Checkout mindroom
         uses: actions/checkout@v5
         with:
           lfs: true
+          persist-credentials: false
 
       - name: Checkout mindroom-stack
         uses: actions/checkout@v5
         with:
           repository: mindroom-ai/mindroom-stack
           path: mindroom-stack
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
+        with:
+          cache-suffix: smoke-stacks
 
       - name: Set up Python
         run: uv python install 3.13
@@ -54,17 +67,18 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Set up kind
-        uses: engineerd/setup-kind@v0.6.2
-        with:
-          skipClusterCreation: true
-          skipClusterDeletion: true
-          skipClusterLogsExport: true
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64"
+          echo "b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  kind" | sha256sum --check
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
 
       - name: Free runner disk space
         run: |
@@ -81,7 +95,7 @@ jobs:
           df -h /
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -105,6 +119,11 @@ jobs:
         run: |
           docker run --rm ghcr.io/mindroom-ai/mindroom:latest mindroom version
           docker run --rm ghcr.io/mindroom-ai/mindroom-minimal:latest mindroom version
+
+      - name: Smoke local instance sandbox isolation
+        run: python -m scripts.smoke_local_instance_sandbox
+        env:
+          MINDROOM_IMAGE: ghcr.io/mindroom-ai/mindroom:latest
 
       - name: Smoke platform images
         run: python -m scripts.smoke_platform_images

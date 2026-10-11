@@ -2,33 +2,32 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+import { useSubscription } from '@/hooks/useSubscription'
+import { planAction, planState } from '@/lib/plan-state'
 import { Loader2, RefreshCw, CheckCircle, AlertCircle, Clock, Play, Pause, ExternalLink, Server, MessageCircle, Globe } from 'lucide-react'
-import { listInstances, startInstance, stopInstance, restartInstance as apiRestartInstance } from '@/lib/api'
-import { cache } from '@/lib/cache'
+import { startInstance, stopInstance, restartInstance as apiRestartInstance, type Instance } from '@/lib/api'
+import { getCachedInstance, loadInstance } from '@/lib/instance-resource'
 import { buildCinnyLoginUrl } from '@/lib/cinny'
 import { getRuntimeConfig } from '@/lib/runtime-config'
 import { logger } from '@/lib/logger'
 import { Card, CardHeader, CardSection } from '@/components/ui/Card'
 
-type InstanceStatus = 'provisioning' | 'running' | 'stopped' | 'failed' | 'error' | 'deprovisioned' | 'restarting'
-
-type Instance = {
-  id: string
-  instance_id: number | string
-  subscription_id: string
-  subdomain: string
-  status: InstanceStatus
-  backend_url: string | null
-  frontend_url: string | null
-  matrix_server_url: string | null
-  config: any
-  created_at: string
-  updated_at: string
-}
+type InstanceStatus = Instance['status']
 
 export default function InstancePage() {
+  const { user, loading: authLoading } = useAuth()
+  const userId = user?.id ?? null
+  return <InstanceDetails key={userId ?? ''} userId={userId} authLoading={authLoading} />
+}
+
+function InstanceDetails({ userId, authLoading }: { userId: string | null; authLoading: boolean }) {
   const router = useRouter()
-  const cachedInstance = cache.get('user-instance') as Instance | null
+  const { subscription, loading: subscriptionLoading } = useSubscription()
+  const state = planState(subscription)
+  // What the account must do before its plan can run the instance, or null while it can
+  const nextStep = state === 'active' ? null : planAction(state)
+  const cachedInstance = getCachedInstance(userId)
   const [instance, setInstance] = useState<Instance | null>(cachedInstance)
   const [loading, setLoading] = useState(!cachedInstance)
   const [refreshing, setRefreshing] = useState(false)
@@ -37,6 +36,7 @@ export default function InstancePage() {
 
 
   useEffect(() => {
+    if (authLoading || !userId) return
     // Only fetch if no cached data, otherwise fetch silently in background
     if (!cachedInstance) {
       fetchInstance()
@@ -44,9 +44,10 @@ export default function InstancePage() {
       // Fetch silently in background to get fresh data
       fetchInstance(true)
     }
-  }, []) // Run only on mount
+  }, [userId, authLoading])
 
   useEffect(() => {
+    if (authLoading || !userId) return
     // Poll for updates while provisioning or restarting
     if (instance?.status === 'provisioning' || instance?.status === 'restarting') {
       const interval = setInterval(() => {
@@ -55,21 +56,14 @@ export default function InstancePage() {
 
       return () => clearInterval(interval)
     }
-  }, [instance?.status])
+  }, [instance?.status, userId, authLoading])
 
   const fetchInstance = async (silent = false) => {
+    if (authLoading || !userId) return
     if (!silent) setLoading(true)
 
     try {
-      const data = await listInstances()
-
-      if (data.instances && data.instances.length > 0) {
-        const newInstance = data.instances[0]
-        setInstance(newInstance)
-        cache.set('user-instance', newInstance)
-      } else {
-        setInstance(null)
-      }
+      setInstance(await loadInstance(userId))
     } catch (error) {
       logger.error('Error fetching instance:', error)
     } finally {
@@ -160,19 +154,23 @@ export default function InstancePage() {
       case 'restarting':
         return 'Restarting your instance... This will take a moment.'
       case 'stopped':
-        return 'Instance is stopped. Start it to access your MindRoom.'
+        if (subscriptionLoading) return 'Instance is stopped.'
+        if (!nextStep) return 'Instance is stopped. Start it to access your MindRoom.'
+        return `Instance is stopped. ${nextStep.step} to start it again.`
       case 'failed':
         return 'Instance provisioning failed. Please contact support.'
       case 'error':
         return 'Instance not found in cluster. It may have been removed during maintenance. Please contact support to reprovision your instance.'
       case 'deprovisioned':
-        return 'Instance has been removed. Click "Reprovision Instance" to restore it.'
+        if (subscriptionLoading) return 'Instance has been removed.'
+        if (!nextStep) return 'Instance has been removed. Click "Reprovision Instance" to set it up again.'
+        return `Instance has been removed. ${nextStep.step} to set it up again.`
       default:
         return 'Unknown status'
     }
   }
 
-  if (loading) {
+  if (loading || (!instance && subscriptionLoading)) {
     return (
       <div className="flex items-center justify-center h-96">
         <Loader2 className="w-8 h-8 animate-spin text-orange-500" />
@@ -187,18 +185,31 @@ export default function InstancePage() {
           <Server className="w-20 h-20 text-gray-400 dark:text-gray-500 mx-auto mb-6" />
           <CardHeader className="mb-3">No Instance Found</CardHeader>
           <p className="text-gray-600 dark:text-gray-400 mb-8 text-lg">
-            You don't have a MindRoom instance yet. Upgrade to a paid plan to get your own instance.
+            You don't have a MindRoom instance yet. {nextStep ? `${nextStep.step} to run a hosted instance.` : 'Create it from the dashboard.'}
           </p>
           <button
-            onClick={() => router.push('/dashboard/billing/upgrade')}
+            onClick={() => router.push(nextStep?.href ?? '/dashboard')}
             className="px-8 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all"
           >
-            Upgrade Plan
+            {nextStep?.label ?? 'Go to dashboard'}
           </button>
         </Card>
       </div>
     )
   }
+
+  const subdomain = instance.subdomain?.trim()
+  const subdomainDisplay = subdomain
+    ? platformDomain
+      ? `${subdomain}.${platformDomain}`
+      : subdomain
+    : instance.frontend_url || instance.backend_url || '—'
+  const supportSubdomain = subdomain || '—'
+  const supportMailtoHref =
+    `mailto:support@mindroom.chat?subject=${encodeURIComponent('Instance Error - Reprovision Request')}` +
+    `&body=${encodeURIComponent(
+      `My instance ID: ${String(instance.instance_id)} (subdomain: ${supportSubdomain}) is showing an error status and needs to be reprovisioned.`
+    )}`
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
@@ -277,7 +288,16 @@ export default function InstancePage() {
             </div>
           )}
 
-          {instance.status === 'stopped' && (
+          {!subscriptionLoading && nextStep && (instance.status === 'stopped' || instance.status === 'deprovisioned') && (
+            <button
+              onClick={() => router.push(nextStep.href)}
+              className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors"
+            >
+              {nextStep.label}
+            </button>
+          )}
+
+          {!nextStep && instance.status === 'stopped' && (
             <button
               onClick={() => handleAction('start')}
               disabled={actionLoading !== null}
@@ -292,7 +312,7 @@ export default function InstancePage() {
             </button>
           )}
 
-          {instance.status === 'deprovisioned' && (
+          {!nextStep && instance.status === 'deprovisioned' && (
             <button
               onClick={() => handleAction('reprovision')}
               disabled={actionLoading !== null}
@@ -309,13 +329,13 @@ export default function InstancePage() {
 
           {instance.status === 'error' && (
             <div className="flex gap-2">
-              <button
-                onClick={() => window.location.href = 'mailto:support@mindroom.chat?subject=Instance Error - Reprovision Request&body=My instance ID: ' + String(instance.instance_id) + ' (subdomain: ' + instance.subdomain + ') is showing an error status and needs to be reprovisioned.'}
+              <a
+                href={supportMailtoHref}
                 className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors"
               >
                 <AlertCircle className="w-4 h-4" />
                 Contact Support
-              </button>
+              </a>
               <button
                 onClick={handleRefresh}
                 disabled={refreshing}
@@ -335,18 +355,16 @@ export default function InstancePage() {
             <div>
               <p className="text-sm text-gray-600 dark:text-gray-400">Subdomain</p>
               <p className="font-mono text-sm">
-                {platformDomain
-                  ? `${instance.subdomain}.${platformDomain}`
-                  : instance.frontend_url || instance.backend_url || instance.subdomain}
+                {subdomainDisplay}
               </p>
             </div>
             <div>
               <p className="text-sm text-gray-600 dark:text-gray-400">Created</p>
-              <p className="text-sm">{new Date(instance.created_at).toLocaleString()}</p>
+              <p className="text-sm">{instance.created_at ? new Date(instance.created_at).toLocaleString() : '—'}</p>
             </div>
             <div>
               <p className="text-sm text-gray-600 dark:text-gray-400">Last Updated</p>
-              <p className="text-sm">{new Date(instance.updated_at).toLocaleString()}</p>
+              <p className="text-sm">{instance.updated_at ? new Date(instance.updated_at).toLocaleString() : '—'}</p>
             </div>
           </div>
         </CardSection>
@@ -421,19 +439,6 @@ export default function InstancePage() {
         </Card>
       )}
 
-      {/* Configuration (collapsible) */}
-      <Card className="overflow-hidden p-0">
-        <details>
-        <summary className="p-8 cursor-pointer hover:bg-gray-50/50 dark:hover:bg-gray-700/50 transition-colors">
-          <CardHeader>Instance Configuration</CardHeader>
-        </summary>
-        <div className="px-8 pb-8">
-          <pre className="bg-gray-50 dark:bg-gray-900/50 p-6 rounded-2xl overflow-x-auto text-sm dark:text-gray-300 font-mono border border-gray-200 dark:border-gray-700">
-            {JSON.stringify(instance.config, null, 2)}
-          </pre>
-        </div>
-      </details>
-      </Card>
     </div>
   )
 }

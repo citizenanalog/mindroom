@@ -2,13 +2,11 @@
 
 from datetime import UTC, datetime
 from typing import Literal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
-from mindroom.api.schedules import UpdateScheduleRequest, update_schedule
-from mindroom.scheduling import CronSchedule, ScheduledTaskRecord, ScheduledWorkflow
+from mindroom.scheduling.tasks import CronSchedule, ScheduledTaskRecord, ScheduledWorkflow
 
 
 def _task(
@@ -22,6 +20,8 @@ def _task(
     description: str = "Ping task",
     thread_id: str | None = "$thread123",
     new_thread: bool = False,
+    history_limit: int | None = None,
+    silent: bool = False,
 ) -> ScheduledTaskRecord:
     cron_schedule = None
     if cron_fields:
@@ -33,10 +33,12 @@ def _task(
         cron_schedule=cron_schedule,
         message=message,
         description=description,
+        history_limit=history_limit,
         thread_id=thread_id,
         room_id=room_id,
         created_by="@user:localhost",
         new_thread=new_thread,
+        silent=silent,
     )
     return ScheduledTaskRecord(
         task_id=task_id,
@@ -45,16 +47,6 @@ def _task(
         created_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         workflow=workflow,
     )
-
-
-def _mock_agent_user() -> MagicMock:
-    user = MagicMock()
-    user.agent_name = "router"
-    user.user_id = "@mindroom_router:localhost"
-    user.display_name = "RouterAgent"
-    user.password = "test_password"  # noqa: S105
-    user.access_token = "test_token"  # noqa: S105
-    return user
 
 
 def _mock_matrix_client() -> AsyncMock:
@@ -80,12 +72,13 @@ def test_list_schedules_success(test_client: TestClient) -> None:
             description="Daily task",
             thread_id=None,
             new_thread=True,
+            history_limit=5,
+            silent=True,
         ),
     ]
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_tasks_for_room", return_value=tasks),
     ):
         response = test_client.get("/api/schedules")
@@ -97,9 +90,13 @@ def test_list_schedules_success(test_client: TestClient) -> None:
     tasks_by_id = {task["task_id"]: task for task in data["tasks"]}
     assert tasks_by_id["once1234"]["schedule_type"] == "once"
     assert tasks_by_id["once1234"]["new_thread"] is False
+    assert tasks_by_id["once1234"]["history_limit"] is None
+    assert tasks_by_id["once1234"]["silent"] is False
     assert tasks_by_id["cron1234"]["cron_expression"] == "0 9 * * *"
     assert tasks_by_id["cron1234"]["new_thread"] is True
     assert tasks_by_id["cron1234"]["thread_id"] is None
+    assert tasks_by_id["cron1234"]["history_limit"] == 5
+    assert tasks_by_id["cron1234"]["silent"] is True
 
 
 def test_list_schedules_invalid_cron_does_not_fail(test_client: TestClient) -> None:
@@ -116,8 +113,7 @@ def test_list_schedules_invalid_cron_does_not_fail(test_client: TestClient) -> N
     ]
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_tasks_for_room", return_value=tasks),
     ):
         response = test_client.get("/api/schedules")
@@ -149,6 +145,7 @@ def test_update_schedule_once_success(test_client: TestClient) -> None:
         room_id="test_room",
         created_by=existing_task.workflow.created_by,
         new_thread=existing_task.workflow.new_thread,
+        silent=True,
     )
     updated_task = ScheduledTaskRecord(
         task_id="abc12345",
@@ -160,8 +157,7 @@ def test_update_schedule_once_success(test_client: TestClient) -> None:
     save_mock = AsyncMock(return_value=updated_task)
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
         patch("mindroom.api.schedules.save_edited_scheduled_task", save_mock),
     ):
@@ -173,6 +169,7 @@ def test_update_schedule_once_success(test_client: TestClient) -> None:
                 "execute_at": "2026-03-01T10:00:00Z",
                 "message": "@mindroom_test_agent updated",
                 "description": "Updated description",
+                "silent": True,
             },
         )
 
@@ -184,72 +181,12 @@ def test_update_schedule_once_success(test_client: TestClient) -> None:
     assert data["description"] == "Updated description"
     assert data["execute_at"] == "2026-03-01T10:00:00Z"
     assert data["new_thread"] is True
+    assert data["silent"] is True
     save_mock.assert_awaited_once()
     assert save_mock.await_args.kwargs["task_id"] == "abc12345"
     assert save_mock.await_args.kwargs["room_id"] == "test_room"
     assert save_mock.await_args.kwargs["workflow"].new_thread is True
-
-
-@pytest.mark.asyncio
-async def test_update_schedule_does_not_resolve_cache_path_when_not_restarting() -> None:
-    """Pure API schedule edits should not construct or resolve an event cache."""
-    mock_client = _mock_matrix_client()
-    existing_task = _task(
-        "abc12345",
-        execute_at=datetime(2026, 2, 10, 9, 0, tzinfo=UTC),
-        description="Original description",
-        message="@mindroom_test_agent original",
-    )
-    updated_workflow = ScheduledWorkflow(
-        schedule_type="once",
-        execute_at=datetime(2026, 3, 1, 10, 0, tzinfo=UTC),
-        message="@mindroom_test_agent updated",
-        description="Updated description",
-        thread_id=existing_task.workflow.thread_id,
-        room_id="test_room",
-        created_by=existing_task.workflow.created_by,
-        new_thread=existing_task.workflow.new_thread,
-    )
-    updated_task = ScheduledTaskRecord(
-        task_id="abc12345",
-        room_id="test_room",
-        status="pending",
-        created_at=existing_task.created_at,
-        workflow=updated_workflow,
-    )
-    runtime_config = MagicMock()
-    runtime_config.cache.resolve_db_path.side_effect = AssertionError(
-        "update_schedule should not resolve cache paths for state-only edits",
-    )
-    save_mock = AsyncMock(return_value=updated_task)
-    api_request = MagicMock()
-
-    with (
-        patch(
-            "mindroom.api.schedules.config_lifecycle.read_committed_runtime_config",
-            return_value=(runtime_config, MagicMock()),
-        ),
-        patch("mindroom.api.schedules.resolve_room_aliases", return_value=["test_room"]),
-        patch("mindroom.api.schedules.get_room_alias_from_id", return_value=None),
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
-        patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
-        patch("mindroom.api.schedules.save_edited_scheduled_task", save_mock),
-    ):
-        response = await update_schedule(
-            task_id="abc12345",
-            request=UpdateScheduleRequest(
-                room_id="test_room",
-                schedule_type="once",
-                execute_at=datetime(2026, 3, 1, 10, 0, tzinfo=UTC),
-                message="@mindroom_test_agent updated",
-                description="Updated description",
-            ),
-            api_request=api_request,
-        )
-
-    runtime_config.cache.resolve_db_path.assert_not_called()
-    assert response.task_id == "abc12345"
+    assert save_mock.await_args.kwargs["workflow"].silent is True
 
 
 def test_update_schedule_invalid_cron_expression(test_client: TestClient) -> None:
@@ -264,8 +201,7 @@ def test_update_schedule_invalid_cron_expression(test_client: TestClient) -> Non
     )
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
     ):
         response = test_client.put(
@@ -287,8 +223,7 @@ def test_cancel_schedule_success(test_client: TestClient) -> None:
     existing_task = _task("abc12345", execute_at=datetime(2026, 2, 10, 9, 0, tzinfo=UTC))
     cancel_mock = AsyncMock(return_value="✅ Cancelled task `abc12345`")
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
         patch("mindroom.api.schedules.cancel_scheduled_task", cancel_mock),
     ):
@@ -300,12 +235,43 @@ def test_cancel_schedule_success(test_client: TestClient) -> None:
     assert cancel_mock.await_args.kwargs["room_id"] == "test_room"
 
 
+def test_cancel_schedule_returns_server_error_when_backend_cancel_fails(test_client: TestClient) -> None:
+    """Cancel endpoint should report persistence failures as server errors."""
+    mock_client = _mock_matrix_client()
+    existing_task = _task("abc12345", execute_at=datetime(2026, 2, 10, 9, 0, tzinfo=UTC))
+    cancel_mock = AsyncMock(return_value="❌ Failed to cancel task `abc12345`: Matrix rejected state write")
+    with (
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
+        patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
+        patch("mindroom.api.schedules.cancel_scheduled_task", cancel_mock),
+    ):
+        response = test_client.delete("/api/schedules/abc12345?room_id=test_room")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to cancel task `abc12345`: Matrix rejected state write"
+
+
+def test_cancel_schedule_returns_not_found_when_backend_cancel_reports_missing(test_client: TestClient) -> None:
+    """Cancel endpoint should preserve 404 when the task disappears after the guard read."""
+    mock_client = _mock_matrix_client()
+    existing_task = _task("abc12345", execute_at=datetime(2026, 2, 10, 9, 0, tzinfo=UTC))
+    cancel_mock = AsyncMock(return_value="❌ Task `abc12345` not found.")
+    with (
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
+        patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
+        patch("mindroom.api.schedules.cancel_scheduled_task", cancel_mock),
+    ):
+        response = test_client.delete("/api/schedules/abc12345?room_id=test_room")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Task `abc12345` not found."
+
+
 def test_cancel_schedule_not_found(test_client: TestClient) -> None:
     """Cancel endpoint should return 404 when task does not exist."""
     mock_client = _mock_matrix_client()
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=None),
     ):
         response = test_client.delete("/api/schedules/missing?room_id=test_room")
@@ -325,8 +291,7 @@ def test_update_schedule_once_to_cron(test_client: TestClient) -> None:
     save_mock = AsyncMock()
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
         patch("mindroom.api.schedules.save_edited_scheduled_task", save_mock),
     ):
@@ -356,8 +321,7 @@ def test_update_schedule_cron_to_once(test_client: TestClient) -> None:
     save_mock = AsyncMock()
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
         patch("mindroom.api.schedules.save_edited_scheduled_task", save_mock),
     ):
@@ -386,8 +350,7 @@ def test_update_schedule_conflicting_fields(test_client: TestClient) -> None:
     )
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
     ):
         response = test_client.put(
@@ -412,8 +375,7 @@ def test_update_schedule_empty_message(test_client: TestClient) -> None:
     )
 
     with (
-        patch("mindroom.api.schedules.create_agent_user", return_value=_mock_agent_user()),
-        patch("mindroom.api.schedules.login_agent_user", return_value=mock_client),
+        patch("mindroom.api.schedules.create_agent_http_client", return_value=mock_client),
         patch("mindroom.api.schedules.get_scheduled_task", return_value=existing_task),
     ):
         response = test_client.put(

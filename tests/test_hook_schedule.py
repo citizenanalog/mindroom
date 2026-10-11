@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import nio
 import pytest
@@ -17,18 +17,17 @@ from mindroom.config.main import Config
 from mindroom.constants import SOURCE_KIND_KEY
 from mindroom.hooks import EVENT_SCHEDULE_FIRED, HookRegistry, ScheduleFiredContext, build_hook_matrix_admin, hook
 from mindroom.logging_config import setup_logging
-from mindroom.scheduling import (
+from mindroom.scheduling.executor import execute_scheduled_workflow, set_scheduling_hook_registry
+from mindroom.scheduling.tasks import (
     CronSchedule,
+    ScheduledTaskRecord,
     ScheduledWorkflow,
-    _execute_scheduled_workflow,
     _run_cron_task,
     _run_once_task,
-    set_scheduling_hook_registry,
 )
 from tests.conftest import (
     bind_runtime_paths,
     delivered_matrix_side_effect,
-    make_event_cache_mock,
     runtime_paths_for,
     test_runtime_paths,
 )
@@ -50,6 +49,7 @@ def _plugin(name: str, callbacks: list[object]) -> object:
         {
             "name": name,
             "discovered_hooks": tuple(callbacks),
+            "discovered_automations": (),
             "entry_config": type("Entry", (), {"settings": {}, "hooks": {}})(),
             "plugin_order": 0,
         },
@@ -68,11 +68,10 @@ def _workflow(message: str) -> ScheduledWorkflow:
     )
 
 
-def _conversation_cache(*, latest_thread_event_id: str | None = None) -> AsyncMock:
-    access = AsyncMock()
-    access.get_latest_thread_event_id_if_needed.return_value = latest_thread_event_id
-    access.notify_outbound_message = Mock()
-    return access
+def _conversation_reader(*, latest_thread_event_id: str | None = None) -> AsyncMock:
+    reader = AsyncMock()
+    reader.latest_thread_event_id = AsyncMock(return_value=latest_thread_event_id)
+    return reader
 
 
 @pytest.fixture(autouse=True)
@@ -93,18 +92,18 @@ async def test_schedule_hook_rewrites_message_text(tmp_path: Path) -> None:
 
     config = _config(tmp_path)
     set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [rewrite])]))
-    conversation_cache = _conversation_cache(latest_thread_event_id="$latest")
+    conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
     with patch(
-        "mindroom.hooks.sender._send_message_result",
+        "mindroom.matrix.client_delivery.send_message_outcome",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$scheduled")),
     ) as mock_send:
-        await _execute_scheduled_workflow(
+        await execute_scheduled_workflow(
             AsyncMock(),
             _workflow("Prepare for meeting"),
             config,
             runtime_paths_for(config),
-            conversation_cache,
+            conversation_reader,
         )
 
     content = mock_send.await_args.args[2]
@@ -123,15 +122,15 @@ async def test_schedule_hook_can_suppress_synthetic_message(tmp_path: Path) -> N
     set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [suppress])]))
 
     with patch(
-        "mindroom.hooks.sender._send_message_result",
+        "mindroom.matrix.client_delivery.send_message_outcome",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$scheduled")),
     ) as mock_send:
-        await _execute_scheduled_workflow(
+        await execute_scheduled_workflow(
             AsyncMock(),
             _workflow("Do not send"),
             config,
             runtime_paths_for(config),
-            _conversation_cache(),
+            _conversation_reader(),
         )
 
     mock_send.assert_not_called()
@@ -156,15 +155,15 @@ async def test_schedule_hook_suppression_log_includes_workflow_thread_context(
     capsys.readouterr()
 
     with patch(
-        "mindroom.hooks.sender._send_message_result",
+        "mindroom.matrix.client_delivery.send_message_outcome",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$scheduled")),
     ):
-        await _execute_scheduled_workflow(
+        await execute_scheduled_workflow(
             AsyncMock(),
             _workflow("Do not send"),
             config,
             runtime_paths_for(config),
-            _conversation_cache(),
+            _conversation_reader(),
         )
 
     payloads = [json.loads(line) for line in capsys.readouterr().err.strip().splitlines()]
@@ -197,19 +196,32 @@ async def test_one_time_task_cancel_log_includes_workflow_thread_context(
     setup_logging(level="INFO", runtime_paths=runtime_paths_for(config))
     capsys.readouterr()
 
-    async def fake_get_pending_task_record(**_: object) -> SimpleNamespace:
-        return SimpleNamespace(workflow=workflow)
+    async def fake_get_pending_task_record(**_: object) -> ScheduledTaskRecord:
+        return ScheduledTaskRecord(
+            task_id="task-1",
+            room_id="!room:localhost",
+            status="pending",
+            created_at=None,
+            workflow=workflow,
+        )
 
-    with patch("mindroom.scheduling._get_pending_task_record", new=fake_get_pending_task_record):
+    client = AsyncMock()
+    client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+        {"membership": "join"},
+        "m.room.member",
+        "@user:localhost",
+        "!room:localhost",
+    )
+
+    with patch("mindroom.scheduling.tasks._get_pending_task_record", new=fake_get_pending_task_record):
         task = asyncio.create_task(
             _run_once_task(
-                AsyncMock(),
+                client,
                 "task-1",
                 workflow,
                 config,
                 runtime_paths_for(config),
-                make_event_cache_mock(),
-                _conversation_cache(),
+                _conversation_reader(),
             ),
         )
         await asyncio.sleep(0.05)
@@ -245,10 +257,15 @@ async def test_cron_task_cancel_log_includes_workflow_thread_context(
     setup_logging(level="INFO", runtime_paths=runtime_paths_for(config))
     capsys.readouterr()
 
+    pending_read_started = asyncio.Event()
+    release_pending_read = asyncio.Event()
+
     async def fake_get_pending_task_record(**_: object) -> SimpleNamespace:
+        pending_read_started.set()
+        await release_pending_read.wait()
         return SimpleNamespace(workflow=workflow)
 
-    with patch("mindroom.scheduling._get_pending_task_record", new=fake_get_pending_task_record):
+    with patch("mindroom.scheduling.tasks._get_pending_task_record", new=fake_get_pending_task_record):
         task = asyncio.create_task(
             _run_cron_task(
                 AsyncMock(),
@@ -257,10 +274,10 @@ async def test_cron_task_cancel_log_includes_workflow_thread_context(
                 {},
                 config,
                 runtime_paths_for(config),
-                _conversation_cache(),
+                _conversation_reader(),
             ),
         )
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(pending_read_started.wait(), timeout=5)
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
@@ -285,24 +302,23 @@ async def test_schedule_hook_send_message_inherits_context_thread_id(tmp_path: P
     set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [notify])]))
     client = AsyncMock()
     client.user_id = "@mindroom_router:localhost"
-    conversation_cache = _conversation_cache(latest_thread_event_id="$latest")
+    conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
     with patch(
-        "mindroom.hooks.sender._send_message_result",
+        "mindroom.hooks.sender.send_matrix_message",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$hook-event")),
     ) as mock_hook_send:
-        await _execute_scheduled_workflow(
+        await execute_scheduled_workflow(
             client,
             _workflow("Resume work"),
             config,
             runtime_paths_for(config),
-            conversation_cache,
+            conversation_reader,
         )
 
-    conversation_cache.get_latest_thread_event_id_if_needed.assert_awaited_once_with(
-        "!room:localhost",
-        "$thread",
-        caller_label="hook_sender",
+    conversation_reader.latest_thread_event_id.assert_awaited_once_with(
+        room_id="!room:localhost",
+        thread_id="$thread",
     )
     mock_hook_send.assert_awaited_once()
     content = mock_hook_send.await_args.args[2]
@@ -323,24 +339,23 @@ async def test_schedule_hook_send_message_allows_explicit_room_level_opt_out(tmp
     set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [notify])]))
     client = AsyncMock()
     client.user_id = "@mindroom_router:localhost"
-    conversation_cache = _conversation_cache(latest_thread_event_id=None)
+    conversation_reader = _conversation_reader(latest_thread_event_id=None)
 
     with patch(
-        "mindroom.hooks.sender._send_message_result",
+        "mindroom.hooks.sender.send_matrix_message",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$hook-event")),
     ) as mock_hook_send:
-        await _execute_scheduled_workflow(
+        await execute_scheduled_workflow(
             client,
             _workflow("Resume work"),
             config,
             runtime_paths_for(config),
-            conversation_cache,
+            conversation_reader,
         )
 
-    conversation_cache.get_latest_thread_event_id_if_needed.assert_awaited_once_with(
-        "!room:localhost",
-        None,
-        caller_label="hook_sender",
+    conversation_reader.latest_thread_event_id.assert_awaited_once_with(
+        room_id="!room:localhost",
+        thread_id=None,
     )
     mock_hook_send.assert_awaited_once()
     content = mock_hook_send.await_args.args[2]
@@ -370,12 +385,12 @@ async def test_schedule_hook_exposes_matrix_admin(tmp_path: Path) -> None:
         servers=["localhost"],
     )
 
-    await _execute_scheduled_workflow(
+    await execute_scheduled_workflow(
         client,
         _workflow("Resume work"),
         config,
         runtime_paths_for(config),
-        _conversation_cache(),
+        _conversation_reader(),
         matrix_admin=build_hook_matrix_admin(client, runtime_paths_for(config)),
     )
 
@@ -399,12 +414,12 @@ async def test_schedule_hook_matrix_admin_is_unavailable_without_router_binding(
     client.user_id = "@mindroom_general:localhost"
     client.homeserver = "http://agent.local:8008"
 
-    await _execute_scheduled_workflow(
+    await execute_scheduled_workflow(
         client,
         _workflow("Resume work"),
         config,
         runtime_paths_for(config),
-        _conversation_cache(),
+        _conversation_reader(),
     )
 
     assert saw_matrix_admin == [False]
@@ -423,18 +438,18 @@ async def test_schedule_hook_send_message_can_trigger_dispatch(tmp_path: Path) -
     set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [notify])]))
     client = AsyncMock()
     client.user_id = "@mindroom_router:localhost"
-    conversation_cache = _conversation_cache(latest_thread_event_id="$latest")
+    conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
     with patch(
-        "mindroom.hooks.sender._send_message_result",
+        "mindroom.hooks.sender.send_matrix_message",
         new=AsyncMock(side_effect=delivered_matrix_side_effect("$hook-event")),
     ) as mock_hook_send:
-        await _execute_scheduled_workflow(
+        await execute_scheduled_workflow(
             client,
             _workflow("Resume work"),
             config,
             runtime_paths_for(config),
-            conversation_cache,
+            conversation_reader,
         )
 
     mock_hook_send.assert_awaited_once()
@@ -467,12 +482,12 @@ async def test_schedule_hook_room_state_helpers_use_live_client(tmp_path: Path) 
     client.room_get_state_event.return_value = SimpleNamespace(content={"name": "Lobby"})
     client.room_put_state.return_value = object()
 
-    await _execute_scheduled_workflow(
+    await execute_scheduled_workflow(
         client,
         _workflow("Resume work"),
         config,
         runtime_paths_for(config),
-        _conversation_cache(),
+        _conversation_reader(),
     )
 
     assert seen == [({"name": "Lobby"}, True)]

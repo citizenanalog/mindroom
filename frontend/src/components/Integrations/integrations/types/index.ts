@@ -26,11 +26,16 @@ export interface Integration {
   dashboard_configuration_supported?: boolean;
   execution_scope_supported?: boolean;
   oauth_client_configured?: boolean;
+  oauth_custom_client_configured?: boolean;
   oauth_client_config_service?: string;
   oauth_client_redirect_uri_supported?: boolean;
   oauth_service_account_configured?: boolean;
+  oauth_reset_required?: boolean;
   status_error?: string;
   config_service?: string;
+  oauth_fallback_fields?: string[];
+  manual_auth_configured?: boolean;
+  environment_auth_configured?: boolean;
 }
 
 export interface IntegrationScope {

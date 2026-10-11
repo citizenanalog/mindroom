@@ -8,6 +8,8 @@ import types
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 
 @pytest.fixture
@@ -34,25 +36,92 @@ def test_get_output_dir_for_standard_build_stays_out_of_dist(
     tmp_path: Path,
 ) -> None:
     """Wheel builds should not leave non-package artifacts in the publish directory."""
-    frontend_dir = tmp_path / "frontend"
     build_dir = tmp_path / "dist"
 
-    output_dir = hatch_build_module._get_output_dir(frontend_dir, str(build_dir), "standard")
+    output_dir = hatch_build_module._get_output_dir(tmp_path / "frontend", str(build_dir), "standard")
 
     assert output_dir == tmp_path / ".frontend-build" / "frontend-dist"
     assert output_dir.parent != build_dir
 
 
-def test_get_output_dir_for_editable_build_uses_repo_frontend_dist(
+def test_editable_build_skips_frontend_build_even_when_bun_is_available(
     hatch_build_module: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Editable installs should still write to the repo frontend dist directory."""
+    """Editable installs should not build bundled dashboard assets."""
     frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    hook = hatch_build_module.FrontendBuildHook()
+    hook.target_name = "wheel"
+    hook.root = str(tmp_path)
+    hook.directory = str(tmp_path / "dist")
+    build_calls: list[tuple[Path, Path, str]] = []
 
-    output_dir = hatch_build_module._get_output_dir(frontend_dir, str(tmp_path / "dist"), "editable")
+    def fake_build_frontend(frontend: Path, output: Path, bun: str) -> None:
+        build_calls.append((frontend, output, bun))
 
-    assert output_dir == frontend_dir / "dist"
+    monkeypatch.setattr(
+        hatch_build_module.shutil,
+        "which",
+        lambda name: "/usr/local/bin/bun" if name == "bun" else None,
+    )
+    monkeypatch.setattr(hatch_build_module, "_build_frontend", fake_build_frontend)
+
+    hook.initialize("editable", {})
+
+    assert build_calls == []
+
+
+def test_editable_build_env_opt_in_builds_repo_frontend_dist(
+    hatch_build_module: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Editable installs should build frontend/dist when explicitly requested."""
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    hook = hatch_build_module.FrontendBuildHook()
+    hook.target_name = "wheel"
+    hook.root = str(tmp_path)
+    hook.directory = str(tmp_path / "dist")
+    build_calls: list[tuple[Path, Path, str]] = []
+    build_data: dict[str, object] = {}
+
+    def fake_build_frontend(frontend: Path, output: Path, bun: str) -> None:
+        build_calls.append((frontend, output, bun))
+
+    monkeypatch.setenv(hatch_build_module._BUILD_FRONTEND_ENV, "1")
+    monkeypatch.setattr(
+        hatch_build_module.shutil,
+        "which",
+        lambda name: "/usr/local/bin/bun" if name == "bun" else None,
+    )
+    monkeypatch.setattr(hatch_build_module, "_build_frontend", fake_build_frontend)
+
+    hook.initialize("editable", build_data)
+
+    assert build_calls == [(frontend_dir, frontend_dir / "dist", "/usr/local/bin/bun")]
+    assert build_data == {}
+
+
+def test_editable_build_env_opt_in_requires_bun(
+    hatch_build_module: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit editable frontend build should fail rather than skip missing Bun."""
+    (tmp_path / "frontend").mkdir()
+    hook = hatch_build_module.FrontendBuildHook()
+    hook.target_name = "wheel"
+    hook.root = str(tmp_path)
+    hook.directory = str(tmp_path / "dist")
+
+    monkeypatch.setenv(hatch_build_module._BUILD_FRONTEND_ENV, "1")
+    monkeypatch.setattr(hatch_build_module.shutil, "which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="MINDROOM_BUILD_FRONTEND=1"):
+        hook.initialize("editable", {})
 
 
 def test_run_command_retries_once_before_succeeding(
@@ -124,6 +193,21 @@ def test_build_frontend_retries_bun_install_only(
             1,
             0.0,
         ),
+        (
+            [
+                "/usr/local/bin/bun",
+                "run",
+                "vite",
+                "build",
+                "--config",
+                "vite.connections.config.ts",
+                "--outDir",
+                str(output_dir / "connections"),
+            ],
+            frontend_dir,
+            1,
+            0.0,
+        ),
     ]
 
 
@@ -155,12 +239,12 @@ def test_build_frontend_rejects_git_lfs_pointer_assets(
         hatch_build_module._build_frontend(frontend_dir, output_dir, "/usr/local/bin/bun")
 
 
-def test_dashboard_shell_uses_canonical_png_logo() -> None:
-    """The installed dashboard should use the canonical PNG logo assets."""
+def test_dashboard_shell_uses_canonical_logo_exports() -> None:
+    """The installed dashboard uses the SVG mark and generated PNG favicon."""
     repo_root = Path(__file__).resolve().parents[1]
 
     assert 'href="/favicon.png"' in (repo_root / "frontend/index.html").read_text()
-    assert 'src="/logo.png"' in (repo_root / "frontend/src/App.tsx").read_text()
+    assert 'src="/logo.svg"' in (repo_root / "frontend/src/App.tsx").read_text()
 
 
 def test_wheel_force_include_does_not_bundle_avatar_assets() -> None:
@@ -171,3 +255,33 @@ def test_wheel_force_include_does_not_bundle_avatar_assets() -> None:
     force_include = data["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
 
     assert "avatars" not in force_include
+
+
+def test_runtime_dependency_requires_released_durable_nio() -> None:
+    """The wheel requires the release that copies deeply nested event trees without recursion."""
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    dependencies = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+    requirement = Requirement(
+        next(dependency for dependency in dependencies if dependency.startswith("mindroom-nio")),
+    )
+
+    assert requirement.name == "mindroom-nio"
+    assert requirement.extras == {"e2e"}
+    assert requirement.url is None
+    assert Version("0.40.0") not in requirement.specifier
+    assert Version("1.0.0") not in requirement.specifier
+    assert Version("1.0.1") not in requirement.specifier
+    assert Version("1.0.2") not in requirement.specifier
+    assert Version("1.0.3") not in requirement.specifier
+    assert Version("1.0.4") not in requirement.specifier
+    assert Version("1.0.5") not in requirement.specifier
+    assert Version("1.0.6") not in requirement.specifier
+    assert Version("1.0.7") not in requirement.specifier
+    assert Version("1.0.8") not in requirement.specifier
+    assert Version("1.0.9") not in requirement.specifier
+    assert Version("1.1.0") not in requirement.specifier
+    assert Version("1.1.1") not in requirement.specifier
+    assert Version("1.1.2") not in requirement.specifier
+    assert Version("1.1.3") not in requirement.specifier
+    assert Version("1.1.4") in requirement.specifier
+    assert Version("2.0.0") not in requirement.specifier

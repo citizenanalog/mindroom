@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from mindroom.authorization import is_sender_allowed_for_agent_reply, responder_candidate_entities_for_room
-from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths
-from mindroom.dispatch_source import ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND
+from mindroom.authorization import (
+    ReplyMembershipPendingError,
+    classify_responder_candidates_from_cached_room,
+    configured_responder_entities_for_room,
+    get_available_responders_in_room,
+    is_sender_allowed_for_agent_reply_in_room,
+    is_sender_allowed_for_responder,
+)
+from mindroom.constants import MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY, ROUTER_AGENT_NAME, RuntimePaths
+from mindroom.dispatch_source import ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND, ScheduledHistoryBudget
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.hooks import (
     EVENT_MESSAGE_ENRICH,
@@ -26,6 +33,7 @@ from mindroom.hooks import (
     render_enrichment_block,
 )
 from mindroom.inbound_turn_normalizer import DispatchPayload
+from mindroom.managed_room_notice import managed_room_notice, responder_display_names
 from mindroom.responder_availability import (
     filter_materializable_responders,
     live_responder_entity_names,
@@ -34,6 +42,7 @@ from mindroom.responder_availability import (
 from mindroom.runtime_protocols import SupportsClientConfigOrchestrator  # noqa: TC001
 from mindroom.teams import (
     TeamIntent,
+    TeamMemberStatus,
     TeamMode,
     TeamOutcome,
     TeamResolution,
@@ -41,11 +50,12 @@ from mindroom.teams import (
     resolve_configured_team,
 )
 from mindroom.thread_utils import (
+    AgentResponseDecision,
+    decide_agent_response,
     get_agents_in_thread,
     get_all_mentioned_agents_in_thread,
     has_multiple_non_agent_users_in_thread,
     is_router_only_agent_mention,
-    should_agent_respond,
     thread_requires_explicit_agent_targeting,
 )
 from mindroom.timing import emit_elapsed_timing, timed
@@ -56,10 +66,17 @@ if TYPE_CHECKING:
     import nio
     import structlog
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+    from mindroom.authorization import ResponderCandidatePermissions
+    from mindroom.config.participation import ParticipationConfig
     from mindroom.conversation_resolver import MessageContext
-    from mindroom.dispatch_handoff import DispatchEvent, MediaDispatchEvent, TextDispatchEvent
+    from mindroom.dispatch_handoff import DispatchEvent, MediaDispatchEvent, PreparedIngress
     from mindroom.matrix.identity import MatrixID
     from mindroom.message_target import MessageTarget
+
+
+def _without_runtime_owned_enrichment(items: list[EnrichmentItem]) -> list[EnrichmentItem]:
+    return [item for item in items if item.key != MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY]
 
 
 @dataclass(frozen=True)
@@ -69,6 +86,7 @@ class ResponseAction:
     kind: Literal["skip", "team", "individual", "reject"]
     form_team: TeamResolution | None = None
     rejection_message: str | None = None
+    participation: ParticipationConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,9 @@ class PreparedDispatch:
     target: MessageTarget
     correlation_id: str
     envelope: MessageEnvelope
+    current_prompt_is_structured: bool = False
+    scheduled_history_budget: ScheduledHistoryBudget | None = None
+    scheduled_model: str | None = None
 
     def __post_init__(self) -> None:
         """Require the prepared envelope and dispatch target to describe the same delivery."""
@@ -104,8 +125,10 @@ class _DispatchPlan:
 _ROUTER_ONLY_MENTION_GUIDANCE = (
     "🧭 Rules of engagement: mention a specific agent or team when you want that entity to answer, or mention "
     "multiple agents when you want an ad-hoc collaboration. If one human and one agent or team are already talking "
-    "in a thread, you can keep going without an explicit tag. Once a thread has multiple human users or multiple "
-    "agent/team participants, explicitly tag the agent, team, or agents you want next. In a new untagged message, "
+    "in a thread, you can keep going without an explicit tag. Explicit tags select who answers next; an untagged "
+    "single-human thread may also continue an eligible ad-hoc team of participating individual agents. "
+    "In multi-human threads, explicitly tag who should answer; eligible existing individual agents may opt into "
+    "adaptive participation, but teams do not form automatically. In a new untagged message, "
     "automatic routing can still choose an agent or team when appropriate. The router is not a conversational AI "
     "agent you can tag directly."
 )
@@ -117,7 +140,7 @@ class _PreparedHookedPayload:
 
     payload: DispatchPayload
     envelope: MessageEnvelope
-    system_enrichment_items: tuple[EnrichmentItem, ...]
+    transient_enrichment_items: tuple[EnrichmentItem, ...]
 
 
 @dataclass
@@ -159,13 +182,11 @@ class IngressHookRunner:
         started = time.monotonic()
         hook_registered = self.hook_context.registry.has_hooks(EVENT_MESSAGE_ENRICH)
         item_count = 0
+        transient_enrichment_items: tuple[EnrichmentItem, ...] = ()
 
         envelope = MessageEnvelope(
             source_event_id=dispatch.envelope.source_event_id,
-            room_id=dispatch.envelope.room_id,
             target=dispatch.envelope.target,
-            requester_id=dispatch.envelope.requester_id,
-            sender_id=dispatch.envelope.sender_id,
             body=dispatch.envelope.body,
             attachment_ids=(
                 tuple(payload.attachment_ids)
@@ -174,7 +195,6 @@ class IngressHookRunner:
             ),
             mentioned_agents=dispatch.envelope.mentioned_agents,
             agent_name=target_entity_name,
-            source_kind=dispatch.envelope.source_kind,
             hook_source=dispatch.envelope.hook_source,
             message_received_depth=dispatch.envelope.message_received_depth,
             dispatch_policy_source_kind=dispatch.envelope.dispatch_policy_source_kind,
@@ -188,10 +208,14 @@ class IngressHookRunner:
                 target_entity_name=target_entity_name,
                 target_member_names=target_member_names,
             )
-            items = await emit_collect(self.hook_context.registry, EVENT_MESSAGE_ENRICH, context)
+            items = _without_runtime_owned_enrichment(
+                await emit_collect(self.hook_context.registry, EVENT_MESSAGE_ENRICH, context),
+            )
             item_count = len(items)
-            if items:
-                enrichment_block = render_enrichment_block(items)
+            persisted_items = [item for item in items if item.persist]
+            transient_enrichment_items = tuple(item for item in items if not item.persist)
+            if persisted_items:
+                enrichment_block = render_enrichment_block(persisted_items)
                 base_model_prompt = payload.model_prompt if payload.model_prompt is not None else payload.prompt
                 model_prompt = f"{base_model_prompt.rstrip()}\n\n{enrichment_block}"
 
@@ -211,7 +235,7 @@ class IngressHookRunner:
                 attachment_ids=payload.attachment_ids,
             ),
             envelope=envelope,
-            system_enrichment_items=(),
+            transient_enrichment_items=transient_enrichment_items,
         )
 
     async def apply_system_enrichment(
@@ -245,7 +269,11 @@ class IngressHookRunner:
             target_entity_name=target_entity_name,
             target_member_names=target_member_names,
         )
-        return finish(await emit_collect(self.hook_context.registry, EVENT_SYSTEM_ENRICH, context))
+        return finish(
+            _without_runtime_owned_enrichment(
+                await emit_collect(self.hook_context.registry, EVENT_SYSTEM_ENRICH, context),
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -257,6 +285,19 @@ class TurnPolicyDeps:
     runtime_paths: RuntimePaths
     agent_name: str
     matrix_id: MatrixID
+    agent_reply_memberships: AgentReplyMembershipIndex
+
+
+@dataclass(frozen=True)
+class _ResponderAvailability:
+    """Point-in-time responder availability threaded through one decision flow.
+
+    ``None`` values mean live runtime state is unknown, so availability
+    filtering must not narrow responder candidates.
+    """
+
+    materializable_agent_names: set[str] | None
+    live_entity_names: set[str] | None
 
 
 @dataclass(frozen=True)
@@ -265,71 +306,143 @@ class TurnPolicy:
 
     deps: TurnPolicyDeps
 
-    def can_reply_to_sender(self, sender_id: str) -> bool:
-        """Return whether this entity may reply to ``sender_id``."""
-        return is_sender_allowed_for_agent_reply(
+    def can_reply_to_sender_in_room(
+        self,
+        sender_id: str,
+        room_id: str,
+        *,
+        observed_room: nio.MatrixRoom | None = None,
+    ) -> bool:
+        """Decide durable turn access, retrying unresolved membership before settlement.
+
+        ``observed_room`` is this bot's own view of the room; it only lets a denial wait for the router's join.
+        """
+        return is_sender_allowed_for_agent_reply_in_room(
             sender_id,
             self.deps.agent_name,
+            self.deps.runtime.config,
+            room_id,
+            self.deps.runtime_paths,
+            self.deps.agent_reply_memberships,
+            require_resolved_membership=True,
+            observed_room=observed_room,
+        )
+
+    def _adaptive_thread_participation(
+        self,
+        context: MessageContext,
+        requester_user_id: str,
+    ) -> ParticipationConfig | None:
+        """Resolve this agent's participation for proven untagged multi-human context."""
+        agent = self.deps.runtime.config.agents.get(self.deps.agent_name)
+        participation = agent.participation if agent is not None else None
+        if (
+            participation is not None
+            and context.is_thread
+            and not context.planning_thread_history_unavailable
+            and not context.mentioned_agents
+            and not context.am_i_mentioned
+            and not context.has_non_agent_mentions
+            and has_multiple_non_agent_users_in_thread(
+                context.planning_thread_history,
+                self.deps.runtime.config,
+                self.deps.runtime_paths,
+                current_sender_id=requester_user_id,
+            )
+        ):
+            return participation
+        return None
+
+    def _is_participating_thread_agent(self, context: MessageContext) -> bool:
+        """Only individual agents that have already replied may judge continuation."""
+        return self.deps.agent_name in self.deps.runtime.config.agents and self.deps.matrix_id in get_agents_in_thread(
+            context.planning_thread_history,
             self.deps.runtime.config,
             self.deps.runtime_paths,
         )
 
-    def materializable_agent_names(self) -> set[str] | None:
-        """Return live shared agent names that can currently answer."""
+    def adaptive_participation(
+        self,
+        *,
+        context: MessageContext,
+        room: nio.MatrixRoom,
+        requester_user_id: str,
+    ) -> ParticipationConfig | None:
+        """Select an authorized existing agent for a proven multi-human thread."""
+        participation = self._adaptive_thread_participation(context, requester_user_id)
+        if participation is None or not self._is_participating_thread_agent(context):
+            return None
+        candidates = classify_responder_candidates_from_cached_room(
+            room,
+            requester_user_id,
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+            self.deps.agent_reply_memberships,
+        )
+        available = self._filter_materializable_responders(candidates.allowed, self.responder_availability())
+        return participation if self.deps.matrix_id in available else None
+
+    def responder_availability(self) -> _ResponderAvailability:
+        """Snapshot in-memory responder liveness for one decision flow.
+
+        Each decision flow takes a fresh snapshot on entry and passes it down
+        instead of recomputing; snapshots are deliberately not cached on this
+        long-lived policy object because liveness changes between turns.
+        """
         materializable_agent_names = materializable_agent_names_for_orchestrator(
             self.deps.runtime.orchestrator,
             self.deps.runtime.config,
         )
         if materializable_agent_names is not None and self.deps.agent_name in self.deps.runtime.config.agents:
             materializable_agent_names = materializable_agent_names | {self.deps.agent_name}
-        return materializable_agent_names
-
-    def filter_materializable_responders(
-        self,
-        responder_ids: list[MatrixID],
-        materializable_agent_names: set[str] | None,
-        *,
-        live_entity_names: set[str] | None = None,
-    ) -> list[MatrixID]:
-        """Keep only materializable responder candidates when live state is known."""
-        if live_entity_names is None and materializable_agent_names is not None:
-            live_entity_names = live_responder_entity_names(
+        live_entity_names = (
+            live_responder_entity_names(
                 self.deps.runtime.orchestrator,
                 self.deps.runtime.config,
             )
+            if materializable_agent_names is not None
+            else None
+        )
+        return _ResponderAvailability(
+            materializable_agent_names=materializable_agent_names,
+            live_entity_names=live_entity_names,
+        )
+
+    def _filter_materializable_responders(
+        self,
+        responder_ids: list[MatrixID],
+        availability: _ResponderAvailability,
+    ) -> list[MatrixID]:
+        """Keep only materializable responder candidates when live state is known."""
         return filter_materializable_responders(
             responder_ids,
             self.deps.runtime.config,
             self.deps.runtime_paths,
-            materializable_agent_names=materializable_agent_names,
-            live_entity_names=live_entity_names,
+            materializable_agent_names=availability.materializable_agent_names,
+            live_entity_names=availability.live_entity_names,
         )
 
     async def responder_candidates_for_room(
         self,
         room: nio.MatrixRoom,
         requester_user_id: str,
-        *,
-        materializable_agent_names: set[str] | None = None,
-        live_entity_names: set[str] | None = None,
+        availability: _ResponderAvailability | None = None,
     ) -> list[MatrixID]:
-        """Return sender-visible candidates filtered by live responder availability."""
-        available_responders = await responder_candidate_entities_for_room(
-            self.deps.runtime.client,
+        """Return candidates from the boundary-prepared room membership snapshot."""
+        if availability is None:
+            availability = self.responder_availability()
+        candidates = classify_responder_candidates_from_cached_room(
             room,
             requester_user_id,
             self.deps.runtime.config,
             self.deps.runtime_paths,
+            self.deps.agent_reply_memberships,
         )
-        if materializable_agent_names is None:
-            materializable_agent_names = self.materializable_agent_names()
-        return self.filter_materializable_responders(
-            available_responders,
-            materializable_agent_names,
-            live_entity_names=live_entity_names,
-        )
+        if self._filter_materializable_responders(candidates.pending, availability):
+            raise ReplyMembershipPendingError
+        return self._filter_materializable_responders(candidates.allowed, availability)
 
-    def response_owner_for_team_resolution(
+    def _response_owner_for_team_resolution(
         self,
         form_team: TeamResolution,
         responder_pool: list[MatrixID],
@@ -338,27 +451,105 @@ class TurnPolicy:
         if form_team.outcome is TeamOutcome.NONE:
             return None
 
-        response_owners = form_team.eligible_members
-        if (
-            not response_owners
-            and form_team.outcome is TeamOutcome.REJECT
-            and form_team.intent is TeamIntent.EXPLICIT_MEMBERS
-        ):
-            response_owners = responder_pool
+        if self._requires_shared_owner_for_explicit_private_resolution(form_team):
+            return self._shared_owner_for_explicit_private_resolution(form_team, responder_pool)
 
+        response_owner = self._select_response_owner(
+            self._eligible_responder_owners(form_team, responder_pool),
+        )
+        if response_owner is not None:
+            return response_owner
+
+        if form_team.intent is TeamIntent.EXPLICIT_MEMBERS and form_team.outcome is TeamOutcome.REJECT:
+            # A reject can be visible even when no requested member is eligible;
+            # explicit configured-team rejects rely on this when the team bot is
+            # the only live responder.
+            return self._select_response_owner(responder_pool)
+
+        return None
+
+    @staticmethod
+    def _select_response_owner(response_owners: list[MatrixID]) -> MatrixID | None:
+        """Return the stable visible owner from one candidate set."""
         if not response_owners:
             return None
         return min(response_owners, key=lambda value: value.full_id)
 
-    def team_response_action(
+    @staticmethod
+    def _eligible_responder_owners(
+        form_team: TeamResolution,
+        responder_pool: list[MatrixID],
+    ) -> list[MatrixID]:
+        """Return eligible team members that are present in the live responder pool."""
+        responder_pool_ids = {responder.full_id for responder in responder_pool}
+        return [member for member in form_team.eligible_members if member.full_id in responder_pool_ids]
+
+    def _shared_owner_for_explicit_private_resolution(
         self,
         form_team: TeamResolution,
         responder_pool: list[MatrixID],
+    ) -> MatrixID | None:
+        """Return a live shared-agent owner for a private explicit team or reject."""
+        shared_agent_responders = self._live_shared_agent_responders(responder_pool)
+        shared_responder_ids = {responder.full_id for responder in shared_agent_responders}
+        shared_eligible_owners = [
+            member for member in form_team.eligible_members if member.full_id in shared_responder_ids
+        ]
+        return self._select_response_owner(shared_eligible_owners or shared_agent_responders)
+
+    def _requires_shared_owner_for_explicit_private_resolution(self, form_team: TeamResolution) -> bool:
+        """Return whether a private ad hoc team resolution needs a shared visible owner."""
+        if form_team.intent is not TeamIntent.EXPLICIT_MEMBERS:
+            return False
+        if form_team.outcome not in {TeamOutcome.TEAM, TeamOutcome.REJECT}:
+            return False
+
+        registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
+        members = [*form_team.requested_members, *form_team.eligible_members]
+        for member in members:
+            entity_name = registry.current_entity_name_for_user_id(member.full_id, include_router=False)
+            if entity_name is None:
+                continue
+            agent_config = self.deps.runtime.config.agents.get(entity_name)
+            if agent_config is not None and agent_config.private is not None:
+                return True
+        return False
+
+    def _live_shared_agent_responders(self, responder_pool: list[MatrixID]) -> list[MatrixID]:
+        """Return fallback responders that can execute ad hoc team runs as agents."""
+        registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
+        shared_responders: list[MatrixID] = []
+        for responder in responder_pool:
+            entity_name = registry.current_entity_name_for_user_id(responder.full_id)
+            if entity_name is None:
+                continue
+            agent_config = self.deps.runtime.config.agents.get(entity_name)
+            if agent_config is not None and agent_config.private is None:
+                shared_responders.append(responder)
+        return shared_responders
+
+    def _team_response_action(
+        self,
+        form_team: TeamResolution,
+        responder_pool: list[MatrixID],
+        pending_responders: list[MatrixID],
     ) -> ResponseAction | None:
-        """Return the response action implied by one team resolution."""
+        """Resolve one team outcome only when its execution and visible owner are proven."""
         if form_team.outcome is TeamOutcome.NONE:
             return None
-        response_owner = self.response_owner_for_team_resolution(form_team, responder_pool)
+        pending_ids = {responder.full_id for responder in pending_responders}
+        if form_team.outcome is not TeamOutcome.REJECT and any(
+            member.full_id in pending_ids for member in form_team.eligible_members
+        ):
+            raise ReplyMembershipPendingError
+        response_owner = self._response_owner_for_team_resolution(form_team, responder_pool)
+        if pending_ids:
+            resolved_pool = [responder for responder in responder_pool if responder.full_id not in pending_ids]
+            resolved_owner = self._response_owner_for_team_resolution(form_team, resolved_pool)
+            # A proven rejection may proceed only if every remaining membership
+            # outcome chooses the same authorized visible owner.
+            if response_owner != resolved_owner:
+                raise ReplyMembershipPendingError
         if response_owner is None:
             return ResponseAction(kind="skip")
         if self.deps.matrix_id != response_owner:
@@ -374,10 +565,9 @@ class TurnPolicy:
             rejection_message=form_team.reason,
         )
 
-    def configured_team_response_action(
+    def _configured_team_response_action(
         self,
-        *,
-        materializable_agent_names: set[str] | None = None,
+        availability: _ResponderAvailability,
     ) -> ResponseAction | None:
         """Return the configured-team response action for this bot when it represents a team."""
         team_config = self.deps.runtime.config.teams.get(self.deps.agent_name)
@@ -386,15 +576,13 @@ class TurnPolicy:
         configured_mode = TeamMode.COORDINATE if team_config.mode == "coordinate" else TeamMode.COLLABORATE
         registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
         team_agents = [registry.current_id(agent_name) for agent_name in team_config.agents]
-        if materializable_agent_names is None:
-            materializable_agent_names = self.materializable_agent_names()
         team_resolution = resolve_configured_team(
             self.deps.agent_name,
             team_agents,
             configured_mode,
             self.deps.runtime.config,
             self.deps.runtime_paths,
-            materializable_agent_names=materializable_agent_names,
+            materializable_agent_names=availability.materializable_agent_names,
         )
         if team_resolution.outcome is TeamOutcome.TEAM:
             return ResponseAction(kind="team", form_team=team_resolution)
@@ -410,23 +598,21 @@ class TurnPolicy:
         """Apply configured-team execution behavior before running one response action."""
         if action.kind != "individual":
             return action
-        configured_team_action = self.configured_team_response_action()
+        configured_team_action = self._configured_team_response_action(self.responder_availability())
         return configured_team_action or action
 
-    def explicit_configured_team_rejection_action(
+    def _explicit_configured_team_rejection_action(
         self,
         context: MessageContext,
         sender_visible_responders: list[MatrixID],
-        *,
-        materializable_agent_names: set[str] | None,
-        live_entity_names: set[str] | None,
+        availability: _ResponderAvailability,
     ) -> ResponseAction | None:
         """Return the explicit configured-team rejection action for this live team bot."""
         if self.deps.agent_name not in self.deps.runtime.config.teams:
             return None
         if not context.am_i_mentioned:
             return None
-        if live_entity_names is not None and self.deps.agent_name not in live_entity_names:
+        if availability.live_entity_names is not None and self.deps.agent_name not in availability.live_entity_names:
             return None
 
         registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
@@ -435,24 +621,21 @@ class TurnPolicy:
         if team_matrix_id.full_id not in sender_visible_ids:
             return None
 
-        configured_team_action = self.configured_team_response_action(
-            materializable_agent_names=materializable_agent_names,
-        )
+        configured_team_action = self._configured_team_response_action(availability)
         if configured_team_action is None or configured_team_action.kind != "reject":
             return None
         return configured_team_action
 
-    async def decide_team_for_sender(
+    async def _decide_team_for_sender(
         self,
         agents_in_thread: list[MatrixID],
         context: MessageContext,
         room: nio.MatrixRoom,
         requester_user_id: str,
-        message: str,
         is_dm: bool,
         *,
+        availability: _ResponderAvailability,
         available_responders_in_room: list[MatrixID] | None = None,
-        materializable_agent_names: set[str] | None = None,
     ) -> TeamResolution:
         """Decide team formation using sender-visible candidates without losing explicit intent."""
         planning_thread_history = context.planning_thread_history
@@ -472,30 +655,27 @@ class TurnPolicy:
             self.deps.runtime.config,
             self.deps.runtime_paths,
         )
-        if materializable_agent_names is None:
-            materializable_agent_names = self.materializable_agent_names()
         if available_responders_in_room is None:
             available_responders_in_room = await self.responder_candidates_for_room(
                 room,
                 requester_user_id,
-                materializable_agent_names=materializable_agent_names,
+                availability,
             )
-        return await decide_team_formation(
-            self.deps.matrix_id,
+        return decide_team_formation(
             context.mentioned_agents,
             agents_in_thread,
             all_mentioned_in_thread,
             room=room,
-            message=message,
             config=self.deps.runtime.config,
             runtime_paths=self.deps.runtime_paths,
             is_dm_room=is_dm,
             is_thread=context.is_thread,
             available_responders_in_room=available_responders_in_room,
-            materializable_agent_names=materializable_agent_names,
+            materializable_agent_names=availability.materializable_agent_names,
+            allow_explicit_private_agents=True,
         )
 
-    async def plan_router_dispatch(
+    async def _plan_router_dispatch(
         self,
         room: nio.MatrixRoom,
         event: DispatchEvent,
@@ -519,6 +699,8 @@ class TurnPolicy:
             config=self.deps.runtime.config,
             runtime_paths=self.deps.runtime_paths,
         ):
+            if not self.can_reply_to_sender_in_room(requester_user_id, room.room_id):
+                return _DispatchPlan(kind="ignore", ignore_reason="router")
             plan = _DispatchPlan(
                 kind="respond",
                 response_action=ResponseAction(
@@ -532,15 +714,15 @@ class TurnPolicy:
             self.deps.logger.info("Skipping routing: thread policy history unavailable")
             plan = _DispatchPlan(kind="ignore", ignore_reason="router")
         else:
-            available_responders = await self.responder_candidates_for_room(
-                room,
-                requester_user_id,
-            )
+            if not self.can_reply_to_sender_in_room(requester_user_id, room.room_id):
+                return _DispatchPlan(kind="ignore", ignore_reason="router")
+            available_responders = await self.responder_candidates_for_room(room, requester_user_id)
             if context.is_thread and thread_requires_explicit_agent_targeting(
                 planning_thread_history,
                 sender_id=requester_user_id,
                 config=self.deps.runtime.config,
                 runtime_paths=self.deps.runtime_paths,
+                membership_index=self.deps.agent_reply_memberships,
                 available_responders_in_room=available_responders,
             ):
                 self.deps.logger.info("Skipping routing: thread already requires explicit responder targeting")
@@ -562,7 +744,7 @@ class TurnPolicy:
     async def plan_turn(
         self,
         room: nio.MatrixRoom,
-        event: TextDispatchEvent,
+        event: PreparedIngress,
         dispatch: PreparedDispatch,
         *,
         is_dm: bool,
@@ -572,7 +754,7 @@ class TurnPolicy:
         router_event: DispatchEvent | None = None,
     ) -> _DispatchPlan:
         """Return the explicit policy plan for one prepared inbound turn."""
-        router_plan = await self.plan_router_dispatch(
+        router_plan = await self._plan_router_dispatch(
             room,
             event,
             dispatch,
@@ -584,10 +766,9 @@ class TurnPolicy:
         if router_plan is not None:
             return router_plan
 
-        action = await self.resolve_response_action(
+        action = await self._resolve_response_action(
             dispatch,
             room,
-            event.body,
             is_dm,
             has_active_response_for_target=has_active_response_for_target,
         )
@@ -595,11 +776,28 @@ class TurnPolicy:
             return _DispatchPlan(kind="ignore")
         return _DispatchPlan(kind="respond", response_action=action)
 
-    async def resolve_response_action(
+    def _adaptive_response_action(
+        self,
+        dispatch: PreparedDispatch,
+        available_responders: list[MatrixID],
+    ) -> ResponseAction | None:
+        """Select participation for ambient turns, including coalesced active follow-ups."""
+        if not dispatch.envelope.origin.may_answer_interactive_prompt:
+            return None
+        participation = self._adaptive_thread_participation(
+            dispatch.context,
+            dispatch.requester_user_id,
+        )
+        if participation is None:
+            return None
+        if not self._is_participating_thread_agent(dispatch.context) or self.deps.matrix_id not in available_responders:
+            return ResponseAction(kind="skip")
+        return ResponseAction(kind="individual", participation=participation)
+
+    async def _resolve_response_action(  # noqa: PLR0911
         self,
         dispatch: PreparedDispatch,
         room: nio.MatrixRoom,
-        message: str,
         is_dm: bool,
         *,
         has_active_response_for_target: Callable[[MessageTarget], bool],
@@ -608,37 +806,34 @@ class TurnPolicy:
         context = dispatch.context
         requester_user_id = dispatch.requester_user_id
         planning_thread_history = context.planning_thread_history
-        materializable_agent_names = self.materializable_agent_names()
-        live_entity_names = (
-            live_responder_entity_names(
-                self.deps.runtime.orchestrator,
-                self.deps.runtime.config,
-            )
-            if materializable_agent_names is not None
-            else None
-        )
-        sender_visible_responders_in_room = await responder_candidate_entities_for_room(
-            self.deps.runtime.client,
+        availability = self.responder_availability()
+        candidates = classify_responder_candidates_from_cached_room(
             room,
             requester_user_id,
             self.deps.runtime.config,
             self.deps.runtime_paths,
+            self.deps.agent_reply_memberships,
         )
-        available_responders_in_room = self.filter_materializable_responders(
-            sender_visible_responders_in_room,
-            materializable_agent_names=materializable_agent_names,
-            live_entity_names=live_entity_names,
-        )
+        available_responders_in_room = self._filter_materializable_responders(candidates.allowed, availability)
+        pending_responders_in_room = self._filter_materializable_responders(candidates.pending, availability)
         registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
         agent_matrix_id = registry.current_id(self.deps.agent_name)
-        agent_is_responder_candidate = agent_matrix_id.full_id in {
-            responder.full_id for responder in available_responders_in_room
-        }
-        team_action = self.explicit_configured_team_rejection_action(
+        agent_is_responder_candidate = agent_matrix_id in available_responders_in_room
+        if not self._has_resolved_planning_candidates(
             context,
-            sender_visible_responders_in_room,
-            materializable_agent_names=materializable_agent_names,
-            live_entity_names=live_entity_names,
+            candidates,
+            available_responders_in_room,
+            pending_responders_in_room,
+        ):
+            return ResponseAction(kind="skip")
+
+        # Pending members remain possible for team intent and definitive rejection.
+        # They never authorize execution; the team action validates that below.
+        sender_visible_responders_in_room = [*candidates.allowed, *candidates.pending]
+        team_action = self._explicit_configured_team_rejection_action(
+            context,
+            candidates.allowed,
+            availability,
         )
         if (
             context.planning_thread_history_unavailable
@@ -661,6 +856,9 @@ class TurnPolicy:
             if should_continue_active_thread or single_visible_self:
                 return ResponseAction(kind="individual")
             return ResponseAction(kind="skip")
+        participation_action = self._adaptive_response_action(dispatch, available_responders_in_room)
+        if participation_action is not None:
+            return participation_action
         agents_in_thread = get_agents_in_thread(
             planning_thread_history,
             self.deps.runtime.config,
@@ -669,21 +867,29 @@ class TurnPolicy:
         if team_action is None:
             # Use sender-visible responders here so explicit team requests can distinguish
             # hidden members from visible-but-not-materializable members.
-            form_team = await self.decide_team_for_sender(
+            form_team = await self._decide_team_for_sender(
                 agents_in_thread,
                 context,
                 room,
                 requester_user_id,
-                message,
                 is_dm,
+                availability=availability,
                 available_responders_in_room=sender_visible_responders_in_room,
-                materializable_agent_names=materializable_agent_names,
             )
-            team_action = self.team_response_action(form_team, available_responders_in_room)
+            team_action = self._explain_managed_room_team_rejection(
+                self._team_response_action(
+                    form_team,
+                    [*available_responders_in_room, *pending_responders_in_room],
+                    candidates.pending,
+                ),
+                room,
+                requester_user_id,
+                available_responders_in_room,
+            )
         if team_action is not None:
             return team_action
 
-        if not should_agent_respond(
+        agent_response_decision = decide_agent_response(
             agent_name=self.deps.agent_name,
             am_i_mentioned=context.am_i_mentioned,
             is_thread=context.is_thread,
@@ -691,21 +897,138 @@ class TurnPolicy:
             thread_history=planning_thread_history,
             config=self.deps.runtime.config,
             runtime_paths=self.deps.runtime_paths,
+            membership_index=self.deps.agent_reply_memberships,
             mentioned_agents=context.mentioned_agents,
             has_non_agent_mentions=context.has_non_agent_mentions,
             sender_id=requester_user_id,
             available_responders_in_room=available_responders_in_room,
-        ):
-            if agent_is_responder_candidate and self._should_queue_follow_up_in_active_response_thread(
+            agents_in_thread=agents_in_thread,
+            require_resolved_membership=True,
+        )
+        if not agent_response_decision.should_respond and agent_is_responder_candidate:
+            if self._should_queue_follow_up_in_active_response_thread(
                 context=context,
                 target=dispatch.target,
                 source_envelope=dispatch.envelope,
                 has_active_response_for_target=has_active_response_for_target,
             ):
                 return ResponseAction(kind="individual")
-            return ResponseAction(kind="skip")
+            self._log_multi_agent_thread_skip(context, agent_response_decision)
+        if rejection := self._unlisted_room_mention_rejection(
+            context,
+            room,
+            agent_response_decision,
+            available_responders_in_room,
+        ):
+            return rejection
+        return ResponseAction(kind="individual" if agent_response_decision.should_respond else "skip")
 
-        return ResponseAction(kind="individual")
+    def _unlisted_room_mention_rejection(
+        self,
+        context: MessageContext,
+        room: nio.MatrixRoom,
+        agent_response_decision: AgentResponseDecision,
+        available_responders: list[MatrixID],
+    ) -> ResponseAction | None:
+        """Explain a direct mention that the configured room's responder boundary excludes."""
+        if not context.am_i_mentioned or agent_response_decision.skip_reason != "agent_not_available":
+            return None
+        configured_responders = configured_responder_entities_for_room(
+            room,
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+        )
+        if configured_responders is None or self.deps.matrix_id in configured_responders:
+            return None
+        self.deps.logger.info("Rejecting mention: agent is not configured for this room", room_id=room.room_id)
+        return ResponseAction(
+            kind="reject",
+            rejection_message=managed_room_notice(available=self._display_names(available_responders)),
+        )
+
+    def _explain_managed_room_team_rejection(
+        self,
+        team_action: ResponseAction | None,
+        room: nio.MatrixRoom,
+        requester_user_id: str,
+        available_responders: list[MatrixID],
+    ) -> ResponseAction | None:
+        """Use the managed-room note when only that room's responder boundary rejected a team request."""
+        if team_action is None or team_action.kind != "reject" or team_action.form_team is None:
+            return team_action
+        rejected = [
+            member for member in team_action.form_team.member_statuses if member.status is not TeamMemberStatus.ELIGIBLE
+        ]
+        config = self.deps.runtime.config
+        configured_responders = configured_responder_entities_for_room(room, config, self.deps.runtime_paths)
+        if not rejected or configured_responders is None:
+            return team_action
+        configured_ids = {responder.full_id for responder in configured_responders}
+        joined_ids = {
+            responder.full_id for responder in get_available_responders_in_room(room, config, self.deps.runtime_paths)
+        }
+        if any(
+            member.agent.full_id in configured_ids
+            or member.agent.full_id not in joined_ids
+            or not is_sender_allowed_for_responder(
+                requester_user_id,
+                member.name,
+                room.room_id,
+                config,
+                self.deps.runtime_paths,
+                self.deps.agent_reply_memberships,
+            )
+            for member in rejected
+        ):
+            return team_action
+        return replace(
+            team_action,
+            rejection_message=managed_room_notice(
+                available=self._display_names(available_responders),
+                unavailable=[config.entity_display_name(member.name) for member in rejected],
+            ),
+        )
+
+    def _display_names(self, responders: list[MatrixID]) -> list[str]:
+        """Return the configured display names of responder Matrix IDs."""
+        return responder_display_names(responders, self.deps.runtime.config, self.deps.runtime_paths)
+
+    def _has_resolved_planning_candidates(
+        self,
+        context: MessageContext,
+        candidates: ResponderCandidatePermissions,
+        available_responders: list[MatrixID],
+        pending_responders: list[MatrixID],
+    ) -> bool:
+        """Require relevant grants while preserving proven absence of this owner."""
+        if not context.mentioned_agents and not context.has_non_agent_mentions:
+            if self.deps.matrix_id not in available_responders and self.deps.matrix_id not in pending_responders:
+                return False
+            if pending_responders:
+                raise ReplyMembershipPendingError
+        elif len(context.mentioned_agents) == 1 and context.mentioned_agents[0] in candidates.pending:
+            raise ReplyMembershipPendingError
+        return True
+
+    def _log_multi_agent_thread_skip(
+        self,
+        context: MessageContext,
+        agent_response_decision: AgentResponseDecision,
+    ) -> None:
+        """Log the multi-agent thread branch selected by individual response policy."""
+        if agent_response_decision.skip_reason != "multiple_agents_in_thread":
+            return
+
+        agents_in_thread = agent_response_decision.sender_visible_thread_agents
+        if len(agents_in_thread) < 2:
+            return
+
+        self.deps.logger.info(
+            "Skipping response: multiple agents in thread require explicit mention",
+            agent_name=self.deps.agent_name,
+            thread_id=context.thread_id,
+            agents_in_thread=[agent.full_id for agent in agents_in_thread],
+        )
 
     def _should_queue_follow_up_in_active_response_thread(
         self,

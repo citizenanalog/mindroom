@@ -1,16 +1,21 @@
 ---
-icon: lucide/user-round
+icon: simple/google
 ---
 
-# Google Services OAuth For Individuals
+# Google Services OAuth For Local Installs
 
-This guide is for one person running MindRoom with their own Google OAuth client.
-MindRoom uses per-service generic OAuth providers instead of a legacy all-Google route.
+This page explains how to connect Google Drive, Docs, Calendar, Sheets, Tasks, and Gmail on a paired local installation.
+Paired installations use MindRoom's Google OAuth client, so you do not need a Google Cloud project, callback URLs, or a client secret.
+Pair first with `mindroom connect`, or let `mindroom run` pair automatically on first run (see [Hosted Matrix](hosted-matrix.md)).
+The provisioned client works only when MindRoom is opened on a loopback address (`localhost`, `127.0.0.1`, or `::1`).
+For an unpaired install, a remote or public address, organization-specific Google policies, or your own consent-screen branding, set up a custom client instead (see [Custom Google Cloud Setup](google-services-oauth.md#custom-google-cloud-setup)).
+That page also lists the scopes each Google tool requests and how to restrict which Google accounts may connect.
 
 ## Choose Providers
 
-Enable only the APIs your agents need.
-Add the matching tool to the agent config.
+Add only the Google tools your agents need.
+Each Google Workspace tool connects and asks for Google approval separately.
+Google Cloud tools such as `google_bigquery` use one Google Cloud connection instead; see [Providers](google-services-oauth.md#providers).
 
 ```yaml
 agents:
@@ -20,53 +25,47 @@ agents:
     worker_scope: user_agent
     tools:
       - google_drive
+      - google_docs
       - google_calendar
       - google_sheets
+      - google_tasks
       - gmail
 ```
 
-## Create OAuth Credentials
-
-Open Google Cloud Console and create an OAuth client.
-Add one redirect URI per provider you use.
-
-```text
-http://localhost:8765/api/oauth/google_drive/callback
-http://localhost:8765/api/oauth/google_calendar/callback
-http://localhost:8765/api/oauth/google_sheets/callback
-http://localhost:8765/api/oauth/google_gmail/callback
-```
-
-## Configure MindRoom
-
-For a single personal OAuth client, store shared Google OAuth app client config under `google_oauth_client` through the dashboard credentials API or raw credentials editor:
-
-```json
-{
-  "client_id": "your-client-id.apps.googleusercontent.com",
-  "client_secret": "your-client-secret"
-}
-```
-
-For provider-specific client config, use `google_drive_oauth_client`, `google_calendar_oauth_client`, `google_sheets_oauth_client`, or `google_gmail_oauth_client`.
-Provider-specific client config wins over the shared `google_oauth_client` service.
-The shared `google_oauth_client` service supplies only the shared client ID and secret.
-MindRoom derives each provider's redirect URI from `MINDROOM_PUBLIC_URL` or the local default origin.
-MindRoom stores OAuth app client config separately from user OAuth tokens and never mirrors it into worker containers.
-First-time dashboard client setup requires `client_id` and `client_secret`.
-Later edits may leave `client_secret` blank only when `client_id` is unchanged.
-Changing `client_id` requires submitting the matching new `client_secret`.
-
-When using standalone dashboard API-key auth, also set `MINDROOM_OWNER_USER_ID` to your Matrix user ID, such as `@alice:matrix.example.com`.
-Do not use `MINDROOM_OWNER_USER_ID` as the identity model for hosted multi-user private agents.
-Use [Trusted Upstream Browser Auth](trusted-upstream-auth.md) for those deployments.
+`worker_scope` decides whose Google account the agent uses.
+With `user_agent`, each Matrix user connects their own account for this agent.
+With `shared`, everyone allowed to use the agent acts through one connected account and may receive its Google data in replies.
+See [Where Connections Are Stored](../oauth-framework.md#where-connections-are-stored) for every scope.
 
 ## Connect
 
-Open the MindRoom dashboard and connect the integration required by each tool.
-If an agent tries a Google tool before it is connected, the tool result includes a MindRoom connect URL for that exact provider and agent scope.
-After the browser OAuth flow completes, retry the original request.
+1. Ask the agent to do something safe with the Google tool, such as listing files or upcoming events.
+   If the account is not connected, the agent replies with a connect link.
+   When `config_manager` has just added the Google tool to an agent, use the connect link it returns instead.
+2. Open the link in a browser on the computer where MindRoom runs, not on a phone or another computer, because the link points to `localhost`.
+   If you are chatting from another device, open the conversation on the MindRoom computer or copy the complete link into a browser there.
+3. Choose a Google account and approve the scopes for that one service.
+4. Ask the agent to retry the request.
 
-OAuth tokens are stored under provider token services such as `google_drive_oauth`.
-Editable tool settings are stored separately under services such as `google_drive`, `google_calendar`, `google_sheets`, and `gmail`.
-OAuth app client config is stored separately under services such as `google_oauth_client` or `google_drive_oauth_client`.
+Without a connect link, open the dashboard **Tools** tab, choose the agent in the selector, and select **Connect** on the Google integration.
+Only agents with a worker scope appear in the selector; for an agent without one, keep **Shared deployment credentials** selected.
+The dashboard shows how Google data is handled before you continue.
+For personal connections from the dashboard, the dashboard must know your Matrix identity; see [Connect An Account](../oauth-framework.md#connect-an-account).
+Link lifetime, who may connect, disconnecting, and resetting a connection are covered in the [OAuth Integration Framework](../oauth-framework.md).
+
+## Privacy
+
+On a local installation, the provisioning service only supplies the OAuth client configuration.
+Google sends the authorization response straight to your MindRoom process, which exchanges and stores the tokens, so the provisioning service does not receive your authorization code, tokens, or Google API data.
+Google data an agent reads goes to your configured AI model provider and Matrix homeserver as part of the conversation.
+Anyone with administrative or filesystem access to the installation's storage may be able to read the stored credentials and data.
+See the [Privacy Policy](../privacy.md#google-api-services) for the complete data-handling disclosure.
+
+## Troubleshooting
+
+- **`OAuth client configuration could not be resolved`**: MindRoom could not get a Google OAuth client, usually because the install is not paired or its pairing was revoked.
+  Run `mindroom connect`, or configure a [custom client](google-services-oauth.md#custom-google-cloud-setup).
+- **Google shows an unverified-app warning or blocks the Google Cloud connection**: `cloud-platform.read-only` is a sensitive scope, so an OAuth client that Google has not verified for it can be limited to test users.
+  The provisioned client is not yours to change, so use a [custom client](google-services-oauth.md#custom-google-cloud-setup) instead, ideally one whose consent screen is Internal to your Google Workspace organization.
+  On your own custom client, you can also add your account as a test user; see [Production Verification Follow-up](google-services-oauth.md#production-verification-follow-up).
+- **`The provisioned OAuth client is available only when MindRoom is opened on localhost...`**: open MindRoom on `localhost`, or configure a custom client for remote access.

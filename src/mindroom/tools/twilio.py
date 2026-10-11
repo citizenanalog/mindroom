@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.twilio import TwilioTools
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="twilio",
+    file_access=ToolFileAccess.NONE,
     display_name="Twilio",
     description="SMS messaging and voice communication platform",
     category=ToolCategory.COMMUNICATION,
@@ -100,7 +102,7 @@ if TYPE_CHECKING:
     ],
     dependencies=["twilio"],
     docs_url="https://docs.agno.com/tools/toolkits/social/twilio",
-    function_names=("get_call_details", "list_messages", "send_sms", "validate_phone_number"),
+    function_names=("get_call_details", "list_messages", "send_sms"),
 )
 def twilio_tools() -> type[TwilioTools]:
     """Return Twilio tools for SMS messaging and voice communication."""

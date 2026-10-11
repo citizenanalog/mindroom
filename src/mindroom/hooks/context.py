@@ -11,7 +11,6 @@ from mindroom.logging_config import get_logger
 from mindroom.runtime_protocols import SupportsClientConfigOrchestrator  # noqa: TC001
 from mindroom.tool_system.plugin_identity import validate_plugin_name
 
-from . import matrix_admin as hook_matrix_admin
 from .state import (
     build_hook_room_state_putter,
     build_hook_room_state_querier,
@@ -43,10 +42,10 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.history import HistoryScope
-    from mindroom.matrix.cache import AgentMessageSnapshot
+    from mindroom.history.types import HistoryScope
+    from mindroom.matrix.agent_message_snapshot import AgentMessageSnapshot
     from mindroom.message_target import MessageTarget
-    from mindroom.scheduling import ScheduledWorkflow
+    from mindroom.scheduling.tasks import ScheduledWorkflow
     from mindroom.tool_system.events import ToolTraceEntry
     from mindroom.turn_origin import TurnOrigin
 
@@ -62,10 +61,8 @@ if TYPE_CHECKING:
             room_id: str,
             thread_id: str | None,
             sender: str,
-            *,
-            runtime_started_at: float | None,
         ) -> Awaitable[AgentMessageSnapshot | None]:
-            """Read the latest visible cached sender message for one room or thread scope."""
+            """Read the latest visible sender message for one room or thread scope."""
 
 
 def _resolve_plugin_state_root(
@@ -197,7 +194,15 @@ class HookContextSupport:
             if admin is not None:
                 return admin
         if self.agent_name == ROUTER_AGENT_NAME and self.runtime.client is not None:
-            return hook_matrix_admin.build_hook_matrix_admin(self.runtime.client, self.runtime_paths)
+            # Imported on first use so the tool-registry import chain stays free
+            # of the nio matrix-client import (#1436).
+            from .matrix_admin import build_hook_matrix_admin  # noqa: PLC0415
+
+            return build_hook_matrix_admin(
+                self.runtime.client,
+                self.runtime_paths,
+                config=self.runtime.config,
+            )
         return None
 
     def base_kwargs(self, event_name: str, correlation_id: str) -> dict[str, Any]:
@@ -216,6 +221,7 @@ class HookContextSupport:
             "matrix_admin": self.matrix_admin(),
             "room_state_querier": self.room_state_querier(),
             "room_state_putter": self.room_state_putter(),
+            "_hook_registry_state": self.hook_registry_state,
         }
 
 
@@ -224,15 +230,11 @@ class MessageEnvelope:
     """Normalized inbound message shape used by message hooks."""
 
     source_event_id: str
-    room_id: str
     target: MessageTarget
-    requester_id: str
-    sender_id: str
     body: str
     attachment_ids: tuple[str, ...]
     mentioned_agents: tuple[str, ...]
     agent_name: str
-    source_kind: str
     origin: TurnOrigin = field(kw_only=True)
     hook_source: str | None = None
     message_received_depth: int = 0
@@ -243,18 +245,26 @@ class MessageEnvelope:
         if self.origin is None:
             message = "MessageEnvelope.origin is required"
             raise TypeError(message)
-        if self.room_id != self.target.room_id:
-            message = "MessageEnvelope.room_id must match MessageEnvelope.target.room_id"
-            raise ValueError(message)
-        if self.sender_id != self.origin.transport_sender_id:
-            message = "MessageEnvelope.sender_id must match MessageEnvelope.origin.transport_sender_id"
-            raise ValueError(message)
-        if self.requester_id != self.origin.requester_id:
-            message = "MessageEnvelope.requester_id must match MessageEnvelope.origin.requester_id"
-            raise ValueError(message)
-        if self.source_kind != self.origin.source_kind:
-            message = "MessageEnvelope.source_kind must match MessageEnvelope.origin.source_kind"
-            raise ValueError(message)
+
+    @property
+    def room_id(self) -> str:
+        """Return the canonical target room ID."""
+        return self.target.room_id
+
+    @property
+    def requester_id(self) -> str:
+        """Return the canonical requester ID."""
+        return self.origin.requester_id
+
+    @property
+    def sender_id(self) -> str:
+        """Return the canonical transport sender ID."""
+        return self.origin.transport_sender_id
+
+    @property
+    def source_kind(self) -> str:
+        """Return the canonical ingress source kind."""
+        return self.origin.source_kind
 
 
 @dataclass(slots=True)
@@ -289,8 +299,32 @@ class ResponseResult:
     envelope: MessageEnvelope
 
 
+@dataclass(slots=True, kw_only=True)
+class _HookLifecycleContext:
+    """Track whether a bound hook still belongs to the active registry."""
+
+    _hook_registry_state: HookRegistryState | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _hook_registry_snapshot: HookRegistry | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def is_active(self) -> bool:
+        """Return whether this hook still belongs to the live registry snapshot."""
+        return (
+            self._hook_registry_state is not None
+            and self._hook_registry_snapshot is not None
+            and self._hook_registry_state.registry is self._hook_registry_snapshot
+        )
+
+
 @dataclass(slots=True)
-class HookContext:
+class HookContext(_HookLifecycleContext):
     """Base fields available to every hook."""
 
     event_name: str
@@ -373,7 +407,7 @@ class HookContext:
         *,
         thread_id: str | None = None,
     ) -> AgentMessageSnapshot | None:
-        """Return the latest visible cached sender message when a reader is available."""
+        """Return the latest visible sender message when a reader is available."""
         if self.agent_message_snapshot_reader is None:
             self.logger.warning("No agent-message snapshot reader available")
             return None
@@ -381,7 +415,6 @@ class HookContext:
             room_id=room_id,
             thread_id=thread_id,
             sender=sender,
-            runtime_started_at=self.runtime_started_at,
         )
 
     async def put_room_state(
@@ -426,9 +459,10 @@ class MessageEnrichContext(HookContext):
         text: str,
         *,
         cache_policy: EnrichmentCachePolicy = "volatile",
+        persist: bool = True,
     ) -> None:
         """Append one enrichment item for this hook."""
-        self._items.append(EnrichmentItem(key=key, text=text, cache_policy=cache_policy))
+        self._items.append(EnrichmentItem(key=key, text=text, cache_policy=cache_policy, persist=persist))
 
 
 @dataclass(slots=True)
@@ -582,6 +616,21 @@ class RoomMemberJoinedContext(HookContext):
 
 
 @dataclass(slots=True)
+class RoomMemberLeftContext(HookContext):
+    """Context for room:member_left hooks."""
+
+    agent_name: str
+    room_id: str
+    event_id: str
+    user_id: str
+    sender_id: str
+    display_name: str | None
+    avatar_url: str | None
+    membership: str
+    prev_membership: str | None
+
+
+@dataclass(slots=True)
 class ConfigReloadedContext(HookContext):
     """Context for config:reloaded hooks."""
 
@@ -615,7 +664,7 @@ class CustomEventContext(HookContext):
 
 
 @dataclass(slots=True)
-class ToolBeforeCallContext:
+class ToolBeforeCallContext(_HookLifecycleContext):
     """Context passed to tool:before_call hook callbacks."""
 
     tool_name: str
@@ -708,7 +757,7 @@ class ToolBeforeCallContext:
 
 
 @dataclass(slots=True)
-class ToolAfterCallContext:
+class ToolAfterCallContext(_HookLifecycleContext):
     """Context passed to tool:after_call hook callbacks."""
 
     tool_name: str

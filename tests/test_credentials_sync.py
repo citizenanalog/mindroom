@@ -3,31 +3,43 @@
 import base64
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from mindroom import constants as constants_mod
-from mindroom import credentials_sync as credentials_sync_mod
-from mindroom.credentials import CredentialsManager
-from mindroom.credentials_sync import (
+from mindroom.credentials import sync as credentials_sync_mod
+from mindroom.credentials.manager import CredentialsManager
+from mindroom.credentials.sync import (
+    _EMBEDDER_CREDENTIAL_SERVICE,
+    _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY,
     _ENV_TO_SERVICE_MAP,
     get_api_key_for_provider,
+    get_api_key_for_service,
+    get_embedder_api_key,
     get_ollama_host,
     get_secret_from_env,
     sync_env_to_credentials,
 )
+from mindroom.providers.model_loading import missing_model_api_key_provider
 from mindroom.runtime_env_policy import CREDENTIALS_ENCRYPTION_KEY_ENV, SHARED_CREDENTIALS_PATH_ENV
+from tests.conftest import load_config_yaml
 
 
 def _runtime_paths(
     storage_root: Path,
     *,
     shared_credentials_dir: Path | None = None,
+    process_env: Mapping[str, str] | None = None,
+    env_file: str | None = None,
 ) -> constants_mod.RuntimePaths:
     config_path = storage_root / "config.yaml"
     config_path.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n", encoding="utf-8")
-    process_env = dict(os.environ)
+    if env_file is not None:
+        (storage_root / ".env").write_text(env_file, encoding="utf-8")
+    process_env = dict(os.environ if process_env is None else process_env)
     if shared_credentials_dir is not None:
         process_env[SHARED_CREDENTIALS_PATH_ENV] = str(shared_credentials_dir)
     return constants_mod.resolve_runtime_paths(
@@ -51,6 +63,19 @@ def _credential_seed_json(service: str = "google_oauth_client") -> str:
     )
 
 
+def _import_notices(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        event for event in events if event["event"] in {"credential_imported_from_env", "credential_updated_from_env"}
+    ]
+
+
+def _to_stop(service: str) -> str:
+    return (
+        "remove the variable (and any _FILE variant) from the process environment and .env, "
+        f"or this service's entry from every seed declaration that lists it, then DELETE /api/credentials/{service}"
+    )
+
+
 class TestCredentialsSync:
     """Test the shared provider/bootstrap credential sync behavior."""
 
@@ -65,6 +90,59 @@ class TestCredentialsSync:
     def credentials_manager(self, temp_credentials_dir: Path) -> CredentialsManager:
         """Create a CredentialsManager with a temporary directory."""
         return CredentialsManager(base_path=temp_credentials_dir)
+
+    @pytest.mark.parametrize(
+        ("env_file_text", "exported"),
+        [
+            ("OPENAI_API_KEY=your-openai-key-here\n", None),
+            ("OPENAI_API_KEY=your-openai-key-here # replace with your key\n", None),
+            ("", "your-openai-key-here"),
+        ],
+        ids=["env-file", "env-file-inline-comment", "exported"],
+    )
+    def test_template_placeholder_is_not_synced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        env_file_text: str,
+        exported: str | None,
+    ) -> None:
+        """A starter-template placeholder never becomes a stored key, so the dashboard still reports the provider."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        if exported is not None:
+            monkeypatch.setenv("OPENAI_API_KEY", exported)
+        (tmp_path / ".env").write_text(env_file_text, encoding="utf-8")
+        runtime_paths = _runtime_paths(tmp_path)
+        assert get_secret_from_env("OPENAI_API_KEY", runtime_paths) is None
+
+        sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert get_api_key_for_provider("openai", runtime_paths) is None
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "agents: {}\nmodels:\n  default:\n    provider: openai\n    id: gpt-6-astra\nrouter:\n  model: default\n",
+            encoding="utf-8",
+        )
+        assert missing_model_api_key_provider(load_config_yaml(config_path), runtime_paths, "default") == "openai"
+
+    @pytest.mark.parametrize(
+        ("file_text", "expected"),
+        [("sk-from-file\n", "sk-from-file"), ("your-openai-key-here\n", None), ("  \n", None)],
+    )
+    def test_unset_name_falls_through_to_name_file_with_the_same_rule(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        file_text: str,
+        expected: str | None,
+    ) -> None:
+        """A placeholder in NAME does not block NAME_FILE, whose contents follow the same unset rule."""
+        secret_file = tmp_path / "openai-key"
+        secret_file.write_text(file_text, encoding="utf-8")
+        monkeypatch.setenv("OPENAI_API_KEY", "your-openai-key-here")
+        monkeypatch.setenv("OPENAI_API_KEY_FILE", str(secret_file))
+
+        assert get_secret_from_env("OPENAI_API_KEY", _runtime_paths(tmp_path)) == expected
 
     def test_sync_env_to_credentials_new_keys(
         self,
@@ -153,6 +231,32 @@ class TestCredentialsSync:
             "client_secret": "client-secret",
             "_source": "env",
         }
+
+    def test_sync_declared_credential_seed_rejects_oauth_token_service(
+        self,
+        temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bootstrap seeds must not bypass lifecycle publication for OAuth tokens."""
+        monkeypatch.setenv(
+            "MINDROOM_CREDENTIAL_SEEDS_JSON",
+            json.dumps(
+                {
+                    "service": "google_oauth",
+                    "credentials": {"access_token": {"value": "seeded-access-token"}},
+                },
+            ),
+        )
+
+        sync_env_to_credentials(
+            runtime_paths=_runtime_paths(
+                temp_credentials_dir.parent,
+                shared_credentials_dir=temp_credentials_dir,
+            ),
+        )
+
+        cm = CredentialsManager(base_path=temp_credentials_dir)
+        assert cm.load_credentials("google_oauth") is None
 
     def test_sync_declared_credential_seed_from_file(
         self,
@@ -464,23 +568,22 @@ class TestCredentialsSync:
             },
         )
 
-        public_runtime = constants_mod._serialize_public_runtime_paths(runtime_paths)
+        public_runtime = constants_mod.serialize_public_runtime_paths(runtime_paths)
         isolated_runtime = constants_mod.isolated_runtime_paths(runtime_paths)
         public_and_execution_envs = [
             public_runtime["process_env"],
             public_runtime["env_file_values"],
             constants_mod.trusted_tool_runtime_env_values(runtime_paths),
-            constants_mod.execution_tool_runtime_env_values(runtime_paths),
+            constants_mod.build_execution_tool_env("python", runtime_paths),
             constants_mod.trusted_tool_runtime_env_values(isolated_runtime),
-            constants_mod.execution_tool_runtime_env_values(isolated_runtime),
+            constants_mod.build_execution_tool_env("python", isolated_runtime),
         ]
 
-        assert isolated_runtime.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV) == "encryption-key-material"
+        assert isolated_runtime.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV) is None
         for runtime_env in public_and_execution_envs:
             assert CREDENTIALS_ENCRYPTION_KEY_ENV not in runtime_env
             assert "MINDROOM_CREDENTIAL_SEEDS_JSON" not in runtime_env
             assert "MINDROOM_CREDENTIAL_SEEDS_FILE" not in runtime_env
-        assert isolated_runtime.process_env[CREDENTIALS_ENCRYPTION_KEY_ENV] == "encryption-key-material"
         assert "MINDROOM_CREDENTIAL_SEEDS_JSON" not in isolated_runtime.process_env
         assert "MINDROOM_CREDENTIAL_SEEDS_FILE" not in isolated_runtime.process_env
         assert "MINDROOM_CREDENTIAL_SEEDS_JSON" not in isolated_runtime.env_file_values
@@ -835,6 +938,43 @@ class TestCredentialsSync:
         # Test non-existent provider
         assert get_api_key_for_provider("anthropic", runtime_paths=runtime_paths) is None
 
+    def test_get_api_key_for_provider_accepts_env_var_named_service(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """Dashboard keys saved under the env var name resolve, but the canonical service wins."""
+        credentials_manager.save_credentials("OPENROUTER_API_KEY", {"api_key": "env-named-openrouter-key"})
+        credentials_manager.save_credentials("GOOGLE_API_KEY", {"api_key": "env-named-google-key"})
+        credentials_manager.save_credentials("OLLAMA_HOST", {"api_key": "not-a-provider-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_api_key_for_provider("openrouter", runtime_paths=runtime_paths) == "env-named-openrouter-key"
+        assert get_api_key_for_provider("gemini", runtime_paths=runtime_paths) == "env-named-google-key"
+        assert get_api_key_for_provider("ollama", runtime_paths=runtime_paths) is None
+        assert get_api_key_for_provider("openai", runtime_paths=runtime_paths) is None
+
+        credentials_manager.save_credentials("openrouter", {"api_key": "canonical-openrouter-key"})
+        assert get_api_key_for_provider("openrouter", runtime_paths=runtime_paths) == "canonical-openrouter-key"
+
+    def test_get_api_key_for_service_is_strict(self, credentials_manager: CredentialsManager) -> None:
+        """A named service resolves only that service's API key."""
+        credentials_manager.save_credentials("openai", {"api_key": "shared-key"})
+        credentials_manager.save_credentials("openai-realtime", {"api_key": "realtime-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_api_key_for_service("openai-realtime", runtime_paths) == "realtime-key"
+        assert get_api_key_for_service("missing", runtime_paths) is None
+        assert get_api_key_for_service("openrouter", runtime_paths) is None
+
+        credentials_manager.save_credentials("OPENROUTER_API_KEY", {"api_key": "env-named-openrouter-key"})
+        assert get_api_key_for_service("openrouter", runtime_paths) == "env-named-openrouter-key"
+
     def test_get_ollama_host(self, credentials_manager: CredentialsManager) -> None:
         """Test getting Ollama host configuration."""
         # Test when no Ollama config exists
@@ -859,10 +999,240 @@ class TestCredentialsSync:
             "DEEPSEEK_API_KEY": "deepseek",
             "CEREBRAS_API_KEY": "cerebras",
             "GROQ_API_KEY": "groq",
+            "ZAI_API_KEY": "zai",
             "OLLAMA_HOST": "ollama",
         }
 
         assert expected_services == _ENV_TO_SERVICE_MAP
+
+    def test_sync_env_seeds_embedder_credential(
+        self,
+        temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """EMBEDDER_API_KEY should seed the dedicated embedder credential service."""
+        monkeypatch.setenv("EMBEDDER_API_KEY", "sk-embedder-key")
+
+        sync_env_to_credentials(
+            runtime_paths=_runtime_paths(
+                temp_credentials_dir.parent,
+                shared_credentials_dir=temp_credentials_dir,
+            ),
+        )
+
+        cm = CredentialsManager(base_path=temp_credentials_dir)
+        assert cm.load_credentials(_EMBEDDER_CREDENTIAL_SERVICE) == {
+            "api_key": "sk-embedder-key",
+            "_source": "env",
+        }
+
+    def test_sync_env_seeds_embedder_credential_from_file(
+        self,
+        temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """EMBEDDER_API_KEY_FILE should follow the NAME_FILE secret convention."""
+        key_file = temp_credentials_dir.parent / "embedder.key"
+        key_file.write_text("sk-embedder-file-key\n", encoding="utf-8")
+        monkeypatch.delenv("EMBEDDER_API_KEY", raising=False)
+        monkeypatch.setenv("EMBEDDER_API_KEY_FILE", str(key_file))
+
+        sync_env_to_credentials(
+            runtime_paths=_runtime_paths(
+                temp_credentials_dir.parent,
+                shared_credentials_dir=temp_credentials_dir,
+            ),
+        )
+
+        cm = CredentialsManager(base_path=temp_credentials_dir)
+        assert cm.get_api_key(_EMBEDDER_CREDENTIAL_SERVICE) == "sk-embedder-file-key"
+
+    def test_sync_env_does_not_overwrite_ui_embedder_credential(
+        self,
+        temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """UI-managed embedder credentials must not be overwritten by env sync."""
+        cm = CredentialsManager(base_path=temp_credentials_dir)
+        cm.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": "ui-embedder-key", "_source": "ui"})
+        monkeypatch.setenv("EMBEDDER_API_KEY", "env-embedder-key")
+
+        sync_env_to_credentials(
+            runtime_paths=_runtime_paths(
+                temp_credentials_dir.parent,
+                shared_credentials_dir=temp_credentials_dir,
+            ),
+        )
+
+        assert cm.get_api_key(_EMBEDDER_CREDENTIAL_SERVICE) == "ui-embedder-key"
+
+    def test_sync_env_skips_embedder_when_env_missing(
+        self,
+        temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing EMBEDDER_API_KEY should not create the embedder credential."""
+        monkeypatch.delenv("EMBEDDER_API_KEY", raising=False)
+        monkeypatch.delenv("EMBEDDER_API_KEY_FILE", raising=False)
+
+        sync_env_to_credentials(
+            runtime_paths=_runtime_paths(
+                temp_credentials_dir.parent,
+                shared_credentials_dir=temp_credentials_dir,
+            ),
+        )
+
+        cm = CredentialsManager(base_path=temp_credentials_dir)
+        assert cm.load_credentials(_EMBEDDER_CREDENTIAL_SERVICE) is None
+
+    def test_get_embedder_api_key_explicit_wins(self, credentials_manager: CredentialsManager) -> None:
+        """An explicit config key must beat both credential services."""
+        credentials_manager.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": "embedder-key"})
+        credentials_manager.save_credentials("openai", {"api_key": "openai-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths, explicit_api_key="explicit-key") == "explicit-key"
+
+    def test_get_embedder_api_key_embedder_service_beats_openai(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """The dedicated embedder credential must beat the shared openai key."""
+        credentials_manager.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": "embedder-key"})
+        credentials_manager.save_credentials("openai", {"api_key": "openai-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths) == "embedder-key"
+
+    def test_get_embedder_api_key_configured_service_is_a_strict_binding(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """A named service wins over legacy services and never leaks into their fallback chain."""
+        credentials_manager.save_credentials("embedding-production", {"api_key": "named-key"})
+        credentials_manager.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": "embedder-key"})
+        credentials_manager.save_credentials("openai", {"api_key": "openai-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths, credentials_service="embedding-production") == "named-key"
+
+        credentials_manager.delete_credentials("embedding-production")
+        assert (
+            get_embedder_api_key(runtime_paths, credentials_service="embedding-production")
+            == _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+        )
+
+    def test_get_embedder_api_key_explicit_key_wins_over_configured_service(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """Inline config remains the highest-priority backwards-compatible override."""
+        credentials_manager.save_credentials("embedding-production", {"api_key": "named-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert (
+            get_embedder_api_key(
+                runtime_paths,
+                explicit_api_key="inline-key",
+                credentials_service="embedding-production",
+            )
+            == "inline-key"
+        )
+
+    def test_get_embedder_api_key_falls_back_to_openai(self, credentials_manager: CredentialsManager) -> None:
+        """Without a dedicated credential the shared openai key keeps working."""
+        credentials_manager.save_credentials("openai", {"api_key": "openai-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths) == "openai-key"
+
+    def test_get_embedder_api_key_accepts_env_var_named_provider_services(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """The openai fallback and a provider credentials_service both accept env-var-named services."""
+        credentials_manager.save_credentials("OPENAI_API_KEY", {"api_key": "env-named-openai-key"})
+        credentials_manager.save_credentials("OPENROUTER_API_KEY", {"api_key": "env-named-openrouter-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths) == "env-named-openai-key"
+        assert get_embedder_api_key(runtime_paths, credentials_service="openrouter") == "env-named-openrouter-key"
+
+        credentials_manager.save_credentials("openrouter", {"api_key": "canonical-openrouter-key"})
+        assert get_embedder_api_key(runtime_paths, credentials_service="openrouter") == "canonical-openrouter-key"
+
+    def test_get_embedder_api_key_returns_placeholder_when_nothing_configured(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """Keyless mode resolves the placeholder so client construction never crashes."""
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths) == _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+
+    def test_get_embedder_api_key_strips_resolved_values(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """Keys with stray whitespace must be stripped before reaching the Authorization header."""
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths, explicit_api_key="explicit-key\n") == "explicit-key"
+
+        credentials_manager.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": " embedder-key "})
+        assert get_embedder_api_key(runtime_paths) == "embedder-key"
+
+    def test_get_embedder_api_key_ignores_non_string_stored_credential(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """A malformed stored value resolves as absent instead of crashing resolution."""
+        credentials_manager.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": 42})
+        credentials_manager.save_credentials("openai", {"api_key": "openai-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths) == "openai-key"
+
+    def test_get_embedder_api_key_treats_blank_values_as_absent(
+        self,
+        credentials_manager: CredentialsManager,
+    ) -> None:
+        """Blank explicit and blank embedder-service values must not shadow real keys."""
+        credentials_manager.save_credentials(_EMBEDDER_CREDENTIAL_SERVICE, {"api_key": "   "})
+        credentials_manager.save_credentials("openai", {"api_key": "openai-key"})
+        runtime_paths = _runtime_paths(
+            credentials_manager.storage_root,
+            shared_credentials_dir=credentials_manager.base_path,
+        )
+
+        assert get_embedder_api_key(runtime_paths, explicit_api_key="  ") == "openai-key"
 
     def test_sync_idempotent(self, temp_credentials_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that running sync multiple times doesn't cause issues."""
@@ -885,3 +1255,233 @@ class TestCredentialsSync:
         # Should only have one file
         openai_files = list(temp_credentials_dir.glob("openai_*.json"))
         assert len(openai_files) == 1
+
+    @pytest.mark.parametrize(
+        ("process_env", "env_file", "expected_source"),
+        [
+            ({"OPENAI_API_KEY": "sk-secret"}, "", "process_env"),
+            ({}, "OPENAI_API_KEY=sk-secret\n", "env_file"),
+            ({"OPENAI_API_KEY": "sk-secret"}, "OPENAI_API_KEY=sk-other\n", "process_env_overrides_env_file"),
+        ],
+    )
+    def test_first_import_logs_notice_naming_variable_and_source(
+        self,
+        temp_credentials_dir: Path,
+        process_env: dict[str, str],
+        env_file: str,
+        expected_source: str,
+    ) -> None:
+        """A first import logs one notice with its variable, source, and stop path, but never the value."""
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env=process_env,
+            env_file=env_file,
+        )
+
+        with capture_logs() as events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert _import_notices(events) == [
+            {
+                "event": "credential_imported_from_env",
+                "log_level": "info",
+                "service": "openai",
+                "env_var": "OPENAI_API_KEY",
+                "source": expected_source,
+                "to_stop": _to_stop("openai"),
+            },
+        ]
+        assert "sk-secret" not in json.dumps(events)
+        assert "sk-other" not in json.dumps(events)
+
+    def test_changed_value_logs_update_notice(self, temp_credentials_dir: Path) -> None:
+        """A changed env value logs an update notice without either value."""
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env={"OPENAI_API_KEY": "sk-new-secret"},
+        )
+        CredentialsManager(base_path=temp_credentials_dir).save_credentials(
+            "openai",
+            {"api_key": "sk-old-secret", "_source": "env"},
+        )
+
+        with capture_logs() as events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert _import_notices(events) == [
+            {
+                "event": "credential_updated_from_env",
+                "log_level": "info",
+                "service": "openai",
+                "env_var": "OPENAI_API_KEY",
+                "source": "process_env",
+                "to_stop": _to_stop("openai"),
+            },
+        ]
+        assert "sk-new-secret" not in json.dumps(events)
+        assert "sk-old-secret" not in json.dumps(events)
+
+    def test_unchanged_value_is_not_saved_or_announced(
+        self,
+        temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unchanged env value neither rewrites the credential file nor logs a notice."""
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env={"OPENAI_API_KEY": "sk-same"},
+        )
+        CredentialsManager(base_path=temp_credentials_dir).save_credentials(
+            "openai",
+            {"api_key": "sk-same", "_source": "env"},
+        )
+        saved: list[str] = []
+        monkeypatch.setattr(
+            CredentialsManager,
+            "save_credentials",
+            lambda _self, service, _creds: saved.append(service),
+        )
+
+        with capture_logs() as events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert saved == []
+        assert _import_notices(events) == []
+
+    @pytest.mark.parametrize("existing_key", [None, "sk-existing"])
+    def test_blank_secret_file_is_not_imported(self, temp_credentials_dir: Path, existing_key: str | None) -> None:
+        """A blank NAME_FILE neither creates a credential nor overwrites a stored one."""
+        secret_file = temp_credentials_dir.parent / "openai-key"
+        secret_file.write_text("  \n\t\n", encoding="utf-8")
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env={"OPENAI_API_KEY_FILE": str(secret_file)},
+        )
+        manager = CredentialsManager(base_path=temp_credentials_dir)
+        if existing_key is not None:
+            manager.save_credentials("openai", {"api_key": existing_key, "_source": "env"})
+
+        with capture_logs() as events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert _import_notices(events) == []
+        assert manager.get_api_key("openai") == existing_key
+
+    @pytest.mark.parametrize(
+        ("name", "service"),
+        [
+            ("OPENAI_API_KEY", "openai"),
+            ("GITHUB_TOKEN", "github_private"),
+            ("EMBEDDER_API_KEY", "embedder"),
+        ],
+    )
+    def test_empty_name_with_readable_file_names_file_variable(
+        self,
+        temp_credentials_dir: Path,
+        name: str,
+        service: str,
+    ) -> None:
+        """An empty NAME falls back to NAME_FILE, and the notice names NAME_FILE and its source."""
+        secret_file = temp_credentials_dir.parent / "secret"
+        secret_file.write_text("secret-from-file\n", encoding="utf-8")
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env={name: ""},
+            env_file=f"{name}_FILE={secret_file}\n",
+        )
+
+        with capture_logs() as events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert [(notice["service"], notice["env_var"], notice["source"]) for notice in _import_notices(events)] == [
+            (service, f"{name}_FILE", "env_file"),
+        ]
+        stored = CredentialsManager(base_path=temp_credentials_dir).load_credentials(service)
+        assert stored is not None
+        assert "secret-from-file" in stored.values()
+
+    def test_adc_path_notice_names_variable_and_repeat_is_quiet(self, temp_credentials_dir: Path) -> None:
+        """The ADC import notice names GOOGLE_APPLICATION_CREDENTIALS, and an unchanged path stays quiet."""
+        adc_file = temp_credentials_dir.parent / "adc.json"
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env={"GOOGLE_APPLICATION_CREDENTIALS": str(adc_file)},
+        )
+
+        with capture_logs() as first_events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+        with capture_logs() as repeat_events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert _import_notices(first_events) == [
+            {
+                "event": "credential_imported_from_env",
+                "log_level": "info",
+                "service": "google_vertex_adc",
+                "env_var": "GOOGLE_APPLICATION_CREDENTIALS",
+                "source": "process_env",
+                "to_stop": _to_stop("google_vertex_adc"),
+            },
+        ]
+        assert _import_notices(repeat_events) == []
+
+    def test_valid_name_ignores_unresolvable_file_variable(self, temp_credentials_dir: Path) -> None:
+        """A non-empty NAME is imported without resolving a broken NAME_FILE path."""
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env={"OPENAI_API_KEY": "sk-direct", "OPENAI_API_KEY_FILE": "~mindroom-nonexistent-user/key"},
+        )
+
+        sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert CredentialsManager(base_path=temp_credentials_dir).get_api_key("openai") == "sk-direct"
+
+    @pytest.mark.parametrize(
+        ("declare_in_file", "expected_env_var"),
+        [
+            (False, "MINDROOM_CREDENTIAL_SEEDS_JSON"),
+            (True, "MINDROOM_CREDENTIAL_SEEDS_FILE"),
+        ],
+    )
+    def test_seed_notice_names_declaration_variable(
+        self,
+        temp_credentials_dir: Path,
+        declare_in_file: bool,
+        expected_env_var: str,
+    ) -> None:
+        """A seed notice names its declaration variable, and a service declared twice is announced once."""
+        process_env = {
+            "OAUTH_CLIENT_ID": "client-id",
+            "OAUTH_CLIENT_SECRET": "client-secret",
+            "MINDROOM_CREDENTIAL_SEEDS_JSON": _credential_seed_json(),
+        }
+        if declare_in_file:
+            seed_file = temp_credentials_dir.parent / "seeds.json"
+            seed_file.write_text(_credential_seed_json(), encoding="utf-8")
+            process_env["MINDROOM_CREDENTIAL_SEEDS_FILE"] = str(seed_file)
+        runtime_paths = _runtime_paths(
+            temp_credentials_dir.parent,
+            shared_credentials_dir=temp_credentials_dir,
+            process_env=process_env,
+        )
+
+        with capture_logs() as events:
+            sync_env_to_credentials(runtime_paths=runtime_paths)
+
+        assert _import_notices(events) == [
+            {
+                "event": "credential_imported_from_env",
+                "log_level": "info",
+                "service": "google_oauth_client",
+                "env_var": expected_env_var,
+                "source": "process_env",
+                "to_stop": _to_stop("google_oauth_client"),
+            },
+        ]

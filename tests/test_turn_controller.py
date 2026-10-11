@@ -11,22 +11,24 @@ import nio
 import pytest
 
 from mindroom import interactive
-from mindroom.bot import AgentBot
-from mindroom.coalescing import CoalescingGate, IngressAdmissionClosedError, IngressOrderReservation, ReadyPendingEvent
-from mindroom.coalescing_batch import CoalescingKey, PendingEvent
+from mindroom.coalescing.batch import CoalescingKey, PendingEvent, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate, IngressAdmissionClosedError, LaneSlot, ReadyPendingEvent
+from mindroom.coalescing.ingress_lanes import ReceiptLaneKey
+from mindroom.coalescing.prompt_ingress_reservation import PromptIngressReservationOwner
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.constants import MATRIX_SOURCE_EVENT_IDS_METADATA_KEY
-from mindroom.dispatch_handoff import PendingDispatchMetadata, PreparedTextEvent
+from mindroom.constants import MATRIX_SOURCE_EVENT_IDS_METADATA_KEY, MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY
+from mindroom.dispatch_handoff import PendingDispatchMetadata, PreparedIngress
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
-from mindroom.matrix.cache.thread_history_result import thread_history_result
+from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
-from mindroom.prompt_ingress_reservation import PromptIngressReservationOwner
 from mindroom.streaming import send_streaming_response
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     bind_runtime_paths,
     delivered_matrix_side_effect,
     install_generate_response_mock,
+    make_pending_event,
     replace_turn_controller_deps,
     runtime_paths_for,
     test_runtime_paths,
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
+    from mindroom.bot import AgentBot
     from mindroom.hooks import MessageEnvelope
 
 
@@ -76,9 +79,9 @@ def _text_event(event_id: str, body: str, origin_server_ts: int) -> nio.RoomMess
 
 def _pending(event: nio.RoomMessageText) -> PendingEvent:
     """Wrap one Matrix event as pending user ingress."""
-    return PendingEvent(
-        event=event,
-        room=nio.MatrixRoom("!room:localhost", "@mindroom:localhost"),
+    return make_pending_event(
+        event,
+        nio.MatrixRoom("!room:localhost", "@mindroom:localhost"),
         source_kind=MESSAGE_SOURCE_KIND,
     )
 
@@ -98,7 +101,6 @@ async def test_late_admit_rejection_closes_completed_ready_task_metadata_once() 
             kind="test",
             payload=object(),
             close=close_metadata,
-            requires_solo_batch=False,
         ),
     )
 
@@ -106,27 +108,26 @@ async def test_late_admit_rejection_closes_completed_ready_task_metadata_once() 
         return ReadyPendingEvent(pending_event=pending_event)
 
     class RejectingGate:
-        async def admit(self, *_args: object, **_kwargs: object) -> None:
+        def submit_lane_slot(self, *_args: object, **_kwargs: object) -> None:
             msg = "closed"
             raise IngressAdmissionClosedError(msg)
 
-        def release_order_reservation(self, reservation: IngressOrderReservation) -> None:
-            reservation.released = True
-            reservation.settled.set()
+        def release_lane_slot(self, slot: LaneSlot) -> None:
+            slot.released = True
+            slot.settled.set()
 
-    reservation = IngressOrderReservation(
+    slot = LaneSlot(
         room_id="!room:localhost",
-        requester_user_id="@user:localhost",
-        received_order=1,
+        sender_id="@user:localhost",
         receipt_time=1.0,
     )
-    owner = PromptIngressReservationOwner(gate=RejectingGate(), reservation=reservation)
+    owner = PromptIngressReservationOwner(gate=RejectingGate(), slot=slot)
     ready_task = asyncio.create_task(ready())
     await ready_task
 
     with pytest.raises(IngressAdmissionClosedError):
         await owner.admit(
-            CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost"),
+            CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost")),
             ready_task=ready_task,
             source_event_id="$late:localhost",
             source_kind=MESSAGE_SOURCE_KIND,
@@ -134,6 +135,8 @@ async def test_late_admit_rejection_closes_completed_ready_task_metadata_once() 
 
     await owner.release()
 
+    assert slot.released is True
+    assert slot.settled.is_set()
     assert close_count == 1
 
 
@@ -153,7 +156,6 @@ async def test_owner_cancel_ready_task_closes_ready_result_returned_during_cance
             kind="test",
             payload=object(),
             close=close_metadata,
-            requires_solo_batch=False,
         ),
     )
 
@@ -165,26 +167,28 @@ async def test_owner_cancel_ready_task_closes_ready_result_returned_during_cance
             return ReadyPendingEvent(pending_event=pending_event)
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
-        upload_grace_seconds=lambda: 0.0,
         is_shutting_down=lambda: False,
     )
-    reservation = gate.reserve_order(room_id="!room:localhost", requester_user_id="@user:localhost")
-    owner = PromptIngressReservationOwner(gate=gate, reservation=reservation)
+    slot = gate.enter_lane(ReceiptLaneKey(room_id="!room:localhost", sender_id="@user:localhost"))
+    owner = PromptIngressReservationOwner(gate=gate, slot=slot)
     owner.ready_task = asyncio.create_task(ready())
     await asyncio.sleep(0)
 
-    await owner.cancel_ready_task()
+    await owner._cancel_ready_task()
 
     assert cancelled.is_set()
     assert close_count == 1
-    await owner.cancel_ready_task()
+    await owner._cancel_ready_task()
     assert close_count == 1
+
+    await owner.release()
+    await asyncio.wait_for(slot.settled.wait(), timeout=1.0)
 
 
 @pytest.mark.asyncio
-async def test_owner_release_settles_reservation_when_cancelled_during_ready_task_cleanup() -> None:
+async def test_owner_release_settles_lane_slot_when_cancelled_during_ready_task_cleanup() -> None:
     """Owner release must not orphan its ready task when callback cancellation interrupts cleanup."""
 
     async def never_ready() -> ReadyPendingEvent | None:
@@ -192,13 +196,12 @@ async def test_owner_release_settles_reservation_when_cancelled_during_ready_tas
         return None
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
-        upload_grace_seconds=lambda: 0.0,
         is_shutting_down=lambda: False,
     )
-    reservation = gate.reserve_order(room_id="!room:localhost", requester_user_id="@user:localhost")
-    owner = PromptIngressReservationOwner(gate=gate, reservation=reservation)
+    slot = gate.enter_lane(ReceiptLaneKey(room_id="!room:localhost", sender_id="@user:localhost"))
+    owner = PromptIngressReservationOwner(gate=gate, slot=slot)
     ready_task = asyncio.create_task(never_ready())
     owner.ready_task = ready_task
 
@@ -209,8 +212,8 @@ async def test_owner_release_settles_reservation_when_cancelled_during_ready_tas
         with suppress(asyncio.CancelledError):
             await release_task
 
-        assert reservation.released
-        assert reservation.settled.is_set()
+        assert slot.released
+        await asyncio.wait_for(slot.settled.wait(), timeout=1.0)
         assert ready_task.done()
         assert ready_task.cancelled()
         assert owner.ready_task is None
@@ -237,7 +240,7 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
         display_name="GeneralAgent",
         password="test_password",  # noqa: S106
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -250,7 +253,9 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
     room.room_id = "!test:localhost"
     selection = interactive.InteractiveSelection(
         question_event_id="$question:localhost",
+        question_text="Which option should I use?",
         selection_key="1",
+        selected_label="Option 1",
         selected_value="Option 1",
         thread_id="$thread-root:localhost",
     )
@@ -273,11 +278,11 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
         prompt: str,
         thread_history: list[object],
         existing_event_id: str | None = None,
-        existing_event_is_placeholder: bool = False,
         user_id: str | None = None,  # noqa: ARG001
         media: object | None = None,  # noqa: ARG001
         attachment_ids: list[str] | None = None,  # noqa: ARG001
         model_prompt: str | None = None,  # noqa: ARG001
+        transient_enrichment_items: tuple[object, ...] = (),  # noqa: ARG001
         system_enrichment_items: tuple[object, ...] = (),  # noqa: ARG001
         response_envelope: MessageEnvelope | None = None,
         correlation_id: str | None = None,  # noqa: ARG001
@@ -287,13 +292,12 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
         assert response_envelope is not None
         captured_envelope = response_envelope
         captured_metadata = matrix_run_metadata
-        assert prompt == "The user selected: Option 1"
+        assert prompt == interactive.build_selection_prompt(selection)
         assert response_envelope.target.room_id == room.room_id
         assert response_envelope.target.reply_to_event_id == selection.question_event_id
         assert response_envelope.target.resolved_thread_id == selection.thread_id
         assert thread_history == []
         assert existing_event_id == "$ack:localhost"
-        assert existing_event_is_placeholder is True
 
         async def response_stream() -> AsyncIterator[str]:
             yield "Processed selection"
@@ -309,7 +313,7 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
                 runtime_paths=runtime_paths_for(config),
                 response_stream=response_stream(),
                 existing_event_id=existing_event_id,
-                adopt_existing_placeholder=existing_event_is_placeholder,
+                adopt_existing_placeholder=True,
             )
 
         mock_edit.assert_awaited()
@@ -319,23 +323,42 @@ async def test_handle_interactive_selection_threaded_streaming_keeps_reply_targe
     generate_response_mock = AsyncMock(side_effect=generate_response)
     install_generate_response_mock(bot, generate_response_mock)
 
-    await bot._turn_controller.handle_interactive_selection(
+    await bot._turn_controller._handle_interactive_selection(
         room,
         selection=selection,
-        user_id="@user:localhost",
+        transport_sender_id="@user:localhost",
+        requester_user_id="@user:localhost",
         source_event_id="$selection:localhost",
     )
 
     bot._delivery_gateway.send_text.assert_awaited_once()
     ack_request = bot._delivery_gateway.send_text.await_args.args[0]
     assert ack_request.target.resolved_thread_id == selection.thread_id
-    assert ack_request.target.reply_to_event_id is None
+    assert ack_request.target.reply_to_event_id == selection.question_event_id
     generate_response_mock.assert_awaited_once()
     assert captured_envelope is not None
     assert captured_envelope.source_event_id == "$selection:localhost"
     assert captured_envelope.target.resolved_thread_id == selection.thread_id
     assert captured_metadata is not None
     assert captured_metadata[MATRIX_SOURCE_EVENT_IDS_METADATA_KEY] == ["$selection:localhost"]
+    assert captured_metadata[MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY] == [selection.question_event_id]
+    request = bot._response_runner.generate_response.await_args.args[0]
+    assert request.history_boundary_event_id == "$selection:localhost"
+    _assert_interactive_turn_aliases(bot, selection, "$selection:localhost")
+
+
+def _assert_interactive_turn_aliases(
+    bot: AgentBot,
+    selection: interactive.InteractiveSelection,
+    selection_event_id: str,
+) -> None:
+    """Assert that question and selection IDs resolve to one canonical turn."""
+    question_record = bot._turn_store.get_turn_record(selection.question_event_id)
+    selection_record = bot._turn_store.get_turn_record(selection_event_id)
+    assert question_record is not None
+    assert question_record == selection_record
+    assert question_record.source_event_ids == (selection_event_id,)
+    assert question_record.discovery_event_ids == (selection.question_event_id,)
 
 
 @pytest.mark.asyncio
@@ -355,7 +378,7 @@ async def test_handle_interactive_selection_does_not_mark_handled_when_runner_re
         display_name="GeneralAgent",
         password="test_password",  # noqa: S106
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -368,7 +391,9 @@ async def test_handle_interactive_selection_does_not_mark_handled_when_runner_re
     room.room_id = "!test:localhost"
     selection = interactive.InteractiveSelection(
         question_event_id="$question:localhost",
+        question_text="Which option should I use?",
         selection_key="1",
+        selected_label="Option 1",
         selected_value="Option 1",
         thread_id="$thread-root:localhost",
     )
@@ -383,26 +408,28 @@ async def test_handle_interactive_selection_does_not_mark_handled_when_runner_re
         resolver=bot._conversation_resolver,
         delivery_gateway=bot._delivery_gateway,
     )
-    bot._turn_controller.deps.turn_store.record_turn = MagicMock()
+    bot._turn_controller.deps.turn_store.record_turn = AsyncMock()
     generate_response_mock = AsyncMock(return_value=None)
     install_generate_response_mock(bot, generate_response_mock)
 
-    await bot._turn_controller.handle_interactive_selection(
-        room,
-        selection=selection,
-        user_id="@user:localhost",
-        source_event_id="$selection:localhost",
-    )
+    with pytest.raises(RuntimeError, match="no durable terminal outcome"):
+        await bot._turn_controller._handle_interactive_selection(
+            room,
+            selection=selection,
+            transport_sender_id="@user:localhost",
+            requester_user_id="@user:localhost",
+            source_event_id="$selection:localhost",
+        )
 
     generate_response_mock.assert_awaited_once()
     bot._turn_controller.deps.turn_store.record_turn.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_on_message_passes_resolved_thread_id_to_interactive_text_response(
+async def test_on_message_claims_interactive_text_by_durable_source_event(
     tmp_path: Path,
 ) -> None:
-    """Plain numeric replies should use the canonical coalescing thread id for interactive matching."""
+    """Plain numeric replies should claim against their admitted source event."""
     config = bind_runtime_paths(
         Config(agents={"general": AgentConfig(display_name="General")}),
         test_runtime_paths(tmp_path),
@@ -415,7 +442,7 @@ async def test_on_message_passes_resolved_thread_id_to_interactive_text_response
         display_name="GeneralAgent",
         password="test_password",  # noqa: S106
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -452,43 +479,42 @@ async def test_on_message_passes_resolved_thread_id_to_interactive_text_response
         "room_id": "!test:localhost",
     }
 
+    interactive_questions = MagicMock()
+    interactive_questions.claim_interactive_text = AsyncMock(return_value=None)
     wrap_extracted_collaborators(bot, "_delivery_gateway", "_turn_policy")
     replace_turn_controller_deps(
         bot,
         resolver=bot._conversation_resolver,
         delivery_gateway=bot._delivery_gateway,
         turn_policy=bot._turn_policy,
+        interactive_questions=interactive_questions,
     )
 
     with (
-        patch("mindroom.turn_controller.is_authorized_sender", return_value=True),
-        patch.object(bot._turn_policy, "can_reply_to_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+        patch.object(bot._turn_policy, "can_reply_to_sender_in_room", return_value=True),
         patch.object(
             bot._conversation_resolver,
             "coalescing_thread_id",
             new_callable=AsyncMock,
             return_value="$thread-root:localhost",
         ),
-        patch(
-            "mindroom.turn_controller.interactive.handle_text_response",
-            new_callable=AsyncMock,
-            return_value=None,
-        ) as mock_handle_text_response,
-        patch.object(bot._turn_controller, "_dispatch_text_message", new_callable=AsyncMock) as mock_dispatch_text,
+        patch("mindroom.turn_controller.dispatch_text_message", new_callable=AsyncMock) as mock_dispatch_text,
     ):
         await bot._on_message(room, message_event)
         await _wait_for(lambda: mock_dispatch_text.await_count == 1)
 
-    mock_handle_text_response.assert_awaited_once()
-    assert mock_handle_text_response.await_args.kwargs["resolved_thread_id"] == "$thread-root:localhost"
+    interactive_questions.claim_interactive_text.assert_awaited_once_with(
+        source_event_id="$selection:localhost",
+    )
     mock_dispatch_text.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_sidecar_preview_passes_resolved_thread_id_to_interactive_text_response(
+async def test_sidecar_preview_claims_interactive_text_by_durable_source_event(
     tmp_path: Path,
 ) -> None:
-    """Sidecar previews should use the same interactive matching thread id as text messages."""
+    """Sidecar previews should claim against their admitted source event."""
     config = bind_runtime_paths(
         Config(agents={"general": AgentConfig(display_name="General")}),
         test_runtime_paths(tmp_path),
@@ -501,7 +527,7 @@ async def test_sidecar_preview_passes_resolved_thread_id_to_interactive_text_res
         display_name="GeneralAgent",
         password="test_password",  # noqa: S106
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -547,7 +573,7 @@ async def test_sidecar_preview_passes_resolved_thread_id_to_interactive_text_res
         "type": "m.room.message",
         "room_id": "!test:localhost",
     }
-    prepared_event = PreparedTextEvent(
+    prepared_event = PreparedIngress(
         sender="@user:localhost",
         event_id="$sidecar-selection:localhost",
         body="1",
@@ -565,17 +591,20 @@ async def test_sidecar_preview_passes_resolved_thread_id_to_interactive_text_res
         server_timestamp=1000000,
     )
 
+    interactive_questions = MagicMock()
+    interactive_questions.claim_interactive_text = AsyncMock(return_value=None)
     wrap_extracted_collaborators(bot, "_turn_policy", "_inbound_turn_normalizer")
     replace_turn_controller_deps(
         bot,
         resolver=bot._conversation_resolver,
         turn_policy=bot._turn_policy,
         normalizer=bot._inbound_turn_normalizer,
+        interactive_questions=interactive_questions,
     )
 
     with (
-        patch("mindroom.turn_controller.is_authorized_sender", return_value=True),
-        patch.object(bot._turn_policy, "can_reply_to_sender", return_value=True),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+        patch.object(bot._turn_policy, "can_reply_to_sender_in_room", return_value=True),
         patch.object(
             bot._conversation_resolver,
             "coalescing_thread_id",
@@ -588,11 +617,6 @@ async def test_sidecar_preview_passes_resolved_thread_id_to_interactive_text_res
             new_callable=AsyncMock,
             return_value=prepared_event,
         ),
-        patch(
-            "mindroom.turn_controller.interactive.handle_text_response",
-            new_callable=AsyncMock,
-            return_value=None,
-        ) as mock_handle_text_response,
         patch.object(
             bot._turn_controller,
             "_enqueue_prepared_text_for_dispatch",
@@ -601,8 +625,8 @@ async def test_sidecar_preview_passes_resolved_thread_id_to_interactive_text_res
     ):
         await bot._turn_controller._handle_media_message_inner(room, sidecar_event)
 
-    mock_handle_text_response.assert_awaited_once()
-    assert mock_handle_text_response.await_args.kwargs["resolved_thread_id"] == "$thread-root:localhost"
+    interactive_questions.claim_interactive_text.assert_awaited_once_with(
+        source_event_id=prepared_event.event_id,
+    )
     mock_enqueue.assert_awaited_once()
     assert mock_enqueue.await_args.kwargs["prepared_event"] is prepared_event
-    assert mock_enqueue.await_args.kwargs["dispatch_event"] is prepared_event

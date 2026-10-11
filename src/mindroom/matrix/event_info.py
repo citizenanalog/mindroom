@@ -10,6 +10,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
+_THREAD_RELATION_EVENT_TYPES = frozenset({"m.room.encrypted", "m.room.message"})
+
+
+def event_type_supports_thread_relations(event_type: object) -> bool:
+    """Return whether this Matrix event family can affect conversation thread state."""
+    return isinstance(event_type, str) and event_type in _THREAD_RELATION_EVENT_TYPES
+
 
 def origin_server_ts_from_event_source(event_source: object) -> int | float | None:
     """Return a Matrix origin timestamp from one raw event source if present."""
@@ -86,7 +93,21 @@ class EventInfo:
     """The primary event ID this event relates to (if any)."""
 
     thread_id_from_edit: str | None = None
-    """For edit events: the thread root event ID found in ``m.new_content``."""
+    """For edit events: the thread root event ID found in ``m.new_content``.
+
+    A claim, never a placement, and never evidence of membership. Matrix applies ``m.new_content``
+    by keeping the original event's relation and ignoring every ``m.relates_to`` written inside the
+    replacement, so this value is whatever the edit's author decided to type and no rule turns it
+    into a fact. An edit is placed by the event it replaces; resolve that original through
+    ``mindroom.matrix.thread_membership`` instead of reading this. The one use left in the repo is
+    a search hint that widens a durable lookup whose result is validated on its own terms.
+    """
+
+    event_type: str | None = None
+    """The Matrix event type carrying these relations, when known."""
+
+    is_thread_fallback: bool = False
+    """Whether a thread relation uses ``m.in_reply_to`` only as legacy fallback."""
 
     @staticmethod
     def from_event(event_source: dict | None) -> EventInfo:
@@ -108,6 +129,22 @@ class EventInfo:
                 continue
             return normalized_related_event_id
         return None
+
+
+def is_thread_affecting_relation(
+    event_info: EventInfo,
+    *,
+    event_type: str | None,
+) -> bool:
+    """Return whether one event relation can affect visible thread-scoped cache state.
+
+    Relation names are reused by non-message event families.
+    Only relations carried by plaintext or encrypted room messages can add visible
+    conversation history, so every non-message relation stays room-level.
+    """
+    return event_type_supports_thread_relations(event_type) and (
+        event_info.is_thread or event_info.is_edit or event_info.is_reply or event_info.relation_type == "m.reference"
+    )
 
 
 def _analyze_event_relations(event_source: dict | None) -> EventInfo:
@@ -148,6 +185,8 @@ def _analyze_event_relations(event_source: dict | None) -> EventInfo:
             thread_id_from_edit=None,
         )
 
+    raw_event_type = event_source.get("type")
+    event_type = raw_event_type if isinstance(raw_event_type, str) else None
     content = event_source.get("content", {})
     if not isinstance(content, dict):
         content = {}
@@ -158,11 +197,12 @@ def _analyze_event_relations(event_source: dict | None) -> EventInfo:
     # Extract basic relation information
     relation_type = relates_to.get("rel_type")
     has_relations = bool(relates_to)
-    relates_to_event_id = relates_to.get("event_id")
+    relates_to_event_id = _relation_target_event_id(relates_to)
 
     # Thread analysis
     is_thread = relation_type == "m.thread"
     thread_id = relates_to_event_id if is_thread else None
+    is_thread_fallback = is_thread and relates_to.get("is_falling_back") is True
 
     # Edit analysis
     is_edit = relation_type == "m.replace"
@@ -183,6 +223,7 @@ def _analyze_event_relations(event_source: dict | None) -> EventInfo:
     can_be_thread_root = not has_relations
 
     return EventInfo(
+        event_type=event_type,
         # Thread info
         is_thread=is_thread,
         thread_id=thread_id,
@@ -202,7 +243,26 @@ def _analyze_event_relations(event_source: dict | None) -> EventInfo:
         relation_type=relation_type,
         relates_to_event_id=relates_to_event_id,
         thread_id_from_edit=thread_id_from_edit,
+        is_thread_fallback=is_thread_fallback,
     )
+
+
+def _relation_target_event_id(relates_to: dict) -> str | None:
+    """Return the event a relation targets, or ``None`` when it names no event.
+
+    A relation target that is not a non-empty string is not an event ID, and no
+    homeserver MindRoom runs rejects one: Tuwunel's nested-thread check parses
+    ``m.relates_to`` with ruma and skips its own guard when the target fails to
+    deserialize, so the malformed relation is stored verbatim.
+
+    ``event_journal.projection.thread_root`` and ``replacement_target`` already
+    refuse such a target, so honoring it here would split the turn away from the
+    durable row that admitted the same event -- a turn resolved into thread ``''``
+    over a journal row that says room level. Guarding the shared derivation keeps
+    the thread root, the edit original, and the reaction target on one answer.
+    """
+    target = relates_to.get("event_id")
+    return target if isinstance(target, str) and target else None
 
 
 def _extract_thread_id_from_new_content(content: dict) -> str | None:
@@ -218,5 +278,4 @@ def _extract_thread_id_from_new_content(content: dict) -> str | None:
     if new_relates_to.get("rel_type") != "m.thread":
         return None
 
-    event_id = new_relates_to.get("event_id")
-    return event_id if isinstance(event_id, str) else None
+    return _relation_target_event_id(new_relates_to)

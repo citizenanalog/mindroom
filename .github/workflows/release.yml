@@ -8,28 +8,297 @@ on:
         required: true
         type: string
 
+# Any job on main can write the Actions cache, so no job here restores one.
 jobs:
+  build:
+    # Build code never runs in the job that can mint a PyPI upload token.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+      - name: Fetch Git LFS assets
+        run: git lfs pull
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: false
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Build
+        run: uv build --wheel
+      - name: Upload package distributions
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
   deploy:
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/mindroom
     permissions:
-      contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - name: Download package distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          # A retried release must reach the macOS job, which waits for this one.
+          skip-existing: true
+
+  build_macos_helper:
+    name: Build macOS desktop helper
+    # Helper build code runs on its own runner, never beside the signing and release secrets.
+    # It starts after PyPI publishing so it cannot touch this run's wheel artifact before it is published.
+    needs: deploy
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: false
+      - name: Build desktop helper
+        run: macos/build-desktop-helper.sh
+      # Artifacts drop symlinks and executable bits, so ship the bundle as a tarball.
+      - name: Archive desktop helper
+        run: tar -C dist/macos/desktop-helper/dist -cf "$RUNNER_TEMP/desktop-helper.tar" "MindRoom Desktop Helper.app"
+      - name: Upload desktop helper
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macos-desktop-helper
+          path: ${{ runner.temp }}/desktop-helper.tar
+          if-no-files-found: error
+
+  build_macos_app:
+    name: Build and publish macOS app
+    # The app installs the runtime release matching its own version, so publish
+    # it only after that version is on PyPI, which the helper job waits for.
+    needs: build_macos_helper
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      # Short-lived token from the mindroom-release-bot GitHub App; minted first
+      # so a misconfigured app fails the job before the expensive notarized build.
+      - name: Mint release bot token
+        id: release-bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
           lfs: true
+          persist-credentials: false
       - name: Fetch Git LFS assets
         run: git lfs pull
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-      - name: Build
-        run: uv build
-      - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: false
+      - name: Download desktop helper
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macos-desktop-helper
+          path: ${{ runner.temp }}
+      - name: Unpack desktop helper
+        run: |
+          mkdir -p dist/macos/desktop-helper/dist
+          tar -xf "$RUNNER_TEMP/desktop-helper.tar" -C dist/macos/desktop-helper/dist
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CODESIGN_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CODESIGN_CERTIFICATE_PASSWORD }}
+          keychain-password: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+      - name: Resolve Developer ID identity
+        id: codesign
+        run: |
+          IDENTITY=$(
+            security find-identity -v -p codesigning |
+              awk -F '"' '/Developer ID Application/ { print $2; exit }'
+          )
+          if [[ -z "$IDENTITY" ]]; then
+            echo "Developer ID Application signing identity not found." >&2
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+      - name: Build notarized macOS DMG
+        env:
+          CODESIGN_IDENTITY: ${{ steps.codesign.outputs.identity }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_VERSION: ${{ inputs.release_ref }}
+          BUILD_VERSION: ${{ github.run_number }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          SKIP_DESKTOP_HELPER_BUILD: "1"
+        run: |
+          if [[ -z "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+            echo "SPARKLE_PUBLIC_ED_KEY repository variable is required to enable Sparkle updates." >&2
+            exit 1
+          fi
+          NOTARIZE=1 macos/build-macos-app.sh --dmg
+          ditto -c -k --keepParent dist/macos/MindRoom.app dist/macos/MindRoom.zip
+      - name: Upload macOS app to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.release_ref }}
+        run: gh release upload "$TAG_NAME" dist/macos/MindRoom.dmg dist/macos/MindRoom.zip --clobber
+      - name: Update Sparkle appcast
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.release_ref }}
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          git fetch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          git switch --force-create release-metadata FETCH_HEAD
+
+          if [[ -z "$SPARKLE_PRIVATE_ED_KEY" ]]; then
+            echo "SPARKLE_PRIVATE_ED_KEY is required to sign Sparkle updates." >&2
+            exit 1
+          fi
+
+          SPARKLE_GENERATE_APPCAST="macos/MindRoom/.build/artifacts/sparkle/Sparkle/bin/generate_appcast"
+          if [[ ! -x "$SPARKLE_GENERATE_APPCAST" ]]; then
+            echo "Sparkle generate_appcast not found: $SPARKLE_GENERATE_APPCAST" >&2
+            exit 1
+          fi
+
+          APPCAST_DIR="$RUNNER_TEMP/mindroom-appcast"
+          rm -rf "$APPCAST_DIR"
+          mkdir -p "$APPCAST_DIR"
+          cp dist/macos/MindRoom.zip "$APPCAST_DIR/MindRoom.zip"
+          cp macos/appcast.xml "$APPCAST_DIR/appcast.xml"
+          gh release view "$TAG_NAME" --json body --jq .body >"$APPCAST_DIR/MindRoom.md"
+
+          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" |
+            "$SPARKLE_GENERATE_APPCAST" \
+              --ed-key-file - \
+              --download-url-prefix "https://github.com/mindroom-ai/mindroom/releases/download/${TAG_NAME}/" \
+              --link "https://github.com/mindroom-ai/mindroom" \
+              --embed-release-notes \
+              --maximum-versions 10 \
+              -o "$APPCAST_DIR/appcast.xml" \
+              "$APPCAST_DIR"
+
+          cp "$APPCAST_DIR/appcast.xml" macos/appcast.xml
+      - name: Update Sparkle appcast metadata
+        env:
+          GH_TOKEN: ${{ steps.release-bot.outputs.token }}
+          TAG_NAME: ${{ inputs.release_ref }}
+        run: |
+          set -o pipefail
+          python3 .github/scripts/normalize_appcast.py macos/appcast.xml
+
+          if git diff --quiet -- macos/appcast.xml; then
+            echo "macos/appcast.xml is already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add macos/appcast.xml
+          git commit -m "Update MindRoom release metadata to ${TAG_NAME}"
+          git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+
+          PR_BODY=$(mktemp)
+          cat >"$PR_BODY" <<EOF
+          Updates release metadata generated by the ${TAG_NAME} macOS release workflow.
+
+          This includes:
+          - Sparkle appcast entry and signature
+          EOF
+
+          RELEASE_METADATA_BRANCH="release-metadata/mindroom"
+          EXISTING_RELEASE_METADATA_PR=$(
+            gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --state open \
+              --head "$RELEASE_METADATA_BRANCH" \
+              --limit 100 \
+              --json number,headRefName,isCrossRepository |
+              jq -r --arg branch "$RELEASE_METADATA_BRANCH" 'map(select(.headRefName == $branch and .isCrossRepository == false)) | first | if . == null then "" else .number end'
+          )
+
+          if [[ -n "$EXISTING_RELEASE_METADATA_PR" ]]; then
+            echo "Updating existing release metadata PR #${EXISTING_RELEASE_METADATA_PR} on ${RELEASE_METADATA_BRANCH}."
+          else
+            echo "Creating a new release metadata PR on ${RELEASE_METADATA_BRANCH}."
+          fi
+
+          git fetch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "+refs/heads/${RELEASE_METADATA_BRANCH}:refs/remotes/origin/${RELEASE_METADATA_BRANCH}" || true
+          if REMOTE_RELEASE_METADATA_SHA=$(git rev-parse --verify --quiet "refs/remotes/origin/${RELEASE_METADATA_BRANCH}"); then
+            FORCE_WITH_LEASE=(--force-with-lease="refs/heads/${RELEASE_METADATA_BRANCH}:${REMOTE_RELEASE_METADATA_SHA}")
+          else
+            FORCE_WITH_LEASE=(--force-with-lease="refs/heads/${RELEASE_METADATA_BRANCH}:")
+          fi
+          git push "${FORCE_WITH_LEASE[@]}" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:${RELEASE_METADATA_BRANCH}"
+
+          if [[ -n "$EXISTING_RELEASE_METADATA_PR" ]]; then
+            gh pr edit "$EXISTING_RELEASE_METADATA_PR" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Update MindRoom release metadata to ${TAG_NAME}" \
+              --body-file "$PR_BODY"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$RELEASE_METADATA_BRANCH" \
+              --title "Update MindRoom release metadata to ${TAG_NAME}" \
+              --body-file "$PR_BODY"
+          fi
+  update_homebrew_tap:
+    name: Trigger Homebrew tap update
+    needs: build_macos_app
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # repository_dispatch needs contents write on mindroom-ai/homebrew-tap,
+      # which the mindroom-release-bot app installation grants.
+      - name: Mint release bot token
+        id: release-bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: mindroom-ai
+          repositories: homebrew-tap
+      - name: Dispatch tap workflow
+        env:
+          GH_TOKEN: ${{ steps.release-bot.outputs.token }}
+          TAG_NAME: ${{ inputs.release_ref }}
+        run: |
+          gh api repos/mindroom-ai/homebrew-tap/dispatches \
+            -f event_type=mindroom-release \
+            -F "client_payload[tag_name]=$TAG_NAME" \
+            -F "client_payload[asset_url]=https://github.com/mindroom-ai/mindroom/releases/download/${TAG_NAME}/MindRoom.dmg"

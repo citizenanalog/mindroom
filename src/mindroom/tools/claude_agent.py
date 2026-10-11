@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from mindroom.custom_tools.claude_agent import ClaudeAgentTools
@@ -12,9 +13,12 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="claude_agent",
+    requires_primary_runtime=True,
     display_name="Claude Agent SDK",
     description="Run persistent Claude coding sessions with tool-use and subagents",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.UNCONFINED,
+    executes_code=True,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.API_KEY,
     icon="Bot",

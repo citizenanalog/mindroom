@@ -7,9 +7,11 @@ from enum import StrEnum
 
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.dispatch_source import (
+    EXTERNAL_TRIGGER_SOURCE_KIND,
     HOOK_DISPATCH_SOURCE_KIND,
     HOOK_SOURCE_KIND,
     SCHEDULED_SOURCE_KIND,
+    SILENT_SCHEDULE_SOURCE_KIND,
     TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
 )
 
@@ -29,6 +31,7 @@ class TurnIntent(StrEnum):
     ROUTER_HANDOFF = "router_handoff"
     ROUTER_NOTICE = "router_notice"
     SCHEDULED_FIRE = "scheduled_fire"
+    EXTERNAL_TRIGGER = EXTERNAL_TRIGGER_SOURCE_KIND
     HOOK_MESSAGE = "hook_message"
     HOOK_DISPATCH = HOOK_DISPATCH_SOURCE_KIND
     TRUSTED_INTERNAL_RELAY = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
@@ -61,14 +64,23 @@ class TurnOrigin:
         """Return whether this synthetic turn may bypass the managed-sender mention gate."""
         return self.intent in {
             TurnIntent.HOOK_DISPATCH,
+            TurnIntent.EXTERNAL_TRIGGER,
             TurnIntent.ROUTER_HANDOFF,
             TurnIntent.SCHEDULED_FIRE,
         }
 
     @property
+    def acting_sender_id(self) -> str | None:
+        """Return the managed sender of a reply it wrote for this turn's human requester, if it is one."""
+        if self.intent == TurnIntent.MANAGED_MESSAGE and self.requester_kind == SenderKind.USER:
+            return self.transport_sender_id
+        return None
+
+    @property
     def blocks_unmentioned_managed_sender(self) -> bool:
         """Return whether an unmentioned managed sender should be treated as chatter."""
-        return self.requester_kind == SenderKind.MANAGED_ENTITY and not self.may_dispatch_without_mention
+        managed_sender = self.requester_kind == SenderKind.MANAGED_ENTITY or self.acting_sender_id is not None
+        return managed_sender and not self.may_dispatch_without_mention
 
     @property
     def may_answer_interactive_prompt(self) -> bool:
@@ -78,6 +90,11 @@ class TurnOrigin:
             TurnIntent.ROUTER_HANDOFF,
             TurnIntent.TRUSTED_INTERNAL_RELAY,
         }
+
+    @property
+    def may_be_superseded_by_newer_requester_turn(self) -> bool:
+        """Return whether replay guards may skip this turn when a newer requester prompt exists."""
+        return self.may_answer_interactive_prompt
 
 
 def classify_turn_origin(
@@ -150,6 +167,27 @@ def original_sender_for_router_relay(
     return None
 
 
+def requester_id_from_trusted_original_sender(
+    *,
+    original_sender: str | None,
+    original_sender_entity_name: str | None,
+    original_sender_is_access_checked: bool,
+    source_kind: str | None,
+    sender_trusts_original_sender: bool,
+) -> str | None:
+    """Return original-sender metadata that may act as the dispatch requester.
+
+    A relayed human or configured bot account stays the requester, so access applies to it, not the relaying entity.
+    """
+    if not sender_trusts_original_sender or not original_sender:
+        return None
+    if original_sender_is_access_checked:
+        return original_sender
+    if original_sender_entity_name is not None and source_kind in {SCHEDULED_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND}:
+        return original_sender
+    return None
+
+
 def _turn_trust(
     *,
     sender_kind: SenderKind,
@@ -176,8 +214,10 @@ def _turn_intent(
             intent = TurnIntent.ROUTER_HANDOFF
         else:
             intent = TurnIntent.TRUSTED_INTERNAL_RELAY
-    elif source_kind == SCHEDULED_SOURCE_KIND:
+    elif source_kind in {SCHEDULED_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND}:
         intent = TurnIntent.SCHEDULED_FIRE
+    elif source_kind == EXTERNAL_TRIGGER_SOURCE_KIND:
+        intent = TurnIntent.EXTERNAL_TRIGGER
     elif source_kind == HOOK_DISPATCH_SOURCE_KIND:
         intent = TurnIntent.HOOK_DISPATCH
     elif source_kind == HOOK_SOURCE_KIND:

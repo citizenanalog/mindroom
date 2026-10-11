@@ -23,12 +23,23 @@ class CommandType(Enum):
     CANCEL_SCHEDULE = "cancel_schedule"
     EDIT_SCHEDULE = "edit_schedule"
     CONFIG = "config"  # Configuration command
+    DESKTOP = "desktop"  # Requester-scoped Desktop pairing
+    MODE = "mode"
+    MODEL = "model"  # Per-thread model override command
+    ROOM_MODEL = "room_model"  # Room-level model override command
+    THREAD_MODE = "thread_mode"  # Room-level thread mode override command
+    ENCRYPT = "encrypt"  # Room encryption enablement command
+    E2EE = "e2ee"  # Encryption diagnostics command
     HI = "hi"  # Welcome message command
     UNKNOWN = "unknown"  # Special type for unrecognized commands
 
 
 # Command documentation for each command type
 _COMMAND_DOCS = {
+    CommandType.MODE: (
+        "!mode <agent> minimal|standard|show|reset",
+        "Switch one agent between standard tools and a Bash-only interface",
+    ),
     CommandType.SCHEDULE: ("!schedule <task>", "Schedule a task"),
     CommandType.LIST_SCHEDULES: ("!list_schedules", "List scheduled tasks"),
     CommandType.CANCEL_SCHEDULE: ("!cancel_schedule <id>", "Cancel a scheduled task"),
@@ -36,6 +47,21 @@ _COMMAND_DOCS = {
     CommandType.HELP: ("!help [topic]", "Get help"),
     CommandType.RELOAD_PLUGINS: ("!reload-plugins", "Reload configured plugins (admin only)"),
     CommandType.CONFIG: ("!config <operation>", "Manage configuration"),
+    CommandType.DESKTOP: ("!desktop [setup|status|confirm|rotate|disconnect]", "Manage your Desktop target"),
+    CommandType.MODEL: ("!model [name|list|reset]", "Show or switch the model used in the current thread"),
+    CommandType.ROOM_MODEL: (
+        "!room_model [name|list|reset]",
+        "Show the room model default or switch it (set/reset require a room admin)",
+    ),
+    CommandType.THREAD_MODE: (
+        "!thread_mode [room|thread|reset|show]",
+        "Show or switch the thread mode used in the current room (room admin only)",
+    ),
+    CommandType.ENCRYPT: (
+        "!encrypt [confirm]",
+        "Enable end-to-end encryption for this room (irreversible, room admin only)",
+    ),
+    CommandType.E2EE: ("!e2ee", "Show encryption diagnostics for this room"),
     CommandType.HI: ("!hi", "Show welcome message"),
 }
 _WELCOME_COMMAND_TYPES = (CommandType.HI, CommandType.SCHEDULE, CommandType.HELP)
@@ -103,9 +129,16 @@ class _CommandParser:
     CANCEL_SCHEDULE_PATTERN = re.compile(r"^!cancel[_-]?schedule\s+(.+)$", re.IGNORECASE)
     EDIT_SCHEDULE_PATTERN = re.compile(r"^!edit[_-]?schedule\s+(\S+)\s+(.+)$", re.IGNORECASE | re.DOTALL)
     CONFIG_PATTERN = re.compile(r"^!config(?:\s+(.+))?$", re.IGNORECASE)
+    DESKTOP_PATTERN = re.compile(r"^!desktop(?:\s+(.+))?$", re.IGNORECASE)
+    MODE_PATTERN = re.compile(r"^!mode(?:\s+(.+))?$", re.IGNORECASE)
+    MODEL_PATTERN = re.compile(r"^!model(?:\s+(.+))?$", re.IGNORECASE)
+    ROOM_MODEL_PATTERN = re.compile(r"^!room[_-]?model(?:\s+(.+))?$", re.IGNORECASE)
+    THREAD_MODE_PATTERN = re.compile(r"^!thread[_-]?mode(?:\s+(.+))?$", re.IGNORECASE)
+    ENCRYPT_PATTERN = re.compile(r"^!encrypt(?:\s+(.+))?$", re.IGNORECASE)
+    E2EE_PATTERN = re.compile(r"^!e2ee$", re.IGNORECASE)
     HI_PATTERN = re.compile(r"^!hi$", re.IGNORECASE)
 
-    def parse(self, message: str) -> Command | None:  # noqa: PLR0911
+    def parse(self, message: str) -> Command | None:  # noqa: C901, PLR0911, PLR0912
         """Parse a message for commands.
 
         Args:
@@ -185,6 +218,58 @@ class _CommandParser:
                 raw_text=message,
             )
 
+        match = self.DESKTOP_PATTERN.match(message)
+        if match:
+            args_text = match.group(1).strip() if match.group(1) else ""
+            return Command(
+                type=CommandType.DESKTOP,
+                args={"args_text": args_text},
+                raw_text=message,
+            )
+
+        match = self.MODE_PATTERN.match(message)
+        if match:
+            return Command(type=CommandType.MODE, args={"args_text": (match.group(1) or "").strip()}, raw_text=message)
+
+        match = self.MODEL_PATTERN.match(message)
+        if match:
+            args_text = match.group(1).strip() if match.group(1) else ""
+            return Command(
+                type=CommandType.MODEL,
+                args={"args_text": args_text},
+                raw_text=message,
+            )
+
+        match = self.ROOM_MODEL_PATTERN.match(message)
+        if match:
+            args_text = match.group(1).strip() if match.group(1) else ""
+            return Command(
+                type=CommandType.ROOM_MODEL,
+                args={"args_text": args_text},
+                raw_text=message,
+            )
+
+        match = self.THREAD_MODE_PATTERN.match(message)
+        if match:
+            args_text = match.group(1).strip() if match.group(1) else ""
+            return Command(
+                type=CommandType.THREAD_MODE,
+                args={"args_text": args_text},
+                raw_text=message,
+            )
+
+        match = self.ENCRYPT_PATTERN.match(message)
+        if match:
+            args_text = match.group(1).strip() if match.group(1) else ""
+            return Command(
+                type=CommandType.ENCRYPT,
+                args={"args_text": args_text},
+                raw_text=message,
+            )
+
+        if self.E2EE_PATTERN.match(message):
+            return Command(type=CommandType.E2EE, args={}, raw_text=message)
+
         logger.debug("unknown_command", command=message)
         return Command(
             type=CommandType.UNKNOWN,
@@ -193,7 +278,7 @@ class _CommandParser:
         )
 
 
-def get_command_help(topic: str | None = None) -> str:  # noqa: PLR0911
+def get_command_help(topic: str | None = None) -> str:  # noqa: C901, PLR0911
     """Get help text for commands.
 
     Args:
@@ -215,12 +300,12 @@ Usage: `!schedule <time> <message>` - Schedule tasks, reminders, or agent/team w
 - `ping me tomorrow about the meeting`
 - `remind me in 2 hours to review PRs`
 
-**Event-Driven Workflows (New!):**
-- `!schedule If I get an email about "urgent", @phone_agent call me`
-- `!schedule When Bitcoin drops below $40k, @crypto_agent notify me`
-- `!schedule If server CPU > 80%, @ops_agent scale up`
-- `!schedule When someone mentions our product on Reddit, @analyst summarize it`
-- `!schedule Whenever I get email from boss, @notification_agent alert me immediately`
+**Event-Driven Workflows (New!):** _(include a polling cadence — they check on a schedule)_
+- `!schedule Every 5 minutes, check if I got an email about "urgent"; if so, @phone_agent call me`
+- `!schedule Every 10 minutes, check whether Bitcoin dropped below $40k; if so, @crypto_agent notify me`
+- `!schedule Every minute, check if server CPU > 80%; if so, @ops_agent scale up`
+- `!schedule Every 15 minutes, check for mentions of our product on Reddit; if any, @analyst summarize them`
+- `!schedule Every 5 minutes, check for new email from my boss; if any, @notification_agent alert me immediately`
 
 **Agent and Team Workflows:**
 - `!schedule Daily at 9am, @finance give me a market analysis`
@@ -232,9 +317,20 @@ Usage: `!schedule <time> <message>` - Schedule tasks, reminders, or agent/team w
 - `!schedule Daily at 9am, @finance market report`
 - `!schedule Weekly on Friday, @analyst prepare weekly summary`
 
+**Conversation Context Limits:**
+- `!schedule Every hour, @ops check deployment health with no history`
+- `!schedule Daily at 9am, @research summarize AI news with only the last 5 messages`
+
+**Silent Delivery:**
+- Add `silently` or `quietly` when a scheduled check should post only findings, failures, or messages explicitly sent by tools
+- `!schedule Every 5 minutes, quietly check the inbox for urgent messages and report only when one arrives`
+- Silent schedules hide their trigger and omit successful final responses that are empty or contain only `NO_REPLY`
+- Schedules remain visible by default
+
 How it works:
 - **Time-based**: Executes at specific times or intervals
-- **Event-based**: Automatically converts to smart polling (e.g., "if email" → check every 1-2 min)
+- **Event-based**: Requires an explicit recurring polling cadence (e.g., "every 5 minutes")
+- **History limits**: Scheduled responders normally see full configured history; "with no history" uses none, and "last N messages" caps each run
 - Agents and teams receive clear instructions about conditions to check
 - Multiple agents collaborate when mentioned together; mention a team directly for its team workflow
 - Automated tasks are clearly marked and agents or teams follow up when they fire"""
@@ -247,7 +343,7 @@ Usage: `!reload-plugins` - Force-reload all configured plugins from disk
 Alternative syntax: `!reload_plugins`
 
 Notes:
-- Admin only. Caller must be in `authorization.global_users`.
+- Admin only: platform administrators.
 - Use this when you want to force a plugin reload immediately instead of waiting for the file watcher.
 - The reply shows the active plugin set and the count of cancelled background tasks."""
 
@@ -284,7 +380,13 @@ Alternative syntax: `!editschedule`, `!edit-schedule`
 Examples:
 - `!edit_schedule abc123 tomorrow at 9am @finance send market update`
 - `!edit_schedule task42 every weekday at 8am check build status`
+- `!edit_schedule task42 keep the same schedule but restore full history`
+- `!edit_schedule task42 every weekday at 8am check build status with no history`
+- `!edit_schedule task42 keep the same schedule but make this schedule silent`
 
+Omitted fields stay unchanged, including any existing history limit or silent-delivery mode.
+Use "restore full history" or "use unlimited history" to remove a history limit.
+Use "make this schedule silent" or "make this schedule visible" to change its delivery mode.
 Use `!list_schedules` to find task IDs before editing."""
 
     if topic == "config":
@@ -302,7 +404,7 @@ Usage: `!config <operation>` - View and modify MindRoom configuration
 **Modifying Configuration:**
 - `!config set <path> <value>` - Set a configuration value
 - `!config set agents.analyst.display_name "Research Expert"` - Change display name
-- `!config set models.default.id gpt-4` - Change default model
+- `!config set models.default.id my-model` - Change default model
 - `!config set defaults.markdown false` - Disable markdown by default
 - `!config set timezone America/New_York` - Set timezone
 
@@ -311,7 +413,94 @@ Usage: `!config <operation>` - View and modify MindRoom configuration
 - Arrays use indexes (e.g., `agents.analyst.tools.0` for first tool)
 - String values with spaces must be quoted
 
+**Permission:** Disabled by default.
+Set `authorization.config_command_enabled: true`; the caller must also be a platform administrator.
+
 **Note:** Configuration changes are immediately saved to config.yaml and affect all new agent interactions."""
+
+    if topic == "mode":
+        return """**Agent Mode Command**
+
+Usage: `!mode <agent> minimal|standard|show|reset`
+
+- `!mode helper minimal` - Use a Bash-only model interface with the agent's configured tools available through the CLI
+- `!mode helper standard` - Restore the standard tool interface
+- `!mode helper show` - Show the saved choice
+- `!mode helper reset` - Remove the choice and return to standard mode
+
+How it works:
+- Applies to this agent's next Matrix response in the same conversation and survives restarts
+- Thread agents require an existing thread; room-mode agents use one choice for the whole room
+- Private agents keep a separate choice for each requester; other agents and conversations are unaffected
+- Teams and OpenAI-compatible API requests do not use this selection
+- Minimal mode requires existing run/check/kill shell permissions, a canonical workspace, and MindRoom's API server, reachable from wherever the agent's shell runs; a refusal lists everything missing
+- If deployment settings change and minimal mode becomes unavailable, use `!mode <agent> standard` in the same conversation"""
+
+    if topic == "model":
+        return """**Model Command**
+
+Usage: `!model [name|list|reset]` - Show or switch the model used in the current thread
+
+**Examples:**
+- `!model` or `!model list` - Show the current thread's model overrides, each with the entities it applies to, and the available models
+- `!model opus` - Make the agents and teams you may address in this thread use the `opus` model
+- `!model reset` - Remove the override of the agents and teams you may address so room-level model selection applies to them again
+
+How it works:
+- The override applies from the next message in the thread to the agents, teams, and router you may address
+- Every other entity keeps its own thread override or room-level model
+- Model names come from the `models:` section of config.yaml
+- The override is scoped to one thread and survives restarts; other threads and rooms are unaffected
+- Use `!room_model` for a runtime room default, or `room_models` in config.yaml for an authored room default"""
+
+    if topic in {"room_model", "room-model", "roommodel"}:
+        return """**Room Model Command**
+
+Usage: `!room_model [name|list|reset]` - Show or switch the default model used in the current room
+
+**Examples:**
+- `!room_model` or `!room_model list` - Show the current room override and available models
+- `!room_model opus` - Make `opus` the default for every agent, team, and the router in this room
+- `!room_model reset` - Remove the runtime override so the room default returns to configured room or entity models
+
+How it works:
+- The override applies from the next model run and survives restarts without changing config.yaml
+- Thread overrides take precedence over this room default
+- The runtime room override takes precedence over `room_models` in config.yaml
+- Only Matrix room admins can set or reset the override"""
+
+    if topic in {"encrypt", "e2ee", "encryption"}:
+        return """**Encryption Commands**
+
+Usage: `!encrypt [confirm]` - Enable end-to-end encryption for the current room
+       `!e2ee` - Show encryption diagnostics for the current room
+
+**Examples:**
+- `!encrypt` - Review what enabling encryption means for this room
+- `!encrypt confirm` - Enable encryption (room admin only)
+- `!e2ee` - Show room encryption state, bot device, and decryption-failure counters
+
+How it works:
+- Enabling encryption is **irreversible**; a room can never go back to unencrypted
+- People joining later cannot read messages sent before they joined
+- Managed rooms can also be encrypted from config via `room_defaults.encrypted: true`
+  or `rooms.<key>.encrypted: true`"""
+
+    if topic in {"thread_mode", "thread-mode", "threadmode"}:
+        return """**Thread Mode Command**
+
+Usage: `!thread_mode [room|thread|reset|show]` - Show or switch the thread mode used in the current room
+
+**Examples:**
+- `!thread_mode` or `!thread_mode show` - Show the current room override
+- `!thread_mode room` - Use one continuous conversation for the whole room
+- `!thread_mode thread` - Use Matrix threads for separate conversations in this room
+- `!thread_mode reset` - Remove the room override and use configured modes again
+
+How it works:
+- The override applies to future agent replies in the current Matrix room
+- The override is stored in MindRoom runtime state, not config.yaml
+- Only Matrix room admins can set or reset the override"""
 
     # General help - dynamically generated from COMMAND_DOCS
     commands_text = "\n".join(_get_command_entries(format_code=True))

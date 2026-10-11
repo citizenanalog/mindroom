@@ -1,0 +1,545 @@
+"""Public API endpoint for authenticated external trigger delivery."""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import ValidationError
+
+from mindroom.api import config_lifecycle
+from mindroom.authorization import is_sender_allowed_for_agent_reply_in_room
+from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
+from mindroom.external_triggers.auth import (
+    TriggerAuthError,
+    TriggerSignatureHeaders,
+    trigger_capability_matches,
+    verify_trigger_request,
+)
+from mindroom.external_triggers.executor import execute_external_trigger, is_external_trigger_owner_joined_target_room
+from mindroom.external_triggers.models import (
+    ExternalTriggerAcceptedResponse,
+    ExternalTriggerPayload,
+)
+from mindroom.external_triggers.replay_store import (
+    ExternalTriggerEventClaim,
+    ExternalTriggerReplayScopeFullError,
+    ExternalTriggerReplayStore,
+    ExternalTriggerReplayStoreError,
+    ExternalTriggerThreadKeyClaim,
+)
+from mindroom.external_triggers.store import (
+    ExternalTriggerRecordNotDeliverableError,
+    ExternalTriggerStore,
+    ExternalTriggerStoreError,
+    TriggerDeliverySnapshot,
+)
+from mindroom.logging_config import get_logger
+from mindroom.response_admission import (
+    ResponseAdmissionRefusedError,
+    admitted_response_decision,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import nio
+
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
+    from mindroom.matrix.conversation_reads import ConversationReader
+
+router = APIRouter(prefix="/api/triggers", tags=["external-triggers"])
+logger = get_logger(__name__)
+_IN_PROGRESS_EVENT_ID_TTL_SECONDS = 86400
+_DELIVERED_EVENT_ID_TTL_SECONDS = 86400
+# A thread key keeps routing to the same Matrix thread for a week of activity.
+_THREAD_KEY_TTL_SECONDS = 7 * 86400
+# A reservation for a key whose first root is still being posted; short so a
+# crashed delivery cannot block a conversation for long.
+_PENDING_THREAD_KEY_TTL_SECONDS = 300
+# Replay calls can wait on a scope's file lock, so they queue on their own few threads
+# instead of occupying the default executor that chat turns share.
+_REPLAY_STORE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mindroom-external-trigger-replay")
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+@router.post(
+    "/{trigger_id}",
+    status_code=202,
+    response_model=ExternalTriggerAcceptedResponse,
+)
+async def post_external_trigger(trigger_id: str, request: Request) -> ExternalTriggerAcceptedResponse:
+    """Accept one authenticated external trigger and dispatch it into Matrix."""
+    config, runtime_paths, trigger_snapshot = await _request_config_and_trigger_snapshot(trigger_id, request)
+    body = await _read_bounded_body(request, max_body_bytes=trigger_snapshot.max_body_bytes)
+    signature_headers = _authenticate_trigger_request(
+        request,
+        body=body,
+        snapshot=trigger_snapshot,
+    )
+    payload = _parse_payload(body)
+    if trigger_snapshot.allowed_kinds and payload.kind not in trigger_snapshot.allowed_kinds:
+        raise HTTPException(status_code=422, detail="External trigger kind is not allowed")
+    runtime = _require_external_trigger_runtime_binding(request, trigger_snapshot)
+    try:
+        async with admitted_response_decision(
+            runtime.response_admission_gate,
+            runtime.wait_for_admission_or_shutdown,
+        ):
+            config_lifecycle.rebind_current_request_snapshot(request)
+            config, runtime_paths, trigger_snapshot = await _request_config_and_trigger_snapshot(trigger_id, request)
+            if len(body) > trigger_snapshot.max_body_bytes:
+                raise HTTPException(status_code=413, detail="External trigger body exceeds configured limit")
+            signature_headers = _authenticate_trigger_request(
+                request,
+                body=body,
+                snapshot=trigger_snapshot,
+            )
+            payload = _parse_payload(body)
+            if trigger_snapshot.allowed_kinds and payload.kind not in trigger_snapshot.allowed_kinds:
+                raise HTTPException(status_code=422, detail="External trigger kind is not allowed")
+            runtime = _require_external_trigger_runtime_binding(request, trigger_snapshot)
+            _validate_snapshot_policy_and_auth(
+                trigger_snapshot,
+                config,
+                runtime_paths,
+                runtime.agent_reply_memberships,
+            )
+            await _require_external_trigger_runtime_ready(runtime, trigger_snapshot)
+            await _require_owner_joined_target_room(runtime, trigger_snapshot, config, runtime_paths)
+
+            return await _claim_and_execute_trigger(
+                payload=payload,
+                signature_headers=signature_headers,
+                snapshot=trigger_snapshot,
+                config=config,
+                runtime_paths=runtime_paths,
+                runtime=runtime,
+            )
+    except ResponseAdmissionRefusedError as exc:
+        raise HTTPException(status_code=503, detail="External trigger runtime is not available") from exc
+
+
+async def _request_config_and_trigger_snapshot(
+    trigger_id: str,
+    request: Request,
+) -> tuple[Config, RuntimePaths, TriggerDeliverySnapshot]:
+    api_snapshot = _bind_request_api_snapshot(request)
+    try:
+        config, runtime_paths = config_lifecycle.read_committed_runtime_config(request)
+    except HTTPException as exc:
+        raise HTTPException(status_code=503, detail="External trigger configuration is not available") from exc
+    if not config.external_trigger_policy.enabled:
+        raise HTTPException(status_code=404, detail="External trigger not found")
+
+    trigger_store = _trigger_store(runtime_paths)
+    try:
+        trigger_snapshot = await asyncio.to_thread(
+            trigger_store.delivery_snapshot,
+            trigger_id,
+            config=config,
+            config_generation=api_snapshot.generation,
+        )
+    except ExternalTriggerRecordNotDeliverableError as exc:
+        raise HTTPException(status_code=404, detail="External trigger not found") from exc
+    except ExternalTriggerStoreError as exc:
+        raise HTTPException(status_code=503, detail="External trigger store is not available") from exc
+    if trigger_snapshot is None or not trigger_snapshot.enabled:
+        raise HTTPException(status_code=404, detail="External trigger not found")
+    return config, runtime_paths, trigger_snapshot
+
+
+def _bind_request_api_snapshot(request: Request) -> config_lifecycle.ApiSnapshot:
+    try:
+        return config_lifecycle.bind_current_request_snapshot(request)
+    except TypeError as exc:
+        raise HTTPException(status_code=503, detail="External trigger configuration is not available") from exc
+
+
+async def _claim_and_execute_trigger(
+    *,
+    payload: ExternalTriggerPayload,
+    signature_headers: TriggerSignatureHeaders | None,
+    snapshot: TriggerDeliverySnapshot,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    runtime: config_lifecycle.ExternalTriggerRuntime,
+) -> ExternalTriggerAcceptedResponse:
+    now = int(time.time())
+    event_id = (
+        snapshot.uid
+        if snapshot.delivery_mode == "single_use"
+        else _reusable_event_id(
+            payload,
+            signature_headers,
+        )
+    )
+    replay_store = _replay_store(runtime_paths)
+    if signature_headers is not None and not await _run_replay_store_call(
+        replay_store.claim_nonce,
+        snapshot.replay_scope,
+        signature_headers.nonce,
+        now=now,
+        ttl_seconds=snapshot.replay_window_seconds,
+    ):
+        raise HTTPException(status_code=409, detail="External trigger nonce has already been used")
+
+    event_claim = await _run_replay_store_call(
+        replay_store.claim_event_id,
+        snapshot.replay_scope,
+        event_id,
+        now=now,
+        ttl_seconds=_IN_PROGRESS_EVENT_ID_TTL_SECONDS,
+    )
+    if event_claim is ExternalTriggerEventClaim.DELIVERED:
+        await _consume_single_use_trigger(snapshot, runtime_paths)
+        return ExternalTriggerAcceptedResponse(
+            accepted=True,
+            duplicate=True,
+            trigger_id=snapshot.trigger_id,
+            event_id=event_id,
+        )
+    if event_claim is ExternalTriggerEventClaim.IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="External trigger event is already in progress")
+    await _require_current_replay_scope(replay_store, snapshot, event_id, runtime_paths)
+
+    payload = payload.model_copy(update={"event_id": event_id})
+    # Only per-fire targets group by thread key; a fixed target thread already
+    # collects every delivery.
+    thread_key = payload.thread_key if snapshot.target.new_thread else None
+    continue_thread_event_id: str | None = None
+    thread_reservation: str | None = None
+    if thread_key is not None:
+        continue_thread_event_id, thread_reservation = await _claim_thread_key(
+            replay_store,
+            snapshot,
+            thread_key,
+            event_id,
+            now=now,
+        )
+    try:
+        matrix_event_id = await execute_external_trigger(
+            client=cast("nio.AsyncClient", runtime.client),
+            snapshot=snapshot,
+            payload=payload,
+            config=config,
+            runtime_paths=runtime_paths,
+            conversation_reader=cast("ConversationReader", runtime.conversation_reader),
+            continue_thread_event_id=continue_thread_event_id,
+        )
+    except Exception:
+        await _rollback_failed_delivery(replay_store, snapshot, event_id, thread_key, thread_reservation)
+        raise
+    if matrix_event_id is None:
+        await _rollback_failed_delivery(replay_store, snapshot, event_id, thread_key, thread_reservation)
+        raise HTTPException(status_code=502, detail="External trigger delivery failed")
+    if thread_key is not None:
+        intended_root = continue_thread_event_id or matrix_event_id
+        bound_root = await _run_replay_store_call(
+            replay_store.bind_thread_root,
+            snapshot.replay_scope,
+            thread_key,
+            intended_root,
+            room_id=snapshot.resolved_room_id,
+            reservation=thread_reservation,
+            now=int(time.time()),
+            ttl_seconds=_THREAD_KEY_TTL_SECONDS,
+        )
+        if bound_root != intended_root:
+            # The delivery outlived its reservation, and another one opened the
+            # thread meanwhile or the trigger's thread keys reached their limit.
+            # The message is posted; only its root is orphaned.
+            logger.warning(
+                "External trigger delivery lost its thread key",
+                trigger_id=snapshot.trigger_id,
+                thread_key=thread_key,
+                matrix_event_id=matrix_event_id,
+                bound_root=bound_root,
+            )
+
+    await _run_replay_store_call(
+        replay_store.mark_event_delivered,
+        snapshot.replay_scope,
+        event_id,
+        now=int(time.time()),
+        ttl_seconds=_DELIVERED_EVENT_ID_TTL_SECONDS,
+    )
+    await _consume_single_use_trigger(snapshot, runtime_paths)
+    return ExternalTriggerAcceptedResponse(
+        accepted=True,
+        duplicate=False,
+        trigger_id=snapshot.trigger_id,
+        event_id=event_id,
+        matrix_event_id=matrix_event_id,
+    )
+
+
+async def _claim_thread_key(
+    replay_store: ExternalTriggerReplayStore,
+    snapshot: TriggerDeliverySnapshot,
+    thread_key: str,
+    event_id: str,
+    *,
+    now: int,
+) -> tuple[str | None, str | None]:
+    """Return the thread root to continue and the caller's reservation, releasing the event id when refused."""
+    try:
+        thread_claim, continue_thread_event_id, thread_reservation = await _run_replay_store_call(
+            replay_store.claim_thread_key,
+            snapshot.replay_scope,
+            thread_key,
+            room_id=snapshot.resolved_room_id,
+            now=now,
+            pending_ttl_seconds=_PENDING_THREAD_KEY_TTL_SECONDS,
+        )
+    except HTTPException:
+        # A refused thread claim must not leave the event id stuck in progress.
+        await _release_event_id_best_effort(replay_store, snapshot.replay_scope, event_id)
+        raise
+    if thread_claim is ExternalTriggerThreadKeyClaim.PENDING:
+        await _release_event_id_best_effort(replay_store, snapshot.replay_scope, event_id)
+        raise HTTPException(status_code=409, detail="External trigger thread is being opened by another delivery")
+    return continue_thread_event_id, thread_reservation
+
+
+async def _require_current_replay_scope(
+    replay_store: ExternalTriggerReplayStore,
+    snapshot: TriggerDeliverySnapshot,
+    event_id: str,
+    runtime_paths: RuntimePaths,
+) -> None:
+    """Refuse a fresh claim made in a scope that was retired after this request's snapshot.
+
+    Consuming, deleting, or re-keying a trigger retires its scope, and trigger writes delete a retired
+    scope's replay records and lock, so a claim there can be fresh for an event already delivered.
+    A retired scope never becomes current again, so one still current after the claim was intact during it.
+    """
+    try:
+        is_current = await asyncio.to_thread(
+            _trigger_store(runtime_paths).is_current_replay_scope,
+            snapshot.trigger_id,
+            snapshot.replay_scope,
+        )
+    except ExternalTriggerStoreError as exc:
+        await _release_event_id_best_effort(replay_store, snapshot.replay_scope, event_id)
+        raise HTTPException(status_code=503, detail="External trigger store is not available") from exc
+    if not is_current:
+        raise HTTPException(status_code=404, detail="External trigger not found")
+
+
+def _trigger_store(runtime_paths: RuntimePaths) -> ExternalTriggerStore:
+    if runtime_paths.control_state_root is None:
+        raise HTTPException(status_code=503, detail="External trigger store is not available")
+    return ExternalTriggerStore(runtime_paths)
+
+
+def _replay_store(runtime_paths: RuntimePaths) -> ExternalTriggerReplayStore:
+    if runtime_paths.control_state_root is None:
+        raise HTTPException(status_code=503, detail="External trigger replay store is not available")
+    return ExternalTriggerReplayStore(runtime_paths.control_state_root)
+
+
+def _validate_snapshot_policy_and_auth(
+    snapshot: TriggerDeliverySnapshot,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    agent_reply_memberships: AgentReplyMembershipIndex,
+) -> None:
+    if not is_sender_allowed_for_agent_reply_in_room(
+        snapshot.owner_user_id,
+        snapshot.target.agent,
+        config,
+        snapshot.resolved_room_id,
+        runtime_paths,
+        agent_reply_memberships,
+    ):
+        raise HTTPException(status_code=403, detail="External trigger owner is not authorized for this target room")
+
+
+async def _read_bounded_body(request: Request, *, max_body_bytes: int) -> bytes:
+    try:
+        return await collect_bounded_bytes(request.stream(), max_bytes=max_body_bytes)
+    except ByteLimitExceededError as exc:
+        raise HTTPException(status_code=413, detail="External trigger body exceeds configured limit") from exc
+
+
+def _authenticate_trigger_request(
+    request: Request,
+    *,
+    body: bytes,
+    snapshot: TriggerDeliverySnapshot,
+) -> TriggerSignatureHeaders | None:
+    if snapshot.auth == "capability":
+        _require_matching_capability(request, snapshot)
+        return None
+    if snapshot.key_id is None or snapshot.public_key is None:
+        raise HTTPException(status_code=503, detail="External trigger signing key is not available")
+    try:
+        signature_headers = TriggerSignatureHeaders.from_mapping(request.headers)
+        verify_trigger_request(
+            method=request.method,
+            path=request.url.path,
+            body=body,
+            headers=signature_headers,
+            expected_key_id=snapshot.key_id,
+            public_key_b64=snapshot.public_key,
+            replay_window_seconds=snapshot.replay_window_seconds,
+            now=int(time.time()),
+        )
+    except TriggerAuthError as exc:
+        raise HTTPException(status_code=401, detail="Invalid external trigger signature") from exc
+    return signature_headers
+
+
+def _require_matching_capability(request: Request, snapshot: TriggerDeliverySnapshot) -> None:
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    token_hash = snapshot.capability_token_hash
+    if (
+        scheme.lower() != "bearer"
+        or not token.strip()
+        or token_hash is None
+        or not trigger_capability_matches(token.strip(), token_hash)
+    ):
+        raise HTTPException(status_code=404, detail="External trigger not found")
+
+
+def _reusable_event_id(
+    payload: ExternalTriggerPayload,
+    signature_headers: TriggerSignatureHeaders | None,
+) -> str:
+    if payload.event_id is not None:
+        return payload.event_id
+    if signature_headers is None:
+        raise HTTPException(status_code=422, detail="Reusable triggers require an event id")
+    return signature_headers.nonce
+
+
+async def _consume_single_use_trigger(snapshot: TriggerDeliverySnapshot, runtime_paths: RuntimePaths) -> None:
+    if snapshot.delivery_mode != "single_use":
+        return
+    try:
+        await asyncio.to_thread(
+            _trigger_store(runtime_paths).consume_single_use,
+            snapshot.trigger_id,
+            expected_uid=snapshot.uid,
+        )
+    except ExternalTriggerStoreError as exc:
+        raise HTTPException(status_code=503, detail="Single-use trigger could not be consumed") from exc
+
+
+def _parse_payload(body: bytes) -> ExternalTriggerPayload:
+    try:
+        return ExternalTriggerPayload.model_validate_json(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
+
+
+async def _in_replay_executor(call: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_REPLAY_STORE_EXECUTOR, functools.partial(call, *args, **kwargs))
+
+
+async def _run_replay_store_call(call: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    try:
+        return await _in_replay_executor(call, *args, **kwargs)
+    except ExternalTriggerReplayScopeFullError as exc:
+        raise HTTPException(status_code=429, detail="External trigger replay limit reached") from exc
+    except ExternalTriggerReplayStoreError as exc:
+        raise HTTPException(status_code=503, detail="External trigger replay store is not available") from exc
+
+
+async def _rollback_failed_delivery(
+    replay_store: ExternalTriggerReplayStore,
+    snapshot: TriggerDeliverySnapshot,
+    event_id: str,
+    thread_key: str | None,
+    thread_reservation: str | None,
+) -> None:
+    """Undo replay claims after a failed send without masking the failure.
+
+    A failed first delivery releases its own thread-key reservation so the next
+    delivery can open the root. A failed continuation holds no reservation and
+    keeps the key bound: the root is still the right thread, and a transient
+    send error must not split the conversation.
+    """
+    await _release_event_id_best_effort(replay_store, snapshot.replay_scope, event_id)
+    if thread_key is None or thread_reservation is None:
+        return
+    try:
+        await _in_replay_executor(
+            replay_store.release_thread_key,
+            snapshot.replay_scope,
+            thread_key,
+            reservation=thread_reservation,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to release external trigger thread key after delivery failure",
+            trigger_id=snapshot.trigger_id,
+            thread_key=thread_key,
+            exc_info=True,
+        )
+
+
+async def _release_event_id_best_effort(
+    store: ExternalTriggerReplayStore,
+    replay_scope: str,
+    event_id: str,
+) -> None:
+    """Release an in-progress event claim without masking the delivery failure."""
+    try:
+        await _in_replay_executor(store.release_event_id, replay_scope, event_id)
+    except Exception:
+        logger.warning(
+            "Failed to release external trigger event claim after delivery failure",
+            replay_scope=replay_scope,
+            event_id=event_id,
+            exc_info=True,
+        )
+
+
+def _require_external_trigger_runtime_binding(
+    request: Request,
+    snapshot: TriggerDeliverySnapshot,
+) -> config_lifecycle.ExternalTriggerRuntime:
+    runtime = config_lifecycle.app_state(request.app).external_trigger_runtime
+    if runtime is None or runtime.config_generation != snapshot.config_generation:
+        raise HTTPException(status_code=503, detail="External trigger runtime is not available")
+    return runtime
+
+
+async def _require_external_trigger_runtime_ready(
+    runtime: config_lifecycle.ExternalTriggerRuntime,
+    snapshot: TriggerDeliverySnapshot,
+) -> None:
+    """Require current router and target delivery readiness for one trigger."""
+    try:
+        is_trigger_ready = await runtime.is_trigger_snapshot_ready(snapshot)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="External trigger target runtime is not available") from exc
+    if not is_trigger_ready:
+        raise HTTPException(status_code=503, detail="External trigger target runtime is not available")
+
+
+async def _require_owner_joined_target_room(
+    runtime: config_lifecycle.ExternalTriggerRuntime,
+    snapshot: TriggerDeliverySnapshot,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> None:
+    owner_joined = await is_external_trigger_owner_joined_target_room(
+        cast("nio.AsyncClient", runtime.client),
+        snapshot,
+        config,
+        runtime_paths,
+    )
+    if not owner_joined:
+        raise HTTPException(status_code=403, detail="External trigger owner is not joined to the target room")

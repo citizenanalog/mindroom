@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from mindroom.constants import ROUTER_AGENT_NAME
@@ -29,6 +29,7 @@ class ResolvedExactTeamMembers:
     display_names: list[str]
     materialized_agent_names: set[str]
     failed_agent_names: list[str]
+    model_names: dict[str, str] = field(default_factory=dict)
 
 
 def resolve_live_shared_agent_names(
@@ -48,6 +49,21 @@ def resolve_live_shared_agent_names(
         for name, bot in running_agent_bots.items()
         if name != ROUTER_AGENT_NAME and name in active_config.agents and bot.running
     }
+
+
+def resolve_team_materializable_agent_names(
+    config: Config,
+    materializable_agent_names: set[str] | None,
+    *,
+    allow_direct_private_agents: bool,
+) -> set[str] | None:
+    """Add on-demand private agents to one known live shared-agent set when allowed."""
+    if materializable_agent_names is None or not allow_direct_private_agents:
+        return materializable_agent_names
+    private_agent_names = {
+        agent_name for agent_name, agent_config in config.agents.items() if agent_config.private is not None
+    }
+    return materializable_agent_names | private_agent_names
 
 
 def materialize_exact_requested_team_members(

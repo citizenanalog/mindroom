@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import nio
 
-from mindroom.matrix.client_room_admin import add_room_to_space, create_room, get_room_members, invite_to_room
+from mindroom.matrix.client_room_admin import (
+    add_room_to_space,
+    admin_join_room_user,
+    create_room,
+    get_joined_rooms,
+    get_room_members,
+    invite_to_room,
+)
+from mindroom.matrix.identity import managed_account_key, managed_account_user_id
+from mindroom.matrix.invited_rooms_store import (
+    invited_room_entity_names,
+    invited_rooms_path,
+    remember_invited_room,
+    should_persist_invited_rooms,
+)
 from mindroom.matrix_identifiers import extract_server_name_from_homeserver
 
 if TYPE_CHECKING:
+    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
     from .types import HookMatrixAdmin
@@ -22,6 +37,7 @@ class _BoundHookMatrixAdmin:
 
     client: nio.AsyncClient
     runtime_paths: RuntimePaths
+    config: Config | None = None
 
     async def resolve_alias(self, alias: str) -> str | None:
         """Resolve one room alias and return the room ID when it exists."""
@@ -38,22 +54,65 @@ class _BoundHookMatrixAdmin:
         topic: str | None = None,
         power_user_ids: list[str] | None = None,
     ) -> str | None:
-        """Create one room with the existing managed room helper."""
-        return await create_room(
+        """Create one room and record it so lifecycle cleanup preserves it for the creator."""
+        room_id = await create_room(
             client=self.client,
             name=name,
             alias=alias_localpart,
             topic=topic,
             power_users=power_user_ids,
         )
+        if room_id is not None:
+            self.retain_room(room_id)
+        return room_id
 
     async def invite_user(self, room_id: str, user_id: str) -> bool:
         """Invite one user into one room."""
         return await invite_to_room(self.client, room_id, user_id)
 
-    async def get_room_members(self, room_id: str) -> set[str]:
-        """Return the current joined members for one room."""
+    async def force_join_user(self, room_id: str, user_id: str) -> bool:
+        """Join one local user through the Synapse-compatible admin API."""
+        if not self.client.access_token:
+            return False
+        # Tuwunel's Synapse-compatible endpoint performs the join on the
+        # user's behalf, but still enforces the room's join rules.  Restore an
+        # invite first so a user who left an invite-only room can rejoin.
+        await invite_to_room(self.client, room_id, user_id)
+        return await admin_join_room_user(self.client, room_id, user_id)
+
+    async def kick_user(self, room_id: str, user_id: str, *, reason: str | None = None) -> bool:
+        """Kick one joined user from one room."""
+        response = await self.client.room_kick(room_id, user_id, reason=reason)
+        return isinstance(response, nio.RoomKickResponse)
+
+    async def get_room_members(self, room_id: str) -> set[str] | None:
+        """Return the current joined members for one room, or ``None`` when the fetch fails."""
         return await get_room_members(self.client, room_id)
+
+    async def get_joined_rooms(self) -> list[str] | None:
+        """Return the bound account's joined rooms, or ``None`` when unavailable."""
+        return await get_joined_rooms(self.client)
+
+    async def get_profile_avatar(self, user_id: str) -> str | None:
+        """Return one user's Matrix avatar content URI, or ``None`` when unavailable."""
+        response = await self.client.get_profile(user_id)
+        if isinstance(response, nio.ProfileGetResponse):
+            return response.avatar_url or None
+        return None
+
+    async def get_room_state_event(
+        self,
+        room_id: str,
+        event_type: str,
+        state_key: str,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Return one state event while distinguishing missing from unreadable."""
+        response = await self.client.room_get_state_event(room_id, event_type, state_key)
+        if isinstance(response, nio.RoomGetStateEventResponse) and isinstance(response.content, dict):
+            return True, response.content
+        if isinstance(response, nio.RoomGetStateEventError) and response.status_code == "M_NOT_FOUND":
+            return True, None
+        return False, None
 
     async def add_room_to_space(self, space_room_id: str, room_id: str) -> bool:
         """Link one room under an existing Matrix Space."""
@@ -63,10 +122,58 @@ class _BoundHookMatrixAdmin:
         )
         return await add_room_to_space(self.client, space_room_id, room_id, server_name)
 
+    async def put_room_state(
+        self,
+        room_id: str,
+        event_type: str,
+        state_key: str,
+        content: dict[str, Any],
+    ) -> bool:
+        """Write one room state event using the bound admin-capable client."""
+        response = await self.client.room_put_state(
+            room_id=room_id,
+            event_type=event_type,
+            content=content,
+            state_key=state_key,
+        )
+        return isinstance(response, nio.RoomPutStateResponse)
+
+    def retain_room(self, room_id: str) -> None:
+        """Retain a plugin-owned room for the bound managed entity across cleanup.
+
+        Plugins reconciling existing rooms can restore this local ownership
+        record without creating a room or changing Matrix membership.
+        """
+        if self.config is None:
+            return
+        entity_name = self._managed_entity_name_for_user_id(self.client.user_id)
+        if entity_name is None or not should_persist_invited_rooms(self.config, entity_name):
+            return
+        path = invited_rooms_path(self.runtime_paths, entity_name)
+        remember_invited_room(path, room_id)
+
+    def _managed_entity_name_for_user_id(self, user_id: str | None) -> str | None:
+        """Return the configured bot entity name for one managed Matrix user ID."""
+        if self.config is None or user_id is None:
+            return None
+
+        domain = self.config.get_domain(self.runtime_paths)
+        for entity_name in invited_room_entity_names(self.config):
+            entity_user_id = managed_account_user_id(
+                managed_account_key(entity_name),
+                domain,
+                self.runtime_paths,
+            )
+            if entity_user_id == user_id:
+                return entity_name
+        return None
+
 
 def build_hook_matrix_admin(
     client: nio.AsyncClient,
     runtime_paths: RuntimePaths,
+    *,
+    config: Config | None = None,
 ) -> HookMatrixAdmin:
     """Return a minimal hook-facing Matrix admin helper bound to one client."""
-    return _BoundHookMatrixAdmin(client=client, runtime_paths=runtime_paths)
+    return _BoundHookMatrixAdmin(client=client, runtime_paths=runtime_paths, config=config)

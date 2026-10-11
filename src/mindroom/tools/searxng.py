@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.searxng import Searxng
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="searxng",
+    file_access=ToolFileAccess.NONE,
     display_name="SearxNG",
     description="Open source search engine for web, images, news, science, and specialized content",
     category=ToolCategory.RESEARCH,
@@ -29,7 +31,7 @@ if TYPE_CHECKING:
         ConfigField(
             name="engines",
             label="Engines",
-            type="text",
+            type="string[]",
             required=False,
         ),
         ConfigField(
@@ -38,6 +40,13 @@ if TYPE_CHECKING:
             type="number",
             required=False,
             default=None,
+        ),
+        ConfigField(
+            name="timeout",
+            label="Timeout",
+            type="number",
+            required=False,
+            default=30,
         ),
     ],
     dependencies=[],  # httpx already included in main dependencies

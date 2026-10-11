@@ -11,15 +11,21 @@ from typing import Any, ClassVar
 import nio
 from agno.tools import Toolkit
 
-from mindroom.config.matrix import ignore_unverified_devices_for_config
+from mindroom.constants import ACTING_REQUESTER_KEY
 from mindroom.custom_tools.attachment_helpers import room_access_allowed
 from mindroom.custom_tools.matrix_helpers import check_rate_limit
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
 from mindroom.logging_config import get_logger
-from mindroom.matrix.thread_bookkeeping import (
+from mindroom.matrix.client import room_admin_power_user, send_room_event_result
+from mindroom.matrix.thread_mutation_impact import (
     MutationThreadImpactState,
     resolve_event_thread_impact_for_client,
     resolve_redaction_thread_impact_for_client,
+)
+from mindroom.requester_identity import (
+    equivalent_requester_ids,
+    is_access_checked_requester_id,
+    is_human_requester_id,
 )
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
 
@@ -112,6 +118,7 @@ class MatrixApiTools(Toolkit):
         "redact": 2,
     }
     _HARD_BLOCKED_STATE_TYPES: ClassVar[frozenset[str]] = frozenset({"m.room.create"})
+    _RESERVED_MINDROOM_PREFIXES: ClassVar[tuple[str, ...]] = ("com.mindroom.", "io.mindroom.")
     _DANGEROUS_STATE_TYPES: ClassVar[frozenset[str]] = frozenset(
         {
             "m.room.power_levels",
@@ -257,8 +264,9 @@ class MatrixApiTools(Toolkit):
             return "", "state_key must be a string."
         return state_key, None
 
-    @staticmethod
+    @classmethod
     def _validate_content(
+        cls,
         content: dict[str, object] | None,
     ) -> tuple[dict[str, object] | None, str | None]:
         if not isinstance(content, dict):
@@ -267,7 +275,73 @@ class MatrixApiTools(Toolkit):
             json.dumps(content, sort_keys=True)
         except (TypeError, ValueError) as exc:
             return None, f"content must be JSON-serializable: {exc}"
+        reserved_keys = cls._reserved_content_keys(content)
+        if reserved_keys:
+            return None, (
+                f"content must not set MindRoom-reserved keys ({', '.join(reserved_keys)}); "
+                "they carry runtime trust metadata such as the relayed requester identity."
+            )
         return content, None
+
+    @classmethod
+    def _reserved_content_keys(cls, value: object) -> list[str]:
+        """Return every MindRoom-reserved key the model placed anywhere in *value*.
+
+        A managed Matrix account speaks for the runtime, so content the model
+        composes must never carry the namespaces ingress reads as runtime
+        metadata. Nested payloads count: edits and sidecars promote inner
+        objects into the content the receiving agent validates.
+
+        The walk keeps its own stack: content the model chose can nest deeply
+        enough to exhaust the interpreter's, and a rejection is only useful if
+        it reaches the caller.
+        """
+        found: set[str] = set()
+        pending: list[object] = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                found.update(key for key in current if isinstance(key, str) and cls._is_reserved_name(key))
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+        return sorted(found)
+
+    @classmethod
+    def _is_reserved_name(cls, name: str) -> bool:
+        """Return whether one content key or event type belongs to MindRoom's runtime namespaces."""
+        return name.startswith(cls._RESERVED_MINDROOM_PREFIXES)
+
+    @classmethod
+    def _reserved_event_type_error(
+        cls,
+        *,
+        action: str,
+        room_id: str,
+        event_type: str,
+        state_key: str | None = None,
+    ) -> str | None:
+        """Reject writes to event types MindRoom's own runtime owns and reads back.
+
+        A runtime-owned event is an instruction, not a message: a scheduled
+        task's state event names the requester its fire will later speak for.
+        Rejecting reserved content keys is not enough, because such a payload
+        can carry the identity inside a field of its own -- so the model must
+        not be able to author one of these events from the agent's Matrix
+        account at all.
+        """
+        if not cls._is_reserved_name(event_type):
+            return None
+        state_key_payload = {} if state_key is None else {"state_key": state_key}
+        return cls._error_payload(
+            action=action,
+            room_id=room_id,
+            event_type=event_type,
+            message=(
+                f"Event type '{event_type}' is reserved for MindRoom runtime state and cannot be written by a tool."
+            ),
+            **state_key_payload,
+        )
 
     @classmethod
     def _content_summary(
@@ -589,8 +663,9 @@ class MatrixApiTools(Toolkit):
         )
 
     @classmethod
-    def _state_write_policy_error(
+    async def _state_write_policy_error(
         cls,
+        context: ToolRuntimeContext,
         *,
         action: str,
         room_id: str,
@@ -598,6 +673,14 @@ class MatrixApiTools(Toolkit):
         state_key: str,
         allow_dangerous: bool,
     ) -> tuple[str | None, bool]:
+        reserved_error = cls._reserved_event_type_error(
+            action=action,
+            room_id=room_id,
+            event_type=event_type,
+            state_key=state_key,
+        )
+        if reserved_error is not None:
+            return reserved_error, False
         if event_type in cls._HARD_BLOCKED_STATE_TYPES:
             return (
                 cls._error_payload(
@@ -620,12 +703,58 @@ class MatrixApiTools(Toolkit):
                     dangerous=True,
                     message=(
                         f"State event type '{event_type}' is dangerous. "
-                        "Re-run with allow_dangerous=true only when you intentionally want to change critical room state."
+                        "Re-run with allow_dangerous=true only when you intentionally want to change critical room state; "
+                        "the requester must also be a joined room admin in the target room."
+                    ),
+                ),
+                True,
+            )
+        if dangerous and not await cls._requester_may_write_dangerous_state(context, room_id):
+            return (
+                cls._error_payload(
+                    action=action,
+                    room_id=room_id,
+                    event_type=event_type,
+                    state_key=state_key,
+                    dangerous=True,
+                    message=(
+                        f"State event type '{event_type}' requires the requester to be a joined room admin "
+                        "in the target room."
                     ),
                 ),
                 True,
             )
         return None, dangerous
+
+    @staticmethod
+    async def _requester_may_write_dangerous_state(
+        context: ToolRuntimeContext,
+        room_id: str,
+    ) -> bool:
+        """Return whether the human requester could authorize this room's critical state themselves."""
+        requester_id = context.requester_id
+        config = context.current_config
+        if requester_id == context.client.user_id or not is_human_requester_id(
+            requester_id,
+            config,
+            context.runtime_paths,
+        ):
+            return False
+        joined_ids = [
+            user_id
+            for user_id in sorted(equivalent_requester_ids(requester_id, config, context.runtime_paths))
+            if await MatrixApiTools._is_joined(context.client, room_id, user_id)
+        ]
+        return await room_admin_power_user(context.client, room_id, joined_ids) is not None
+
+    @staticmethod
+    async def _is_joined(client: nio.AsyncClient, room_id: str, user_id: str) -> bool:
+        membership = await client.room_get_state_event(room_id, "m.room.member", user_id)
+        return (
+            isinstance(membership, nio.RoomGetStateEventResponse)
+            and isinstance(membership.content, dict)
+            and membership.content.get("membership") == "join"
+        )
 
     @classmethod
     def _send_event_policy_error(
@@ -634,6 +763,13 @@ class MatrixApiTools(Toolkit):
         room_id: str,
         event_type: str,
     ) -> str | None:
+        reserved_error = cls._reserved_event_type_error(
+            action="send_event",
+            room_id=room_id,
+            event_type=event_type,
+        )
+        if reserved_error is not None:
+            return reserved_error
         if event_type == "m.room.redaction":
             return cls._error_payload(
                 action="send_event",
@@ -662,38 +798,19 @@ class MatrixApiTools(Toolkit):
         return None
 
     @staticmethod
-    async def _record_send_event_outbound_cache_write(
-        context: ToolRuntimeContext,
-        *,
-        room_id: str,
-        event_type: str,
-        event_id: str,
-        content: dict[str, object],
-        requires_conversation_cache_write: bool,
-    ) -> None:
-        """Record a successful threaded room-message send in the local conversation cache."""
-        if event_type != "m.room.message" or not requires_conversation_cache_write:
-            return
-        context.conversation_cache.notify_outbound_message(
-            room_id,
-            event_id,
-            content,
-        )
-
-    @staticmethod
-    async def _resolve_redaction_cache_write_requirement(
+    async def _redaction_thread_resolution_error(
         context: ToolRuntimeContext,
         *,
         room_id: str,
         event_id: str,
-    ) -> tuple[bool, str | None]:
-        """Return redaction bookkeeping intent plus an optional fail-closed error."""
+    ) -> str | None:
+        """Return a fail-closed error when redaction thread impact cannot be resolved."""
         try:
             thread_impact = await resolve_redaction_thread_impact_for_client(
                 context.client,
                 room_id=room_id,
                 event_id=event_id,
-                conversation_cache=context.conversation_cache,
+                relations=context.relations,
             )
         except Exception as exc:
             logger.warning(
@@ -702,18 +819,33 @@ class MatrixApiTools(Toolkit):
                 target_event_id=event_id,
                 error=str(exc),
             )
-            return False, "Failed to resolve redaction target thread mapping."
+            return "Failed to resolve redaction target thread mapping."
 
-        if thread_impact.state is MutationThreadImpactState.UNKNOWN:
+        if thread_impact is MutationThreadImpactState.UNKNOWN:
             logger.warning(
                 "Failed to resolve redaction target thread mapping for matrix_api redact",
                 room_id=room_id,
                 target_event_id=event_id,
                 error="thread impact unknown",
             )
-            return False, "Failed to resolve redaction target thread mapping."
+            return "Failed to resolve redaction target thread mapping."
 
-        return thread_impact.state is MutationThreadImpactState.THREADED, None
+        return None
+
+    @staticmethod
+    def _with_acting_requester(
+        context: ToolRuntimeContext,
+        event_type: str,
+        content: dict[str, object],
+    ) -> dict[str, object]:
+        """Name a human or bot-account requester on a room message, so entities it mentions act for it as on replies."""
+        if event_type != "m.room.message" or not is_access_checked_requester_id(
+            context.requester_id,
+            context.config,
+            context.runtime_paths,
+        ):
+            return content
+        return {**content, ACTING_REQUESTER_KEY: context.requester_id}
 
     async def _send_event(  # noqa: PLR0911
         self,
@@ -757,16 +889,15 @@ class MatrixApiTools(Toolkit):
                 room_id=room_id,
                 event_type=normalized_event_type,
                 content=normalized_content,
-                conversation_cache=context.conversation_cache,
+                relations=context.relations,
             )
-            if thread_impact.state is MutationThreadImpactState.UNKNOWN:
+            if thread_impact is MutationThreadImpactState.UNKNOWN:
                 return self._error_payload(
                     action="send_event",
                     room_id=room_id,
                     event_type=normalized_event_type,
                     message="Failed to resolve threaded Matrix message send target.",
                 )
-            requires_conversation_cache_write = thread_impact.state is MutationThreadImpactState.THREADED
         except Exception as exc:
             logger.warning(
                 "Failed to resolve threaded send_event target for matrix_api",
@@ -801,12 +932,14 @@ class MatrixApiTools(Toolkit):
                 message=limit_error,
             )
 
+        normalized_content = self._with_acting_requester(context, normalized_event_type, normalized_content)
         try:
-            response = await context.client.room_send(
-                room_id=room_id,
-                message_type=normalized_event_type,
-                content=normalized_content,
-                ignore_unverified_devices=ignore_unverified_devices_for_config(context.config),
+            response = await send_room_event_result(
+                context.client,
+                room_id,
+                normalized_event_type,
+                normalized_content,
+                operation="matrix_api_send_event",
             )
         except Exception as exc:
             self._audit_write(
@@ -827,14 +960,6 @@ class MatrixApiTools(Toolkit):
             )
 
         if isinstance(response, nio.RoomSendResponse):
-            await self._record_send_event_outbound_cache_write(
-                context,
-                room_id=room_id,
-                event_type=normalized_event_type,
-                event_id=response.event_id,
-                content=normalized_content,
-                requires_conversation_cache_write=requires_conversation_cache_write,
-            )
             self._audit_write(
                 context=context,
                 room_id=room_id,
@@ -992,7 +1117,8 @@ class MatrixApiTools(Toolkit):
         assert normalized_event_type is not None
         assert normalized_content is not None
 
-        policy_error, dangerous = self._state_write_policy_error(
+        policy_error, dangerous = await self._state_write_policy_error(
+            context,
             action="put_state",
             room_id=room_id,
             event_type=normalized_event_type,
@@ -1095,6 +1221,42 @@ class MatrixApiTools(Toolkit):
             response=response,
         )
 
+    async def _redaction_state_policy_error(
+        self,
+        context: ToolRuntimeContext,
+        *,
+        room_id: str,
+        event_id: str,
+        allow_dangerous: bool,
+    ) -> tuple[str | None, bool]:
+        """Hold a state event redaction to the put_state policy, because redacting current state rewrites it."""
+        try:
+            response = await context.client.room_get_event(room_id, event_id)
+        except Exception as exc:
+            response = exc
+        if not isinstance(response, nio.RoomGetEventResponse):
+            return (
+                self._error_payload(
+                    action="redact",
+                    room_id=room_id,
+                    target_event_id=event_id,
+                    message="Failed to fetch the redaction target.",
+                    response=response,
+                ),
+                False,
+            )
+        target = response.event.source
+        if "state_key" not in target:
+            return None, False
+        return await self._state_write_policy_error(
+            context,
+            action="redact",
+            room_id=room_id,
+            event_type=str(target["type"]),
+            state_key=str(target["state_key"]),
+            allow_dangerous=allow_dangerous,
+        )
+
     async def _redact(  # noqa: PLR0911
         self,
         context: ToolRuntimeContext,
@@ -1103,6 +1265,7 @@ class MatrixApiTools(Toolkit):
         event_id: str | None,
         reason: str | None,
         dry_run: bool,
+        allow_dangerous: bool,
     ) -> str:
         normalized_event_id, event_id_error = self._validate_non_empty_string(
             event_id,
@@ -1119,16 +1282,23 @@ class MatrixApiTools(Toolkit):
 
         assert normalized_event_id is not None
 
-        (
-            requires_conversation_cache_write,
-            thread_resolution_error,
-        ) = await self._resolve_redaction_cache_write_requirement(
+        thread_resolution_error = await self._redaction_thread_resolution_error(
             context,
             room_id=room_id,
             event_id=normalized_event_id,
         )
+        dangerous = False
         if thread_resolution_error is not None:
             error_message = thread_resolution_error
+        else:
+            state_policy_error, dangerous = await self._redaction_state_policy_error(
+                context,
+                room_id=room_id,
+                event_id=normalized_event_id,
+                allow_dangerous=allow_dangerous,
+            )
+            if state_policy_error is not None:
+                return state_policy_error
 
         if dry_run:
             if error_message is not None:
@@ -1176,6 +1346,7 @@ class MatrixApiTools(Toolkit):
                 status="error",
                 target_event_id=normalized_event_id,
                 reason=normalized_reason,
+                dangerous=dangerous,
                 response=exc,
             )
             return self._error_payload(
@@ -1187,11 +1358,6 @@ class MatrixApiTools(Toolkit):
             )
 
         if isinstance(response, nio.RoomRedactResponse):
-            if requires_conversation_cache_write:
-                context.conversation_cache.notify_outbound_redaction(
-                    room_id,
-                    normalized_event_id,
-                )
             self._audit_write(
                 context=context,
                 room_id=room_id,
@@ -1199,6 +1365,7 @@ class MatrixApiTools(Toolkit):
                 status="ok",
                 target_event_id=normalized_event_id,
                 reason=normalized_reason,
+                dangerous=dangerous,
             )
             return self._payload(
                 "ok",
@@ -1216,6 +1383,7 @@ class MatrixApiTools(Toolkit):
             status="error",
             target_event_id=normalized_event_id,
             reason=normalized_reason,
+            dangerous=dangerous,
             response=response,
         )
         return self._error_payload(
@@ -1402,15 +1570,18 @@ class MatrixApiTools(Toolkit):
         - send_event: Send an arbitrary room event with `event_type` and `content`.
         - get_state: Read one state event by `event_type` and optional `state_key`.
         - put_state: Write one state event by `event_type`, optional `state_key`, and `content`.
-        - redact: Redact an event by `event_id`.
+        - redact: Redact an event by `event_id`; redacting a state event follows the put_state policy for its type.
         - get_event: Fetch one event by `event_id`.
         - search: Full-text search one room's events with `search_term`, optional `keys`, pagination, and context.
 
         `room_id` defaults to the current Matrix tool runtime context room.
         `search` enforces a single-room scope via `room_id`; if `filter.rooms` is supplied it must match that room.
         `search` always uses the top-level `limit`; `filter.limit` is rejected to avoid conflicting inputs.
+        `com.mindroom.*` and `io.mindroom.*` are reserved for runtime metadata: `content` may not set keys in
+        those namespaces, and `send_event`/`put_state` may not write event types in them.
         `dry_run` is supported for send_event, put_state, and redact.
-        `allow_dangerous` only affects put_state for a small set of high-risk room-state event types.
+        `allow_dangerous` only affects put_state and redact for a small set of high-risk room-state event types,
+        which also require the requester to be a joined room admin in the target room.
         `search` rejects `dry_run` and `allow_dangerous` because it is read-only.
         """
         context = get_tool_runtime_context()
@@ -1463,7 +1634,7 @@ class MatrixApiTools(Toolkit):
                 message="dry_run/allow_dangerous not applicable to read-only search action",
             )
 
-        if not room_access_allowed(context, resolved_room_id):
+        if not await room_access_allowed(context, resolved_room_id):
             return self._error_payload(
                 action=normalized_action,
                 room_id=resolved_room_id,
@@ -1502,6 +1673,7 @@ class MatrixApiTools(Toolkit):
                 event_id=event_id,
                 reason=reason,
                 dry_run=normalized_dry_run,
+                allow_dangerous=normalized_allow_dangerous,
             )
         if normalized_action == "get_event":
             return await self._get_event(

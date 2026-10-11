@@ -6,11 +6,17 @@ import io
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeGuard
+from urllib.parse import urlsplit
 
 import nio
+from aiohttp import ClientResponse
 from nio import crypto
+from nio.durable.transport import HttpError, ResponseTooLarge, Transport
+from nio.http import TransportResponse
 
+from mindroom.constants import RETAINED_MEDIA_MAX_BYTES
 from mindroom.logging_config import get_logger
+from mindroom.matrix.encrypted_file import encrypted_file_content
 
 logger = get_logger(__name__)
 
@@ -30,6 +36,15 @@ _FILE_OR_VIDEO_MESSAGE_EVENT_TYPES = (*_FILE_MESSAGE_EVENT_TYPES, *_VIDEO_MESSAG
 _AUDIO_MESSAGE_EVENT_TYPES = (nio.RoomMessageAudio, nio.RoomEncryptedAudio)
 _MATRIX_MEDIA_DISPATCH_EVENT_TYPES = (*_IMAGE_MESSAGE_EVENT_TYPES, *_FILE_OR_VIDEO_MESSAGE_EVENT_TYPES)
 MATRIX_MEDIA_EVENT_TYPES = (*_MATRIX_MEDIA_DISPATCH_EVENT_TYPES, *_AUDIO_MESSAGE_EVENT_TYPES)
+MATRIX_MEDIA_MSGTYPES = frozenset({"m.image", "m.audio", "m.video", "m.file"})
+_AVATAR_MAX_BYTES = 1024 * 1024
+_AVATAR_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_EXIF_ORIENTATION_TAG = 274
+_EXIF_ROTATED_ORIENTATIONS = frozenset({5, 6, 7, 8})
+
+
+class MatrixMediaUpstreamError(RuntimeError):
+    """A Matrix profile or thumbnail request failed upstream."""
 
 
 @dataclass(frozen=True)
@@ -72,20 +87,38 @@ def is_matrix_media_dispatch_event(event: object) -> TypeGuard[MatrixMediaDispat
     return is_image_message_event(event) or is_file_or_video_message_event(event)
 
 
-def parse_matrix_media_dispatch_event_source(
+def is_encrypted_media_event_source(event_source: Mapping[str, Any]) -> bool:
+    """Return whether one event source contains standard encrypted media."""
+    content = event_source.get("content")
+    return (
+        event_source.get("type") == "m.room.message"
+        and isinstance(content, Mapping)
+        and content.get("msgtype") in MATRIX_MEDIA_MSGTYPES
+        and "file" in content
+    )
+
+
+def parse_matrix_media_event_source(
     event_source: Mapping[str, Any],
-) -> MatrixMediaDispatchEvent | None:
-    """Parse one Matrix event source into image/file/video media when possible."""
+) -> MatrixMediaEvent | nio.BadEvent | None:
+    """Parse one Matrix event source through nio's correct media validation path."""
     normalized_source = {key: value for key, value in event_source.items() if isinstance(key, str)}
-    content = normalized_source.get("content")
     try:
         parsed_event = (
             nio.RoomMessage.parse_decrypted_event(normalized_source)
-            if isinstance(content, Mapping) and "file" in content
+            if is_encrypted_media_event_source(normalized_source)
             else nio.RoomMessage.parse_event(normalized_source)
         )
     except Exception:
         return None
+    return parsed_event if isinstance(parsed_event, (*MATRIX_MEDIA_EVENT_TYPES, nio.BadEvent)) else None
+
+
+def parse_matrix_media_dispatch_event_source(
+    event_source: Mapping[str, Any],
+) -> MatrixMediaDispatchEvent | None:
+    """Parse one Matrix event source into image/file/video media when possible."""
+    parsed_event = parse_matrix_media_event_source(event_source)
     return parsed_event if is_matrix_media_dispatch_event(parsed_event) else None
 
 
@@ -95,6 +128,149 @@ def upload_content_uri(upload_result: object) -> str | None:
     if isinstance(upload_response, nio.UploadResponse) and upload_response.content_uri:
         return str(upload_response.content_uri)
     return None
+
+
+def _is_upstream_matrix_error(response: nio.ErrorResponse) -> bool:
+    if response.status_code == "M_NOT_FOUND":
+        return False
+    if response.status_code is not None:
+        return True
+    if isinstance(response.transport_response, TransportResponse):
+        http_status = response.transport_response.status_code
+    elif isinstance(response.transport_response, ClientResponse):
+        http_status = response.transport_response.status
+    else:
+        http_status = None
+    return http_status == 429 or (http_status is not None and http_status >= 500)
+
+
+def matrix_profile_avatar_uri(response: object) -> str | None:
+    """Return a profile avatar URI while preserving typed Matrix failures."""
+    if isinstance(response, nio.ProfileGetResponse):
+        return response.avatar_url
+    if isinstance(response, nio.ProfileGetError) and _is_upstream_matrix_error(response):
+        raise MatrixMediaUpstreamError
+    return None
+
+
+async def fetch_matrix_thumbnail(
+    client: nio.AsyncClient,
+    mxc_uri: object,
+) -> tuple[bytes, str] | None:
+    """Fetch one bounded raster thumbnail from a validated Matrix content URI."""
+    if not isinstance(mxc_uri, str):
+        return None
+    try:
+        uri = urlsplit(mxc_uri)
+    except ValueError:
+        return None
+    if (
+        uri.scheme != "mxc"
+        or not uri.netloc
+        or not uri.path.strip("/")
+        or uri.path.count("/") != 1
+        or uri.query
+        or uri.fragment
+    ):
+        return None
+    thumbnail = await client.thumbnail(uri.netloc, uri.path[1:], width=96, height=96)
+    if isinstance(thumbnail, nio.ThumbnailError):
+        if _is_upstream_matrix_error(thumbnail):
+            raise MatrixMediaUpstreamError
+        return None
+    if (
+        not isinstance(thumbnail, nio.ThumbnailResponse)
+        or not isinstance(thumbnail.body, bytes)
+        or not 0 < len(thumbnail.body) <= _AVATAR_MAX_BYTES
+        or thumbnail.content_type not in _AVATAR_MIME_TYPES
+    ):
+        return None
+    return thumbnail.body, thumbnail.content_type
+
+
+def media_size_exceeds_limit(size_bytes: int) -> bool:
+    """Return whether a media size exceeds the runtime ingestion cap."""
+    return size_bytes > RETAINED_MEDIA_MAX_BYTES
+
+
+def media_payload_exceeds_limit(media_bytes: bytes | None) -> bool:
+    """Return whether a Matrix media payload exceeds the runtime ingestion cap."""
+    return media_bytes is not None and media_size_exceeds_limit(len(media_bytes))
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMediaUpload:
+    """Upload bytes and metadata after the caller has resolved room encryption."""
+
+    media_bytes: bytes
+    mimetype: str
+    data: bytes
+    content_type: str
+    filename: str
+    encryption_keys: dict[str, Any] | None
+
+    def info(self) -> dict[str, Any]:
+        """Build Matrix event info, decoding image dimensions only for callers that send it."""
+        return {
+            "size": len(self.media_bytes),
+            "mimetype": self.mimetype,
+            **_image_dimensions(self.media_bytes, self.mimetype),
+        }
+
+    def encrypted_file_content(self, *, url: str) -> dict[str, Any] | None:
+        """Build the Matrix encrypted-file object with the given MXC ``url``, or None for unencrypted uploads."""
+        if self.encryption_keys is None:
+            return None
+        return encrypted_file_content(
+            url=url,
+            key=self.encryption_keys["key"],
+            iv=self.encryption_keys["iv"],
+            hashes=self.encryption_keys["hashes"],
+            mime_type=self.mimetype,
+            size=len(self.media_bytes),
+        )
+
+
+def _image_dimensions(media_bytes: bytes, mimetype: str) -> dict[str, int]:
+    """Return displayed image dimensions so clients size previews instead of cropping them."""
+    if not mimetype.startswith("image/"):
+        return {}
+    # Keep the image decoder lazy during slim worker startup.
+    from PIL import Image, UnidentifiedImageError  # noqa: PLC0415
+
+    try:
+        with Image.open(io.BytesIO(media_bytes)) as image:
+            width, height = image.size
+            # A PNG whose eXIf chunk follows its image data decodes the whole raster to read EXIF.
+            if image.format == "PNG" and "exif" not in image.info:
+                return {"w": width, "h": height}
+            orientation = image.getexif().get(_EXIF_ORIENTATION_TAG)
+    except (OSError, ValueError, SyntaxError, UnidentifiedImageError, Image.DecompressionBombError):
+        return {}
+    if orientation in _EXIF_ROTATED_ORIENTATIONS:
+        width, height = height, width
+    return {"w": width, "h": height}
+
+
+def prepare_media_upload(
+    media_bytes: bytes,
+    *,
+    filename: str,
+    mimetype: str,
+    encrypt: bool,
+) -> _PreparedMediaUpload:
+    """Prepare media without discovering room state, uploading, or handling failures."""
+    upload_bytes, encryption_keys = (
+        crypto.attachments.encrypt_attachment(media_bytes) if encrypt else (media_bytes, None)
+    )
+    return _PreparedMediaUpload(
+        media_bytes=media_bytes,
+        mimetype=mimetype,
+        data=upload_bytes,
+        content_type="application/octet-stream" if encrypt else mimetype,
+        filename=f"{filename}.enc" if encrypt else filename,
+        encryption_keys=encryption_keys,
+    )
 
 
 async def upload_media_bytes(
@@ -193,6 +369,16 @@ def extract_media_caption(
     return default
 
 
+def decrypt_media_bytes(encrypted_bytes: bytes, *, key: str, sha256: str, iv: str) -> bytes:
+    """Verify the ciphertext SHA-256, then decrypt with the given key and IV.
+
+    Raises nio's ``EncryptionError`` on a digest mismatch or an undecodable key or IV,
+    and ``binascii.Error`` when the SHA-256 is not valid base64.
+    A well-formed wrong key or IV yields garbage, so callers must validate the plaintext.
+    """
+    return crypto.attachments.decrypt_attachment(encrypted_bytes, key, sha256, iv)
+
+
 def _decrypt_encrypted_media_bytes(
     event: nio.RoomEncryptedMedia,
     encrypted_bytes: bytes,
@@ -207,10 +393,36 @@ def _decrypt_encrypted_media_bytes(
         return None
 
     try:
-        return crypto.attachments.decrypt_attachment(encrypted_bytes, key, sha256, iv)
+        return decrypt_media_bytes(encrypted_bytes, key=key, sha256=sha256, iv=iv)
     except Exception:
         logger.exception("Media decryption failed", event_id=_event_id_for_log(event))
         return None
+
+
+async def download_mxc_bytes(
+    client: nio.AsyncClient,
+    mxc_url: str,
+    *,
+    max_bytes: int,
+    request_timeout: float | None = None,
+) -> bytes | None:
+    """Download one MXC payload, abandoning it as soon as it passes ``max_bytes``.
+
+    nio's ``download`` holds the whole body before a caller can measure it, so this streams it instead.
+    ``request_timeout`` overrides the client's total request timeout; ``0`` disables it.
+    """
+    server_name, separator, media_id = mxc_url.removeprefix("mxc://").partition("/")
+    if not mxc_url.startswith("mxc://") or not server_name or not separator or not media_id:
+        logger.error("invalid_mxc_url", mxc_url=mxc_url)
+        return None
+    method, path = nio.Api.download(server_name, media_id)
+    try:
+        return await Transport(client, max_bytes).request(method, path, request_timeout=request_timeout)
+    except HttpError as error:
+        logger.warning("mxc_download_failed", mxc_url=mxc_url, status=error.status, errcode=error.errcode)
+    except ResponseTooLarge:
+        logger.warning("mxc_payload_exceeds_byte_limit", mxc_url=mxc_url, limit_bytes=max_bytes)
+    return None
 
 
 async def download_media_bytes(
@@ -219,18 +431,19 @@ async def download_media_bytes(
 ) -> bytes | None:
     """Download and decrypt Matrix media payload bytes."""
     try:
-        response = await client.download(event.url)
+        # Like nio's own download, a large file on a slow link may take longer than the client's request timeout.
+        downloaded_bytes = await download_mxc_bytes(
+            client,
+            event.url,
+            max_bytes=RETAINED_MEDIA_MAX_BYTES,
+            request_timeout=0,
+        )
     except Exception:
         logger.exception("Error downloading media")
         return None
-
-    if isinstance(response, nio.DownloadError):
-        logger.error("Media download failed", event_id=_event_id_for_log(event), error=str(response))
-        return None
-    if not isinstance(response.body, bytes):
-        logger.error("Media download returned non-bytes payload", event_id=_event_id_for_log(event))
+    if downloaded_bytes is None:
         return None
 
     if isinstance(event, nio.RoomEncryptedMedia):
-        return _decrypt_encrypted_media_bytes(event, response.body)
-    return response.body
+        return _decrypt_encrypted_media_bytes(event, downloaded_bytes)
+    return downloaded_bytes

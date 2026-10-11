@@ -62,9 +62,57 @@ const titleFromProviderId = (providerId: string) =>
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 
+const oauthProviderDisplayName = (
+  providerId: string,
+  providerTool?: ToolInfo,
+) =>
+  providerTool?.display_name.replace(/\s+Tool$/, "") ??
+  titleFromProviderId(providerId);
+
+// Several tools can share one provider connection, so no single tool's settings can stand for its card.
+const providersSharedByTools = (tools: ToolInfo[]) => {
+  const toolNames = new Set(tools.map((tool) => tool.name));
+  const toolCounts = new Map<string, number>();
+  for (const tool of tools) {
+    if (tool.auth_provider) {
+      toolCounts.set(
+        tool.auth_provider,
+        (toolCounts.get(tool.auth_provider) ?? 0) + 1,
+      );
+    }
+  }
+  return new Set(
+    [...toolCounts]
+      .filter(([providerId, count]) => count > 1 && !toolNames.has(providerId))
+      .map(([providerId]) => providerId),
+  );
+};
+
 const oauthRedirectPlaceholderOrigin = () =>
   new URL(API_BASE_URL || window.location.origin, window.location.origin)
     .origin;
+
+const hasManualOAuthFallback = (integration: Integration) =>
+  integration.setup_type === "oauth" &&
+  Boolean(integration.oauth_fallback_fields?.length);
+
+const hasConfiguredOAuthFallback = (integration?: {
+  manual_auth_configured?: boolean;
+  environment_auth_configured?: boolean;
+}) =>
+  integration?.manual_auth_configured === true ||
+  integration?.environment_auth_configured === true;
+
+const manualOAuthFallbackLabel = (integration: Integration) => {
+  const fallbackFields = integration.oauth_fallback_fields ?? [];
+  if (fallbackFields.length !== 1) {
+    return "Manual credentials";
+  }
+  return (
+    integration.config_fields?.find((field) => field.name === fallbackFields[0])
+      ?.label ?? "Manual credentials"
+  );
+};
 
 export function Integrations() {
   const { agents, agentPoliciesByAgent } = useConfigStore();
@@ -211,15 +259,18 @@ export function Integrations() {
       const backendToolsByName = new Map<string, ToolInfo>(
         backendTools.map((tool) => [tool.name, tool]),
       );
+      const sharedProviderIds = providersSharedByTools(backendTools);
+      const findProviderTool = (providerId: string) =>
+        sharedProviderIds.has(providerId)
+          ? undefined
+          : backendTools.find((tool) => tool.auth_provider === providerId);
 
       // Load special integrations from providers
       for (const provider of getAllIntegrations()) {
         const config = provider.getConfig(scope);
         const providerTool =
           backendToolsByName.get(config.integration.id) ??
-          backendTools.find(
-            (tool) => tool.auth_provider === config.integration.id,
-          );
+          findProviderTool(config.integration.id);
         if (
           hidesSharedOnlyIntegrations &&
           SHARED_ONLY_PROVIDER_IDS.has(config.integration.id)
@@ -229,13 +280,12 @@ export function Integrations() {
         const status = provider.loadStatus
           ? await provider.loadStatus(scope)
           : {};
+        const fallbackConfigured = hasConfiguredOAuthFallback(providerTool);
         loadedIntegrations.push({
           ...config.integration,
           config_fields:
             providerTool?.config_fields ?? config.integration.config_fields,
           docs_url: providerTool?.docs_url ?? config.integration.docs_url,
-          helper_text:
-            providerTool?.helper_text ?? config.integration.helper_text,
           dependencies:
             providerTool?.dependencies ?? config.integration.dependencies,
           icon_color: providerTool?.icon_color ?? config.integration.icon_color,
@@ -245,7 +295,24 @@ export function Integrations() {
           execution_scope_supported:
             providerTool?.execution_scope_supported ??
             config.integration.execution_scope_supported,
+          oauth_fallback_fields: providerTool?.oauth_fallback_fields,
+          manual_auth_configured: providerTool?.manual_auth_configured,
+          environment_auth_configured:
+            providerTool?.environment_auth_configured,
           ...status,
+          status: fallbackConfigured
+            ? "connected"
+            : (status.status ?? config.integration.status),
+          connected: fallbackConfigured || status.connected === true,
+          status_error: fallbackConfigured ? undefined : status.status_error,
+          helper_text:
+            status.oauth_reset_required === true
+              ? (status.helper_text ?? providerTool?.helper_text)
+              : fallbackConfigured
+                ? providerTool?.helper_text
+                : (status.helper_text ??
+                  providerTool?.helper_text ??
+                  config.integration.helper_text),
           config_service:
             providerTool?.name ??
             status.config_service ??
@@ -264,13 +331,15 @@ export function Integrations() {
           ),
       );
       for (const providerId of dynamicOAuthProviderIds) {
-        const providerTool = backendTools.find(
-          (tool) => tool.auth_provider === providerId,
+        const providerTool = findProviderTool(providerId);
+        const providerDisplayName = oauthProviderDisplayName(
+          providerId,
+          providerTool,
         );
         const integration: Integration = {
           id: providerId,
-          name: titleFromProviderId(providerId),
-          description: `Connect ${titleFromProviderId(providerId)} OAuth for ${providerTool?.display_name ?? "this tool"}.`,
+          name: providerDisplayName,
+          description: `Connect ${providerDisplayName} OAuth for ${providerTool?.display_name ?? "this tool"}.`,
           category: providerTool?.category ?? "productivity",
           icon: getIconForTool(
             providerTool?.icon ?? null,
@@ -289,15 +358,31 @@ export function Integrations() {
           dashboard_configuration_supported:
             providerTool?.dashboard_configuration_supported,
           execution_scope_supported: providerTool?.execution_scope_supported,
+          oauth_fallback_fields: providerTool?.oauth_fallback_fields,
+          manual_auth_configured: providerTool?.manual_auth_configured,
+          environment_auth_configured:
+            providerTool?.environment_auth_configured,
         };
         const provider = new GenericOAuthIntegrationProvider(
           integration,
           providerId,
         );
         const status = await provider.loadStatus?.(scope);
+        const fallbackConfigured = hasConfiguredOAuthFallback(providerTool);
         loadedIntegrations.push({
           ...integration,
           ...status,
+          status: fallbackConfigured
+            ? "connected"
+            : (status?.status ?? integration.status),
+          connected: fallbackConfigured || status?.connected === true,
+          status_error: fallbackConfigured ? undefined : status?.status_error,
+          helper_text:
+            status?.oauth_reset_required === true
+              ? (status.helper_text ?? providerTool?.helper_text)
+              : fallbackConfigured
+                ? providerTool?.helper_text
+                : (status?.helper_text ?? integration.helper_text),
           config_service:
             providerTool?.name ??
             status?.config_service ??
@@ -312,7 +397,11 @@ export function Integrations() {
         .filter(
           (tool) =>
             !providerIds.has(tool.name) &&
-            !(tool.auth_provider && providerIds.has(tool.auth_provider)),
+            !(
+              tool.auth_provider &&
+              providerIds.has(tool.auth_provider) &&
+              !sharedProviderIds.has(tool.auth_provider)
+            ),
         )
         .filter(
           (tool) =>
@@ -332,6 +421,8 @@ export function Integrations() {
                 : mapped.status,
             auth_provider: tool.auth_provider ?? undefined,
             config_service: tool.name,
+            oauth_fallback_fields: tool.oauth_fallback_fields,
+            manual_auth_configured: tool.manual_auth_configured,
           } as Integration & { auth_provider?: string };
         });
 
@@ -400,30 +491,29 @@ export function Integrations() {
     if (!integration.oauth_client_config_service) {
       return false;
     }
+    const hasCustomClientConfig =
+      integration.oauth_custom_client_configured === true;
     const configFields: ToolFieldSchema[] = [
       {
         name: "client_id",
         label: "Client ID",
         type: "text",
         required: true,
-        placeholder: "your-client-id.apps.googleusercontent.com",
+        placeholder: "OAuth app client ID",
         description: "OAuth app client ID",
       },
       {
         name: "client_secret",
         label: "Client Secret",
         type: "password",
-        required: integration.oauth_client_configured !== true,
-        requiredWhenFieldChanges:
-          integration.oauth_client_configured === true ? "client_id" : null,
-        placeholder:
-          integration.oauth_client_configured === true
-            ? "Required when changing Client ID"
-            : "OAuth app client secret",
-        description:
-          integration.oauth_client_configured === true
-            ? "The saved secret is kept for edits that do not change the Client ID."
-            : "OAuth app client secret",
+        required: !hasCustomClientConfig,
+        requiredWhenFieldChanges: hasCustomClientConfig ? "client_id" : null,
+        placeholder: hasCustomClientConfig
+          ? "Required when changing Client ID"
+          : "OAuth app client secret",
+        description: hasCustomClientConfig
+          ? "The saved secret is kept for edits that do not change the Client ID."
+          : "OAuth app client secret",
       },
     ];
     if (integration.oauth_client_redirect_uri_supported === true) {
@@ -443,7 +533,7 @@ export function Integrations() {
       displayName: `${integration.name} OAuth Client`,
       description: `Configure the OAuth app client used to connect ${integration.name}.`,
       configFields,
-      isEditing: integration.oauth_client_configured === true,
+      isEditing: hasCustomClientConfig,
       docsUrl: integration.docs_url || null,
       helperText: null,
       icon: null,
@@ -537,7 +627,11 @@ export function Integrations() {
     }
   };
 
-  const handleDisconnect = async (integration: Integration) => {
+  const runDisconnectOperation = async (
+    integration: Integration,
+    disconnect: () => void | Promise<void>,
+    success?: { title: string; description: string },
+  ) => {
     if (blocksScopedDashboardCredentials(integration)) {
       toast({
         title: "Shared-only dashboard configuration",
@@ -548,41 +642,17 @@ export function Integrations() {
       return;
     }
 
-    const provider = oauthProviderForIntegration(integration);
-    const scope = {
-      agentName: effectiveScopeAgentName,
-      executionScope: selectedExecutionScope,
-    };
-
     setLoading(true);
     try {
-      if (provider?.getConfig(scope).onDisconnect) {
-        // Use provider's disconnect method if available
-        await provider.getConfig(scope).onDisconnect!(integration.id);
-      } else {
-        // For generic tools, delete credentials via API
-        const response = await fetch(
-          withAgentExecutionScope(
-            `${API_BASE_URL}/api/credentials/${integration.id}`,
-            effectiveScopeAgentName,
-            selectedExecutionScope,
-          ),
-          {
-            method: "DELETE",
-          },
-        );
-
-        if (!response.ok) {
-          throw new Error("Failed to disconnect");
-        }
-      }
+      await disconnect();
 
       // Refetch tools to update status
       await refetchTools();
 
       toast({
-        title: "Disconnected",
-        description: `${integration.name} has been disconnected.`,
+        title: success?.title ?? "Disconnected",
+        description:
+          success?.description ?? `${integration.name} has been disconnected.`,
       });
     } catch (error) {
       toast({
@@ -595,6 +665,39 @@ export function Integrations() {
       setLoading(false);
     }
   };
+
+  const handleProviderDisconnect = (
+    integration: Integration,
+    disconnect: NonNullable<IntegrationConfig["onDisconnect"]>,
+  ) =>
+    runDisconnectOperation(
+      integration,
+      () => disconnect(integration.id),
+      integration.oauth_reset_required === true
+        ? {
+            title: "Connection reset",
+            description: `${integration.name} OAuth has been reset.`,
+          }
+        : undefined,
+    );
+
+  const handleStoredCredentialDelete = (integration: Integration) =>
+    runDisconnectOperation(integration, async () => {
+      const response = await fetch(
+        withAgentExecutionScope(
+          `${API_BASE_URL}/api/credentials/${integration.config_service ?? integration.id}`,
+          effectiveScopeAgentName,
+          selectedExecutionScope,
+        ),
+        {
+          method: "DELETE",
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error("Failed to disconnect");
+      }
+    });
 
   const getActionButton = (integration: Integration) => {
     if (blocksScopedDashboardCredentials(integration)) {
@@ -622,13 +725,17 @@ export function Integrations() {
         />
       );
     }
+    const providerDisconnect = config?.onDisconnect;
+    const disconnectProvider = providerDisconnect
+      ? () => handleProviderDisconnect(integration, providerDisconnect)
+      : undefined;
 
-    const canEditOAuthClientConfig =
+    const canConfigureOAuthClient =
       integration.setup_type === "oauth" &&
       integration.oauth_client_configured === true &&
       integration.oauth_service_account_configured !== true &&
       Boolean(integration.oauth_client_config_service);
-    const oauthClientConfigButton = canEditOAuthClientConfig ? (
+    const oauthClientConfigButton = canConfigureOAuthClient ? (
       <Button
         onClick={() => openOAuthClientConfigDialog(integration)}
         disabled={loading}
@@ -636,9 +743,69 @@ export function Integrations() {
         size="sm"
       >
         <Settings className="h-4 w-4 mr-1" />
-        Edit client
+        {integration.oauth_custom_client_configured === true
+          ? "Edit client"
+          : "Use custom client"}
       </Button>
     ) : null;
+    const manualFallbackAvailable = hasManualOAuthFallback(integration);
+    const manualFallbackLabel = manualOAuthFallbackLabel(integration);
+    const manualFallbackActionLabel = manualFallbackLabel.toLocaleLowerCase();
+    const manualFallbackButton =
+      manualFallbackAvailable && !hasConfiguredOAuthFallback(integration) ? (
+        <Button
+          onClick={() => openToolConfigDialog(integration)}
+          disabled={loading}
+          variant="outline"
+          size="sm"
+        >
+          <Key className="h-4 w-4 mr-1" />
+          Use {manualFallbackActionLabel}
+        </Button>
+      ) : null;
+    const configuredFallbackControls =
+      manualFallbackAvailable &&
+      integration.environment_auth_configured === true &&
+      integration.manual_auth_configured !== true ? (
+        <>
+          <Badge className="bg-green-500/10 dark:bg-green-500/20 text-green-700 dark:text-green-300">
+            <Key className="h-3 w-3 mr-1" />
+            Environment {manualFallbackLabel}
+          </Badge>
+          <Button
+            onClick={() => openToolConfigDialog(integration)}
+            disabled={loading}
+            variant="outline"
+            size="sm"
+          >
+            Configure
+          </Button>
+        </>
+      ) : manualFallbackAvailable &&
+        integration.manual_auth_configured === true ? (
+        <>
+          <Badge className="bg-green-500/10 dark:bg-green-500/20 text-green-700 dark:text-green-300">
+            <Key className="h-3 w-3 mr-1" />
+            {manualFallbackLabel}
+          </Badge>
+          <Button
+            onClick={() => openToolConfigDialog(integration)}
+            disabled={loading}
+            variant="outline"
+            size="sm"
+          >
+            Edit {manualFallbackActionLabel}
+          </Button>
+          <Button
+            onClick={() => handleStoredCredentialDelete(integration)}
+            disabled={loading}
+            variant="destructive"
+            size="sm"
+          >
+            Remove {manualFallbackActionLabel}
+          </Button>
+        </>
+      ) : null;
 
     // Handle tools with delegated authentication
     const tool = integration;
@@ -650,7 +817,8 @@ export function Integrations() {
 
       if (
         integration.status === "connected" ||
-        integration.status === "available"
+        integration.status === "available" ||
+        authProvider?.status === "connected"
       ) {
         // Auth provider is connected
         if (tool.config_fields && tool.config_fields.length > 0) {
@@ -731,7 +899,7 @@ export function Integrations() {
                 Settings
               </Button>
               <Button
-                onClick={() => handleDisconnect(integration)}
+                onClick={() => handleStoredCredentialDelete(integration)}
                 disabled={loading}
                 variant="ghost"
                 size="sm"
@@ -771,6 +939,36 @@ export function Integrations() {
       }
     }
 
+    if (
+      integration.setup_type === "oauth" &&
+      integration.oauth_reset_required === true
+    ) {
+      return (
+        <div className="flex gap-2 items-center">
+          <Button
+            onClick={disconnectProvider}
+            disabled={loading || !disconnectProvider}
+            variant="destructive"
+            size="sm"
+          >
+            {loading && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+            Reset connection
+          </Button>
+          {oauthClientConfigButton}
+          {configuredFallbackControls ?? manualFallbackButton}
+        </div>
+      );
+    }
+
+    if (configuredFallbackControls) {
+      return (
+        <div className="flex gap-2 items-center">
+          {configuredFallbackControls}
+          {oauthClientConfigButton}
+        </div>
+      );
+    }
+
     if (integration.setup_type === "oauth" && integration.status_error) {
       return (
         <div className="flex gap-2 items-center">
@@ -778,6 +976,7 @@ export function Integrations() {
             Status unavailable
           </Button>
           {oauthClientConfigButton}
+          {manualFallbackButton}
           <Button
             onClick={() => void loadIntegrations(false)}
             disabled={loading}
@@ -793,7 +992,7 @@ export function Integrations() {
     if (
       integration.setup_type === "oauth" &&
       integration.status !== "connected" &&
-      canEditOAuthClientConfig
+      canConfigureOAuthClient
     ) {
       return (
         <div className="flex gap-2 items-center">
@@ -808,9 +1007,12 @@ export function Integrations() {
             ) : (
               <ExternalLink className="h-4 w-4" />
             )}
-            Connect
+            {manualFallbackAvailable
+              ? `Connect with ${integration.name}`
+              : "Connect"}
           </Button>
           {oauthClientConfigButton}
+          {manualFallbackButton}
         </div>
       );
     }
@@ -821,14 +1023,34 @@ export function Integrations() {
       integration.oauth_service_account_configured !== true
     ) {
       return (
-        <Button
-          onClick={() => handleIntegrationAction(integration)}
-          disabled={loading || !integration.oauth_client_config_service}
-          variant="outline"
-          size="sm"
-        >
-          Configure client
-        </Button>
+        <div className="flex gap-2 items-center">
+          <Button
+            onClick={() => handleIntegrationAction(integration)}
+            disabled={loading || !integration.oauth_client_config_service}
+            variant="outline"
+            size="sm"
+          >
+            Configure client
+          </Button>
+          {manualFallbackButton}
+        </div>
+      );
+    }
+
+    if (integration.status === "connected" && manualFallbackAvailable) {
+      return (
+        <div className="flex gap-2">
+          {manualFallbackButton}
+          {oauthClientConfigButton}
+          <Button
+            onClick={disconnectProvider}
+            disabled={loading || !disconnectProvider}
+            variant="destructive"
+            size="sm"
+          >
+            Disconnect
+          </Button>
+        </div>
       );
     }
 
@@ -846,7 +1068,10 @@ export function Integrations() {
           </Button>
           {oauthClientConfigButton}
           <Button
-            onClick={() => handleDisconnect(integration)}
+            onClick={
+              disconnectProvider ??
+              (() => handleStoredCredentialDelete(integration))
+            }
             disabled={loading}
             variant="destructive"
             size="sm"
@@ -873,7 +1098,7 @@ export function Integrations() {
         <Key className="h-4 w-4" />
       );
 
-    return (
+    const actionButton = (
       <Button
         onClick={() => handleIntegrationAction(integration)}
         disabled={loading}
@@ -881,13 +1106,27 @@ export function Integrations() {
         className="flex items-center gap-2"
       >
         {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : icon}
-        {buttonText}
+        {manualFallbackAvailable
+          ? `Connect with ${integration.name}`
+          : buttonText}
       </Button>
+    );
+
+    return manualFallbackButton ? (
+      <div className="flex gap-2 items-center">
+        {actionButton}
+        {manualFallbackButton}
+      </div>
+    ) : (
+      actionButton
     );
   };
 
   const IntegrationCard = ({ integration }: { integration: Integration }) => {
     const isConnected = integration.status === "connected";
+    const usesGoogleUserData = (
+      integration.oauth_provider_id ?? integration.id
+    ).startsWith("google_");
     const statusLabel = integration.status_error
       ? "Status error"
       : integration.status === "not_connected"
@@ -915,6 +1154,29 @@ export function Integrations() {
             )}
           </div>
           <CardDescription>{integration.description}</CardDescription>
+          {usesGoogleUserData ? (
+            <p className="text-xs text-muted-foreground">
+              By connecting, you authorize this MindRoom installation to access
+              Google data for the selected agent and credential scope. Shared or
+              unscoped agents can use the connected account for any user
+              authorized to invoke them. Relevant results may be sent to your
+              configured AI model and retained in session or Matrix history. The
+              installation operator and anyone with administrative or filesystem
+              access may be able to access stored credentials and data. Project
+              maintainers have no automatic access merely because they maintain
+              MindRoom; if they also operate this installation, they may have
+              operator access.{" "}
+              <a
+                href="https://docs.mindroom.chat/privacy/"
+                target="_blank"
+                rel="noreferrer"
+                className="underline underline-offset-2"
+              >
+                Privacy policy
+              </a>
+              .
+            </p>
+          ) : null}
           {integration.status_error ? (
             <p className="text-xs text-muted-foreground">
               Status error: {integration.status_error}
@@ -1098,10 +1360,7 @@ export function Integrations() {
                 onChange={(value) =>
                   setFilterMode(
                     value as
-                      | "all"
-                      | "available"
-                      | "unconfigured"
-                      | "configured",
+                      "all" | "available" | "unconfigured" | "configured",
                   )
                 }
                 size="sm"
@@ -1124,8 +1383,8 @@ export function Integrations() {
               <AlertDescription className="mt-2">
                 Home Assistant and Spotify remain shared-only unless the agent
                 has an effective shared runtime scope (
-                <code>worker_scope=shared</code>). OAuth-backed Google
-                integrations can be connected for this selected agent.
+                <code>worker_scope=shared</code>). OAuth-backed integrations can
+                be connected for this selected agent.
               </AlertDescription>
             </Alert>
           )}

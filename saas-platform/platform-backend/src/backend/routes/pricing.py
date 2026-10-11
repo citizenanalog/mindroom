@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.models import StripePriceResponse
+from backend.models import PricingConfigResponse, StripePriceResponse
 from backend.pricing import PRICING_CONFIG_MODEL, get_stripe_price_id
 from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
 
 
-@router.get("/pricing/config")
+@router.get("/pricing/config", response_model=PricingConfigResponse)
 async def get_pricing_config() -> dict[str, Any]:
     """Get the current pricing configuration.
 
-    This returns the pricing plans, features, and limits.
+    This returns the pricing plans and their features.
     Stripe price IDs are only included if they are configured.
     """
     config_model = PRICING_CONFIG_MODEL
@@ -50,7 +50,6 @@ async def get_pricing_config() -> dict[str, Any]:
             "price_yearly": f"${price_yearly / 100:.0f}" if isinstance(price_yearly, (int, float)) else price_yearly,
             "description": plan_data.description,
             "features": plan_data.features,
-            "limits": plan_data.limits.model_dump(),
             "recommended": plan_data.recommended,
             "included_ai_budget_usd": plan_data.included_ai_budget_usd,
             "requires_customer_provider_keys": plan_data.requires_customer_provider_keys,

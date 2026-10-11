@@ -3,18 +3,43 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mem0 import AsyncMemory
+from mem0.configs.embeddings.base import BaseEmbedderConfig
+from mem0.embeddings.openai import OpenAIEmbedding
+from mem0.llms.openai import OpenAILLM
+from mem0.utils.factory import LlmFactory
 
+from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.memory import MemoryConfig, _MemoryEmbedderConfig, _MemoryLLMConfig
 from mindroom.config.models import EmbedderConfig, RouterConfig
 from mindroom.constants import RuntimePaths, resolve_primary_runtime_paths
-from mindroom.credentials import get_runtime_shared_credentials_manager
-from mindroom.memory.config import _get_memory_config, _memory_collection_name, create_memory_instance
-from mindroom.model_defaults import MEMORY_OLLAMA_LLM, OLLAMA_HOST_DEFAULT
+from mindroom.credentials.manager import get_runtime_shared_credentials_manager
+from mindroom.credentials.sync import _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+from mindroom.embeddings.errors import EmbedderRequestError
+from mindroom.embeddings.factory import create_configured_embedder, resolve_embedder_settings
+from mindroom.embeddings.openai_embedder import MindRoomOpenAIEmbedder
+from mindroom.memory.config import (
+    _get_memory_config,
+    _Mem0StrictOpenAIEmbedder,
+    _memory_collection_name,
+    create_memory_instance,
+)
+from mindroom.model_defaults import (
+    MEMORY_OLLAMA_LLM,
+    OLLAMA_HOST_DEFAULT,
+    OPENAI_GPT_LUNA,
+    OPENAI_GPT_SOL,
+    OPENROUTER_BASE_URL_DEFAULT,
+    OPENROUTER_OPENAI_EMBEDDING_SMALL,
+    OPENROUTER_OPENAI_LUNA,
+)
 from mindroom.orchestrator import _MultiAgentOrchestrator
+from mindroom.path_globs import matches_root_glob
 from tests.conftest import orchestrator_runtime_paths
 
 
@@ -80,11 +105,11 @@ class TestMemoryConfig:
         # Create config with OpenAI embedder
         embedder_config = _MemoryEmbedderConfig(
             provider="openai",
-            config=EmbedderConfig(model="text-embedding-ada-002"),
+            config=EmbedderConfig(model="text-embedding-3-small"),
         )
         llm_config = _MemoryLLMConfig(
             provider="openai",
-            config={"model": "gpt-4", "temperature": 0.1, "top_p": 1},
+            config={"model": OPENAI_GPT_LUNA},
         )
         memory = MemoryConfig(embedder=embedder_config, llm=llm_config)
         config = Config(memory=memory, router=RouterConfig(model="default"))
@@ -95,13 +120,115 @@ class TestMemoryConfig:
 
         # Verify embedder config
         assert result["embedder"]["provider"] == "openai"
-        assert result["embedder"]["config"]["model"] == "text-embedding-ada-002"
+        assert result["embedder"]["config"]["model"] == "text-embedding-3-small"
         assert result["embedder"]["config"]["api_key"] == "test-key"
 
         # Verify LLM config
         assert result["llm"]["provider"] == "openai"
-        assert result["llm"]["config"]["model"] == "gpt-4"
+        assert result["llm"]["config"]["model"] == OPENAI_GPT_LUNA
         assert result["llm"]["config"]["api_key"] == "test-key"
+
+    @pytest.mark.parametrize(
+        ("configured_api_key", "expected_api_key"),
+        [(" sk-configured ", "sk-configured"), ("  ", "sk-shared"), (None, "sk-shared")],
+        ids=["explicit-trimmed", "blank", "missing"],
+    )
+    def test_memory_llm_explicit_api_key_beats_shared_provider_key(
+        self,
+        tmp_path: Path,
+        configured_api_key: str | None,
+        expected_api_key: str,
+    ) -> None:
+        """An explicit memory.llm.config.api_key must not be replaced by the provider's shared key."""
+        runtime_paths = _runtime_paths(tmp_path)
+        get_runtime_shared_credentials_manager(runtime_paths).save_credentials("openai", {"api_key": "sk-shared"})
+        llm_settings: dict[str, object] = {"model": OPENAI_GPT_LUNA}
+        if configured_api_key is not None:
+            llm_settings["api_key"] = configured_api_key
+        memory = MemoryConfig(llm=_MemoryLLMConfig(provider="openai", config=llm_settings))
+        config = Config(memory=memory, router=RouterConfig(model="default"))
+
+        result = _get_memory_config(tmp_path / "memory", config, runtime_paths)
+
+        assert result["llm"]["config"]["api_key"] == expected_api_key
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model_id", "expected_temperature", "expected_top_p", "legacy_request_builder"),
+        [
+            ("gpt-6-astra", None, None, False),
+            (OPENAI_GPT_LUNA, None, None, False),
+            (OPENAI_GPT_SOL, None, None, False),
+            ("gpt-5.6-luna", 0.1, None, False),
+            ("gpt-5.6-terra", 0.1, None, False),
+            # Keep a legacy non-reasoning model as the sampling-control positive case.
+            ("gpt-4", 0.1, 0.8, False),
+            (OPENAI_GPT_SOL, None, None, True),
+        ],
+        ids=["astra", "luna", "sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-4", "sol-legacy-mem0"],
+    )
+    async def test_mem0_openai_sampling_support_is_model_specific(
+        self,
+        tmp_path: Path,
+        model_id: str,
+        expected_temperature: float | None,
+        expected_top_p: float | None,
+        legacy_request_builder: bool,
+    ) -> None:
+        """Memory extraction must omit only sampling controls rejected by its model."""
+        memory = MemoryConfig(
+            embedder=_MemoryEmbedderConfig(
+                provider="ollama",
+                config=EmbedderConfig(model="nomic-embed-text", host="http://localhost:11434"),
+            ),
+            llm=_MemoryLLMConfig(
+                provider="openai",
+                config={
+                    "api_key": "test-key",
+                    "model": model_id,
+                    "temperature": 0.1,
+                    "top_p": 0.8,
+                },
+            ),
+        )
+        config = Config(memory=memory, router=RouterConfig(model="default"))
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+        create_completion = MagicMock(return_value=response)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_completion)))
+
+        with patch("mem0.llms.openai.OpenAI", return_value=fake_client):
+            mem0_llm = OpenAILLM(memory.llm.config)
+
+        with patch.object(
+            AsyncMemory,
+            "from_config",
+            return_value=SimpleNamespace(llm=mem0_llm, vector_store=object()),
+        ):
+            instance = await create_memory_instance(tmp_path / "memory", config, _runtime_paths(tmp_path))
+
+        assert instance.llm is mem0_llm
+        messages = [{"role": "user", "content": "remember this"}]
+        if legacy_request_builder:
+
+            def legacy_generate_response(llm: OpenAILLM, request_messages: list[dict[str, str]]) -> object:
+                return llm.client.chat.completions.create(
+                    model=llm.config.model,
+                    messages=request_messages,
+                    temperature=llm.config.temperature,
+                    max_tokens=llm.config.max_tokens,
+                    top_p=llm.config.top_p,
+                )
+
+            with patch.object(OpenAILLM, "generate_response", legacy_generate_response):
+                instance.llm.generate_response(messages)
+        else:
+            instance.llm.generate_response(messages)
+
+        request_params = create_completion.call_args.kwargs
+        expected_sampling = {"temperature": expected_temperature, "top_p": expected_top_p}
+        assert {name: request_params[name] for name in expected_sampling if name in request_params} == {
+            name: value for name, value in expected_sampling.items() if value is not None
+        }
 
     def test_get_memory_config_passes_configured_embedding_dimensions(
         self,
@@ -111,7 +238,7 @@ class TestMemoryConfig:
         embedder_config = _MemoryEmbedderConfig(
             provider="openai",
             config=EmbedderConfig(
-                model="gemini-embedding-001",
+                model="gemini-embedding-2",
                 host="http://example.com/v1",
                 dimensions=3072,
             ),
@@ -213,6 +340,125 @@ class TestMemoryConfig:
 
         assert result["embedder"]["config"]["api_key"] == "shared-openai-key"
 
+    def test_get_memory_config_prefers_dedicated_embedder_credential(self, tmp_path: Path) -> None:
+        """The dedicated embedder credential should beat the shared openai key for Mem0."""
+        runtime_paths = _runtime_paths(tmp_path)
+        creds_manager = get_runtime_shared_credentials_manager(runtime_paths)
+        creds_manager.save_credentials("openai", {"api_key": "shared-openai-key"})
+        creds_manager.save_credentials("embedder", {"api_key": "dedicated-embedder-key"})
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {"model": "text-embedding-3-small"},
+                },
+            },
+            router=RouterConfig(model="default"),
+        )
+
+        result = _get_memory_config(tmp_path / "memory", config, runtime_paths)
+
+        assert result["embedder"]["config"]["api_key"] == "dedicated-embedder-key"
+        assert "dedicated-embedder-key" not in result["vector_store"]["config"]["collection_name"]
+
+    def test_get_memory_config_explicit_embedder_api_key_wins(self, tmp_path: Path) -> None:
+        """An explicit memory.embedder.config.api_key should beat every credential service."""
+        runtime_paths = _runtime_paths(tmp_path)
+        creds_manager = get_runtime_shared_credentials_manager(runtime_paths)
+        creds_manager.save_credentials("openai", {"api_key": "shared-openai-key"})
+        creds_manager.save_credentials("embedder", {"api_key": "dedicated-embedder-key"})
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {"model": "text-embedding-3-small", "api_key": "explicit-config-key"},
+                },
+            },
+            router=RouterConfig(model="default"),
+        )
+
+        result = _get_memory_config(tmp_path / "memory", config, runtime_paths)
+
+        assert result["embedder"]["config"]["api_key"] == "explicit-config-key"
+
+    def test_mem0_and_knowledge_embedders_resolve_the_same_key(self, tmp_path: Path) -> None:
+        """Both embedder construction paths must authenticate with the same resolved key."""
+        runtime_paths = _runtime_paths(tmp_path)
+        creds_manager = get_runtime_shared_credentials_manager(runtime_paths)
+        creds_manager.save_credentials("openai", {"api_key": "shared-openai-key"})
+        creds_manager.save_credentials("embedder", {"api_key": "dedicated-embedder-key"})
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {"model": "text-embedding-3-small"},
+                },
+            },
+            router=RouterConfig(model="default"),
+        )
+
+        mem0_key = _get_memory_config(tmp_path / "memory", config, runtime_paths)["embedder"]["config"]["api_key"]
+        knowledge_embedder = create_configured_embedder(config, runtime_paths)
+
+        assert mem0_key == "dedicated-embedder-key"
+        assert knowledge_embedder.api_key == mem0_key
+
+    def test_mem0_and_knowledge_embedders_share_named_credential_binding(self, tmp_path: Path) -> None:
+        """Every semantic consumer should use the same explicitly bound credential service."""
+        runtime_paths = _runtime_paths(tmp_path)
+        creds_manager = get_runtime_shared_credentials_manager(runtime_paths)
+        creds_manager.save_credentials("openai", {"api_key": "shared-openai-key"})
+        creds_manager.save_credentials("embedder", {"api_key": "legacy-embedder-key"})
+        creds_manager.save_credentials("embedding-production", {"api_key": "named-key"})
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {
+                        "model": "text-embedding-3-small",
+                        "credentials_service": "embedding-production",
+                    },
+                },
+            },
+            router=RouterConfig(model="default"),
+        )
+
+        mem0_key = _get_memory_config(tmp_path / "memory", config, runtime_paths)["embedder"]["config"]["api_key"]
+        knowledge_embedder = create_configured_embedder(config, runtime_paths)
+
+        assert mem0_key == "named-key"
+        assert knowledge_embedder.api_key == mem0_key
+
+        resolved_settings = resolve_embedder_settings(config, runtime_paths)
+        assert "named-key" not in repr(resolved_settings)
+
+    def test_keyless_local_endpoint_constructs_both_real_clients(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no key anywhere, both real client paths construct via the placeholder (keyless local mode)."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        runtime_paths = _runtime_paths(tmp_path)
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {"model": "embeddinggemma:300m", "host": "http://localhost:9292/v1"},
+                },
+            },
+            router=RouterConfig(model="default"),
+        )
+
+        knowledge_embedder = create_configured_embedder(config, runtime_paths)
+        assert knowledge_embedder.api_key == _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+        assert knowledge_embedder.client.api_key == _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+
+        mem0_embedder_config = _get_memory_config(tmp_path / "memory", config, runtime_paths)["embedder"]["config"]
+        assert mem0_embedder_config["api_key"] == _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+        mem0_embedding = OpenAIEmbedding(BaseEmbedderConfig(**mem0_embedder_config))
+        assert mem0_embedding.client.api_key == _EMBEDDER_KEYLESS_PLACEHOLDER_API_KEY
+
     def test_get_memory_config_openai_embedder_maps_provider_settings(self, tmp_path: Path) -> None:
         """OpenAI Mem0 embedder config should keep the provider-specific field names."""
         runtime_paths = _runtime_paths(tmp_path)
@@ -243,6 +489,83 @@ class TestMemoryConfig:
             "openai_base_url": "http://embeddings.local/v1",
             "embedding_dims": 1024,
         }
+
+    @pytest.mark.parametrize("blank_host", ["", "   "])
+    def test_blank_openai_embedder_host_uses_client_default_url(self, tmp_path: Path, blank_host: str) -> None:
+        """A cleared dashboard host must not become an empty base URL."""
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {"model": "text-embedding-3-small", "host": blank_host, "api_key": "key"},
+                },
+            },
+            router=RouterConfig(model="default"),
+        )
+        runtime_paths = _runtime_paths(tmp_path)
+
+        assert config.memory.embedder.config.host is None
+        embedder = create_configured_embedder(config, runtime_paths)
+        assert str(embedder.client.base_url) == "https://api.openai.com/v1/"
+        mem0_embedder_config = _get_memory_config(tmp_path / "memory", config, runtime_paths)["embedder"]["config"]
+        assert "openai_base_url" not in mem0_embedder_config
+
+    def test_openrouter_only_memory_uses_openrouter_for_llm_and_embedder(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Memory must work with only an OpenRouter key, even one saved under its env var name."""
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        runtime_paths = _runtime_paths(tmp_path)
+        get_runtime_shared_credentials_manager(runtime_paths).save_credentials(
+            "OPENROUTER_API_KEY",
+            {"api_key": "openrouter-key"},
+        )
+        config = Config(
+            memory={
+                "embedder": {
+                    "provider": "openai",
+                    "config": {
+                        "model": OPENROUTER_OPENAI_EMBEDDING_SMALL,
+                        "host": OPENROUTER_BASE_URL_DEFAULT,
+                        "credentials_service": "openrouter",
+                        "dimensions": 1536,
+                    },
+                },
+                "llm": {"provider": "openrouter", "config": {"model": OPENROUTER_OPENAI_LUNA, "temperature": 0.1}},
+            },
+            router=RouterConfig(model="default"),
+        )
+
+        result = _get_memory_config(tmp_path / "memory", config, runtime_paths)
+
+        assert result["llm"] == {
+            "provider": "openai",
+            "config": {
+                "model": OPENROUTER_OPENAI_LUNA,
+                "temperature": 0.1,
+                "api_key": "openrouter-key",
+                "openai_base_url": OPENROUTER_BASE_URL_DEFAULT,
+                "openrouter_base_url": OPENROUTER_BASE_URL_DEFAULT,
+            },
+        }
+        mem0_llm = LlmFactory.create(result["llm"]["provider"], result["llm"]["config"])
+        assert str(mem0_llm.client.base_url) == f"{OPENROUTER_BASE_URL_DEFAULT}/"
+        assert mem0_llm.client.api_key == "openrouter-key"
+
+        assert result["embedder"]["config"] == {
+            "model": OPENROUTER_OPENAI_EMBEDDING_SMALL,
+            "api_key": "openrouter-key",
+            "openai_base_url": OPENROUTER_BASE_URL_DEFAULT,
+            "embedding_dims": 1536,
+        }
+        embedder = create_configured_embedder(config, runtime_paths)
+        assert embedder.api_key == "openrouter-key"
+        assert str(embedder.client.base_url) == f"{OPENROUTER_BASE_URL_DEFAULT}/"
+        assert embedder.embedding_request_parameters("hi")["dimensions"] == 1536
 
     def test_get_memory_config_ollama_embedder_uses_credential_host_before_config(self, tmp_path: Path) -> None:
         """Credential-backed Ollama host should override the embedder config host."""
@@ -310,7 +633,7 @@ class TestMemoryConfig:
             embedder=_MemoryEmbedderConfig(
                 provider="openai",
                 config=EmbedderConfig(
-                    model="gemini-embedding-001",
+                    model="gemini-embedding-2",
                     host="http://example.com/v1",
                 ),
             ),
@@ -320,7 +643,7 @@ class TestMemoryConfig:
             embedder=_MemoryEmbedderConfig(
                 provider="openai",
                 config=EmbedderConfig(
-                    model="gemini-embedding-001",
+                    model="gemini-embedding-2",
                     host="http://example.com/v1",
                     dimensions=1536,
                 ),
@@ -411,7 +734,7 @@ class TestMemoryConfig:
 
     @pytest.mark.asyncio
     @patch("mindroom.memory.config.ensure_sentence_transformers_dependencies")
-    @patch("mindroom.memory.config.AsyncMemory.from_config")
+    @patch.object(AsyncMemory, "from_config")
     async def test_create_memory_instance_auto_installs_sentence_transformers(
         self,
         mock_from_config: MagicMock,
@@ -427,7 +750,7 @@ class TestMemoryConfig:
             llm=None,
         )
         config = Config(memory=memory, router=RouterConfig(model="default"))
-        expected_memory = object()
+        expected_memory = SimpleNamespace(vector_store=object())
         mock_from_config.return_value = expected_memory
 
         result = await create_memory_instance(tmp_path / "memory", config, _runtime_paths(tmp_path))
@@ -435,6 +758,64 @@ class TestMemoryConfig:
         assert result is expected_memory
         mock_ensure_sentence_transformers_dependencies.assert_called_once_with(_runtime_paths(tmp_path))
         mock_from_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_memory_instance_replaces_mem0_openai_embedder_with_strict_adapter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed OpenAI successes cross Mem0 as classified strict failures."""
+        config = Config(
+            memory=MemoryConfig(
+                embedder=_MemoryEmbedderConfig(
+                    provider="openai",
+                    config=EmbedderConfig(model="text-embedding-3-small", api_key="sk-test"),
+                ),
+                llm=None,
+            ),
+            router=RouterConfig(model="default"),
+        )
+        client = MagicMock()
+        client.embeddings.create.return_value = SimpleNamespace(data=[], usage=None)
+        strict_embedder = MindRoomOpenAIEmbedder(
+            id="text-embedding-3-small",
+            api_key="sk-test",
+            openai_client=client,
+        )
+        memory = SimpleNamespace(vector_store=object(), embedding_model=object())
+
+        with (
+            patch.object(AsyncMemory, "from_config", return_value=memory),
+            patch("mindroom.embeddings.factory.create_configured_embedder", return_value=strict_embedder),
+        ):
+            result = await create_memory_instance(tmp_path / "memory", config, _runtime_paths(tmp_path))
+
+        assert isinstance(result.embedding_model, _Mem0StrictOpenAIEmbedder)
+        with pytest.raises(EmbedderRequestError, match="embedder returned 0 embeddings for 1 inputs"):
+            result.embedding_model.embed("query", "search")
+
+    def test_mem0_strict_adapter_remembers_swallowed_operation_failure(self) -> None:
+        """A later successful retry cannot hide a batch failure from the caller."""
+        failure_detail = "embedder authentication failed (HTTP 401)"
+
+        class BatchFailingEmbedder:
+            def get_embedding(self, _text: str) -> list[float]:
+                return [0.1, 0.2]
+
+            def get_embeddings_batch(self, _texts: list[str]) -> list[list[float]]:
+                raise EmbedderRequestError(failure_detail)
+
+        adapter = _Mem0StrictOpenAIEmbedder(BatchFailingEmbedder())
+        adapter.begin_operation()
+
+        with pytest.raises(EmbedderRequestError):
+            adapter.embed_batch(["first", "second"])
+        assert adapter.embed("first") == [0.1, 0.2]
+        with pytest.raises(EmbedderRequestError, match="embedder authentication failed"):
+            adapter.raise_for_operation_failure()
+
+        # Consuming the failure resets the next operation.
+        adapter.raise_for_operation_failure()
 
     def test_memory_auto_flush_batch_config_is_parameterized(self) -> None:
         """Auto-flush batch/extractor limits should be configurable."""
@@ -485,7 +866,7 @@ class TestMemoryConfig:
         )
 
         assert config.memory.backend == "none"
-        assert config.get_agent_memory_backend("scratch") == "none"
+        assert config.resolve_entity("scratch").memory_backend == "none"
         assert config.uses_file_memory() is False
 
     def test_config_accepts_per_agent_disabled_memory_backend(self) -> None:
@@ -499,6 +880,90 @@ class TestMemoryConfig:
             router=RouterConfig(model="default"),
         )
 
-        assert config.get_agent_memory_backend("general") == "mem0"
-        assert config.get_agent_memory_backend("scratch") == "none"
+        assert config.resolve_entity("general").memory_backend == "mem0"
+        assert config.resolve_entity("scratch").memory_backend == "none"
         assert config.uses_file_memory() is False
+
+
+def test_memory_search_defaults_to_keyword_daily_files() -> None:
+    """File-memory search should default to keyword mode over daily memory files."""
+    config = Config(router=RouterConfig(model="default"))
+
+    search = config.resolve_entity("missing_agent").memory_search
+
+    assert search.mode == "keyword"
+    assert search.include == ["memory/**/*.md"]
+    assert search.include_entrypoint is False
+
+
+def test_agent_memory_search_override_merges_per_field() -> None:
+    """Per-agent memory search overrides should inherit omitted global fields."""
+    config = Config(
+        memory={
+            "search": {
+                "mode": "semantic",
+                "include": ["memory/**/*.md"],
+                "include_entrypoint": False,
+            },
+        },
+        agents={
+            "openclaw": AgentConfig(
+                display_name="OpenClaw",
+                memory_backend="file",
+                memory_search={"include_entrypoint": True},
+            ),
+        },
+        router=RouterConfig(model="default"),
+    )
+
+    search = config.resolve_entity("openclaw").memory_search
+
+    assert search.mode == "semantic"
+    assert search.include == ["memory/**/*.md"]
+    assert search.include_entrypoint is True
+
+
+def test_agent_memory_search_can_override_include_patterns() -> None:
+    """Per-agent memory search should support custom include patterns."""
+    config = Config(
+        memory={
+            "search": {
+                "mode": "semantic",
+                "include": ["memory/**/*.md"],
+                "include_entrypoint": False,
+            },
+        },
+        agents={
+            "openclaw": AgentConfig(
+                display_name="OpenClaw",
+                memory_backend="file",
+                memory_search={
+                    "include": ["memory/**/*.md", "decisions/**/*.md"],
+                    "include_entrypoint": True,
+                },
+            ),
+        },
+        router=RouterConfig(model="default"),
+    )
+
+    search = config.resolve_entity("openclaw").memory_search
+
+    assert search.include == ["memory/**/*.md", "decisions/**/*.md"]
+    assert search.include_entrypoint is True
+
+
+def test_memory_search_include_pattern_matches_direct_and_nested_daily_files() -> None:
+    """The root glob matcher should treat memory/**/*.md as daily-memory files."""
+    assert matches_root_glob("memory/2026-06-02.md", "memory/**/*.md")
+    assert matches_root_glob("memory/2026/06/02.md", "memory/**/*.md")
+    assert not matches_root_glob("MEMORY.md", "memory/**/*.md")
+    assert not matches_root_glob("docs/runbook.md", "memory/**/*.md")
+
+
+def test_memory_search_rejects_unsafe_include_pattern() -> None:
+    """Memory search include patterns must stay inside the memory root."""
+    with pytest.raises(ValueError, match=r"memory\.search\.include"):
+        Config(
+            memory={"search": {"include": ["../secret.md"]}},
+            router=RouterConfig(model="default"),
+        )

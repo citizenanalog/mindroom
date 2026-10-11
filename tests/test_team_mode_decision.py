@@ -1,4 +1,8 @@
-"""Tests for AI-powered team mode decision functionality."""
+"""Tests for team-mode decision functionality.
+
+Team formation is pure and assigns a heuristic provisional mode; the AI-powered
+mode selection runs separately at execution time via ``select_ad_hoc_team_mode``.
+"""
 # ruff: noqa: ANN001, ANN201, F841
 
 from __future__ import annotations
@@ -7,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 import pytest
+from agno.metrics import RunMetrics
+from agno.run.agent import RunOutput
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
@@ -15,10 +21,11 @@ from mindroom.teams import (
     TeamMode,
     TeamOutcome,
     TeamResolution,
-    _select_team_mode,
     _TeamModeDecision,
     decide_team_formation,
+    select_ad_hoc_team_mode,
 )
+from mindroom.usage.stats import collect_admin_usage
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.identity_helpers import actual_entity_usernames, entity_ids, entity_name_for_id, persist_entity_accounts
 
@@ -39,10 +46,12 @@ def _matrix_room(config: Config, room_id: str = "!room:localhost", user_ids: lis
 
 
 async def _select_team_mode_for_test(message: str, agent_names: list[str], config: Config) -> TeamMode:
-    return await _select_team_mode(message, agent_names, config, runtime_paths_for(config))
+    runtime_paths = runtime_paths_for(config)
+    ids = entity_ids(config, runtime_paths)
+    return await select_ad_hoc_team_mode(message, [ids[name] for name in agent_names], config, runtime_paths)
 
 
-async def decide_team_formation_for_test(**kwargs: object) -> TeamResolution:
+def decide_team_formation_for_test(**kwargs: object) -> TeamResolution:
     """Run team-formation logic with the test config's bound runtime context."""
     config = kwargs.get("config")
     runtime_paths = kwargs.get("runtime_paths")
@@ -59,7 +68,7 @@ async def decide_team_formation_for_test(**kwargs: object) -> TeamResolution:
             room,
             [agent_id.full_id for agent_id in entity_ids(config, runtime_paths).values() if agent_id is not None],
         )
-    return await decide_team_formation(**kwargs)
+    return decide_team_formation(**kwargs)
 
 
 def _agent_names(ids: list[object], config: Config) -> list[str]:
@@ -141,21 +150,18 @@ class TestTeamModeDecision:
         assert decision.reasoning == "Tasks can be done in parallel"
 
 
-class TestDetermineTeamMode:
-    """Test the AI-powered team mode determination."""
+class TestSelectAdHocTeamMode:
+    """Test the AI-powered execution-time team mode selection."""
 
     @pytest.mark.asyncio
     async def test_select_team_mode_coordinate(self, mock_config):
         """Test AI correctly identifies coordination tasks (different subtasks)."""
-        with patch("mindroom.model_loading.get_model_instance") as mock_get_model:
+        with patch("mindroom.providers.model_loading.get_model_instance") as mock_get_model:
             # Mock the AI agent response
             mock_agent = AsyncMock()
-            mock_response = MagicMock()
-            mock_response.content = _TeamModeDecision(
-                mode="coordinate",
-                reasoning="Different agents handle different subtasks",
+            mock_agent.arun.return_value = RunOutput(
+                content=_TeamModeDecision(mode="coordinate", reasoning="Different agents handle different subtasks"),
             )
-            mock_agent.arun.return_value = mock_response
 
             with patch("mindroom.teams.Agent", return_value=mock_agent):
                 result = await _select_team_mode_for_test(
@@ -170,15 +176,15 @@ class TestDetermineTeamMode:
     @pytest.mark.asyncio
     async def test_select_team_mode_collaborate(self, mock_config):
         """Test AI correctly identifies collaboration tasks (same task for all)."""
-        with patch("mindroom.model_loading.get_model_instance") as mock_get_model:
+        with patch("mindroom.providers.model_loading.get_model_instance") as mock_get_model:
             # Mock the AI agent response
             mock_agent = AsyncMock()
-            mock_response = MagicMock()
-            mock_response.content = _TeamModeDecision(
-                mode="collaborate",
-                reasoning="All agents work on the same brainstorming task",
+            mock_agent.arun.return_value = RunOutput(
+                content=_TeamModeDecision(
+                    mode="collaborate",
+                    reasoning="All agents work on the same brainstorming task",
+                ),
             )
-            mock_agent.arun.return_value = mock_response
 
             with patch("mindroom.teams.Agent", return_value=mock_agent):
                 result = await _select_team_mode_for_test(
@@ -193,7 +199,7 @@ class TestDetermineTeamMode:
     @pytest.mark.asyncio
     async def test_select_team_mode_fallback_on_error(self, mock_config):
         """Test fallback to collaborate mode on AI error."""
-        with patch("mindroom.model_loading.get_model_instance") as mock_get_model:
+        with patch("mindroom.providers.model_loading.get_model_instance") as mock_get_model:
             # Mock the AI agent to raise an error
             mock_agent = AsyncMock()
             mock_agent.arun.side_effect = Exception("AI service unavailable")
@@ -216,12 +222,10 @@ class TestDetermineTeamMode:
     @pytest.mark.asyncio
     async def test_select_team_mode_unexpected_response(self, mock_config):
         """Test fallback when AI returns unexpected response type."""
-        with patch("mindroom.model_loading.get_model_instance") as mock_get_model:
+        with patch("mindroom.providers.model_loading.get_model_instance") as mock_get_model:
             # Mock the AI agent response with wrong type
             mock_agent = AsyncMock()
-            mock_response = MagicMock()
-            mock_response.content = "Just a string, not TeamModeDecision"
-            mock_agent.arun.return_value = mock_response
+            mock_agent.arun.return_value = RunOutput(content="Just a string, not TeamModeDecision")
 
             with patch("mindroom.teams.Agent", return_value=mock_agent):
                 result = await _select_team_mode_for_test(
@@ -233,18 +237,39 @@ class TestDetermineTeamMode:
                 # Should fallback to COLLABORATE on unexpected response
                 assert result == TeamMode.COLLABORATE
 
+    @pytest.mark.asyncio
+    async def test_team_mode_choice_is_counted_as_internal_usage(self, mock_config):
+        """The mode choice is a paid model call, so organization usage reports it under system:internal."""
+        mock_agent = AsyncMock()
+        mock_agent.arun.return_value = RunOutput(
+            run_id="mode-choice",
+            content=_TeamModeDecision(mode="coordinate", reasoning="Different subtasks"),
+            model="gpt-6-luna",
+            model_provider="OpenAI",
+            metrics=RunMetrics(input_tokens=600, output_tokens=20, total_tokens=620),
+        )
+        with (
+            patch("mindroom.providers.model_loading.get_model_instance"),
+            patch("mindroom.teams.Agent", return_value=mock_agent),
+        ):
+            result = await _select_team_mode_for_test("Send me an email then call me", ["email", "phone"], mock_config)
+
+        assert result == TeamMode.COORDINATE
+        report = collect_admin_usage(config=mock_config, runtime_paths=runtime_paths_for(mock_config))
+        assert report.totals.total_tokens == 620
+        assert [(row.key, row.totals.total_tokens) for row in report.breakdown] == [("system:internal", 620)]
+
 
 class TestShouldFormTeam:
-    """Test the enhanced decide_team_formation function."""
+    """Test the pure decide_team_formation function."""
 
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_with_ai_decision(self, mock_config):
-        """Test team formation with AI mode decision."""
-        with patch("mindroom.teams._select_team_mode") as mock_determine:
-            mock_determine.return_value = TeamMode.COORDINATE
-
-            result = await decide_team_formation_for_test(
-                agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
+    def test_decide_team_formation_never_calls_ai(self, mock_config):
+        """Formation is pure: it must never reach for the AI mode selector."""
+        with patch(
+            "mindroom.teams._select_team_mode",
+            side_effect=AssertionError("formation must not call AI"),
+        ):
+            result = decide_team_formation_for_test(
                 tagged_agents=[
                     entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
                     entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
@@ -252,48 +277,17 @@ class TestShouldFormTeam:
                 agents_in_thread=[],
                 all_mentioned_in_thread=[],
                 room=_matrix_room(mock_config),
-                message="Send email then call",
                 config=mock_config,
-                use_ai_decision=True,
             )
-
-            assert result.outcome is TeamOutcome.TEAM
-            assert _agent_names(result.eligible_members, mock_config) == ["email", "phone"]
-            assert result.mode == TeamMode.COORDINATE
-            mock_determine.assert_called_once_with(
-                "Send email then call",
-                ["email", "phone"],
-                mock_config,
-                runtime_paths_for(mock_config),
-            )
-
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_without_ai_decision(self, mock_config):
-        """Test team formation with hardcoded mode selection."""
-        result = await decide_team_formation_for_test(
-            agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-            tagged_agents=[
-                entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-                entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
-            ],
-            agents_in_thread=[],
-            all_mentioned_in_thread=[],
-            room=_matrix_room(mock_config),
-            message="Send email then call",
-            config=mock_config,
-            use_ai_decision=False,
-        )
 
         assert result.outcome is TeamOutcome.TEAM
         assert _agent_names(result.eligible_members, mock_config) == ["email", "phone"]
-        # Hardcoded logic: multiple tagged agents = COORDINATE
+        # Provisional heuristic: multiple tagged agents = COORDINATE
         assert result.mode == TeamMode.COORDINATE
 
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_no_message_fallback(self, mock_config):
-        """Test fallback to hardcoded logic when message is None."""
-        result = await decide_team_formation_for_test(
-            agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
+    def test_decide_team_formation_no_config_fallback(self, mock_config):
+        """Test team formation when config is None."""
+        result = decide_team_formation_for_test(
             tagged_agents=[
                 entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
                 entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
@@ -301,115 +295,86 @@ class TestShouldFormTeam:
             agents_in_thread=[],
             all_mentioned_in_thread=[],
             room=_matrix_room(mock_config),
-            message=None,  # No message provided
-            config=mock_config,
-            use_ai_decision=True,
-        )
-
-        assert result.outcome is TeamOutcome.TEAM
-        assert _agent_names(result.eligible_members, mock_config) == ["email", "phone"]
-        # Should use hardcoded logic when message is None
-        assert result.mode == TeamMode.COORDINATE
-
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_no_config_fallback(self, mock_config):
-        """Test fallback to hardcoded logic when config is None."""
-        result = await decide_team_formation_for_test(
-            agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-            tagged_agents=[
-                entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-                entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
-            ],
-            agents_in_thread=[],
-            all_mentioned_in_thread=[],
-            room=_matrix_room(mock_config),
-            message="Send email then call",
             config=None,  # No config provided
             runtime_paths=runtime_paths_for(mock_config),
-            use_ai_decision=True,
         )
 
         assert result.outcome is TeamOutcome.TEAM
         assert _agent_names(result.eligible_members, mock_config) == ["email", "phone"]
-        # Should use hardcoded logic when config is None
         assert result.mode == TeamMode.COORDINATE
 
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_no_team_needed(self, mock_config):
+    def test_decide_team_formation_no_team_needed(self, mock_config):
         """Test when no team formation is needed."""
-        result = await decide_team_formation_for_test(
-            agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
+        result = decide_team_formation_for_test(
             tagged_agents=[entity_ids(mock_config, runtime_paths_for(mock_config))["email"]],  # Only one agent
             agents_in_thread=[],
             all_mentioned_in_thread=[],
             room=_matrix_room(mock_config),
-            message="Send an email",
             config=None,
             runtime_paths=runtime_paths_for(mock_config),
-            use_ai_decision=True,
         )
 
         assert result.outcome is TeamOutcome.NONE
         assert result.eligible_members == []
         assert result.mode is None
 
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_thread_agents(self, mock_config):
+    def test_decide_team_formation_thread_agents(self, mock_config):
         """Test team formation with agents from thread history."""
-        with patch("mindroom.teams._select_team_mode") as mock_determine:
-            mock_determine.return_value = TeamMode.COLLABORATE
+        result = decide_team_formation_for_test(
+            tagged_agents=[],
+            agents_in_thread=[
+                entity_ids(mock_config, runtime_paths_for(mock_config))["research"],
+                entity_ids(mock_config, runtime_paths_for(mock_config))["analyst"],
+            ],
+            all_mentioned_in_thread=[],
+            room=_matrix_room(mock_config),
+            config=mock_config,
+        )
 
-            result = await decide_team_formation_for_test(
-                agent=entity_ids(mock_config, runtime_paths_for(mock_config))["analyst"],
-                tagged_agents=[],
-                agents_in_thread=[
-                    entity_ids(mock_config, runtime_paths_for(mock_config))["research"],
-                    entity_ids(mock_config, runtime_paths_for(mock_config))["analyst"],
-                ],
-                all_mentioned_in_thread=[],
-                room=_matrix_room(mock_config),
-                message="Continue the analysis",
-                config=mock_config,
-                use_ai_decision=True,
-            )
+        assert result.outcome is TeamOutcome.TEAM
+        assert _agent_names(result.eligible_members, mock_config) == ["research", "analyst"]
+        # Provisional heuristic: no tagged agents = COLLABORATE
+        assert result.mode == TeamMode.COLLABORATE
 
-            assert result.outcome is TeamOutcome.TEAM
-            assert _agent_names(result.eligible_members, mock_config) == ["research", "analyst"]
-            assert result.mode == TeamMode.COLLABORATE
-
-    @pytest.mark.asyncio
-    async def test_decide_team_formation_mentioned_agents(self, mock_config):
+    def test_decide_team_formation_mentioned_agents(self, mock_config):
         """Test team formation with previously mentioned agents."""
-        with patch("mindroom.teams._select_team_mode") as mock_determine:
-            mock_determine.return_value = TeamMode.COLLABORATE
+        result = decide_team_formation_for_test(
+            tagged_agents=[],
+            agents_in_thread=[],
+            all_mentioned_in_thread=[
+                entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
+                entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
+                entity_ids(mock_config, runtime_paths_for(mock_config))["research"],
+            ],
+            room=_matrix_room(mock_config),
+            config=mock_config,
+        )
 
-            result = await decide_team_formation_for_test(
-                agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-                tagged_agents=[],
-                agents_in_thread=[],
-                all_mentioned_in_thread=[
-                    entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-                    entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
-                    entity_ids(mock_config, runtime_paths_for(mock_config))["research"],
-                ],
-                room=_matrix_room(mock_config),
-                message="Let's continue",
-                config=mock_config,
-                use_ai_decision=True,
-            )
-
-            assert result.outcome is TeamOutcome.TEAM
-            assert _agent_names(result.eligible_members, mock_config) == ["email", "phone", "research"]
-            assert result.mode == TeamMode.COLLABORATE
+        assert result.outcome is TeamOutcome.TEAM
+        assert _agent_names(result.eligible_members, mock_config) == ["email", "phone", "research"]
+        assert result.mode == TeamMode.COLLABORATE
 
 
 class TestIntegrationScenarios:
-    """Test real-world integration scenarios."""
+    """Test formation plus execution-time mode refinement together."""
 
     @pytest.mark.asyncio
     async def test_email_then_call_scenario(self, mock_config):
         """Test the email-then-call scenario - coordinate mode for different tasks."""
-        with patch("mindroom.model_loading.get_model_instance") as mock_get_model:
+        result = decide_team_formation_for_test(
+            tagged_agents=[
+                entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
+                entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
+            ],
+            agents_in_thread=[],
+            all_mentioned_in_thread=[],
+            room=_matrix_room(mock_config),
+            config=mock_config,
+        )
+        assert result.outcome is TeamOutcome.TEAM
+        assert set(_agent_names(result.eligible_members, mock_config)) == {"email", "phone"}
+
+        with patch("mindroom.providers.model_loading.get_model_instance") as mock_get_model:
             # Mock the AI to recognize different subtasks
             mock_agent = AsyncMock()
             mock_response = MagicMock()
@@ -420,28 +385,32 @@ class TestIntegrationScenarios:
             mock_agent.arun.return_value = mock_response
 
             with patch("mindroom.teams.Agent", return_value=mock_agent):
-                result = await decide_team_formation_for_test(
-                    agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-                    tagged_agents=[
-                        entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
-                        entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
-                    ],
-                    agents_in_thread=[],
-                    all_mentioned_in_thread=[],
-                    room=_matrix_room(mock_config),
-                    message="Email me the details, then call me to discuss",
-                    config=mock_config,
-                    use_ai_decision=True,
+                mode = await select_ad_hoc_team_mode(
+                    "Email me the details, then call me to discuss",
+                    result.eligible_members,
+                    mock_config,
+                    runtime_paths_for(mock_config),
                 )
 
-                assert result.outcome is TeamOutcome.TEAM
-                assert result.mode == TeamMode.COORDINATE
-                assert set(_agent_names(result.eligible_members, mock_config)) == {"email", "phone"}
+        assert mode == TeamMode.COORDINATE
 
     @pytest.mark.asyncio
     async def test_brainstorming_scenario(self, mock_config):
         """Test brainstorming scenario - collaborate mode for same task."""
-        with patch("mindroom.model_loading.get_model_instance") as mock_get_model:
+        result = decide_team_formation_for_test(
+            tagged_agents=[
+                entity_ids(mock_config, runtime_paths_for(mock_config))["research"],
+                entity_ids(mock_config, runtime_paths_for(mock_config))["analyst"],
+            ],
+            agents_in_thread=[],
+            all_mentioned_in_thread=[],
+            room=_matrix_room(mock_config),
+            config=mock_config,
+        )
+        assert result.outcome is TeamOutcome.TEAM
+        assert set(_agent_names(result.eligible_members, mock_config)) == {"research", "analyst"}
+
+        with patch("mindroom.providers.model_loading.get_model_instance") as mock_get_model:
             # Mock the AI to recognize same task for all
             mock_agent = AsyncMock()
             mock_response = MagicMock()
@@ -452,29 +421,18 @@ class TestIntegrationScenarios:
             mock_agent.arun.return_value = mock_response
 
             with patch("mindroom.teams.Agent", return_value=mock_agent):
-                result = await decide_team_formation_for_test(
-                    agent=entity_ids(mock_config, runtime_paths_for(mock_config))["analyst"],
-                    tagged_agents=[
-                        entity_ids(mock_config, runtime_paths_for(mock_config))["research"],
-                        entity_ids(mock_config, runtime_paths_for(mock_config))["analyst"],
-                    ],
-                    agents_in_thread=[],
-                    all_mentioned_in_thread=[],
-                    room=_matrix_room(mock_config),
-                    message="What are your thoughts on this approach?",
-                    config=mock_config,
-                    use_ai_decision=True,
+                mode = await select_ad_hoc_team_mode(
+                    "What are your thoughts on this approach?",
+                    result.eligible_members,
+                    mock_config,
+                    runtime_paths_for(mock_config),
                 )
 
-                assert result.outcome is TeamOutcome.TEAM
-                assert result.mode == TeamMode.COLLABORATE
-                assert set(_agent_names(result.eligible_members, mock_config)) == {"research", "analyst"}
+        assert mode == TeamMode.COLLABORATE
 
-    @pytest.mark.asyncio
-    async def test_optional_message_and_config_defaults(self, mock_config):
-        """Test that optional message/config inputs still fall back cleanly."""
-        result = await decide_team_formation_for_test(
-            agent=entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
+    def test_optional_config_defaults(self, mock_config):
+        """Test that optional config input still falls back cleanly."""
+        result = decide_team_formation_for_test(
             tagged_agents=[
                 entity_ids(mock_config, runtime_paths_for(mock_config))["email"],
                 entity_ids(mock_config, runtime_paths_for(mock_config))["phone"],
@@ -485,7 +443,7 @@ class TestIntegrationScenarios:
             runtime_paths=runtime_paths_for(mock_config),
         )
 
-        # Should still work with hardcoded logic
+        # Should still work with the provisional heuristic
         assert result.outcome is TeamOutcome.TEAM
         assert _agent_names(result.eligible_members, mock_config) == ["email", "phone"]
-        assert result.mode == TeamMode.COORDINATE  # Hardcoded for multiple tagged
+        assert result.mode == TeamMode.COORDINATE  # Heuristic for multiple tagged

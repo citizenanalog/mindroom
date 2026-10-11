@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from mindroom.memory_scope_ids import agent_name_from_scope_user_id, agent_scope_user_id
 from mindroom.runtime_resolution import resolve_agent_runtime
 
 from ._shared import FileMemoryResolution
@@ -17,44 +18,38 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
-def use_file_memory_backend(config: Config, *, agent_name: str | None = None) -> bool:
-    """Return whether the resolved backend is file-backed."""
-    if agent_name is None:
-        return config.memory.backend == "file"
-    return config.get_agent_memory_backend(agent_name) == "file"
+def _agent_uses_file_memory_backend(config: Config, agent_name: str) -> bool:
+    return config.resolve_entity(agent_name).memory_backend == "file"
 
 
-def use_disabled_memory_backend(config: Config, *, agent_name: str | None = None) -> bool:
-    """Return whether the resolved backend disables memory."""
-    if agent_name is None:
-        return config.memory.backend == "none"
-    return config.get_agent_memory_backend(agent_name) == "none"
+def _agent_uses_disabled_memory_backend(config: Config, agent_name: str) -> bool:
+    return config.resolve_entity(agent_name).memory_backend == "none"
 
 
 def caller_uses_file_memory_backend(config: Config, caller_context: str | list[str]) -> bool:
     """Return whether the caller context resolves to file-backed memory."""
     if isinstance(caller_context, str):
-        return use_file_memory_backend(config, agent_name=caller_context)
-    return team_uses_file_memory_backend(config, caller_context)
+        return _agent_uses_file_memory_backend(config, caller_context)
+    return _team_uses_file_memory_backend(config, caller_context)
 
 
 def caller_uses_disabled_memory_backend(config: Config, caller_context: str | list[str]) -> bool:
     """Return whether the caller context resolves to disabled memory."""
     if isinstance(caller_context, str):
-        return use_disabled_memory_backend(config, agent_name=caller_context)
-    return team_uses_disabled_memory_backend(config, caller_context)
+        return _agent_uses_disabled_memory_backend(config, caller_context)
+    return _team_uses_disabled_memory_backend(config, caller_context)
 
 
-def team_uses_file_memory_backend(config: Config, agent_names: list[str]) -> bool:
+def _team_uses_file_memory_backend(config: Config, agent_names: list[str]) -> bool:
     """Return whether all team members resolve to file-backed memory."""
     config.assert_team_agents_supported(agent_names)
-    return all(use_file_memory_backend(config, agent_name=agent_name) for agent_name in agent_names)
+    return all(_agent_uses_file_memory_backend(config, agent_name) for agent_name in agent_names)
 
 
-def team_uses_disabled_memory_backend(config: Config, agent_names: list[str]) -> bool:
+def _team_uses_disabled_memory_backend(config: Config, agent_names: list[str]) -> bool:
     """Return whether all team members resolve to disabled memory."""
     config.assert_team_agents_supported(agent_names)
-    return all(use_disabled_memory_backend(config, agent_name=agent_name) for agent_name in agent_names)
+    return all(_agent_uses_disabled_memory_backend(config, agent_name) for agent_name in agent_names)
 
 
 def effective_storage_paths_for_context(
@@ -94,18 +89,6 @@ def _effective_storage_path_for_agent(
 def build_team_user_id(agent_names: list[str]) -> str:
     """Create a stable team scope user ID from a set of agent names."""
     return f"team_{'+'.join(sorted(agent_names))}"
-
-
-def agent_scope_user_id(agent_name: str) -> str:
-    """Return the scoped memory user ID for one agent."""
-    return f"agent_{agent_name}"
-
-
-def agent_name_from_scope_user_id(scope_user_id: str) -> str | None:
-    """Extract the agent name from an agent scope user ID."""
-    if scope_user_id.startswith("agent_"):
-        return scope_user_id[len("agent_") :]
-    return None
 
 
 def get_team_ids_for_agent(agent_name: str, config: Config) -> list[str]:

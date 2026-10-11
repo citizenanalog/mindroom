@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import re
+import tempfile
 from concurrent.futures import CancelledError as FutureCancelledError
 from contextlib import contextmanager
 from contextvars import Context
@@ -14,13 +16,19 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from tests.conftest import FakeModel, seed_session
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
+    from mindroom.ai import ResponseTurnContext
+
 import pytest
 from agno.agent import Agent as AgnoAgent
+from agno.metrics import RunMetrics
 from agno.models.message import Message
 from agno.models.ollama import Ollama
+from agno.models.response import ModelResponse
 from agno.run.agent import RunContentEvent, RunOutput
 from agno.run.team import RunContentEvent as TeamContentEvent
 from agno.run.team import TeamRunOutput
@@ -33,33 +41,41 @@ from starlette.requests import ClientDisconnect
 
 from mindroom import constants
 from mindroom.agents import create_agent
-from mindroom.ai_run_metadata import build_prepared_history_metadata_content
+from mindroom.ai_run_metadata import build_ai_run_metadata_content, build_prepared_history_metadata_content
 from mindroom.api import config_lifecycle, openai_compat
 from mindroom.api.main import initialize_api_app
 from mindroom.api.openai_compat import (
     _ChatMessage,
     _convert_messages,
     _derive_session_id,
-    _extract_content_text,
     _is_error_response,
 )
+from mindroom.api.openai_request_parsing import _extract_content_text
+from mindroom.approval.tool_approval import shutdown_approval_runtime
+from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
+from mindroom.config.judgment import TypeSafeJudgmentConfig
 from mindroom.config.main import Config
-from mindroom.config.models import ModelConfig, RouterConfig
+from mindroom.config.models import ModelConfig, RouterConfig, ToolConfigEntry
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.execution_preparation import _PreparedExecutionContext
-from mindroom.history.runtime import ScopeSessionContext, open_bound_scope_session_context
-from mindroom.history.types import CompactionDecision, HistoryScope, ResolvedReplayPlan
+from mindroom.helper_usage import HelperUsageOwner, get_helper_usage_owner
+from mindroom.history.session_context import ScopeSessionContext, open_bound_scope_session_context
+from mindroom.history.types import CompactionDecision, HistoryScope, PreparedHistoryState, ResolvedReplayPlan
+from mindroom.judgment.client import JudgmentClient
+from mindroom.judgment.typesafe import _PINNED_MODEL
 from mindroom.knowledge.availability import KnowledgeAvailability
-from mindroom.knowledge.manager import IndexingSettings
+from mindroom.knowledge.indexing_config import IndexingSettings
 from mindroom.knowledge.utils import KnowledgeAvailabilityDetail, _KnowledgeResolution
 from mindroom.llm_request_logging import current_llm_request_log_context
 from mindroom.matrix.client import ResolvedVisibleMessage
 from mindroom.memory import MemoryPromptParts
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
+from mindroom.providers.media_fallback import install_provider_media_fallback
+from mindroom.routing import ResponderSelection
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode
-from mindroom.tool_approval import _shutdown_approval_store
 from mindroom.tool_system.tool_calls import record_tool_success
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
@@ -68,7 +84,9 @@ from mindroom.tool_system.worker_routing import (
 )
 from tests.identity_helpers import persist_entity_accounts
 
-_TEST_MODEL = "openai:gpt-5.4"
+_TEST_MODEL = "openai:gpt-6-astra"
+_QUEUED_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"
+_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY = "mindroom_queued_message_notice_response_turn_id"
 
 
 def _make_test_agent(name: str) -> AgnoAgent:
@@ -85,7 +103,11 @@ def _make_test_team(
 
 
 def _runtime_paths(process_env: dict[str, str] | None = None) -> RuntimePaths:
-    return resolve_runtime_paths(config_path=Path(__file__), process_env=process_env or {})
+    return resolve_runtime_paths(
+        config_path=Path(__file__),
+        storage_path=Path(tempfile.mkdtemp()),
+        process_env=process_env or {},
+    )
 
 
 def _runtime_paths_for_config(config: Config, process_env: dict[str, str] | None = None) -> RuntimePaths:
@@ -112,6 +134,8 @@ def _fake_indexing_settings(base_id: str) -> IndexingSettings:
         git_skip_hidden="",
         git_include_patterns="",
         git_exclude_patterns="",
+        include_patterns="",
+        exclude_patterns="",
         include_extensions="",
         exclude_extensions="()",
     )
@@ -130,6 +154,7 @@ def _knowledge_lookup(
                 source_signature=hashlib.sha256().hexdigest(),
                 last_published_at="2999-01-01T00:00:00+00:00",
                 last_refresh_at=None,
+                last_error=None,
             ),
         )
         if knowledge is not None
@@ -161,14 +186,12 @@ def _prepared_team_execution_context(
 ) -> SimpleNamespace:
     prepared_context = _PreparedExecutionContext(
         messages=tuple(messages or [Message(role="user", content=final_prompt)]),
-        replay_plan=replay_plan,
         unseen_event_ids=[],
-        replays_persisted_history=replays_persisted_history,
-        compaction_outcomes=[],
-        compaction_decision=CompactionDecision(mode="none", reason="unclassified"),
-        compaction_reply_outcome="none",
-        prepared_context_tokens=prepared_context_tokens,
-        estimated_context_tokens=prepared_context_tokens,
+        prepared_history=PreparedHistoryState(
+            replay_plan=replay_plan,
+            replays_persisted_history=replays_persisted_history,
+            prepared_context_tokens=prepared_context_tokens,
+        ),
     )
     return SimpleNamespace(
         messages=prepared_context.messages,
@@ -181,7 +204,6 @@ def _prepared_team_execution_context(
         compaction_decision=CompactionDecision(mode="none", reason="unclassified"),
         compaction_reply_outcome="none",
         prepared_context_tokens=prepared_context_tokens,
-        estimated_context_tokens=prepared_context_tokens,
         prepared_history=prepared_context.prepared_history,
     )
 
@@ -189,9 +211,9 @@ def _prepared_team_execution_context(
 @pytest.fixture(autouse=True)
 def reset_approval_store() -> Iterator[None]:
     """Keep the module-level approval store isolated per test."""
-    asyncio.run(_shutdown_approval_store())
+    asyncio.run(shutdown_approval_runtime())
     yield
-    asyncio.run(_shutdown_approval_store())
+    asyncio.run(shutdown_approval_runtime())
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -246,7 +268,7 @@ def app_client(test_config: Config) -> Iterator[TestClient]:
 
     with (
         patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-        TestClient(app) as client,
+        TestClient(app, base_url="http://localhost") as client,
     ):
         yield client
 
@@ -277,7 +299,7 @@ def test_load_config_uses_dynamic_runtime_config_path(
     """OpenAI-compatible config loading should follow the active runtime config path."""
     config_path = tmp_path / "alt-config.yaml"
     config_path.write_text(
-        "models:\n  default:\n    provider: openai\n    id: gpt-5.4\n"
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\n"
         "agents:\n  only_alt:\n    display_name: OnlyAlt\n    role: alt\n    rooms: []\n"
         "router:\n  model: default\n",
         encoding="utf-8",
@@ -320,7 +342,7 @@ def test_list_models_uses_committed_snapshot_until_reload(tmp_path: Path) -> Non
         "models:\n"
         "  default:\n"
         "    provider: openai\n"
-        "    id: gpt-5.4\n"
+        "    id: gpt-6-astra\n"
         "router:\n"
         "  model: default\n"
         "agents:\n"
@@ -342,7 +364,7 @@ def test_list_models_uses_committed_snapshot_until_reload(tmp_path: Path) -> Non
         "models:\n"
         "  default:\n"
         "    provider: openai\n"
-        "    id: gpt-5.4\n"
+        "    id: gpt-6-astra\n"
         "router:\n"
         "  model: default\n"
         "agents:\n"
@@ -353,7 +375,7 @@ def test_list_models_uses_committed_snapshot_until_reload(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/v1/models")
 
     assert response.status_code == 200
@@ -376,13 +398,14 @@ def test_list_models_keeps_auth_runtime_bound_across_runtime_swap(test_config: C
     captured_runtime_paths: list[RuntimePaths | None] = []
 
     def _authenticate_and_swap(
+        _request: Request,
         authorization: str | None,
         runtime_paths: RuntimePaths,
-    ) -> JSONResponse | None:
+    ) -> openai_compat._AuthenticatedCaller:
         assert authorization == "Bearer old-key"
         assert runtime_paths == runtime_a
         initialize_api_app(app, runtime_b)
-        return None
+        return openai_compat._AuthenticatedCaller(session_namespace="old-key-namespace", requester_id=None)
 
     def _capture_load_config(
         _request: Request,
@@ -427,7 +450,7 @@ def test_openai_compatible_agent_hides_approval_gated_tools(test_config: Config,
         session_id="openai-session",
     )
 
-    with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
         agent = create_agent(
             "code",
             config=config,
@@ -437,12 +460,120 @@ def test_openai_compatible_agent_hides_approval_gated_tools(test_config: Config,
         )
 
     exposed_tool_names = {
-        *(function_name for toolkit in agent.tools for function_name in getattr(toolkit, "functions", {})),
-        *(function_name for toolkit in agent.tools for function_name in getattr(toolkit, "async_functions", {})),
+        *(function_name for toolkit in agent.tools for function_name in toolkit.functions),
+        *(function_name for toolkit in agent.tools for function_name in toolkit.async_functions),
     }
     assert "run_shell_command" not in exposed_tool_names
     assert "check_shell_command" in exposed_tool_names
     assert "kill_shell_command" in exposed_tool_names
+
+
+def test_openai_compatible_agent_hides_context_bound_todo_tool(tmp_path: Path) -> None:
+    """OpenAI-compatible agent construction should hide Matrix-context-bound todo tools."""
+    runtime_paths = constants.resolve_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+    config = Config(
+        agents={
+            "code": AgentConfig(
+                display_name="CodeAgent",
+                role="Generate code and manage files",
+                tools=["todo"],
+                rooms=[],
+            ),
+        },
+        models={"default": ModelConfig(provider="ollama", id="test-model")},
+        router=RouterConfig(model="default"),
+    )
+    persist_entity_accounts(config, runtime_paths)
+    execution_identity = build_tool_execution_identity(
+        channel="openai_compat",
+        agent_name="code",
+        runtime_paths=runtime_paths,
+        requester_id=None,
+        room_id=None,
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="openai-session",
+    )
+
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+        agent = create_agent(
+            "code",
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+            include_openai_compat_guidance=True,
+        )
+
+    exposed_tool_names = {
+        *(function_name for toolkit in agent.tools for function_name in toolkit.functions),
+        *(function_name for toolkit in agent.tools for function_name in toolkit.async_functions),
+    }
+    assert "todo" not in {toolkit.name for toolkit in agent.tools}
+    assert (
+        not {
+            "add_todo",
+            "apply_template",
+            "list_templates",
+            "list_todos",
+            "plan",
+            "update_todo",
+        }
+        & exposed_tool_names
+    )
+
+
+def test_openai_compatible_dynamic_tools_hide_deferred_context_bound_todo(tmp_path: Path) -> None:
+    """OpenAI-compatible dynamic tooling should not advertise or load context-bound todo."""
+    runtime_paths = constants.resolve_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+    config = Config(
+        agents={
+            "code": AgentConfig(
+                display_name="CodeAgent",
+                role="Generate code and manage files",
+                tools=[
+                    ToolConfigEntry(name="todo", defer=True),
+                    ToolConfigEntry(name="sleep", defer=True),
+                ],
+                rooms=[],
+            ),
+        },
+        models={"default": ModelConfig(provider="ollama", id="test-model")},
+        router=RouterConfig(model="default"),
+    )
+    persist_entity_accounts(config, runtime_paths)
+    execution_identity = build_tool_execution_identity(
+        channel="openai_compat",
+        agent_name="code",
+        runtime_paths=runtime_paths,
+        requester_id=None,
+        room_id=None,
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="openai-session",
+    )
+
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+        agent = create_agent(
+            "code",
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+            session_id="openai-session",
+            include_openai_compat_guidance=True,
+        )
+
+    toolkits = {toolkit.name: toolkit for toolkit in agent.tools}
+    assert "todo" not in toolkits
+    dynamic_tools = toolkits["dynamic_tools"]
+    listing = json.loads(dynamic_tools.list_tools())
+    search_result = json.loads(dynamic_tools.tool_search("todo"))
+    load_result = json.loads(dynamic_tools.load_tool("todo"))
+
+    assert [tool["name"] for tool in listing["tools"]] == ["sleep"]
+    assert listing["loaded_tools"] == []
+    assert search_result["matches"] == []
+    assert load_result["status"] == "unknown"
+    assert load_result["available_tools"] == ["sleep"]
 
 
 def test_openai_compatible_agent_hides_script_gated_tools(test_config: Config, tmp_path: Path) -> None:
@@ -475,7 +606,7 @@ def test_openai_compatible_agent_hides_script_gated_tools(test_config: Config, t
         session_id="openai-session",
     )
 
-    with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
         agent = create_agent(
             "code",
             config=config,
@@ -485,8 +616,8 @@ def test_openai_compatible_agent_hides_script_gated_tools(test_config: Config, t
         )
 
     exposed_tool_names = {
-        *(function_name for toolkit in agent.tools for function_name in getattr(toolkit, "functions", {})),
-        *(function_name for toolkit in agent.tools for function_name in getattr(toolkit, "async_functions", {})),
+        *(function_name for toolkit in agent.tools for function_name in toolkit.functions),
+        *(function_name for toolkit in agent.tools for function_name in toolkit.async_functions),
     }
     assert "run_shell_command" not in exposed_tool_names
 
@@ -502,7 +633,7 @@ def test_chat_completions_keeps_auth_runtime_bound_across_runtime_swap(tmp_path:
         "models:\n"
         "  default:\n"
         "    provider: openai\n"
-        "    id: gpt-5.4\n"
+        "    id: gpt-6-astra\n"
         "router:\n"
         "  model: default\n"
         "agents:\n"
@@ -528,13 +659,14 @@ def test_chat_completions_keeps_auth_runtime_bound_across_runtime_swap(tmp_path:
     captured_runtime_paths: list[RuntimePaths | None] = []
 
     def _authenticate_and_swap(
+        _request: Request,
         authorization: str | None,
         runtime_paths: RuntimePaths,
-    ) -> JSONResponse | None:
+    ) -> openai_compat._AuthenticatedCaller:
         assert authorization == "Bearer old-key"
         assert runtime_paths == runtime_a
         initialize_api_app(app, runtime_b)
-        return None
+        return openai_compat._AuthenticatedCaller(session_namespace="old-key-namespace", requester_id=None)
 
     real_load_config = openai_compat._load_config
 
@@ -577,7 +709,7 @@ def test_list_models_tolerate_missing_plugin_path(tmp_path: Path) -> None:
         "models:\n"
         "  default:\n"
         "    provider: openai\n"
-        "    id: gpt-5.4\n"
+        "    id: gpt-6-astra\n"
         "router:\n"
         "  model: default\n"
         "agents: {}\n"
@@ -594,7 +726,7 @@ def test_list_models_tolerate_missing_plugin_path(tmp_path: Path) -> None:
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is True
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/v1/models")
 
     assert response.status_code == 200
@@ -618,7 +750,7 @@ def test_list_models_returns_malformed_yaml_errors(tmp_path: Path) -> None:
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is False
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/v1/models")
 
     assert response.status_code == 422
@@ -636,7 +768,7 @@ def test_chat_completions_tolerate_missing_plugin_path_during_model_validation(t
         "models:\n"
         "  default:\n"
         "    provider: openai\n"
-        "    id: gpt-5.4\n"
+        "    id: gpt-6-astra\n"
         "router:\n"
         "  model: default\n"
         "agents:\n"
@@ -657,7 +789,7 @@ def test_chat_completions_tolerate_missing_plugin_path_during_model_validation(t
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is True
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.post(
             "/v1/chat/completions",
             json={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
@@ -684,7 +816,7 @@ def test_chat_completions_returns_malformed_yaml_errors(tmp_path: Path) -> None:
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is False
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.post(
             "/v1/chat/completions",
             json={"model": "general", "messages": [{"role": "user", "content": "hi"}]},
@@ -773,7 +905,7 @@ class TestListModels:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
 
@@ -799,7 +931,7 @@ class TestListModels:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
 
@@ -825,7 +957,7 @@ class TestListModels:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
 
@@ -875,7 +1007,7 @@ class TestListModels:
         )
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(empty_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
             assert response.status_code == 200
@@ -910,11 +1042,70 @@ class TestChatCompletions:
         assert data["choices"][0]["finish_reason"] == "stop"
         assert data["usage"]["prompt_tokens"] == 0
 
+    def test_non_stream_completion_reports_run_token_usage(self, app_client: TestClient) -> None:
+        """Non-streaming usage comes from the run's own token metrics instead of zeros."""
+
+        async def respond(_ctx: object, **kwargs: object) -> str:
+            collector = kwargs.get("run_metadata_collector")
+            if isinstance(collector, dict):
+                collector[constants.AI_RUN_METADATA_KEY] = {
+                    "usage": {"input_tokens": 1200, "output_tokens": 34, "total_tokens": 1234},
+                }
+            return "Hello!"
+
+        with patch("mindroom.api.openai_compat.ai_response", side_effect=respond):
+            response = app_client.post(
+                "/v1/chat/completions",
+                json={"model": "general", "messages": [{"role": "user", "content": "Hello"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"prompt_tokens": 1200, "completion_tokens": 34, "total_tokens": 1234}
+
+    def test_non_stream_usage_counts_cached_prompt_tokens_for_anthropic(self, app_client: TestClient) -> None:
+        """Anthropic reports cache reads and writes outside input_tokens; prompt_tokens must include them."""
+
+        async def respond(_ctx: object, **kwargs: object) -> str:
+            collector = kwargs.get("run_metadata_collector")
+            if isinstance(collector, dict):
+                collector.update(
+                    build_ai_run_metadata_content(
+                        config=Config(
+                            agents={},
+                            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
+                            router=RouterConfig(model="default"),
+                        ),
+                        model_name="default",
+                        run_id="run-1",
+                        session_id="session-1",
+                        status="completed",
+                        model="claude-sonnet-5-5",
+                        model_provider="Anthropic",
+                        metrics=RunMetrics(
+                            input_tokens=40,
+                            output_tokens=200,
+                            total_tokens=240,
+                            cache_read_tokens=30000,
+                            cache_write_tokens=500,
+                        ),
+                    ),
+                )
+            return "Hello!"
+
+        with patch("mindroom.api.openai_compat.ai_response", side_effect=respond):
+            response = app_client.post(
+                "/v1/chat/completions",
+                json={"model": "general", "messages": [{"role": "user", "content": "Hello"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"prompt_tokens": 30540, "completion_tokens": 200, "total_tokens": 30740}
+
     def test_completion_lock_releases_when_request_is_cancelled(self, app_client: TestClient) -> None:
         """Cancellation after lock acquisition must not leave the OpenAI session locked."""
         completion_lock = asyncio.Lock()
 
-        async def cancelled_response(**_kwargs: object) -> str:
+        async def cancelled_response(_ctx: object, **_kwargs: object) -> str:
             raise asyncio.CancelledError
 
         with (
@@ -947,7 +1138,26 @@ class TestChatCompletions:
 
             assert "include_default_tools" not in mock_ai.call_args.kwargs
             assert mock_ai.call_args.kwargs["include_interactive_questions"] is False
-            assert mock_ai.call_args.kwargs["active_event_ids"] == set()
+            assert mock_ai.call_args.args[0].active_event_ids == frozenset()
+
+    def test_agent_completion_mints_fresh_uuid_correlation_id(self, app_client: TestClient) -> None:
+        """Each OpenAI-compatible agent completion mints its own uuid-hex correlation id."""
+        with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
+            mock_ai.return_value = "Response"
+
+            for _ in range(2):
+                app_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "general",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                    },
+                )
+
+            first_ctx, second_ctx = (call.args[0] for call in mock_ai.call_args_list)
+            assert re.fullmatch(r"[0-9a-f]{32}", first_ctx.correlation_id)
+            assert re.fullmatch(r"[0-9a-f]{32}", second_ctx.correlation_id)
+            assert first_ctx.correlation_id != second_ctx.correlation_id
 
     def test_passes_knowledge_none(self, app_client: TestClient) -> None:
         """Passes knowledge=None when agent has no knowledge_bases."""
@@ -978,7 +1188,7 @@ class TestChatCompletions:
                 },
             )
 
-            assert mock_ai.call_args.kwargs["user_id"] is None
+            assert mock_ai.call_args.args[0].requester_id is None
 
     def test_request_body_user_is_not_used_for_openai_execution_identity(self, app_client: TestClient) -> None:
         """The OpenAI user field should not become credential-routing identity."""
@@ -1055,13 +1265,13 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(config, runtime_paths)),
-            patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
             patch("mindroom.ai.build_memory_prompt_parts", new=AsyncMock(return_value=MemoryPromptParts())),
             patch(
                 "mindroom.ai._run_cached_agent_attempt",
                 new=AsyncMock(return_value=RunOutput(content="Agent reply")),
             ),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1130,7 +1340,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1168,7 +1378,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1200,7 +1410,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1232,7 +1442,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1250,7 +1460,7 @@ class TestChatCompletions:
         observed_session_ids: list[str] = []
 
         async def _capture(*args: object, **kwargs: object) -> str:  # noqa: ARG001
-            observed_session_ids.append(kwargs["session_id"])
+            observed_session_ids.append(args[0].session_id)
             return "Response"
 
         with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
@@ -1282,7 +1492,7 @@ class TestChatCompletions:
         observed_session_ids: list[str] = []
 
         async def _capture(*args: object, **kwargs: object) -> str:  # noqa: ARG001
-            observed_session_ids.append(kwargs["session_id"])
+            observed_session_ids.append(args[0].session_id)
             return "Response"
 
         with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
@@ -1431,7 +1641,7 @@ class TestStreamingCompletion:
     def test_streaming_sse_format(self, app_client: TestClient) -> None:
         """Streaming returns valid SSE format."""
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             yield RunContentEvent(content="Hello ")
             yield RunContentEvent(content="world!")
 
@@ -1475,7 +1685,7 @@ class TestStreamingCompletion:
     def test_streaming_passes_include_interactive_questions_false(self, app_client: TestClient) -> None:
         """Streaming disables interactive question prompting for OpenAI compatibility."""
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             yield RunContentEvent(content="ok")
 
         with patch("mindroom.api.openai_compat.stream_agent_response", side_effect=mock_stream) as mock_stream_fn:
@@ -1491,12 +1701,12 @@ class TestStreamingCompletion:
         assert response.status_code == 200
         assert "include_default_tools" not in mock_stream_fn.call_args.kwargs
         assert mock_stream_fn.call_args.kwargs["include_interactive_questions"] is False
-        assert mock_stream_fn.call_args.kwargs["active_event_ids"] == set()
+        assert mock_stream_fn.call_args.args[0].active_event_ids == frozenset()
 
     def test_streaming_consistent_id(self, app_client: TestClient) -> None:
         """All streaming chunks have the same completion ID."""
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             yield RunContentEvent(content="test")
 
         with patch("mindroom.api.openai_compat.stream_agent_response", side_effect=mock_stream):
@@ -1525,7 +1735,7 @@ class TestStreamingCompletion:
         """Worker-routing identity must stay active after the first streamed event."""
         observed_session_ids: list[str | None] = []
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             identity = get_tool_execution_identity()
             observed_session_ids.append(identity.session_id if identity is not None else None)
             yield RunContentEvent(content="Hello ")
@@ -1549,6 +1759,63 @@ class TestStreamingCompletion:
         assert all(session_id is not None for session_id in observed_session_ids)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+    async def test_prefetched_provider_stream_completes_under_asgi(
+        self,
+        test_config: Config,
+        spec_version: str,
+    ) -> None:
+        """The real API prefetch and ASGI response may advance a model in different tasks."""
+        model = Ollama(id="synthetic-model")
+        closed = False
+
+        async def provider(**_kwargs: object) -> AsyncIterator[ModelResponse]:
+            nonlocal closed
+            try:
+                yield ModelResponse(content="Hello")
+                yield ModelResponse(content=" world")
+            finally:
+                closed = True
+
+        model.ainvoke_stream = provider
+        install_provider_media_fallback(model, fallback_prompt="Continue without inline media.")
+
+        async def agent_stream(_ctx: object, **_kwargs: object) -> AsyncIterator[RunContentEvent]:
+            async for chunk in model._ainvoke_stream_with_retry(messages=[Message(role="user", content="Hello")]):
+                yield RunContentEvent(content=chunk.content)
+
+        with patch("mindroom.api.openai_compat.stream_agent_response", side_effect=agent_stream):
+            response = await openai_compat._stream_completion(
+                "general",
+                "Hello",
+                "session-123",
+                test_config,
+                _runtime_paths(),
+                None,
+            )
+
+        assert isinstance(response, openai_compat._OpenAIStreamingResponse)
+        sent: list[bytes] = []
+
+        async def receive() -> dict[str, object]:
+            await asyncio.Event().wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, object]) -> None:
+            if message["type"] == "http.response.body":
+                sent.append(cast("bytes", message["body"]))
+
+        await response({"type": "http", "asgi": {"spec_version": spec_version}}, receive, send)
+
+        assert closed
+        assert response.completion_predicate is not None
+        assert response.completion_predicate()
+        body = b"".join(sent).decode()
+        assert '"content":"Hello"' in body
+        assert '"content":" world"' in body
+        assert body.endswith("data: [DONE]\n\n")
+
+    @pytest.mark.asyncio
     async def test_streaming_close_from_other_task_keeps_execution_identity(self, test_config: Config) -> None:
         """Closing the SSE body from another task should still clean up inside the execution identity."""
         runtime_paths = _runtime_paths()
@@ -1564,7 +1831,7 @@ class TestStreamingCompletion:
         )
         observed_final_identities: list[ToolExecutionIdentity | None] = []
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             try:
                 assert get_tool_execution_identity() == execution_identity
                 yield RunContentEvent(content="Hello")
@@ -1581,7 +1848,6 @@ class TestStreamingCompletion:
                 runtime_paths,
                 None,
                 None,
-                None,
                 execution_identity=execution_identity,
             )
 
@@ -1594,7 +1860,7 @@ class TestStreamingCompletion:
     def test_streaming_cached_response(self, app_client: TestClient) -> None:
         """Cached full response (string) is streamed correctly."""
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[str]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[str]:
             yield "This is a cached response"
 
         with patch("mindroom.api.openai_compat.stream_agent_response", side_effect=mock_stream):
@@ -1615,7 +1881,7 @@ class TestStreamingCompletion:
     def test_streaming_first_event_error_returns_500(self, app_client: TestClient) -> None:
         """If first stream event is an error string, return HTTP 500 instead of SSE."""
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[str]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[str]:
             yield "❌ Authentication failed (openai): Invalid API key"
 
         with patch("mindroom.api.openai_compat.stream_agent_response", side_effect=mock_stream):
@@ -1650,7 +1916,7 @@ class TestStreamingCompletion:
             result="3 results",
         )
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[object]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="Let me search. ")
             yield ToolCallStartedEvent(tool=tool_started)
             yield ToolCallCompletedEvent(tool=tool_completed)
@@ -1702,7 +1968,7 @@ class TestStreamingCompletion:
             result="</tool><i>boom</i>" + ("x" * 600),
         )
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[object]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[object]:
             yield ToolCallStartedEvent(tool=tool_started)
             yield ToolCallCompletedEvent(tool=tool_completed)
 
@@ -1766,7 +2032,7 @@ class TestStreamingCompletion:
             result="two-result",
         )
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[object]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[object]:
             yield RunContentEvent(content="Start ")
             yield ToolCallStartedEvent(tool=first_started)
             yield ToolCallCompletedEvent(tool=first_completed)
@@ -1899,6 +2165,59 @@ class TestAuthentication:
             },
         )
         assert response.status_code == 401
+
+    def test_unauthenticated_api_refuses_rebound_hosts_and_other_sites(self, app_client: TestClient) -> None:
+        """Without a key a completion runs an agent for any caller, so no rebound or cross-site page may start one."""
+        body = json.dumps({"model": "general", "messages": [{"role": "user", "content": "Hello"}]})
+        # A text/plain POST is a simple request, which a browser sends cross-site without a preflight.
+        simple = {"Content-Type": "text/plain"}
+        with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
+            mock_ai.return_value = "Hello!"
+            rebound = app_client.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={**simple, "Host": "attacker.example"},
+            )
+            cross_origin = app_client.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={**simple, "Origin": "https://attacker.example"},
+            )
+            cross_site = app_client.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={**simple, "Sec-Fetch-Site": "cross-site"},
+            )
+            rebound_models = app_client.get("/v1/models", headers={"Host": "attacker.example"})
+
+        statuses = [response.status_code for response in (rebound, cross_origin, cross_site, rebound_models)]
+        assert statuses == [400, 403, 403, 400]
+        assert "MINDROOM_DASHBOARD_ALLOWED_HOSTS" in rebound.json()["error"]["message"]
+        mock_ai.assert_not_awaited()
+
+    def test_unauthenticated_api_serves_local_callers(self, app_client: TestClient) -> None:
+        """API clients, the local UI, and callers on an address keep reaching an unauthenticated `/v1`."""
+        payload = {"model": "general", "messages": [{"role": "user", "content": "Hello"}]}
+        with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
+            mock_ai.return_value = "Hello!"
+            responses = [
+                app_client.post("/v1/chat/completions", json=payload, headers=headers)
+                for headers in ({}, {"Origin": "http://localhost"}, {"Host": "192.168.1.20:8765"})
+            ]
+
+        assert [response.status_code for response in responses] == [200, 200, 200]
+
+    def test_keyed_api_serves_any_host_and_origin(self, authed_client: TestClient) -> None:
+        """A key authorizes a `/v1` request, so the host and origin it names do not matter."""
+        response = authed_client.get(
+            "/v1/models",
+            headers={
+                "Authorization": "Bearer test-key-1",
+                "Host": "mindroom.internal",
+                "Origin": "https://ui.example.org",
+            },
+        )
+        assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -2055,6 +2374,30 @@ async def test_openai_completion_lock_releases_after_response_background() -> No
 
     assert events == ["background"]
     assert not completion_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_openai_completion_lock_is_shared_and_dropped_when_unreferenced(tmp_path: Path) -> None:
+    """Same-session requests share one lock; cache entries vanish once no request holds the lock."""
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "data")
+    key = (str(runtime_paths.storage_root), "general", "session-1")
+
+    lock = openai_compat._openai_completion_lock(
+        runtime_paths=runtime_paths,
+        agent_name="general",
+        session_id="session-1",
+    )
+    same_session_lock = openai_compat._openai_completion_lock(
+        runtime_paths=runtime_paths,
+        agent_name="general",
+        session_id="session-1",
+    )
+    assert same_session_lock is lock
+    assert key in openai_compat._OPENAI_COMPLETION_LOCKS
+
+    del lock, same_session_lock
+    gc.collect()
+    assert key not in openai_compat._OPENAI_COMPLETION_LOCKS
 
 
 @pytest.mark.asyncio
@@ -2252,6 +2595,44 @@ async def test_openai_error_response_releases_lock_when_send_fails() -> None:
     assert not completion_lock.locked()
 
 
+def _completion_session_ids(client: TestClient, authorization_headers: list[str]) -> list[str]:
+    """Post one completion per Authorization header with the same X-Session-Id and return the session IDs."""
+    session_ids: list[str] = []
+
+    async def capture(ctx: ResponseTurnContext, **_kwargs: object) -> str:
+        session_ids.append(ctx.session_id)
+        return "Response"
+
+    with patch("mindroom.api.openai_compat.ai_response", side_effect=capture):
+        for authorization in authorization_headers:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": authorization, "X-Session-Id": "shared"},
+                json={"model": "general", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+            assert response.status_code == 200
+    return session_ids
+
+
+def test_session_namespace_is_the_full_digest_of_the_validated_key(authed_client: TestClient) -> None:
+    """Accepted spellings of one key share its session; another key never does."""
+    first, padded, tabbed, other = _completion_session_ids(
+        authed_client,
+        ["Bearer test-key-1", "Bearer   test-key-1", "Bearer \ttest-key-1", "Bearer test-key-2"],
+    )
+
+    assert first == f"{hashlib.sha256(b'test-key-1').hexdigest()}:shared"
+    assert padded == tabbed == first
+    assert other == f"{hashlib.sha256(b'test-key-2').hexdigest()}:shared"
+
+
+def test_unauthenticated_session_namespace_ignores_the_authorization_header(app_client: TestClient) -> None:
+    """Without configured keys the header authenticates nothing, so it cannot select a session namespace."""
+    session_ids = _completion_session_ids(app_client, ["Bearer anything", "Bearer something-else"])
+
+    assert session_ids == ["noauth:shared", "noauth:shared"]
+
+
 class TestSessionIdDerivation:
     """Tests for _derive_session_id()."""
 
@@ -2264,30 +2645,24 @@ class TestSessionIdDerivation:
         return mock
 
     def test_explicit_session_id_header(self) -> None:
-        """X-Session-Id header takes highest priority (namespaced with key)."""
+        """X-Session-Id header takes highest priority (namespaced with the caller's key)."""
         request = self._mock_request({"X-Session-Id": "my-session"})
-        sid = _derive_session_id("general", request)
-        # Session ID is namespaced with API key hash prefix
-        assert sid.endswith(":my-session")
-        assert sid.startswith("noauth:")  # No auth header
+        sid = _derive_session_id("general", request, "noauth")
+        assert sid == "noauth:my-session"
 
     def test_explicit_session_id_namespaced_by_key(self) -> None:
-        """Different API keys produce different session namespaces."""
-        req1 = self._mock_request({"X-Session-Id": "sess", "Authorization": "Bearer key-1"})
-        req2 = self._mock_request({"X-Session-Id": "sess", "Authorization": "Bearer key-2"})
-        sid1 = _derive_session_id("general", req1)
-        sid2 = _derive_session_id("general", req2)
-        # Same session ID but different keys → different derived IDs
-        assert sid1 != sid2
-        assert sid1.endswith(":sess")
-        assert sid2.endswith(":sess")
+        """Different key namespaces produce different session IDs for one X-Session-Id."""
+        request = self._mock_request({"X-Session-Id": "sess"})
+        sid1 = _derive_session_id("general", request, "key-1-digest")
+        sid2 = _derive_session_id("general", request, "key-2-digest")
+        assert sid1 == "key-1-digest:sess"
+        assert sid2 == "key-2-digest:sess"
 
     def test_librechat_conversation_id(self) -> None:
         """X-LibreChat-Conversation-Id header is used when no X-Session-Id."""
         request = self._mock_request({"X-LibreChat-Conversation-Id": "conv-123"})
-        sid = _derive_session_id("general", request)
-        assert "conv-123" in sid
-        assert "general" in sid
+        sid = _derive_session_id("general", request, "noauth")
+        assert sid == "noauth:conv-123:general"
 
     def test_session_id_takes_priority_over_librechat(self) -> None:
         """X-Session-Id takes priority over X-LibreChat-Conversation-Id."""
@@ -2297,22 +2672,22 @@ class TestSessionIdDerivation:
                 "X-LibreChat-Conversation-Id": "libre",
             },
         )
-        sid = _derive_session_id("general", request)
+        sid = _derive_session_id("general", request, "noauth")
         assert "explicit" in sid
         assert "libre" not in sid
 
     def test_fallback_generates_ephemeral_session_id(self) -> None:
         """Fallback generates an ephemeral namespaced session ID."""
         request = self._mock_request()
-        sid1 = _derive_session_id("general", request)
+        sid1 = _derive_session_id("general", request, "noauth")
         assert sid1.startswith("noauth:ephemeral:")
         assert len(sid1) > len("noauth:ephemeral:")
 
     def test_fallback_is_not_deterministic(self) -> None:
         """Fallback IDs differ across requests to avoid cross-chat collisions."""
         request = self._mock_request()
-        sid1 = _derive_session_id("general", request)
-        sid2 = _derive_session_id("general", request)
+        sid1 = _derive_session_id("general", request, "noauth")
+        sid2 = _derive_session_id("general", request, "noauth")
         assert sid1 != sid2
 
     def test_fallback_ignores_user_message_content(self, app_client: TestClient) -> None:
@@ -2470,18 +2845,25 @@ class TestAutoRouting:
 
     def test_auto_routes_to_suggested_agent(self, app_client: TestClient) -> None:
         """Auto model routes to the agent suggested by suggest_responder()."""
+        observed: list[tuple[str | None, str | None]] = []
+
+        async def respond(*_args: object, **_kwargs: object) -> str:
+            (identity,) = config_lifecycle.app_state(app_client.app).openai_responses
+            observed.append((identity.responder, identity.requester_id))
+            return "Here is your code"
+
         with (
             patch("mindroom.api.openai_compat.suggest_responder", new_callable=AsyncMock) as mock_route,
-            patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
+            patch("mindroom.api.openai_compat.ai_response", side_effect=respond),
         ):
-            mock_route.return_value = "code"
-            mock_ai.return_value = "Here is your code"
+            mock_route.return_value = ResponderSelection("code")
 
             response = app_client.post(
                 "/v1/chat/completions",
                 json={
                     "model": "auto",
                     "messages": [{"role": "user", "content": "Write Python code"}],
+                    "user": "@bob:example.org",
                 },
             )
 
@@ -2490,6 +2872,60 @@ class TestAutoRouting:
         # Response model field shows the resolved agent, not "auto"
         assert data["model"] == "code"
         assert data["choices"][0]["message"]["content"] == "Here is your code"
+        assert observed == [("code", None)]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_auto_no_fit_does_not_fall_back_to_first_agent(
+        self,
+        app_client: TestClient,
+        test_config: Config,
+        monkeypatch: pytest.MonkeyPatch,
+        stream: bool,
+    ) -> None:
+        """An accepted no-fit returns an error before invoking any response agent."""
+        test_config.router.judgment = TypeSafeJudgmentConfig(provider="typesafe")
+        posted = []
+        original_env_value = RuntimePaths.env_value
+
+        def env_value(paths: RuntimePaths, key: str, *args: object, **kwargs: object) -> str | None:
+            return "synthetic" if key == "TYPESAFE_API_KEY" else original_env_value(paths, key, *args, **kwargs)
+
+        async def post(_self: JudgmentClient, body: bytes) -> bytes:
+            payload = json.loads(body)
+            posted.append(payload)
+            return json.dumps(
+                {
+                    "model": _PINNED_MODEL,
+                    "answers": {
+                        "responder_selection": {
+                            "type": "choice",
+                            "choice": "no_fit",
+                            "confidence": 1,
+                            "probabilities": {
+                                key: int(key == "no_fit")
+                                for key in payload["questions"]["responder_selection"]["criteria"]
+                            },
+                        },
+                    },
+                    "usage": {"input_tokens": 42, "output_tokens": 1},
+                },
+            ).encode()
+
+        monkeypatch.setattr(RuntimePaths, "env_value", env_value)
+        monkeypatch.setattr(JudgmentClient, "_post", post)
+        with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as response_agent:
+            response = app_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "An unsupported request"}],
+                    "stream": stream,
+                },
+            )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "no_suitable_responder"
+        assert len(posted) == 1
+        response_agent.assert_not_called()
 
     def test_auto_fallback_when_routing_fails(self, app_client: TestClient) -> None:
         """When suggest_responder returns None, falls back to first agent."""
@@ -2518,7 +2954,7 @@ class TestAutoRouting:
             patch("mindroom.api.openai_compat.suggest_responder", new_callable=AsyncMock) as mock_route,
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
         ):
-            mock_route.return_value = "general"
+            mock_route.return_value = ResponderSelection("general")
             mock_ai.return_value = "Response"
 
             app_client.post(
@@ -2545,14 +2981,14 @@ class TestAutoRouting:
     def test_auto_streaming(self, app_client: TestClient) -> None:
         """Auto model works with streaming, chunks carry resolved agent name."""
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             yield RunContentEvent(content="Streamed!")
 
         with (
             patch("mindroom.api.openai_compat.suggest_responder", new_callable=AsyncMock) as mock_route,
             patch("mindroom.api.openai_compat.stream_agent_response", side_effect=mock_stream),
         ):
-            mock_route.return_value = "research"
+            mock_route.return_value = ResponderSelection("research")
 
             response = app_client.post(
                 "/v1/chat/completions",
@@ -2590,7 +3026,7 @@ class TestAutoRouting:
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(empty_config, runtime_paths)),
             patch("mindroom.api.openai_compat.suggest_responder", new_callable=AsyncMock) as mock_route,
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             mock_route.return_value = None
             response = client.post(
@@ -2610,7 +3046,7 @@ class TestAutoRouting:
             patch("mindroom.api.openai_compat.suggest_responder", new_callable=AsyncMock) as mock_route,
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
         ):
-            mock_route.return_value = "code"
+            mock_route.return_value = ResponderSelection("code")
             mock_ai.return_value = "Response"
 
             app_client.post(
@@ -2622,10 +3058,10 @@ class TestAutoRouting:
                 headers={"X-LibreChat-Conversation-Id": "conv-abc"},
             )
 
-            # ai_response should receive agent_name="code", not "auto"
-            assert mock_ai.call_args.kwargs["agent_name"] == "code"
+            # ai_response should receive entity_label="code", not "auto"
+            assert mock_ai.call_args.args[0].entity_label == "code"
             # Session ID should use the resolved model name with LibreChat IDs.
-            session_id = mock_ai.call_args.kwargs["session_id"]
+            session_id = mock_ai.call_args.args[0].session_id
             assert session_id.endswith(":conv-abc:code")
             assert "auto" not in session_id
 
@@ -2698,9 +3134,122 @@ def team_app_client(team_config: Config) -> Iterator[TestClient]:
     initialize_api_app(app, runtime_paths)
     with (
         patch("mindroom.api.openai_compat._load_config", return_value=(team_config, runtime_paths)),
-        TestClient(app) as client,
+        TestClient(app, base_url="http://localhost") as client,
     ):
         yield client
+
+
+def _post_team_completion_capturing_run_user(
+    client: TestClient,
+    *,
+    stream: bool,
+    headers: dict[str, str] | None = None,
+) -> MagicMock:
+    """Post one team completion carrying a spoofed body ``user`` and return the captured ``team.arun``."""
+    mock_team = _make_test_team()
+
+    async def stream_events() -> AsyncIterator[object]:
+        yield TeamContentEvent(content="Team answer")
+
+    async def run() -> TeamRunOutput:
+        return TeamRunOutput(content="Team answer")
+
+    mock_team.arun = MagicMock(side_effect=lambda *_args, **kwargs: stream_events() if kwargs.get("stream") else run())
+    with (
+        patch(
+            "mindroom.api.openai_compat._build_team",
+            return_value=([_make_test_agent("GeneralAgent")], mock_team, TeamMode.COORDINATE),
+        ),
+        patch(
+            "mindroom.api.openai_compat._prepare_openai_team_prompt",
+            new=AsyncMock(return_value=openai_compat._PreparedOpenAITeamPrompt("Build it", None)),
+        ),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers or {},
+            json={
+                "model": "team/super_team",
+                "messages": [{"role": "user", "content": "Build it"}],
+                "stream": stream,
+                "user": "@victim:localhost",
+            },
+        )
+    assert response.status_code == 200
+    assert "Team answer" in response.text
+    return mock_team.arun
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_team_run_ignores_request_body_user_without_requester(team_app_client: TestClient, stream: bool) -> None:
+    """The request body ``user`` must not choose the Agno user scope of a team run."""
+    arun = _post_team_completion_capturing_run_user(team_app_client, stream=stream)
+
+    assert arun.call_args.kwargs["user_id"] is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_team_run_uses_mapped_requester_instead_of_request_body_user(team_config: Config, stream: bool) -> None:
+    """A mapped key's canonical requester, never the body ``user``, owns the team run's Agno user scope."""
+    team_config.teams["super_team"].access = ResponderAccessConfig(users=["@alice:localhost"])
+    runtime_paths = _runtime_paths(
+        {
+            "OPENAI_COMPAT_API_KEYS": "alice-key",
+            "OPENAI_COMPAT_API_KEY_REQUESTERS": json.dumps({"alice-key": "@alice:localhost"}),
+        },
+    )
+    persist_entity_accounts(team_config, runtime_paths)
+    app = FastAPI()
+    app.include_router(openai_compat.router)
+    initialize_api_app(app, runtime_paths)
+    with (
+        patch("mindroom.api.openai_compat._load_config", return_value=(team_config, runtime_paths)),
+        TestClient(app, base_url="http://localhost") as client,
+    ):
+        arun = _post_team_completion_capturing_run_user(
+            client,
+            stream=stream,
+            headers={"Authorization": "Bearer alice-key"},
+        )
+
+    assert arun.call_args.kwargs["user_id"] == "@alice:localhost"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_team_run_records_helper_usage_in_its_conversation(team_app_client: TestClient, stream: bool) -> None:
+    """Helper work during an API team run, such as a member's Claude Code session, belongs to the team conversation."""
+    owners: list[HelperUsageOwner | None] = []
+    mock_team = _make_test_team()
+
+    async def stream_events() -> AsyncIterator[object]:
+        owners.append(get_helper_usage_owner())
+        yield TeamContentEvent(content="Team answer")
+
+    async def run() -> TeamRunOutput:
+        owners.append(get_helper_usage_owner())
+        return TeamRunOutput(content="Team answer")
+
+    mock_team.arun = MagicMock(side_effect=lambda *_args, **kwargs: stream_events() if kwargs.get("stream") else run())
+    with (
+        patch(
+            "mindroom.api.openai_compat._build_team",
+            return_value=([_make_test_agent("GeneralAgent")], mock_team, TeamMode.COORDINATE),
+        ),
+        patch(
+            "mindroom.api.openai_compat._prepare_openai_team_prompt",
+            new=AsyncMock(return_value=openai_compat._PreparedOpenAITeamPrompt("Build it", None)),
+        ),
+    ):
+        response = team_app_client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "team-session"},
+            json={"model": "team/super_team", "messages": [{"role": "user", "content": "Build it"}], "stream": stream},
+        )
+
+    assert response.status_code == 200
+    assert len(owners) == 1
+    assert owners[0] is not None
+    assert owners[0].session_id == mock_team.arun.call_args.kwargs["session_id"]
 
 
 class TestTeamCompletion:
@@ -2757,22 +3306,22 @@ class TestTeamCompletion:
         assert prepared.run_metadata is run_metadata
         assert mock_prepare.await_count == 1
         preparation_kwargs = mock_prepare.await_args.kwargs
+        preparation_ctx = mock_prepare.await_args.args[0]
         assert preparation_kwargs["agents"] == mock_agents
         assert preparation_kwargs["team"] is mock_team
         assert preparation_kwargs["message"] == "Build it"
         assert preparation_kwargs["thread_history"] == []
-        assert preparation_kwargs["reply_to_event_id"] is None
-        assert preparation_kwargs["active_event_ids"] == frozenset()
+        assert preparation_ctx.reply_to_event_id is None
+        assert preparation_ctx.active_event_ids == frozenset()
         assert preparation_kwargs["response_sender_id"] is None
         assert preparation_kwargs["current_sender_id"] is None
-        assert preparation_kwargs["room_id"] is None
-        assert preparation_kwargs["thread_id"] is None
-        assert preparation_kwargs["requester_id"] is None
-        assert re.fullmatch(r"[0-9a-f]{32}", preparation_kwargs["correlation_id"])
-        assert preparation_kwargs["compaction_outcomes_collector"] is None
+        assert preparation_ctx.room_id is None
+        assert preparation_ctx.thread_id is None
+        assert preparation_ctx.requester_id is None
+        assert re.fullmatch(r"[0-9a-f]{32}", preparation_ctx.correlation_id)
         assert preparation_kwargs["configured_team_name"] == "super_team"
-        assert preparation_kwargs["matrix_run_metadata"] is None
-        assert preparation_kwargs["active_model_name"] == "default"
+        assert preparation_ctx.matrix_run_metadata is None
+        assert preparation_kwargs["runtime_model"].model_name == "default"
 
     def test_team_listed_in_models(self, team_app_client: TestClient) -> None:
         """Teams appear in /v1/models with team/ prefix."""
@@ -2836,6 +3385,52 @@ class TestTeamCompletion:
         assert run_input == "Build a feature"
         metadata = mock_team.arun.call_args.kwargs["metadata"]
         assert metadata[constants.AI_RUN_METADATA_KEY]["prepared_context"]["tokens"] == 321
+
+    def test_team_non_streaming_reports_leader_and_member_token_usage(self, team_app_client: TestClient) -> None:
+        """Team usage sums every run's prompt tokens, each normalized for its own provider's cache accounting."""
+        mock_team = _make_test_team()
+        mock_team.arun = AsyncMock(
+            return_value=TeamRunOutput(
+                content="Team consensus result",
+                model="claude-sonnet-5-5",
+                model_provider="Anthropic",
+                metrics=RunMetrics(
+                    input_tokens=100,
+                    output_tokens=20,
+                    total_tokens=120,
+                    cache_read_tokens=1000,
+                    cache_write_tokens=200,
+                ),
+                member_responses=[
+                    RunOutput(
+                        content="Member view",
+                        model="gpt-6-astra",
+                        model_provider="OpenAI",
+                        metrics=RunMetrics(input_tokens=50, output_tokens=10, total_tokens=60, cache_read_tokens=30),
+                    ),
+                ],
+            ),
+        )
+        mock_agents = [_make_test_agent("GeneralAgent"), _make_test_agent("CodeAgent")]
+
+        with (
+            patch(
+                "mindroom.api.openai_compat._build_team",
+                return_value=(mock_agents, mock_team, TeamMode.COORDINATE),
+            ),
+            patch(
+                "mindroom.api.openai_compat.prepare_materialized_team_execution",
+                new_callable=AsyncMock,
+            ) as mock_prepare,
+        ):
+            mock_prepare.return_value = _prepared_team_execution_context(final_prompt="Build a feature")
+            response = team_app_client.post(
+                "/v1/chat/completions",
+                json={"model": "team/super_team", "messages": [{"role": "user", "content": "Build a feature"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"prompt_tokens": 1350, "completion_tokens": 30, "total_tokens": 1380}
 
     def test_team_non_streaming_unready_kb_emits_system_hint(self, team_app_client: TestClient) -> None:
         """Non-streaming team completions should prepend the degraded knowledge notice."""
@@ -2932,10 +3527,10 @@ class TestTeamCompletion:
         prepared_correlation_ids: list[str] = []
         request_log_contexts: list[dict[str, object]] = []
 
-        async def mock_prepare_team_execution(**kwargs: object) -> SimpleNamespace:
-            correlation_id = kwargs["correlation_id"]
+        async def mock_prepare_team_execution(ctx: object, **_kwargs: object) -> SimpleNamespace:
+            correlation_id = ctx.correlation_id
             assert isinstance(correlation_id, str)
-            assert kwargs["requester_id"] is None
+            assert ctx.requester_id is None
             prepared_correlation_ids.append(correlation_id)
             return _prepared_team_execution_context(
                 final_prompt="Build it",
@@ -2985,7 +3580,6 @@ class TestTeamCompletion:
                 team_config,
                 runtime_paths,
                 None,
-                "@api-user:localhost",
                 execution_identity=execution_identity,
             )
 
@@ -3194,10 +3788,10 @@ class TestTeamCompletion:
         prepared_correlation_ids: list[str] = []
         request_log_contexts: list[dict[str, object]] = []
 
-        async def mock_prepare_team_execution(**kwargs: object) -> SimpleNamespace:
-            correlation_id = kwargs["correlation_id"]
+        async def mock_prepare_team_execution(ctx: object, **_kwargs: object) -> SimpleNamespace:
+            correlation_id = ctx.correlation_id
             assert isinstance(correlation_id, str)
-            assert kwargs["requester_id"] is None
+            assert ctx.requester_id is None
             prepared_correlation_ids.append(correlation_id)
             return _prepared_team_execution_context(
                 final_prompt="Build it",
@@ -3248,7 +3842,6 @@ class TestTeamCompletion:
                 team_config,
                 runtime_paths,
                 None,
-                "@api-user:localhost",
                 execution_identity=execution_identity,
             )
 
@@ -3720,7 +4313,6 @@ class TestTeamCompletion:
                 team_config,
                 runtime_paths,
                 None,
-                None,
                 execution_identity=execution_identity,
             )
 
@@ -3956,7 +4548,7 @@ class TestTeamCompletion:
     def test_team_member_materialization_failure_returns_generic_500(self, team_app_client: TestClient) -> None:
         """Configured team build failures should not expose internal exception details."""
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=MagicMock()),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=MagicMock()),
             patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
             patch(
                 "mindroom.teams.create_agent",
@@ -4192,7 +4784,13 @@ class TestTeamCompletion:
 
         assert response.status_code == 200
         prompt = mock_team.arun.call_args.args[0]
-        assert prompt == "user: Start\n\nassistant: Ack\n\nFollow-up"
+        assert prompt == "\n\n".join(
+            (
+                render_msg_tag(sender="user", body="Start", event_id="$openai-1"),
+                render_msg_tag(sender="assistant", body="Ack", event_id="$openai-2"),
+                "Follow-up",
+            ),
+        )
 
     def test_team_non_streaming_preserves_full_request_history_for_ad_hoc_team_runs(
         self,
@@ -4230,8 +4828,8 @@ class TestTeamCompletion:
 
         assert response.status_code == 200
         run_input = mock_team.arun.call_args.args[0]
-        assert "user: msg 0" in run_input
-        assert f"assistant: {long_body}" in run_input
+        assert render_msg_tag(sender="user", body="msg 0", event_id="$openai-1") in run_input
+        assert render_msg_tag(sender="assistant", body=long_body, event_id="$openai-2") in run_input
         assert run_input.endswith("Final prompt")
 
     def test_team_non_streaming_prefers_persisted_history_over_thread_history(
@@ -4261,8 +4859,6 @@ class TestTeamCompletion:
                     add_history_to_context=True,
                     num_history_runs=1,
                     num_history_messages=None,
-                    history_limit_mode="runs",
-                    history_limit=1,
                 ),
                 replays_persisted_history=True,
             )
@@ -4335,7 +4931,7 @@ class TestTeamCompletion:
 
     @pytest.mark.asyncio
     async def test_prepare_openai_team_prompt_scrubs_queued_notices_and_uses_team_renderer(self) -> None:
-        """OpenAI team prep should match the main team path for cleanup and assistant-role rendering."""
+        """OpenAI team prep should recover notice facts and preserve assistant-role rendering."""
         config = Config(
             agents={"general": AgentConfig(display_name="GeneralAgent", role="General", rooms=[])},
             models={"default": ModelConfig(provider="openai", id="test-model")},
@@ -4344,6 +4940,7 @@ class TestTeamCompletion:
         runtime_paths = _runtime_paths()
         agent = _make_test_agent("GeneralAgent")
         team = _make_test_team(name="General Team", team_id="general-team")
+        prior_response_id = "prior-openai-team-response"
 
         with open_bound_scope_session_context(
             agents=[agent],
@@ -4366,7 +4963,10 @@ class TestTeamCompletion:
                         Message(
                             role="user",
                             content=QUEUED_MESSAGE_NOTICE_TEXT,
-                            provider_data={"mindroom_queued_message_notice": True},
+                            provider_data={
+                                _QUEUED_NOTICE_MARKER_KEY: True,
+                                _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+                            },
                         ),
                     ],
                     member_responses=[
@@ -4377,14 +4977,17 @@ class TestTeamCompletion:
                                 Message(
                                     role="user",
                                     content=QUEUED_MESSAGE_NOTICE_TEXT,
-                                    provider_data={"mindroom_queued_message_notice": True},
+                                    provider_data={
+                                        _QUEUED_NOTICE_MARKER_KEY: True,
+                                        _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+                                    },
                                 ),
                             ],
                         ),
                     ],
                 ),
             ]
-            scope_context.storage.upsert_session(scope_context.session)
+            seed_session(scope_context.storage, scope_context.session)
 
         with open_bound_scope_session_context(
             agents=[agent],
@@ -4396,7 +4999,7 @@ class TestTeamCompletion:
             assert scope_context is not None
             assert scope_context.session is not None
 
-            async def fake_prepare_bound_team_run_context(**kwargs: object) -> SimpleNamespace:
+            async def fake_prepare_bound_team_run_context(_ctx: object, **kwargs: object) -> SimpleNamespace:
                 prepared_scope_context = kwargs["scope_context"]
                 assert prepared_scope_context is not None
                 assert prepared_scope_context.session is not None
@@ -4415,7 +5018,23 @@ class TestTeamCompletion:
                     if isinstance(run, (RunOutput, TeamRunOutput))
                     for message in collect_messages(run)
                 ]
-                assert not any(message.provider_data for message in persisted_messages)
+                persisted_notices = [
+                    message
+                    for message in persisted_messages
+                    if isinstance(message.provider_data, dict)
+                    and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) == "persisted"
+                ]
+                assert len(persisted_notices) == 1
+                assert persisted_notices[0].content == QUEUED_MESSAGE_NOTICE_TEXT
+                assert persisted_notices[0].provider_data == {
+                    _QUEUED_NOTICE_MARKER_KEY: "persisted",
+                    _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+                }
+                assert not any(
+                    isinstance(message.provider_data, dict)
+                    and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) is True
+                    for message in persisted_messages
+                )
                 return _prepared_team_execution_context(
                     final_prompt="Previous team reply\n\nAnalyze this.",
                     messages=[
@@ -4468,7 +5087,22 @@ class TestTeamCompletion:
             persisted_messages = [
                 message for run in scope_context.session.runs or [] for message in (run.messages or [])
             ]
-        assert not any(message.provider_data for message in persisted_messages)
+        persisted_notices = [
+            message
+            for message in persisted_messages
+            if isinstance(message.provider_data, dict)
+            and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) == "persisted"
+        ]
+        assert len(persisted_notices) == 1
+        assert persisted_notices[0].content == QUEUED_MESSAGE_NOTICE_TEXT
+        assert persisted_notices[0].provider_data == {
+            _QUEUED_NOTICE_MARKER_KEY: "persisted",
+            _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+        }
+        assert not any(
+            isinstance(message.provider_data, dict) and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) is True
+            for message in persisted_messages
+        )
 
     def test_collaborate_mode_delegates_to_all(self) -> None:
         """Collaborate mode sets delegate_to_all_members=True on Team."""
@@ -4489,19 +5123,30 @@ class TestTeamCompletion:
         )
         with (
             patch("mindroom.teams.create_agent") as mock_create,
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("agno.team.Team.__init__", return_value=None) as mock_team_init,
         ):
             mock_create.return_value = MagicMock(name="GeneralAgent")
 
             from mindroom.api.openai_compat import _build_team  # noqa: PLC0415
 
-            _build_team(
-                "collab_team",
-                collaborate_config,
-                _runtime_paths_for_config(collaborate_config),
+            runtime_paths = _runtime_paths_for_config(collaborate_config)
+            with open_bound_scope_session_context(
+                agents=[],
+                session_id="session-1",
+                runtime_paths=runtime_paths,
+                config=collaborate_config,
                 execution_identity=None,
-            )
+                team_name="collab_team",
+            ) as scope_context:
+                assert scope_context is not None
+                _build_team(
+                    "collab_team",
+                    collaborate_config,
+                    runtime_paths,
+                    execution_identity=None,
+                    scope_context=scope_context,
+                )
 
             mock_team_init.assert_called_once()
             assert mock_team_init.call_args.kwargs["delegate_to_all_members"] is True
@@ -4510,7 +5155,7 @@ class TestTeamCompletion:
         """Coordinate mode sets delegate_to_all_members=False on Team."""
         with (
             patch("mindroom.teams.create_agent") as mock_create,
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("agno.team.Team.__init__", return_value=None) as mock_team_init,
         ):
             mock_create.return_value = MagicMock(name="GeneralAgent")
@@ -4531,7 +5176,23 @@ class TestTeamCompletion:
                     ),
                 },
             )
-            _build_team("coord_team", config, _runtime_paths_for_config(config), execution_identity=None)
+            runtime_paths = _runtime_paths_for_config(config)
+            with open_bound_scope_session_context(
+                agents=[],
+                session_id="session-1",
+                runtime_paths=runtime_paths,
+                config=config,
+                execution_identity=None,
+                team_name="coord_team",
+            ) as scope_context:
+                assert scope_context is not None
+                _build_team(
+                    "coord_team",
+                    config,
+                    runtime_paths,
+                    execution_identity=None,
+                    scope_context=scope_context,
+                )
 
             mock_team_init.assert_called_once()
             assert mock_team_init.call_args.kwargs["delegate_to_all_members"] is False
@@ -4557,7 +5218,7 @@ class TestTeamCompletion:
 
         with (
             patch("mindroom.teams.create_agent", return_value=member),
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("agno.team.Team.__init__", return_value=None) as mock_team_init,
         ):
             from mindroom.api.openai_compat import _build_team  # noqa: PLC0415
@@ -4601,16 +5262,30 @@ class TestTeamCompletion:
 
         with (
             patch("mindroom.teams.create_agent", return_value=member),
-            patch("mindroom.model_loading.get_model_instance", return_value="openai:test-model"),
+            patch(
+                "mindroom.providers.model_loading.get_model_instance",
+                return_value=FakeModel(id="test-model", provider="fake"),
+            ),
         ):
             from mindroom.api.openai_compat import _build_team  # noqa: PLC0415
 
-            _agents, team, _mode = _build_team(
-                "coord_team",
-                config,
-                _runtime_paths_for_config(config),
+            runtime_paths = _runtime_paths_for_config(config)
+            with open_bound_scope_session_context(
+                agents=[],
+                session_id="session-1",
+                runtime_paths=runtime_paths,
+                config=config,
                 execution_identity=None,
-            )
+                team_name="coord_team",
+            ) as scope_context:
+                assert scope_context is not None
+                _agents, team, _mode = _build_team(
+                    "coord_team",
+                    config,
+                    runtime_paths,
+                    execution_identity=None,
+                    scope_context=scope_context,
+                )
 
         assert team.num_history_runs is None
         assert team.num_history_messages is None
@@ -4638,12 +5313,24 @@ class TestTeamCompletion:
 
         agents: list[AgnoAgent] | None = None
         team: AgnoTeam | None = None
-        with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+        with (
+            open_bound_scope_session_context(
+                agents=[],
+                session_id="openai-team-session",
+                runtime_paths=runtime_paths,
+                config=team_config,
+                execution_identity=execution_identity,
+                team_name="super_team",
+            ) as scope_context,
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
+        ):
+            assert scope_context is not None
             agents, team, mode = openai_compat._build_team(
                 "super_team",
                 team_config,
                 runtime_paths,
                 execution_identity=execution_identity,
+                scope_context=scope_context,
                 session_id="openai-team-session",
             )
 
@@ -4675,32 +5362,47 @@ class TestTeamCompletion:
             },
         )
         built_agent = _make_test_agent("GeneralAgent")
+        runtime_paths = _runtime_paths()
 
-        with (
-            patch(
-                "mindroom.api.openai_compat.materialize_exact_team_members",
-                return_value=ResolvedExactTeamMembers(
-                    requested_agent_names=["general"],
-                    agents=[built_agent],
-                    display_names=["GeneralAgent"],
-                    materialized_agent_names={"general"},
-                    failed_agent_names=[],
+        with open_bound_scope_session_context(
+            agents=[],
+            session_id="session-1",
+            runtime_paths=runtime_paths,
+            config=config,
+            execution_identity=None,
+            team_name="coord_team",
+        ) as scope_context:
+            assert scope_context is not None
+            with (
+                patch(
+                    "mindroom.api.openai_compat.materialize_exact_team_members",
+                    return_value=ResolvedExactTeamMembers(
+                        requested_agent_names=["general"],
+                        agents=[built_agent],
+                        display_names=["GeneralAgent"],
+                        materialized_agent_names={"general"},
+                        failed_agent_names=[],
+                    ),
                 ),
-            ),
-            patch(
-                "mindroom.api.openai_compat.build_materialized_team_instance",
-                side_effect=RuntimeError("team build failed"),
-            ),
-            patch("mindroom.api.openai_compat.close_team_runtime_state_dbs") as mock_close,
-            pytest.raises(RuntimeError, match="team build failed"),
-        ):
-            openai_compat._build_team("coord_team", config, _runtime_paths(), execution_identity=None)
-
-        mock_close.assert_called_once_with(
-            agents=[built_agent],
-            team_db=None,
-            shared_scope_storage=None,
-        )
+                patch(
+                    "mindroom.api.openai_compat.build_materialized_team_instance",
+                    side_effect=RuntimeError("team build failed"),
+                ),
+                patch("mindroom.api.openai_compat.close_team_runtime_state_dbs") as mock_close,
+                pytest.raises(RuntimeError, match="team build failed"),
+            ):
+                openai_compat._build_team(
+                    "coord_team",
+                    config,
+                    runtime_paths,
+                    execution_identity=None,
+                    scope_context=scope_context,
+                )
+            mock_close.assert_called_once_with(
+                agents=[built_agent],
+                team_db=None,
+                shared_scope_storage=scope_context.storage,
+            )
 
     def test_build_team_passes_knowledge_to_member_agents(self) -> None:
         """Team member creation resolves and passes configured knowledge."""
@@ -4730,7 +5432,7 @@ class TestTeamCompletion:
         mock_knowledge = MagicMock()
         with (
             patch("mindroom.teams.create_agent") as mock_create,
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch(
                 "mindroom.teams.resolve_agent_knowledge_access",
                 return_value=_KnowledgeResolution(knowledge=mock_knowledge),
@@ -4741,7 +5443,23 @@ class TestTeamCompletion:
 
             from mindroom.api.openai_compat import _build_team  # noqa: PLC0415
 
-            _build_team("team_with_kb", config, _runtime_paths_for_config(config), execution_identity=None)
+            runtime_paths = _runtime_paths_for_config(config)
+            with open_bound_scope_session_context(
+                agents=[],
+                session_id="session-1",
+                runtime_paths=runtime_paths,
+                config=config,
+                execution_identity=None,
+                team_name="team_with_kb",
+            ) as scope_context:
+                assert scope_context is not None
+                _build_team(
+                    "team_with_kb",
+                    config,
+                    runtime_paths,
+                    execution_identity=None,
+                    scope_context=scope_context,
+                )
 
             assert mock_create.call_args.kwargs["knowledge"] is mock_knowledge
             assert "include_default_tools" not in mock_create.call_args.kwargs
@@ -4793,7 +5511,7 @@ def knowledge_app_client(knowledge_config: Config) -> Iterator[TestClient]:
     initialize_api_app(app, runtime_paths)
     with (
         patch("mindroom.api.openai_compat._load_config", return_value=(knowledge_config, runtime_paths)),
-        TestClient(app) as client,
+        TestClient(app, base_url="http://localhost") as client,
     ):
         yield client
 
@@ -4856,7 +5574,7 @@ class TestKnowledgeIntegration:
             patch("mindroom.api.openai_compat._load_config", return_value=(knowledge_config, runtime_paths)),
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
             patch("mindroom.knowledge.utils._lookup_knowledge_for_base", side_effect=fake_lookup_knowledge_for_base),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             mock_ai.return_value = "Response with keyed knowledge"
             response = client.post(
@@ -4958,7 +5676,7 @@ class TestKnowledgeIntegration:
         """Knowledge is passed through in streaming mode too."""
         mock_knowledge = MagicMock()
 
-        async def mock_stream(**_kw: object) -> AsyncIterator[RunContentEvent]:
+        async def mock_stream(_ctx: object, **_kw: object) -> AsyncIterator[RunContentEvent]:
             yield RunContentEvent(content="Streamed!")
 
         with (
@@ -5019,7 +5737,7 @@ class TestKnowledgeIntegration:
             patch("mindroom.api.openai_compat._load_config", return_value=(knowledge_config, runtime_paths)),
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
             patch("mindroom.knowledge.utils._lookup_knowledge_for_base", side_effect=fake_lookup_knowledge_for_base),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             mock_ai.return_value = "Merged knowledge response"
             response = client.post(
@@ -5044,7 +5762,8 @@ class TestKnowledgeIntegration:
         with (
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
             patch(
-                "mindroom.api.openai_compat.resolve_agent_knowledge_access",
+                "mindroom.api.openai_compat.resolve_agent_knowledge_access_async",
+                new_callable=AsyncMock,
                 side_effect=RuntimeError("DB connection failed"),
             ),
         ):
@@ -5062,3 +5781,126 @@ class TestKnowledgeIntegration:
         assert mock_ai.call_args.kwargs["knowledge"] is None
         data = response.json()
         assert data["choices"][0]["message"]["content"] == "Response without knowledge"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_activity_tracks_full_openai_request(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """OpenAI work remains visible through generation and streaming finalization."""
+    state = config_lifecycle.app_state(app_client.app)
+    observed: list[int] = []
+
+    async def complete(*_args: object, **_kwargs: object) -> JSONResponse | StreamingResponse:
+        observed.append(len(state.openai_responses))
+        if not stream:
+            return JSONResponse({"ok": True})
+
+        async def chunks() -> AsyncIterator[str]:
+            observed.append(len(state.openai_responses))
+            yield "data: hello\n\n"
+            observed.append(len(state.openai_responses))
+
+        return StreamingResponse(chunks())
+
+    monkeypatch.setattr(openai_compat, "_chat_completions", complete)
+    response = app_client.post(
+        "/v1/chat/completions",
+        json={"model": "general", "messages": [{"role": "user", "content": "Hello"}], "stream": stream},
+    )
+    assert response.status_code == 200, response.text
+    assert observed == ([1, 1, 1] if stream else [1])
+    assert len(state.openai_responses) == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_activity_releases_failed_openai_request(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Generation and stream failures cannot leak an activity slot."""
+    state = config_lifecycle.app_state(app_client.app)
+    observed: list[int] = []
+
+    async def complete(*_args: object, **_kwargs: object) -> JSONResponse | StreamingResponse:
+        observed.append(len(state.openai_responses))
+        if not stream:
+            message = "generation failed"
+            raise RuntimeError(message)
+
+        async def chunks() -> AsyncIterator[str]:
+            observed.append(len(state.openai_responses))
+            yield "data: hello\n\n"
+            message = "generation failed"
+            raise RuntimeError(message)
+
+        return StreamingResponse(chunks())
+
+    monkeypatch.setattr(openai_compat, "_chat_completions", complete)
+    with pytest.raises(RuntimeError, match="generation failed"):
+        app_client.post(
+            "/v1/chat/completions",
+            json={"model": "general", "messages": [{"role": "user", "content": "Hello"}], "stream": stream},
+        )
+    assert observed == ([1, 1] if stream else [1])
+    assert len(state.openai_responses) == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_activity_releases_cancelled_openai_request(
+    app_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """A cancelled HTTP request releases activity only after its stream unwinds."""
+    import httpx  # noqa: PLC0415
+
+    state = config_lifecycle.app_state(app_client.app)
+
+    async def check() -> None:
+        started = asyncio.Event()
+        unwound: list[int] = []
+
+        async def wait_for_cancel() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                unwound.append(len(state.openai_responses))
+
+        async def complete(*_args: object, **_kwargs: object) -> JSONResponse | StreamingResponse:
+            if not stream:
+                await wait_for_cancel()
+                return JSONResponse({})
+
+            async def chunks() -> AsyncIterator[str]:
+                yield "data: hello\n\n"
+                await wait_for_cancel()
+
+            return StreamingResponse(chunks())
+
+        monkeypatch.setattr(openai_compat, "_chat_completions", complete)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_client.app),
+            base_url="http://localhost",
+        ) as client:
+            task = asyncio.create_task(
+                client.post(
+                    "/v1/chat/completions",
+                    json={"model": "general", "messages": [{"role": "user", "content": "Hello"}], "stream": stream},
+                ),
+            )
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                assert len(state.openai_responses) == 1
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert unwound == [1]
+        assert len(state.openai_responses) == 0
+
+    asyncio.run(check())

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.reddit import RedditTools
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="reddit",
+    file_access=ToolFileAccess.NONE,
     display_name="Reddit",
     description="Social media platform for browsing, posting, and interacting with Reddit communities",
     category=ToolCategory.SOCIAL,
@@ -61,6 +63,14 @@ if TYPE_CHECKING:
             type="password",
             required=False,
             default=None,
+        ),
+        ConfigField(
+            name="allowed_subreddits",
+            label="Allowed Subreddits",
+            type="string[]",
+            required=False,
+            default=None,
+            description="Restrict posts and replies to these subreddits (case-insensitive); reads are unaffected",
         ),
     ],
     dependencies=["praw"],

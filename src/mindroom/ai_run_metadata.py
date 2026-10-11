@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from agno.models.metrics import Metrics
+from agno.metrics import RunMetrics
 from agno.run.base import RunStatus
 
-from mindroom.constants import AI_RUN_METADATA_KEY, ROUTER_AGENT_NAME, RuntimePaths
+from mindroom.constants import AI_RUN_METADATA_KEY
+from mindroom.model_usage import context_input_tokens_from_counts
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from mindroom.config.main import Config
     from mindroom.config.models import ModelConfig
-    from mindroom.history import PreparedHistoryState
+    from mindroom.history.types import PreparedHistoryState
 
 _AI_RUN_METADATA_VERSION = 1
 
@@ -31,25 +32,40 @@ def empty_request_metric_totals() -> dict[str, int]:
     }
 
 
-def _get_model_config(
-    config: Config,
-    agent_name: str,
+def accumulate_model_request_metrics(
+    totals: dict[str, int],
+    observed_fields: set[str],
     *,
-    runtime_paths: RuntimePaths,
-    room_id: str | None = None,
-) -> tuple[str | None, ModelConfig | None]:
-    """Return configured model name/config for an agent when available."""
-    if agent_name not in config.agents and agent_name not in config.teams and agent_name != ROUTER_AGENT_NAME:
-        return None, None
-    model_name = config.resolve_runtime_model(
-        entity_name=agent_name,
-        room_id=room_id,
-        runtime_paths=runtime_paths,
-    ).model_name
-    return model_name, config.models.get(model_name)
+    input_tokens: int | None,
+    output_tokens: int | None,
+    total_tokens: int | None,
+    reasoning_tokens: int | None,
+    cache_read_tokens: int | None,
+    cache_write_tokens: int | None,
+    time_to_first_token: float | None,
+    first_token_latency: float | None,
+) -> float | None:
+    """Accumulate observed integer counters and retain the first numeric latency.
+
+    The caller owns counter initialization; missing counters are left untouched.
+    """
+    for field_name, value in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("total_tokens", total_tokens),
+        ("reasoning_tokens", reasoning_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+        ("cache_write_tokens", cache_write_tokens),
+    ):
+        if isinstance(value, int):
+            observed_fields.add(field_name)
+            totals[field_name] = totals.get(field_name, 0) + value
+    if first_token_latency is None and isinstance(time_to_first_token, (int, float)):
+        return float(time_to_first_token)
+    return first_token_latency
 
 
-def _serialize_metrics(metrics: Metrics | dict[str, Any] | None) -> dict[str, Any] | None:
+def _serialize_metrics(metrics: RunMetrics | dict[str, Any] | None) -> dict[str, Any] | None:
     def _sanitize_metrics_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         sanitized: dict[str, Any] = {}
         for key, value in payload.items():
@@ -61,7 +77,7 @@ def _serialize_metrics(metrics: Metrics | dict[str, Any] | None) -> dict[str, An
 
     if metrics is None:
         return None
-    if isinstance(metrics, Metrics):
+    if isinstance(metrics, RunMetrics):
         metrics_dict = metrics.to_dict()
         if not isinstance(metrics_dict, dict):
             return None
@@ -131,44 +147,6 @@ def _build_context_payload(
     return payload
 
 
-def _provider_reports_cache_tokens_outside_input(
-    *,
-    provider: str | None,
-    configured_provider: str | None,
-    model_id: str | None,
-) -> bool:
-    """Return whether cache tokens must be added to input tokens for context occupancy."""
-    provider_key = (provider or configured_provider or "").lower()
-    configured_provider_key = (configured_provider or "").lower()
-    model_key = (model_id or "").lower()
-    if "anthropic" in provider_key or "bedrock" in provider_key:
-        return True
-    if configured_provider_key == "vertexai_claude":
-        return True
-    return "vertex" in provider_key and "claude" in model_key
-
-
-def _context_input_tokens_from_counts(
-    *,
-    input_tokens: int | None,
-    cache_read_tokens: int | None,
-    cache_write_tokens: int | None,
-    provider: str | None,
-    configured_provider: str | None,
-    model_id: str | None,
-) -> int | None:
-    """Return full request-context tokens from provider usage counters."""
-    if input_tokens is None:
-        return None
-    if not _provider_reports_cache_tokens_outside_input(
-        provider=provider,
-        configured_provider=configured_provider,
-        model_id=model_id,
-    ):
-        return input_tokens
-    return input_tokens + (cache_read_tokens or 0) + (cache_write_tokens or 0)
-
-
 def _int_usage_value(usage_payload: dict[str, Any] | None, key: str) -> int | None:
     if usage_payload is None:
         return None
@@ -229,33 +207,58 @@ def ai_run_extra_content_from_metadata(run_metadata: Mapping[str, Any] | None) -
     return {AI_RUN_METADATA_KEY: dict(ai_run_metadata)}
 
 
+def _context_provider_key(provider: str | None) -> str:
+    key = (provider or "").strip().lower().replace("-", "_")
+    return {"vertexai_claude": "vertexai", "bedrock_claude": "awsbedrock"}.get(key, key)
+
+
+def _native_context_counts(
+    metrics: RunMetrics | None,
+    model_id: str | None,
+    provider: str | None,
+) -> tuple[int | None, int | None, int | None] | None:
+    """Read final-iteration context separately from accumulated billing."""
+    if isinstance(metrics, RunMetrics):
+        for detail in (metrics.details or {}).get("model", []):
+            if detail.id == model_id and _context_provider_key(detail.provider) == _context_provider_key(provider):
+                usage = (detail.provider_metrics or {}).get("context_usage")
+                if isinstance(usage, dict):
+                    return (
+                        _int_usage_value(usage, "input_tokens"),
+                        _int_usage_value(usage, "cache_read_tokens"),
+                        _int_usage_value(usage, "cache_write_tokens"),
+                    )
+    return None
+
+
 def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     *,
-    agent_name: str,
     config: Config,
-    runtime_paths: RuntimePaths,
+    model_name: str,
     run_id: str | None,
     session_id: str | None,
     status: RunStatus | str | None,
     model: str | None,
     model_provider: str | None,
-    room_id: str | None = None,
-    metrics: Metrics | dict[str, Any] | None = None,
+    metrics: RunMetrics | dict[str, Any] | None = None,
     metrics_fallback: dict[str, Any] | None = None,
+    context_metrics: RunMetrics | None = None,
     context_raw_input_tokens: int | None = None,
     context_input_tokens: int | None = None,
     context_cache_read_tokens: int | None = None,
     context_cache_write_tokens: int | None = None,
     tool_count: int | None = None,
     prepared_history: PreparedHistoryState | None = None,
-) -> dict[str, Any] | None:
-    """Build the Matrix event content fragment for one AI run."""
-    model_name, model_config = _get_model_config(
-        config,
-        agent_name,
-        runtime_paths=runtime_paths,
-        room_id=room_id,
-    )
+) -> dict[str, Any]:
+    """Build the Matrix event content fragment for one AI run.
+
+    `model_name` is the configured model name resolved at run preparation time.
+    It must not be re-resolved here: the per-thread override store can change
+    mid-run (for example via `switch_thread_model`), and this metadata must
+    describe the model that actually produced the response.
+    `context_metrics` belongs to that model run before team-member billing is aggregated.
+    """
+    model_config = config.models.get(model_name)
     model_id = model or (model_config.id if model_config is not None else None)
     provider = model_provider or (model_config.provider if model_config is not None else None)
 
@@ -271,33 +274,39 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     usage_input_tokens = usage_payload.get("input_tokens") if usage_payload else None
     if not isinstance(usage_input_tokens, int):
         usage_input_tokens = None
+    # Native compaction adds a billed sampling iteration. Its cost is included
+    # above, while the final iteration alone describes the active context.
+    if native_counts := _native_context_counts(context_metrics, model_id, provider):
+        context_raw_input_tokens, context_cache_read_tokens, context_cache_write_tokens = native_counts
     explicit_context_scope = any(
         value is not None
         for value in (
             context_raw_input_tokens,
-            context_input_tokens,
             context_cache_read_tokens,
             context_cache_write_tokens,
         )
     )
-    resolved_context_input_tokens = context_input_tokens
+    # Provider usage counters are authoritative for context occupancy; the
+    # pre-flight `context_input_tokens` estimate is only a fallback when the
+    # provider reported nothing (for example a request that failed early).
+    resolved_context_input_tokens = context_input_tokens_from_counts(
+        input_tokens=context_raw_input_tokens if explicit_context_scope else usage_input_tokens,
+        cache_read_tokens=(
+            context_cache_read_tokens
+            if explicit_context_scope
+            else _int_usage_value(usage_payload, "cache_read_tokens")
+        ),
+        cache_write_tokens=(
+            context_cache_write_tokens
+            if explicit_context_scope
+            else _int_usage_value(usage_payload, "cache_write_tokens")
+        ),
+        provider=provider,
+        configured_provider=model_config.provider if model_config is not None else None,
+        model_id=model_id,
+    )
     if resolved_context_input_tokens is None:
-        resolved_context_input_tokens = _context_input_tokens_from_counts(
-            input_tokens=context_raw_input_tokens if explicit_context_scope else usage_input_tokens,
-            cache_read_tokens=(
-                context_cache_read_tokens
-                if explicit_context_scope
-                else _int_usage_value(usage_payload, "cache_read_tokens")
-            ),
-            cache_write_tokens=(
-                context_cache_write_tokens
-                if explicit_context_scope
-                else _int_usage_value(usage_payload, "cache_write_tokens")
-            ),
-            provider=provider,
-            configured_provider=model_config.provider if model_config is not None else None,
-            model_id=model_id,
-        )
+        resolved_context_input_tokens = context_input_tokens
     resolved_context_cache_read_tokens = context_cache_read_tokens
     if resolved_context_cache_read_tokens is None and not explicit_context_scope:
         resolved_context_cache_read_tokens = _int_usage_value(usage_payload, "cache_read_tokens")
@@ -313,16 +322,14 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     if status is not None:
         raw_status = status.value if isinstance(status, RunStatus) else str(status)
         payload["status"] = raw_status.lower()
-    if model_name is not None or model_id is not None or provider is not None:
-        model_payload: dict[str, Any] = {}
-        if model_name is not None:
-            model_payload["config"] = model_name
-        if model_id is not None:
-            model_payload["id"] = model_id
-        if provider is not None:
-            model_payload["provider"] = provider
-        if model_payload:
-            payload["model"] = model_payload
+    model_payload: dict[str, Any] = {"config": model_name}
+    if model_config is not None and model_config.display_name:
+        model_payload["display_name"] = model_config.display_name
+    if model_id is not None:
+        model_payload["id"] = model_id
+    if provider is not None:
+        model_payload["provider"] = provider
+    payload["model"] = model_payload
     if usage_payload:
         payload["usage"] = usage_payload
     context_payload = _build_context_payload(
@@ -343,6 +350,4 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     if tool_count is not None:
         payload["tools"] = {"count": tool_count}
 
-    if len(payload) == 1:
-        return None
     return {AI_RUN_METADATA_KEY: payload}

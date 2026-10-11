@@ -22,8 +22,8 @@ from mindroom.matrix.identity import (
     parse_historical_matrix_user_id,
     try_parse_historical_matrix_user_id,
 )
-from mindroom.matrix.state import MatrixState
-from mindroom.matrix_identifiers import agent_username_localpart
+from mindroom.matrix.state import MatrixState, _write_matrix_state_file
+from mindroom.matrix_identifiers import agent_username_localpart, unnamespaced_agent_name_from_username_localpart
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.identity_helpers import entity_ids, persist_entity_accounts
 
@@ -239,6 +239,13 @@ class TestMatrixID:
         assert _entity_name(f"@actual_calculator:{domain}", config, runtime_paths) == "calculator"
         assert _entity_name(f"@mindroom_calculator:{domain}", config, runtime_paths) is None
 
+    def test_unnamespaced_agent_name_from_username_localpart(self) -> None:
+        """Generated unnamespaced agent localparts can be inverted."""
+        assert unnamespaced_agent_name_from_username_localpart("mindroom_calculator") == "calculator"
+        assert unnamespaced_agent_name_from_username_localpart("MINDROOM_calculator") == "calculator"
+        assert unnamespaced_agent_name_from_username_localpart("calculator") is None
+        assert unnamespaced_agent_name_from_username_localpart("mindroom_") is None
+
 
 class TestThreadStateKey:
     """Test the ThreadStateKey class."""
@@ -364,49 +371,61 @@ class TestHelperFunctions:
         self.config = _bind_runtime_paths(self.config, tmp_path)
         runtime_paths = runtime_paths_for(self.config)
         state_file = constants_mod.matrix_state_file(runtime_paths=runtime_paths)
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(
-            yaml.safe_dump(
-                {
-                    "accounts": {
-                        "agent_general": {
-                            "username": "mindroom_general_oldns",
-                            "password": "pw",
-                            "known_user_ids": ["@mindroom_general_oldns:legacy.example.com"],
-                        },
+        _write_matrix_state_file(
+            state_file,
+            {
+                "accounts": {
+                    "agent_general": {
+                        "username": "mindroom_general_oldns",
+                        "password": "pw",
+                        "device_id": "DEVICE",
+                        "access_token": "secret-token",
+                        "known_user_ids": ["@mindroom_general_oldns:legacy.example.com"],
                     },
                 },
-                sort_keys=False,
-            ),
+                "rooms": {
+                    "general": {
+                        "room_id": "!general:legacy.example.com",
+                        "alias": "#general:legacy.example.com",
+                        "name": "General",
+                        "created_at": "2026-04-01T12:00:00+00:00",
+                    },
+                },
+                "space_room_id": "!space:legacy.example.com",
+            },
         )
 
         state = MatrixState.load(runtime_paths=runtime_paths)
 
-        assert state.accounts["agent_general"].domain == self.config.get_domain(runtime_paths)
+        account = state.accounts["agent_general"]
+        assert account.domain == self.config.get_domain(runtime_paths)
+        assert account.device_id == "DEVICE"
+        assert account.access_token == "secret-token"  # noqa: S105
+        assert state.rooms["general"].room_id == "!general:legacy.example.com"
+        assert state.rooms["general"].alias == "#general:legacy.example.com"
+        assert state.rooms["general"].name == "General"
+        assert state.space_room_id == "!space:legacy.example.com"
         migrated_data = yaml.safe_load(state_file.read_text())
         assert migrated_data["accounts"]["agent_general"]["domain"] == self.config.get_domain(runtime_paths)
         assert "known_user_ids" not in migrated_data["accounts"]["agent_general"]
+        assert MatrixState.load(runtime_paths=runtime_paths) == state
 
     def test_matrix_state_load_preserves_persisted_account_domain(self, tmp_path: Path) -> None:
         """Loading current state must preserve actual provisioned account domains."""
         self.config = _bind_runtime_paths(self.config, tmp_path)
         runtime_paths = runtime_paths_for(self.config)
         state_file = constants_mod.matrix_state_file(runtime_paths=runtime_paths)
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(
-            yaml.safe_dump(
-                {
-                    "accounts": {
-                        "agent_general": {
-                            "username": "actual_general",
-                            "password": "pw",
-                            "domain": "matrix.example",
-                        },
+        _write_matrix_state_file(
+            state_file,
+            {
+                "accounts": {
+                    "agent_general": {
+                        "username": "actual_general",
+                        "password": "pw",
+                        "domain": "matrix.example",
                     },
                 },
-                sort_keys=False,
-            ),
-            encoding="utf-8",
+            },
         )
 
         state = MatrixState.load(runtime_paths=runtime_paths)
@@ -415,6 +434,7 @@ class TestHelperFunctions:
         assert managed_account_user_id("agent_general", self.config.get_domain(runtime_paths), runtime_paths) == (
             "@actual_general:matrix.example"
         )
+        assert MatrixState.load(runtime_paths=runtime_paths) == state
 
     def test_matrix_state_load_migrates_without_advisory_lock(
         self,
@@ -425,20 +445,16 @@ class TestHelperFunctions:
         self.config = _bind_runtime_paths(self.config, tmp_path)
         runtime_paths = runtime_paths_for(self.config)
         state_file = constants_mod.matrix_state_file(runtime_paths=runtime_paths)
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(
-            yaml.safe_dump(
-                {
-                    "accounts": {
-                        "agent_general": {
-                            "username": "mindroom_general_oldns",
-                            "password": "pw",
-                        },
+        _write_matrix_state_file(
+            state_file,
+            {
+                "accounts": {
+                    "agent_general": {
+                        "username": "mindroom_general_oldns",
+                        "password": "pw",
                     },
                 },
-                sort_keys=False,
-            ),
-            encoding="utf-8",
+            },
         )
 
         def _fail_flock(*_args: object, **_kwargs: object) -> None:
@@ -502,7 +518,7 @@ class TestHelperFunctions:
 
         replacement_state = MatrixState.load(runtime_paths=runtime_paths)
         replacement_state.add_account("agent_other", "mindroom_other", "pw", domain=domain)
-        monkeypatch.setattr("mindroom.matrix.state.yaml.safe_dump", _partial_dump)
+        monkeypatch.setattr("mindroom.matrix.state.yaml_io.safe_dump", _partial_dump)
 
         with pytest.raises(_InterruptedWriteError):
             replacement_state.save(runtime_paths=runtime_paths)

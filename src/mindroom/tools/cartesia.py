@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.model_defaults import CARTESIA_TTS
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.cartesia import CartesiaTools
@@ -12,6 +14,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="cartesia",
+    file_access=ToolFileAccess.NONE,
+    worker_inert_agent_functions=("text_to_speech",),
     display_name="Cartesia",
     description="Voice AI services including text-to-speech and voice localization",
     category=ToolCategory.DEVELOPMENT,  # others/ → DEVELOPMENT according to mapping
@@ -32,7 +36,7 @@ if TYPE_CHECKING:
             label="Model ID",
             type="text",
             required=False,
-            default="sonic-2",
+            default=CARTESIA_TTS,
         ),
         ConfigField(
             name="default_voice_id",

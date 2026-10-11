@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.slack import SlackTools
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="slack",
+    file_access=ToolFileAccess.UNCONFINED,
+    requires_primary_runtime=True,
     display_name="Slack",
     description="Send messages and manage channels",
     category=ToolCategory.COMMUNICATION,
@@ -28,6 +31,14 @@ if TYPE_CHECKING:
             default=None,
         ),
         ConfigField(
+            name="user_token",
+            label="User Token",
+            type="password",
+            required=False,
+            default=None,
+            description="User token (xoxp-) used for search_messages, which bot tokens cannot call",
+        ),
+        ConfigField(
             name="markdown",
             label="Markdown",
             type="boolean",
@@ -40,6 +51,13 @@ if TYPE_CHECKING:
             type="text",
             required=False,
             default=None,
+        ),
+        ConfigField(
+            name="save_downloads",
+            label="Save Downloads",
+            type="boolean",
+            required=False,
+            default=False,
         ),
         ConfigField(
             name="enable_send_message",
@@ -86,6 +104,13 @@ if TYPE_CHECKING:
         ConfigField(
             name="enable_search_messages",
             label="Enable Search Messages",
+            type="boolean",
+            required=False,
+            default=False,
+        ),
+        ConfigField(
+            name="enable_search_workspace",
+            label="Enable Search Workspace",
             type="boolean",
             required=False,
             default=False,
@@ -144,7 +169,6 @@ if TYPE_CHECKING:
     docs_url="https://docs.agno.com/tools/toolkits/social/slack",
     function_names=(
         "download_file",
-        "download_file_bytes",
         "get_channel_history",
         "get_channel_info",
         "get_thread",
@@ -152,6 +176,7 @@ if TYPE_CHECKING:
         "list_channels",
         "list_users",
         "search_messages",
+        "search_workspace",
         "send_message",
         "send_message_thread",
         "upload_file",

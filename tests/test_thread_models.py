@@ -1,0 +1,922 @@
+"""Tests for per-thread model overrides (!model command and thread_model tool)."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
+
+import pytest
+
+import mindroom.tools  # noqa: F401
+from mindroom.ai_run_metadata import build_ai_run_metadata_content
+from mindroom.commands.model_commands import handle_model_command
+from mindroom.commands.parsing import CommandType, command_parser, get_command_help
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
+from mindroom.config.models import ModelConfig
+from mindroom.constants import AI_RUN_METADATA_KEY
+from mindroom.custom_tools.thread_model import ThreadModelTools
+from mindroom.message_target import MessageTarget
+from mindroom.room_model_overrides import set_room_model_override
+from mindroom.thread_models import (
+    _get_thread_model_override,
+    _store_path,
+    clear_thread_model_override,
+    set_thread_model_override,
+)
+from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from tests.authorization_helpers import (
+    isolated_membership_index,
+    make_test_tool_runtime_context,
+)
+from tests.conftest import (
+    bind_runtime_paths,
+    make_conversation_reader_mock,
+    make_relation_lookup,
+    runtime_paths_for,
+    test_runtime_paths,
+)
+from tests.test_model_selection_commands import OTHER, resolved_thread_models, restricted_config
+from tests.test_model_selection_scope import ROOM, USER
+
+if TYPE_CHECKING:
+    from mindroom.constants import RuntimePaths
+
+THREAD_ID = "$thread-root:localhost"
+ROOM_ID = "!room:localhost"
+
+
+def _stored_model(runtime_paths: RuntimePaths, thread_id: str | None) -> str | None:
+    record = _get_thread_model_override(runtime_paths, thread_id)
+    return None if record is None else record.get("model:test_agent")
+
+
+def _config_with_models(tmp_path: Path) -> Config:
+    return bind_runtime_paths(
+        Config(
+            agents={"test_agent": AgentConfig(display_name="Test Agent", model="default")},
+            models={
+                "default": ModelConfig(provider="openai", id="default-model", context_window=None),
+                "large": ModelConfig(provider="openai", id="large-model", context_window=32_000),
+            },
+        ),
+        test_runtime_paths(tmp_path),
+    )
+
+
+def test_store_roundtrip(tmp_path: Path) -> None:
+    """Set, get, and clear should persist one override per thread root."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = test_runtime_paths(tmp_path)
+
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+    assert _stored_model(runtime_paths, None) is None
+
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+    assert _stored_model(runtime_paths, THREAD_ID) == "large"
+    assert _stored_model(runtime_paths, "$other:localhost") is None
+
+    assert clear_thread_model_override(runtime_paths, THREAD_ID, entity_names=("test_agent",), config=config) is True
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+    assert clear_thread_model_override(runtime_paths, THREAD_ID, entity_names=("test_agent",), config=config) is False
+
+
+def test_store_ignores_corrupt_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A corrupt store file should read as empty and be replaced on write."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = test_runtime_paths(tmp_path)
+    path = _store_path(runtime_paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not json", encoding="utf-8")
+
+    parse_calls = 0
+    real_loads = json.loads
+
+    def tracked_loads(payload: str) -> object:
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_loads(payload)
+
+    monkeypatch.setattr("mindroom.durable_write.json.loads", tracked_loads)
+
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+    assert parse_calls == 1
+
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+    assert _stored_model(runtime_paths, THREAD_ID) == "large"
+    assert parse_calls == 2
+
+
+def test_store_prunes_oldest_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store should keep only the newest overrides past the cap."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = test_runtime_paths(tmp_path)
+    monkeypatch.setattr("mindroom.thread_models._MAX_TRACKED_THREADS", 3)
+
+    for index in range(5):
+        set_thread_model_override(
+            runtime_paths,
+            thread_id=f"$thread-{index}:localhost",
+            model_name="large",
+            room_id=ROOM_ID,
+            set_by="@user:localhost",
+            entity_names=("test_agent",),
+            config=config,
+        )
+
+    stored = json.loads(_store_path(runtime_paths).read_text(encoding="utf-8"))
+    assert len(stored) == 3
+    assert _stored_model(runtime_paths, "$thread-4:localhost") == "large"
+
+
+def test_store_invalidates_cached_records_when_mtime_changes(tmp_path: Path) -> None:
+    """An external file replacement should invalidate the parsed-record cache."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = test_runtime_paths(tmp_path)
+    path = _store_path(runtime_paths)
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+    assert _stored_model(runtime_paths, THREAD_ID) == "large"
+
+    path.write_text(
+        json.dumps({THREAD_ID: {"model:test_agent": "default", "set_at": "2026-07-09T00:00:00+00:00"}}),
+        encoding="utf-8",
+    )
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    assert _stored_model(runtime_paths, THREAD_ID) == "default"
+
+
+def test_resolve_runtime_model_prefers_thread_override(tmp_path: Path) -> None:
+    """A thread override should beat the agent's authored model."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+
+    runtime_model = config.resolve_runtime_model(
+        entity_name="test_agent",
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        runtime_paths=runtime_paths,
+    )
+
+    assert runtime_model.model_name == "large"
+    assert runtime_model.context_window == 32_000
+
+
+def test_resolve_runtime_model_thread_override_beats_room_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread override should beat the room_models override."""
+    config = bind_runtime_paths(
+        Config(
+            agents={"test_agent": AgentConfig(display_name="Test Agent", model="default")},
+            room_models={"lobby": "default"},
+            models={
+                "default": ModelConfig(provider="openai", id="default-model", context_window=None),
+                "large": ModelConfig(provider="openai", id="large-model", context_window=32_000),
+            },
+        ),
+        test_runtime_paths(tmp_path),
+    )
+    monkeypatch.setattr("mindroom.matrix.state.get_room_alias_from_id", lambda *_args: "lobby")
+    runtime_paths = runtime_paths_for(config)
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+
+    runtime_model = config.resolve_runtime_model(
+        entity_name="test_agent",
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        runtime_paths=runtime_paths,
+    )
+
+    assert runtime_model.model_name == "large"
+
+
+def test_resolve_runtime_model_active_model_beats_thread_override(tmp_path: Path) -> None:
+    """An explicit active model should beat the thread override."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+
+    runtime_model = config.resolve_runtime_model(
+        entity_name="test_agent",
+        active_model_name="default",
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        runtime_paths=runtime_paths,
+    )
+
+    assert runtime_model.model_name == "default"
+
+
+def test_resolve_runtime_model_ignores_stale_thread_override(tmp_path: Path) -> None:
+    """An override naming a removed model should fall back to authored config."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="removed-model",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+
+    runtime_model = config.resolve_runtime_model(
+        entity_name="test_agent",
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        runtime_paths=runtime_paths,
+    )
+
+    assert runtime_model.model_name == "default"
+
+
+def test_resolve_runtime_model_without_thread_id_keeps_authored_model(tmp_path: Path) -> None:
+    """Resolution without thread context should ignore thread overrides."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+
+    runtime_model = config.resolve_runtime_model(
+        entity_name="test_agent",
+        room_id=ROOM_ID,
+        runtime_paths=runtime_paths,
+    )
+
+    assert runtime_model.model_name == "default"
+
+
+def test_model_command_parsing() -> None:
+    """The parser should recognize !model with and without arguments."""
+    command = command_parser.parse("!model")
+    assert command is not None
+    assert command.type == CommandType.MODEL
+    assert command.args["args_text"] == ""
+
+    command = command_parser.parse("!model large")
+    assert command is not None
+    assert command.type == CommandType.MODEL
+    assert command.args["args_text"] == "large"
+
+    command = command_parser.parse("!model reset")
+    assert command is not None
+    assert command.type == CommandType.MODEL
+    assert command.args["args_text"] == "reset"
+
+
+def test_model_command_set_and_reset(tmp_path: Path) -> None:
+    """!model <name> should persist and !model reset should clear the override."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+
+    response = handle_model_command(
+        "large",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "✅" in response
+    assert "`large`" in response
+    assert "room-level model selection" in response
+    assert _stored_model(runtime_paths, THREAD_ID) == "large"
+
+    set_room_model_override(
+        runtime_paths,
+        room_id=ROOM_ID,
+        model_name="large",
+        set_by="@admin:localhost",
+    )
+
+    response = handle_model_command(
+        "reset",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "✅" in response
+    assert "room-level model selection" in response
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+    assert (
+        config.resolve_runtime_model(
+            entity_name="test_agent",
+            room_id=ROOM_ID,
+            thread_id=THREAD_ID,
+            runtime_paths=runtime_paths,
+        ).model_name
+        == "large"
+    )
+
+    response = handle_model_command(
+        "reset",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "no model override" in response
+
+
+def test_model_command_show(tmp_path: Path) -> None:
+    """Bare !model should report the current override and available models."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+
+    response = handle_model_command(
+        "",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "No thread model override" in response
+    assert "room-level model selection" in response
+    assert "`default`" in response
+    assert "`large`" in response
+
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+    response = handle_model_command(
+        "",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "- `large` (openai large-model) for `test_agent`" in response
+
+
+@pytest.mark.parametrize("write_args", ["reset", "default"])
+def test_model_command_ignores_overrides_of_removed_entities(tmp_path: Path, write_args: str) -> None:
+    """A removed agent's thread override is not reported, and the next reset or selection removes it.
+
+    The agent added again under the same name then starts without the old override.
+    """
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    readded_config = bind_runtime_paths(
+        Config(
+            agents={
+                "test_agent": AgentConfig(display_name="Test Agent", model="default"),
+                "removed_agent": AgentConfig(display_name="Removed Agent", model="default"),
+            },
+            models=config.models,
+        ),
+        runtime_paths,
+    )
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent", "removed_agent"),
+        config=readded_config,
+    )
+
+    def model_command(args_text: str, command_config: Config = config) -> str:
+        return handle_model_command(
+            args_text,
+            config=command_config,
+            runtime_paths=runtime_paths,
+            membership_index=isolated_membership_index(),
+            room_id=ROOM_ID,
+            thread_id=THREAD_ID,
+            requester_user_id="@user:localhost",
+        )
+
+    assert "`removed_agent`" not in model_command("")
+    assert "✅" in model_command(write_args)
+    assert "`removed_agent`" not in model_command("", readded_config)
+    runtime_model = readded_config.resolve_runtime_model(
+        entity_name="removed_agent",
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        runtime_paths=runtime_paths,
+    )
+    assert runtime_model.model_name == "default"
+
+
+def test_model_help_describes_room_level_fallback() -> None:
+    """Reset help must describe the room-level fallback that actually runs."""
+    help_text = get_command_help("model")
+
+    assert "room-level model selection" in help_text
+
+
+def test_model_command_list_alias_shows_models(tmp_path: Path) -> None:
+    """!model list must show the override state, even outside a thread."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+
+    for thread_id in (THREAD_ID, None):
+        response = handle_model_command(
+            "list",
+            config=config,
+            runtime_paths=runtime_paths,
+            membership_index=isolated_membership_index(),
+            room_id=ROOM_ID,
+            thread_id=thread_id,
+            requester_user_id="@user:localhost",
+        )
+        assert "No thread model override" in response
+        assert "`default`" in response
+        assert "`large`" in response
+
+
+def test_model_command_rejects_unknown_model(tmp_path: Path) -> None:
+    """!model should reject names missing from config.models."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+
+    response = handle_model_command(
+        "nonexistent",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "Unknown model" in response
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+
+
+def test_model_command_requires_thread_for_set(tmp_path: Path) -> None:
+    """Setting an override outside a thread should fail clearly."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+
+    response = handle_model_command(
+        "large",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=None,
+        requester_user_id="@user:localhost",
+    )
+    assert "only work inside a thread" in response
+    assert _stored_model(runtime_paths, THREAD_ID) is None
+
+
+def test_model_command_default_sets_model_instead_of_resetting(tmp_path: Path) -> None:
+    """A configured model named "default" must be settable, not treated as a reset alias."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+
+    response = handle_model_command(
+        "default",
+        config=config,
+        runtime_paths=runtime_paths,
+        membership_index=isolated_membership_index(),
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        requester_user_id="@user:localhost",
+    )
+    assert "✅" in response
+    assert "`default`" in response
+    assert _stored_model(runtime_paths, THREAD_ID) == "default"
+
+
+def test_resolve_runtime_model_requires_runtime_paths_for_thread_id(tmp_path: Path) -> None:
+    """Passing thread_id without runtime_paths must fail loudly, mirroring the room branch."""
+    config = _config_with_models(tmp_path)
+
+    with pytest.raises(ValueError, match="thread-specific runtime model"):
+        config.resolve_runtime_model(entity_name="test_agent", thread_id=THREAD_ID)
+
+
+def test_store_drops_records_with_corrupt_set_at(tmp_path: Path) -> None:
+    """Records with a non-string set_at must be dropped so prune sorting cannot fail."""
+    config = _config_with_models(tmp_path)
+    runtime_paths = test_runtime_paths(tmp_path)
+    path = _store_path(runtime_paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"$bad:localhost": {"model:test_agent": "large", "set_at": 12345}}),
+        encoding="utf-8",
+    )
+
+    assert _stored_model(runtime_paths, "$bad:localhost") is None
+
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+    assert _stored_model(runtime_paths, THREAD_ID) == "large"
+
+
+def _make_tool_context(*, thread_id: str | None = THREAD_ID) -> ToolRuntimeContext:
+    config = _config_with_models(Path(tempfile.mkdtemp()))
+    return make_test_tool_runtime_context(
+        agent_name="test_agent",
+        target=MessageTarget.resolve(
+            room_id=ROOM_ID,
+            thread_id=thread_id,
+            reply_to_event_id=None,
+        ),
+        requester_id="@user:localhost",
+        client=AsyncMock(),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
+        room=None,
+        storage_path=None,
+    )
+
+
+def test_thread_model_tool_registered() -> None:
+    """The thread_model tool should be available from the metadata registry."""
+    config = _config_with_models(Path(tempfile.mkdtemp()))
+    toolkit = get_tool_by_name("thread_model", runtime_paths_for(config), worker_target=None)
+
+    assert "thread_model" in TOOL_METADATA
+    assert isinstance(toolkit, ThreadModelTools)
+    assert "list_models" in toolkit.async_functions
+    assert "list_models" in TOOL_METADATA["thread_model"].function_names
+
+
+def test_thread_model_switch_stops_provider_without_exposing_raw_result() -> None:
+    """The continuation, not Agno's raw tool result, should own the final response."""
+    tool = ThreadModelTools()
+    function = tool.async_functions["switch_thread_model"]
+    function.process_entrypoint(strict=False)
+
+    assert function.stop_after_tool_call is True
+    assert function.show_result is False
+    assert function.parameters["properties"]["model_name"]["type"] == "string"
+    assert function.parameters["properties"]["when"]["enum"] == ["after-toolcall", "next-turn"]
+    assert function.parameters["required"] == ["model_name"]
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_requires_runtime_context() -> None:
+    """Tool calls should fail clearly outside Matrix runtime context."""
+    payload = json.loads(await ThreadModelTools().switch_thread_model("large"))
+
+    assert payload["status"] == "error"
+    assert payload["tool"] == "thread_model"
+    assert "context" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_lists_configured_models_without_thread() -> None:
+    """Removing explicit discovery would leave agents unable to choose a configured alias."""
+    context = _make_tool_context(thread_id=None)
+
+    with tool_runtime_context(context):
+        payload = json.loads(await ThreadModelTools().list_models())
+
+    assert payload == {
+        "action": "list",
+        "models": [
+            {"model_id": "default-model", "name": "default", "provider": "openai"},
+            {"model_id": "large-model", "name": "large", "provider": "openai"},
+        ],
+        "status": "ok",
+        "tool": "thread_model",
+    }
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_requires_thread() -> None:
+    """Switching should fail clearly without an active thread."""
+    context = _make_tool_context(thread_id=None)
+    with tool_runtime_context(context):
+        payload = json.loads(await ThreadModelTools().switch_thread_model("large"))
+
+    assert payload["status"] == "error"
+    assert "thread" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_switch_get_and_reset() -> None:
+    """Switch, get, and reset should round-trip through the store."""
+    context = _make_tool_context()
+    tool = ThreadModelTools()
+
+    with tool_runtime_context(context):
+        switch_payload = json.loads(await tool.switch_thread_model("large"))
+        get_payload = json.loads(await tool.get_thread_model())
+        reset_payload = json.loads(await tool.reset_thread_model())
+
+    assert switch_payload["status"] == "ok"
+    assert switch_payload["model"] == "large"
+    assert switch_payload["model_id"] == "large-model"
+    assert get_payload["overrides"] == {"router": "large", "test_agent": "large"}
+    assert reset_payload["status"] == "ok"
+    assert reset_payload["cleared"] is True
+    assert _stored_model(context.runtime_paths, THREAD_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_can_switch_after_current_tool_call() -> None:
+    """Ignoring the timing argument would leave the current response on the old model."""
+    context = _make_tool_context()
+
+    with tool_runtime_context(context):
+        payload = json.loads(
+            await ThreadModelTools().switch_thread_model("large", when="after-toolcall"),
+        )
+
+    assert payload["status"] == "ok"
+    assert payload["model"] == "large"
+    assert payload["when"] == "after-toolcall"
+    assert payload["note"] == "The current response will continue with the new model after this tool call."
+    assert _stored_model(context.runtime_paths, THREAD_ID) == "large"
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_rejects_unknown_switch_timing() -> None:
+    """Accepting an unknown timing value could persist a change with undefined execution semantics."""
+    context = _make_tool_context()
+
+    with tool_runtime_context(context):
+        payload = json.loads(
+            await ThreadModelTools().switch_thread_model("large", when="later"),  # type: ignore[arg-type]
+        )
+
+    assert payload["status"] == "error"
+    assert payload["available_when"] == ["after-toolcall", "next-turn"]
+    assert _stored_model(context.runtime_paths, THREAD_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_rejects_unknown_model() -> None:
+    """Switching should reject names missing from config.models."""
+    context = _make_tool_context()
+
+    with tool_runtime_context(context):
+        payload = json.loads(await ThreadModelTools().switch_thread_model("nonexistent"))
+
+    assert payload["status"] == "error"
+    assert payload["available_models"] == ["default", "large"]
+    assert _stored_model(context.runtime_paths, THREAD_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_thread_model_tool_reports_stale_override_as_inactive() -> None:
+    """An override naming a removed model must not be reported as active."""
+    context = _make_tool_context()
+    set_thread_model_override(
+        context.runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="removed-model",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=context.config,
+    )
+    set_room_model_override(
+        context.runtime_paths,
+        room_id=ROOM_ID,
+        model_name="large",
+        set_by="@admin:localhost",
+    )
+
+    with tool_runtime_context(context):
+        payload = json.loads(await ThreadModelTools().get_thread_model())
+
+    assert payload["status"] == "ok"
+    assert payload["overrides"] == {}
+    assert payload["stale_overrides"] == {"test_agent": "removed-model"}
+    assert "no longer configured" in payload["note"]
+    assert "room-level model selection" in payload["note"]
+    assert (
+        context.config.resolve_runtime_model(
+            entity_name="test_agent",
+            room_id=ROOM_ID,
+            thread_id=THREAD_ID,
+            runtime_paths=context.runtime_paths,
+        ).model_name
+        == "large"
+    )
+
+
+def _restricted_tool_context(tmp_path: Path, requester_id: str) -> ToolRuntimeContext:
+    config = restricted_config(tmp_path)
+    return make_test_tool_runtime_context(
+        agent_name="helper",
+        target=MessageTarget.resolve(room_id=ROOM, thread_id="$root", reply_to_event_id=None),
+        requester_id=requester_id,
+        client=AsyncMock(),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
+        room=None,
+        storage_path=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+async def test_thread_model_tool_switch_leaves_entities_the_requester_cannot_address(tmp_path: Path) -> None:
+    """A tool switch for a requester excluded by an agent's access must leave that agent on its own model."""
+    context = _restricted_tool_context(tmp_path, USER)
+
+    with tool_runtime_context(context):
+        payload = json.loads(await ThreadModelTools().switch_thread_model("expensive"))
+
+    assert payload["status"] == "ok"
+    assert resolved_thread_models(context.config, context.runtime_paths) == {
+        "helper": "expensive",
+        "restricted": "default",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+async def test_thread_model_tool_reports_and_resets_only_the_entities_each_override_governs(tmp_path: Path) -> None:
+    """Get must name each override's entities, and reset must keep another setter's restricted selection."""
+    other_context = _restricted_tool_context(tmp_path, OTHER)
+    context = replace(other_context, requester_id=USER)
+    tool = ThreadModelTools()
+
+    with tool_runtime_context(other_context):
+        await tool.switch_thread_model("expensive")
+    with tool_runtime_context(context):
+        await tool.switch_thread_model("cheap")
+        get_payload = json.loads(await tool.get_thread_model())
+        reset_payload = json.loads(await tool.reset_thread_model())
+
+    assert get_payload["overrides"] == {"helper": "cheap", "restricted": "expensive"}
+    assert reset_payload["cleared"] is True
+    assert resolved_thread_models(context.config, context.runtime_paths) == {
+        "helper": "default",
+        "restricted": "expensive",
+    }
+
+
+@pytest.mark.parametrize("display_name", [None, "Default Model"])
+def test_ai_run_metadata_uses_preparation_time_model(tmp_path: Path, display_name: str | None) -> None:
+    """Run metadata must describe the model that produced the response, not the next override."""
+    config = _config_with_models(tmp_path)
+    config.models["default"].display_name = display_name
+    config.models["large"].display_name = "Large Model"
+    runtime_paths = runtime_paths_for(config)
+    prepared_model_name = config.resolve_runtime_model(
+        entity_name="test_agent",
+        room_id=ROOM_ID,
+        thread_id=THREAD_ID,
+        runtime_paths=runtime_paths,
+    ).model_name
+
+    # A mid-run switch_thread_model call persists a new override before the
+    # metadata for the current response is built.
+    set_thread_model_override(
+        runtime_paths,
+        thread_id=THREAD_ID,
+        model_name="large",
+        room_id=ROOM_ID,
+        set_by="@user:localhost",
+        entity_names=("test_agent",),
+        config=config,
+    )
+
+    metadata = build_ai_run_metadata_content(
+        config=config,
+        model_name=prepared_model_name,
+        run_id="run-1",
+        session_id="session-1",
+        status="completed",
+        model="default-model",
+        model_provider="openai",
+    )
+
+    assert metadata[AI_RUN_METADATA_KEY]["model"] == {
+        "config": "default",
+        "id": "default-model",
+        "provider": "openai",
+        **({"display_name": display_name} if display_name else {}),
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_name", "display_name", "expected_name"),
+    [
+        ("default", "  Friendly Model  ", "Friendly Model"),
+        ("default", None, None),
+        ("default", "", None),
+        ("default", "  ", None),
+        ("removed-model", "Friendly Model", None),
+    ],
+)
+def test_ai_run_metadata_optional_model_display_name(
+    tmp_path: Path,
+    model_name: str,
+    display_name: str | None,
+    expected_name: str | None,
+) -> None:
+    """Publish the configured display name when set while retaining the model alias."""
+    config = _config_with_models(tmp_path)
+    config.models["default"] = ModelConfig(provider="openai", id="default-model", display_name=display_name)
+
+    metadata = build_ai_run_metadata_content(
+        config=config,
+        model_name=model_name,
+        run_id="run-1",
+        session_id="session-1",
+        status="completed",
+        model="default-model",
+        model_provider="openai",
+    )
+
+    model = metadata[AI_RUN_METADATA_KEY]["model"]
+    assert model["config"] == model_name
+    if expected_name is None:
+        assert "display_name" not in model
+    else:
+        assert model["display_name"] == expected_name

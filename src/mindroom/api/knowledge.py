@@ -3,38 +3,50 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from mindroom import constants
 from mindroom.api import config_lifecycle
+from mindroom.constants import resolve_config_relative_path
 from mindroom.knowledge.availability import KnowledgeAvailability
-from mindroom.knowledge.manager import git_checkout_present, include_knowledge_relative_path
-from mindroom.knowledge.manager import list_git_tracked_knowledge_files as list_git_tracked_managed_knowledge_files
-from mindroom.knowledge.manager import list_knowledge_files as list_managed_knowledge_files
+from mindroom.knowledge.file_listing import git_checkout_present, include_knowledge_relative_path
+from mindroom.knowledge.file_listing import list_git_tracked_knowledge_files as list_git_tracked_managed_knowledge_files
+from mindroom.knowledge.file_listing import list_knowledge_files as list_managed_knowledge_files
+from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge.redaction import redact_credentials_in_text, redact_url_credentials
+from mindroom.knowledge.refresh_locks import is_refresh_active_for_binding
 from mindroom.knowledge.refresh_runner import (
-    is_refresh_active_for_binding,
     knowledge_binding_mutation_lock,
     publish_file_mode_source_metadata_for_base,
-    refresh_knowledge_binding,
+    refresh_knowledge_binding_in_subprocess,
 )
 from mindroom.knowledge.status import (
+    KnowledgeCandidateStatus,
     KnowledgeIndexStatus,
     get_knowledge_index_status,
     mark_knowledge_source_changed_async,
 )
 from mindroom.logging_config import get_logger
+from mindroom.path_confinement import open_directory_within_root, open_regular_file_at, resolve_path_within_root
+from mindroom.runtime_resolution import shared_knowledge_path
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+    from contextlib import AbstractContextManager
+    from typing import BinaryIO
 
     from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
@@ -53,6 +65,13 @@ class _FileListInfo:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _FileCountInfo:
+    count: int
+    degraded: bool = False
+    error: str | None = None
+
+
 def _ensure_base_exists(config: Config, base_id: str) -> None:
     if base_id not in config.knowledge_bases:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{base_id}' not found")
@@ -61,15 +80,28 @@ def _ensure_base_exists(config: Config, base_id: str) -> None:
 def _knowledge_root(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     *,
     create: bool = False,
 ) -> Path:
     _ensure_base_exists(config, base_id)
-    root = constants.resolve_config_relative_path(config.knowledge_bases[base_id].path, runtime_paths)
+    try:
+        root = shared_knowledge_path(config.knowledge_bases[base_id].path, runtime_paths)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if create:
         root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _open_checked_directory(root: Path, relative_path: Path = Path()) -> AbstractContextManager[int]:
+    """Pin a directory at or below the checked canonical root, following no link on its whole path.
+
+    Workers can write bases inside agent workspaces, so a folder checked by
+    name may be swapped for a link before the mutation; acting relative to
+    this descriptor refuses the swap instead of reaching the link target.
+    """
+    return open_directory_within_root(Path(root.anchor), root.relative_to(root.anchor) / relative_path)
 
 
 def _resolve_within_root(root: Path, relative_path: str) -> Path:
@@ -77,34 +109,31 @@ def _resolve_within_root(root: Path, relative_path: str) -> Path:
     if candidate.is_absolute() or ".." in candidate.parts:
         raise HTTPException(status_code=400, detail="Invalid path")
 
-    resolved_root = root.resolve()
-    resolved = (resolved_root / candidate).resolve()
     try:
-        resolved.relative_to(resolved_root)
+        # The root is the checked binding path; no link below it is followed.
+        return resolve_path_within_root(root, candidate, symlinks="reject")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Path is outside the knowledge folder") from exc
-    return resolved
 
 
 async def _list_file_info(
     config: Config,
     base_id: str,
     root: Path,
+    runtime_paths: RuntimePaths,
 ) -> _FileListInfo:
     files: list[dict[str, Any]] = []
     total_size = 0
-    resolved_root = root.resolve()
-
-    if not resolved_root.is_dir():
+    if not root.is_dir():
         return _FileListInfo(files=files, total_size=total_size)
 
-    managed_paths, error = await _list_managed_file_paths(config, base_id, resolved_root)
+    managed_paths, error = await _list_managed_file_paths(config, base_id, root, runtime_paths)
     if error is not None:
         return _FileListInfo(files=[], total_size=0, degraded=True, error=error)
     for file_path in sorted(managed_paths):
         try:
             stat = file_path.stat()
-            relative_path = file_path.relative_to(resolved_root).as_posix()
+            relative_path = file_path.relative_to(root).as_posix()
         except (OSError, ValueError):
             continue
         total_size += stat.st_size
@@ -122,7 +151,34 @@ async def _list_file_info(
     return _FileListInfo(files=files, total_size=total_size)
 
 
-async def _list_managed_file_paths(config: Config, base_id: str, root: Path) -> tuple[set[Path], str | None]:
+async def _count_managed_files(
+    config: Config,
+    base_id: str,
+    root: Path,
+    runtime_paths: RuntimePaths,
+) -> _FileCountInfo:
+    """Count managed files without stating each one.
+
+    The base list and per-base status report only a count. Collecting per-file
+    sizes and modification times to derive it is unbounded work that scales with
+    the corpus on every request; ``/bases/{base_id}/files`` still serves the full
+    listing for callers that need it.
+    """
+    if not root.is_dir():
+        return _FileCountInfo(count=0)
+
+    managed_paths, error = await _list_managed_file_paths(config, base_id, root, runtime_paths)
+    if error is not None:
+        return _FileCountInfo(count=0, degraded=True, error=error)
+    return _FileCountInfo(count=len(managed_paths))
+
+
+async def _list_managed_file_paths(
+    config: Config,
+    base_id: str,
+    root: Path,
+    runtime_paths: RuntimePaths,
+) -> tuple[set[Path], str | None]:
     base_config = config.knowledge_bases[base_id]
     if base_config.git is None:
         return set(await asyncio.to_thread(list_managed_knowledge_files, config, base_id, root)), None
@@ -132,6 +188,7 @@ async def _list_managed_file_paths(config: Config, base_id: str, root: Path) -> 
             config,
             base_id,
             root,
+            knowledge_git_dir(runtime_paths.storage_root, root),
             timeout_seconds=_DASHBOARD_GIT_FILE_LIST_TIMEOUT_SECONDS,
         )
     except (RuntimeError, ValueError) as exc:
@@ -148,7 +205,7 @@ def _request_refresh_scheduler(request: Request) -> KnowledgeRefreshScheduler | 
 def _schedule_refresh(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     *,
     request: Request,
 ) -> None:
@@ -165,7 +222,7 @@ def _schedule_refresh(
 def _schedule_refreshes(
     config: Config,
     base_ids: tuple[str, ...],
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     *,
     request: Request,
 ) -> None:
@@ -178,14 +235,14 @@ def _schedule_refreshes(
 def _same_source_base_ids(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
 ) -> tuple[str, ...]:
-    source_root = _knowledge_root(config, base_id, runtime_paths).resolve()
+    source_root = _knowledge_root(config, base_id, runtime_paths)
     base_ids = [base_id]
     for candidate_id in config.knowledge_bases:
         if candidate_id == base_id:
             continue
-        if _knowledge_root(config, candidate_id, runtime_paths).resolve() == source_root:
+        if _knowledge_root(config, candidate_id, runtime_paths) == source_root:
             base_ids.append(candidate_id)
     return tuple(base_ids)
 
@@ -194,7 +251,7 @@ async def _mark_source_changed_after_committed_mutation(
     base_id: str,
     *,
     config: Config,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     reason: str,
 ) -> tuple[tuple[str, ...], bool]:
     source_changed_task = asyncio.create_task(
@@ -215,7 +272,7 @@ async def _publish_file_mode_metadata_after_committed_mutation(
     base_id: str,
     *,
     config: Config,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
 ) -> bool:
     base_config = config.get_knowledge_base_config(base_id)
     if base_config.mode != "files" or base_config.git is not None:
@@ -237,7 +294,7 @@ async def _mark_committed_mutation_and_schedule_refresh(
     base_id: str,
     *,
     config: Config,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     request: Request,
     reason: str,
 ) -> bool:
@@ -266,7 +323,7 @@ async def _mark_committed_mutation_and_schedule_refresh(
 def _index_status_sync(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
 ) -> KnowledgeIndexStatus:
     base_config = config.get_knowledge_base_config(base_id)
     if base_config.mode == "files" and base_config.git is None:
@@ -286,7 +343,7 @@ def _index_status_sync(
 async def _index_status(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
 ) -> KnowledgeIndexStatus:
     return await asyncio.to_thread(_index_status_sync, config, base_id, runtime_paths)
 
@@ -297,10 +354,32 @@ def _redacted_last_error(value: str | None) -> str | None:
     return redact_credentials_in_text(value)
 
 
+def _candidate_payload(candidate: KnowledgeCandidateStatus | None) -> dict[str, Any] | None:
+    """Render in-progress candidate build state as an additive optional field.
+
+    Kept strictly separate from ``indexed_count``, which describes the
+    published, queryable index: candidate counts are work that no reader can
+    see yet. The key is omitted entirely when no candidate exists, so existing
+    clients keep parsing these responses unchanged.
+    """
+    if candidate is None:
+        return None
+    return {
+        "status": candidate.status,
+        "completed_count": candidate.completed_count,
+        "failed_count": candidate.failed_count,
+        "total_files": candidate.total_files,
+        "pending_count": candidate.pending_count,
+        "target_revision": candidate.target_revision,
+        "created_at": candidate.created_at,
+        "updated_at": candidate.updated_at,
+    }
+
+
 def _is_refreshing(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     *,
     request: Request,
 ) -> bool:
@@ -321,7 +400,7 @@ def _is_refreshing(
 async def _git_status(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     *,
     request: Request,
     index_status: KnowledgeIndexStatus | None = None,
@@ -335,7 +414,7 @@ async def _git_status(
     repo_present = await asyncio.to_thread(
         git_checkout_present,
         root,
-        timeout_seconds=_DASHBOARD_GIT_FILE_LIST_TIMEOUT_SECONDS,
+        knowledge_git_dir(runtime_paths.storage_root, root),
     )
     return {
         "repo_url": redact_url_credentials(git_config.repo_url),
@@ -357,14 +436,14 @@ def _path_overlaps(left: Path, right: Path) -> bool:
 def _git_backed_bases_for_target(
     config: Config,
     target: Path,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
 ) -> tuple[str, ...]:
     resolved_target = target.resolve()
     git_base_ids: list[str] = []
     for candidate_id, candidate_config in config.knowledge_bases.items():
         if candidate_config.git is None:
             continue
-        candidate_root = constants.resolve_config_relative_path(candidate_config.path, runtime_paths).resolve()
+        candidate_root = resolve_config_relative_path(candidate_config.path, runtime_paths).resolve()
         if _path_overlaps(resolved_target, candidate_root):
             git_base_ids.append(candidate_id)
     return tuple(git_base_ids)
@@ -373,7 +452,7 @@ def _git_backed_bases_for_target(
 def _reject_git_file_mutation(
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     target: Path,
 ) -> None:
     git_base_ids = _git_backed_bases_for_target(config, target, runtime_paths)
@@ -421,13 +500,12 @@ def _ensure_within_upload_limit(bytes_written: int, filename: str) -> None:
         raise _upload_limit_error(filename)
 
 
-async def _stream_upload_to_destination(upload: UploadFile, destination: Path, filename: str) -> None:
+async def _stream_upload_to_destination(upload: UploadFile, destination: BinaryIO, filename: str) -> None:
     bytes_written = 0
-    with destination.open("wb") as handle:
-        while chunk := await upload.read(_UPLOAD_CHUNK_BYTES):
-            bytes_written += len(chunk)
-            _ensure_within_upload_limit(bytes_written, filename)
-            handle.write(chunk)
+    while chunk := await upload.read(_UPLOAD_CHUNK_BYTES):
+        bytes_written += len(chunk)
+        _ensure_within_upload_limit(bytes_written, filename)
+        destination.write(chunk)
 
 
 def _reject_non_file_upload_destination(destination: Path, relative_path: str) -> None:
@@ -457,35 +535,31 @@ def _reject_duplicate_upload_destination(relative_path: str) -> None:
     )
 
 
-def _upload_temp_path(destination: Path) -> Path:
-    return destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.upload.tmp")
-
-
 @dataclass(frozen=True, slots=True)
 class _UploadTarget:
     upload: UploadFile
-    destination: Path
     filename: str
     relative_path: str
 
 
 @dataclass(frozen=True, slots=True)
 class _StagedUpload:
-    temp_path: Path
-    destination: Path
+    temp_name: str
     relative_path: str
 
 
-async def _stage_upload(upload: UploadFile, destination: Path, filename: str, relative_path: str) -> _StagedUpload:
-    _validate_upload_size_hint(upload, filename)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = _upload_temp_path(destination)
+async def _stage_upload(root_fd: int, target: _UploadTarget) -> _StagedUpload:
+    _validate_upload_size_hint(target.upload, target.filename)
+    temp_name = f".{target.relative_path}.{uuid.uuid4().hex}.upload.tmp"
+    temp_fd = open_regular_file_at(root_fd, temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
-        await _stream_upload_to_destination(upload, temp_path, filename)
+        with os.fdopen(temp_fd, "wb") as handle:
+            await _stream_upload_to_destination(target.upload, handle, target.filename)
     except (asyncio.CancelledError, Exception):
-        temp_path.unlink(missing_ok=True)
+        with suppress(FileNotFoundError):
+            os.unlink(temp_name, dir_fd=root_fd)
         raise
-    return _StagedUpload(temp_path=temp_path, destination=destination, relative_path=relative_path)
+    return _StagedUpload(temp_name=temp_name, relative_path=target.relative_path)
 
 
 async def _write_uploads(
@@ -493,14 +567,13 @@ async def _write_uploads(
     *,
     config: Config,
     base_id: str,
-    runtime_paths: constants.RuntimePaths,
+    runtime_paths: RuntimePaths,
     root: Path,
     before_commit: Callable[[], Awaitable[bool]] | None = None,
 ) -> tuple[list[str], bool]:
     try:
         upload_targets: list[_UploadTarget] = []
         seen_relative_paths: set[str] = set()
-        resolved_root = root.resolve()
         for upload in files:
             filename = Path(upload.filename or "").name
             if not filename:
@@ -508,39 +581,35 @@ async def _write_uploads(
 
             destination = _resolve_within_root(root, filename)
             _reject_git_file_mutation(config, base_id, runtime_paths, destination)
-            relative_path = destination.relative_to(resolved_root).as_posix()
+            relative_path = destination.relative_to(root).as_posix()
             _reject_unmanaged_knowledge_file_path(config, base_id, relative_path)
             if relative_path in seen_relative_paths:
                 _reject_duplicate_upload_destination(relative_path)
             seen_relative_paths.add(relative_path)
             _reject_non_file_upload_destination(destination, relative_path)
-            upload_targets.append(
-                _UploadTarget(
-                    upload=upload,
-                    destination=destination,
-                    filename=filename,
-                    relative_path=relative_path,
-                ),
-            )
+            upload_targets.append(_UploadTarget(upload=upload, filename=filename, relative_path=relative_path))
 
-        staged_uploads: list[_StagedUpload] = []
-        try:
-            staged_uploads = [
-                await _stage_upload(
-                    target.upload,
-                    target.destination,
-                    target.filename,
-                    target.relative_path,
-                )
-                for target in upload_targets
-            ]
-            cancelled_after_source_changed = await before_commit() if staged_uploads and before_commit else False
-            for staged_upload in staged_uploads:
-                staged_upload.temp_path.replace(staged_upload.destination)
-        except (asyncio.CancelledError, Exception):
-            for staged_upload in staged_uploads:
-                staged_upload.temp_path.unlink(missing_ok=True)
-            raise
+        if not upload_targets:
+            return [], False
+        root.mkdir(parents=True, exist_ok=True)
+        # Upload names are single components, so every upload is staged and published in the pinned root.
+        with _open_checked_directory(root) as root_fd:
+            staged_uploads: list[_StagedUpload] = []
+            try:
+                staged_uploads = [await _stage_upload(root_fd, target) for target in upload_targets]
+                cancelled_after_source_changed = await before_commit() if before_commit else False
+                for staged_upload in staged_uploads:
+                    os.replace(
+                        staged_upload.temp_name,
+                        staged_upload.relative_path,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
+                    )
+            except (asyncio.CancelledError, Exception):
+                for staged_upload in staged_uploads:
+                    with suppress(FileNotFoundError):
+                        os.unlink(staged_upload.temp_name, dir_fd=root_fd)
+                raise
         return [staged_upload.relative_path for staged_upload in staged_uploads], cancelled_after_source_changed
     finally:
         for upload in files:
@@ -556,7 +625,7 @@ async def list_knowledge_bases(request: Request) -> dict[str, Any]:
     for base_id in sorted(config.knowledge_bases):
         base_config = config.knowledge_bases[base_id]
         root = _knowledge_root(config, base_id, runtime_paths)
-        file_info = await _list_file_info(config, base_id, root)
+        file_info = await _count_managed_files(config, base_id, root, runtime_paths)
         index_status = await _index_status(config, base_id, runtime_paths)
         git_status = await _git_status(
             config,
@@ -573,12 +642,15 @@ async def list_knowledge_bases(request: Request) -> dict[str, Any]:
             "mode": base_config.mode,
             "path": str(root),
             "watch": base_config.watch,
-            "file_count": len(file_info.files),
+            "file_count": file_info.count,
             "indexed_count": index_status.indexed_count,
             "refreshing": refreshing,
             "refresh_state": index_status.refresh_state,
             "file_listing_degraded": file_info.degraded,
         }
+        candidate = _candidate_payload(index_status.candidate)
+        if candidate is not None:
+            base_entry["candidate"] = candidate
         if index_status.last_error is not None:
             base_entry["last_error"] = _redacted_last_error(index_status.last_error)
         if file_info.error is not None:
@@ -598,7 +670,7 @@ async def list_knowledge_files(base_id: str, request: Request) -> dict[str, Any]
     """List all managed files currently present in one knowledge base folder."""
     config, runtime_paths = config_lifecycle.read_committed_runtime_config(request)
     root = _knowledge_root(config, base_id, runtime_paths)
-    file_info = await _list_file_info(config, base_id, root)
+    file_info = await _list_file_info(config, base_id, root, runtime_paths)
 
     return {
         "base_id": base_id,
@@ -610,13 +682,50 @@ async def list_knowledge_files(base_id: str, request: Request) -> dict[str, Any]
     }
 
 
-@router.post("/bases/{base_id}/upload")
-async def upload_knowledge_files(
-    base_id: str,
-    request: Request,
-    files: Annotated[list[UploadFile], File(...)],
-) -> dict[str, Any]:
-    """Upload one or more files into a knowledge base folder."""
+# The handler parses its multipart body after authentication, so the API docs take the body schema from here.
+# Swagger UI renders array items as file pickers only with ``format: binary``.
+_UPLOAD_REQUEST_BODY = {
+    "required": True,
+    "content": {
+        "multipart/form-data": {
+            "schema": {
+                "type": "object",
+                "required": ["files"],
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string", "format": "binary", "contentMediaType": "application/octet-stream"},
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+@router.post("/bases/{base_id}/upload", openapi_extra={"requestBody": _UPLOAD_REQUEST_BODY})
+async def upload_knowledge_files(base_id: str, request: Request) -> dict[str, Any]:
+    """Upload the multipart ``files`` parts into a knowledge base folder."""
+    # Parsed here because FastAPI reads a File parameter before the router authenticates the caller.
+    # The errors below match the ones FastAPI returned for that File parameter.
+    try:
+        form = await request.form()
+    except StarletteHTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="There was an error parsing the body") from exc
+    try:
+        files = [upload for upload in form.getlist("files") if isinstance(upload, UploadFile)]
+        if not files:
+            raise RequestValidationError(
+                [{"type": "missing", "loc": ("body", "files"), "msg": "Field required", "input": None}],
+            )
+        return await _upload_knowledge_files(base_id, request, files)
+    finally:
+        await form.close()
+
+
+async def _upload_knowledge_files(base_id: str, request: Request, files: list[UploadFile]) -> dict[str, Any]:
     config, runtime_paths = config_lifecycle.read_committed_runtime_config(request)
     _ensure_base_exists(config, base_id)
     uploaded: list[str] = []
@@ -677,9 +786,11 @@ async def delete_knowledge_file(base_id: str, path: str, request: Request) -> di
         if not target.exists() or not target.is_file():
             raise HTTPException(status_code=404, detail="Knowledge file not found")
 
-        relative_path = target.relative_to(root.resolve()).as_posix()
+        relative_file = target.relative_to(root)
+        relative_path = relative_file.as_posix()
         _reject_unmanaged_knowledge_file_path(config, base_id, relative_path)
-        target.unlink()
+        with _open_checked_directory(root, relative_file.parent) as parent_fd:
+            os.unlink(relative_file.name, dir_fd=parent_fd)
         cancelled_after_source_changed = await _mark_committed_mutation_and_schedule_refresh(
             base_id,
             config=config,
@@ -709,7 +820,7 @@ async def knowledge_status(base_id: str, request: Request) -> dict[str, Any]:
     root = _knowledge_root(config, base_id, runtime_paths)
     base_config = config.knowledge_bases[base_id]
     index_status = await _index_status(config, base_id, runtime_paths)
-    file_info = await _list_file_info(config, base_id, root)
+    file_info = await _count_managed_files(config, base_id, root, runtime_paths)
     git_status = await _git_status(
         config,
         base_id,
@@ -725,7 +836,7 @@ async def knowledge_status(base_id: str, request: Request) -> dict[str, Any]:
         "mode": base_config.mode,
         "folder_path": str(root),
         "watch": base_config.watch,
-        "file_count": len(file_info.files),
+        "file_count": file_info.count,
         "indexed_count": index_status.indexed_count,
         "refreshing": refreshing,
         "refresh_state": index_status.refresh_state,
@@ -733,6 +844,9 @@ async def knowledge_status(base_id: str, request: Request) -> dict[str, Any]:
         "file_listing_degraded": file_info.degraded,
         "file_listing_error": file_info.error,
     }
+    candidate = _candidate_payload(index_status.candidate)
+    if candidate is not None:
+        payload["candidate"] = candidate
     if git_status is not None:
         payload["git"] = git_status
     return payload
@@ -754,7 +868,7 @@ async def reindex_knowledge(base_id: str, request: Request) -> dict[str, Any]:
                 force_reindex=True,
             )
         else:
-            result = await refresh_knowledge_binding(
+            result = await refresh_knowledge_binding_in_subprocess(
                 base_id,
                 config=config,
                 runtime_paths=runtime_paths,

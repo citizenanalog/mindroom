@@ -1,87 +1,25 @@
 # Image Messages
 
-MindRoom can process images sent to Matrix rooms, passing them to vision-capable agents and teams for analysis.
+This page covers how agents and teams see images sent in Matrix rooms, which image formats they receive, and what happens when a model cannot accept an image.
+Images follow the same rules as other attachments for captions, routing, encryption, size limits, attachment IDs, and retention; see [Attachments](https://docs.mindroom.chat/attachments/).
 
-## Overview
+## Sending Images
 
-When a user sends an image in a Matrix room:
+Send an image in a room and mention the agent or team in the caption, for example `@assistant What does this diagram show?`.
+No configuration is needed; the image is passed to the responder's model as vision input, so that model must support vision (for example Claude or GPT-6 Astra).
+A model without vision answers through the [media fallback](#media-fallback).
 
-1. The responder determines whether it should answer (via mention, thread participation, or DM)
-2. The image is downloaded and decrypted (if E2E encrypted)
-3. The image is wrapped as an `agno.media.Image` and passed to the AI model
-4. The responder replies with its analysis
+Captions from bridges trigger a response when they mention the agent through Matrix mention metadata, an HTML mention pill, or plain `@name` text.
 
-Image support works automatically for agents and teams -- no configuration is needed.
-The selected model must support vision (e.g., Claude, GPT-5.4).
+## Image Formats
 
-## Supported Formats
-
-MindRoom detects image format from file byte signatures:
-
-- PNG
-- JPEG
-- GIF
-- WebP
-- BMP
-- TIFF
-
-If the declared MIME type in the Matrix event does not match the detected byte signature, MindRoom logs a warning and uses the detected type.
-
-## How It Works
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Image Msg   │────>│ Download &  │────>│ Pass to AI  │
-│ (Matrix)    │     │ Decrypt     │     │ Model       │
-└─────────────┘     └─────────────┘     └─────────────┘
-                                              │
-                                              v
-                                        ┌─────────────┐
-                                        │ Responder   │
-                                        │ Replies     │
-                                        └─────────────┘
-```
-
-## Usage
-
-Send an image in a Matrix room and mention the agent or team in the caption:
-
-- **With caption**: `@assistant What does this diagram show?` -- the caption is used as the prompt
-- **Without caption**: The agent receives `[Attached image]` as the prompt and describes what it sees
-- **Bare filename**: If the body is just a filename (e.g., `IMG_1234.jpg`), it is treated the same as no caption
-
-Images work in both direct messages and threads, and with both individual agents and teams.
-
-## Captions (MSC2530)
-
-If the Matrix event's `filename` field differs from `body`, the `body` is used as a user caption.
-This follows [MSC2530](https://github.com/matrix-org/matrix-spec-proposals/pull/2530) semantics and works with clients that set the caption in the body.
-
-## Image Persistence
-
-Images are saved under `mindroom_data/attachments/` and `mindroom_data/incoming_media/` and registered as attachment records with 30-day retention.
-In addition to being passed to the AI model as vision input, each image is also registered as an `att_*` attachment ID so agents can reference it via tool calls.
-See [Attachments](https://docs.mindroom.chat/attachments/) for details on retention and context scoping.
-
-## Encryption
-
-Both unencrypted and E2E encrypted images are supported. Encrypted images are decrypted transparently using the key material from the Matrix event.
-
-## Caching
-
-AI response caching is automatically skipped when images are present, since image payloads are large and unlikely to repeat.
+MindRoom recognizes PNG, JPEG, GIF, WebP, BMP, and TIFF images from their content and sends the recognized type to the model, logging a warning when the client declared a different MIME type.
+Other image formats are sent with the client's declared MIME type, and the provider may reject them.
 
 ## Media Fallback
 
-If a model rejects inline media (images, audio, video, or documents), MindRoom automatically retries the request without the inline media.
-The retried prompt includes `[Inline media unavailable for this model]` to inform the agent that attachments were dropped.
-Agents can still reference the files via attachment IDs and tools.
-
-This fallback is transparent — no user action is required.
-It detects provider-specific error patterns such as unsupported media type, base64 field validation failures, and capability rejections.
-
-## Limitations
-
-- **Routing with multiple eligible responders** -- without an `@mention`, the router uses the image caption to select among candidates only when room configuration and reply permissions leave multiple eligible agents or teams.
-- **Bridge mention detection** uses `m.mentions` in the event, falling back to parsing HTML pills from `formatted_body` when `m.mentions` is absent (e.g., mautrix-telegram). Bridges that set neither may not trigger agent responses.
-- **Model support** -- the configured model must support vision. Text-only models will ignore the image or return an error. If the model rejects the image entirely, the [media fallback](#media-fallback) retries without the inline image.
+When a provider rejects a request containing inline media (images, audio, video, or documents), MindRoom retries it once without that media.
+The retry adds `[Inline media unavailable for this model]` and tells the agent the content was not inspected, so the agent can still open the file through the [`attachments` tool](https://docs.mindroom.chat/attachments/#the-attachments-tool) or explain the limitation.
+If the provider error says the model does not support that kind of input, such as `does not support image input` or `is not a multimodal model`, later requests to the same model leave that media kind out from the start until MindRoom restarts.
+Other rejections, such as an image the provider could not decode, drop the media from that one request only.
+Once a streamed reply has produced text, tool calls, or reasoning, a later provider error is reported instead of retried without media, and provider safeguard refusals are never retried without media.

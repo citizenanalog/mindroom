@@ -12,6 +12,7 @@ import OpenRouter from "@lobehub/icons/es/OpenRouter/components/Mono";
 import Perplexity from "@lobehub/icons/es/Perplexity/components/Mono";
 import Together from "@lobehub/icons/es/Together/components/Mono";
 import XAI from "@lobehub/icons/es/XAI/components/Mono";
+import ZAI from "@lobehub/icons/es/ZAI/components/Mono";
 import { Brain } from "lucide-react";
 
 export interface ProviderInfo {
@@ -161,9 +162,28 @@ export const PROVIDERS: Record<string, ProviderInfo> = {
     icon: (className = "h-5 w-5") => <Cerebras className={className} />,
     requiresApiKey: true,
   },
+  zai: {
+    id: "zai",
+    name: "Z.ai",
+    description: "Configure your Z.ai API key for GLM models",
+    color:
+      "bg-slate-500/10 text-slate-600 dark:text-slate-400 border-slate-500/20",
+    icon: (className = "h-5 w-5") => <ZAI className={className} />,
+    requiresApiKey: true,
+  },
 };
 
 // Helper function to get provider info with fallback
+// Keyless providers the picker does not list; the backend drops a configured key for them.
+const UNLISTED_KEYLESS_PROVIDER_IDS = new Set([
+  "codex",
+  "openai_codex",
+  "kimi",
+  "kimi_code",
+  "bedrock_claude",
+  "synthetic",
+]);
+
 export function getProviderInfo(providerId: string): ProviderInfo {
   return (
     PROVIDERS[providerId] || {
@@ -171,7 +191,7 @@ export function getProviderInfo(providerId: string): ProviderInfo {
       name: providerId,
       color: "bg-gray-500/10 text-gray-600 dark:text-gray-400",
       icon: (className = "h-5 w-5") => <Brain className={className} />,
-      requiresApiKey: true,
+      requiresApiKey: !UNLISTED_KEYLESS_PROVIDER_IDS.has(providerId),
     }
   );
 }

@@ -10,13 +10,13 @@ from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.memory._policy import (
-    agent_scope_user_id,
     allowed_scope_storage_paths,
     effective_storage_paths_for_context,
     get_allowed_memory_user_ids,
     get_team_ids_for_agent,
     storage_paths_for_scope_user_id,
 )
+from mindroom.memory_scope_ids import agent_scope_user_id
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, agent_state_root_path, tool_execution_identity
 from tests.conftest import bind_runtime_paths, runtime_paths_for
 from tests.memory_test_support import MockTeamConfig
@@ -119,7 +119,7 @@ def test_effective_storage_paths_for_mixed_private_team_is_rejected(tmp_path: Pa
         tool_execution_identity(identity),
         pytest.raises(
             ValueError,
-            match="private agents cannot participate in teams yet",
+            match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
         ),
     ):
         effective_storage_paths_for_context(["general", "calculator"], tmp_path, config, runtime_paths_for(config))
@@ -147,7 +147,7 @@ def test_storage_paths_for_scope_user_id_rejects_mixed_private_team(
         tool_execution_identity(identity),
         pytest.raises(
             ValueError,
-            match="private agents cannot participate in teams yet",
+            match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
         ),
     ):
         storage_paths_for_scope_user_id("team_calculator+general", tmp_path, config, runtime_paths_for(config))
@@ -180,7 +180,7 @@ def test_effective_storage_paths_for_team_rejects_transitive_private_delegate_ta
         tool_execution_identity(identity),
         pytest.raises(
             ValueError,
-            match="reaches private agent 'mind' via delegation; private agents cannot participate in teams yet",
+            match="reaches private agent 'mind' via delegation; private delegation is not supported for teams",
         ),
     ):
         effective_storage_paths_for_context(["leader", "helper"], tmp_path, config, runtime_paths_for(config))
@@ -194,5 +194,8 @@ def test_get_team_ids_for_agent_rejects_private_team_members(config: Config) -> 
     }
     config.teams = {"mixed_team": MockTeamConfig(agents=["general", "calculator"])}
 
-    with pytest.raises(ValueError, match="private agents cannot participate in teams yet"):
+    with pytest.raises(
+        ValueError,
+        match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
+    ):
         get_team_ids_for_agent("general", config)

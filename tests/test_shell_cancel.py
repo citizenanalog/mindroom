@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 def _make_runtime_paths(tmp_path: Path) -> RuntimePaths:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "models:\n  default:\n    provider: openai\n    id: gpt-5.4\nagents: {}\nrouter:\n  model: default\n",
+        "models:\n  default:\n    provider: openai\n    id: gpt-6-astra\nagents: {}\nrouter:\n  model: default\n",
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text("", encoding="utf-8")
@@ -45,9 +45,19 @@ def _get_run_shell_command(tmp_path: Path) -> Callable[..., Awaitable[str]]:
 
 
 async def _wait_for_pid(pid_file: Path) -> int:
+    """Wait until the PID file holds a PID, rather than until it merely exists.
+
+    The subprocesses record their PID with `write_text`, which creates the file
+    before it puts anything in it. Treating the file's appearance as readiness
+    therefore reads whatever is there at that instant, and between those two
+    steps that is an empty string -- `int("")`, not a PID. The window is a
+    couple of syscalls wide and a loaded machine is enough to land in it, so
+    wait for the content this helper actually promises to return.
+    """
     for _ in range(50):
-        if pid_file.exists():
-            return int(pid_file.read_text(encoding="utf-8").strip())
+        recorded = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+        if recorded:
+            return int(recorded)
         await asyncio.sleep(0.05)
     message = f"PID file was not written: {pid_file}"
     raise AssertionError(message)
@@ -129,7 +139,7 @@ async def test_run_shell_command_cancellation_kills_subprocess(tmp_path: Path) -
         str(pid_file),
     ]
 
-    with patch("mindroom.tools.shell.os.killpg", wraps=os.killpg) as killpg_mock:
+    with patch("mindroom.shell.execution.os.killpg", wraps=os.killpg) as killpg_mock:
         task = asyncio.create_task(run_shell_command(command, timeout=120))
         pid = await _wait_for_pid(pid_file)
         await asyncio.sleep(0.1)
@@ -206,7 +216,7 @@ async def test_run_shell_command_cancellation_cleans_up_background_handle(tmp_pa
             return
         await real_sleep(delay)
 
-    with patch("mindroom.tools.shell.asyncio.sleep", new=controlled_sleep):
+    with patch("mindroom.shell.execution.asyncio.sleep", new=controlled_sleep):
         task = asyncio.create_task(run_shell_command(command, timeout=0))
         pid = await _wait_for_pid(pid_file)
         await background_registered.wait()
@@ -246,8 +256,8 @@ async def test_run_shell_command_cancellation_after_foreground_exit_does_not_ter
     terminate_process_group = AsyncMock()
 
     with (
-        patch("mindroom.tools.shell._await_reader_tasks_with_grace", new=blocked_reader_grace),
-        patch("mindroom.tools.shell._terminate_process_group", new=terminate_process_group),
+        patch("mindroom.shell.execution._await_reader_tasks_with_grace", new=blocked_reader_grace),
+        patch("mindroom.shell.execution._terminate_process_group", new=terminate_process_group),
     ):
         task = asyncio.create_task(run_shell_command(command, timeout=120))
         try:

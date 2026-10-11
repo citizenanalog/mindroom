@@ -9,13 +9,12 @@ from typing import TYPE_CHECKING, Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from mindroom import constants
 from mindroom.api import config_lifecycle
 from mindroom.api.config_lifecycle import api_runtime_paths
 from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths
-from mindroom.matrix.state import get_room_alias_from_id, resolve_room_aliases
-from mindroom.matrix.users import create_agent_user, login_agent_user
-from mindroom.scheduling import (
+from mindroom.matrix.state import get_room_alias_from_id, resolve_room_aliases, resolve_room_id
+from mindroom.matrix.users import create_agent_http_client
+from mindroom.scheduling.tasks import (
     ScheduledTaskReadModel,
     ScheduledTaskRecord,
     build_edited_scheduled_workflow,
@@ -28,11 +27,10 @@ from mindroom.scheduling import (
 )
 
 if TYPE_CHECKING:
-    from nio import AsyncClient
-
     from mindroom.config.main import Config
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
+_SCHEDULER_ERROR_PREFIX = "❌ "
 
 
 class ScheduledTaskResponse(BaseModel):
@@ -49,8 +47,10 @@ class ScheduledTaskResponse(BaseModel):
     cron_description: str | None = None
     description: str
     message: str
+    history_limit: int | None = None
     thread_id: str | None = None
     new_thread: bool
+    silent: bool
     created_by: str | None = None
     created_at: datetime | None = None
 
@@ -71,6 +71,7 @@ class UpdateScheduleRequest(BaseModel):
     schedule_type: Literal["once", "cron"] | None = None
     execute_at: datetime | None = None
     cron_expression: str | None = None
+    silent: bool | None = None
 
 
 class CancelScheduleResponse(BaseModel):
@@ -83,12 +84,6 @@ class CancelScheduleResponse(BaseModel):
 RoomFilter = Annotated[str | None, Query(description="Optional room ID or alias filter")]
 IncludeCancelled = Annotated[bool, Query(description="Include cancelled schedules in the result")]
 CancelRoomId = Annotated[str, Query(description="Room ID or alias containing the task")]
-
-
-def _resolve_room_id(room_id_or_alias: str, runtime_paths: RuntimePaths) -> str:
-    """Resolve room aliases (e.g. lobby) to room IDs when available."""
-    resolved = resolve_room_aliases([room_id_or_alias], runtime_paths=runtime_paths)
-    return resolved[0] if resolved else room_id_or_alias
 
 
 def _configured_room_ids(runtime_config: Config, runtime_paths: RuntimePaths) -> list[str]:
@@ -106,16 +101,16 @@ def _to_response_task(task: ScheduledTaskReadModel, runtime_paths: RuntimePaths)
     )
 
 
-async def _get_router_client(runtime_paths: RuntimePaths) -> AsyncClient:
-    """Login the router user and return an authenticated Matrix client."""
-    homeserver = constants.runtime_matrix_homeserver(runtime_paths=runtime_paths)
-    router_user = await create_agent_user(
-        homeserver,
-        ROUTER_AGENT_NAME,
-        "RouterAgent",
-        runtime_paths=runtime_paths,
-    )
-    return await login_agent_user(homeserver, router_user, runtime_paths)
+def _scheduler_error_detail(result: str) -> str:
+    """Convert chat-formatted scheduler errors into API response details."""
+    return result.removeprefix(_SCHEDULER_ERROR_PREFIX).strip()
+
+
+def _cancel_error_status_code(detail: str) -> int:
+    """Return the HTTP status for one scheduler cancel failure detail."""
+    if detail.startswith("Task `") and detail.endswith("` not found."):
+        return 404
+    return 500
 
 
 @router.get("", response_model=ListSchedulesResponse)
@@ -127,7 +122,7 @@ async def list_schedules(
     """List scheduled tasks from one room or all configured rooms."""
     runtime_config, runtime_paths = config_lifecycle.read_committed_runtime_config(request)
     room_ids = (
-        [_resolve_room_id(room_id, runtime_paths=runtime_paths)]
+        [resolve_room_id(room_id, runtime_paths=runtime_paths)]
         if room_id
         else _configured_room_ids(runtime_config, runtime_paths=runtime_paths)
     )
@@ -135,16 +130,17 @@ async def list_schedules(
     if not room_ids:
         return ListSchedulesResponse(timezone=runtime_config.timezone, tasks=[])
 
-    client = await _get_router_client(runtime_paths)
+    client = create_agent_http_client(ROUTER_AGENT_NAME, runtime_paths)
     try:
         tasks: list[ScheduledTaskReadModel] = []
         for resolved_room_id in room_ids:
             room_tasks: list[ScheduledTaskRecord] = await get_scheduled_tasks_for_room(
                 client=client,
                 room_id=resolved_room_id,
+                runtime_paths=runtime_paths,
                 include_non_pending=include_cancelled,
             )
-            tasks.extend(build_scheduled_task_read_model(task) for task in room_tasks)
+            tasks.extend(build_scheduled_task_read_model(task, timezone=runtime_config.timezone) for task in room_tasks)
     finally:
         await client.close()
 
@@ -162,12 +158,17 @@ async def update_schedule(
     api_request: Request,
 ) -> ScheduledTaskResponse:
     """Update prompt text and schedule fields for an existing task."""
-    _, runtime_paths = config_lifecycle.read_committed_runtime_config(api_request)
-    resolved_room_id = _resolve_room_id(request.room_id, runtime_paths=runtime_paths)
+    runtime_config, runtime_paths = config_lifecycle.read_committed_runtime_config(api_request)
+    resolved_room_id = resolve_room_id(request.room_id, runtime_paths=runtime_paths)
 
-    client = await _get_router_client(runtime_paths)
+    client = create_agent_http_client(ROUTER_AGENT_NAME, runtime_paths)
     try:
-        existing_task = await get_scheduled_task(client=client, room_id=resolved_room_id, task_id=task_id)
+        existing_task = await get_scheduled_task(
+            client=client,
+            room_id=resolved_room_id,
+            task_id=task_id,
+            runtime_paths=runtime_paths,
+        )
         if not existing_task:
             raise HTTPException(status_code=404, detail=f"Task `{task_id}` not found")
 
@@ -180,6 +181,7 @@ async def update_schedule(
                 schedule_type=request.schedule_type,
                 execute_at=request.execute_at,
                 cron_expression=request.cron_expression,
+                silent=request.silent,
             )
             updated_task = await save_edited_scheduled_task(
                 client=client,
@@ -187,11 +189,16 @@ async def update_schedule(
                 task_id=task_id,
                 workflow=updated_workflow,
                 existing_task=existing_task,
+                runtime_paths=runtime_paths,
+                timezone=runtime_config.timezone,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"{e!s}") from e
 
-        return _to_response_task(build_scheduled_task_read_model(updated_task), runtime_paths)
+        return _to_response_task(
+            build_scheduled_task_read_model(updated_task, timezone=runtime_config.timezone),
+            runtime_paths,
+        )
     finally:
         await client.close()
 
@@ -204,20 +211,29 @@ async def cancel_schedule(
 ) -> CancelScheduleResponse:
     """Cancel a scheduled task by ID."""
     runtime_paths = api_runtime_paths(request)
-    resolved_room_id = _resolve_room_id(room_id, runtime_paths=runtime_paths)
+    resolved_room_id = resolve_room_id(room_id, runtime_paths=runtime_paths)
 
-    client = await _get_router_client(runtime_paths)
+    client = create_agent_http_client(ROUTER_AGENT_NAME, runtime_paths)
     try:
-        existing = await get_scheduled_task(client=client, room_id=resolved_room_id, task_id=task_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail=f"Task `{task_id}` not found")
-
-        await cancel_scheduled_task(
+        existing = await get_scheduled_task(
             client=client,
             room_id=resolved_room_id,
             task_id=task_id,
+            runtime_paths=runtime_paths,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Task `{task_id}` not found")
+
+        result = await cancel_scheduled_task(
+            client=client,
+            room_id=resolved_room_id,
+            task_id=task_id,
+            runtime_paths=runtime_paths,
             cancel_in_memory=False,
         )
+        if result.startswith("❌"):
+            detail = _scheduler_error_detail(result)
+            raise HTTPException(status_code=_cancel_error_status_code(detail), detail=detail)
     finally:
         await client.close()
 

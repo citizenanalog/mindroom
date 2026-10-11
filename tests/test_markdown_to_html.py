@@ -6,6 +6,7 @@ import pytest
 
 from mindroom.matrix.message_builder import markdown_to_html
 from mindroom.tool_system.events import ensure_visible_tool_marker_spacing
+from tests.cpu_budget_helpers import cpu_budget
 
 # --- Core bug fix: tables without blank lines ---
 
@@ -216,6 +217,27 @@ def test_unsupported_tags_escaped() -> None:
     assert "<tool>" not in html
 
 
+def test_tag_followed_by_long_whitespace_renders_within_a_cpu_budget() -> None:
+    """A line opening a tag and trailing off into whitespace classifies in linear time."""
+    for line in ("<a" + " " * 1_000, "<a" + " " * 60_000, "<a" + " " * 60_000 + "x"):
+        with cpu_budget(0.5):
+            html = markdown_to_html(f"Title\n\n{line}\n<custom   x>\n")
+        assert "&lt;a" in html
+        assert "&lt;custom   x&gt;" in html
+
+
+def test_many_tag_openers_before_a_closing_bracket_render_within_a_cpu_budget() -> None:
+    """Tag openers closed by a later ``>`` on the same line are classified in linear time."""
+    openers = "<a" * 32_000
+    for text, expected in (
+        (f"<div {openers}>x", "<div>x"),
+        (f'hello <span title="{openers}">x</span>', "<p>hello <span>x</span></p>\n"),
+    ):
+        with cpu_budget(0.5):
+            html = markdown_to_html(text)
+        assert html == expected
+
+
 def test_supported_tags_pass_through() -> None:
     """Known Matrix tags are preserved."""
     html = markdown_to_html("<code>example</code>")
@@ -353,6 +375,15 @@ def test_data_uri_attributes_are_stripped() -> None:
     html = markdown_to_html('<a href="data:text/html,<script>alert(1)</script>">click</a>')
     assert "<a>click</a>" in html
     assert 'href="data:' not in html
+
+
+def test_malformed_ipv6_url_attribute_is_dropped_without_crashing() -> None:
+    """A URL with an unbalanced IPv6 bracket must not abort the whole render (ISSUE-230)."""
+    html = markdown_to_html('<a href="http://[">x</a>\n<img src="http://[" alt="safe">')
+    assert "<a>x</a>" in html
+    assert 'href="http://["' not in html
+    assert 'alt="safe"' in html
+    assert 'src="http://["' not in html
 
 
 @pytest.mark.parametrize(

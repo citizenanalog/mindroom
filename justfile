@@ -25,13 +25,12 @@ local-matrix-down:
 local-matrix-logs:
     cd local/matrix && docker compose logs -f
 
-# Reset Matrix + DB stack (remove volumes)
+# Reset local Matrix volumes, selected runtime Matrix state, and repository tmp/
 local-matrix-reset:
     cd local/matrix && docker compose down -v
-    rm -f matrix_state.yaml
-    docker volume prune -f
+    uv run python -c "from mindroom.constants import matrix_state_file, resolve_runtime_paths; matrix_state_file(resolve_runtime_paths()).unlink(missing_ok=True)"
     rm -rf tmp/
-    @echo "✅ Reset complete! Run 'just create' then 'mindroom run' to start fresh."
+    @echo "✅ Reset complete! Run 'just local-matrix-up' then 'mindroom run' to start fresh."
 
 #########################################
 # Local: Instances orchestration (Compose)
@@ -97,6 +96,11 @@ local-platform-compose-logs:
 # ------------------------
 # Development / CI helpers
 # ------------------------
+
+# Export SaaS backend OpenAPI schema and regenerate frontend API types
+saas-openapi:
+    cd saas-platform/platform-backend && uv run python scripts/export_openapi.py
+    cd saas-platform/platform-frontend && bun install && bun run generate:api
 
 ################################
 # Cluster: Terraform / Helm / DB
@@ -192,6 +196,10 @@ env-saas:
 test-saas-backend *args:
     cd saas-platform/platform-backend && uv run pytest {{args}}
 
+# Run SaaS platform backend tests with a terminal coverage report
+test-saas-backend-coverage *args:
+    cd saas-platform/platform-backend && uv run pytest --cov=backend --cov-report=term-missing {{ args }}
+
 # Run SaaS platform frontend tests (Jest)
 test-saas-frontend:
     cd saas-platform/platform-frontend && bun install && bun run test
@@ -207,9 +215,31 @@ test-backend *args:
     uv sync --all-extras
     uv run --all-extras pytest {{args}}
 
+# Run core backend tests with a terminal coverage report
+test-backend-coverage *args:
+    uv sync --all-extras
+    uv run --all-extras pytest --cov=mindroom --cov-report=term-missing {{ args }}
+
+# Run the standard cross-platform test suites with dependency preflight and fail-fast behavior
+test-standard:
+    ./run-tests.sh
+
+# Boots a disposable Tuwunel, a deterministic model stub, and this worktree's
+# MindRoom, then restarts MindRoom mid-turn around forty times. Needs Docker,
+# free ports, and a mostly idle machine for 30-60 minutes. Deliberately not in
+# CI; scripts/README.md explains why and says what a pass has to show.
+# Live pre-merge gate for Matrix ingress, journal, dispatch, and shutdown changes
+test-live-journal-gate *args:
+    uv run python scripts/testing/fuzz_live_matrix.py --seed 42 --steps 200 --threads 45 --restart-interval 5 {{args}}
+    uv run python scripts/testing/fuzz_live_matrix.py --profile restart-regression {{args}}
+
+# Opt-in Docker minimal-mode smoke; use a built worker image and a persistent evidence directory
+test-minimal-agent-worker-smoke image evidence_dir:
+    uv run python -m tests.manual.minimal_agent_worker_smoke --image {{quote(image)}} --evidence-dir {{quote(evidence_dir)}}
+
 # Check for public symbols that should be private
 check-module-privacy:
-    uv run privata .
+    uv run privata --methods .
 
 #############################
 # Developer-friendly aliases

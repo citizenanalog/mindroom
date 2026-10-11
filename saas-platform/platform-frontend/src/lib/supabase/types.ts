@@ -1,7 +1,7 @@
 // Database types for Supabase
 type PlanTier = 'free' | 'byok' | 'hobby' | 'pro' | 'enterprise'
 type AccountStatus = 'active' | 'suspended' | 'deleted' | 'pending_verification'
-type SubscriptionStatus = 'trialing' | 'active' | 'cancelled' | 'past_due' | 'paused'
+type SubscriptionStatus = 'trialing' | 'active' | 'cancelled' | 'past_due' | 'paused' | 'incomplete' | 'incomplete_expired' | 'unpaid'
 
 export type Database = {
   public: {
@@ -31,38 +31,38 @@ export type Database = {
           email: string
           full_name?: string | null
           company_name?: string | null
-          stripe_customer_id?: string | null
-          tier?: PlanTier
-          is_admin?: boolean
-          status?: AccountStatus
-          deleted_at?: string | null
-          deletion_reason?: string | null
-          deletion_requested_by?: string | null
-          deletion_requested_at?: string | null
+          stripe_customer_id?: never
+          tier?: never
+          is_admin?: never
+          status?: never
+          deleted_at?: never
+          deletion_reason?: never
+          deletion_requested_by?: never
+          deletion_requested_at?: never
           consent_marketing?: boolean
           consent_analytics?: boolean
           consent_updated_at?: string | null
-          created_at?: string
-          updated_at?: string
+          created_at?: never
+          updated_at?: never
         }
         Update: {
-          id?: string
-          email?: string
+          id?: never
+          email?: never
           full_name?: string | null
           company_name?: string | null
-          stripe_customer_id?: string | null
-          tier?: PlanTier
-          is_admin?: boolean
-          status?: AccountStatus
-          deleted_at?: string | null
-          deletion_reason?: string | null
-          deletion_requested_by?: string | null
-          deletion_requested_at?: string | null
+          stripe_customer_id?: never
+          tier?: never
+          is_admin?: never
+          status?: never
+          deleted_at?: never
+          deletion_reason?: never
+          deletion_requested_by?: never
+          deletion_requested_at?: never
           consent_marketing?: boolean
           consent_analytics?: boolean
           consent_updated_at?: string | null
-          created_at?: string
-          updated_at?: string
+          created_at?: never
+          updated_at?: never
         }
       }
       subscriptions: {
@@ -78,8 +78,6 @@ export type Database = {
           current_period_start: string | null
           current_period_end: string | null
           cancelled_at: string | null
-          max_agents: number
-          max_messages_per_day: number
           created_at: string
           updated_at: string
         }
@@ -95,8 +93,6 @@ export type Database = {
           current_period_start?: string | null
           current_period_end?: string | null
           cancelled_at?: string | null
-          max_agents?: number
-          max_messages_per_day?: number
           created_at?: string
           updated_at?: string
         }
@@ -112,8 +108,6 @@ export type Database = {
           current_period_start?: string | null
           current_period_end?: string | null
           cancelled_at?: string | null
-          max_agents?: number
-          max_messages_per_day?: number
           created_at?: string
           updated_at?: string
         }
@@ -163,35 +157,6 @@ export type Database = {
           openrouter_key_created_at?: string | null
           created_at?: string
           updated_at?: string
-        }
-      }
-      usage_metrics: {
-        Row: {
-          id: string
-          subscription_id: string
-          date: string
-          messages_sent: number
-          agents_used: number
-          storage_used_gb: number
-          created_at: string
-        }
-        Insert: {
-          id?: string
-          subscription_id: string
-          date: string
-          messages_sent: number
-          agents_used: number
-          storage_used_gb: number
-          created_at?: string
-        }
-        Update: {
-          id?: string
-          subscription_id?: string
-          date?: string
-          messages_sent?: number
-          agents_used?: number
-          storage_used_gb?: number
-          created_at?: string
         }
       }
     }

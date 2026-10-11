@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from mindroom.api.config_lifecycle import ApiSnapshot
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
@@ -12,8 +14,6 @@ from mindroom.oauth.providers import OAuthProvider
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def _runtime_paths(tmp_path: Path) -> RuntimePaths:
@@ -36,9 +36,50 @@ def _provider(provider_id: str) -> OAuthProvider:
         authorization_url="https://auth.example.test/authorize",
         token_url="https://auth.example.test/token",  # noqa: S106
         scopes=("read",),
-        credential_service=provider_id,
+        credential_service=f"{provider_id}_oauth",
         client_config_services=(f"{provider_id}_oauth_client",),
     )
+
+
+def test_builtin_oauth_registry_includes_google_docs() -> None:
+    """The built-in provider registry should expose Google Docs independently from Drive."""
+    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
+
+    assert providers["google_docs"].credential_service == "google_docs_oauth"
+    assert providers["google_docs"].tool_config_service == "google_docs"
+    assert providers["google_drive"].scopes[-1] == "https://www.googleapis.com/auth/drive"
+
+
+def test_builtin_oauth_registry_includes_google_cloud() -> None:
+    """Google Cloud is a built-in provider whose tools keep settings under their own tool names."""
+    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
+
+    assert providers["google_cloud"].credential_service == "google_cloud_oauth"
+    assert providers["google_cloud"].tool_config_service is None
+    assert providers["google_cloud"].scopes[-1] == "https://www.googleapis.com/auth/cloud-platform.read-only"
+
+
+def test_builtin_oauth_registry_includes_github() -> None:
+    """GitHub should participate in built-in discovery and service-collision checks."""
+    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
+
+    assert providers["github"].credential_service == "github_oauth"
+    assert providers["github"].tool_config_service == "github"
+
+
+def test_oauth_provider_rejects_token_suffix_for_tool_config_service() -> None:
+    """Dashboard-editable provider settings cannot use the reserved OAuth token suffix."""
+    with pytest.raises(ValueError, match=r"tool_config_service.*must not end with '_oauth'"):
+        OAuthProvider(
+            id="demo",
+            display_name="Demo",
+            authorization_url="https://auth.example.test/authorize",
+            token_url="https://auth.example.test/token",  # noqa: S106
+            scopes=("read",),
+            credential_service="demo_oauth",
+            tool_config_service="demo_settings_oauth",
+            client_config_services=("demo_oauth_client",),
+        )
 
 
 def test_load_oauth_provider_registry_caches_loaded_registry(
@@ -119,17 +160,18 @@ def test_load_oauth_providers_uses_config_cache_key(
     assert calls == [(config, runtime_paths, ("config", id(config), runtime_paths, False), False)]
 
 
-def test_load_oauth_providers_for_snapshot_hydrates_config_before_shared_load(
+def test_load_oauth_providers_for_snapshot_uses_runtime_config_and_cache_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Snapshot loading should preserve hydration and snapshot-specific cache key shape."""
+    """Snapshot loading should pass the snapshot's runtime config and cache key shape through."""
     runtime_paths = _runtime_paths(tmp_path)
+    runtime_config = Config.validate_with_runtime({"agents": {}}, runtime_paths)
     snapshot = ApiSnapshot(
         generation=7,
         runtime_paths=runtime_paths,
         config_data={"agents": {}},
-        runtime_config=None,
+        runtime_config=runtime_config,
     )
     expected_providers = {"provider": _provider("provider")}
     calls: list[tuple[Config, RuntimePaths, tuple[object, ...], bool]] = []
@@ -149,10 +191,39 @@ def test_load_oauth_providers_for_snapshot_hydrates_config_before_shared_load(
     providers = oauth_registry.load_oauth_providers_for_snapshot(snapshot, skip_broken_plugins=False)
 
     assert providers is expected_providers
+    assert calls == [(runtime_config, runtime_paths, ("snapshot", 7, id(snapshot), runtime_paths, False), False)]
+
+
+def test_load_oauth_providers_for_pre_load_snapshot_falls_back_to_empty_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Snapshots published before the first config load should use an empty config."""
+    runtime_paths = _runtime_paths(tmp_path)
+    snapshot = ApiSnapshot(
+        generation=0,
+        runtime_paths=runtime_paths,
+        config_data={},
+        runtime_config=None,
+    )
+    expected_providers = {"provider": _provider("provider")}
+    calls: list[Config] = []
+
+    def load_registry(
+        received_config: Config,
+        received_runtime_paths: RuntimePaths,
+        cache_key: tuple[object, ...],
+        *,
+        skip_broken_plugins: bool,
+    ) -> dict[str, OAuthProvider]:
+        del received_runtime_paths, cache_key, skip_broken_plugins
+        calls.append(received_config)
+        return expected_providers
+
+    monkeypatch.setattr(oauth_registry, "_load_oauth_provider_registry", load_registry)
+
+    providers = oauth_registry.load_oauth_providers_for_snapshot(snapshot)
+
+    assert providers is expected_providers
     assert len(calls) == 1
-    received_config, received_runtime_paths, cache_key, skip_broken_plugins = calls[0]
-    assert isinstance(received_config, Config)
-    assert received_config.authored_model_dump() == {"agents": {}}
-    assert received_runtime_paths == runtime_paths
-    assert cache_key == ("snapshot", 7, id(snapshot), runtime_paths, False)
-    assert skip_broken_plugins is False
+    assert calls[0].authored_model_dump() == {}

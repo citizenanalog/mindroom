@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import (
+from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
+    ToolManagedInitArg,
     ToolStatus,
-    register_tool_with_metadata,
 )
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from mindroom.custom_tools.coding import CodingTools
@@ -20,11 +22,14 @@ if TYPE_CHECKING:
 @register_tool_with_metadata(
     name="coding",
     display_name="Coding Tools",
-    description="Advanced code-oriented file operations (precise edits, grep, and discovery). Prefer this over file for coding agents; keep file for backward compatibility.",
+    description="Find code, search across files, and make precise edits",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.AGENT,
+    managed_init_args=(ToolManagedInitArg.FILE_ACCESS,),
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.WORKER,
+    consumes_workspace_paths=True,
     icon="Code",
     icon_color="text-purple-500",
     config_fields=[
@@ -36,14 +41,6 @@ if TYPE_CHECKING:
             default=None,
             description="Working directory for file operations. Defaults to current directory.",
             authored_override=False,
-        ),
-        ConfigField(
-            name="restrict_to_base_dir",
-            label="Restrict To Base Dir",
-            type="boolean",
-            required=False,
-            default=True,
-            description="Whether file access must stay under base_dir. Relative paths still resolve from base_dir.",
         ),
     ],
     dependencies=[],

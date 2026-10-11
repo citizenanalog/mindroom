@@ -16,7 +16,7 @@ from hypothesis.stateful import RuleBasedStateMachine, rule, invariant, initiali
 os.environ["PLATFORM_DOMAIN"] = "test.mindroom.chat"
 os.environ["ENVIRONMENT"] = "test"
 
-from backend.routes import provisioner  # noqa: E402
+from backend.services import provisioner_service  # noqa: E402
 
 
 class TestProvisionerCommandValidation:
@@ -57,22 +57,11 @@ class TestProvisionerCommandValidation:
     @pytest.mark.asyncio
     async def test_helm_install_command_validates_required_values(self):
         """Verify Helm command includes all required values."""
-        # Set environment before importing to ensure correct values
-        os.environ["PLATFORM_DOMAIN"] = "test.mindroom.chat"
-        os.environ["ENVIRONMENT"] = "test"
-
-        # Force reimport to pick up environment variables
-        import sys
-
-        if "backend.config" in sys.modules:
-            del sys.modules["backend.config"]
-        if "backend.routes.provisioner" in sys.modules:
-            del sys.modules["backend.routes.provisioner"]
-
         from backend.routes.provisioner import provision_instance
 
         captured_helm_args = []
         captured_secret_manifests = []
+        captured_secret_patches = []
         operations = []
 
         async def capture_helm_command(args):
@@ -84,11 +73,24 @@ class TestProvisionerCommandValidation:
             if args[:2] == ["apply", "-f"]:
                 captured_secret_manifests.append(json.loads(Path(args[2]).read_text(encoding="utf-8")))
                 operations.append("secret")
+            if args[:3] == ["get", "secret", "mindroom-api-keys-123"] and "--ignore-not-found" not in args:
+                # The live Secret still holds the platform key written by older releases.
+                live_keys = [*captured_secret_manifests[-1]["stringData"], "supabase_service_key"]
+                return (0, " ".join(live_keys), "")
+            if args[:2] == ["patch", "secret"]:
+                captured_secret_patches.append(json.loads(args[args.index("-p") + 1]))
             return (0, "Success", "")
 
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.run_helm", side_effect=capture_helm_command):
-                with patch("backend.routes.provisioner.run_kubectl", side_effect=capture_kubectl_command):
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch.multiple(
+                "backend.services.provisioner_service",
+                PROVISIONER_API_KEY="test-key",
+                INSTANCE_BASE_DOMAIN="test.mindroom.chat",
+            ),
+        ):
+            with patch("backend.services.provisioner_service.run_helm", side_effect=capture_helm_command):
+                with patch("backend.services.provisioner_service.run_kubectl", side_effect=capture_kubectl_command):
                     with patch("backend.routes.provisioner.ensure_supabase") as mock_sb:
                         # Minimal mocking - just database
                         mock_sb.return_value.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
@@ -137,17 +139,25 @@ class TestProvisionerCommandValidation:
         assert "sandbox_proxy_token" not in set_args
         assert "credentials_encryption_key" not in set_args
         assert "matrix_registration_shared_secret" not in set_args
+        assert "platform_sso_secret" not in set_args
         assert set_file_args == {}
 
         secret_data = captured_secret_manifests[0]["stringData"]
         assert secret_data["sandbox_proxy_token"]
         assert secret_data["credentials_encryption_key"]
         assert secret_data["matrix_registration_shared_secret"]
-        assert operations == ["helm", "secret"]
+        assert secret_data["platform_sso_secret"]
+        assert secret_data["platform_sso_secret"] != secret_data["matrix_registration_shared_secret"]
+        assert "supabase_service_key" not in secret_data
+        # Before Helm so restarted pods read new values; after Helm in case legacy pruning deleted it.
+        assert operations == ["secret", "helm", "secret"]
+        assert captured_secret_manifests[0] == captured_secret_manifests[1]
+        # Stale-key cleanup removes only the retired platform key, never a key the provisioner still writes.
+        assert captured_secret_patches == [{"data": {"supabase_service_key": None}}] * 2
 
     def test_instance_secrets_are_stable_and_instance_scoped(self):
         """Provisioner-derived instance secrets should be stable without being shared across tenants."""
-        provisioner_module = importlib.import_module("backend.routes.provisioner")
+        provisioner_module = importlib.import_module("backend.services.provisioner_service")
         with patch.multiple(
             provisioner_module,
             INSTANCE_CREDENTIALS_ENCRYPTION_SECRET="root-secret",
@@ -157,10 +167,13 @@ class TestProvisionerCommandValidation:
             second = provisioner_module._instance_credentials_encryption_key("123")
             other = provisioner_module._instance_credentials_encryption_key("456")
             registration_secret = provisioner_module._instance_matrix_registration_shared_secret("123")
+            platform_sso_secret = provisioner_module.instance_platform_sso_secret("123")
+            other_platform_sso_secret = provisioner_module.instance_platform_sso_secret("456")
 
         assert first == second
         assert first != other
         assert first != registration_secret
+        assert platform_sso_secret not in {first, registration_secret, other_platform_sso_secret}
         assert len(base64.urlsafe_b64decode(f"{first}=")) == 32
         assert len(base64.urlsafe_b64decode(f"{registration_secret}=")) == 32
 
@@ -170,21 +183,61 @@ class TestProvisionerCommandValidation:
         captured = {}
 
         async def capture_kubectl_command(args, namespace=None):
-            path = Path(args[2])
-            captured["mode"] = path.stat().st_mode & 0o777
-            captured["manifest"] = json.loads(path.read_text(encoding="utf-8"))
-            return (0, "Success", "")
+            if args[:2] == ["apply", "-f"]:
+                path = Path(args[2])
+                captured["mode"] = path.stat().st_mode & 0o777
+                captured["manifest"] = json.loads(path.read_text(encoding="utf-8"))
+                return (0, "Success", "")
+            return (0, "credentials_encryption_key ", "")
 
-        with patch.object(provisioner, "run_kubectl", side_effect=capture_kubectl_command):
-            await provisioner._apply_instance_secret(
-                "123",
-                "mindroom-instances",
-                {"credentials_encryption_key": "secret-key-value"},
+        with patch.object(provisioner_service, "run_kubectl", side_effect=capture_kubectl_command):
+            await provisioner_service._apply_instance_secret(
+                "123", "mindroom-instances", {"credentials_encryption_key": "secret-key-value"}
             )
 
         assert captured["mode"] == 0o600
         assert captured["manifest"]["metadata"]["name"] == "mindroom-api-keys-123"
         assert captured["manifest"]["stringData"]["credentials_encryption_key"] == "secret-key-value"
+
+    @pytest.mark.asyncio
+    async def test_instance_secret_apply_removes_keys_no_longer_written(self):
+        """Re-applying must delete retired keys such as the old platform service key from tenant Secrets."""
+        calls = []
+
+        async def capture_kubectl_command(args, namespace=None):
+            calls.append((args, namespace))
+            if args[:2] == ["get", "secret"]:
+                return (0, "credentials_encryption_key supabase_service_key ", "")
+            return (0, "Success", "")
+
+        with patch.object(provisioner_service, "run_kubectl", side_effect=capture_kubectl_command):
+            await provisioner_service._apply_instance_secret(
+                "123", "mindroom-instances", {"credentials_encryption_key": "secret-key-value"}
+            )
+
+        patch_args, patch_namespace = calls[-1]
+        assert patch_args[:4] == ["patch", "secret", "mindroom-api-keys-123", "--type=merge"]
+        assert json.loads(patch_args[5]) == {"data": {"supabase_service_key": None}}
+        assert patch_namespace == "mindroom-instances"
+        assert "secret-key-value" not in " ".join(arg for args, _ in calls for arg in args)
+
+    @pytest.mark.asyncio
+    async def test_instance_secret_apply_skips_patch_without_stale_keys(self):
+        """An up-to-date Secret needs no follow-up patch."""
+        calls = []
+
+        async def capture_kubectl_command(args, namespace=None):
+            calls.append(args)
+            if args[:2] == ["get", "secret"]:
+                return (0, "credentials_encryption_key ", "")
+            return (0, "Success", "")
+
+        with patch.object(provisioner_service, "run_kubectl", side_effect=capture_kubectl_command):
+            await provisioner_service._apply_instance_secret(
+                "123", "mindroom-instances", {"credentials_encryption_key": "secret-key-value"}
+            )
+
+        assert [args[0] for args in calls] == ["apply", "get"]
 
     @pytest.mark.asyncio
     async def test_helm_install_command_honors_instance_overrides(self):
@@ -204,9 +257,11 @@ class TestProvisionerCommandValidation:
             return (0, "Success", "")
 
         with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
             patch.multiple(
-                "backend.routes.provisioner",
+                "backend.services.provisioner_service",
                 PROVISIONER_API_KEY="test-key",
+                PLATFORM_DOMAIN="platform.example.test",
                 INSTANCE_BASE_DOMAIN="local",
                 INSTANCE_STORAGE_CLASS_NAME="standard",
                 INSTANCE_MINDROOM_IMAGE="ghcr.io/mindroom-ai/mindroom:latest",
@@ -216,6 +271,7 @@ class TestProvisionerCommandValidation:
                 INSTANCE_SYNAPSE_IMAGE_PULL_POLICY="IfNotPresent",
                 INSTANCE_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
                 INSTANCE_TRUSTED_UPSTREAM_USER_ID_HEADER="X-MindRoom-User-Id",
+                INSTANCE_TRUSTED_UPSTREAM_EMAIL_DOMAIN="example.com",
                 INSTANCE_TRUSTED_UPSTREAM_EMAIL_HEADER="X-MindRoom-User-Email",
                 INSTANCE_TRUSTED_UPSTREAM_MATRIX_USER_ID_HEADER="X-MindRoom-Matrix-User-Id",
                 INSTANCE_TRUSTED_UPSTREAM_EMAIL_TO_MATRIX_USER_ID_TEMPLATE="@{localpart}:example.org",
@@ -232,18 +288,15 @@ class TestProvisionerCommandValidation:
                 INSTANCE_MATRIX_OIDC_CLIENT_ID="mindroom-synapse",
                 INSTANCE_MATRIX_OIDC_CLIENT_SECRET="matrix-client-secret",
             ),
-            patch("backend.routes.provisioner.run_helm", side_effect=capture_helm_command),
-            patch("backend.routes.provisioner.run_kubectl", side_effect=capture_kubectl_command),
-            patch("backend.routes.provisioner.wait_for_deployment_ready", return_value=True),
+            patch("backend.services.provisioner_service.run_helm", side_effect=capture_helm_command),
+            patch("backend.services.provisioner_service.run_kubectl", side_effect=capture_kubectl_command),
+            patch("backend.services.provisioner_service.wait_for_deployment_ready", return_value=True),
             patch("backend.routes.provisioner.ensure_supabase") as mock_sb,
         ):
             mock_sb.return_value.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
 
             await provision_instance(
-                None,
-                {"subscription_id": "sub-123", "account_id": "acc-123", "tier": "byok"},
-                "Bearer test-key",
-                None,
+                None, {"subscription_id": "sub-123", "account_id": "acc-123", "tier": "byok"}, "Bearer test-key", None
             )
 
         helm_args = captured_helm_args[0]
@@ -262,6 +315,7 @@ class TestProvisionerCommandValidation:
                 set_file_args[key] = value
 
         assert set_args["baseDomain"] == "local"
+        assert set_args["platformDomain"] == "platform.example.test"
         assert set_args["storageClassName"] == "standard"
         assert set_args["mindroom_image"] == "ghcr.io/mindroom-ai/mindroom:latest"
         assert set_args["mindroom_image_pull_policy"] == "IfNotPresent"
@@ -272,6 +326,7 @@ class TestProvisionerCommandValidation:
         assert set_args["synapse_image_pull_policy"] == "IfNotPresent"
         assert set_args["trustedUpstreamAuth.enabled"] == "true"
         assert set_args["trustedUpstreamAuth.userIdHeader"] == "X-MindRoom-User-Id"
+        assert set_args["trustedUpstreamAuth.emailDomain"] == "example.com"
         assert set_args["trustedUpstreamAuth.emailHeader"] == "X-MindRoom-User-Email"
         assert set_args["trustedUpstreamAuth.matrixUserIdHeader"] == "X-MindRoom-Matrix-User-Id"
         assert set_args["trustedUpstreamAuth.emailToMatrixUserIdTemplate"] == "@{localpart}:example.org"
@@ -325,14 +380,15 @@ class TestProvisionerCommandValidation:
             return (0, "", "")
 
         with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
             patch.multiple(
-                "backend.routes.provisioner",
+                "backend.services.provisioner_service",
                 PROVISIONER_API_KEY="test-key",
                 INSTANCE_STORAGE_CLASS_NAME="hcloud-volumes",
             ),
-            patch("backend.routes.provisioner.run_helm", side_effect=capture_helm_command),
-            patch("backend.routes.provisioner.run_kubectl", side_effect=capture_kubectl_command),
-            patch("backend.routes.provisioner.wait_for_deployment_ready", return_value=True),
+            patch("backend.services.provisioner_service.run_helm", side_effect=capture_helm_command),
+            patch("backend.services.provisioner_service.run_kubectl", side_effect=capture_kubectl_command),
+            patch("backend.services.provisioner_service.wait_for_deployment_ready", return_value=True),
             patch("backend.routes.provisioner.ensure_supabase") as mock_sb,
         ):
             mock_sb.return_value.table().update().eq().execute.return_value = Mock(data=[{"instance_id": "1"}])
@@ -363,9 +419,12 @@ class TestProvisionerCommandValidation:
             captured_kubectl_args.append((args, namespace))
             return (0, "Success", "")
 
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.run_kubectl", side_effect=capture_kubectl):
-                with patch("backend.routes.provisioner.check_deployment_exists", return_value=True):
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-key"),
+        ):
+            with patch("backend.services.provisioner_service.run_kubectl", side_effect=capture_kubectl):
+                with patch("backend.services.provisioner_service.check_deployment_exists", return_value=True):
                     await stop_instance_provisioner(None, 123, "Bearer test-key")
 
         assert captured_kubectl_args == [
@@ -407,7 +466,7 @@ class TestProvisionerStateTransitions:
     def test_concurrent_state_changes_maintain_consistency(self):
         """Test that concurrent operations don't corrupt state."""
         import threading
-        from backend.db_utils import update_instance_status
+        from backend.services.instances_data import update_instance_status
 
         instance_id = 999
         results = []
@@ -430,7 +489,7 @@ class TestProvisionerStateTransitions:
             success = update_instance_status(instance_id, new_state)
             results.append((new_state, success))
 
-        with patch("backend.db_utils.ensure_supabase", return_value=_DummySB()):
+        with patch("backend.services.instances_data.ensure_supabase", return_value=_DummySB()):
             # Simulate concurrent updates
             threads = [
                 threading.Thread(target=update_state, args=("running",)),
@@ -521,13 +580,16 @@ class TestProvisionerErrorRecovery:
                 return (0, "Rolled back", "")
             return (0, "Success", "")
 
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.run_helm", side_effect=helm_with_failure):
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-key"),
+        ):
+            with patch("backend.services.provisioner_service.run_helm", side_effect=helm_with_failure):
                 with patch("backend.routes.provisioner.ensure_supabase") as mock_sb:
                     mock_sb.return_value.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
                     mock_sb.return_value.table().update().eq().execute.return_value = Mock()
 
-                    with patch("backend.routes.provisioner.run_kubectl") as mock_kubectl:
+                    with patch("backend.services.provisioner_service.run_kubectl") as mock_kubectl:
                         mock_kubectl.return_value = (0, "Success", "")
 
                         with pytest.raises(Exception):
@@ -554,9 +616,12 @@ class TestProvisionerErrorRecovery:
                 namespace_deleted = True
             return (0, "Success", "")
 
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.run_kubectl", side_effect=track_namespace_operations):
-                with patch("backend.routes.provisioner.run_helm") as mock_helm:
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-key"),
+        ):
+            with patch("backend.services.provisioner_service.run_kubectl", side_effect=track_namespace_operations):
+                with patch("backend.services.provisioner_service.run_helm") as mock_helm:
                     # Make Helm fail after namespace creation
                     mock_helm.return_value = (1, "", "Deployment failed")
 
@@ -699,8 +764,11 @@ class TestProvisionerRealScenarios:
         """Test when namespace exceeds resource quotas."""
         from backend.routes.provisioner import provision_instance
 
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.run_helm") as mock_helm:
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-key"),
+        ):
+            with patch("backend.services.provisioner_service.run_helm") as mock_helm:
                 # Real Kubernetes quota error
                 mock_helm.return_value = (
                     1,
@@ -709,7 +777,7 @@ class TestProvisionerRealScenarios:
                 )
 
                 with (
-                    patch("backend.routes.provisioner.run_kubectl", return_value=(0, "Success", "")),
+                    patch("backend.services.provisioner_service.run_kubectl", return_value=(0, "Success", "")),
                     patch("backend.routes.provisioner.ensure_supabase") as mock_sb,
                 ):
                     mock_sb.return_value.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
@@ -780,19 +848,22 @@ class TestProvisionerObservability:
         from backend.routes.provisioner import provision_instance
 
         # Capture logs
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.logger") as mock_logger:
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-key"),
+        ):
+            with patch("backend.services.provisioner_service.logger") as mock_logger:
                 with patch("backend.routes.provisioner.ensure_supabase") as mock_sb:
                     mock_sb.return_value.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
                     mock_sb.return_value.table().update().eq().execute.return_value = Mock()
 
-                    with patch("backend.routes.provisioner.run_kubectl") as mock_kubectl:
+                    with patch("backend.services.provisioner_service.run_kubectl") as mock_kubectl:
                         mock_kubectl.return_value = (0, "Success", "")
 
-                        with patch("backend.routes.provisioner.run_helm") as mock_helm:
+                        with patch("backend.services.provisioner_service.run_helm") as mock_helm:
                             mock_helm.return_value = (0, "Deployed", "")
 
-                            with patch("backend.routes.provisioner.wait_for_deployment_ready") as mock_wait:
+                            with patch("backend.services.provisioner_service.wait_for_deployment_ready") as mock_wait:
                                 mock_wait.return_value = True
 
                                 await provision_instance(
@@ -819,11 +890,14 @@ class TestProvisionerObservability:
         """Test that failures include enough context for debugging."""
         from backend.routes.provisioner import provision_instance
 
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"):
-            with patch("backend.routes.provisioner.run_kubectl") as mock_kubectl:
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-key"),
+        ):
+            with patch("backend.services.provisioner_service.run_kubectl") as mock_kubectl:
                 mock_kubectl.return_value = (0, "Success", "")
 
-                with patch("backend.routes.provisioner.run_helm") as mock_helm:
+                with patch("backend.services.provisioner_service.run_helm") as mock_helm:
                     mock_helm.return_value = (1, "", "Connection refused")
 
                     with patch("backend.routes.provisioner.ensure_supabase") as mock_sb:

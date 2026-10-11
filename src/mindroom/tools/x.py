@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.x import XTools
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="x",
+    file_access=ToolFileAccess.NONE,
     display_name="X (Twitter)",
     description="Post tweets, send DMs, and search Twitter/X content",
     category=ToolCategory.SOCIAL,
@@ -86,7 +88,6 @@ if TYPE_CHECKING:
     function_names=(
         "create_post",
         "get_home_timeline",
-        "get_my_info",
         "get_user_info",
         "reply_to_post",
         "search_posts",

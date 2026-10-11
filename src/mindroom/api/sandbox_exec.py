@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import selectors
@@ -17,11 +18,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from mindroom import constants
+from mindroom.path_confinement import resolve_path_within_root
 from mindroom.runtime_env_policy import (
-    CREDENTIALS_ENCRYPTION_KEY_ENV,
     KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY,
     SANDBOX_RUNTIME_ENV_BY_KEY,
-    credentials_encryption_key_value,
+    SHARED_CREDENTIALS_PATH_ENV,
     is_trusted_tool_runtime_env_file_name,
     sandbox_runner_runtime_state_env,
     sandbox_subprocess_system_env,
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from mindroom.workers.backends.local import LocalWorkerStatePaths
 
 _DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+_TMPDIR_LINK_ROOT = Path("/tmp")  # noqa: S108
 _WORKSPACE_ENV_HOOK_RELATIVE_PATH = Path(".mindroom") / "worker-env.sh"
 _WORKSPACE_ENV_HOOK_TIMEOUT_SECONDS = 10.0
 _WORKSPACE_ENV_HOOK_MAX_SCRIPT_BYTES = 64 * 1024
@@ -44,7 +46,7 @@ _WORKSPACE_ENV_HOOK_MAX_VALUE_BYTES = 32 * 1024
 _WORKSPACE_ENV_HOOK_MAX_OVERLAY_BYTES = 128 * 1024
 _KUBERNETES_STORAGE_SUBPATH_PREFIX_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["storage_subpath_prefix"]
 _DEFAULT_WORKER_STORAGE_SUBPATH_PREFIX = "workers"
-EXECUTION_ENV_TOOL_NAMES = frozenset({"python", "shell"})
+EXECUTION_ENV_TOOL_NAMES = constants.EXECUTION_ENV_TOOL_NAMES
 
 
 def _runner_execution_mode(runtime_paths: RuntimePaths) -> str:
@@ -54,8 +56,13 @@ def _runner_execution_mode(runtime_paths: RuntimePaths) -> str:
 
 
 def runner_uses_subprocess(runtime_paths: RuntimePaths) -> bool:
-    """Return whether the runner should dispatch through a subprocess."""
-    return _runner_execution_mode(runtime_paths) == "subprocess"
+    """Return whether the runner should dispatch through a per-request child process."""
+    return _runner_execution_mode(runtime_paths) in {"subprocess", "forkserver"}
+
+
+def runner_uses_forkserver(runtime_paths: RuntimePaths) -> bool:
+    """Return whether per-request children should fork from a warm template process."""
+    return _runner_execution_mode(runtime_paths) == "forkserver"
 
 
 def runner_subprocess_timeout_seconds(runtime_paths: RuntimePaths) -> float:
@@ -153,18 +160,48 @@ def request_execution_env(
     """Return the effective runtime-scoped execution env for one request."""
     if tool_name not in EXECUTION_ENV_TOOL_NAMES:
         return {}
-    if tool_name == "shell":
-        source_env = execution_env or runtime_paths.process_env
-        return dict(
-            constants.sandbox_shell_execution_runtime_env_values(
-                runtime_paths,
-                extra_env_passthrough=extra_env_passthrough,
-                process_env=source_env,
-            ),
-        )
+    # Agent Vault egress is composed from the worker pod's own token + endpoint,
+    # so it is always overlaid here at the worker (never shipped from the
+    # primary, which has neither the token nor the endpoint env).
+    worker_local_env = {**runtime_paths.process_env, **os.environ}
+    agent_vault_env = constants.worker_proxy_execution_env(worker_local_env)
     if execution_env:
-        return dict(execution_env)
-    return dict(constants.execution_tool_runtime_env_values(runtime_paths))
+        protected_env_names = _protected_dedicated_worker_execution_env_names(runtime_paths)
+        if protected_env_names:
+            # The primary's HOME is a host path; a dedicated worker keeps its own HOME until the
+            # workspace HOME contract replaces it, so only the incoming request env drops it.
+            protected_env_names |= {"HOME"}
+        env = {key: value for key, value in execution_env.items() if key not in protected_env_names}
+        env.update(agent_vault_env)
+        return env
+    shell_process_env = (
+        runtime_paths.process_env
+        if runner_uses_dedicated_worker(runtime_paths)
+        else {**os.environ, **runtime_paths.process_env}
+    )
+    return (
+        constants.build_execution_tool_env(
+            tool_name,
+            runtime_paths,
+            extra_env_passthrough=extra_env_passthrough,
+            shell_process_env=shell_process_env,
+        )
+        | agent_vault_env
+    )
+
+
+def _protected_dedicated_worker_execution_env_names(runtime_paths: RuntimePaths) -> frozenset[str]:
+    """Return execution env names that a dedicated worker must keep worker-local."""
+    if not runner_uses_dedicated_worker(runtime_paths):
+        return frozenset()
+
+    protected_names = {"MINDROOM_CONFIG_PATH", "MINDROOM_STORAGE_PATH", SHARED_CREDENTIALS_PATH_ENV}
+    protected_names.update(
+        name for name in {*runtime_paths.process_env, *runtime_paths.env_file_values} if name.endswith("_FILE")
+    )
+    if runtime_paths.env_value("GOOGLE_APPLICATION_CREDENTIALS"):
+        protected_names.add("GOOGLE_APPLICATION_CREDENTIALS")
+    return frozenset(protected_names)
 
 
 def tool_runtime_paths_with_request_env(
@@ -172,13 +209,14 @@ def tool_runtime_paths_with_request_env(
     execution_env: dict[str, str],
     *,
     include_base_execution_env: bool = True,
-    include_credentials_encryption_key: bool = False,
     trusted_env_overlay: Mapping[str, str] | None = None,
 ) -> RuntimePaths:
     """Return runtime paths overlaid with one tool-request env snapshot."""
+    protected_env_names = _protected_dedicated_worker_execution_env_names(runtime_paths)
+    overlay_env = {key: value for key, value in execution_env.items() if key not in protected_env_names}
     process_env = dict(constants.trusted_tool_runtime_env_values(runtime_paths)) if include_base_execution_env else {}
     process_env.update(sandbox_runner_runtime_state_env(runtime_paths.process_env))
-    process_env.update(execution_env)
+    process_env.update(overlay_env)
     env_file_values = (
         {
             key: value
@@ -188,15 +226,21 @@ def tool_runtime_paths_with_request_env(
         if include_base_execution_env
         else {}
     )
+    if protected_env_names:
+        process_env.update(
+            {key: runtime_paths.process_env[key] for key in protected_env_names if key in runtime_paths.process_env},
+        )
+        env_file_values.update(
+            {
+                key: runtime_paths.env_file_values[key]
+                for key in protected_env_names
+                if key in runtime_paths.env_file_values
+            },
+        )
+    env_file_values.update(overlay_env)
     if trusted_env_overlay:
         env_file_values.update(trusted_env_overlay)
         process_env.update(trusted_env_overlay)
-    if include_credentials_encryption_key:
-        credentials_encryption_key = credentials_encryption_key_value(
-            runtime_paths.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV),
-        )
-        if credentials_encryption_key is not None:
-            process_env[CREDENTIALS_ENCRYPTION_KEY_ENV] = credentials_encryption_key
     return constants.RuntimePaths(
         config_path=runtime_paths.config_path,
         config_dir=runtime_paths.config_dir,
@@ -237,7 +281,34 @@ def generic_subprocess_env() -> dict[str, str]:
     """Build the baseline subprocess env for non-worker execution."""
     env = _subprocess_passthrough_env()
     env.update(vendor_telemetry_env_values())
+    for key in ("HOME", "PATH", "VIRTUAL_ENV"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    python_path_parts = [str(_project_src_path())]
+    existing_python_path = os.environ.get("PYTHONPATH", "")
+    if existing_python_path:
+        python_path_parts.append(existing_python_path)
+    env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
     return env
+
+
+def worker_tmp_dir(paths: LocalWorkerStatePaths) -> Path:
+    """Return the TMPDIR for one worker's tool subprocesses.
+
+    Chromium binds its SingletonSocket at `$TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket`,
+    and a Unix socket path holds at most 107 bytes, which the worker state path alone can exceed.
+    A short link in /tmp keeps socket paths short while temp files stay on the disk-backed state mount.
+    When this process cannot create the link, or the name leads anywhere else, the long path stays.
+    """
+    digest = hashlib.sha256(os.fsencode(paths.tmp_dir)).hexdigest()[:16]
+    link = _TMPDIR_LINK_ROOT / f"mindroom-{digest}"
+    with suppress(OSError):
+        link.symlink_to(paths.tmp_dir)
+    with suppress(OSError):
+        if link.lstat().st_uid == os.geteuid() and link.readlink() == paths.tmp_dir:
+            return link
+    return paths.tmp_dir
 
 
 def worker_subprocess_env(paths: LocalWorkerStatePaths) -> dict[str, str]:
@@ -248,6 +319,7 @@ def worker_subprocess_env(paths: LocalWorkerStatePaths) -> dict[str, str]:
     env["PIP_CACHE_DIR"] = str(paths.cache_dir / "pip")
     env["UV_CACHE_DIR"] = str(paths.cache_dir / "uv")
     env["PYTHONPYCACHEPREFIX"] = str(paths.cache_dir / "pycache")
+    env["TMPDIR"] = str(worker_tmp_dir(paths))
     env["VIRTUAL_ENV"] = str(paths.venv_dir)
 
     env["PATH"] = constants.subprocess_path_with_prepends(
@@ -298,8 +370,11 @@ def subprocess_worker_command(
     *,
     python_executable: str | None = None,
 ) -> list[str]:
-    """Build the sandbox subprocess worker command line."""
-    return [python_executable or sys.executable, "-m", "mindroom.api.sandbox_runner", subprocess_worker_arg]
+    """Build the sandbox subprocess worker command line.
+
+    `-P -s`: a workspace cwd or `HOME` must not shadow MindRoom modules or inject site code.
+    """
+    return [python_executable or sys.executable, "-P", "-s", "-m", "mindroom.api.sandbox_runner", subprocess_worker_arg]
 
 
 class WorkspaceEnvHookError(RuntimeError):
@@ -336,16 +411,16 @@ def resolve_workspace_env_hook_path(base_dir: Path | str | None) -> Path | None:
     if not candidate.exists():
         return None
     try:
-        candidate_resolved = candidate.resolve()
+        candidate_resolved = resolve_path_within_root(base_resolved, candidate, symlinks="internal")
     except OSError as exc:
         msg = f"Failed to resolve .mindroom/worker-env.sh: {exc}"
         raise WorkspaceEnvHookError(msg) from exc
-    if not candidate_resolved.is_relative_to(base_resolved):
+    except ValueError:
         msg = (
             f".mindroom/worker-env.sh resolves outside of {base_resolved}; "
             "agent-editable workspace hooks must stay inside the resolved tool workspace."
         )
-        raise WorkspaceEnvHookError(msg)
+        raise WorkspaceEnvHookError(msg) from None
     if not candidate_resolved.is_file():
         return None
     try:

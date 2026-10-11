@@ -6,14 +6,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict, cast
 
-from mindroom.thread_utils import create_session_id
+from mindroom.session_ids import create_session_id
 
 if TYPE_CHECKING:
-    from mindroom.scheduling import ScheduledWorkflow
-    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.scheduling.tasks import ScheduledWorkflow
 
 
-class MessageTargetMetadata(TypedDict):
+class _MessageTargetMetadata(TypedDict):
     """JSON-safe persisted conversation-target identity."""
 
     room_id: str
@@ -21,6 +20,14 @@ class MessageTargetMetadata(TypedDict):
     resolved_thread_id: str | None
     reply_to_event_id: str | None
     session_id: str
+
+
+@dataclass(frozen=True)
+class ResponseLifecycleKey:
+    """Response-lifecycle identity: one room-level or threaded conversation in one room."""
+
+    room_id: str
+    thread_id: str | None
 
 
 @dataclass(frozen=True)
@@ -57,13 +64,18 @@ class MessageTarget:
         return self.resolved_thread_id is None
 
     @property
+    def lifecycle_key(self) -> ResponseLifecycleKey:
+        """Return the response-lifecycle identity this target serializes under."""
+        return ResponseLifecycleKey(room_id=self.room_id, thread_id=self.resolved_thread_id)
+
+    @property
     def log_context(self) -> dict[str, str | None]:
         """Return the canonical room/thread log fields for this target."""
         return {"room_id": self.room_id, "thread_id": self.resolved_thread_id}
 
     _build_session_id = staticmethod(create_session_id)
 
-    def to_metadata(self) -> MessageTargetMetadata:
+    def to_metadata(self) -> _MessageTargetMetadata:
         """Return JSON-safe conversation-target metadata."""
         return {
             "room_id": self.room_id,
@@ -108,17 +120,6 @@ class MessageTarget:
             thread_id=None if workflow.new_thread else workflow.thread_id,
             reply_to_event_id=None,
             room_mode=workflow.new_thread or workflow.thread_id is None,
-        )
-
-    @classmethod
-    def from_runtime_context(cls, context: ToolRuntimeContext) -> MessageTarget:
-        """Build the canonical target represented by one tool runtime context."""
-        return cls(
-            room_id=context.room_id,
-            source_thread_id=context.thread_id,
-            resolved_thread_id=context.resolved_thread_id,
-            reply_to_event_id=context.reply_to_event_id,
-            session_id=context.session_id or cls._build_session_id(context.room_id, context.resolved_thread_id),
         )
 
     def with_thread_root(self, resolved_thread_id: str | None) -> MessageTarget:
