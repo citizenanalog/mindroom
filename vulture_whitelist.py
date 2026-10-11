@@ -34,6 +34,7 @@ egress_services  # JSON response field set on the catalog by its route (src/mind
 inactive_services  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_credentials.py)
 scope_agents  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_credentials.py)
 managers  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_credentials.py)
+placeholder_names  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_credentials.py)
 is_administrator  # JSON response field consumed by the Connections header (src/mindroom/api/connections.py)
 me  # FastAPI route (src/mindroom/api/connections.py)
 connect_egress_account  # FastAPI route (src/mindroom/api/egress_credentials.py)

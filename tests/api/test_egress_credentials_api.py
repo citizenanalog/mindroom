@@ -2165,6 +2165,39 @@ def test_listing_summarizes_where_each_service_applies_and_nothing_else(egress_p
     assert {row["name"]: row["rules"] for row in personal["egress_services"]}["own"] == rows["own"]["rules"]
 
 
+def test_listing_names_the_placeholder_variables_each_service_sets(egress_portal: dict[str, Any]) -> None:
+    """Each service lists its placeholder variables by name, preset ones included, so the editor can warn about a clash."""
+    portal = egress_portal
+    portal["payload"]["egress_broker"]["services"]["github_cli"] = {"preset": "github"}
+    portal["payload"]["egress_broker"]["services"]["billing"] = {
+        "description": "Billing API",
+        "rules": [{"host": "billing.example.com", "auth": {"type": "bearer"}}],
+        "placeholder_env": {"BILLING_API_KEY": "mindroom-brokered", "BILLING_TOKEN": "mindroom-brokered"},
+    }
+    _publish_config(main.app, portal["paths"], portal["payload"])
+    _use_runtime_auth_settings(main.app)
+    own = {**_NOTES, "placeholder_env": {"NOTES_API_KEY": "mindroom-brokered"}}
+    assert _put_service(portal, "alice", "personal", "notes", own).status_code == 204
+
+    rows = {service["name"]: service for service in _listed_services(portal, "alice", "personal")}
+
+    assert rows["github"]["placeholder_names"] == []
+    assert rows["github_cli"]["placeholder_names"] == ["GH_TOKEN", "GITHUB_TOKEN"]
+    assert rows["billing"]["placeholder_names"] == ["BILLING_API_KEY", "BILLING_TOKEN"]
+    assert rows["notes"]["placeholder_names"] == ["NOTES_API_KEY"]
+    listing = portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"]).text
+    assert "mindroom-brokered" not in listing
+    # The portal catalog carries the same names for its egress rows.
+    catalog = portal["client"].get("/api/connections", headers=portal["headers"]["alice"]).json()
+    personal = next(agent for agent in catalog["agents"] if agent["agent_name"] == "personal")
+    assert {row["name"]: row["placeholder_names"] for row in personal["egress_services"]}["billing"] == [
+        "BILLING_API_KEY",
+        "BILLING_TOKEN",
+    ]
+    # Another requester never sees the names of a service defined in alice's own scope.
+    assert "notes" not in {service["name"] for service in _listed_services(portal, "bob", "personal")}
+
+
 def test_presets_are_served_as_the_config_model_expands_them(egress_portal: dict[str, Any]) -> None:
     """The editor learns every preset's name, login, rules, and placeholders from the server, with no auth settings."""
     response = egress_portal["client"].get("/api/connections/egress/presets", headers=egress_portal["headers"]["alice"])

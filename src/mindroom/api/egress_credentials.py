@@ -75,7 +75,9 @@ class EgressCredentialService(EgressSourceStatus):
 
     `source` is `config` for a service the administrator defines and `user` for one defined in the agent's own
     scope through the services routes. `rules` says where the service applies (host, port, path prefix), so a client
-    can tell which services overlap; it carries no auth settings.
+    can tell which services overlap; it carries no auth settings. `placeholder_names` lists the variables the
+    service sets in the sandbox (a preset's included), names only, so the editor can warn when a service of
+    one's own sets the same one.
     """
 
     name: str
@@ -85,6 +87,7 @@ class EgressCredentialService(EgressSourceStatus):
     can_manage: bool
     source: EgressServiceSource
     rules: list[EgressRuleSummary]
+    placeholder_names: list[str]
 
 
 class EgressInactiveService(BaseModel):
@@ -279,6 +282,7 @@ async def _build_service_for_agent(
         can_manage=can_manage,
         source=source,
         rules=rule_summaries(service),
+        placeholder_names=list(service.placeholder_env),
         **sources.model_dump(),
     )
 
