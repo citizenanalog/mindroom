@@ -12,6 +12,7 @@ import pytest
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.ca import materialize_ca_bundle
 from mindroom.egress_broker.rules import EgressRules
+from mindroom.egress_broker.secrets import SecretMissing, SecretNeedsReconnect
 from tests.egress_broker.conftest import audit_records, proxy_authorization
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
     import httpx
 
     from mindroom.egress_broker.audit import AuditLog
+    from mindroom.egress_broker.secrets import SecretResult
     from tests.egress_broker.conftest import BrokerFactory, RawResponse, Upstream
 
     ProxyClient = Callable[..., httpx.AsyncClient]
@@ -28,6 +30,9 @@ if TYPE_CHECKING:
 
 MISSING_KEY = "No svc key is set for this agent. Ask the user to add one at manage_url, then retry."
 TLS_REQUIRED = "Credentials are only added over HTTPS. Use https:// for localhost."
+MANAGE_URL = "https://m.test/connections/egress"
+CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
+GIT_USER_AGENT = {"User-Agent": "git/2.55.0"}
 _PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "git_askpass", "ssh_askpass"}
 
 
@@ -38,10 +43,12 @@ def _config(*, unmatched_hosts: str = "passthrough") -> EgressBrokerConfig:
     )
 
 
-def _plain_get(target: str, *, token: str | None, method: str = "GET") -> bytes:
+def _plain_get(target: str, *, token: str | None, method: str = "GET", git: bool = False) -> bytes:
     lines = [f"{method} {target} HTTP/1.1", "Host: localhost"]
     if token is not None:
         lines.append(f"Proxy-Authorization: {proxy_authorization(token)}")
+    if git:
+        lines.append(f"User-Agent: {GIT_USER_AGENT['User-Agent']}")
     return ("\r\n".join(lines) + "\r\n\r\n").encode()
 
 
@@ -148,7 +155,10 @@ async def test_git_discovery_refusal_in_a_tunnel_is_an_advertisement_ending_in_e
     """Git reads `ERR <message>` from a 200 advertisement and prints it; the audit row keeps the refusal code."""
     await broker(_config())
 
-    response = await proxy_client(broker.token()).get(tls_upstream.url(f"/repo.git/info/refs?service={service}"))
+    response = await proxy_client(broker.token()).get(
+        tls_upstream.url(f"/repo.git/info/refs?service={service}"),
+        headers=GIT_USER_AGENT,
+    )
 
     assert response.status_code == 200
     assert response.headers["content-type"] == f"application/x-{service}-advertisement"
@@ -174,8 +184,8 @@ async def test_plain_git_discovery_refusal_is_an_advertisement_but_the_proxy_cha
     started = await broker(_config())
     target = "http://localhost:1/repo.git/info/refs?service=git-upload-pack"
 
-    refused = await raw_proxy(started.port, _plain_get(target, token=broker.token()))
-    challenge = await raw_proxy(started.port, _plain_get(target, token=None))
+    refused = await raw_proxy(started.port, _plain_get(target, token=broker.token(), git=True))
+    challenge = await raw_proxy(started.port, _plain_get(target, token=None, git=True))
 
     assert refused.status == 200
     assert refused.headers["content-type"] == "application/x-git-upload-pack-advertisement"
@@ -208,12 +218,95 @@ async def test_other_requests_keep_the_json_refusal(
 
     response = await raw_proxy(
         started.port,
-        _plain_get(f"http://localhost:1{path}", token=broker.token(), method=method),
+        _plain_get(f"http://localhost:1{path}", token=broker.token(), method=method, git=True),
     )
 
     assert response.status == 403
     assert response.headers["content-type"] == "application/json"
     assert response.json()["error"] == "tls_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "git_form"),
+    [
+        (GIT_USER_AGENT, True),
+        ({"Git-Protocol": "version=2"}, True),
+        ({"User-Agent": "curl/8.10.1"}, False),
+        ({"User-Agent": "python-httpx/0.28 git/2.55.0"}, False),
+    ],
+    ids=["git-user-agent", "git-protocol-header", "curl", "git-later-in-user-agent"],
+)
+async def test_only_a_git_client_gets_the_git_form(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+    headers: dict[str, str],
+    git_form: bool,
+) -> None:
+    """A discovery URL fetched by anything but git keeps the JSON refusal its client can read."""
+    await broker(_config())
+
+    response = await proxy_client(broker.token()).get(
+        tls_upstream.url("/repo.git/info/refs?service=git-upload-pack"),
+        headers=headers,
+    )
+
+    assert response.headers["x-mindroom-error"] == "credential_not_configured"
+    if git_form:
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/x-git-upload-pack-advertisement"
+    else:
+        assert response.status_code == 403
+        assert response.json()["message"] == MISSING_KEY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lookup", "error_line", "json_message"),
+    [
+        (
+            SecretMissing(),
+            f"No svc key is set for this agent. Ask the user to add one at {MANAGE_URL}, then retry.",
+            MISSING_KEY,
+        ),
+        (
+            SecretMissing(provider="github", connect_url=CONNECT_URL),
+            f"No svc credential is set for this agent. Ask the user to connect it at {MANAGE_URL} "
+            f"or add a key at {MANAGE_URL}, then retry.",
+            "No svc credential is set for this agent. "
+            "Ask the user to connect it at connect_url or add a key at manage_url, then retry.",
+        ),
+        (
+            SecretNeedsReconnect(provider="github", connect_url=CONNECT_URL),
+            f"The github account for svc must be connected again. Ask the user to reconnect at {MANAGE_URL}.",
+            "The github account for svc must be connected again. Ask the user to reconnect at connect_url or manage_url.",
+        ),
+    ],
+    ids=["key-only", "connectable", "reconnect"],
+)
+async def test_git_error_line_names_the_manage_link_but_never_the_connect_link(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+    lookup: SecretResult,
+    error_line: str,
+    json_message: str,
+) -> None:
+    """Git shows only the ERR line, so it carries the manage link itself; the token-bearing connect link never."""
+    await broker(_config(), resolve_secret=lambda _claims, _service: lookup, manage_url=lambda _claims: MANAGE_URL)
+    client = proxy_client(broker.token())
+    url = tls_upstream.url("/repo.git/info/refs?service=git-upload-pack")
+
+    git = await client.get(url, headers=GIT_USER_AGENT)
+    other = await client.get(url)
+
+    assert git.content.endswith(_pkt_line(f"ERR {error_line}\n"))
+    assert b"one-time-token" not in git.content
+    # The JSON body and the reason phrase keep the field names: their clients read the links from the fields.
+    assert git.reason_phrase == json_message[:200]
+    assert other.json()["message"] == json_message
+    assert other.json()["manage_url"] == MANAGE_URL
 
 
 @pytest.mark.asyncio
@@ -226,7 +319,7 @@ async def test_a_target_that_does_not_parse_as_a_url_keeps_the_json_refusal(
 
     response = await raw_proxy(
         started.port,
-        _plain_get("http://[::1]localhost/repo.git/info/refs?service=git-upload-pack", token=broker.token()),
+        _plain_get("http://[::1]localhost/repo.git/info/refs?service=git-upload-pack", token=broker.token(), git=True),
     )
 
     assert response.status == 400

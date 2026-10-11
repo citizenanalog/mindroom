@@ -100,6 +100,7 @@ class Peer:
         # The request being answered, for the shape of a refusal; empty until one is read in this cycle.
         self.request_method = b""
         self.request_target = b""
+        self.request_from_git = False
         # Whether the connection must close after the response (RFC 9112 section 6.1).
         self.close_after_response = False
         self._idle_timeout = idle_timeout
@@ -129,6 +130,10 @@ class Peer:
         if isinstance(event, h11.Request):
             self.request_method = event.method
             self.request_target = event.target
+            self.request_from_git = any(
+                name == b"git-protocol" or (name == b"user-agent" and value.startswith(b"git/"))
+                for name, value in event.headers
+            )
             if consumed - len(self.conn.trailing_data[0]) > _MAX_REQUEST_HEAD:
                 msg = "Request head too large."
                 raise h11.RemoteProtocolError(msg, error_status_hint=431)
@@ -141,6 +146,7 @@ class Peer:
         self.conn.start_next_cycle()
         self.request_method = b""
         self.request_target = b""
+        self.request_from_git = False
         self.close_after_response = False
 
     async def send(self, *events: h11.Event) -> None:
@@ -197,6 +203,20 @@ def _git_discovery_service(method: bytes, target: bytes) -> str | None:
     return services[0]
 
 
+def _git_error_text(body: dict[str, object]) -> str:
+    """Return the message for git's ERR line, naming the body's `manage_url` itself, since git shows no other field.
+
+    The connect link is never named: it carries a one-time token. Where the message offers it, the manage link
+    stands in.
+    """
+    message = str(body["message"])
+    link = body.get("manage_url")
+    if not isinstance(link, str) or not link:
+        return message
+    message = message.replace("connect_url or manage_url", "manage_url").replace("connect_url", "manage_url")
+    return message.replace("manage_url", link)
+
+
 def _pkt_line(data: bytes) -> bytes:
     """Frame `data` as one git pkt-line: four hex digits giving the length, the prefix included, then the data."""
     return b"%04x" % (len(data) + 4) + data
@@ -213,22 +233,27 @@ async def send_json(
 
     Every refusal carries `X-MindRoom-Error: <code>`, and its reason phrase is the body's message (printable ASCII, at
     most 200 characters), so clients that print only the status line, such as urllib or `curl -f`, still show it.
-    A refusal of a git smart-HTTP discovery request (`GET .../info/refs?service=git-upload-pack` or
-    `git-receive-pack`) is a 200 advertisement whose pkt-lines end in `ERR <message>`, so git prints `remote error:
-    <message>` instead of a bare status; the caller's audit row keeps the refusal's own status and code. A 407 stays a
-    407 for git too: git's curl answers the challenge with the proxy credentials.
+    A git client's (`User-Agent: git/...` or a `Git-Protocol` header) refused smart-HTTP discovery request
+    (`GET .../info/refs?service=git-upload-pack` or `git-receive-pack`) gets a 200 advertisement whose pkt-lines end
+    in `ERR <message>`, the message naming the manage link itself, so git prints `remote error: <message>` instead of
+    a bare status; the caller's audit row keeps the refusal's own status and code. A 407 stays a 407 for git too:
+    git's curl answers the challenge with the proxy credentials.
     """
     if client.conn.our_state not in {h11.IDLE, h11.SEND_RESPONSE}:
         return
     code, message = str(body["error"]), str(body["message"])
-    git_service = None if status == 407 else _git_discovery_service(client.request_method, client.request_target)
+    git_service = (
+        _git_discovery_service(client.request_method, client.request_target)
+        if status != 407 and client.request_from_git
+        else None
+    )
     if git_service is None:
         content_type = b"application/json"
         payload = json.dumps(body).encode()
     else:
         status = 200
         content_type = f"application/x-{git_service}-advertisement".encode()
-        error = _printable(message, limit=_GIT_ERROR_LIMIT)
+        error = _printable(_git_error_text(body), limit=_GIT_ERROR_LIMIT)
         payload = _pkt_line(f"# service={git_service}\n".encode()) + b"0000" + _pkt_line(f"ERR {error}\n".encode())
     response = h11.Response(
         status_code=status,
