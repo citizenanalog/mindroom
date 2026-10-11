@@ -2892,7 +2892,7 @@ The tool calls still appear in the reply.
 If the summary and the current message together exceed the model's `context_window` minus `reserve_tokens`, the reply fails with `Saved conversation summary exceeds the available history budget` (see [Compacted history and redaction](#compacted-history-and-redaction)).
 If the summary model fails, the reply continues without compacting and may then fail with a provider error.
 
-The summary is always the first message of the replayed conversation, never part of the system prompt, so a compaction leaves the system prompt and tools unchanged and later requests reuse the new conversation prefix for provider prompt caching.
+A compaction leaves the system prompt and tools unchanged, so provider prompt caching keeps working after it.
 Agents, teams, subagents, workflow participants, and minimal-mode agents all compact the same way.
 
 ### Compacted history and redaction

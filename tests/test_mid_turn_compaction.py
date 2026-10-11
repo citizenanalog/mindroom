@@ -39,7 +39,7 @@ from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScope
 from mindroom.native_compaction import NativeCompactionModel
 from mindroom.synthetic_model import SyntheticModel
 from mindroom.usage_storage import project_usage
-from tests.conftest import FakeModel, seed_session
+from tests.conftest import FakeModel, runtime_paths_for, seed_session
 from tests.history_helpers import (
     RecordingCompactionLifecycle,
     _completed_run,
@@ -50,6 +50,7 @@ from tests.history_helpers import (
     archived_run_ids,
     compaction_generations,
 )
+from tests.test_agents import _test_config
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -725,8 +726,6 @@ async def test_scoped_compaction_after_resume_keeps_the_run_local_summary(
 
 
 def test_factories_install_mid_turn_compaction() -> None:
-    from tests.conftest import runtime_paths_for  # noqa: PLC0415
-    from tests.test_agents import _test_config  # noqa: PLC0415
 
     config = _test_config()
     agent = create_agent("calculator", config, runtime_paths_for(config), execution_identity=None)

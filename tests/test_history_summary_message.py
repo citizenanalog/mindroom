@@ -37,6 +37,8 @@ from mindroom.history.types import (
     ResolvedHistorySettings,
     ResolvedReplayPlan,
 )
+from tests.conftest import runtime_paths_for
+from tests.test_agents import _test_config
 from tests.test_agno_compat_message_builder import RecordingOpenAIChat, _paused_and_resumed_requests
 
 if TYPE_CHECKING:
@@ -297,8 +299,6 @@ async def test_approval_resume_replays_the_summary_once(kind: str) -> None:
 
 
 def test_mindroom_agents_never_render_the_summary_in_the_system_prompt() -> None:
-    from tests.conftest import runtime_paths_for  # noqa: PLC0415
-    from tests.test_agents import _test_config  # noqa: PLC0415
 
     config = _test_config()
     agent = create_agent("calculator", config, runtime_paths_for(config), execution_identity=None)
