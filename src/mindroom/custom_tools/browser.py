@@ -27,8 +27,8 @@ from playwright.async_api import Error as PlaywrightError
 
 from mindroom.atomic_file import atomic_write_bytes_at, atomic_write_file_at
 from mindroom.background_tasks import run_blocking_until_complete, run_coroutine_until_complete
-from mindroom.browser_fetch_guard import continue_or_abort_browser_fetch, run_browser_tool_url_check
-from mindroom.browser_profile import clear_stale_singleton_locks
+from mindroom.browser.fetch_guard import continue_or_abort_browser_fetch, run_browser_tool_url_check
+from mindroom.browser.profile_locks import clear_stale_singleton_locks
 from mindroom.custom_tools.attachments import resolve_context_attachment_path
 from mindroom.custom_tools.desktop_attachment import (
     register_runtime_screenshot_attachment,
@@ -44,6 +44,7 @@ from mindroom.matrix.olm_to_device import PinnedMatrixDevice
 from mindroom.media_delivery import image_result
 from mindroom.path_confinement import (
     open_directory_within_root,
+    read_regular_file_within_root,
     resolve_path_within_root,
 )
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
@@ -61,6 +62,7 @@ from mindroom.worker_computer.browser_proxy import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from typing import BinaryIO
 
     from playwright.async_api import Download
 
@@ -72,12 +74,17 @@ _DEFAULT_SNAPSHOT_LIMIT = 200
 _DEFAULT_AI_SNAPSHOT_MAX_CHARS = 12_000
 _DEFAULT_TIMEOUT_MS = 30_000
 _MAX_CONSOLE_ENTRIES = 200
+# A self-contained page an agent wrote, with embedded images; a larger file is not a page to check.
+_MAX_OPEN_FILE_BYTES = 16 * 1024 * 1024
+# Upload snapshots stay on disk until their tab closes, so bound what one browser holds at once.
+_MAX_STAGED_UPLOAD_BYTES = 256 * 1024 * 1024
 _VIEWPORT_WIDTH = 1280
 _VIEWPORT_HEIGHT = 720
 _PLAYWRIGHT_INSTALL_COMMAND = "uv run playwright install chromium"
 # Chromium binds its SingletonSocket in a new directory under TMPDIR, and a Unix
-# socket path holds at most 107 bytes. Dedicated workers point TMPDIR into their
-# long state path, where Chromium aborts at startup with "Socket path too long".
+# socket path holds at most 107 bytes. Under a long inherited TMPDIR, such as a worker
+# state path when the worker cannot link its temp directory into /tmp, Chromium aborts
+# at startup with "Socket path too long".
 _CHROMIUM_SINGLETON_SOCKET_SUFFIX = "/org.chromium.Chromium.XXXXXX/SingletonSocket"
 _UNIX_SOCKET_PATH_MAX_BYTES = 107
 
@@ -104,6 +111,15 @@ _BROWSER_ACTIONS = {
     "help",
 }
 
+# Actions that only return reference data and never use a browser.
+_REFERENCE_ACTIONS = frozenset({"actions", "help"})
+
+
+def is_reference_action(action: object) -> bool:
+    """Return whether a browser_control action only returns reference data and never uses a browser."""
+    return str(action).strip().lower() in _REFERENCE_ACTIONS
+
+
 _ACT_REQUEST_KINDS = (
     "click",
     "type",
@@ -124,7 +140,7 @@ _BROWSER_ACTION_TABLE = (
     {"action": "stop", "description": "Stop the selected browser profile."},
     {"action": "profiles", "description": "List known browser profiles."},
     {"action": "tabs", "description": "List tabs for the selected browser profile."},
-    {"action": "open", "description": "Open targetUrl in a new tab."},
+    {"action": "open", "description": "Open targetUrl, or one HTML file from paths, in a new tab."},
     {"action": "focus", "description": "Host target only: focus targetId; desktop does not support focus."},
     {
         "action": "close",
@@ -282,6 +298,7 @@ class _BrowserTabState:
     pending_dialog: dict[str, Any] | None = None
     console: list[dict[str, Any]] = field(default_factory=list)
     upload_staging: list[TemporaryDirectory[str]] = field(default_factory=list)
+    upload_staged_bytes: int = 0
 
 
 @dataclass
@@ -536,9 +553,29 @@ def _friendly_playwright_browser_error_message(exc: PlaywrightError) -> str | No
     )
 
 
-def _stage_browser_upload_paths(sources: list[AuthorizedFile], staging_dir: Path) -> list[str]:
-    """Snapshot authorized descriptors to private paths that Playwright can reopen."""
+def _copy_within_limit(source: BinaryIO, output: BinaryIO, max_bytes: int) -> int:
+    """Copy one file and return its size, refusing it as soon as it passes ``max_bytes``."""
+    copied = 0
+    while chunk := source.read(1024 * 1024):
+        copied += len(chunk)
+        if copied > max_bytes:
+            msg = (
+                f"Browser uploads keep at most {_MAX_STAGED_UPLOAD_BYTES // (1024 * 1024)} MiB of files "
+                "until their tabs close; close tabs to release earlier uploads."
+            )
+            raise ValueError(msg)
+        output.write(chunk)
+    return copied
+
+
+def _stage_browser_upload_paths(
+    sources: list[AuthorizedFile],
+    staging_dir: Path,
+    max_bytes: int,
+) -> tuple[list[str], int]:
+    """Snapshot authorized descriptors to private paths that Playwright can reopen, and return their total size."""
     staged_paths: list[str] = []
+    staged_bytes = 0
     for index, source_file in enumerate(sources):
         # Open the canonical file relative to the root that authorized it, without following links.
         # Resolving a replaced child here would grant trust to its new destination.
@@ -546,9 +583,9 @@ def _stage_browser_upload_paths(sources: list[AuthorizedFile], staging_dir: Path
             destination = staging_dir / str(index) / source_file.name
             destination.parent.mkdir(mode=0o700)
             with destination.open("xb") as output:
-                shutil.copyfileobj(source, output, length=1024 * 1024)
+                staged_bytes += _copy_within_limit(source, output, max_bytes - staged_bytes)
         staged_paths.append(str(destination))
-    return staged_paths
+    return staged_paths, staged_bytes
 
 
 class _BrowserFunctionNotRegisteredError(RuntimeError):
@@ -606,6 +643,7 @@ class BrowserTools(Toolkit):
         self._worker_workspace: Path | None = None
         self._worker_process_env: dict[str, str] | None = None
         self._lock = asyncio.Lock()
+        self._upload_lock = asyncio.Lock()
         self._configured_output_dir = Path(output_dir).expanduser().resolve() if output_dir is not None else None
         # Keep the caller's spelling: uploads open from it without following links, so a root swapped for a link is refused.
         self._workspace_root = tool_output_workspace_root
@@ -620,8 +658,7 @@ class BrowserTools(Toolkit):
         """Keep Matrix desktop calls with their live context while isolating host calls."""
         if function_name != "browser_control":
             return False
-        action = cast("str", arguments["action"]).strip().lower()
-        if action in {"actions", "help"}:
+        if is_reference_action(arguments["action"]):
             return False
         return (
             self._resolve_target(
@@ -815,7 +852,8 @@ class BrowserTools(Toolkit):
     ) -> str | ToolResult:
         """Control MindRoom's browser state and actions, including worker browser navigation.
 
-        To let the user watch this worker browser, use chat_ui.open_panel(panel='computer').
+        If you have chat_ui, your first host browser call in a conversation already shows the user the Computer panel;
+        use chat_ui.open_panel(panel='computer') only to show it again.
         That UI request does not navigate, send a prompt to ChatGPT, or take control.
         The user's local browser is separate and requires the configured desktop target.
 
@@ -846,6 +884,8 @@ class BrowserTools(Toolkit):
             level: Console log level filter.
             paths: Browser artifact or workspace file paths, or att_* context attachment IDs to upload.
                 Workspace-relative paths are allowed; use ./ for a workspace file named att_*.
+                For ``open``, one HTML file to show instead of targetUrl, for example to check a page you wrote;
+                it cannot load other local files, and relative links in it do not resolve.
             inputRef: Host-target upload input selector or ref.
             timeoutMs: Host-target timeout for upload/dialog actions.
             accept: Whether to accept dialog.
@@ -860,7 +900,7 @@ class BrowserTools(Toolkit):
         if normalized_action not in _BROWSER_ACTIONS:
             msg = _unknown_browser_action_message(action)
             raise ValueError(msg)
-        if normalized_action in {"actions", "help"}:
+        if normalized_action in _REFERENCE_ACTIONS:
             return json.dumps(_browser_help_payload(normalized_action), sort_keys=True)
         if not isinstance(returnAttachment, bool):
             msg = "returnAttachment must be a boolean."
@@ -881,6 +921,9 @@ class BrowserTools(Toolkit):
             raise ValueError(msg)
         if saveOnly and resolved_target == "desktop":
             msg = "saveOnly requires target=host because desktop captures do not retain a local artifact path."
+            raise ValueError(msg)
+        if resolved_target == "desktop" and normalized_action == "open" and paths:
+            msg = "Opening a file requires target=host."
             raise ValueError(msg)
         if resolved_target == "desktop":
             unsupported = {
@@ -939,6 +982,14 @@ class BrowserTools(Toolkit):
             return json.dumps(await self._tabs_payload(profile_name, state), sort_keys=True)
         if normalized_action == "open":
             target_url = _clean_str(targetUrl)
+            if paths:
+                if target_url is not None or len(paths) != 1:
+                    msg = "action=open takes targetUrl or one HTML file in paths."
+                    raise ValueError(msg)
+                page_html = await asyncio.to_thread(self._read_page_file, paths[0])
+                # The page shows as about:blank, so the result names the file it holds.
+                opened = await self._open_tab(profile_name, html=page_html)
+                return json.dumps({**opened, "path": paths[0]}, sort_keys=True)
             if target_url is None:
                 msg = "targetUrl required for action=open"
                 raise ValueError(msg)
@@ -1255,11 +1306,22 @@ class BrowserTools(Toolkit):
             "tabs": tabs,
         }
 
-    async def _open_tab(self, profile_name: str, target_url: str) -> dict[str, Any]:
+    async def _open_tab(
+        self,
+        profile_name: str,
+        target_url: str | None = None,
+        *,
+        html: str | None = None,
+    ) -> dict[str, Any]:
         state = await self._ensure_profile(profile_name)
         page = await state.context.new_page()
         target_id = self._register_tab(state, page)
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=_DEFAULT_TIMEOUT_MS)
+        if html is not None:
+            # Content on about:blank, unlike a file:// page, cannot load or navigate to other local files.
+            await page.set_content(html, wait_until="domcontentloaded", timeout=_DEFAULT_TIMEOUT_MS)
+        else:
+            assert target_url is not None
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=_DEFAULT_TIMEOUT_MS)
         if self._worker_display is not None:
             await page.bring_to_front()
         state.active_target_id = target_id
@@ -1367,23 +1429,32 @@ class BrowserTools(Toolkit):
             raise ValueError(msg)
         sources = [self._resolve_upload_path(path) for path in paths]
         locator = tab.page.locator(selector).first
-        staging = TemporaryDirectory(prefix="mindroom-browser-upload-")
-        try:
-            staged_paths = await run_blocking_until_complete(
-                _stage_browser_upload_paths,
-                sources,
-                Path(staging.name),
+        # Count this upload before another one measures the budget, so parallel uploads cannot each spend all of it.
+        async with self._upload_lock:
+            retained_bytes = sum(
+                open_tab.upload_staged_bytes
+                for profile in self._profiles.values()
+                for open_tab in profile.tabs.values()
             )
-            await locator.set_input_files(staged_paths, timeout=timeout_ms or _DEFAULT_TIMEOUT_MS)
-        except BaseException:
-            staging.cleanup()
-            raise
-        # Chromium reads selected paths lazily, including during a later form submit.
-        # Keep snapshots until tab/profile teardown even after set_input_files returns.
-        if state.cleanup_required or tab.page.is_closed():
-            staging.cleanup()
-        else:
-            tab.upload_staging.append(staging)
+            staging = TemporaryDirectory(prefix="mindroom-browser-upload-")
+            try:
+                staged_paths, staged_bytes = await run_blocking_until_complete(
+                    _stage_browser_upload_paths,
+                    sources,
+                    Path(staging.name),
+                    _MAX_STAGED_UPLOAD_BYTES - retained_bytes,
+                )
+                await locator.set_input_files(staged_paths, timeout=timeout_ms or _DEFAULT_TIMEOUT_MS)
+            except BaseException:
+                staging.cleanup()
+                raise
+            # Chromium reads selected paths lazily, including during a later form submit.
+            # Keep snapshots until tab/profile teardown even after set_input_files returns.
+            if state.cleanup_required or tab.page.is_closed():
+                staging.cleanup()
+            else:
+                tab.upload_staging.append(staging)
+                tab.upload_staged_bytes += staged_bytes
         return {
             "action": "upload",
             "paths": [source.display_path for source in sources],
@@ -1894,6 +1965,7 @@ class BrowserTools(Toolkit):
         tab = _BrowserTabState(target_id=target_id, page=page)
         state.tabs[target_id] = tab
         page.on("console", lambda message: self._record_console(tab, message))
+        page.on("pageerror", lambda error: self._record_page_error(tab, error))
         page.on("dialog", lambda dialog: asyncio.create_task(self._handle_dialog(tab, dialog)))
         page.on("close", lambda _: self._remove_tab(state, target_id))
         if self._worker_workspace is not None:
@@ -1935,6 +2007,18 @@ class BrowserTools(Toolkit):
             "location": message.location,
             "text": message.text,
         }
+        BrowserTools._append_console(tab, entry)
+
+    @staticmethod
+    def _record_page_error(tab: _BrowserTabState, error: PlaywrightError) -> None:
+        # Uncaught exceptions never reach console.*, yet they are what a broken page produces.
+        BrowserTools._append_console(
+            tab,
+            {"level": "error", "text": f"Uncaught {error.name or 'Error'}: {error.message}"},
+        )
+
+    @staticmethod
+    def _append_console(tab: _BrowserTabState, entry: dict[str, Any]) -> None:
         tab.console.append(entry)
         if len(tab.console) > _MAX_CONSOLE_ENTRIES:
             del tab.console[:-_MAX_CONSOLE_ENTRIES]
@@ -1987,7 +2071,17 @@ class BrowserTools(Toolkit):
             pass
         return output_dir
 
-    def _resolve_upload_path(self, path: str) -> AuthorizedFile:
+    def _read_page_file(self, path: str) -> str:
+        """Read one HTML file to open, from the same places uploads may read."""
+        authorized = self._resolve_upload_path(path, field_name="open path")
+        page = read_regular_file_within_root(authorized.root, authorized.relative, max_bytes=_MAX_OPEN_FILE_BYTES)
+        try:
+            return page.decode("utf-8")
+        except UnicodeDecodeError:
+            msg = f"File to open must be UTF-8 text: {path}"
+            raise ValueError(msg) from None
+
+    def _resolve_upload_path(self, path: str, *, field_name: str = "upload path") -> AuthorizedFile:
         """Resolve one upload path or ``att_*`` ID to its authorized file.
 
         The agent's ``file_access`` governs paths in the agent workspace, which
@@ -2000,7 +2094,7 @@ class BrowserTools(Toolkit):
                 path,
                 workspace_root=self._worker_workspace,
                 file_access=self._file_access,
-                field_name="upload path",
+                field_name=field_name,
             )
         if path.startswith("att_"):
             return self._resolve_upload_attachment(path)
@@ -2012,13 +2106,13 @@ class BrowserTools(Toolkit):
                     path,
                     workspace_root=artifact_dir,
                     file_access="workspace",
-                    field_name="upload path",
+                    field_name=field_name,
                 )
         return resolve_agent_file(
             path,
             workspace_root=self._workspace_root,
             file_access=self._file_access,
-            field_name="upload path",
+            field_name=field_name,
         )
 
     @staticmethod

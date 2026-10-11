@@ -39,6 +39,10 @@ _RECONCILIATION_RETRY_SECONDS = 30.0
 _RECONCILIATION_MAX_RETRY_SECONDS = 3600.0
 
 
+class _TargetNotReadyError(RuntimeError):
+    """The personal-room agent is not connected yet."""
+
+
 @dataclass(frozen=True)
 class _CandidateBackoff:
     """One candidate's consecutive reconciliation failures and when it is next due."""
@@ -79,6 +83,8 @@ class PersonalRoomLifecycle:
     _config_revision: int = field(default=0, init=False)
     _completed_candidates: set[tuple[str, str]] = field(default_factory=set, init=False)
     _candidate_backoff: dict[tuple[str, str], _CandidateBackoff] = field(default_factory=dict, init=False)
+    # Live triggers that failed, with whether they asked to re-invite a departed owner.
+    _retry_candidates: dict[tuple[str, str], bool] = field(default_factory=dict, init=False)
     _reconciliation_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _next_reconciliation_at: float = field(default=0.0, init=False)
 
@@ -159,7 +165,7 @@ class PersonalRoomLifecycle:
         target = self.lookup_target(settings.agent)
         if target is None or self.runtime.client is None:
             msg = "Personal-room target is not ready"
-            raise RuntimeError(msg)
+            raise _TargetNotReadyError(msg)
         await target.service.ensure(
             user_id,
             source_room_id,
@@ -178,11 +184,16 @@ class PersonalRoomLifecycle:
 
         A room no retry can fix is logged and the event settles; reconciliation,
         which runs at startup and after a configuration reload, retries it after
-        doubling delays up to hourly. Transient failures still raise so the
-        journal retries the event.
+        doubling delays up to hourly. Any other failure, such as a requester
+        whose server refuses the invite, also settles the event and hands the
+        trigger to reconciliation, which retries it with the same backoff. A
+        personal-room agent that is not connected yet still raises, so the
+        journal keeps the trigger across restarts until that agent is ready.
         """
         try:
             await self._onboard(user_id, source_room_id, reinvite_departed_owner=reinvite_departed_owner)
+        except _TargetNotReadyError:
+            raise
         except PersonalRoomValidationError as error:
             logger.warning(
                 "Personal-room validation failed for an onboarding trigger",
@@ -190,6 +201,31 @@ class PersonalRoomLifecycle:
                 room_id=source_room_id,
                 error=str(error),
             )
+        except Exception as error:
+            logger.warning(
+                "Personal-room onboarding trigger failed",
+                user_id=user_id,
+                room_id=source_room_id,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            candidate = (user_id, source_room_id)
+            self._retry_candidates[candidate] = reinvite_departed_owner or self._retry_candidates.get(candidate, False)
+            self._completed_candidates.discard(candidate)
+            self._reconciled = False
+        else:
+            self._settle_retry((user_id, source_room_id), reinvite_departed_owner=reinvite_departed_owner)
+
+    def _settle_retry(self, candidate: tuple[str, str], *, reinvite_departed_owner: bool) -> bool:
+        """Forget a failed trigger's retry once a successful attempt covered it, and say whether it did.
+
+        An attempt without re-invite authority does not cover a stored request
+        to re-invite a departed owner, so that request stays pending.
+        """
+        if self._retry_candidates.get(candidate, False) and not reinvite_departed_owner:
+            return False
+        self._retry_candidates.pop(candidate, None)
+        return True
 
     async def handle_command(self, room: nio.MatrixRoom, event: nio.RoomMessageFormatted) -> bool:
         """Recognize exact self-onboarding commands through trusted requester resolution."""
@@ -287,12 +323,14 @@ class PersonalRoomLifecycle:
             backfill, backfill_failed = await self._backfill_candidates(settings.onboarding_rooms)
             candidates.update(backfill)
             failed |= backfill_failed
+        candidates.update(self._retry_candidates)
         for candidate in sorted(candidates - self._completed_candidates):
             if revision != self._config_revision:
                 return
             if not await self._reconcile_candidate(candidate, revision):
                 failed = True
-        if not failed and revision == self._config_revision:
+        # A live trigger that failed during this pass is still owed a retry.
+        if not failed and not self._retry_candidates and revision == self._config_revision:
             self._reconciled = True
 
     async def _reconcile_candidate(self, candidate: tuple[str, str], revision: int) -> bool:
@@ -301,8 +339,9 @@ class PersonalRoomLifecycle:
         if previous is not None and monotonic() < previous.retry_at:
             return False
         user_id, room_id = candidate
+        reinvite_departed_owner = self._retry_candidates.get(candidate, False)
         try:
-            await self._onboard(user_id, room_id)
+            await self._onboard(user_id, room_id, reinvite_departed_owner=reinvite_departed_owner)
         except Exception as error:
             backoff = _next_backoff(previous, error)
             if revision == self._config_revision:
@@ -331,8 +370,10 @@ class PersonalRoomLifecycle:
                 )
             return False
         if revision == self._config_revision:
-            self._completed_candidates.add(candidate)
             self._candidate_backoff.pop(candidate, None)
+            # A live trigger can fail during this attempt and ask for a re-invite it did not carry.
+            if self._settle_retry(candidate, reinvite_departed_owner=reinvite_departed_owner):
+                self._completed_candidates.add(candidate)
         return True
 
     def retained_room_ids(self) -> set[str]:

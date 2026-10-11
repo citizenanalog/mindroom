@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
+import gc
 import json
 import os
 import signal
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import weakref
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -37,7 +40,7 @@ import mindroom.knowledge.refresh_runner as knowledge_refresh_runner
 import mindroom.knowledge.refresh_scheduler as knowledge_refresh_scheduler
 import mindroom.knowledge.registry as knowledge_registry
 import mindroom.knowledge.utils as knowledge_utils
-from mindroom import embedder_health, file_locks
+from mindroom import file_locks
 from mindroom.api import config_lifecycle, main
 from mindroom.api import knowledge as knowledge_api
 from mindroom.background_tasks import wait_for_background_tasks
@@ -48,9 +51,9 @@ from mindroom.constants import (
     DEFAULT_KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_SECONDS,
     KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV,
 )
-from mindroom.credentials import get_runtime_shared_credentials_manager
-from mindroom.credentials_sync import get_embedder_api_key
-from mindroom.file_memory_knowledge import resolve_file_memory_knowledge
+from mindroom.credentials.manager import get_runtime_shared_credentials_manager
+from mindroom.credentials.sync import get_embedder_api_key
+from mindroom.embeddings import embedder_health
 from mindroom.git_invocation import hardened_git_command, hardened_git_env
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.candidate_checkpoint import load_candidate_checkpoint
@@ -61,6 +64,7 @@ from mindroom.knowledge.file_listing import (
     list_git_tracked_knowledge_files,
     list_knowledge_files,
 )
+from mindroom.knowledge.file_memory_knowledge import resolve_file_memory_knowledge
 from mindroom.knowledge.git_source import GitKnowledgeSource, GitSyncResult
 from mindroom.knowledge.github_app_auth import GitHubAppTokenProvider
 from mindroom.knowledge.indexing_config import IndexingSettings, knowledge_git_dir
@@ -86,10 +90,12 @@ from mindroom.knowledge.registry import (
 )
 from mindroom.knowledge.utils import KnowledgeAvailabilityDetail, resolve_agent_knowledge_access
 from mindroom.knowledge.watch import KnowledgeSourceWatcher
+from mindroom.logging_config import subprocess_logging_env
 from mindroom.memory_scope_ids import agent_scope_user_id
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, agent_workspace_root_path
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
+from tests.cpu_budget_helpers import cpu_budget
 from tests.knowledge_test_support import (
     _Client,
     _Collection,
@@ -5610,6 +5616,96 @@ async def test_refresh_scheduler_runs_independent_per_binding_tasks(
     await scheduler.shutdown()
 
 
+_TURN_OWNER: contextvars.ContextVar[object | None] = contextvars.ContextVar("test_refresh_turn_owner", default=None)
+
+
+@pytest.mark.asyncio
+async def test_refresh_scheduled_during_a_turn_does_not_retain_the_turn_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh can outlive the tool call that schedules it, whose turn context holds the turn's Agent."""
+    docs_path = tmp_path / "docs"
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    scheduler = KnowledgeRefreshScheduler()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_refresh(_base_id: str, **_kwargs: object) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_runner.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+
+    class _TurnAgent:
+        pass
+
+    agent = _TurnAgent()
+    agent_ref = weakref.ref(agent)
+    token = _TURN_OWNER.set(agent)
+    try:
+        scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+    finally:
+        _TURN_OWNER.reset(token)
+    del agent
+    await asyncio.wait_for(started.wait(), timeout=5)
+    gc.collect()
+
+    try:
+        assert agent_ref() is None
+    finally:
+        release.set()
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_refresh_deferred_behind_a_direct_refresh_does_not_retain_the_turn_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claim retries while a direct refresh runs must not keep the scheduling turn's Agent alive."""
+    docs_path = tmp_path / "docs"
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    refresh_target = knowledge_registry.resolve_refresh_target("docs", config=config, runtime_paths=runtime_paths)
+    scheduler = KnowledgeRefreshScheduler()
+    started = asyncio.Event()
+
+    async def _fake_refresh(_base_id: str, **_kwargs: object) -> None:
+        started.set()
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_runner.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+
+    class _TurnAgent:
+        pass
+
+    agent = _TurnAgent()
+    agent_ref = weakref.ref(agent)
+    knowledge_refresh_locks.mark_refresh_active(refresh_target)
+    direct_claim_active = True
+    token = _TURN_OWNER.set(agent)
+    try:
+        scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+    finally:
+        _TURN_OWNER.reset(token)
+    del agent
+
+    try:
+        # Let a few claim retries run while the direct refresh still holds the claim.
+        await asyncio.sleep(3 * knowledge_refresh_scheduler._REFRESH_CLAIM_RETRY_SECONDS)
+        assert not started.is_set()
+        gc.collect()
+        assert agent_ref() is None
+        knowledge_refresh_locks.mark_refresh_inactive(refresh_target)
+        direct_claim_active = False
+        await asyncio.wait_for(started.wait(), timeout=1)
+    finally:
+        if direct_claim_active:
+            knowledge_refresh_locks.mark_refresh_inactive(refresh_target)
+        await scheduler.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_refresh_scheduler_does_not_deep_copy_config_on_event_loop(
     tmp_path: Path,
@@ -6055,10 +6151,11 @@ async def test_scheduled_refresh_subprocess_receives_config_snapshot(
         execution_identity=_identity("@alice:localhost"),
     )
 
-    assert captured_args[:3] == (sys.executable, "-m", "mindroom.knowledge_refresh_runner")
+    assert captured_args[:3] == (sys.executable, "-m", "mindroom.knowledge.refresh_entrypoint")
     assert "--request-path" not in captured_args
     assert captured_env["MINDROOM_KNOWLEDGE_REFRESH_SUBPROCESS"] == "1"
     assert captured_env["TMPDIR"] == tempfile.gettempdir()
+    assert captured_env.items() >= subprocess_logging_env().items()
     assert captured_env["PATH"] == str((launcher_bin, runtime_bin)[explicit_runtime_path])
     assert captured_stdin is not None
     captured_request.update(json.loads(bytes(captured_stdin.payload).decode()))
@@ -7757,8 +7854,10 @@ async def test_private_agent_knowledge_schedules_refresh_when_source_changes(
     scheduler.schedule_refresh.assert_called_once()
 
 
-def test_private_agent_knowledge_bookkeeping_is_bounded(tmp_path: Path) -> None:
+def test_private_agent_knowledge_bookkeeping_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Private index, lock, and refresh-cooldown registries should be pruned."""
+    # Hundreds of private identities each fsync their records; disk flush latency on a busy host is not under test.
+    monkeypatch.setattr(os, "fsync", lambda _descriptor: None)
     runtime_paths = test_runtime_paths(tmp_path)
     config = bind_runtime_paths(
         Config(
@@ -9856,6 +9955,38 @@ def test_redacting_a_non_ascii_basic_token_does_not_raise() -> None:
     replaces the Git failure it was called to sanitise.
     """
     assert redact_credentials_in_text("Authorization: Basic éééé") == "Authorization: Basic ***"
+
+
+def test_redacting_basic_secrets_scrubs_a_secret_that_contains_another_whole() -> None:
+    """Decoded Basic credentials are scrubbed wherever else they appear, the longest first."""
+    entries = [("alice", "hunter2"), ("bob", "hunter2-extra"), ("carol", "plain")]
+    headers = [
+        f"Authorization: Basic {base64.b64encode(f'{user}:{password}'.encode()).decode()}" for user, password in entries
+    ]
+    text = "\n".join([*headers, "echo hunter2-extra and hunter2 and alice:plain and carol:plain"])
+
+    assert redact_credentials_in_text(text).splitlines() == [
+        *["Authorization: Basic ***"] * len(entries),
+        "echo *** and *** and alice:*** and ***",
+    ]
+
+
+@pytest.mark.parametrize("lead", ["", "-", "1.", "+x9-"])
+def test_redacting_a_url_finds_its_scheme_after_other_scheme_characters(lead: str) -> None:
+    """A URL starts at the first letter of the scheme-character run that ends at ``://``."""
+    text = f"fatal: {lead}https://user:token@example.com/repo.git failed"
+
+    assert redact_credentials_in_text(text) == f"fatal: {lead}https://***@example.com/repo.git failed"
+
+
+def test_redacting_a_long_run_of_scheme_characters_stays_within_a_cpu_budget() -> None:
+    """A stored Git error is re-redacted on every knowledge API read, so a long non-URL run must not stall the loop."""
+    text = "remote: " + "A" * 100_000
+
+    with cpu_budget(0.5):
+        redacted = redact_credentials_in_text(text)
+
+    assert redacted == text
 
 
 @pytest.mark.asyncio

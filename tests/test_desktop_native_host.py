@@ -27,6 +27,7 @@ from uuid import uuid4
 import aiohttp
 import nio
 import pytest
+from mcp.types import CallToolResult, TextContent
 from nio import AuthenticatedDevice, AuthenticatedToDeviceEvent
 
 from mindroom.desktop.bridge import DesktopBridge, DesktopBridgePolicy
@@ -47,6 +48,7 @@ from mindroom.desktop.native_host import (
     supervise_native_tasks,
 )
 from mindroom.desktop.native_protocol import NativeProtocolError, NativeRequest, parse_native_request
+from mindroom.desktop.playwright_mcp import PlaywrightMCPBrowserProvider
 from mindroom.desktop.protocol import (
     DESKTOP_COMMAND_EVENT_TYPE,
     DesktopCommand,
@@ -605,7 +607,7 @@ def _attach_shell_runtime(host: NativeDesktopHost, tmp_path: Path) -> NativeBrid
     """Attach a real shell-only bridge to the native channel without opening Matrix."""
     config = load_native_config(native_config_path(tmp_path))
     runtime = NativeBridgeRuntime(SimpleNamespace(storage_root=tmp_path), config)
-    runtime._shell = DesktopShell(environment={"PATH": os.defpath})
+    runtime._shell = DesktopShell(environment={"PATH": os.environ["PATH"]})
     runtime._bridge = DesktopBridge(
         client=object(),
         provider=None,
@@ -848,6 +850,40 @@ async def test_native_status_lists_handles_and_can_kill_one(bridge_transport: As
     await host.shutdown()
 
 
+class _LiveExtensionSession:
+    """A started extension session that answers every MCP call until it is closed."""
+
+    running = True
+
+    async def call_tool(self, _name: str, _arguments: dict[str, object]) -> CallToolResult:
+        return CallToolResult(content=[TextContent(type="text", text="- 0: (current) [Example](https://example.org)")])
+
+    async def close(self) -> None:
+        self.running = False
+
+
+@pytest.mark.asyncio
+async def test_native_status_reports_a_remotely_started_browser_session_as_connected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status follows the provider's live session, not only the local connect and disconnect buttons."""
+    host = await _shell_host(tmp_path)
+    runtime = _attach_shell_runtime(host, tmp_path)
+    browser = PlaywrightMCPBrowserProvider(output_dir=tmp_path / "desktop-browser")
+    monkeypatch.setattr(browser, "_new_session", _LiveExtensionSession)
+    runtime._browser = browser
+    assert runtime.status()["browser_connected"] is False
+
+    # A lease holder's remote browser start reaches the provider through the bridge, not through connect_browser.
+    await browser.execute("start", {})
+    assert runtime.status()["browser_connected"] is True
+
+    await browser.execute("stop", {})
+    assert runtime.status()["browser_connected"] is False
+    await host.shutdown()
+
+
 class _RecordingOutput(io.BytesIO):
     """Record each native response with the shell's active command at the moment it is written."""
 
@@ -1022,7 +1058,7 @@ def offline_runtime_session(monkeypatch: pytest.MonkeyPatch) -> _FakeOwner:
     monkeypatch.setattr("mindroom.desktop.bridge_components.PyAutoGuiDesktopProvider", forbidden_gui_provider)
     monkeypatch.setattr(
         "mindroom.desktop.login_environment.capture_login_environment",
-        AsyncMock(return_value={"PATH": os.defpath, "MINDROOM_CAPTURED": "from-login-shell"}),
+        AsyncMock(return_value={"PATH": os.environ["PATH"], "MINDROOM_CAPTURED": "from-login-shell"}),
     )
     return owner
 

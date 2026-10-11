@@ -30,6 +30,9 @@ CLASSIC_SYNC_TIMELINE_LIMIT = 5000
 DEFAULT_COMPACTION_TIMEOUT_SECONDS = 600.0
 DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES = 50 * 1024
 DEFAULT_TOOL_OUTPUT_MAX_BYTES = 64 * 1024 * 1024
+# Largest attachment MindRoom retains, received from Matrix or registered by a tool;
+# also the default inline primary-to-worker save cap, so every retained attachment can reach a worker.
+RETAINED_MEDIA_MAX_BYTES = 64 * 1024 * 1024
 KNOWLEDGE_FILE_INDEX_CONCURRENCY_ENV = "MINDROOM_KNOWLEDGE_FILE_INDEX_CONCURRENCY"
 DEFAULT_MAX_CONCURRENT_KNOWLEDGE_FILE_INDEXES = 4
 MAX_ALLOWED_CONCURRENT_KNOWLEDGE_FILE_INDEXES = 128
@@ -686,8 +689,7 @@ def trusted_tool_runtime_env_values(
 
 def _execution_tool_runtime_env_values(runtime_paths: RuntimePaths) -> Mapping[str, str]:
     """Return the stricter env visible to sandbox-proxied execution tools."""
-    process_env = runtime_env_policy.execution_tool_runtime_env(runtime_paths.process_env)
-    env_file_values = runtime_env_policy.execution_tool_runtime_env(runtime_paths.env_file_values)
+    process_env, env_file_values = _isolated_runtime_env_layers(runtime_paths)
     merged_env = dict(env_file_values)
     merged_env.update(process_env)
     merged_env["MINDROOM_CONFIG_PATH"] = str(runtime_paths.config_path)
@@ -936,6 +938,15 @@ def tracking_dir(runtime_paths: RuntimePaths) -> Path:
     return runtime_paths.storage_root / "tracking"
 
 
+def primary_records_dir(state_root: Path, runtime_paths: RuntimePaths) -> Path:
+    """Map a canonical state root to the primary-only directory for the records the primary trusts about it.
+
+    The Kubernetes sandbox runner sidecar mounts `agents` and `private_instances` read-write,
+    so these records keep the state root's storage-relative path below the tracking directory, which no worker mounts.
+    """
+    return tracking_dir(runtime_paths) / state_root.relative_to(runtime_paths.storage_root.expanduser().resolve())
+
+
 def encryption_keys_dir(runtime_paths: RuntimePaths) -> Path:
     """Return the encryption-keys directory for one runtime context."""
     return runtime_paths.storage_root / "encryption_keys"
@@ -1066,7 +1077,7 @@ def _find_config(*, process_env: Mapping[str, str]) -> Path:
 # Other constants
 VOICE_PREFIX = "🎤 "
 ORIGINAL_SENDER_KEY = "com.mindroom.original_sender"
-# The human an entity's reply was written for; entities it mentions act for that human.
+# The human or configured bot account an entity's reply was written for; entities it mentions act for that requester.
 ACTING_REQUESTER_KEY = "com.mindroom.acting_requester"
 SOURCE_KIND_KEY = "com.mindroom.source_kind"
 PER_FIRE_THREAD_ROOT_KEY = "com.mindroom.per_fire_thread_root"
@@ -1082,24 +1093,20 @@ VOICE_RAW_AUDIO_FALLBACK_KEY = "com.mindroom.voice_raw_audio_fallback"
 VOICE_TRANSCRIPT_KEY = "com.mindroom.voice_transcript"
 ATTACHMENT_IDS_KEY = "com.mindroom.attachment_ids"
 AI_RUN_METADATA_KEY = "io.mindroom.ai_run"
-MATRIX_TURN_SCHEMA_VERSION_METADATA_KEY = "matrix_turn_schema_version"
 MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY = "matrix_turn_discovery_event_ids"
-MATRIX_TURN_REDACTED_SOURCE_EVENT_IDS_METADATA_KEY = "matrix_turn_redacted_source_event_ids"
 MATRIX_EVENT_ID_METADATA_KEY = "matrix_event_id"
 MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY = "matrix_message_target"
 MATRIX_RESPONSE_EVENT_ID_METADATA_KEY = "matrix_response_event_id"
-MATRIX_RESPONSE_OWNER_METADATA_KEY = "matrix_response_owner"
 MATRIX_SEEN_EVENT_IDS_METADATA_KEY = "matrix_seen_event_ids"
-MATRIX_HISTORY_SCOPE_METADATA_KEY = "matrix_history_scope"
-MATRIX_CONVERSATION_TARGET_METADATA_KEY = "matrix_conversation_target"
 MATRIX_SOURCE_EVENT_IDS_METADATA_KEY = "matrix_source_event_ids"
 MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY = "matrix_source_event_prompts"
 MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY = "matrix_source_event_revisions"
-MATRIX_SOURCE_EVENT_METADATA_KEY = "matrix_source_event_metadata"
 MINDROOM_COMPACTION_METADATA_KEY = "mindroom_compaction"
 MINDROOM_MATRIX_HISTORY_METADATA_KEY = "mindroom_matrix_history"
 COMPACTION_NOTICE_CONTENT_KEY = "io.mindroom.compaction"
 SKILL_REVIEW_NOTICE_CONTENT_KEY = "io.mindroom.skill_review"
+UI_ACTION_CONTENT_KEY = "io.mindroom.ui_action"
+THREAD_SUMMARY_CONTENT_KEY = "io.mindroom.thread_summary"
 STREAM_STATUS_KEY = "io.mindroom.stream_status"
 DURABLE_FINAL_OUTCOME_KEY = "io.mindroom.final_delivery"
 DURABLE_FINAL_OUTCOME_VERSION = 2
@@ -1113,6 +1120,10 @@ STREAM_STATUS_COMPLETED = "completed"
 STREAM_STATUS_CANCELLED = "cancelled"
 STREAM_STATUS_INTERRUPTED = "interrupted"
 STREAM_STATUS_ERROR = "error"
+# A reply with one of these statuses is still being written or waits for a tool approval.
+UNFINISHED_REPLY_STATUSES = frozenset(
+    {STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING, STREAM_STATUS_APPROVAL_PENDING},
+)
 
 # Placeholder used in starter config templates. `mindroom connect` can
 # automatically replace this token with the owner Matrix user ID returned

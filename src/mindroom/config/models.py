@@ -10,7 +10,8 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from mindroom.config.access import InviteAcceptancePolicy, ResponderAccessConfig  # noqa: TC001
-from mindroom.config.judgment import TypeSafeJudgmentConfig  # noqa: TC001
+from mindroom.config.automations import AutomationList  # noqa: TC001
+from mindroom.config.judgment import ProbabilityJudgmentConfig  # noqa: TC001
 from mindroom.config.legacy_fields import reject_legacy_defaults_fields
 from mindroom.config.schema_hints import dashboard_hint
 from mindroom.config.validation import duplicate_items, validate_history_limit_choice
@@ -18,8 +19,8 @@ from mindroom.constants import (
     DEFAULT_COMPACTION_TIMEOUT_SECONDS,
     DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES,
 )
-from mindroom.credential_policy import credential_service_policy
-from mindroom.credentials import validate_service_name
+from mindroom.credentials.manager import validate_service_name
+from mindroom.credentials.policy import credential_service_policy
 from mindroom.matrix.identity import valid_matrix_server_name
 from mindroom.model_defaults import OPENAI_EMBEDDING_SMALL
 from mindroom.tool_system.worker_routing import WorkerScope  # noqa: TC001
@@ -403,9 +404,13 @@ class DefaultsConfig(BaseModel):
         description="Live message coalescing settings for rapid same-sender turns",
     )
     show_stop_button: bool = Field(default=True, description="Whether to automatically show stop button on messages")
-    auto_resume_after_restart: bool = Field(
-        default=True,
-        description="Whether restart cleanup should post a real system message to resume interrupted threaded conversations",
+    max_consecutive_agent_replies: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            "Most consecutive agent or team messages in one conversation before mentions in them stop waking "
+            "other agents and teams; a message from a person resets the count"
+        ),
     )
     learning: bool = Field(default=True, description="Default Agno Learning setting")
     learning_mode: AgentLearningMode = Field(default="always", description="Default Agno Learning mode")
@@ -490,6 +495,10 @@ class DefaultsConfig(BaseModel):
         default=50000,
         ge=1,
         description="Hard cap for extra role preload context loaded from context_files",
+    )
+    automations: AutomationList = Field(
+        default_factory=list,
+        description="Automations, built-in such as prompt_curation or from a plugin, for agents that do not list their own",
     )
     tool_output_auto_save_threshold_bytes: int = Field(
         default=DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES,
@@ -677,6 +686,15 @@ class ModelConfig(BaseModel):
             "enables request-time fitting that trims replayed history when a request would exceed the window"
         ),
     )
+    stream_idle_timeout_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Seconds a streamed model request may go without a provider event before MindRoom treats it as "
+            "stalled and retries once if nothing was streamed yet; unset uses 300 for hosted providers on their "
+            "built-in endpoint and no limit for ollama, llama_cpp, or a configured endpoint; 0 disables the limit"
+        ),
+    )
 
     @field_validator("display_name")
     @classmethod
@@ -771,9 +789,9 @@ class RouterConfig(BaseModel):
         description="Model to use for routing decisions",
         json_schema_extra=dashboard_hint(reference="model"),
     )
-    judgment: TypeSafeJudgmentConfig | None = Field(
+    judgment: ProbabilityJudgmentConfig | None = Field(
         default=None,
-        description="Optional JEV responder selection before the LLM router",
+        description="Optional System One or OpenAI Decisions responder selection before the LLM router",
     )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,

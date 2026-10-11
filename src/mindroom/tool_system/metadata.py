@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import mindroom.tool_system.plugin_imports as plugin_module
 from mindroom.constants import DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES
-from mindroom.credentials import get_runtime_credentials_manager, load_scoped_credentials
+from mindroom.credentials.manager import get_runtime_credentials_manager, load_scoped_credentials
 from mindroom.file_access import agent_file_access
 from mindroom.logging_config import get_logger
 from mindroom.tool_system.declarations import (
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.config.models import FileAccess
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
 
 logger = get_logger(__name__)
 
@@ -613,8 +613,13 @@ def _apply_implicit_toolkit_filters(
     *,
     include_tools: list[str] | None,
     exclude_tools: list[str] | None,
+    declared_functions: frozenset[str] = frozenset(),
 ) -> None:
-    """Apply Agno-equivalent filters after constructing a Toolkit subclass."""
+    """Apply Agno-equivalent filters after constructing a Toolkit subclass.
+
+    Excluding a declared function that an option left disabled (such as chat_ui's show_canvas) is a
+    no-op, so the exclusion cannot drop the whole toolkit.
+    """
     if include_tools is None and exclude_tools is None:
         return
 
@@ -623,7 +628,7 @@ def _apply_implicit_toolkit_filters(
     if missing_includes:
         msg = f"Included tool(s) not present in the toolkit: {', '.join(missing_includes)}"
         raise ValueError(msg)
-    missing_excludes = sorted(set(exclude_tools or ()) - available_tools)
+    missing_excludes = sorted(set(exclude_tools or ()) - available_tools - declared_functions)
     if missing_excludes:
         msg = f"Excluded tool(s) not present in the toolkit: {', '.join(missing_excludes)}"
         raise ValueError(msg)
@@ -738,11 +743,7 @@ def _build_tool_instance(
             credentials_manager=resolved_credentials_manager,
             worker_target=worker_target,
             allowed_shared_services=allowed_shared_services,
-            primary_built_tool=primary_owns_tool_settings(
-                tool_name,
-                runtime_paths=runtime_paths,
-                worker_tools_override=worker_tools_override,
-            ),
+            primary_built_tool=primary_owns_tool_settings(tool_name, runtime_paths=runtime_paths),
         )
         if resolved_credentials_manager is not None
         else {}
@@ -783,6 +784,7 @@ def _build_tool_instance(
         toolkit,
         include_tools=include_tools,
         exclude_tools=exclude_tools,
+        declared_functions=frozenset(metadata.function_names or ()),
     )
     output_file_policy = (
         ToolOutputFilePolicy.from_runtime(
@@ -807,11 +809,6 @@ def _build_tool_instance(
         worker_tools_override=worker_tools_override,
         shared_storage_root_path=shared_storage_root_path,
         worker_target=worker_target,
-        authored_worker_tools=(
-            runtime_config.get_agent_worker_tools(routing_agent_name)
-            if runtime_config is not None and routing_agent_name in runtime_config.agents
-            else None
-        ),
     )
 
 

@@ -14,6 +14,7 @@ import yaml
 
 from mindroom.agents import create_agent
 from mindroom.api import config_lifecycle, main
+from mindroom.approval.tool_approval import POLICY_CONFIRMATION_APPROVAL_TYPE
 from mindroom.config.agent import AgentConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
@@ -22,7 +23,6 @@ from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.custom_tools.self_config import SelfConfigTools
 from mindroom.message_target import MessageTarget
-from mindroom.tool_approval import POLICY_CONFIRMATION_APPROVAL_TYPE
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import (
@@ -309,6 +309,25 @@ class TestUpdateOwnConfig:
             # Verify persisted
             reloaded = load_config_yaml(config_path)
             assert reloaded.agents["coder"].role == "New role"
+        finally:
+            config_path.unlink(missing_ok=True)
+
+    def test_update_refuses_instructions_copied_from_redacted_read(self) -> None:
+        """Appending to instructions read back redacted must not replace the real instructions with the marker."""
+        instructions = ["Never share the API key with anyone", "Log in with password: hunter2"]
+        _, config_path = _make_config(
+            agents={"coder": AgentConfig(display_name="Coder", role="Code", instructions=instructions)},
+        )
+        try:
+            tool = _self_config_tools(agent_name="coder", config_path=config_path)
+            with _as_requester(tool):
+                shown = tool.get_own_config()
+                shown_instructions = yaml.safe_load(shown.split("```yaml\n", 1)[1].removesuffix("```"))["instructions"]
+                result = tool.update_own_config(instructions=[*shown_instructions, "Be concise"])
+            assert "'instructions' holds the redaction marker" in result
+            assert "omit it to keep the stored value" in result
+            assert "Changes were NOT applied." in result
+            assert load_config_yaml(config_path).agents["coder"].instructions == instructions
         finally:
             config_path.unlink(missing_ok=True)
 

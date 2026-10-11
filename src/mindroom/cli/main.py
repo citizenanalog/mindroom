@@ -18,23 +18,33 @@ from mindroom.constants import ensure_writable_config_path
 from .api import is_loopback_host
 from .banner import make_banner
 from .config import (
+    DEFAULT_API_HOST,
+    DEFAULT_API_PORT,
     activate_cli_runtime,
     check_env_keys,
     config_app,
     console,
     create_first_run_config,
+    ensure_worker_dashboard_api_key,
     format_validation_errors,
     load_config_quiet,
     print_config_search_locations,
+    warn_dashboard_without_key,
 )
-from .config_bundle import config_install_bundle, initialize_runtime_bundle
+from .config_bundle import (
+    config_apply_bundle,
+    config_classify_change,
+    config_install_bundle,
+    initialize_runtime_bundle,
+)
 from .config_reload import config_check_applied, config_fingerprint
+from .debug_report import debug_report
 from .desktop import desktop_app
 from .local_stack import local_stack_setup
 from .migrate import config_migrate
 from .plugins import plugins_app
 from .response_activity import check_active_responses
-from .service import service_app
+from .service import require_login_service, service_app, start_login_service
 from .trigger import trigger_app
 
 if TYPE_CHECKING:
@@ -76,6 +86,8 @@ journal_app = typer.Typer(help="Inspect and rebind the durable event journal.")
 config_app.command("migrate")(config_migrate)
 config_app.command("fingerprint")(config_fingerprint)
 config_app.command("install-bundle")(config_install_bundle)
+config_app.command("classify-change")(config_classify_change)
+config_app.command("apply-bundle")(config_apply_bundle)
 config_app.command("check-applied")(config_check_applied)
 app.add_typer(config_app, name="config")
 app.add_typer(plugins_app, name="plugins")
@@ -86,6 +98,7 @@ app.add_typer(journal_app, name="journal")
 app.add_typer(service_app, name="service")
 app.add_typer(trigger_app, name="trigger")
 app.command()(check_active_responses)
+app.command("debug-report")(debug_report)
 
 
 @app.command()
@@ -133,21 +146,39 @@ def run(
         help="Start the bundled dashboard/API server alongside the bot",
     ),
     api_port: int = typer.Option(
-        8765,
+        DEFAULT_API_PORT,
         "--api-port",
         help="Port for the bundled dashboard/API server",
     ),
     api_host: str = typer.Option(
-        "0.0.0.0",  # noqa: S104
+        DEFAULT_API_HOST,
         "--api-host",
         help="Host for the bundled dashboard/API server",
+    ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help=(
+            "Model provider preset for the starter config when none exists, with the choices of "
+            "`config init --provider`. It also lets setup run without a terminal, taking the API key "
+            "from the environment."
+        ),
+    ),
+    service: bool | None = typer.Option(
+        None,
+        "--service/--no-service",
+        help=(
+            "After setup and pairing, install and start MindRoom as a login service (systemd or launchd) "
+            "instead of running it here, or never offer to. A first run in a terminal asks."
+        ),
     ),
 ) -> None:
     """Run the mindroom multi-agent system.
 
     This command starts the multi-agent bot system which automatically:
-    - Creates a hosted starter config on first run in a terminal
+    - Creates a hosted starter config on first run in a terminal, or with --provider
     - Pairs hosted installs with your MindRoom Chat account on first run
+    - Offers on first run to keep running as a background service that starts at login (--service/--no-service)
     - Creates all necessary user and agent accounts
     - Creates all rooms defined in config.yaml
     - Manages agent room memberships
@@ -156,21 +187,40 @@ def run(
     if bootstrap_config_bundle_revision is not None and bootstrap_config_bundle is None:
         typer.echo("--bootstrap-config-bundle-revision requires --bootstrap-config-bundle.", err=True)
         raise typer.Exit(2)
+    # The service runs a plain `mindroom run`, so it only takes over runs with the default paths and API options.
+    plain_run = (
+        config_path is None
+        and storage_path is None
+        and api
+        and api_host == DEFAULT_API_HOST
+        and api_port == DEFAULT_API_PORT
+    )
+    if service and not plain_run:
+        typer.echo(
+            "--service runs a plain `mindroom run`, so it cannot be combined with "
+            "--config, --storage-path, --no-api, --api-host, or --api-port.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    # Fail before setup and pairing ask a person for anything when this machine cannot run the service.
+    service_manager = require_login_service() if service else None
     if bootstrap_config_bundle is not None:
         initialize_runtime_bundle(bootstrap_config_bundle, config_path, storage_path, bootstrap_config_bundle_revision)
 
     from mindroom.matrix.provisioning_env import local_pairing_required  # noqa: PLC0415
 
     runtime_paths = activate_cli_runtime(path=config_path, storage_path=storage_path)
-    first_run = not ensure_writable_config_path(runtime_paths=runtime_paths) and _terminal_is_interactive()
+    interactive = _terminal_is_interactive()
+    first_run = not ensure_writable_config_path(runtime_paths=runtime_paths) and (interactive or provider is not None)
     if first_run:
         try:
-            create_first_run_config(runtime_paths)
+            create_first_run_config(runtime_paths, provider=provider, interactive=interactive)
         except (OSError, ValueError) as exc:
             console.print(f"[red]Error:[/red] {exc}")
             raise typer.Exit(1) from None
         # Pick up the new config and .env before pairing and startup.
         runtime_paths = activate_cli_runtime(path=config_path, storage_path=storage_path)
+    runtime_paths = _protect_dashboard_from_workers(runtime_paths, config_path, storage_path)
     # Report a broken config or missing model keys before any pairing waits for a human.
     config = _load_active_config_or_exit(runtime_paths)
     if not first_run:
@@ -194,6 +244,12 @@ def run(
         # Pairing errors can carry text the provisioning service chose, such as an approver or error detail.
         console.print(f"[red]Error:[/red] {escape(str(exc))}")
         raise typer.Exit(1) from None
+    ask_service = service is None and first_run and interactive and plain_run
+    if (service or ask_service) and start_login_service(runtime_paths, service_manager):
+        console.print(f"Dashboard: http://localhost:{api_port}")
+        console.print(f"After editing {runtime_paths.env_path}, run [cyan]mindroom service restart[/cyan].")
+        # The service runs MindRoom now; starting it here as well would run it twice.
+        return
 
     asyncio.run(
         _run(
@@ -205,6 +261,22 @@ def run(
             api_host=api_host,
         ),
     )
+
+
+def _protect_dashboard_from_workers(
+    runtime_paths: RuntimePaths,
+    config_path: Path | None,
+    storage_path: Path | None,
+) -> RuntimePaths:
+    """Give the dashboard API a generated key when dedicated workers could reach it, then reload that runtime."""
+    from mindroom.api.auth import dashboard_requires_credential  # noqa: PLC0415  # lazy: FastAPI import
+
+    if ensure_worker_dashboard_api_key(
+        runtime_paths,
+        dashboard_has_credential=dashboard_requires_credential(runtime_paths),
+    ):
+        return activate_cli_runtime(path=config_path, storage_path=storage_path)
+    return runtime_paths
 
 
 def _load_active_config_or_exit(runtime_paths: RuntimePaths) -> Config:
@@ -240,7 +312,7 @@ async def _run(
     api_host: str,
 ) -> None:
     """Run the multi-agent system with friendly error handling."""
-    from mindroom.startup_errors import PermanentStartupError  # noqa: PLC0415
+    from mindroom.startup_errors import EventJournalHoldLostError, PermanentStartupError  # noqa: PLC0415
 
     runtime_paths = activate_cli_runtime(path=config_path, storage_path=storage_path)
     # Validate again: pairing may have rewritten owner placeholders in the config.
@@ -253,7 +325,7 @@ async def _run(
         from mindroom.frontend_assets import ensure_frontend_dist_dir  # noqa: PLC0415
 
         frontend_dir = ensure_frontend_dist_dir(runtime_paths)
-        display_host = "localhost" if api_host == "0.0.0.0" else api_host  # noqa: S104
+        display_host = "localhost" if api_host == DEFAULT_API_HOST else api_host
         if frontend_dir is None:
             console.print("Dashboard: unavailable (frontend assets missing)")
             console.print("  Install Bun or provide MINDROOM_FRONTEND_DIST when running from a source checkout.")
@@ -278,7 +350,7 @@ async def _run(
     except ConnectionError as exc:
         _print_connection_error(exc, runtime_paths)
         raise typer.Exit(1) from None
-    except PermanentStartupError as exc:
+    except (PermanentStartupError, EventJournalHoldLostError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from None
     except OSError as exc:
@@ -295,11 +367,10 @@ def _warn_if_dashboard_is_open_beyond_loopback(runtime_paths: RuntimePaths, api_
     if is_loopback_host(api_host) or dashboard_requires_credential(runtime_paths):
         return
     address_host = f"[{api_host}]" if ":" in api_host else api_host
-    console.print(
-        f"[yellow]Warning:[/yellow] The dashboard API listens on {address_host}:{api_port} without MINDROOM_API_KEY, "
-        "so anyone who can reach that address can administer MindRoom.",
+    warn_dashboard_without_key(
+        f"{address_host}:{api_port}",
+        f"Set MINDROOM_API_KEY in {runtime_paths.env_path}, or pass --api-host 127.0.0.1.",
     )
-    console.print(f"  Set MINDROOM_API_KEY in {runtime_paths.env_path}, or pass --api-host 127.0.0.1.")
 
 
 @app.command()
@@ -457,7 +528,7 @@ async def _journal_adopt(
     force: bool,
 ) -> None:
     """Bind this install to whatever event-journal database is configured right now."""
-    from mindroom.event_journal_open import (  # noqa: PLC0415 - keeps the journal store out of CLI import time
+    from mindroom.event_journal.opening import (  # noqa: PLC0415 - keeps the journal store out of CLI import time
         EventJournalBindingError,
         adopt_event_journal,
         current_binding_description,
@@ -596,6 +667,10 @@ async def _threads_export(
                 max_thread_roots=max_thread_roots,
                 include_invited_rooms=include_invited_rooms,
             )
+        except ValueError as exc:
+            # A refused URL stays refused, so watching would only repeat the error.
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(1) from None
         except (OSError, RuntimeError) as exc:
             _handle_thread_export_error(exc, runtime_paths, watch=watch)
         else:
@@ -769,7 +844,12 @@ def _print_missing_config_error(process_env: Mapping[str, str]) -> None:
         soft_wrap=True,
     )
     console.print(
-        "  [cyan]mindroom run[/cyan]            In an interactive terminal: create a hosted starter config, pair, and start\n",
+        "  [cyan]mindroom run[/cyan]            In an interactive terminal: create a hosted starter config, pair, and start",
+        soft_wrap=True,
+    )
+    console.print(
+        f"  [cyan]mindroom run --provider {_CONFIG_INIT_PROVIDER_CHOICES} [--service][/cyan]    "
+        "Without a terminal: the same, with the API key from the environment\n",
         soft_wrap=True,
     )
     print_config_search_locations(process_env, title="Config search locations (first match wins):")

@@ -4,13 +4,14 @@ import base64
 import errno
 import os
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import mindroom.constants as constants_mod
-import mindroom.credentials as credentials_module
+import mindroom.credentials.manager as credentials_module
 from mindroom.api.credentials import _DashboardCredentialAccess
 from mindroom.api.credentials_oauth_policy import OAuthCredentialServices
 from mindroom.api.credentials_target import (
@@ -20,7 +21,7 @@ from mindroom.api.credentials_target import (
     save_credentials_for_target,
 )
 from mindroom.api.integrations import _save_spotify_credentials
-from mindroom.credentials import (
+from mindroom.credentials.manager import (
     CredentialsManager,
     WorkerCredentialPathError,
     _merge_credential_layers,
@@ -195,6 +196,97 @@ class TestCredentialsManager:
         assert stat.S_IMODE(worker_shared_credentials.stat().st_mode) == 0o700
         assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
         assert stat.S_IMODE(shared_credentials_path.stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+    @pytest.mark.parametrize(
+        "locked_entry",
+        [".", "credentials", "credentials/github_credentials.json"],
+        ids=["worker-root", "credentials-dir", "payload"],
+    )
+    def test_primary_manager_starts_when_worker_code_locks_its_own_store(
+        self,
+        tmp_path: Path,
+        locked_entry: str,
+    ) -> None:
+        """Worker code may change the modes of its own store, which must not stop the primary from starting."""
+        storage_root = tmp_path / "mindroom_data"
+        CredentialsManager(storage_root / "credentials").save_credentials("openai", {"api_key": "primary"})
+        worker_root = storage_root / "workers" / "worker-a"
+        (worker_root / "credentials").mkdir(parents=True)
+        (worker_root / "credentials" / "github_credentials.json").write_text("{}", encoding="utf-8")
+        locked_path = worker_root / locked_entry
+        locked_path.chmod(0)
+        try:
+            manager = CredentialsManager(storage_root / "credentials")
+        finally:
+            locked_path.chmod(0o700)
+
+        assert manager.load_credentials("openai") == {"api_key": "primary"}
+
+    def test_primary_manager_hardens_worker_stores_concurrently(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dormant worker stores are secured in overlapping calls, since each costs network round trips."""
+        storage_root = tmp_path / "mindroom_data"
+        payloads = []
+        for index in range(40):
+            credentials_dir = storage_root / "workers" / f"worker-{index}" / "credentials"
+            credentials_dir.mkdir(parents=True, mode=0o755)
+            payload = credentials_dir / "github_credentials.json"
+            payload.write_text("{}", encoding="utf-8")
+            payload.chmod(0o644)
+            payloads.append(payload)
+        # Two worker stores must be in progress at the same time to pass this barrier.
+        overlap = threading.Barrier(2, timeout=10)
+        harden_store = credentials_module._harden_worker_credential_store
+
+        def harden_while_overlapping(credential_path: Path) -> None:
+            if credential_path.parent.name in {"worker-0", "worker-1"}:
+                overlap.wait()
+            harden_store(credential_path)
+
+        monkeypatch.setattr(credentials_module, "_harden_worker_credential_store", harden_while_overlapping)
+
+        CredentialsManager(storage_root / "credentials")
+
+        for payload in payloads:
+            assert stat.S_IMODE(payload.parent.stat().st_mode) == 0o700
+            assert stat.S_IMODE(payload.stat().st_mode) == 0o600
+
+    def test_one_unsecurable_worker_store_does_not_stop_hardening_the_others(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A worker store that cannot be secured is logged while every other store is still hardened."""
+        storage_root = tmp_path / "mindroom_data"
+        payloads = []
+        for index in range(5):
+            credentials_dir = storage_root / "workers" / f"worker-{index}" / "credentials"
+            credentials_dir.mkdir(parents=True, mode=0o755)
+            payload = credentials_dir / "github_credentials.json"
+            payload.write_text("{}", encoding="utf-8")
+            payload.chmod(0o644)
+            payloads.append(payload)
+        failing_store = payloads[2].parent
+        harden_files = credentials_module._harden_existing_credential_files
+
+        def fail_one_store(path: Path) -> None:
+            if path == failing_store:
+                raise PermissionError(errno.EACCES, "locked by worker code", str(path))
+            harden_files(path)
+
+        monkeypatch.setattr(credentials_module, "_harden_existing_credential_files", fail_one_store)
+
+        manager = CredentialsManager(storage_root / "credentials")
+        manager.save_credentials("openai", {"api_key": "primary"})
+
+        assert manager.load_credentials("openai") == {"api_key": "primary"}
+        assert stat.S_IMODE(payloads[2].stat().st_mode) == 0o644
+        for payload in (*payloads[:2], *payloads[3:]):
+            assert stat.S_IMODE(payload.stat().st_mode) == 0o600
 
     def test_encrypted_save_and_load_credentials_round_trip(
         self,
@@ -511,37 +603,6 @@ class TestCredentialsManager:
         creds_path.write_bytes(b"MINDROOM-CREDENTIALS-V1\nnot-valid-ciphertext")
 
         assert manager.load_credentials("oauth_service") is None
-
-    def test_isolated_worker_runtime_loads_encrypted_shared_credentials(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        """Isolated workers should keep the encryption key in RuntimePaths for credential reads."""
-        encryption_key = _test_encryption_key()
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n", encoding="utf-8")
-        manager = CredentialsManager(tmp_path / "credentials", encryption_key=encryption_key)
-        worker_manager = manager.for_worker("worker-a")
-        worker_manager.shared_manager().save_credentials("openai", {"api_key": "shared-key", "_source": "env"})
-        runtime_paths = constants_mod.resolve_runtime_paths(
-            config_path=config_path,
-            storage_path=worker_manager.storage_root,
-            process_env={
-                CREDENTIALS_ENCRYPTION_KEY_ENV: encryption_key,
-                SHARED_CREDENTIALS_PATH_ENV: str(worker_manager.shared_base_path),
-            },
-        )
-
-        isolated_runtime_paths = constants_mod.isolated_runtime_paths(runtime_paths)
-
-        loaded_credentials = (
-            get_runtime_credentials_manager(isolated_runtime_paths)
-            .shared_manager()
-            .load_credentials(
-                "openai",
-            )
-        )
-        assert loaded_credentials == {"api_key": "shared-key", "_source": "env"}
 
     def test_load_nonexistent_credentials(self, credentials_manager: CredentialsManager) -> None:
         """Test loading credentials that don't exist."""
@@ -1813,7 +1874,6 @@ class TestSharedIntegrationCredentialTagging:
     def test_spotify_credentials_saved_from_dashboard_are_tagged_as_ui_source(
         self,
         temp_credentials_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Spotify OAuth saves should mark credentials as UI-managed so unscoped workers mirror them."""
         manager = CredentialsManager(temp_credentials_dir)
@@ -1829,15 +1889,7 @@ class TestSharedIntegrationCredentialTagging:
             execution_identity=None,
         )
 
-        def _resolve_target(*_args: object, **_kwargs: object) -> RequestCredentialsTarget:
-            return target
-
-        monkeypatch.setattr(
-            "mindroom.api.integrations.resolve_request_credentials_target",
-            _resolve_target,
-        )
-
-        _save_spotify_credentials({"access_token": "spotify-token"}, object())
+        _save_spotify_credentials({"access_token": "spotify-token"}, target)
 
         assert manager.load_credentials("spotify") == {
             "access_token": "spotify-token",
@@ -2076,13 +2128,8 @@ def test_primary_built_tool_settings_preserve_shared_layer(
     assert load_scoped_credentials("browserbase", **kwargs) == {**(expected or {}), **primary_config}
 
 
-@pytest.mark.parametrize(("worker_tools", "primary_store"), [([], True), (["google_bigquery"], False)])
-def test_dashboard_saves_tool_settings_where_the_runtime_reads_them(
-    tmp_path: Path,
-    worker_tools: list[str],
-    primary_store: bool,
-) -> None:
-    """Dashboard writes follow the agent's routing: primary-built tools use the primary store, routed tools the worker's."""
+def test_dashboard_saves_tool_settings_where_the_runtime_reads_them(tmp_path: Path) -> None:
+    """Dashboard writes of scoped tool settings go to the agent's primary store, wherever the tool's calls run."""
     runtime_paths = constants_mod.resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
         storage_path=tmp_path / "storage",
@@ -2099,20 +2146,47 @@ def test_dashboard_saves_tool_settings_where_the_runtime_reads_them(
         worker_scope="shared",
         agent_name="alpha",
         execution_identity=None,
-        worker_tools=worker_tools,
     )
-    settings = {"project": "alpha-project", "dataset": "demo", "location": "us-central1"}
+    settings = {"host": "alpha-db.example.test", "db_name": "demo", "user": "alpha"}
 
-    save_credentials_for_target("google_bigquery", settings, target)
+    save_credentials_for_target("postgres", settings, target)
 
-    primary_settings = manager.for_primary_runtime_agent_scope("alpha").load_credentials("google_bigquery")
-    worker_settings = worker_manager.load_credentials("google_bigquery")
-    assert (primary_settings, worker_settings) == ((settings, None) if primary_store else (None, settings))
-    assert load_credentials_for_target("google_bigquery", target) == settings
+    primary_settings = manager.for_primary_runtime_agent_scope("alpha").load_credentials("postgres")
+    worker_settings = worker_manager.load_credentials("postgres")
+    assert (primary_settings, worker_settings) == (settings, None)
+    assert load_credentials_for_target("postgres", target) == settings
     access = _DashboardCredentialAccess(target=target, oauth_services=OAuthCredentialServices(providers={}))
-    assert "google_bigquery" in access.list_services()
-    if primary_store:
-        # A worker copy of a primary-built tool's settings is ignored, so it is not listed either.
-        delete_credentials_for_target("google_bigquery", target)
-        worker_manager.save_credentials("google_bigquery", {"project": "planted"})
-        assert "google_bigquery" not in access.list_services()
+    assert "postgres" in access.list_services()
+    # A worker copy of a tool's settings is ignored, so it is not listed either.
+    delete_credentials_for_target("postgres", target)
+    worker_manager.save_credentials("postgres", {"host": "planted.example.test"})
+    assert load_credentials_for_target("postgres", target) is None
+    assert "postgres" not in access.list_services()
+
+
+def test_dashboard_delete_also_removes_the_worker_copy_of_tool_settings(tmp_path: Path) -> None:
+    """Deleting a scoped tool's settings also deletes the worker copy an older dashboard saved, which it no longer lists."""
+    runtime_paths = constants_mod.resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_SANDBOX_PROXY_URL": "http://sandbox:8765", "MINDROOM_SANDBOX_PROXY_TOKEN": "token"},
+    )
+    manager = CredentialsManager(tmp_path / "credentials")
+    worker_target = resolve_worker_target("shared", "alpha", None, tenant_id="test-tenant")
+    assert worker_target.worker_key is not None
+    worker_manager = manager.for_worker(worker_target.worker_key)
+    target = RequestCredentialsTarget(
+        runtime_paths=runtime_paths,
+        base_manager=manager,
+        target_manager=worker_manager,
+        worker_scope="shared",
+        agent_name="alpha",
+        execution_identity=None,
+    )
+    worker_manager.save_credentials("openweather", {"api_key": "old-worker-key"})
+    save_credentials_for_target("openweather", {"api_key": "new-key"}, target)
+
+    delete_credentials_for_target("openweather", target)
+
+    assert manager.for_primary_runtime_agent_scope("alpha").load_credentials("openweather") is None
+    assert worker_manager.load_credentials("openweather") is None

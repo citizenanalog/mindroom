@@ -10,15 +10,15 @@ from threading import Barrier, Thread
 
 import pytest
 
-from mindroom import private_instance_identity_store
-from mindroom.private_instance_identity import (
+from mindroom.private_storage import private_instance_identity_store
+from mindroom.private_storage.private_instance_identity import (
     PrivateInstance,
     PrivateInstanceIdentity,
     PrivateInstanceIdentityError,
     load_private_instance_identity,
     private_instances_for_agent,
 )
-from mindroom.private_instance_identity_store import ensure_private_instance_identity
+from mindroom.private_storage.private_instance_identity_store import ensure_private_instance_identity
 from mindroom.tool_system.worker_routing import private_instance_scope_root_path
 
 
@@ -447,6 +447,34 @@ def test_private_instances_for_agent_lists_owned_roots_and_flags_the_rest(tmp_pa
             ),
             key=lambda instance: instance.state_root,
         ),
+    )
+
+
+def test_private_instances_for_agent_ignores_a_record_the_primary_never_wrote(tmp_path: Path) -> None:
+    """A self-consistent owner record that sandbox runner code plants in a scope names no owner until the primary materializes it."""
+    requester_id = "@secret:example.test"
+    worker_key = f"v1:tenant-a:user:~{requester_id}"
+    scope_root = _scope_root(tmp_path, worker_key)
+    (scope_root / "secret").mkdir(parents=True)
+    (scope_root / ".mindroom-private-instance.json").write_text(
+        json.dumps(
+            {
+                "format": "mindroom-private-instance",
+                "version": 1,
+                "worker_key": worker_key,
+                "requester_id": requester_id,
+            },
+        ),
+        encoding="utf-8",
+    )
+    assert load_private_instance_identity(tmp_path, scope_root) == PrivateInstanceIdentity(worker_key, requester_id)
+
+    assert private_instances_for_agent(tmp_path, "secret", "user") == (PrivateInstance(scope_root / "secret", None),)
+
+    # A scope from an earlier release gains its owner at the requester's next turn.
+    ensure_private_instance_identity(tmp_path, worker_key=worker_key, requester_id=requester_id)
+    assert private_instances_for_agent(tmp_path, "secret", "user") == (
+        PrivateInstance(scope_root / "secret", requester_id),
     )
 
 

@@ -31,7 +31,7 @@ from mindroom.config.yaml_includes import (
     partial_source_uses_includes,
     source_files_fingerprint,
 )
-from mindroom.event_journal_open import pending_event_journal_restart
+from mindroom.event_journal.opening import pending_event_journal_restart
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -42,11 +42,11 @@ if TYPE_CHECKING:
     from mindroom.api.computers import ComputerRuntime
     from mindroom.api.mcp_gateway import GatewayRuntime
     from mindroom.api.usage_export import UsageExportRunner
-    from mindroom.config_reload import ConfigReloadStatus
+    from mindroom.config.reload_status import ConfigReloadStatus
     from mindroom.external_triggers.store import TriggerDeliverySnapshot
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.knowledge.watch import KnowledgeSourceWatcher
-    from mindroom.response_activity import ResponseIdentity
+    from mindroom.response_activity import ActiveScriptRunInfo, ResponseIdentity
     from mindroom.response_admission import ResponseAdmissionGate
     from mindroom.thread_export.workspace_sync import WorkspaceThreadExportRunner
     from mindroom.worker_computer.sessions import ComputerSessionStore
@@ -133,6 +133,8 @@ class _MindroomAppState:
     agent_reply_memberships: AgentReplyMembershipIndex = field(default_factory=AgentReplyMembershipIndex)
     response_admission_gate: ResponseAdmissionGate | None = None
     openai_responses: set[ResponseIdentity] = field(default_factory=set)
+    active_calls: Callable[[], list[ResponseIdentity]] | None = None
+    active_script_runs: Callable[[], Awaitable[list[ActiveScriptRunInfo]]] | None = None
     config_reload_status: Callable[[], ConfigReloadStatus] | None = None
     script_worker_keepalive: Callable[[WorkerBackend], None] | None = None
     mcp_gateway_runtime: GatewayRuntime | None = None

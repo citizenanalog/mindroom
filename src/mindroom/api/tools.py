@@ -17,12 +17,12 @@ from mindroom.api.dashboard_credential_scope import (
     resolve_dashboard_execution_scope_override,
 )
 from mindroom.config.main import Config
-from mindroom.credential_policy import credential_service_policy
-from mindroom.credentials import (
+from mindroom.credentials.manager import (
     get_runtime_credentials_manager,
     load_scoped_credentials,
     load_worker_grantable_shared_credentials,
 )
+from mindroom.credentials.policy import credential_service_policy
 from mindroom.oauth import OAuthProviderError
 from mindroom.oauth.credential_lifecycle import (
     load_oauth_credentials_snapshot,
@@ -45,7 +45,7 @@ from mindroom.tool_system.worker_routing import (
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth.providers import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
@@ -73,7 +73,6 @@ class _ResolvedToolAvailabilityContext:
     oauth_providers: dict[str, OAuthProvider]
     runtime_paths: RuntimePaths
     oauth_config: Config | None = None
-    worker_tools: list[str] | None = None
 
 
 def _effective_allowed_shared_services(
@@ -99,17 +98,17 @@ def _check_homeassistant_configured(tool_name: str, ha_creds: dict[str, Any] | N
     return False
 
 
+def _required_fields_stored(tool: dict[str, Any], credentials: dict[str, Any] | None) -> bool:
+    """Return whether every required config field is present in credentials."""
+    required_fields = [field["name"] for field in tool.get("config_fields") or [] if field.get("required", True)]
+    return all(field in (credentials or {}) for field in required_fields)
+
+
 def _check_standard_tool_configured(tool: dict[str, Any], credentials: dict[str, Any] | None) -> bool:
     """Check if a standard tool with config_fields is configured."""
-    if not tool.get("config_fields"):
+    if not tool.get("config_fields") or not credentials:
         return False
-
-    if not credentials:
-        return False
-
-    # Check if all required fields are present
-    required_fields = [field["name"] for field in tool.get("config_fields", []) if field.get("required", True)]
-    return all(field in credentials for field in required_fields)
+    return _required_fields_stored(tool, credentials)
 
 
 def _check_auth_provider_configured(
@@ -304,9 +303,6 @@ def _resolve_tool_availability_context(
         oauth_providers=oauth_providers,
         runtime_paths=runtime_paths,
         oauth_config=config,
-        worker_tools=(
-            config.get_agent_worker_tools(scope_request.agent_name) if scope_request.agent_name is not None else None
-        ),
     )
 
 
@@ -368,11 +364,7 @@ async def _update_tools_statuses(
                     allowed_shared_services=allowed_shared_services,
                     primary_built_tool=worker_target is not None
                     and worker_target.routing_agent_name is not None
-                    and primary_owns_tool_settings(
-                        service,
-                        runtime_paths=context.runtime_paths,
-                        worker_tools_override=context.worker_tools,
-                    ),
+                    and primary_owns_tool_settings(service, runtime_paths=context.runtime_paths),
                 )
             else:
                 credentials_cache[cache_key] = _load_shared_preview_credentials(
@@ -418,7 +410,7 @@ async def _update_tools_statuses(
                     use_request_target=use_request_target,
                 )
             )
-            if (
+            auth_configured = (
                 manual_auth_configured
                 or environment_auth_configured
                 or _check_auth_provider_configured(
@@ -427,7 +419,10 @@ async def _update_tools_statuses(
                     provider=provider,
                     runtime_paths=context.runtime_paths,
                 )
-            ):
+            )
+            # An OAuth connection alone cannot construct a tool whose own required settings are missing.
+            # Without a registered OAuth provider, the required fields live in the provider credentials already checked above.
+            if auth_configured and (provider is None or _required_fields_stored(tool, get_credentials(tool_name))):
                 tool["status"] = "available"
             continue
 

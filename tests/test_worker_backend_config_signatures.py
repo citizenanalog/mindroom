@@ -20,7 +20,7 @@ from mindroom.workers.backends.docker_config import (
 )
 from mindroom.workers.backends.kubernetes_config import (
     KubernetesWorkerBackendConfig,
-    credentials_encryption_key_hash,
+    _credentials_encryption_key_hash,
     kubernetes_backend_cleanup_signature,
     kubernetes_backend_config_signature,
 )
@@ -99,7 +99,7 @@ def _legacy_kubernetes_backend_config_signature(
     """Hand-assembled pre-refactor signature, kept verbatim as the equivalence oracle."""
     config = KubernetesWorkerBackendConfig.from_runtime(runtime_paths)
     credentials_encryption_key = runtime_paths.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV)
-    credentials_encryption_key_marker = credentials_encryption_key_hash(credentials_encryption_key) or ""
+    credentials_encryption_key_marker = _credentials_encryption_key_hash(credentials_encryption_key) or ""
     extra_env_json = json.dumps(config.extra_env, sort_keys=True, separators=(",", ":"))
     extra_labels_json = json.dumps(config.extra_labels, sort_keys=True, separators=(",", ":"))
     extra_annotations_json = json.dumps(config.extra_annotations, sort_keys=True, separators=(",", ":"))
@@ -381,6 +381,30 @@ def test_kubernetes_tmp_size_limit_changes_cache_identity_only_when_configured(t
 
     base_signature = kubernetes_backend_config_signature(base, auth_token=None)
     assert kubernetes_backend_config_signature(configured, auth_token=None) != base_signature
+
+
+def test_kubernetes_image_pull_secrets_read_chart_list_and_change_identity_only_when_configured(
+    tmp_path: Path,
+) -> None:
+    """The chart's imagePullSecrets list becomes Secret names; unset keeps the existing identity."""
+    env_name = "MINDROOM_KUBERNETES_WORKER_IMAGE_PULL_SECRETS_JSON"
+    base = _runtime_paths(tmp_path, _MINIMAL_KUBERNETES_ENV)
+    configured = _runtime_paths(
+        tmp_path,
+        {**_MINIMAL_KUBERNETES_ENV, env_name: '[{"name": "private-registry-pull"}, {"name": "mirror-pull"}]'},
+    )
+
+    assert KubernetesWorkerBackendConfig.from_runtime(base).image_pull_secrets == ()
+    assert KubernetesWorkerBackendConfig.from_runtime(configured).image_pull_secrets == (
+        "private-registry-pull",
+        "mirror-pull",
+    )
+    base_signature = kubernetes_backend_config_signature(base, auth_token=None)
+    assert kubernetes_backend_config_signature(configured, auth_token=None)[:-1] == base_signature
+    with pytest.raises(WorkerBackendError, match="IMAGE_PULL_SECRETS_JSON"):
+        KubernetesWorkerBackendConfig.from_runtime(
+            _runtime_paths(tmp_path, {**_MINIMAL_KUBERNETES_ENV, env_name: '["private-registry-pull"]'}),
+        )
 
 
 def test_kubernetes_user_resources_change_cache_identity_only_when_configured(tmp_path: Path) -> None:

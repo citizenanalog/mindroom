@@ -27,13 +27,13 @@ One shared boundary helper encodes `None` to the empty string and decodes it bac
 ### Durable sync batch boundary
 
 The Matrix client uses `nio.durable.open_durable_sync` with Classic or Simplified Sliding Sync.
-The current repository dependency in `pyproject.toml` is `mindroom-nio[e2e]==1.1.2`; `uv.lock` resolves version `1.1.2` from the package registry, with no Git source override.
+The current repository dependency in `pyproject.toml` is `mindroom-nio[e2e]==1.1.4`; `uv.lock` resolves version `1.1.4` from the package registry, with no Git source override.
 Account, device, consumer and stream ownership bind once when opening the session.
 Soft-logout renewal requests the existing device; it preserves the bound stream, membership positions, and attempted-delivery sending identity.
 Hard logout, missing device storage, or changed identity stops startup instead of attempting a stream replacement.
 Initial credentials are persisted after the local store exists and before journal binding, so an interrupted bind reopens the same device.
 The application trusts nio's typed records and does not reproduce a canonical JSON, digest, or per-record proof protocol.
-Existing deployments use the automatic in-place migration in [the Nio 1.0 upgrade guide](../deployment/nio-upgrade.md), preserving journal identity, message history, Matrix accounts, devices, and encryption keys while retiring unfinished old work.
+Existing deployments use the automatic in-place migration in [the Nio 1.0 upgrade guide](../deployment/upgrades.md#upgrading-to-nio-10), preserving journal identity, message history, Matrix accounts, devices, and encryption keys while retiring unfinished old work.
 
 One `SyncBatch` becomes an ordered vector of application dispositions.
 One journal transaction advances the consumer's `next_sequence` (starting at 1), applies every record, and freezes interactive associations for newly admitted actionable sources.
@@ -165,6 +165,8 @@ The room-history-loss repair in contract 7 instead follows request and raw-event
 
 Thread hydration adapts the room bounds rather than copying them: `_fetch_relations` counts a logical message only when `replaces_event_id is None`, and `max_fetched_events` bounds the raw relation tree that streaming makes an order of magnitude larger than the message count.
 The thread root is kept over and above the window, because a thread starting at its first reply is missing the message it is about.
+A walk that is not complete and saw no edit of the root by its sender then fetches the root's direct edits on their own, because an early root edit sorts behind every newer reply.
+If that fetch also stops at the event ceiling without such an edit, the root is installed with the unreadable-edit notice rather than as unedited.
 
 **Why early truncation is safe.** The walk asks for `direction=back` explicitly rather than inheriting nio's default.
 Under MSC3981 the server returns relations in the topological order `/messages` would give, and an edit is sent after the message it revises, so every edit arrives *before* its original.
@@ -179,12 +181,14 @@ The write checks the expected refresh token and membership epoch, rejects a tomb
 An admitted producer `LOSS` record also creates a durable room-history-loss obligation.
 Strict conversation reads ask the shared hydrator to repair it through the room's `/messages` history, including the threaded events returned there.
 Concurrent room and thread readers share one repair walk per room.
-That walk can continue beyond the logical prompt window to readable server exhaustion, but its request count and raw-event count remain bounded.
+That walk can continue beyond the logical prompt window to server exhaustion, but its request count and raw-event count remain bounded.
 Each page is installed under the exact recovery revision and membership epoch, so a new loss obligation or membership change fences stale work.
 
-Readable server exhaustion completes the obligation; reaching a ceiling retains a durable truncated result.
+Server exhaustion completes the obligation; reaching a ceiling retains a durable truncated result.
 A later read does not repeat the same bounded repair under the same policy, while a complete-history caller with a higher policy rank can request a further bounded attempt.
-Fetch failures or unreadable history at server exhaustion fail the read and leave the obligation repairable.
+Fetch failures fail the read and leave the obligation repairable.
+Unreadable history at server exhaustion still settles the obligation for every caller, because a missing room key may never arrive and live sync admits such events without failing any read.
+That settlement records the room conversation as incomplete and revokes every thread's hydration marker, since the walk cannot always tell which thread an unreadable event belonged to, so each thread's next walk decides whether it is complete; a complete-history caller refuses there, only for the threads that hold such an event.
 These repairs are read-triggered; there is no unrestricted periodic background rescan.
 
 ### 8. Membership epochs fence every derived and pending fact
@@ -287,7 +291,7 @@ Failure stays a visible readiness or request failure rather than reviving room-w
 
 Initial and final delivery stages use deterministic transaction IDs derived from principal, delivery ID, and stage.
 
-The completed model result is durable in `TurnStore` before final outbox enqueue, so recovery does not rerun a completed model call merely to rebuild delivery content.
+The completed model result is durable before final outbox enqueue, in the AI reply's record or, for other deliveries, in `TurnStore`, so recovery does not rerun a completed model call merely to rebuild delivery content.
 
 Enqueue may create a row or update an unattempted one.
 The worker then atomically claims the row by committing `attempted=true` **before** network I/O; claiming freezes the payload and target and returns the exact stored delivery to send.
@@ -295,12 +299,14 @@ An attempted but unacknowledged row is retried with the same payload and transac
 
 That ordering closes the case where Matrix accepted an older deterministic transaction while a restarted model run produced different content that could never become visible.
 
-Acknowledgement and the terminal turn record commit in **one** transaction, and an acknowledgement loser writes neither row — that is what stops the outbox and the turn record naming different events.
+For a delivery that is not an AI reply, acknowledgement and the terminal turn record commit in **one** transaction, and an acknowledgement loser writes neither row — that is what stops the outbox and the turn record naming different events.
+An AI reply's acknowledgement binds the event on its reply record instead, and the reply's rules settle its turn when its terminal row is enqueued.
 
 ## Storage concurrency
 
-SQLite uses one writer task and a command queue.
-The writer opens `synchronous = FULL`; readers use `NORMAL`.
+Both backends serialize writes through one writer task and a command queue that accepts writes from any event loop, including the loop a synchronous tool's hooks run on.
+The writes queued at once commit in one transaction, each in a savepoint of its own, so one commit covers the batch and a write that fails rolls back alone.
+The SQLite writer opens `synchronous = FULL`; readers use `NORMAL`.
 Writer and reader connections use WAL-compatible settings and an explicit `busy_timeout`.
 
 PostgreSQL implements the same behavioural contract without a second application protocol.

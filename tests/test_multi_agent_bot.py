@@ -55,6 +55,7 @@ from tests.bot_helpers import (
     _wrap_extracted_collaborators,
     make_mock_agent_user,
     make_test_agent_bot,
+    unique_room_send_responses,
 )
 from tests.conftest import (
     TEST_PASSWORD,
@@ -1014,7 +1015,7 @@ class TestAgentBot(AgentBotTestBase):
         close_order: list[str] = []
         bot.prepare_for_sync_shutdown = AsyncMock(side_effect=failure)
         bot._journal_dispatcher = AsyncMock()
-        bot._journal_dispatcher.stop.side_effect = lambda: close_order.append("dispatcher")
+        bot._journal_dispatcher.stop.side_effect = lambda **_kwargs: close_order.append("dispatcher")
         bot._ingestion_session = AsyncMock()
         bot._ingestion_session.close.side_effect = lambda: close_order.append("ingestion")
         bot.client = _make_matrix_client_mock()
@@ -1059,7 +1060,7 @@ class TestAgentBot(AgentBotTestBase):
         with (
             patch("mindroom.bot_room_lifecycle.is_sender_allowed_for_agent_reply_in_room", return_value=True),
         ):
-            bot._room_lifecycle.record_pending_room_invite(mock_room.room_id, mock_event.sender)
+            await bot._room_lifecycle.record_pending_room_invite(mock_room.room_id, mock_event.sender)
             await bot._room_lifecycle.handle_recorded_invite(mock_room, mock_event.sender)
 
         assert change_membership.await_count == expected_join_calls
@@ -1179,10 +1180,8 @@ class TestAgentBot(AgentBotTestBase):
 
             bot.client.get_presence = mock_get_presence
 
-        # Mock successful room_send response
-        mock_send_response = MagicMock()
-        mock_send_response.__class__ = nio.RoomSendResponse
-        bot.client.room_send.return_value = mock_send_response
+        # Each send creates its own event, as a homeserver does.
+        unique_room_send_responses(bot.client)
 
         mock_room = MagicMock()
         mock_room.room_id = "!test:localhost"
@@ -1593,7 +1592,7 @@ class TestAgentBot(AgentBotTestBase):
     @patch("mindroom.config.main.load_config")
     @patch("mindroom.teams.resolve_agent_knowledge_access")
     @patch("mindroom.teams.create_agent")
-    @patch("mindroom.model_loading.get_model_instance")
+    @patch("mindroom.providers.model_loading.get_model_instance")
     @patch("mindroom.teams.Team.arun")
     @patch("mindroom.response_runner.ai_response")
     @patch("mindroom.response_runner.stream_agent_response")
@@ -1647,10 +1646,8 @@ class TestAgentBot(AgentBotTestBase):
         mock_orchestrator.runtime_paths = runtime_paths_for(config)
         bot.orchestrator = mock_orchestrator
 
-        # Mock successful room_send response
-        mock_send_response = MagicMock()
-        mock_send_response.__class__ = nio.RoomSendResponse
-        bot.client.room_send.return_value = mock_send_response
+        # Each send creates its own event, as a homeserver does.
+        unique_room_send_responses(bot.client)
 
         mock_room = MagicMock()
         mock_room.room_id = "!test:localhost"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,13 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
-from mindroom import scheduling
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
-from mindroom.recurring_schedule import RecurringOccurrence, _RecurringCheckpoint
-from mindroom.scheduling import (
+from mindroom.scheduling import tasks as scheduling
+from mindroom.scheduling.executor import ScheduledWorkflowOutcome
+from mindroom.scheduling.recurring_schedule import RecurringOccurrence, _RecurringCheckpoint
+from mindroom.scheduling.tasks import (
     _SCHEDULED_TASK_EVENT_TYPE,
     CronSchedule,
     ScheduledTaskRecord,
@@ -43,7 +45,6 @@ from mindroom.scheduling import (
     schedule_task,
     scheduled_task_read_sort_key,
 )
-from mindroom.scheduling_executor import ScheduledWorkflowOutcome
 from tests.authorization_helpers import (
     make_test_scheduling_runtime,
 )
@@ -369,7 +370,7 @@ async def test_restore_scheduled_tasks_queues_overdue_one_time_tasks(tmp_path: P
     client.room_get_state = AsyncMock(return_value=state_response)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
-    with patch("mindroom.scheduling._start_scheduled_task") as mock_start:
+    with patch("mindroom.scheduling.tasks._start_scheduled_task") as mock_start:
         restored = await restore_scheduled_tasks(
             client=client,
             room_id="!test:server",
@@ -437,7 +438,7 @@ async def test_drain_deferred_overdue_tasks_starts_queued_tasks_after_sync(tmp_p
     client.room_get_state = AsyncMock(return_value=state_response)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
-    with patch("mindroom.scheduling._start_scheduled_task") as mock_start_during_restore:
+    with patch("mindroom.scheduling.tasks._start_scheduled_task") as mock_start_during_restore:
         await restore_scheduled_tasks(
             client=client,
             room_id="!test:server",
@@ -449,8 +450,8 @@ async def test_drain_deferred_overdue_tasks_starts_queued_tasks_after_sync(tmp_p
     mock_start_during_restore.assert_not_called()
 
     with (
-        patch("mindroom.scheduling._start_scheduled_task", side_effect=[True, True]) as mock_start,
-        patch("mindroom.scheduling.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        patch("mindroom.scheduling.tasks._start_scheduled_task", side_effect=[True, True]) as mock_start,
+        patch("mindroom.scheduling.tasks.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
     ):
         drained = await drain_deferred_overdue_tasks(
             client,
@@ -464,6 +465,132 @@ async def test_drain_deferred_overdue_tasks_starts_queued_tasks_after_sync(tmp_p
     assert all(call.kwargs["matrix_admin"] is not None for call in mock_start.call_args_list)
     mock_sleep.assert_awaited_once_with(scheduling._DEFERRED_OVERDUE_TASK_START_DELAY_SECONDS)
     assert len(scheduling._deferred_overdue_tasks) == 0
+
+
+_TURN_OWNER: contextvars.ContextVar[object | None] = contextvars.ContextVar("test_schedule_turn_owner", default=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_type", ["once", "cron"])
+async def test_task_scheduled_during_a_turn_does_not_inherit_the_turn_context(
+    schedule_type: str,
+    tmp_path: Path,
+) -> None:
+    """A schedule outlives the turn that creates it, whose contextvars hold the turn's Agent and tools."""
+    workflow = ScheduledWorkflow(
+        created_by="@user:server",
+        schedule_type=schedule_type,
+        execute_at=datetime.now(UTC) + timedelta(hours=1) if schedule_type == "once" else None,
+        cron_schedule=CronSchedule(minute="0", hour="9", day="*", month="*", weekday="*")
+        if schedule_type == "cron"
+        else None,
+        message="reminder",
+        description="reminder",
+        room_id="!test:server",
+    )
+    observed: list[object | None] = []
+
+    async def runner(*_args: object, **_kwargs: object) -> None:
+        observed.append(_TURN_OWNER.get())
+
+    token = _TURN_OWNER.set(object())
+    try:
+        with patch.object(scheduling, "_run_once_task", runner), patch.object(scheduling, "_run_cron_task", runner):
+            assert scheduling._start_scheduled_task(
+                AsyncMock(),
+                "task_from_turn",
+                workflow,
+                MagicMock(),
+                _test_runtime_paths(tmp_path),
+                _conversation_reader(),
+            )
+    finally:
+        _TURN_OWNER.reset(token)
+    await scheduling._running_tasks.pop("task_from_turn")
+
+    assert observed == [None]
+
+
+def _pending_once_workflow() -> ScheduledWorkflow:
+    return ScheduledWorkflow(
+        created_by="@user:server",
+        schedule_type="once",
+        execute_at=datetime.now(UTC) + timedelta(hours=1),
+        message="reminder",
+        description="reminder",
+        room_id="!test:server",
+    )
+
+
+def _router_runtime(*, room_power_level: int | None, events_default: int = 0) -> scheduling.ScheduledTaskRunnerOwner:
+    """Return a router runtime joined to the test room at a power level, or not joined when it is None."""
+    router_client = AsyncMock()
+    router_client.user_id = "@mindroom_router:server"
+    router_client.rooms = {}
+    if room_power_level is not None:
+        room = nio.MatrixRoom("!test:server", router_client.user_id)
+        room.power_levels.defaults.state_default = 50
+        room.power_levels.defaults.events_default = events_default
+        room.power_levels.users[router_client.user_id] = room_power_level
+        router_client.rooms["!test:server"] = room
+    return scheduling.ScheduledTaskRunnerOwner(router_client, _conversation_reader())
+
+
+async def _save_agent_schedule(tmp_path: Path, agent_client: AsyncMock, agent_reader: AsyncMock) -> MagicMock:
+    with (
+        patch.object(scheduling, "_persist_scheduled_task_state", new=AsyncMock(return_value="revision")),
+        patch.object(scheduling, "_start_scheduled_task", return_value=True) as start,
+    ):
+        await scheduling._save_pending_scheduled_task(
+            client=agent_client,
+            room_id="!test:server",
+            task_id="agent_task",
+            workflow=_pending_once_workflow(),
+            config=Config(),
+            runtime_paths=_test_runtime_paths(tmp_path),
+            conversation_reader=agent_reader,
+        )
+    start.assert_called_once()
+    assert start.call_args.args[1] == "agent_task"
+    return start
+
+
+@pytest.mark.asyncio
+async def test_schedule_created_by_an_agent_runs_on_the_router_runtime(tmp_path: Path) -> None:
+    """An agent's schedule starts on the router's runtime, so replacing the agent's bot cannot strand it."""
+    router = _router_runtime(room_power_level=100)
+    scheduling.set_scheduled_task_runner_owner(router)
+
+    start = await _save_agent_schedule(tmp_path, AsyncMock(), _conversation_reader())
+
+    assert start.call_args.args[0] is router.client
+    assert start.call_args.args[5] is router.conversation_reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("router_running", "room_power_level", "events_default"),
+    [(False, None, 0), (True, None, 0), (True, 0, 0), (True, 50, 100)],
+    ids=["no-router", "router-not-joined", "router-cannot-write-state", "router-cannot-send-trigger"],
+)
+async def test_schedule_in_a_room_the_router_cannot_serve_runs_on_its_creator(
+    tmp_path: Path,
+    router_running: bool,
+    room_power_level: int | None,
+    events_default: int,
+) -> None:
+    """Without a router that can write the room's schedule state and send its trigger, the creator keeps the task."""
+    if router_running:
+        scheduling.set_scheduled_task_runner_owner(
+            _router_runtime(room_power_level=room_power_level, events_default=events_default),
+        )
+    agent_client = AsyncMock()
+    agent_reader = _conversation_reader()
+
+    start = await _save_agent_schedule(tmp_path, agent_client, agent_reader)
+
+    assert start.call_args.args[0] is agent_client
+    assert start.call_args.args[5] is agent_reader
 
 
 @pytest.mark.asyncio
@@ -519,7 +646,7 @@ async def test_drain_deferred_overdue_tasks_continues_after_one_start_failure(tm
     client.room_get_state = AsyncMock(return_value=state_response)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
-    with patch("mindroom.scheduling._start_scheduled_task") as mock_start_during_restore:
+    with patch("mindroom.scheduling.tasks._start_scheduled_task") as mock_start_during_restore:
         await restore_scheduled_tasks(
             client=client,
             room_id="!test:server",
@@ -532,10 +659,10 @@ async def test_drain_deferred_overdue_tasks_continues_after_one_start_failure(tm
 
     with (
         patch(
-            "mindroom.scheduling._start_scheduled_task",
+            "mindroom.scheduling.tasks._start_scheduled_task",
             side_effect=[RuntimeError("boom"), True],
         ) as mock_start,
-        patch("mindroom.scheduling.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        patch("mindroom.scheduling.tasks.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
     ):
         drained = await drain_deferred_overdue_tasks(
             client,
@@ -582,7 +709,7 @@ async def test_restore_scheduled_tasks_defers_cron_until_sync_ready(tmp_path: Pa
     client.room_get_state = AsyncMock(return_value=state_response)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
-    with patch("mindroom.scheduling._start_scheduled_task", return_value=True) as mock_start:
+    with patch("mindroom.scheduling.tasks._start_scheduled_task", return_value=True) as mock_start:
         restored = await restore_scheduled_tasks(
             client=client,
             room_id="!test:server",
@@ -628,7 +755,7 @@ async def test_restore_scheduled_tasks_does_not_queue_when_nothing_is_overdue(tm
     client.room_get_state = AsyncMock(return_value=state_response)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
-    with patch("mindroom.scheduling._start_scheduled_task", return_value=True) as mock_start:
+    with patch("mindroom.scheduling.tasks._start_scheduled_task", return_value=True) as mock_start:
         restored = await restore_scheduled_tasks(
             client=client,
             room_id="!test:server",
@@ -694,7 +821,7 @@ async def test_restore_scheduled_tasks_uses_canonical_state_parser_for_mixed_rec
     client.room_get_state = AsyncMock(return_value=state_response)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
 
-    with patch("mindroom.scheduling._start_scheduled_task", return_value=True) as mock_start:
+    with patch("mindroom.scheduling.tasks._start_scheduled_task", return_value=True) as mock_start:
         restored = await restore_scheduled_tasks(
             client=client,
             room_id="!test:server",
@@ -1074,12 +1201,12 @@ async def test_run_once_task_stops_when_cancelled_via_matrix_state() -> None:
         return pending_record if fetch_count == 1 else cancelled_record
 
     with (
-        patch("mindroom.scheduling.get_scheduled_task", side_effect=_fetch_task),
+        patch("mindroom.scheduling.tasks.get_scheduled_task", side_effect=_fetch_task),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute_mock,
-        patch("mindroom.scheduling.asyncio.sleep", new=AsyncMock()),
+        patch("mindroom.scheduling.tasks.asyncio.sleep", new=AsyncMock()),
     ):
         await _run_once_task(
             client,
@@ -1122,9 +1249,9 @@ async def test_run_once_task_executes_latest_state_workflow() -> None:
         return _record("task_once_updated", updated_workflow, status="pending")
 
     with (
-        patch("mindroom.scheduling.get_scheduled_task", side_effect=_fetch_task),
+        patch("mindroom.scheduling.tasks.get_scheduled_task", side_effect=_fetch_task),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute_mock,
     ):
@@ -1188,13 +1315,13 @@ async def test_run_once_task_retries_transient_state_read_failure(tmp_path: Path
     )
 
     with (
-        patch("mindroom.scheduling.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch("mindroom.scheduling.tasks.asyncio.sleep", new=AsyncMock()) as sleep,
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute,
         patch(
-            "mindroom.scheduling_executor.send_scheduled_failure_notice",
+            "mindroom.scheduling.executor.send_scheduled_failure_notice",
             new=AsyncMock(),
         ) as failure_notice,
     ):
@@ -1208,7 +1335,7 @@ async def test_run_once_task_retries_transient_state_read_failure(tmp_path: Path
         )
 
     sleep.assert_awaited_once()
-    assert client._send.await_count == 3
+    assert sum(_SCHEDULED_TASK_EVENT_TYPE in call.args[2] for call in client._send.await_args_list) == 3
     execute.assert_awaited_once()
     failure_notice.assert_not_awaited()
 
@@ -1233,11 +1360,11 @@ async def test_run_once_task_marks_completed_after_success() -> None:
 
     with (
         patch(
-            "mindroom.scheduling.get_scheduled_task",
+            "mindroom.scheduling.tasks.get_scheduled_task",
             new=AsyncMock(side_effect=[pending_record, pending_record]),
         ),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute_mock,
     ):
@@ -1281,11 +1408,11 @@ async def test_run_once_task_marks_failed_after_execution_failure() -> None:
 
     with (
         patch(
-            "mindroom.scheduling.get_scheduled_task",
+            "mindroom.scheduling.tasks.get_scheduled_task",
             new=AsyncMock(side_effect=[pending_record, pending_record]),
         ),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="failed", failure_reason="send failed")),
         ) as execute_mock,
     ):
@@ -1343,12 +1470,12 @@ async def test_run_cron_task_executes_latest_state_workflow(tmp_path: Path) -> N
         return _record("task_cron_updated", updated_workflow, status="pending")
 
     with (
-        patch("mindroom.scheduling.get_scheduled_task", side_effect=_fetch_task),
+        patch("mindroom.scheduling.tasks.get_scheduled_task", side_effect=_fetch_task),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute_mock,
-        patch("mindroom.scheduling.plan_recurring_occurrence", return_value=occurrence),
+        patch("mindroom.scheduling.tasks.plan_recurring_occurrence", return_value=occurrence),
     ):
         await _run_cron_task(
             client,
@@ -1394,14 +1521,14 @@ async def test_run_cron_task_keeps_pending_state_after_success(tmp_path: Path) -
 
     with (
         patch(
-            "mindroom.scheduling.get_scheduled_task",
+            "mindroom.scheduling.tasks.get_scheduled_task",
             new=AsyncMock(side_effect=[pending_record, pending_record]),
         ),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute_mock,
-        patch("mindroom.scheduling.plan_recurring_occurrence", return_value=occurrence),
+        patch("mindroom.scheduling.tasks.plan_recurring_occurrence", return_value=occurrence),
     ):
         await _run_cron_task(
             client,
@@ -1435,9 +1562,9 @@ async def test_run_cron_task_stops_when_cancelled_via_matrix_state() -> None:
         return _record("task_cron_cancelled", workflow, status="cancelled")
 
     with (
-        patch("mindroom.scheduling.get_scheduled_task", side_effect=_fetch_task),
+        patch("mindroom.scheduling.tasks.get_scheduled_task", side_effect=_fetch_task),
         patch(
-            "mindroom.scheduling_executor.execute_scheduled_workflow",
+            "mindroom.scheduling.executor.execute_scheduled_workflow",
             new=AsyncMock(return_value=ScheduledWorkflowOutcome(status="delivered")),
         ) as execute_mock,
     ):
@@ -1913,7 +2040,7 @@ async def test_edit_scheduled_task_reuses_existing_thread(tmp_path: Path) -> Non
     client.room_get_state_event = AsyncMock(return_value=state_response)
 
     with patch(
-        "mindroom.scheduling.schedule_task",
+        "mindroom.scheduling.tasks.schedule_task",
         new=AsyncMock(return_value=("task123", "✅ Scheduled")),
     ) as mock_schedule:
         result = await edit_scheduled_task(
@@ -2004,7 +2131,7 @@ async def test_threaded_schedule_edit_preserves_persisted_placement(
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=parsed)),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=parsed)),
     ):
         result = await edit_scheduled_task(
             runtime=_scheduling_runtime(
@@ -2031,6 +2158,80 @@ async def test_threaded_schedule_edit_preserves_persisted_placement(
 
 
 @pytest.mark.asyncio
+async def test_parsed_schedule_never_carries_a_call_approval(tmp_path: Path) -> None:
+    """An edit never becomes pre-approved, even when the parsed schedule claims it is."""
+    client = AsyncMock()
+    serve_task_state_events(client)
+    room_state: dict[str, dict[str, Any]] = {}
+    matrix_admin = _RecordingScheduleStateAdmin(room_state)
+    client.room_get_state_event = AsyncMock(
+        side_effect=lambda room_id, event_type, state_key: nio.RoomGetStateEventResponse(
+            content=room_state[state_key]["content"],
+            room_id=room_id,
+            event_type=event_type,
+            state_key=state_key,
+        ),
+    )
+    runtime_paths = _test_runtime_paths(tmp_path)
+    config = bind_runtime_paths(
+        Config(
+            agents={"assistant": AgentConfig(display_name="Assistant")},
+            models={"default": ModelConfig(provider="test", id="test-model")},
+        ),
+        runtime_paths,
+    )
+    ids = entity_ids(config, runtime_paths)
+    workflow = ScheduledWorkflow(
+        schedule_type="once",
+        execute_at=datetime.now(UTC) + timedelta(minutes=5),
+        message="@assistant call add",
+        description="Pre-approved add",
+        room_id="!test:server",
+        thread_id="$thread",
+        created_by="@alice:server",
+    )
+    await _persist_scheduled_task_state(
+        client=client,
+        room_id="!test:server",
+        task_id="task123",
+        workflow=workflow,
+        matrix_admin=matrix_admin,
+        timezone="UTC",
+    )
+    withdraw = AsyncMock()
+    parsed = workflow.model_copy(update={"description": "Edited", "pre_approved_call": True})
+    with (
+        patch(
+            "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
+            return_value=[ids["assistant"]],
+        ),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=parsed)),
+        patch("mindroom.scheduling.tasks.withdraw_scheduled_call_approval", new=withdraw),
+    ):
+        result = await edit_scheduled_task(
+            runtime=_scheduling_runtime(
+                client=client,
+                config=config,
+                runtime_paths=runtime_paths,
+                room=_matrix_room("!test:server"),
+                matrix_admin=matrix_admin,
+            ),
+            room_id="!test:server",
+            task_id="task123",
+            full_text="rename it Edited",
+            scheduled_by="@alice:server",
+            thread_id="$thread",
+        )
+
+    assert "Updated task" in result
+    withdraw.assert_not_awaited()
+    saved = await get_scheduled_task(client, "!test:server", "task123", runtime_paths)
+    assert saved is not None
+    assert saved.workflow.description == "Edited"
+    assert saved.workflow.pre_approved_call is False
+
+
+@pytest.mark.asyncio
 async def test_edit_scheduled_task_forwards_history_limit_override(tmp_path: Path) -> None:
     """An explicit history limit on edit must reach the shared scheduling backend."""
     client = AsyncMock()
@@ -2053,7 +2254,7 @@ async def test_edit_scheduled_task_forwards_history_limit_override(tmp_path: Pat
     client.room_get_state_event = AsyncMock(return_value=state_response)
 
     with patch(
-        "mindroom.scheduling.schedule_task",
+        "mindroom.scheduling.tasks.schedule_task",
         new=AsyncMock(return_value=("task123", "✅ Scheduled")),
     ) as mock_schedule:
         result = await edit_scheduled_task(
@@ -2095,7 +2296,7 @@ async def test_edit_scheduled_task_preserves_new_thread_mode(tmp_path: Path) -> 
     client.room_get_state_event = AsyncMock(return_value=state_response)
 
     with patch(
-        "mindroom.scheduling.schedule_task",
+        "mindroom.scheduling.tasks.schedule_task",
         new=AsyncMock(return_value=("task123", "✅ Scheduled")),
     ) as mock_schedule:
         result = await edit_scheduled_task(
@@ -2172,7 +2373,7 @@ async def test_edit_scheduled_task_persists_via_admin_and_preserves_omitted_sile
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=updated_workflow)),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=updated_workflow)),
     ):
         result = await edit_scheduled_task(
             runtime=_scheduling_runtime(
@@ -2408,7 +2609,7 @@ async def test_schedule_task_returns_error_when_sender_blocked_from_all_agents()
             return_value=[],
         ),
         patch(
-            "mindroom.scheduling._extract_mentioned_agents_from_text",
+            "mindroom.scheduling.tasks._extract_mentioned_agents_from_text",
             return_value=[],
         ),
     ):
@@ -2437,7 +2638,7 @@ async def test_schedule_task_blocked_sender_new_thread_returns_error() -> None:
             return_value=[],
         ),
         patch(
-            "mindroom.scheduling._extract_mentioned_agents_from_text",
+            "mindroom.scheduling.tasks._extract_mentioned_agents_from_text",
             return_value=[],
         ),
     ):
@@ -2565,10 +2766,10 @@ async def test_schedule_task_persists_via_admin_when_active_agent_lacks_state_po
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
-        patch("mindroom.scheduling._start_scheduled_task", return_value=True),
-        patch("mindroom.scheduling.uuid.uuid4", return_value="task1234"),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
+        patch("mindroom.scheduling.tasks._start_new_scheduled_task"),
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="task1234"),
     ):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(
@@ -2635,10 +2836,10 @@ async def test_schedule_task_explicit_history_limit_overrides_parse_and_round_tr
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
-        patch("mindroom.scheduling._start_scheduled_task", return_value=True),
-        patch("mindroom.scheduling.uuid.uuid4", return_value="task1234"),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
+        patch("mindroom.scheduling.tasks._start_new_scheduled_task"),
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="task1234"),
     ):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(
@@ -2705,10 +2906,10 @@ async def test_schedule_task_keeps_parse_produced_history_limit(tmp_path: Path) 
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
-        patch("mindroom.scheduling._start_scheduled_task", return_value=True),
-        patch("mindroom.scheduling.uuid.uuid4", return_value="task1234"),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
+        patch("mindroom.scheduling.tasks._start_new_scheduled_task"),
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="task1234"),
     ):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(
@@ -2737,7 +2938,7 @@ async def test_schedule_task_rejects_invalid_history_limit_before_parsing(
     """An invalid explicit limit fails fast without spending an AI parse call."""
     parse_mock = AsyncMock()
 
-    with patch("mindroom.scheduling._parse_workflow_schedule", new=parse_mock):
+    with patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=parse_mock):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(),
             room_id="!test:server",
@@ -2779,10 +2980,10 @@ async def test_schedule_task_returns_error_when_state_write_fails_without_admin_
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
-        patch("mindroom.scheduling._start_scheduled_task", return_value=True) as start_task,
-        patch("mindroom.scheduling.uuid.uuid4", return_value="taskfail"),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
+        patch("mindroom.scheduling.tasks._start_new_scheduled_task") as start_task,
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="taskfail"),
     ):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(
@@ -2853,10 +3054,10 @@ async def test_schedule_task_returns_error_when_active_write_returns_unexpected_
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
-        patch("mindroom.scheduling._start_scheduled_task", return_value=True) as start_task,
-        patch("mindroom.scheduling.uuid.uuid4", return_value="taskweird"),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=workflow)),
+        patch("mindroom.scheduling.tasks._start_new_scheduled_task") as start_task,
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="taskweird"),
     ):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(
@@ -2922,11 +3123,11 @@ async def test_schedule_task_uses_configured_room_boundary_without_membership_re
     )
 
     with (
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=parse_result)),
-        patch("mindroom.scheduling._validate_agent_mentions") as mock_validate,
-        patch("mindroom.scheduling._save_pending_scheduled_task", new=AsyncMock(return_value=None)),
-        patch("mindroom.scheduling.uuid.uuid4", return_value="task12345"),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=parse_result)),
+        patch("mindroom.scheduling.tasks._validate_agent_mentions") as mock_validate,
+        patch("mindroom.scheduling.tasks._save_pending_scheduled_task", new=AsyncMock(return_value=None)),
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="task12345"),
     ):
         mock_validate.return_value = scheduling._AgentValidationResult(True, [], [])
         task_id, message = await schedule_task(
@@ -2985,8 +3186,8 @@ async def test_schedule_task_rejects_mentions_outside_existing_thread_scope(tmp_
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             new=AsyncMock(return_value=[ids["assistant"], ids["writer"]]),
         ),
-        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=parse_result)),
-        patch("mindroom.scheduling._save_pending_scheduled_task", new=AsyncMock()) as save_task,
+        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock(return_value=parse_result)),
+        patch("mindroom.scheduling.tasks._save_pending_scheduled_task", new=AsyncMock()) as save_task,
     ):
         runtime = _scheduling_runtime(
             client=client,
@@ -3047,13 +3248,13 @@ async def test_schedule_model_persists_and_edits(tmp_path: Path) -> None:
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
         patch(
-            "mindroom.scheduling._parse_workflow_schedule",
+            "mindroom.scheduling.tasks._parse_workflow_schedule",
             new=AsyncMock(side_effect=lambda *_args, **_kwargs: workflow.model_copy(deep=True)),
         ),
-        patch("mindroom.scheduling._start_scheduled_task", return_value=True),
-        patch("mindroom.scheduling.uuid.uuid4", return_value="task1234"),
+        patch("mindroom.scheduling.tasks._start_new_scheduled_task"),
+        patch("mindroom.scheduling.tasks.uuid.uuid4", return_value="task1234"),
     ):
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(
@@ -3094,9 +3295,9 @@ async def test_schedule_model_persists_and_edits(tmp_path: Path) -> None:
             "mindroom.authorization.responder_candidate_entities_with_membership_refresh",
             return_value=[ids["assistant"]],
         ),
-        patch("mindroom.scheduling._extract_mentioned_agents_from_text", return_value=[]),
+        patch("mindroom.scheduling.tasks._extract_mentioned_agents_from_text", return_value=[]),
         patch(
-            "mindroom.scheduling._parse_workflow_schedule",
+            "mindroom.scheduling.tasks._parse_workflow_schedule",
             new=AsyncMock(side_effect=lambda *_args, **_kwargs: workflow.model_copy(deep=True)),
         ),
     ):
@@ -3127,7 +3328,7 @@ async def test_schedule_model_persists_and_edits(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_schedule_rejects_unknown_model_before_parsing() -> None:
     """An unknown model must fail before parsing or writing schedule state."""
-    with patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock()) as parse:
+    with patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=AsyncMock()) as parse:
         task_id, message = await schedule_task(
             runtime=_scheduling_runtime(),
             room_id="!test:server",

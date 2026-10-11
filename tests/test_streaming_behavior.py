@@ -49,9 +49,10 @@ from mindroom.response_sources import ResponseSources
 from mindroom.response_turn import PausedAttempt, ResponsePausedForApproval
 from mindroom.runtime_shutdown import ORDERLY_SHUTDOWN
 from mindroom.streaming import (
-    _CANCELLED_RESPONSE_NOTE,
     _INTERRUPTED_RESPONSE_NOTE,
     _PROGRESS_PLACEHOLDER,
+    CANCELLED_RESPONSE_NOTE,
+    ProgressPermission,
     ReplacementStreamingResponse,
     StreamingDeliveryError,
     StreamingLifecycleSuspensionError,
@@ -82,12 +83,15 @@ from tests.conftest import (
     make_matrix_client_mock,
     message_origin,
     patch_response_runner_module,
+    push_stream_chunk,
     replace_response_runner_deps,
     request_envelope,
     runtime_paths_for,
     test_runtime_paths,
+    unwrap_extracted_collaborator,
 )
 from tests.identity_helpers import persist_entity_accounts
+from tests.reply_span_helpers import response_span
 from tests.response_attempt_helpers import install_direct_response_admission
 
 if TYPE_CHECKING:
@@ -244,6 +248,44 @@ async def test_dropped_optional_delivery_still_sends_latest_visible_text(tmp_pat
     assert mock_client.room_send.await_args.kwargs["content"]["body"] == "latest body"
 
 
+@pytest.mark.asyncio
+async def test_a_progress_edit_its_records_defer_is_skipped_not_failed(tmp_path: Path) -> None:
+    """While an earlier durable write of the reply is unresolved, progress waits; a later edit shows it."""
+    mock_client = _make_matrix_client_mock()
+    mock_response = MagicMock()
+    mock_response.__class__ = nio.RoomSendResponse
+    mock_response.event_id = "$edit"
+    mock_client.room_send.return_value = mock_response
+    config = bind_runtime_paths(Config(), test_runtime_paths(tmp_path))
+    permissions = [ProgressPermission.DEFER, ProgressPermission.SEND]
+
+    async def write_ahead(_progress: object) -> ProgressPermission:
+        return permissions.pop(0)
+
+    streaming = StreamingResponse(
+        target=MessageTarget.resolve("!test:localhost", None, "$original_123"),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+        update_interval=10.0,
+        min_update_interval=10.0,
+        interval_ramp_seconds=0.0,
+        update_char_threshold=1,
+        min_update_char_threshold=1,
+        min_char_update_interval=0.0,
+        progress_write_ahead=write_ahead,
+    )
+    streaming.event_id = "$reply"
+    streaming.accumulated_text = "progress"
+    streaming.chars_since_last_update = len(streaming.accumulated_text)
+
+    assert await streaming._send_or_edit_message(mock_client)
+    mock_client.room_send.assert_not_awaited()
+    streaming.accumulated_text = "more progress"
+    assert await streaming._send_or_edit_message(mock_client)
+    mock_client.room_send.assert_awaited_once()
+    assert mock_client.room_send.await_args.kwargs["content"]["m.new_content"]["body"] == "more progress"
+
+
 @pytest.fixture
 def mock_helper_agent() -> AgentMatrixUser:
     """Create a mock helper agent user."""
@@ -290,6 +332,7 @@ class TestStreamingBehavior:
         persist_entity_accounts(self.config, runtime_paths_for(self.config))
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("streaming", [True, False], ids=["streamed", "not_streamed"])
     @patch("mindroom.response_runner.ai_response")
     @patch("mindroom.response_runner.stream_agent_response")
     @patch("mindroom.response_runner.should_use_streaming")
@@ -301,19 +344,19 @@ class TestStreamingBehavior:
         mock_helper_agent: AgentMatrixUser,
         mock_calculator_agent: AgentMatrixUser,
         tmp_path: Path,
+        streaming: bool,
     ) -> None:
-        """Test complete flow of one agent streaming and mentioning another."""
+        """Test complete flow of one agent replying, streamed or not, and mentioning another."""
 
-        # Configure streaming - helper will stream, calculator won't
+        # Configure streaming - the helper streams when enabled, the calculator never does
         def side_effect(
             client: object,
             room_id: str,
             requester_user_id: str | None = None,
             enable_streaming: bool = True,
         ) -> bool:
-            _ = (client, room_id, enable_streaming)
-            # Helper streams when mentioned by user
-            return requester_user_id == "@user:localhost"
+            _ = (client, room_id, requester_user_id)
+            return enable_streaming
 
         mock_should_use_streaming.side_effect = side_effect
 
@@ -324,7 +367,7 @@ class TestStreamingBehavior:
             mock_helper_agent,
             tmp_path,
             rooms=["!test:localhost"],
-            enable_streaming=True,
+            enable_streaming=streaming,
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
@@ -364,8 +407,8 @@ class TestStreamingBehavior:
         helper_bot.client.room_send.return_value = mock_send_response
         calc_bot.client.room_send.return_value = mock_send_response
 
-        # Mock AI responses
-        mock_ai_response.return_value = "4"
+        # Mock AI responses: the helper's reply when it does not stream, then the calculator's
+        mock_ai_response.return_value = "Let me help with that calculation. @mindroom_calculator:localhost what's 2+2?"
 
         # Create a generator that yields the streaming response
         async def streaming_generator() -> AsyncIterator[str]:
@@ -398,52 +441,44 @@ class TestStreamingBehavior:
             await helper_bot._on_message(mock_room, user_event)
             await drain_coalescing(helper_bot)
 
-        # Verify helper bot sent initial message and edit
-        assert helper_bot.client.room_send.call_count >= 1  # At least initial message
+        # The helper posted a placeholder, streamed into it if streaming, and delivered its final text as an edit.
+        placeholder_content, *streaming_edit_contents, final_edit_content = (
+            call.kwargs["content"] for call in helper_bot.client.room_send.call_args_list
+        )
+        assert len(streaming_edit_contents) == int(streaming)
+        assert final_edit_content[STREAM_STATUS_KEY] == STREAM_STATUS_COMPLETED
+        mock_ai_response.reset_mock()
+        mock_ai_response.return_value = "4"
 
-        # Simulate the initial message from helper while the stream is still active.
-        initial_event = MagicMock(spec=nio.RoomMessageText)
-        initial_event.sender = "@mindroom_helper:localhost"
-        initial_event.body = "Let me help with that calculation. @mindroom_calculator:localhost what's 2+2?"
-        initial_event.event_id = "$helper_response_123"
-        initial_event.server_timestamp = 1234567890
-        initial_event.source = {
-            "content": {
-                "body": "Let me help with that calculation. @mindroom_calculator:localhost what's 2+2?",
-                "m.mentions": {"user_ids": ["@mindroom_calculator:localhost"]},
-                STREAM_STATUS_KEY: STREAM_STATUS_STREAMING,
-            },
-        }
+        def helper_event(event_id: str, content: dict[str, object]) -> nio.RoomMessageText:
+            return nio.RoomMessageText.from_dict(
+                {
+                    "content": content,
+                    "event_id": event_id,
+                    "sender": "@mindroom_helper:localhost",
+                    "origin_server_ts": 1234567890,
+                    "room_id": "!test:localhost",
+                    "type": "m.room.message",
+                },
+            )
 
-        # Process initial message - calculator should NOT respond while the stream is active.
-        with patch("mindroom.conversation_resolver.check_agent_mentioned") as mock_check:
-            mock_check.return_value = ([MatrixID.parse("@mindroom_calculator:localhost")], True, False)
-
-            calc_bot.logger.info("processing_initial_message", body=initial_event.body)
-
-            await calc_bot._on_message(mock_room, initial_event)
+        # The user the helper answered is still in the room.
+        mock_room.users = {"@user:localhost": MagicMock()}
+        mock_room.invited_users = {}
+        for event in (
+            helper_event("$helper_response_123", placeholder_content),
+            *(helper_event("$helper_streaming_edit", content) for content in streaming_edit_contents),
+        ):
+            await calc_bot._on_message(mock_room, event)
             await drain_coalescing(calc_bot)
 
         assert calc_bot.client.room_send.call_count == 0
-        assert mock_ai_response.call_count == 0  # Calculator didn't process anything
+        assert mock_ai_response.call_count == 0
 
-        # Now simulate the final message
-        final_event = MagicMock(spec=nio.RoomMessageText)
-        final_event.sender = "@mindroom_helper:localhost"
-        final_event.body = "Let me help with that calculation. @mindroom_calculator:localhost what's 2+2?"
-        final_event.event_id = "$helper_final"
-        final_event.server_timestamp = 1234567891
-        final_event.source = {
-            "content": {
-                "body": "Let me help with that calculation. @mindroom_calculator:localhost what's 2+2?",
-                "m.mentions": {"user_ids": ["@mindroom_calculator:localhost"]},
-            },
-        }
-
-        # Process final message - calculator SHOULD respond now
-        with patch("mindroom.conversation_resolver.check_agent_mentioned") as mock_check:
-            mock_check.return_value = ([MatrixID.parse("@mindroom_calculator:localhost")], True, False)
-            await calc_bot._on_message(mock_room, final_event)
+        # The final edit wakes the calculator once, however often it is delivered.
+        final_edit = helper_event("$helper_final_edit", final_edit_content)
+        for _ in range(2):
+            await calc_bot._on_message(mock_room, final_edit)
             await drain_coalescing(calc_bot)
 
         assert calc_bot.client.room_send.call_count == 2  # thinking + final
@@ -558,7 +593,7 @@ class TestStreamingBehavior:
         )
 
         # Simulate streaming chunks
-        await streaming.update_content("Hello ", mock_client)
+        await push_stream_chunk(streaming, "Hello ", mock_client)
         assert streaming.accumulated_text == "Hello "
 
         # Should send initial message
@@ -566,7 +601,7 @@ class TestStreamingBehavior:
         assert streaming.event_id == "$stream_123"
 
         # Add more content immediately (should not trigger update yet)
-        await streaming.update_content("world", mock_client)
+        await push_stream_chunk(streaming, "world", mock_client)
         assert streaming.accumulated_text == "Hello world"
         # Should NOT send edit because not enough time has passed
         assert mock_client.room_send.call_count == 1
@@ -576,7 +611,7 @@ class TestStreamingBehavior:
         await asyncio.sleep(0.06)
 
         # Add more content after delay
-        await streaming.update_content("!", mock_client)
+        await push_stream_chunk(streaming, "!", mock_client)
         assert streaming.accumulated_text == "Hello world!"
         # NOW it should send an edit
         assert mock_client.room_send.call_count == 2
@@ -753,7 +788,7 @@ class TestStreamingBehavior:
 
     def test_is_interrupted_partial_reply_detects_terminal_markers(self) -> None:
         """Interrupted partial-reply detection should recognize shared cancelled/error notes."""
-        assert is_interrupted_partial_reply(f"Draft answer\n\n{_CANCELLED_RESPONSE_NOTE}")
+        assert is_interrupted_partial_reply(f"Draft answer\n\n{CANCELLED_RESPONSE_NOTE}")
         assert is_interrupted_partial_reply("Draft answer\n\n**[Response interrupted by an error: boom]**")
         assert is_interrupted_partial_reply("Draft [cancelled]   ")
         assert not is_interrupted_partial_reply("Discuss [error] in this sentence")
@@ -762,13 +797,13 @@ class TestStreamingBehavior:
 
     def test_is_interrupted_partial_reply_recognises_all_three_variants(self) -> None:
         """Interrupted partial-reply detection should recognize every live cancel note."""
-        assert is_interrupted_partial_reply(f"Draft answer\n\n{_CANCELLED_RESPONSE_NOTE}")
+        assert is_interrupted_partial_reply(f"Draft answer\n\n{CANCELLED_RESPONSE_NOTE}")
         assert is_interrupted_partial_reply(f"Draft answer\n\n{_INTERRUPTED_RESPONSE_NOTE}")
         assert is_interrupted_partial_reply(build_restart_interrupted_body("Draft answer"))
 
     def test_clean_partial_reply_text_strips_shared_markers(self) -> None:
         """Shared partial-reply cleanup should normalize cancelled/error/placeholder bodies."""
-        assert clean_partial_reply_text(f"Draft answer\n\n{_CANCELLED_RESPONSE_NOTE}") == "Draft answer"
+        assert clean_partial_reply_text(f"Draft answer\n\n{CANCELLED_RESPONSE_NOTE}") == "Draft answer"
         assert (
             clean_partial_reply_text("Draft answer\n\n**[Response interrupted by an error: boom]**") == "Draft answer"
         )
@@ -791,7 +826,7 @@ class TestStreamingBehavior:
 
     def test_clean_partial_reply_text_normalises_user_stop_label_to_interrupted_marker(self) -> None:
         """User-stop labels should collapse to the canonical interrupted replay marker."""
-        assert _render_cleaned_interrupted_replay(f"Draft answer\n\n{_CANCELLED_RESPONSE_NOTE}") == (
+        assert _render_cleaned_interrupted_replay(f"Draft answer\n\n{CANCELLED_RESPONSE_NOTE}") == (
             f"Draft answer\n\n{_INTERRUPTION_SUMMARY}"
         )
 
@@ -851,7 +886,7 @@ class TestStreamingBehavior:
         )
         streaming.last_update = time.time()
 
-        await streaming.update_content("hello", mock_client)
+        await push_stream_chunk(streaming, "hello", mock_client)
 
         assert mock_client.room_send.call_count == 1
         assert streaming.event_id == "$stream_char_1"
@@ -1402,12 +1437,12 @@ class TestStreamingBehavior:
         streaming._send_content = AsyncMock(return_value=True)
 
         with patch("mindroom.streaming.time.time", side_effect=[100.0, 100.0]):
-            await streaming.update_content("first", mock_client)
+            await push_stream_chunk(streaming, "first", mock_client)
 
         assert streaming._send_content.await_count == 0
 
         with patch("mindroom.streaming.time.time", side_effect=[105.0, 105.0, 105.0]):
-            await streaming.update_content(" second", mock_client)
+            await push_stream_chunk(streaming, " second", mock_client)
 
         assert streaming._send_content.await_count == 1
         assert streaming.last_delta_at == 105.0
@@ -1452,7 +1487,7 @@ class TestStreamingBehavior:
         assert streaming.chars_since_last_update == 1
 
         with patch("mindroom.streaming.time.time", side_effect=[102.0, 102.0, 102.0]):
-            await streaming.update_content("Hi", mock_client)
+            await push_stream_chunk(streaming, "Hi", mock_client)
 
         assert mock_client.room_send.call_count == 1
 
@@ -1568,7 +1603,7 @@ class TestStreamingBehavior:
         streaming._send_content = AsyncMock(return_value=True)
 
         with patch("mindroom.streaming.time.time", side_effect=[100.0, 100.0]):
-            await streaming.update_content("partial", mock_client)
+            await push_stream_chunk(streaming, "partial", mock_client)
 
         with patch("mindroom.streaming.time.time", return_value=100.3):
             await streaming._throttled_send(mock_client)
@@ -1576,7 +1611,7 @@ class TestStreamingBehavior:
         assert streaming._send_content.await_count == 1
 
         with patch("mindroom.streaming.time.time", side_effect=[100.35, 100.35, 100.35]):
-            await streaming.update_content("!", mock_client)
+            await push_stream_chunk(streaming, "!", mock_client)
 
         assert streaming._send_content.await_count == 1
 
@@ -1604,7 +1639,7 @@ class TestStreamingBehavior:
         clock = iter(100.0 + 0.03 * step for step in range(1, 80))
         with patch("mindroom.streaming.time.time", side_effect=lambda: next(clock)):
             for _ in range(20):
-                await streaming.update_content("a", mock_client)
+                await push_stream_chunk(streaming, "a", mock_client)
 
         assert streaming._send_content.await_count == 2
 
@@ -1630,7 +1665,7 @@ class TestStreamingBehavior:
         streaming._send_content = AsyncMock(return_value=True)
 
         with patch("mindroom.streaming.time.time", side_effect=[100.0, 100.05]):
-            await streaming.update_content("partial", mock_client)
+            await push_stream_chunk(streaming, "partial", mock_client)
 
         assert streaming._send_content.await_count == 0
         assert streaming.last_delta_at == 100.0
@@ -1707,10 +1742,10 @@ class TestStreamingBehavior:
         streaming._send_content = AsyncMock(return_value=True)
 
         with patch("mindroom.streaming.time.time", side_effect=[100.0, 100.0]):
-            await streaming.update_content("first", mock_client)
+            await push_stream_chunk(streaming, "first", mock_client)
 
         with patch("mindroom.streaming.time.time", side_effect=[100.3, 100.3, 100.3]):
-            await streaming.update_content(" second", mock_client)
+            await push_stream_chunk(streaming, " second", mock_client)
 
         assert streaming._send_content.await_count == 0
 
@@ -1979,7 +2014,7 @@ class TestStreamingBehavior:
             runtime_paths=runtime_paths_for(config),
         )
         install_runtime_journal_support(bot)
-        bot.client = MagicMock(rooms={})
+        bot.client = make_matrix_client_mock(user_id=mock_helper_agent.user_id)
         bot._knowledge_access_support.for_agent = MagicMock(return_value=None)
         replace_response_runner_deps(
             bot,
@@ -2008,44 +2043,32 @@ class TestStreamingBehavior:
             _client: object,
             _room_id: str,
             content: dict[str, object],
-            *,
-            retry_sync_recovery: bool = False,  # noqa: ARG001
+            **_kwargs: object,
         ) -> DeliveredMatrixEvent:
             sent_contents.append(content)
             return DeliveredMatrixEvent(event_id="$stream_1", content_sent=dict(content))
 
-        async def record_edit(
-            _client: object,
-            _room_id: str,
-            _event_id: str,
-            _new_content: dict[str, object],
-            _new_text: str,
-            *,
-            retry_sync_recovery: bool = False,  # noqa: ARG001
-        ) -> DeliveredMatrixEvent:
-            return DeliveredMatrixEvent(event_id="$stream_1", content_sent={})
-
+        request = ResponseRequest(
+            sources=ResponseSources(
+                pending_event_ids=(envelope.source_event_id,),
+                logical_source_event_ids=(envelope.source_event_id,),
+            ),
+            thread_history=[],
+            prompt="Continue",
+            user_id="@user:localhost",
+            response_envelope=envelope,
+            correlation_id="$request:localhost",
+        )
+        runner = unwrap_extracted_collaborator(bot._response_runner)
         with (
-            patch("mindroom.streaming.send_message_result", new=record_send),
-            patch("mindroom.streaming.edit_message_result", new=record_edit),
+            patch("mindroom.delivery_gateway.send_message_outcome", new=record_send),
             patch_response_runner_module(
                 stream_agent_response=MagicMock(return_value=response_stream()),
                 typing_indicator=noop_typing,
             ),
         ):
-            generation = await bot._response_runner._process_and_respond_streaming(
-                ResponseRequest(
-                    sources=ResponseSources(
-                        pending_event_ids=(envelope.source_event_id,),
-                        logical_source_event_ids=(envelope.source_event_id,),
-                    ),
-                    thread_history=[],
-                    prompt="Continue",
-                    user_id="@user:localhost",
-                    response_envelope=envelope,
-                    correlation_id="$request:localhost",
-                ),
-            )
+            async with response_span(runner, request):
+                generation = await runner._process_and_respond_streaming(request)
 
         assert generation.delivery.event_id == "$stream_1"
         assert sent_contents
@@ -2085,7 +2108,7 @@ class TestStreamingBehavior:
             assert streaming.thread_id == "$thread:localhost"
             assert streaming.reply_to_event_id == "$reply:localhost"
 
-            await streaming.update_content("Hello world", AsyncMock())
+            await push_stream_chunk(streaming, "Hello world", AsyncMock())
 
         assert sent_messages
         room_id, content = sent_messages[0]
@@ -2261,7 +2284,7 @@ class TestStreamingBehavior:
         )
 
         # Stream some content
-        await streaming.update_content("Hello world", mock_client)
+        await push_stream_chunk(streaming, "Hello world", mock_client)
 
         # Check that the sent message includes the in-progress marker
         first_call = mock_client.room_send.call_args_list[0]
@@ -2316,7 +2339,7 @@ class TestStreamingBehavior:
 
         assert len(edited_texts) == 2
         assert IN_PROGRESS_MARKER not in edited_texts[0]
-        assert edited_texts[-1] == f"Partial answer\n\n{_CANCELLED_RESPONSE_NOTE}"
+        assert edited_texts[-1] == f"Partial answer\n\n{CANCELLED_RESPONSE_NOTE}"
         assert exc_info.value.transport_outcome.terminal_status == "cancelled"
         assert exc_info.value.transport_outcome.failure_reason == "cancelled_by_user"
 
@@ -3256,11 +3279,10 @@ class TestStreamingBehavior:
                 client: nio.AsyncClient,
                 *,
                 cancelled: bool = False,
-                restart_interrupted: bool = False,
                 cancel_source: CancelSource | None = None,
                 error: Exception | None = None,
             ) -> StreamTransportOutcome:
-                del client, cancelled, restart_interrupted, cancel_source
+                del client, cancelled, cancel_source
                 finalize_calls.append(error)
                 return StreamTransportOutcome(
                     last_physical_stream_event_id=self.event_id,

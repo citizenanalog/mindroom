@@ -22,6 +22,7 @@ from mindroom.config.access import (
     RoomJoinPolicy,
     validate_concrete_matrix_user_ids,
 )
+from mindroom.config.automations import AutomationList  # noqa: TC001
 from mindroom.config.knowledge import KnowledgeGitConfig  # noqa: TC001
 from mindroom.config.legacy_fields import reject_legacy_agent_fields
 from mindroom.config.memory import AgentMemorySearchConfig, MemoryBackend  # noqa: TC001
@@ -271,6 +272,14 @@ class AgentConfig(BaseModel):
         default_factory=list,
         description="Concrete Matrix user IDs allowed to manage this agent's credentials",
     )
+    mcp_gateway_shared_credentials: bool = Field(
+        default=False,
+        description=(
+            "Let users who may use this agent call its tools through the MCP gateway even though its worker scope "
+            "is shared or unset, so every caller runs them with the agent's shared credentials and worker, "
+            "without the agent's instructions; agents with per-user scopes are available without it"
+        ),
+    )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,
         description=(
@@ -377,6 +386,10 @@ class AgentConfig(BaseModel):
     allow_self_config: bool | None = Field(
         default=None,
         description="Allow this agent to modify its own configuration via a tool",
+    )
+    automations: AutomationList | None = Field(
+        default=None,
+        description="Automations for this agent, built-in such as prompt_curation or from a plugin; omitted inherits defaults.automations",
     )
     skill_learning: SkillLearningConfig = Field(
         default_factory=SkillLearningConfig,

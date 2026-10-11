@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
+import os
+import re
 import shutil
 import subprocess
+import textwrap
+from contextlib import closing
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
 
+from mindroom import agent_storage
+from mindroom.agent_modes import set_agent_mode
+from mindroom.agent_storage import create_state_storage
 from mindroom.config.main import Config
+from mindroom.constants import resolve_runtime_paths
+from mindroom.matrix.invited_rooms_store import invited_rooms_path, pending_room_invites_path
+from mindroom.matrix.personal_room_store import personal_room_record_path
+from mindroom.private_storage.private_instance_identity_store import ensure_private_instance_identity
+
+if TYPE_CHECKING:
+    from agno.db.base import BaseDb
 
 
 def _render_chart(
@@ -46,6 +61,8 @@ def _run_helm_template(
 ) -> subprocess.CompletedProcess[str]:
     helm = shutil.which("helm")
     if helm is None:
+        if os.environ.get("CI"):
+            pytest.fail("helm must be available in CI, where the pytest workflow runs these checks")
         pytest.skip("helm is required for rendered chart checks")
     return subprocess.run(
         [
@@ -62,6 +79,14 @@ def _run_helm_template(
         capture_output=True,
         text=True,
     )
+
+
+def _values_files(tmp_path: Path, *values: str | dict[str, Any]) -> tuple[Path, ...]:
+    """Write each values document, dedented YAML text or a mapping, to its own file in Helm merge order."""
+    paths = tuple(tmp_path / f"values-{index}.yaml" for index in range(len(values)))
+    for path, value in zip(paths, values, strict=True):
+        path.write_text(textwrap.dedent(value) if isinstance(value, str) else yaml.safe_dump(value), encoding="utf-8")
+    return paths
 
 
 def _render_instance_chart() -> list[dict[str, Any]]:
@@ -510,13 +535,11 @@ def test_runtime_chart_renders_content_bundle_init_containers_after_user_init_co
     )
     assert team_config["imagePullPolicy"] == "IfNotPresent"
     assert team_config["command"] == ["sh", "-ec"]
-    assert team_config["args"] == [
-        "set -eu\n"
-        'rm -rf "/app/agent_data/content-bundles/team-config"\n'
-        'mkdir -p "/app/agent_data/content-bundles/team-config"\n'
-        'cp -a "/bundle/." "/app/agent_data/content-bundles/team-config/"\n'
-        '"/app/agent_data/content-bundles/team-config/scripts/seed-content.sh"',
-    ]
+    team_config_script, *team_config_args = team_config["args"]
+    assert team_config_args == ["content-bundle-team-config", "/bundle", "/app/agent_data/content-bundles/team-config"]
+    # The seed runs after the sync, which tests/test_runtime_chart_content_bundles.py executes.
+    assert team_config_script.startswith("set -eu\nsrc=$1\ndst=$2\n")
+    assert team_config_script.endswith('\nfi\n"/app/agent_data/content-bundles/team-config/scripts/seed-content.sh"')
     assert team_config["volumeMounts"] == [
         {
             "name": "storage",
@@ -524,9 +547,10 @@ def test_runtime_chart_renders_content_bundle_init_containers_after_user_init_co
         },
     ]
     assert policy_pack["args"] == [
-        "set -eu\n"
-        'mkdir -p "/app/agent_data/content-bundles/policy-pack"\n'
-        'cp -a "/bundle/." "/app/agent_data/content-bundles/policy-pack/"',
+        'set -eu\nmkdir -p "$2"\ncp -a "$1/." "$2/"',
+        "content-bundle-policy-pack",
+        "/bundle",
+        "/app/agent_data/content-bundles/policy-pack",
     ]
 
 
@@ -657,6 +681,168 @@ def test_runtime_chart_checks_bootstrap_path_boundaries(source: str, allowed: bo
     assert (result.returncode == 0) is allowed, result.stderr
     if not allowed:
         assert "overlap" in result.stderr
+
+
+_BOOTSTRAP_BUNDLE_DIGEST = "3" * 64
+_BOOTSTRAP_CONTENT_BUNDLE_SETTINGS = (
+    "workers.backend=kubernetes",
+    "config.source=file",
+    "config.path=/app/agent_data/active/config.yaml",
+    "contentBundles[0].name=policy-pack",
+    "contentBundles[0].image=registry.example.org/team/policy@sha256:" + "2" * 64,
+    "contentBundles[1].name=team-config",
+    f"contentBundles[1].image=registry.example.org/team/config:v1@sha256:{_BOOTSTRAP_BUNDLE_DIGEST}",
+    "contentBundles[1].targetPath=/app/agent_data/config-source",
+    "config.bootstrapContentBundle.name=team-config",
+)
+
+
+def _bootstrap_bundle_mount(mount_path: str) -> tuple[str, ...]:
+    return (
+        "contentBundles[1].volumeMounts[0].name=scratch",
+        f"contentBundles[1].volumeMounts[0].mountPath={mount_path}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("sub_path", "source", "image_dir"),
+    [
+        ("", "/app/agent_data/config-source", "/bundle"),
+        ("environments/prod/", "/app/agent_data/config-source/environments/prod", "/bundle/environments/prod"),
+        ("environments/prod", "/app/agent_data/config-source/environments/prod", "/bundle/environments/prod"),
+    ],
+)
+def test_runtime_chart_derives_bootstrap_from_content_bundle(sub_path: str, source: str, image_dir: str) -> None:
+    """The chart derives the source from the bundle target and the revision from its digest and image directory."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        *_BOOTSTRAP_CONTENT_BUNDLE_SETTINGS,
+        release_name="mindroom-runtime",
+        set_string_args=(f"config.bootstrapContentBundle.subPath={sub_path}",),
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    command = deployment["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[command.index("--bootstrap-config-bundle") + 1] == source
+    revision = hashlib.sha256(f"{_BOOTSTRAP_BUNDLE_DIGEST}:{image_dir}".encode()).hexdigest()
+    assert command[command.index("--bootstrap-config-bundle-revision") + 1] == revision
+    transport = _init_container(deployment, "content-bundle-team-config")
+    assert transport["args"][2:] == ["/bundle", "/app/agent_data/config-source"]
+
+
+def test_runtime_chart_bootstrap_content_bundle_uses_default_target_path() -> None:
+    """A bundle without targetPath bootstraps from its default copy location."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        *(setting for setting in _BOOTSTRAP_CONTENT_BUNDLE_SETTINGS if "targetPath" not in setting),
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    command = deployment["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[command.index("--bootstrap-config-bundle") + 1] == "/app/agent_data/content-bundles/team-config"
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        (
+            ("config.bootstrapContentBundle.name=missing",),
+            'config.bootstrapContentBundle.name "missing" must match a contentBundles entry',
+        ),
+        (
+            ("config.bootstrapBundlePath=/app/agent_data/incoming",),
+            "config.bootstrapContentBundle cannot be combined with config.bootstrapBundlePath",
+        ),
+        (
+            ("config.bootstrapBundleRevision=deploy-2",),
+            "config.bootstrapContentBundle cannot be combined with config.bootstrapBundlePath",
+        ),
+        (
+            ("contentBundles[1].overwrite=false",),
+            'contentBundles entry "team-config" to keep overwrite enabled',
+        ),
+        (
+            ("config.bootstrapContentBundle.subPath=/environments/prod",),
+            "config.bootstrapContentBundle.subPath must be a relative path without .. segments",
+        ),
+        (
+            ("config.bootstrapContentBundle.subPath=environments/../../active",),
+            "config.bootstrapContentBundle.subPath must be a relative path without .. segments",
+        ),
+        (("contentBundles[1].seed.enabled=true", "contentBundles[1].seed.command[0]=/bin/true"), None),
+        (_bootstrap_bundle_mount("/scratch"), None),
+        (_bootstrap_bundle_mount("/bundle-cache"), None),
+        (
+            _bootstrap_bundle_mount("/bundle"),
+            'contentBundles entry "team-config" volumeMounts to stay clear of its sourcePath /bundle; mountPath /bundle',
+        ),
+        (_bootstrap_bundle_mount("/bundle/environments/"), "sourcePath /bundle; mountPath /bundle/environments"),
+        (
+            _bootstrap_bundle_mount("/app/agent_data/config-source"),
+            "targetPath /app/agent_data/config-source; mountPath /app/agent_data/config-source overlaps",
+        ),
+        (
+            _bootstrap_bundle_mount("/app/agent_data/config-source/cache"),
+            "targetPath /app/agent_data/config-source; mountPath /app/agent_data/config-source/cache overlaps",
+        ),
+        (_bootstrap_bundle_mount("/app"), "targetPath /app/agent_data/config-source; mountPath /app overlaps"),
+        (
+            ("contentBundles[1].targetPath=/app/agent_data/active/incoming",),
+            "config.bootstrapContentBundle must not overlap the config.path directory",
+        ),
+        (
+            (
+                "config.path=/app/agent_data/config-source/active/config.yaml",
+                "config.bootstrapContentBundle.subPath=environments/prod",
+            ),
+            "config.bootstrapContentBundle must not overlap the config.path directory",
+        ),
+        (
+            ("workers.backend=static_runner",),
+            "config.bootstrapContentBundle cannot be combined with workers.backend=static_runner",
+        ),
+        (
+            ("config.bootstrapContentBundle.name=", "config.bootstrapContentBundle.subPath=environments/prod"),
+            "config.bootstrapContentBundle.subPath requires config.bootstrapContentBundle.name",
+        ),
+    ],
+)
+def test_runtime_chart_validates_bootstrap_content_bundle(settings: tuple[str, ...], message: str | None) -> None:
+    """A derived bootstrap needs a digest-pinned, fully replaced bundle with unmounted paths and a contained subPath."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        *_BOOTSTRAP_CONTENT_BUNDLE_SETTINGS,
+        *settings,
+    )
+    assert (result.returncode == 0) is (message is None), result.stderr
+    if message is not None:
+        assert message in result.stderr
+
+
+@pytest.mark.parametrize(("replicas", "allowed"), [(0, True), (1, True), (2, False)])
+@pytest.mark.parametrize(
+    "bootstrap",
+    [
+        ("config.bootstrapBundlePath=/app/agent_data/incoming",),
+        _BOOTSTRAP_CONTENT_BUNDLE_SETTINGS,
+    ],
+)
+def test_runtime_chart_rejects_bootstrap_with_multiple_replicas(
+    bootstrap: tuple[str, ...],
+    replicas: int,
+    allowed: bool,
+) -> None:
+    """Concurrent pods would install into the same config directory at once."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "config.source=file",
+        "config.path=/app/agent_data/active/config.yaml",
+        *bootstrap,
+        f"replicaCount={replicas}",
+    )
+    assert (result.returncode == 0) is allowed, result.stderr
+    if not allowed:
+        assert "requires replicaCount 0 or 1" in result.stderr
 
 
 def test_runtime_chart_rejects_duplicate_content_bundle_names() -> None:
@@ -826,6 +1012,66 @@ def test_instance_chart_static_runner_mounts_only_agent_state() -> None:
     ]
 
 
+def test_static_runner_storage_mounts_hold_no_record_or_lock_the_primary_trusts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Records and locks the primary acts on stay outside every storage subPath sidecar tool code can write."""
+    runtime_chart = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        release_name="mindroom-runtime",
+    )
+    runner_subpaths = {
+        mount["subPath"]
+        for doc in (*_render_instance_chart(), *runtime_chart)
+        if doc.get("kind") == "Deployment"
+        for container in doc["spec"]["template"]["spec"]["containers"]
+        if any(env["name"] == "MINDROOM_SANDBOX_RUNNER_MODE" for env in container.get("env", []))
+        for mount in container["volumeMounts"]
+        if "subPath" in mount
+    }
+    assert runner_subpaths == {"sandbox-runner", "agents", "private_instances"}
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
+    for state_root in (
+        paths.storage_root / "agents" / "helper",
+        paths.storage_root / "private_instances" / "s" / "helper",
+    ):
+        set_agent_mode(paths, state_root, "helper", "session", "minimal", "@alice:example.org")
+        with closing(_open_sessions(state_root)):
+            pass
+    ensure_private_instance_identity(
+        paths.storage_root,
+        worker_key="v1:default:user:~@alice:example.org",
+        requester_id="@alice:example.org",
+    )
+    locks = list(paths.storage_root.rglob("*.lock"))
+    # Session recovery stays beside the sessions it guards, so its lock may sit in a mounted subPath only because
+    # a planted or held one fails storage creation after SQLite's busy timeout instead of stalling it.
+    recovery_locks = [lock for lock in locks if lock.name == ".sessions-recovery.lock"]
+    trusted = [
+        personal_room_record_path(paths, "helper", "@alice:example.org"),
+        invited_rooms_path(paths, "helper"),
+        pending_room_invites_path(paths, "helper"),
+        *paths.storage_root.rglob("agent_modes.json"),
+        *(lock for lock in locks if lock not in recovery_locks),
+    ]
+    assert len(trusted) == 8
+    assert not [path for path in trusted if path.relative_to(paths.storage_root).parts[0] in runner_subpaths]
+    assert len(recovery_locks) == 2
+    monkeypatch.setattr(agent_storage, "_BUSY_TIMEOUT_SECONDS", 0.2)
+    for lock in recovery_locks:
+        with lock.open("a") as holder:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            with pytest.raises(TimeoutError, match="Session recovery lock"):
+                _open_sessions(lock.parent)
+
+
+def _open_sessions(state_root: Path) -> BaseDb:
+    return create_state_storage("helper", state_root, subdir="sessions", session_table="helper_sessions")
+
+
 def test_instance_chart_static_runner_generates_primary_api_key_without_other_auth() -> None:
     """Without Supabase auth, the primary API gets a key the sidecar never receives."""
     deployment_docs = _render_chart(Path("cluster/k8s/instance"))
@@ -940,6 +1186,23 @@ def test_instance_chart_never_gives_tenant_the_supabase_service_key() -> None:
     assert not any("service_key" in key for key in secret["stringData"])
     assert not any("SERVICE_KEY" in name for name in mindroom_env)
     assert "SUPABASE_ANON_KEY" in mindroom_env
+
+
+def test_instance_chart_mounts_the_platform_oidc_client_secret_only_into_synapse() -> None:
+    """The Matrix OIDC client secret is platform-wide, so tenant code in the MindRoom container must not read it."""
+    docs = _render_instance_chart()
+    mindroom = _resource(docs, "Deployment", "mindroom-demo")
+    synapse = _resource(docs, "Deployment", "synapse-demo")
+    mounted_keys = {item["key"] for item in _volumes_by_name(mindroom)["api-keys"]["secret"].get("items", [])}
+    secret_files = {
+        env["value"]
+        for env in _container(mindroom, "mindroom")["env"]
+        if str(env.get("value")).startswith("/etc/secrets/")
+    }
+
+    assert {f"/etc/secrets/{key}" for key in mounted_keys} == secret_files
+    assert "matrix_oidc_client_secret" not in mounted_keys
+    assert "items" not in _volumes_by_name(synapse)["mindroom-secrets"]["secret"]
 
 
 def test_instance_chart_points_platform_login_at_platform_domain() -> None:
@@ -1166,6 +1429,28 @@ def test_platform_chart_exposes_the_instance_ingress_controller_namespace() -> N
 
     assert default_config["data"]["INSTANCE_INGRESS_CONTROLLER_NAMESPACE"] == ""
     assert config["data"]["INSTANCE_INGRESS_CONTROLLER_NAMESPACE"] == "nginx"
+
+
+def test_platform_chart_trusts_forwarded_client_addresses_only_from_private_networks() -> None:
+    """The backend keys rate limits on X-Real-IP only from the in-cluster ingress, never from public callers."""
+    config = _resource(
+        _render_chart(Path("cluster/k8s/platform"), release_name="mindroom-platform"),
+        "ConfigMap",
+        "platform-config",
+    )
+
+    assert config["data"]["TRUSTED_PROXY_CIDRS"] == "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+
+def test_reference_ingress_sets_x_real_ip_from_the_client_connection() -> None:
+    """Clients reach the node directly, so the trusted controller must not take their address from their headers."""
+    terraform = Path("cluster/terraform/terraform-k8s/kube.tf").read_text(encoding="utf-8")
+    module = _hcl_block(terraform, 'module "kube-hetzner"')
+    values = yaml.safe_load(textwrap.dedent(module.split("nginx_values = <<-EOT\n", 1)[1].split("\n  EOT", 1)[0]))
+
+    assert values["controller"]["config"]["use-forwarded-headers"] == "false"
+    assert values["controller"]["config"]["use-proxy-protocol"] == "false"
+    assert values["controller"]["service"]["externalTrafficPolicy"] == "Local"
 
 
 def test_platform_chart_can_pin_frontend_and_backend_images_separately() -> None:
@@ -2079,10 +2364,19 @@ def test_runtime_chart_parent_bypass_domains_are_inactive_without_parent(tmp_pat
     assert not any(doc["kind"] == "ConfigMap" and doc["metadata"]["name"].endswith("-squid-config") for doc in docs)
 
 
+_PROGRESS_DEADLINE_CHARTS = pytest.mark.parametrize(
+    ("chart", "required_args"),
+    [("runtime", ()), ("tuwunel", ("tuwunel.serverName=example.com",))],
+)
+
+
+@_PROGRESS_DEADLINE_CHARTS
 @pytest.mark.parametrize("deadline", [None, 1, 1800, 2147483647])
 @pytest.mark.parametrize("from_values_file", [False, True])
-def test_runtime_chart_progress_deadline_is_optional(
+def test_chart_progress_deadline_is_optional(
     tmp_path: Path,
+    chart: str,
+    required_args: tuple[str, ...],
     deadline: int | None,
     from_values_file: bool,
 ) -> None:
@@ -2090,12 +2384,13 @@ def test_runtime_chart_progress_deadline_is_optional(
     values_path = tmp_path / "values.yaml"
     values_path.write_text(yaml.safe_dump({"progressDeadlineSeconds": deadline}))
     docs = _render_chart(
-        Path("cluster/k8s/runtime"),
+        Path(f"cluster/k8s/{chart}"),
+        *required_args,
         *((f"progressDeadlineSeconds={deadline}",) if deadline is not None and not from_values_file else ()),
         values_files=(values_path,) if from_values_file else (),
-        release_name="mindroom-runtime",
+        release_name=f"mindroom-{chart}",
     )
-    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    deployment = _resource(docs, "Deployment", f"mindroom-{chart}")
 
     if deadline is None:
         assert "progressDeadlineSeconds" not in deployment["spec"]
@@ -2104,10 +2399,16 @@ def test_runtime_chart_progress_deadline_is_optional(
         assert deployment["spec"]["progressDeadlineSeconds"] == deadline
 
 
-@pytest.mark.parametrize("deadline", [0, -1, 1.5, "abc", True, "", 2147483648, 999999999999999999999999])
+@_PROGRESS_DEADLINE_CHARTS
+@pytest.mark.parametrize(
+    "deadline",
+    [0, -1, 1.5, "abc", True, "", 2147483648, 99999999999999999999, 999999999999999999999999],
+)
 @pytest.mark.parametrize("from_values_file", [False, True])
-def test_runtime_chart_rejects_invalid_progress_deadline(
+def test_chart_rejects_invalid_progress_deadline(
     tmp_path: Path,
+    chart: str,
+    required_args: tuple[str, ...],
     deadline: str | float,
     from_values_file: bool,
 ) -> None:
@@ -2115,13 +2416,54 @@ def test_runtime_chart_rejects_invalid_progress_deadline(
     values_path = tmp_path / "values.yaml"
     values_path.write_text(yaml.safe_dump({"progressDeadlineSeconds": deadline}))
     completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
+        Path(f"cluster/k8s/{chart}"),
+        *required_args,
         set_string_args=() if from_values_file else (f"progressDeadlineSeconds={deadline}",),
         values_files=(values_path,) if from_values_file else (),
     )
 
     assert completed.returncode != 0
     assert "progressDeadlineSeconds must be a positive integer no greater than 2147483647" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ({}, 1800),
+        ({"terminationGracePeriodSeconds": None}, None),
+        ({"terminationGracePeriodSeconds": 0}, 0),
+        ({"terminationGracePeriodSeconds": 600}, 600),
+    ],
+)
+def test_tuwunel_chart_termination_grace_period_outlasts_a_migration_step(
+    tmp_path: Path,
+    values: dict[str, int | None],
+    expected: int | None,
+) -> None:
+    """Killing Tuwunel before a migration step finishes leaves the database half migrated, so the default waits."""
+    docs = _render_chart(
+        Path("cluster/k8s/tuwunel"),
+        "tuwunel.serverName=example.com",
+        values_files=_values_files(tmp_path, values),
+        release_name="mindroom-tuwunel",
+    )
+    pod_spec = _resource(docs, "Deployment", "mindroom-tuwunel")["spec"]["template"]["spec"]
+
+    assert pod_spec.get("terminationGracePeriodSeconds") == expected
+    assert expected is None or isinstance(pod_spec["terminationGracePeriodSeconds"], int)
+
+
+@pytest.mark.parametrize("grace", [-1, 1.5, "abc", True, ""])
+def test_tuwunel_chart_rejects_invalid_termination_grace_period(tmp_path: Path, grace: str | float) -> None:
+    """Reject grace periods Kubernetes would refuse during rendering rather than installation."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/tuwunel"),
+        "tuwunel.serverName=example.com",
+        values_files=_values_files(tmp_path, {"terminationGracePeriodSeconds": grace}),
+    )
+
+    assert completed.returncode != 0
+    assert "terminationGracePeriodSeconds must be a non-negative integer" in completed.stderr
 
 
 @pytest.mark.parametrize("smtp_enabled", [False, True])
@@ -2153,7 +2495,7 @@ def test_runtime_chart_agent_vault_server_rejects_managed_environment(env_name: 
 
     if env_name == "AGENT_VAULT_MASTER_PASSWORD" or smtp_enabled:
         assert completed.returncode != 0
-        assert f"server.extraEnv[0] cannot override chart-managed {env_name}" in completed.stderr
+        assert f"server.extraEnv cannot override chart-managed {env_name}" in completed.stderr
     else:
         completed.check_returncode()
         docs = [doc for doc in yaml.safe_load_all(completed.stdout) if isinstance(doc, dict)]
@@ -2233,6 +2575,230 @@ def test_runtime_chart_agent_vault_server_environment(
     assert runtime["envFrom"] == [{"secretRef": {"name": "mindroom-runtime-api-key"}}]
 
 
+_VAULT_API_PORT = {"protocol": "TCP", "port": 14321}
+_VAULT_PROXY_PORT = {"protocol": "TCP", "port": 14322}
+_VAULT_BASE_EGRESS = [
+    {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+    {"ports": [{"protocol": "TCP", "port": 80}, {"protocol": "TCP", "port": 443}]},
+]
+
+
+def _agent_vault_server_values(**server: object) -> dict[str, Any]:
+    return {
+        "workers": {
+            "kubernetes": {"agentVault": {"server": {"enabled": True, "image": "example.test/vault:test", **server}}},
+        },
+    }
+
+
+def _agent_vault_network_policies(tmp_path: Path, values: dict[str, Any]) -> list[dict[str, Any]]:
+    values_files = _values_files(tmp_path, values)
+    docs = _render_chart(Path("cluster/k8s/runtime"), values_files=values_files, release_name="mindroom-runtime")
+    return [
+        doc
+        for doc in docs
+        if doc["kind"] == "NetworkPolicy"
+        and doc["spec"]["podSelector"].get("matchLabels", {}).get("app.kubernetes.io/component") == "agent-vault"
+    ]
+
+
+_NODE_LOCAL_DNS_BLOCK = {"cidr": "169.254.20.10/32"}
+
+
+@pytest.mark.parametrize(
+    ("approved_egress", "parent_proxy", "worker_ports", "squid_reaches_proxy", "dns", "dns_peers"),
+    [
+        # Vault-first: workers send tool egress to agentVault.proxyUrl directly.
+        # Without a worker egress policy the DNS setting is unused, so vault DNS stays port-only.
+        (False, False, [_VAULT_API_PORT, _VAULT_PROXY_PORT], False, {"ipBlocks": [_NODE_LOCAL_DNS_BLOCK]}, None),
+        # Squid-first: only approved egress forwards token-bearing traffic to the proxy port.
+        # Vault DNS uses the worker egress policy's default cluster DNS destination.
+        (
+            True,
+            True,
+            [_VAULT_API_PORT],
+            True,
+            None,
+            [
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                    "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                },
+            ],
+        ),
+        # Approved egress with an external proxyUrl: nothing in the chart uses the proxy port.
+        # Vault DNS follows a configured destination that replaces the default selectors.
+        (
+            True,
+            False,
+            [_VAULT_API_PORT],
+            False,
+            {"namespaceSelector": None, "podSelector": None, "ipBlocks": [_NODE_LOCAL_DNS_BLOCK]},
+            [{"ipBlock": _NODE_LOCAL_DNS_BLOCK}],
+        ),
+        # A pod-only DNS destination is pinned to the worker namespace, not the vault's release namespace.
+        (
+            True,
+            True,
+            [_VAULT_API_PORT],
+            True,
+            {"namespaceSelector": None, "podSelector": {"matchLabels": {"k8s-app": "node-local-dns"}}},
+            [
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "mindroom-workers"}},
+                    "podSelector": {"matchLabels": {"k8s-app": "node-local-dns"}},
+                },
+            ],
+        ),
+    ],
+    ids=["vault-first", "squid-first", "external-proxy", "pod-only-dns"],
+)
+def test_runtime_chart_agent_vault_server_network_policy_admits_only_chart_clients(
+    tmp_path: Path,
+    approved_egress: bool,
+    parent_proxy: bool,
+    worker_ports: list[dict[str, Any]],
+    squid_reaches_proxy: bool,
+    dns: dict[str, Any] | None,
+    dns_peers: list[dict[str, Any]] | None,
+) -> None:
+    """Workers, the control plane, and the vault Jobs reach the API; the proxy port and DNS follow the egress chain."""
+    agent_vault: dict[str, Any] = {
+        "enabled": True,
+        "cliImage": "example.test/vault:test",
+        "ownerEmail": "owner@example.test",
+        "workerCaConfigMapName": "agent-vault-ca",
+        "server": {"enabled": True},
+        "bootstrap": {"enabled": True, "kubectlImage": "example.test/kubectl:test"},
+        "accessTool": {
+            "enabled": True,
+            "uiBaseUrl": "https://example.test/agent-vault",
+            "emailDomain": "example.test",
+        },
+        "accessGrants": {
+            "enabled": True,
+            "grants": [{"email": "maintainer@example.test", "workerScope": "shared", "agent": "helper"}],
+        },
+    }
+    if approved_egress and not parent_proxy:
+        agent_vault["proxyUrl"] = "http://vault-proxy.example.test:8080"
+    values: dict[str, Any] = {
+        "workers": {
+            "backend": "kubernetes",
+            "sandbox": {"proxyToken": {"value": "test-token"}},
+            "kubernetes": {
+                "namespace": "mindroom-workers",
+                "extraLabels": {"mindroom.ai/instance": "demo"},
+                "agentVault": agent_vault,
+            },
+        },
+    }
+    if approved_egress:
+        values["approvedEgress"] = {
+            "enabled": True,
+            "image": {"tag": "v0.1.0"},
+            "parentProxy": {"enabled": parent_proxy},
+        }
+    if dns is not None:
+        values["egressProxy"] = {"networkPolicy": {"dns": dns}}
+
+    [policy] = _agent_vault_network_policies(tmp_path, values)
+
+    def release_pods(name: str, component: str) -> dict[str, Any]:
+        labels = {"app.kubernetes.io/name": name, "app.kubernetes.io/instance": "mindroom-runtime"}
+        return {"podSelector": {"matchLabels": {**labels, "app.kubernetes.io/component": component}}}
+
+    worker_labels = {
+        "mindroom.ai/component": "worker",
+        "app.kubernetes.io/managed-by": "mindroom",
+        "app.kubernetes.io/name": "mindroom-worker",
+        "mindroom.ai/instance": "demo",
+    }
+    expected_ingress = [
+        {
+            "from": [
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "mindroom-workers"}},
+                    "podSelector": {"matchLabels": worker_labels},
+                },
+            ],
+            "ports": worker_ports,
+        },
+        {
+            "from": [
+                release_pods("mindroom-runtime", "runtime"),
+                release_pods("agent-vault-bootstrap", "agent-vault-bootstrap"),
+                release_pods("agent-vault-access-grants", "agent-vault-access-grants"),
+            ],
+            "ports": [_VAULT_API_PORT],
+        },
+    ]
+    if squid_reaches_proxy:
+        expected_ingress.append(
+            {
+                "from": [release_pods("mindroom-runtime-egress-proxy", "approved-egress-proxy")],
+                "ports": [_VAULT_PROXY_PORT],
+            },
+        )
+    dns_egress, web_egress = _VAULT_BASE_EGRESS
+    if dns_peers is not None:
+        dns_egress = {"to": dns_peers, **dns_egress}
+    assert policy["metadata"]["name"] == "agent-vault"
+    assert policy["spec"]["ingress"] == expected_ingress
+    assert policy["spec"]["egress"] == [dns_egress, web_egress]
+
+
+@pytest.mark.parametrize("smtp_enabled", [False, True])
+def test_runtime_chart_agent_vault_server_network_policy_fences_egress(tmp_path: Path, smtp_enabled: bool) -> None:
+    """The vault egresses only to DNS, web upstreams, and enabled SMTP; without in-chart clients it admits nothing."""
+    values = _agent_vault_server_values(
+        smtp={"enabled": smtp_enabled, "host": "smtp.example.test", "port": 2525, "existingSecret": "vault-smtp"},
+    )
+
+    [policy] = _agent_vault_network_policies(tmp_path, values)
+
+    smtp_egress = [{"ports": [{"protocol": "TCP", "port": 2525}]}] if smtp_enabled else []
+    assert policy["spec"]["policyTypes"] == ["Ingress", "Egress"]
+    assert policy["spec"]["ingress"] == []
+    assert policy["spec"]["egress"] == _VAULT_BASE_EGRESS + smtp_egress
+
+
+def test_runtime_chart_agent_vault_server_network_policy_appends_extra_rules(tmp_path: Path) -> None:
+    """Deployer-owned vault clients and destinations extend the chart rules."""
+    ui_proxy_rule = {
+        "from": [
+            {
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "vault-ui"}},
+                "podSelector": {"matchLabels": {"app.kubernetes.io/name": "vault-ui-proxy"}},
+            },
+        ],
+        "ports": [_VAULT_API_PORT],
+    }
+    database_rule = {"to": [{"ipBlock": {"cidr": "192.0.2.0/24"}}], "ports": [{"protocol": "TCP", "port": 5432}]}
+    values = _agent_vault_server_values(
+        networkPolicy={"name": "vault-fence", "extraIngress": [ui_proxy_rule], "extraEgress": [database_rule]},
+    )
+
+    [policy] = _agent_vault_network_policies(tmp_path, values)
+
+    assert policy["metadata"]["name"] == "vault-fence"
+    assert policy["spec"]["ingress"] == [ui_proxy_rule]
+    assert policy["spec"]["egress"] == [*_VAULT_BASE_EGRESS, database_rule]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [{}, _agent_vault_server_values(networkPolicy={"create": False})],
+    ids=["server-disabled", "policy-disabled"],
+)
+def test_runtime_chart_agent_vault_server_network_policy_can_be_disabled(
+    tmp_path: Path,
+    values: dict[str, Any],
+) -> None:
+    """No vault policy renders without the chart-managed server or when the deployer opts out."""
+    assert _agent_vault_network_policies(tmp_path, values) == []
+
+
 def test_runtime_chart_agent_vault_access_tool_sets_owner_email() -> None:
     """The self-service access tool must know the owner used by worker token minting."""
     docs = _render_chart(
@@ -2274,6 +2840,26 @@ def test_runtime_chart_rejects_agent_vault_default_proxy_url_with_approved_egres
 
     assert completed.returncode != 0
     assert "approvedEgress with Agent Vault must be squid-first" in completed.stderr
+
+
+def _access_grants_config(job: dict[str, Any]) -> dict[str, Any]:
+    """Return the grants config the access-grants Job mounts from its own pod template annotation."""
+    pod = job["spec"]["template"]
+    [volume] = [volume for volume in pod["spec"]["volumes"] if volume["name"] == "access-grants-config"]
+    [item] = volume["downwardAPI"]["items"]
+    assert item["path"] == "access-grants.yaml"
+    annotation = re.fullmatch(r"metadata\.annotations\['(.+)'\]", item["fieldRef"]["fieldPath"])
+    assert annotation is not None
+    return yaml.safe_load(pod["metadata"]["annotations"][annotation.group(1)])
+
+
+def _access_grants_config_maps(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        doc
+        for doc in docs
+        if doc["kind"] == "ConfigMap"
+        and doc["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "agent-vault-access-grants"
+    ]
 
 
 def test_runtime_chart_agent_vault_access_grants_are_noop_by_default() -> None:
@@ -2328,10 +2914,9 @@ def test_runtime_chart_agent_vault_access_grants_renders_shared_grant_job(tmp_pa
         values_files=(values_path,),
         release_name="mindroom-runtime",
     )
-    config_map = _resource(docs, "ConfigMap", "agent-vault-access-grants")
     job = _resource(docs, "Job", "agent-vault-access-grants")
     container = _container(job, "access-grants")
-    config = yaml.safe_load(config_map["data"]["access-grants.yaml"])
+    config = _access_grants_config(job)
 
     assert config == {
         "apiUrl": "http://agent-vault:14321",
@@ -2413,7 +2998,7 @@ def test_runtime_chart_agent_vault_access_grants_renders_user_agent_grant(tmp_pa
         values_files=(values_path,),
         release_name="mindroom-runtime",
     )
-    config = yaml.safe_load(_resource(docs, "ConfigMap", "agent-vault-access-grants")["data"]["access-grants.yaml"])
+    config = _access_grants_config(_resource(docs, "Job", "agent-vault-access-grants"))
 
     assert config["grants"] == [
         {
@@ -2465,7 +3050,7 @@ def test_runtime_chart_agent_vault_access_grants_renders_user_grant(tmp_path: Pa
         values_files=(values_path,),
         release_name="mindroom-runtime",
     )
-    config = yaml.safe_load(_resource(docs, "ConfigMap", "agent-vault-access-grants")["data"]["access-grants.yaml"])
+    config = _access_grants_config(_resource(docs, "Job", "agent-vault-access-grants"))
 
     assert config["grants"] == [
         {
@@ -2537,6 +3122,124 @@ def test_runtime_chart_agent_vault_bootstrap_publishes_access_grants_admin_token
         rule for rule in bootstrap_role["rules"] if "secrets" in rule.get("resources", []) and "resourceNames" in rule
     )
     assert "agent-vault-grants-admin" in secret_rule["resourceNames"]
+
+
+def _render_agent_vault_jobs(
+    tmp_path: Path,
+    *,
+    job_naming: str,
+    grant_email: str = "maintainer@example.test",
+    kubectl_image: str = "registry.example.test/kubectl:1",
+    chart_dir: Path = Path("cluster/k8s/runtime"),
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    agent_vault = {
+        "enabled": True,
+        "cliImage": "infisical/agent-vault:test",
+        "ownerEmail": "owner@example.test",
+        "workerCaConfigMapName": "agent-vault-ca",
+        "jobNaming": job_naming,
+        "bootstrap": {"enabled": True, "kubectlImage": kubectl_image},
+        "accessGrants": {
+            "enabled": True,
+            "grants": [{"email": grant_email, "workerScope": "shared", "agent": "example-agent"}],
+        },
+    }
+    values = {"workers": {"backend": "kubernetes", "kubernetes": {"agentVault": agent_vault}}}
+    docs = _render_chart(
+        chart_dir,
+        values_files=_values_files(tmp_path, values),
+        release_name="mindroom-runtime",
+    )
+    jobs = {doc["metadata"]["labels"]["app.kubernetes.io/component"]: doc for doc in docs if doc["kind"] == "Job"}
+    return docs, jobs["agent-vault-access-grants"], jobs["agent-vault-bootstrap"]
+
+
+def test_runtime_chart_agent_vault_content_hash_jobs_skip_helm_hooks(tmp_path: Path) -> None:
+    """Hashed Job names let plain `kubectl apply` replace the Jobs without Helm hooks."""
+    docs, grants_job, bootstrap_job = _render_agent_vault_jobs(tmp_path, job_naming="contentHash")
+
+    assert re.fullmatch(r"agent-vault-access-grants-[0-9a-f]{10}", grants_job["metadata"]["name"])
+    assert re.fullmatch(r"agent-vault-bootstrap-[0-9a-f]{10}", bootstrap_job["metadata"]["name"])
+    for job, base_name in ((grants_job, "agent-vault-access-grants"), (bootstrap_job, "agent-vault-bootstrap")):
+        assert "annotations" not in job["metadata"]
+        assert job["spec"]["ttlSecondsAfterFinished"] == 86400
+        assert job["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/name"] == base_name
+    assert grants_job["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+    assert _access_grants_config(grants_job)["grants"][0]["email"] == "maintainer@example.test"
+    assert _access_grants_config_maps(docs) == []
+    assert bootstrap_job["spec"]["template"]["spec"]["serviceAccountName"] == "agent-vault-bootstrap"
+
+
+def test_runtime_chart_agent_vault_content_hash_tracks_each_jobs_inputs(tmp_path: Path) -> None:
+    """Only the Job whose rendered inputs changed gets a new name, and each grants Job carries its own config."""
+
+    def names(**overrides: str) -> tuple[str, str]:
+        _, grants_job, bootstrap_job = _render_agent_vault_jobs(tmp_path, job_naming="contentHash", **overrides)
+        grants = _access_grants_config(grants_job)["grants"]
+        assert grants[0]["email"] == overrides.get("grant_email", "maintainer@example.test")
+        return grants_job["metadata"]["name"], bootstrap_job["metadata"]["name"]
+
+    grants_name, bootstrap_name = names()
+    assert names() == (grants_name, bootstrap_name)
+    changed_grants_name, same_bootstrap_name = names(grant_email="second@example.test")
+    assert changed_grants_name != grants_name
+    assert same_bootstrap_name == bootstrap_name
+    same_grants_name, changed_bootstrap_name = names(kubectl_image="registry.example.test/kubectl:2")
+    assert same_grants_name == grants_name
+    assert changed_bootstrap_name != bootstrap_name
+
+
+@pytest.mark.parametrize("job_naming", ["fixed", "contentHash"])
+@pytest.mark.parametrize(
+    ("chart_field", "label", "bumped_label"),
+    [("version", "helm.sh/chart", "mindroom-runtime-9.9.9"), ("appVersion", "app.kubernetes.io/version", "9.9.9")],
+)
+def test_runtime_chart_agent_vault_jobs_keep_name_and_pod_template_across_version_bumps(
+    tmp_path: Path,
+    job_naming: str,
+    chart_field: str,
+    label: str,
+    bumped_label: str,
+) -> None:
+    """A chart or app version bump alone relabels the Jobs but keeps their names and immutable pod templates."""
+    bumped_chart = tmp_path / "chart"
+    shutil.copytree(Path("cluster/k8s/runtime"), bumped_chart)
+    chart_yaml = bumped_chart / "Chart.yaml"
+    chart = yaml.safe_load(chart_yaml.read_text(encoding="utf-8"))
+    chart_yaml.write_text(yaml.safe_dump({**chart, chart_field: "9.9.9"}), encoding="utf-8")
+
+    _, *jobs = _render_agent_vault_jobs(tmp_path, job_naming=job_naming)
+    _, *bumped_jobs = _render_agent_vault_jobs(tmp_path, job_naming=job_naming, chart_dir=bumped_chart)
+
+    for job, bumped_job in zip(jobs, bumped_jobs, strict=True):
+        assert bumped_job["metadata"]["labels"][label] == bumped_label
+        assert bumped_job["metadata"]["name"] == job["metadata"]["name"]
+        assert bumped_job["spec"]["template"] == job["spec"]["template"]
+
+
+def test_runtime_chart_agent_vault_fixed_jobs_keep_names_and_grant_hook(tmp_path: Path) -> None:
+    """The default keeps stable Job names and the Helm hook on the grants Job."""
+    docs, grants_job, bootstrap_job = _render_agent_vault_jobs(tmp_path, job_naming="fixed")
+
+    assert grants_job["metadata"]["name"] == "agent-vault-access-grants"
+    assert _access_grants_config(grants_job)["grants"][0]["email"] == "maintainer@example.test"
+    assert _access_grants_config_maps(docs) == []
+    assert grants_job["metadata"]["annotations"]["helm.sh/hook"] == "post-install,post-upgrade"
+    assert bootstrap_job["metadata"]["name"] == "agent-vault-bootstrap"
+    assert "annotations" not in bootstrap_job["metadata"]
+
+
+def test_runtime_chart_rejects_unknown_agent_vault_job_naming() -> None:
+    """Job naming accepts only the two documented modes."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "workers.kubernetes.agentVault.jobNaming=hooks",
+    )
+    assert result.returncode != 0
+    assert "workers.kubernetes.agentVault.jobNaming must be fixed or contentHash" in result.stderr
 
 
 def test_runtime_chart_rejects_agent_vault_access_token_same_secret_different_keys(tmp_path: Path) -> None:
@@ -3350,12 +4053,161 @@ def test_runtime_chart_opt_out_skips_generated_api_key(backend: str) -> None:
     assert "envFrom" not in mindroom_container
 
 
+@pytest.mark.parametrize("backend", ["static_runner", "kubernetes"])
+def test_runtime_chart_existing_api_key_secret_replaces_generated_key(backend: str) -> None:
+    """An existing Secret gives the primary a key that offline renders cannot rotate, and only the primary reads it."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        f"workers.backend={backend}",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "apiAuth.existingSecret=operator-api",
+        "apiAuth.key=primary-key",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    mindroom_container = _container(deployment, "mindroom")
+
+    assert not any(doc["kind"] == "Secret" and doc["metadata"]["name"] == "mindroom-runtime-api-key" for doc in docs)
+    assert "envFrom" not in mindroom_container
+    assert _env_by_name(mindroom_container)["MINDROOM_API_KEY"] == {
+        "name": "MINDROOM_API_KEY",
+        "valueFrom": {"secretKeyRef": {"name": "operator-api", "key": "primary-key"}},
+    }
+    for container in deployment["spec"]["template"]["spec"]["containers"]:
+        if container["name"] != "mindroom":
+            assert "MINDROOM_API_KEY" not in _env_by_name(container)
+
+
+@pytest.mark.parametrize(
+    ("set_args", "error"),
+    [
+        (
+            ("apiAuth.allowUnauthenticatedPrimary=true",),
+            "apiAuth.existingSecret cannot be set when apiAuth.allowUnauthenticatedPrimary=true",
+        ),
+        (("apiAuth.key=",), "apiAuth.key is required when apiAuth.existingSecret is set"),
+        (
+            ("apiAuth.existingSecret=mindroom-runtime-api-key",),
+            "apiAuth.existingSecret must name a Secret the chart does not manage, not mindroom-runtime-api-key",
+        ),
+        (
+            ("env.extra[0].name=MINDROOM_API_KEY", "env.extra[0].value=duplicate"),
+            "apiAuth.existingSecret and env.extra both set MINDROOM_API_KEY; remove one of them",
+        ),
+    ],
+)
+def test_runtime_chart_rejects_conflicting_existing_api_key_secret(set_args: tuple[str, ...], error: str) -> None:
+    """An existing API key Secret must be the primary's only key source."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "apiAuth.existingSecret=operator-api",
+        *set_args,
+        release_name="mindroom-runtime",
+    )
+
+    assert completed.returncode != 0
+    assert error in completed.stderr
+
+
 def test_runtime_chart_dedicated_workers_skip_static_runner_storage() -> None:
     """Dedicated workers need neither the sidecar nor its storage preparation."""
     pod_spec = _resource(_render_runtime_chart(), "Deployment", "mindroom-runtime")["spec"]["template"]["spec"]
 
     assert [container["name"] for container in pod_spec["containers"]] == ["mindroom"]
     assert "initContainers" not in pod_spec
+
+
+def test_runtime_chart_runs_runtime_image_containers_as_non_root() -> None:
+    """Every runtime-image container enforces non-root, while the state-storage chown step stays explicitly root."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "eventCache.postgres.auth.password=test-password",
+        "stateStorage.enabled=true",
+        "stateStorage.create=true",
+        "workers.kubernetes.agentVault.enabled=true",
+        "workers.kubernetes.agentVault.cliImage=infisical/agent-vault:test",
+        "workers.kubernetes.agentVault.ownerEmail=owner@example.test",
+        "workers.kubernetes.agentVault.accessGrants.enabled=true",
+        "workers.kubernetes.agentVault.accessGrants.grants[0].email=maintainer@example.test",
+        "workers.kubernetes.agentVault.accessGrants.grants[0].workerScope=shared",
+        "workers.kubernetes.agentVault.accessGrants.grants[0].agent=helper",
+        release_name="mindroom-runtime",
+    )
+    pod_spec = _resource(docs, "Deployment", "mindroom-runtime")["spec"]["template"]["spec"]
+    containers = {container["name"]: container for container in [*pod_spec["initContainers"], *pod_spec["containers"]]}
+    access_grants = _container(_resource(docs, "Job", "agent-vault-access-grants"), "access-grants")
+    runtime_security = {"runAsNonRoot": True, "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+
+    assert pod_spec["securityContext"] == {"fsGroup": 1000, "fsGroupChangePolicy": "OnRootMismatch"}
+    for name in ("prepare-sandbox-runner-storage", "mindroom", "sandbox-runner"):
+        assert containers[name]["securityContext"] == runtime_security
+    assert access_grants["securityContext"] == runtime_security
+    assert containers["prepare-state-storage"]["securityContext"] == {
+        "runAsUser": 0,
+        "runAsNonRoot": False,
+        "allowPrivilegeEscalation": False,
+    }
+
+
+def test_runtime_chart_agent_vault_server_runs_as_numeric_non_root_user() -> None:
+    """The vault image names its user, so the chart sets the uid the kubelet needs to enforce runAsNonRoot."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.kubernetes.agentVault.server.enabled=true",
+        "workers.kubernetes.agentVault.server.image=infisical/agent-vault:test",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "agent-vault")
+
+    assert deployment["spec"]["template"]["spec"]["securityContext"] == {
+        "fsGroup": 101,
+        "fsGroupChangePolicy": "OnRootMismatch",
+    }
+    assert _container(deployment, "agent-vault")["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 65532,
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+    }
+
+
+@pytest.mark.parametrize("override", [None, "podSecurityContext", "securityContext", "kubectlSecurityContext"])
+def test_runtime_chart_agent_vault_bootstrap_security_contexts(tmp_path: Path, override: str | None) -> None:
+    """The bootstrap Job pod and both containers get configurable security contexts with hardened defaults."""
+    custom = {"runAsUser": 1234}
+    bootstrap: dict[str, Any] = {"enabled": True, "kubectlImage": "registry.example.test/kubectl:1"}
+    if override:
+        bootstrap[override] = custom
+    agent_vault = {
+        "enabled": True,
+        "cliImage": "infisical/agent-vault:test",
+        "ownerEmail": "owner@example.test",
+        "workerCaConfigMapName": "agent-vault-ca",
+        "bootstrap": bootstrap,
+    }
+    values = {"workers": {"backend": "kubernetes", "kubernetes": {"agentVault": agent_vault}}}
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        values_files=_values_files(tmp_path, values),
+        release_name="mindroom-runtime",
+    )
+    job = _resource(docs, "Job", "agent-vault-bootstrap")
+    drop_all = {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+    expected = {
+        "podSecurityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
+        "securityContext": {"runAsNonRoot": True, "runAsUser": 65532, **drop_all},
+        "kubectlSecurityContext": drop_all,
+    }
+    if override:
+        # Helm deep-merges a values-file map into the chart default.
+        expected[override] = {**expected[override], **custom}
+
+    assert job["spec"]["template"]["spec"]["securityContext"] == expected["podSecurityContext"]
+    assert _init_container(job, "bootstrap-owner")["securityContext"] == expected["securityContext"]
+    assert _container(job, "publish-ca")["securityContext"] == expected["kubectlSecurityContext"]
 
 
 def test_runtime_chart_state_storage_renders_existing_pvc_mounts_and_init_permissions(tmp_path: Path) -> None:
@@ -3463,39 +4315,6 @@ def test_runtime_chart_state_storage_can_create_pvc() -> None:
         "storageClassName": "fast-rwo",
         "resources": {"requests": {"storage": "20Gi"}},
     }
-
-
-@pytest.mark.parametrize(
-    ("config_path", "extra_args"),
-    [
-        ("/app/agent_data/encryption_keys/config.yaml", ()),
-        ("/app/agent_data/sync_continuity/config.yaml", ("stateStorage.syncContinuity.enabled=true",)),
-        ("/app/agent_data/active/config.yaml", ("stateStorage.encryptionKeys.mountPath=/app/agent_data/active/keys",)),
-        (
-            "/app/agent_data/active/config.yaml",
-            ("extraVolumeMounts[0].name=custom", "extraVolumeMounts[0].mountPath=/app/agent_data/active/keys"),
-        ),
-    ],
-)
-def test_runtime_chart_rejects_bootstrap_target_overlapping_mount(
-    config_path: str,
-    extra_args: tuple[str, ...],
-) -> None:
-    """Chart-known mounts must not become bootstrap target or its nested children."""
-    completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        "eventCache.postgres.auth.password=test-password",
-        "config.source=file",
-        f"config.path={config_path}",
-        "config.bootstrapBundlePath=/bundle",
-        "workers.backend=kubernetes",
-        "stateStorage.enabled=true",
-        "stateStorage.existingClaim=mindroom-state",
-        *extra_args,
-        release_name="mindroom-runtime",
-    )
-    assert completed.returncode != 0
-    assert "config.path directory overlaps a mounted volume" in completed.stderr
 
 
 @pytest.mark.parametrize(

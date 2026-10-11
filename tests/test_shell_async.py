@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, workspace_home_identity_env
-from mindroom.shell_execution import _MAX_OUTPUT_BYTES
+from mindroom.shell.execution import _MAX_OUTPUT_BYTES
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tools.shell import (
     _process_registry,
@@ -925,6 +925,7 @@ def test_run_shell_command_description_uses_portable_workspace_paths(tmp_path: P
     assert "$MINDROOM_AGENT_WORKSPACE" in description
     assert "worker-routed execution maps `~` to the workspace" in description
     assert "local execution maps it to the host home" in description
+    assert description.count("Working method:") == 1
 
 
 def test_proxied_run_shell_command_description_does_not_claim_host_home(tmp_path: Path) -> None:
@@ -951,12 +952,13 @@ def test_proxied_run_shell_command_description_does_not_claim_host_home(tmp_path
 
 
 def test_run_shell_command_description_has_no_workspace_note_without_base_dir(tmp_path: Path) -> None:
-    """Without a workspace there is no cwd contract to describe."""
+    """Without a workspace there is no cwd contract to describe, but the working method still applies."""
     tool = _get_toolkit(tmp_path)
 
     description = tool.async_functions["run_shell_command"].description
     assert description is not None
     assert "[cwd:" not in description
+    assert description.count("Working method:") == 1
 
 
 @pytest.mark.asyncio
@@ -1143,7 +1145,7 @@ async def test_max_backgrounded_limit(tmp_path: Path) -> None:
     handles: list[str] = []
 
     # Patch to a small limit
-    with patch("mindroom.shell_execution.MAX_BACKGROUNDED", 2):
+    with patch("mindroom.shell.execution.MAX_BACKGROUNDED", 2):
         # Fill up to the limit
         for _ in range(2):
             result = await run_fn(["sleep", "300"], timeout=0)

@@ -25,7 +25,7 @@ from mindroom.entity_resolution import (
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_room_admin import get_joined_rooms
 from mindroom.requester_identity import is_human_requester_id
-from mindroom.scheduling import get_pending_schedule_thread_ids_for_room
+from mindroom.scheduling.tasks import get_pending_schedule_thread_ids_for_room
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -164,8 +164,8 @@ class TodoPokeRuntimeCoordinator:
         # Access policies never restrict internal senders, so their work runs as the assignee's own turn.
         if requester_id in internal_sender_ids:
             return TodoPokeRequesterKind.INTERNAL
-        # Ingress promotes only a human original sender to requester; any other sender would run with the assignee's authority.
-        # Ingress also refuses a human the assignee may not reply to, so such work would only take poke slots.
+        # Ingress promotes only a human or configured bot-account original sender to requester; any other sender would run with the assignee's authority.
+        # Pokes act only for humans, and ingress refuses a human the assignee may not reply to, so such work would only take poke slots.
         if not is_human_requester_id(requester_id, config, self.runtime_paths) or agent_name not in config.agents:
             return TodoPokeRequesterKind.REFUSED
         try:

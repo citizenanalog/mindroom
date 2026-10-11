@@ -12,6 +12,7 @@ from openai import AuthenticationError as OpenAIAuthError
 from openai import OpenAIError
 
 from mindroom import constants
+from mindroom.agent_cli.minimal_agent import MinimalAgent
 from mindroom.error_handling import (
     MODEL_SAFEGUARD_REFUSAL_MESSAGE,
     MinimalModeUnavailableError,
@@ -20,7 +21,6 @@ from mindroom.error_handling import (
     get_user_friendly_error_message,
     run_error_event_exception,
 )
-from mindroom.minimal_agent import MinimalAgent
 
 _MOCK_RESPONSE = httpx.Response(status_code=401, request=httpx.Request("POST", "https://api.example.com"))
 
@@ -285,3 +285,15 @@ def test_rejected_provider_key_is_still_an_authentication_failure() -> None:
 
     assert "Authentication failed" in message
     assert "Connect your AI provider" not in message
+
+
+def test_minimal_subagent_failure_suggests_a_standard_subagent() -> None:
+    """A minimal child's runtime failure points the caller at a new standard subagent, not the mode command."""
+    agent = MinimalAgent(id="helper", name="Helper")
+    agent.delegation_depth = 1
+    with pytest.raises(MinimalModeUnavailableError) as raised:
+        agent._raise_failure(RuntimeError("Minimal Bash requires an active managed response owner"))
+
+    assert str(raised.value) == (
+        "Minimal Bash requires an active managed response owner. Start a new subagent without minimal."
+    )

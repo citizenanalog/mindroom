@@ -133,7 +133,7 @@ async def test_prepare_history_for_run_forced_compaction_rewrites_session(tmp_pa
     agent = _agent(db=storage)
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -203,7 +203,7 @@ async def test_prepare_history_for_run_required_compaction_starts_lifecycle_befo
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -256,7 +256,7 @@ async def test_prepare_history_for_run_required_compaction_edits_failure_when_mo
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
 
-    with patch("mindroom.model_loading.get_model_instance", side_effect=ValueError("bad summary model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", side_effect=ValueError("bad summary model")):
         prepared = await prepare_history_for_run_for_test(
             agent=_agent(db=storage),
             agent_name="test_agent",
@@ -284,6 +284,51 @@ async def test_prepare_history_for_run_required_compaction_edits_failure_when_mo
 
 
 @pytest.mark.asyncio
+async def test_prepare_history_for_run_compaction_failure_notice_redacts_credentials(tmp_path: Path) -> None:
+    """Room-visible compaction failure text must not carry credentials from the raised error."""
+    config, runtime_paths = _make_config(
+        tmp_path,
+        compaction=CompactionOverrideConfig(enabled=True),
+        context_window=64_000,
+    )
+    storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
+    session = _session("session-1", runs=[_completed_run("run-1"), _completed_run("run-2")])
+    scope = HistoryScope(kind="agent", scope_id="test_agent")
+    set_force_compaction_state(session, scope, HistoryScopeState(), force=True)
+    seed_session(storage, session)
+    lifecycle = RecordingCompactionLifecycle()
+    api_key = "sk-" + "proj" + "A1b2C3d4E5f6G7h8J9k0"
+    password = "hunter" + "2secret"
+    error = RuntimeError(f"Incorrect API key provided: {api_key} at https://user:{password}@llm.internal/v1")
+
+    with (
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="summary-model", provider="fake"),
+        ),
+        patch("mindroom.history.runtime._run_scope_compaction", new=AsyncMock(side_effect=error)),
+    ):
+        await prepare_history_for_run_for_test(
+            agent=_agent(db=storage),
+            agent_name="test_agent",
+            full_prompt="Current prompt",
+            session_id="session-1",
+            runtime_paths=runtime_paths,
+            config=config,
+            execution_identity=None,
+            storage=storage,
+            session=session,
+            compaction_lifecycle=lifecycle,
+        )
+
+    failure = lifecycle.events[1]
+    assert isinstance(failure, CompactionLifecycleFailure)
+    assert api_key not in failure.failure_reason
+    assert password not in failure.failure_reason
+    assert "Incorrect API key provided" in failure.failure_reason
+
+
+@pytest.mark.asyncio
 async def test_prepare_history_for_run_required_compaction_edits_failure_when_cancelled(
     tmp_path: Path,
 ) -> None:
@@ -308,7 +353,7 @@ async def test_prepare_history_for_run_required_compaction_edits_failure_when_ca
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch("mindroom.history.runtime._run_scope_compaction", new=AsyncMock(side_effect=asyncio.CancelledError)),
@@ -360,7 +405,7 @@ async def test_prepare_history_for_run_required_compaction_classifies_provider_t
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch("mindroom.history.compaction.generate_compaction_summary", new=AsyncMock(side_effect=TimeoutError)),
@@ -443,7 +488,7 @@ async def test_prepare_history_for_run_keeps_thread_session_compaction_isolated(
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -596,7 +641,7 @@ async def test_prepare_history_for_run_forced_compaction_finishes_selected_runs_
     )
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -720,7 +765,7 @@ async def test_prepare_history_for_run_auto_compaction_runs_to_completion_before
     )
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -841,7 +886,7 @@ async def test_prepare_history_for_run_auto_required_compaction_finishes_origina
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -1011,7 +1056,7 @@ async def test_prepare_history_for_run_persists_successful_compaction_chunks_bef
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -1131,7 +1176,7 @@ async def test_prepare_history_for_run_failure_notice_reports_serving_fallback_m
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             side_effect=lambda _config, _paths, name, **_kwargs: FakeModel(id=f"{name}-id", provider="fake"),
         ),
         patch(
@@ -1212,7 +1257,7 @@ async def test_prepare_history_for_run_compacts_on_primary_when_fallback_constru
     lifecycle = RecordingCompactionLifecycle()
 
     with (
-        patch("mindroom.model_loading.get_model_instance", side_effect=_load_model),
+        patch("mindroom.providers.model_loading.get_model_instance", side_effect=_load_model),
         patch("mindroom.history.compaction.generate_compaction_summary", new=summary_mock),
         patch("mindroom.history.runtime.logger.warning") as warning_mock,
     ):
@@ -1299,7 +1344,7 @@ async def test_prepare_history_for_run_reuses_completed_auto_compaction(
     )
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -1483,7 +1528,7 @@ async def test_prepare_history_for_run_compaction_failure_clears_force_flag(tmp_
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(

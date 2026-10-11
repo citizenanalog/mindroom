@@ -38,6 +38,7 @@ from mindroom.matrix.personal_room_store import (
     read_personal_room,
     write_personal_room,
 )
+from mindroom.matrix.room_power import privileged_creators, user_power_level
 from mindroom.matrix.state import resolve_room_aliases
 from mindroom.matrix_identifiers import managed_room_alias_localpart
 from mindroom.requester_identity import is_human_requester_id, is_managed_entity_id, runtime_matrix_domain
@@ -411,7 +412,9 @@ class PersonalRoomService:
             if router_id is not None:
                 permitted_members.add(router_id)
         power = state.get(("m.room.power_levels", ""), {}).get("content", {})
-        agent_power = power.get("users", {}).get(agent_id, power.get("users_default", 0))
+        # Room version 12 never lists the creating agent, whose power is unlimited.
+        creators = privileged_creators(state.get(("m.room.create", ""), {}))
+        agent_power = user_power_level(power, agent_id, creators)
         if (
             creator != expected_creator
             or marker.get("sender") != self._client().user_id
@@ -454,8 +457,11 @@ class PersonalRoomService:
         for user_id in sorted(guests):
             response = await client.room_kick(record.room_id, user_id, reason=_GUEST_REMOVAL_REASON)
             if not isinstance(response, nio.RoomKickResponse):
+                # A guest whose power level matches the agent's stays until
+                # someone removes it; other failures are transient.
+                forbidden = isinstance(response, nio.RoomKickError) and response.status_code == "M_FORBIDDEN"
                 msg = "Personal-room guest removal failed"
-                raise RuntimeError(msg)  # noqa: TRY004 - a Matrix transport failure is retryable, not a caller type error
+                raise (PersonalRoomValidationError if forbidden else RuntimeError)(msg)
         logger.info("personal_room_guests_removed", room_id=record.room_id, removed_count=len(guests))
         content = build_message_content(
             _GUEST_REMOVAL_NOTICE.format(owner=record.user_id, guests=", ".join(sorted(guests))),

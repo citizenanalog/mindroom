@@ -11,12 +11,12 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credential_policy import (
+from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.credentials.policy import (
     OAUTH_DYNAMIC_CLIENT_REGISTERED_REDIRECT_URI_KEY,
     OAUTH_DYNAMIC_CLIENT_REGISTERED_TOKEN_URL_KEY,
     RUNTIME_BOOTSTRAPPED_CLIENT_CONFIG_KEY,
 )
-from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.oauth import OAuthDiscoveryConfig, OAuthProvider, oauth_runtime_bootstrapper
 from mindroom.oauth.discovery import (
     _DISCOVERY_CACHE,
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
 
 
 class _Response:
@@ -592,6 +592,55 @@ async def test_dynamic_registration_revalidates_dns_when_connecting(
 
     with pytest.raises(OAuthProviderError, match="dynamic client registration failed") as error:
         await provider.runtime_endpoints(runtime_paths)
+
+    assert isinstance(error.value.__cause__, ServerFetchUrlError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["exchange", "refresh"])
+async def test_token_requests_revalidate_dns_when_connecting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Code exchange and refresh must reject a discovered token host that rebinds before the connection."""
+    token_url = "https://auth.example.test/token"  # noqa: S105
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path, process_env={})
+    get_runtime_credentials_manager(runtime_paths).save_credentials(
+        "rebound_token_oauth_client",
+        {"client_id": "public-client"},
+    )
+    provider = OAuthProvider(
+        id="rebound_token",
+        display_name="Rebound Token",
+        authorization_url="",
+        token_url="",
+        scopes=(),
+        allow_empty_scopes=True,
+        credential_service="rebound_token_oauth",
+        client_config_services=("rebound_token_oauth_client",),
+        token_endpoint_auth_method="none",  # noqa: S106
+        runtime_bootstrapper=oauth_runtime_bootstrapper(
+            OAuthDiscoveryConfig(
+                resource="",
+                discovery="manual",
+                authorization_url="https://auth.example.test/authorize",
+                token_url=token_url,
+                token_endpoint_auth_method="none",  # noqa: S106
+            ),
+        ),
+    )
+    # Manual discovery preflights the authorization and token endpoints before the token request dials.
+    _install_dns_rebinding(monkeypatch, safe_resolutions=2)
+
+    token_request = (
+        provider.exchange_code("authorization-code", runtime_paths, token_url=token_url)
+        if operation == "exchange"
+        else provider.refresh_token_data({"refresh_token": "refresh-token", "token_uri": token_url}, runtime_paths)
+    )
+
+    with pytest.raises(OAuthProviderError, match=f"OAuth token {operation}") as error:
+        await token_request
 
     assert isinstance(error.value.__cause__, ServerFetchUrlError)
 

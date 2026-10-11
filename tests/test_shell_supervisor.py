@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from mindroom import shell_execution as shell_execution_module
-from mindroom import shell_supervisor
 from mindroom.api import sandbox_runner as sandbox_runner_module
 from mindroom.constants import resolve_runtime_paths
 from mindroom.script_runs import shim as script_run_shim
-from mindroom.shell_execution import run_command
-from mindroom.shell_supervisor import (
+from mindroom.shell import execution as shell_execution_module
+from mindroom.shell import supervisor as shell_supervisor
+from mindroom.shell.execution import run_command
+from mindroom.shell.supervisor import (
     SHELL_SUPERVISOR_SOCKET_ENV,
     _handle_connection,
     _ShellSupervisorManager,
@@ -33,6 +33,7 @@ from mindroom.shell_supervisor import (
     run_command_via_supervisor,
 )
 from mindroom.tool_system.metadata import get_tool_by_name
+from tests.process_helpers import assert_linux_pid_not_running
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from agno.tools.toolkit import Toolkit
 
     from mindroom.constants import RuntimePaths
-    from mindroom.shell_execution import ProcessRecord
+    from mindroom.shell.execution import ProcessRecord
 
 _MINIMAL_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
@@ -169,21 +170,6 @@ async def _assert_pid_dead(pid: int) -> None:
             return
         await asyncio.sleep(0.05)
     message = f"Process {pid} is still alive"
-    raise AssertionError(message)
-
-
-async def _assert_linux_pid_not_running(pid: int) -> None:
-    """Wait until a Linux process exits, allowing an unreaped zombie."""
-    stat_path = Path(f"/proc/{pid}/stat")
-    for _ in range(40):
-        try:
-            state = stat_path.read_text(encoding="utf-8").split()[2]
-        except (FileNotFoundError, ProcessLookupError):
-            return
-        if state == "Z":
-            return
-        await asyncio.sleep(0.05)
-    message = f"Process {pid} is still running"
     raise AssertionError(message)
 
 
@@ -1044,9 +1030,9 @@ async def test_supervisor_sigkill_terminates_supervised_process_group(
         supervisor.process.kill()
         supervisor.process.wait(timeout=10)
 
-        await _assert_linux_pid_not_running(supervised_pid)
-        await _assert_linux_pid_not_running(script_pid)
-        await _assert_linux_pid_not_running(descendant_pid)
+        await assert_linux_pid_not_running(supervised_pid)
+        await assert_linux_pid_not_running(script_pid)
+        await assert_linux_pid_not_running(descendant_pid)
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(supervised_pid, signal.SIGKILL)
@@ -1123,7 +1109,7 @@ async def test_finished_script_kills_same_group_descendants(
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
 
         assert "FINISHED" in await _wait_for_finished(socket_path, handle)
-        await _assert_linux_pid_not_running(child_pid)
+        await assert_linux_pid_not_running(child_pid)
     finally:
         if child_pid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -1140,7 +1126,7 @@ async def test_orphaned_supervisor_exits_and_kills_children() -> None:
     # an orphan as soon as that parent exits.
     launcher = (
         "import pathlib, subprocess, sys, time\n"
-        "process = subprocess.Popen([sys.executable, '-m', 'mindroom.shell_supervisor', sys.argv[1]])\n"
+        "process = subprocess.Popen([sys.executable, '-m', 'mindroom.shell.supervisor', sys.argv[1]])\n"
         "pathlib.Path(sys.argv[2]).write_text(str(process.pid), encoding='utf-8')\n"
         "deadline = time.monotonic() + 20\n"
         "while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < deadline:\n"

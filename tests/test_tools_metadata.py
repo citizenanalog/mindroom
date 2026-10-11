@@ -374,6 +374,22 @@ def test_custom_api_tool_strips_configured_credentials_from_hops_off_the_base_ur
     assert followed.headers["X-Request-Id"] == "req-1"
 
 
+def test_custom_api_tool_sends_dashboard_json_headers_to_the_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Headers saved in the dashboard arrive as JSON text and are sent as default headers to base_url."""
+    sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={"ok": True}))
+    tool = custom_api_tools()(base_url="https://api.example.com", headers='{"X-Api-Key": "operator-secret"}')
+
+    assert json.loads(tool.make_request("data"))["data"] == {"ok": True}
+    assert sent[0].headers["X-Api-Key"] == "operator-secret"
+
+
+@pytest.mark.parametrize("headers", ['["X-Api-Key"]', '{"X-Retries": 3}', "X-Api-Key: abc"])
+def test_custom_api_tool_rejects_headers_that_are_not_a_json_object_of_strings(headers: str) -> None:
+    """A malformed headers value fails when the tool is built instead of on every request."""
+    with pytest.raises(ValueError, match="headers must be a JSON object with string keys and values"):
+        custom_api_tools()(base_url="https://api.example.com", headers=headers)
+
+
 def test_custom_api_tool_strips_basic_auth_from_hops_off_the_base_url_origin(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Basic auth pair reaches the base_url origin but not a presigned download on another host."""
 
@@ -841,9 +857,7 @@ async def test_crawl4ai_browser_egress_route(
 
 
 # Research toolkits whose URL functions download pages from the MindRoom process through the server-fetch guard.
-_LOCAL_URL_FETCH_TOOLS = ("crawl4ai", "trafilatura", "website")
-# Research toolkits that still download model-chosen URLs locally without the guard; each is tracked separately.
-_UNGUARDED_LOCAL_URL_FETCH_TOOLS = ("agentql", "newspaper")
+_LOCAL_URL_FETCH_TOOLS = ("agentql", "crawl4ai", "newspaper", "trafilatura", "website")
 # Research toolkits that forward URLs to a hosted service instead of downloading them locally.
 _HOSTED_URL_FETCH_TOOLS = (
     "brightdata",
@@ -907,7 +921,7 @@ def _recording_loopback_server() -> Iterator[tuple[str, list[object]]]:
 
 
 def test_research_url_tools_declare_their_fetch_path() -> None:
-    """Every research toolkit taking URLs must be classified as a guarded, unguarded, or hosted fetcher."""
+    """Every research toolkit taking URLs must be classified as a guarded or hosted fetcher."""
     url_tools = sorted(
         tool_name
         for tool_name, metadata in BUILTIN_TOOL_METADATA.items()
@@ -916,24 +930,20 @@ def test_research_url_tools_declare_their_fetch_path() -> None:
         and _url_functions(tool_name)
     )
 
-    assert url_tools == sorted((*_LOCAL_URL_FETCH_TOOLS, *_UNGUARDED_LOCAL_URL_FETCH_TOOLS, *_HOSTED_URL_FETCH_TOOLS))
+    assert url_tools == sorted((*_LOCAL_URL_FETCH_TOOLS, *_HOSTED_URL_FETCH_TOOLS))
 
 
-@pytest.mark.parametrize(
-    "tool_name",
-    [
-        *_LOCAL_URL_FETCH_TOOLS,
-        # Newspaper4k needs no browser, so it shows that this check catches an unguarded local download.
-        pytest.param(
-            "newspaper",
-            marks=pytest.mark.xfail(strict=True, reason="Newspaper4k downloads are unguarded and tracked separately."),
-        ),
-    ],
-)
-def test_local_url_fetch_tools_do_not_contact_loopback_targets(tool_name: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("tool_name", _LOCAL_URL_FETCH_TOOLS)
+def test_local_url_fetch_tools_do_not_contact_loopback_targets(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Local page fetchers must refuse loopback targets before connecting unless they default to a worker."""
     if BUILTIN_TOOL_METADATA[tool_name].default_execution_target is ToolExecutionTarget.WORKER:
         pytest.skip("Worker execution keeps downloads behind the worker egress policy.")
+    # AgentQL refuses to build without a key; the unsafe URL is refused before any request could use it.
+    monkeypatch.setenv("AGENTQL_API_KEY", "unused")
     toolkit = get_tool_by_name(
         tool_name,
         resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage"),
@@ -1618,6 +1628,8 @@ def test_custom_toolkit_exclude_tools_override_filters_async_functions(tmp_path:
 
     assert set(tool.async_functions) == {
         "schedule",
+        "schedule_tool_call",
+        "run_scheduled_call",
         "edit_schedule",
         "list_schedules",
     }
@@ -1936,23 +1948,15 @@ def test_code_execution_tools_declare_unconfined_file_access() -> None:
 
 
 _UNCONFINED_LOCAL_FILE_TOOLS = (
-    "agentql",
-    "airflow",
     "browserbase",
     "composio",
     "csv",
     "duckdb",
-    "groq",
-    "moviepy_video_tools",
-    "newspaper",
-    "openai",
     "pandas",
     "postgres",
     "redshift",
     "slack",
     "sql",
-    "visualization",
-    "web_browser_tools",
 )
 
 
@@ -1977,7 +1981,20 @@ def test_only_code_execution_tools_execute_code() -> None:
 
 def test_path_tools_follow_agent_file_access_and_receive_it() -> None:
     """Tools that take model-supplied paths follow and receive the agent file_access."""
-    for name in ("file", "coding", "attachments", "matrix_message", "gmail", "google_drive", "browser", "e2b"):
+    for name in (
+        "file",
+        "coding",
+        "attachments",
+        "matrix_message",
+        "gmail",
+        "google_drive",
+        "browser",
+        "e2b",
+        "airflow",
+        "groq",
+        "moviepy_video_tools",
+        "openai",
+    ):
         metadata = TOOL_METADATA[name]
         assert metadata.file_access is ToolFileAccess.AGENT, name
         assert ToolManagedInitArg.FILE_ACCESS in metadata.managed_init_args, name
@@ -2125,7 +2142,6 @@ def test_restrict_to_base_dir_is_rejected_with_file_access_hint() -> None:
         ("custom_api", "headers"),
         ("daytona", "sandbox_env_vars"),
         ("baidusearch", "headers"),
-        ("google_bigquery", "credentials"),
     ],
 )
 def test_credential_bearing_tool_fields_cannot_be_authored_inline(tool_name: str, field_name: str) -> None:

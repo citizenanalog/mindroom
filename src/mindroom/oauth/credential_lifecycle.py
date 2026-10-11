@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import threading
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth.providers import OAuthClientConfig, OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
 
@@ -56,6 +57,9 @@ _OAUTH_REFRESH_TRANSPORT_ERRORS = (
     (httpx.NetworkError, "network"),
     (httpx.HTTPStatusError, "http_status"),
     (httpx.HTTPError, "transport"),
+    (TimeoutError, "timeout"),
+    (json.JSONDecodeError, "invalid_response"),
+    (UnicodeDecodeError, "invalid_response"),
     (requests_exceptions.ConnectTimeout, "timeout"),
     (requests_exceptions.ReadTimeout, "timeout"),
     (requests_exceptions.Timeout, "timeout"),

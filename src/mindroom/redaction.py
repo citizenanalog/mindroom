@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache
 from itertools import islice
@@ -17,9 +17,12 @@ from pydantic import BaseModel
 REDACTED = "***redacted***"
 REDACTION_FAILED = "[redaction failed]"
 __all__ = [
+    "MAX_CANONICAL_JSON_INTEGER",
     "REDACTED",
     "REDACTION_FAILED",
+    "URL_PATTERN",
     "nests_beyond_redaction_depth",
+    "redact_config_text",
     "redact_log_event",
     "redact_sensitive_data",
     "redact_sensitive_text",
@@ -36,7 +39,7 @@ _MAX_DEPTH = 32
 # Start once per scheme-character run, avoiding quadratic suffix rescans.
 # Preserve leading non-letters while still redacting embedded URLs such as
 # ``123https://user:password@host`` that the unanchored scan recognized.
-_URL_PATTERN = re.compile(
+URL_PATTERN = re.compile(
     r"(?<![A-Za-z0-9+.-])(?P<prefix>[0-9+.-]*+)"
     r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*+://[^\s'\"<>]+)",
 )
@@ -112,12 +115,15 @@ _REVIEW_TOKEN_PATTERN = re.compile(
 # names; a generated key has a long run mixing character classes, so those names stay visible.
 _KEBAB_PREFIXES = ("sk-", "pk-")
 _RANDOM_RUN_PATTERN = re.compile(r"[A-Za-z0-9]{12,}")
+# Config prose says "ask for the API key before calling", "bearer JWT", or "keep the API key server-side";
+# the word a log pattern takes for a token there is letters, possibly hyphen-joined and ending a sentence.
+_ORDINARY_WORD_PATTERN = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*\.?")
 # Unpaired surrogates survive JSON parsing but cannot be encoded as UTF-8 or displayed.
 _LONE_SURROGATE_PATTERN = re.compile("[\ud800-\udfff]")
 _PLACEHOLDER_OPEN = "\u27e6"
 _PLACEHOLDER_CLOSE = "\u27e7"
 # Matrix canonical JSON, required for unencrypted room events, rejects floats and integers outside this range.
-_MAX_CANONICAL_JSON_INTEGER = 2**53 - 1
+MAX_CANONICAL_JSON_INTEGER = 2**53 - 1
 _SECRET_KEYS: frozenset[str] = frozenset(
     {
         "access_token",
@@ -349,10 +355,22 @@ class _RedactionError(Exception):
     """Internal signal for input that cannot be redacted safely within its budget."""
 
 
-def _next_assignment_value_end(value: str, value_start: int) -> int:
-    literal_terminator = _ASSIGNMENT_VALUE_TERMINATOR_PATTERN.search(value, value_start)
-    next_assignment = _NEXT_ASSIGNMENT_PATTERN.search(value, value_start)
-    return min(match.start() if match is not None else len(value) for match in (literal_terminator, next_assignment))
+def _forward_match_start(pattern: re.Pattern[str], value: str) -> Callable[[int], int]:
+    """Return a lookup of the first match start at or after each position of a forward-only scan.
+
+    A match found earlier is still the first one for any later position up to it, so the lookup
+    searches again only once the scan passes it and reads each stretch of text once in total.
+    """
+    match_start = -1
+
+    def lookup(position: int) -> int:
+        nonlocal match_start
+        if match_start < position:
+            match = pattern.search(value, position)
+            match_start = len(value) if match is None else match.start()
+        return match_start
+
+    return lookup
 
 
 def _find_unescaped_quote(value: str, quote: str, start: int, end: int) -> int:
@@ -367,13 +385,17 @@ def _find_unescaped_quote(value: str, quote: str, start: int, end: int) -> int:
     return -1
 
 
-def _assignment_value_span(value: str, value_start: int) -> tuple[int, int, int] | None:
+def _assignment_value_span(
+    value: str,
+    value_start: int,
+    unquoted_value_end: Callable[[int], int],
+) -> tuple[int, int, int] | None:
     if value_start >= len(value):
         return None
     if value[value_start] in "\r\n":
         raise _RedactionError
     if value[value_start] not in {"'", '"'}:
-        value_end = _next_assignment_value_end(value, value_start)
+        value_end = unquoted_value_end(value_start)
         if value_end == value_start:
             return None
         return value_start, value_end, value_end
@@ -409,6 +431,12 @@ def _replace_spans_with_redaction(value: str, spans: list[tuple[int, int]]) -> s
 def _redact_secret_assignments(value: str) -> str:
     """Redact shallow key assignments with one forward-only scan."""
     spans: list[tuple[int, int]] = []
+    literal_terminator = _forward_match_start(_ASSIGNMENT_VALUE_TERMINATOR_PATTERN, value)
+    next_assignment = _forward_match_start(_NEXT_ASSIGNMENT_PATTERN, value)
+
+    def unquoted_value_end(value_start: int) -> int:
+        return min(literal_terminator(value_start), next_assignment(value_start))
+
     search_start = 0
     while prefix_match := _ASSIGNMENT_PREFIX_PATTERN.search(value, search_start):
         search_start = prefix_match.end()
@@ -416,7 +444,7 @@ def _redact_secret_assignments(value: str) -> str:
         if not classification.is_secret:
             continue
 
-        value_span = _assignment_value_span(value, prefix_match.end())
+        value_span = _assignment_value_span(value, prefix_match.end(), unquoted_value_end)
         if value_span is None:
             continue
         value_start, value_end, match_end = value_span
@@ -512,7 +540,16 @@ def _redact_url_match(match: re.Match[str]) -> str:
     return match.group("prefix") + _redact_url(url) + trailing_backslashes
 
 
-def _redact_sensitive_text(value: str, *, max_length: int | None) -> str:
+def _redact_prose_token(match: re.Match[str]) -> str:
+    """Keep an ordinary word or kebab-case name that authored prose holds where a log would hold a token."""
+    token = match.group("token")
+    ordinary = _ORDINARY_WORD_PATTERN.fullmatch(token) and not token.lower().startswith(_KEBAB_PREFIXES)
+    if ordinary or not _looks_generated(token):
+        return match.group(0)
+    return _redact_matched_token(match)
+
+
+def _redact_sensitive_text(value: str, *, max_length: int | None, prose: bool = False) -> str:
     bounded_value = _bounded_redaction_input(value, max_length=max_length)
     has_assignment = "=" in bounded_value or ":" in bounded_value
     has_url = "://" in bounded_value
@@ -522,21 +559,22 @@ def _redact_sensitive_text(value: str, *, max_length: int | None) -> str:
     has_token = any(marker in bounded_value for marker in _TOKEN_LIKE_MARKERS)
     if not any((has_assignment, has_url, has_bearer, has_api_key_message, has_token)):
         return _truncate_text(bounded_value, max_length)
-    redacted = _URL_PATTERN.sub(_redact_url_match, bounded_value) if has_url else bounded_value
+    redacted = URL_PATTERN.sub(_redact_url_match, bounded_value) if has_url else bounded_value
+    redact_token = _redact_prose_token if prose else _redact_matched_token
     if has_bearer:
-        redacted = _BEARER_TOKEN_PATTERN.sub(_redact_matched_token, redacted)
+        redacted = _BEARER_TOKEN_PATTERN.sub(redact_token, redacted)
     if has_api_key_message:
-        redacted = _API_KEY_MESSAGE_PATTERN.sub(_redact_matched_token, redacted)
+        redacted = _API_KEY_MESSAGE_PATTERN.sub(redact_token, redacted)
     if has_token:
-        redacted = _TOKEN_LIKE_PATTERN.sub(_redact_matched_token, redacted)
+        redacted = _TOKEN_LIKE_PATTERN.sub(redact_token, redacted)
     if has_assignment:
         redacted = _redact_secret_assignments(redacted)
     return _truncate_text(redacted, max_length)
 
 
-def _redact_sensitive_text_fail_closed(value: str, *, max_length: int | None) -> str:
+def _redact_sensitive_text_fail_closed(value: str, *, max_length: int | None, prose: bool = False) -> str:
     try:
-        return _redact_sensitive_text(value, max_length=max_length)
+        return _redact_sensitive_text(value, max_length=max_length, prose=prose)
     except Exception:
         return _truncate_text(REDACTION_FAILED, max_length)
 
@@ -546,6 +584,17 @@ def redact_sensitive_text(value: str, *, max_length: int | None = None) -> str:
     if len(_bounded_redaction_input(value, max_length=max_length)) > _MAX_TEXT_INPUT_LENGTH:
         return _truncate_text(REDACTION_FAILED, max_length)
     return _redact_sensitive_text_fail_closed(value, max_length=max_length)
+
+
+def redact_config_text(value: str) -> str:
+    """Redact credential patterns in authored config text, showing the prose words log patterns would mask.
+
+    An ordinary word after "API key" or "bearer" and a kebab-case name such as ``sk-learn`` stay
+    visible; URL credentials, secret assignments, and generated tokens are masked as in logs.
+    """
+    if len(value) > _MAX_TEXT_INPUT_LENGTH:
+        return REDACTION_FAILED
+    return _redact_sensitive_text_fail_closed(value, max_length=None, prose=True)
 
 
 def _character_classes(run: str) -> int:
@@ -762,7 +811,7 @@ def _review_scalar_value(value: object, *, max_length: int | None, placeholders:
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, int):
-        return str(value) if abs(value) > _MAX_CANONICAL_JSON_INTEGER else value
+        return str(value) if abs(value) > MAX_CANONICAL_JSON_INTEGER else value
     return _redact_review_tokens(_safe_repr(value), max_length=max_length, placeholders=placeholders)
 
 

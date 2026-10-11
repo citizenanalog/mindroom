@@ -16,7 +16,7 @@ import time
 import weakref
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 from uuid import uuid4
 
 from agno.run.agent import RunCompletedEvent, RunContentEvent, RunErrorEvent, RunOutput
@@ -79,8 +79,9 @@ from mindroom.api.openai_streaming_protocol import (
 from mindroom.api.response_activity import track_openai_request
 from mindroom.authorization import is_sender_allowed_for_responder
 from mindroom.config.access import validate_concrete_matrix_user_ids
-from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths, runtime_env_flag
+from mindroom.constants import AI_RUN_METADATA_KEY, ROUTER_AGENT_NAME, RuntimePaths, runtime_env_flag
 from mindroom.execution_preparation import render_prepared_team_messages_text
+from mindroom.helper_usage import helper_usage_context
 from mindroom.history.session_context import (
     ScopeSessionContext,
     close_team_runtime_state_dbs,
@@ -93,6 +94,7 @@ from mindroom.llm_request_logging import (
     stream_with_llm_request_log_context,
 )
 from mindroom.logging_config import get_logger
+from mindroom.model_usage import context_input_tokens_from_counts
 from mindroom.requester_identity import is_human_requester_id, resolve_human_requester_alias
 from mindroom.response_activity import ResponseIdentity  # noqa: TC001 - FastAPI evaluates dependency annotations.
 from mindroom.routing import suggest_responder
@@ -240,11 +242,80 @@ class _ChatCompletionChoice(BaseModel):
 
 
 class _UsageInfo(BaseModel):
-    """Token usage fields default to zero and are not populated from run metrics."""
+    """Model token usage of the run behind one response, zero when the run reported none."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+
+
+def _usage_info(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int | None,
+    cache_write_tokens: int | None,
+    provider: str | None,
+    model_id: str | None,
+) -> _UsageInfo:
+    """Build OpenAI-style usage, where prompt_tokens includes cached input on every provider."""
+    prompt_tokens = (
+        context_input_tokens_from_counts(
+            input_tokens=input_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            provider=provider,
+            configured_provider=None,
+            model_id=model_id,
+        )
+        or 0
+    )
+    return _UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=prompt_tokens + output_tokens,
+    )
+
+
+def _usage_from_run_metadata(run_metadata: dict[str, Any]) -> _UsageInfo:
+    """Read usage from the versioned AI run metadata that an agent run reports."""
+    payload = run_metadata.get(AI_RUN_METADATA_KEY, {})
+    usage = payload.get("usage") or {}
+    model = payload.get("model") or {}
+    return _usage_info(
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=usage.get("cache_read_tokens"),
+        cache_write_tokens=usage.get("cache_write_tokens"),
+        provider=model.get("provider"),
+        model_id=model.get("id"),
+    )
+
+
+def _usage_from_team_output(response: TeamRunOutput | RunOutput) -> _UsageInfo:
+    """Sum usage over the leader and every member run, normalizing each run for its own provider."""
+    runs: list[TeamRunOutput | RunOutput] = [response]
+    total = _UsageInfo()
+    while runs:
+        run = runs.pop()
+        if isinstance(run, TeamRunOutput):
+            runs.extend(run.member_responses)
+        if run.metrics is None:
+            continue
+        usage = _usage_info(
+            input_tokens=run.metrics.input_tokens,
+            output_tokens=run.metrics.output_tokens,
+            cache_read_tokens=run.metrics.cache_read_tokens,
+            cache_write_tokens=run.metrics.cache_write_tokens,
+            provider=run.model_provider,
+            model_id=run.model,
+        )
+        total = _UsageInfo(
+            prompt_tokens=total.prompt_tokens + usage.prompt_tokens,
+            completion_tokens=total.completion_tokens + usage.completion_tokens,
+            total_tokens=total.total_tokens + usage.total_tokens,
+        )
+    return total
 
 
 class _ChatCompletionResponse(BaseModel):
@@ -759,6 +830,7 @@ async def _non_stream_completion(
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
 ) -> JSONResponse:
     """Handle non-streaming chat completion."""
+    run_metadata: dict[str, Any] = {}
     response_text = await ai_response(
         _openai_agent_turn_context(agent_name, session_id=session_id, execution_identity=execution_identity),
         prompt=prompt,
@@ -768,6 +840,7 @@ async def _non_stream_completion(
         knowledge=knowledge,
         include_interactive_questions=False,
         include_openai_compat_guidance=True,
+        run_metadata_collector=run_metadata,
         execution_identity=execution_identity,
         refresh_scheduler=refresh_scheduler,
     )
@@ -787,6 +860,7 @@ async def _non_stream_completion(
                 message=_ChatMessage(role="assistant", content=response_text),
             ),
         ],
+        usage=_usage_from_run_metadata(run_metadata),
     )
     return _OpenAIJSONResponse(content=response.model_dump())
 
@@ -1092,14 +1166,18 @@ async def _non_stream_team_completion(
                 logger.exception("Team member preparation failed", team=team_name)
                 return _error_response(500, "Team execution failed", error_type="server_error")
             try:
-                with bind_llm_request_log_context(
-                    **_openai_team_request_log_context(
-                        team_name=team_name,
-                        session_id=session_id,
-                        requester_id=execution_identity.requester_id if execution_identity else None,
-                        prompt=prepared_team_run.prompt,
-                        metadata=prepared_team_run.run_metadata,
+                with (
+                    bind_llm_request_log_context(
+                        **_openai_team_request_log_context(
+                            team_name=team_name,
+                            session_id=session_id,
+                            requester_id=execution_identity.requester_id if execution_identity else None,
+                            prompt=prepared_team_run.prompt,
+                            metadata=prepared_team_run.run_metadata,
+                        ),
                     ),
+                    # Helper work during the run, such as a member's Claude Code session, belongs to this conversation.
+                    helper_usage_context(scope_context),
                 ):
                     response = await team.arun(
                         prepared_team_run.prompt,
@@ -1135,6 +1213,11 @@ async def _non_stream_team_completion(
                         message=_ChatMessage(role="assistant", content=response_text),
                     ),
                 ],
+                usage=(
+                    _usage_from_team_output(response)
+                    if isinstance(response, (TeamRunOutput, RunOutput))
+                    else _UsageInfo()
+                ),
             )
             return _OpenAIJSONResponse(content=result.model_dump())
     finally:
@@ -1243,19 +1326,23 @@ async def _stream_team_completion(  # noqa: C901, PLR0915
                 "AsyncGenerator[RunOutputEvent | TeamRunOutputEvent | RunOutput | TeamRunOutput, None]",
                 stream_with_tool_execution_identity(
                     execution_identity,
-                    stream_factory=lambda: stream_with_llm_request_log_context(
-                        cast(
-                            "AsyncGenerator[RunOutputEvent | TeamRunOutputEvent | RunOutput | TeamRunOutput, None]",
-                            team.arun(
-                                prepared_team_run.prompt,
-                                stream=True,
-                                stream_events=True,
-                                session_id=session_id,
-                                user_id=execution_identity.requester_id if execution_identity else None,
-                                metadata=prepared_team_run.run_metadata,
+                    # Helper work during the run, such as a member's Claude Code session, belongs to this conversation.
+                    stream_factory=lambda: context_bound_async_stream(
+                        context_factory=lambda: helper_usage_context(scope_context),
+                        stream_factory=lambda: stream_with_llm_request_log_context(
+                            cast(
+                                "AsyncGenerator[RunOutputEvent | TeamRunOutputEvent | RunOutput | TeamRunOutput, None]",
+                                team.arun(
+                                    prepared_team_run.prompt,
+                                    stream=True,
+                                    stream_events=True,
+                                    session_id=session_id,
+                                    user_id=execution_identity.requester_id if execution_identity else None,
+                                    metadata=prepared_team_run.run_metadata,
+                                ),
                             ),
+                            request_context=request_log_context,
                         ),
-                        request_context=request_log_context,
                     ),
                 ),
             )

@@ -361,6 +361,7 @@ def test_private_registry_state_import_is_whitelisted_outside_tool_system() -> N
     """Only explicitly allowed imports may reach registry state outside tool_system."""
     assert _private_registry_state_importers_outside_tool_system() == {
         ("mindroom.api.sandbox_runner", "BUILTIN_TOOL_METADATA"),
+        ("mindroom.mcp.registry", "MCP_TOOL_FACTORY_MARKER"),
         ("mindroom.mcp.registry", "TOOL_REGISTRY"),
         ("mindroom.mcp.registry", "reconcile_dynamic_tool_state"),
     }
@@ -404,7 +405,9 @@ def test_tach_breaks_metadata_plugins_cycle_with_private_split_modules() -> None
 
 def test_selected_modules_do_not_hide_tool_system_imports_inside_functions() -> None:
     """Standalone tool-system helpers should be imported at module scope once the cycle is split."""
-    assert "mindroom.tool_system.worker_routing" not in _function_local_imports(SOURCE_ROOT / "credentials.py")
+    assert "mindroom.tool_system.worker_routing" not in _function_local_imports(
+        SOURCE_ROOT / "credentials" / "manager.py",
+    )
     assert "mindroom.tool_system.plugin_identity" not in _function_local_imports(
         SOURCE_ROOT / "hooks" / "context.py",
     )

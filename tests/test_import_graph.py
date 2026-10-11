@@ -9,7 +9,7 @@ Two guards keep import-time regressions from creeping back:
    mcp SDK, which the primary runtime genuinely needs at boot.
 2. A third-party allowlist: each slim entry point may only load the
    third-party packages it loads today. Any new package in the graph fails
-   loudly — either defer the import (see the CLAUDE.md import rule) or extend
+   loudly — either defer the import (see the AGENTS.md import rule) or extend
    the allowlist as a conscious, reviewed decision. The orchestrator uses the
    narrower heavy-optional-dependency ban because its core boot graph is large.
 
@@ -135,7 +135,7 @@ _ALLOWED_THIRD_PARTY_ROOTS: dict[str, frozenset[str]] = {
     # provider, storage, or other feature-specific dependency.
     "mindroom.cli.doctor": _CLI_ROOTS | _REGISTRY_ROOTS,
     "mindroom.config.main": _CONFIG_LAYER_ROOTS,
-    "mindroom.model_loading": _CONFIG_LAYER_ROOTS | frozenset({"agno"}),
+    "mindroom.providers.model_loading": _CONFIG_LAYER_ROOTS | frozenset({"agno"}),
     "mindroom.tool_system.declarations": frozenset({"dotenv"}),
     "mindroom.tool_system.metadata": _REGISTRY_ROOTS,
     "mindroom.tool_system.catalog": _REGISTRY_ROOTS,
@@ -238,7 +238,7 @@ def test_slim_entry_point_import_contract(module: str) -> None:
     unexpected = sorted(third_party - _ALLOWED_THIRD_PARTY_ROOTS[module])
     assert not unexpected, (
         f"importing {module} now loads third-party packages not in its allowlist: {unexpected}. "
-        "Defer the import to first use (see the CLAUDE.md function-level import rule), "
+        "Defer the import to first use (see the AGENTS.md function-level import rule), "
         "or extend the allowlist here if the dependency is genuinely needed at import time."
     )
 
@@ -247,12 +247,15 @@ def test_participation_state_has_no_framework_dependencies() -> None:
     """Using turn participation state must not load execution or provider integration."""
     _assert_probe_clean(
         "mindroom.participation",
-        ("agno", "mindroom.provider_tool_policy", "mindroom.hooks"),
+        ("agno", "mindroom.providers.tool_policy", "mindroom.hooks"),
     )
 
 
 _WINDOWS_DESKTOP_PROBE = """
 import json, sys, types
+
+# The MCP SDK gates its POSIX-only imports on sys.platform, which this probe keeps at the host's value.
+import mcp
 
 for name in ("fcntl", "pwd", "termios"):
     sys.modules[name] = None
@@ -406,6 +409,7 @@ print(json.dumps({
             "decision",
             "prune_calls",
             "reserve_delivery",
+            "reserve_script_delivery",
             "resolve",
             "resolve_call",
             "resolve_pending_calls",
@@ -431,7 +435,7 @@ print(json.dumps({
 def test_openai_wire_models_import_only_the_openai_sdk() -> None:
     """Agno's azure package init pulls the anthropic SDK; only the azure branch should pay that."""
     non_openai_roots = tuple(root for root in _PROVIDER_SDK_ROOTS if root != "openai")
-    _assert_probe_clean("mindroom.openai_models", non_openai_roots)
+    _assert_probe_clean("mindroom.providers.openai_models", non_openai_roots)
 
 
 def test_builtin_tool_manifest_does_not_import_runtime_catalog() -> None:

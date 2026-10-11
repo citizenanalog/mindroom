@@ -10,17 +10,16 @@ import nio
 import pytest
 from agno.models.response import ToolExecution
 
-from mindroom.approval_inbound import parse_approval_response_event
-from mindroom.approval_manager import ApprovalActionResult, ApprovalManager
-from mindroom.approval_receipt import build_approval_receipt
-from mindroom.approval_response import ApprovalResponseCoordinator
-from mindroom.approval_transport import ApprovalMatrixTransport, _approval_delivery_content
+from mindroom.approval.inbound import parse_approval_response_event
+from mindroom.approval.manager import ApprovalActionResult, ApprovalManager
+from mindroom.approval.receipt import build_approval_receipt
+from mindroom.approval.response import ApprovalResponseCoordinator
+from mindroom.approval.transport import ApprovalMatrixTransport, _approval_delivery_content
 from mindroom.config.approval import ToolApprovalConfig
 from mindroom.config.main import Config
 from mindroom.delivery_gateway import DeliveryGateway
 from mindroom.event_journal import (
     ApprovalCall,
-    ApprovalContinuation,
     ApprovalDecisionMetadata,
     DeliveryStage,
     EventClass,
@@ -34,8 +33,10 @@ from mindroom.mcp.config import MCPServerConfig
 from mindroom.message_target import MessageTarget
 from mindroom.response_sources import ResponseSources
 from mindroom.tool_approval_grants import AUTO_APPROVE_OPTIONS, ApprovalOperation, grant_operation
+from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import test_runtime_paths
 from tests.journal_membership_helpers import admit_room_membership
+from tests.reply_span_helpers import paused_for_approval
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -132,7 +133,7 @@ async def test_only_policy_pause_offers_timed_approval(
     """Native confirmation remains per-call through the actual pause publisher."""
     journal = journal_database()
     manager = _manager(journal, tmp_path)
-    monkeypatch.setattr("mindroom.approval_manager._MANAGER", manager)
+    monkeypatch.setattr("mindroom.approval.manager._MANAGER", manager)
     responder = journal.principal("agent@code")
     config = Config(tool_approval=ToolApprovalConfig(default="require_approval"))
     coordinator = ApprovalResponseCoordinator(
@@ -141,6 +142,8 @@ async def test_only_policy_pause_offers_timed_approval(
         store=responder,
         delivery_gateway=MagicMock(spec=DeliveryGateway),
         retry_sources=lambda _room, _sources: None,
+        finish_approval=AsyncMock(return_value=True),
+        release_approval=AsyncMock(return_value=True),
     )
     tool = ToolExecution(
         tool_call_id="call-authored",
@@ -166,22 +169,19 @@ async def test_only_policy_pause_offers_timed_approval(
             source={"type": "m.room.message", "content": {"msgtype": "m.text", "body": "run"}},
         ),
     )
-    continuation = ApprovalContinuation(
+    continuation = approval_continuation(
         approval_id="authored",
         run_id="run",
         session_id="session",
-        entity_kind="agent",
         entity_name="code",
         room_id="!room:test",
-        thread_id="$thread",
         requester_id="@human:test",
-        response_event_id="$waiting",
         sources=ResponseSources(("$source-authored",), ("$source-authored",)),
         calls=plan.calls,
         state="waiting",
         runtime_generation="runtime",
     )
-    assert await responder.create_approval_continuation(continuation) is not None
+    assert await paused_for_approval(responder, continuation) is not None
     try:
         await coordinator.publish_generation(
             continuation,
@@ -221,7 +221,7 @@ async def test_policy_pause_receipt_accepts_timed_authorization_without_claiming
     """A reused human grant must not tell the model that another card was shown."""
     journal = journal_database()
     manager = _manager(journal, tmp_path)
-    monkeypatch.setattr("mindroom.approval_manager._MANAGER", manager)
+    monkeypatch.setattr("mindroom.approval.manager._MANAGER", manager)
     responder = journal.principal("agent@code")
     config = Config(tool_approval=ToolApprovalConfig(default="require_approval"))
     coordinator = ApprovalResponseCoordinator(
@@ -230,6 +230,8 @@ async def test_policy_pause_receipt_accepts_timed_authorization_without_claiming
         store=responder,
         delivery_gateway=MagicMock(spec=DeliveryGateway),
         retry_sources=lambda _room, _sources: None,
+        finish_approval=AsyncMock(return_value=True),
+        release_approval=AsyncMock(return_value=True),
     )
     sent = []
 
@@ -265,15 +267,14 @@ async def test_policy_pause_receipt_accepts_timed_authorization_without_claiming
                     source={"type": "m.room.message", "content": {"msgtype": "m.text", "body": "run"}},
                 ),
             )
-            continuation = await coordinator.create(
-                ApprovalContinuation(
+            continuation = await paused_for_approval(
+                responder,
+                approval_continuation(
                     approval_id=name,
                     run_id="run-" + name,
                     session_id="session",
-                    entity_kind="agent",
                     entity_name="code",
                     room_id="!room:test",
-                    thread_id="$thread",
                     requester_id="@human:test",
                     response_event_id="$waiting-" + name,
                     sources=ResponseSources(("$source-" + name,), ("$source-" + name,)),
@@ -282,6 +283,7 @@ async def test_policy_pause_receipt_accepts_timed_authorization_without_claiming
                     runtime_generation="runtime",
                 ),
             )
+            assert continuation is not None
             await coordinator.publish_generation(
                 continuation,
                 plan,
@@ -457,7 +459,7 @@ async def test_automatic_receipt_reply_is_consumed_before_maintenance(
         continuation = await journal.principal("agent@code").approval_continuation("subsequent")
         assert continuation is not None
         assert continuation.calls[0].decision.value == "approved"
-        await owner.maintain_approval_grants()
+        await owner.maintain_automatic_approvals()
         assert await owner.is_terminal_approval_card(room_id="!room:test", card_event_id=receipt_event_id)
     finally:
         await manager.shutdown()
@@ -495,7 +497,7 @@ async def test_republished_receipt_aliases_remain_terminal(
             == "$replacement-receipt"
         )
         if retire_before_reply:
-            await owner.maintain_approval_grants()
+            await owner.maintain_automatic_approvals()
 
         async def get_event(room_id: str, event_id: str) -> nio.RoomGetEventResponse:
             response = nio.RoomGetEventResponse()
@@ -545,7 +547,7 @@ async def test_republished_receipt_aliases_remain_terminal(
             )
             assert result.consumed is True
             before_consume.assert_awaited_once()
-        await owner.maintain_approval_grants()
+        await owner.maintain_automatic_approvals()
         assert await owner.is_terminal_approval_card(room_id="!room:test", card_event_id=old_event_id)
         assert await owner.is_terminal_approval_card(room_id="!room:test", card_event_id="$replacement-receipt")
         continuation = await journal.principal("agent@code").approval_continuation("subsequent")
@@ -633,7 +635,7 @@ async def test_automatic_receipt_recovery_retires_only_acknowledged_payload(
 
         manager.send_delivery = fail_send
         await _card(journal, manager, "deferred", command="original command")
-        await manager.cards.maintain_approval_grants()
+        await manager.cards.maintain_automatic_approvals()
         pending = await manager.cards.load_matrix_delivery(delivery_id="card-deferred", stage=DeliveryStage.INITIAL)
         assert pending is not None
         assert pending.payload["arguments"] == {"command": "original command"}
@@ -1242,11 +1244,10 @@ async def _card(
             source={"type": "m.room.message", "content": {"msgtype": "m.text", "body": "run"}},
         ),
     )
-    continuation = ApprovalContinuation(
+    continuation = approval_continuation(
         approval_id=name,
         run_id="run-" + name,
         session_id="session-" + name,
-        entity_kind="agent",
         entity_name=agent,
         room_id="!room:test",
         thread_id=thread,
@@ -1264,7 +1265,7 @@ async def _card(
         state="waiting",
         runtime_generation="runtime",
     )
-    assert await responder.create_approval_continuation(continuation) is not None
+    assert await paused_for_approval(responder, continuation) is not None
     card = await manager.prepare_detached_approval(
         approval_id="card-" + name,
         continuation_id=name,

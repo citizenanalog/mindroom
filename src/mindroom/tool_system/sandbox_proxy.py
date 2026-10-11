@@ -13,15 +13,15 @@ import os
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from contextvars import copy_context
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 import httpx
 
+from mindroom.agent_cli.shell_contract import current_agent_cli_shell_env
 from mindroom.config.worker_projection import worker_config_data
-from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, PROVIDER_ENV_KEYS, build_execution_tool_env
+from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, RETAINED_MEDIA_MAX_BYTES, build_execution_tool_env
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement, declare_tool_schema_source
 from mindroom.tool_system.registry_state import TOOL_METADATA
@@ -35,6 +35,7 @@ from mindroom.tool_system.runtime_context import (
 from mindroom.tool_system.worker_proxy_client import (
     SANDBOX_PROXY_SAVE_ATTACHMENT_PATH,
     SANDBOX_PROXY_VIEW_FILE_PATH,
+    WorkerCallCancellation,
     WorkerProxyClientConfig,
     execute_worker_proxy_request,
     post_worker_proxy_json,
@@ -64,14 +65,13 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.workers.backend import WorkerBackend
 
 _DEFAULT_SANDBOX_PROXY_TIMEOUT_SECONDS = 120.0
 _DEFAULT_CREDENTIAL_LEASE_TTL_SECONDS = 60
 _MAX_CREDENTIAL_LEASE_TTL_SECONDS = 3600
 INLINE_ATTACHMENT_BYTES_ENV = "MINDROOM_ATTACHMENT_INLINE_SAVE_MAX_BYTES"
-_DEFAULT_INLINE_ATTACHMENT_BYTES = 16 * 1024 * 1024
 _SANDBOX_ALL_EXECUTION_MODES = frozenset({"all", "sandbox_all"})
 _SANDBOX_SELECTIVE_EXECUTION_MODES = frozenset({"selective", "sandbox_selective"})
 _UNSAFE_LOCAL_EXECUTION_MODES = frozenset({"off", "local", "disabled"})
@@ -201,18 +201,18 @@ def _read_proxy_timeout(runtime_paths: RuntimePaths) -> float:
 
 
 def inline_attachment_byte_limit(runtime_paths: RuntimePaths) -> int:
-    """Return the hard cap for inline primary-to-worker attachment saves."""
+    """Return the hard cap for inline primary-to-worker attachment saves, by default the retained media limit."""
     raw_value = (
         runtime_paths.env_value(INLINE_ATTACHMENT_BYTES_ENV)
         or os.environ.get(INLINE_ATTACHMENT_BYTES_ENV)
-        or str(_DEFAULT_INLINE_ATTACHMENT_BYTES)
+        or str(RETAINED_MEDIA_MAX_BYTES)
     )
     try:
         limit = int(raw_value)
     except ValueError:
-        return _DEFAULT_INLINE_ATTACHMENT_BYTES
+        return RETAINED_MEDIA_MAX_BYTES
     if limit <= 0:
-        return _DEFAULT_INLINE_ATTACHMENT_BYTES
+        return RETAINED_MEDIA_MAX_BYTES
     return limit
 
 
@@ -912,27 +912,13 @@ def sandbox_proxy_enabled_for_tool(
     )
 
 
-def primary_owns_tool_settings(
-    tool_name: str,
-    *,
-    runtime_paths: RuntimePaths,
-    worker_tools_override: list[str] | None = None,
-) -> bool:
-    """Return whether routing runs this registered tool in the primary, so its settings must stay in primary stores.
+def primary_owns_tool_settings(tool_name: str, *, runtime_paths: RuntimePaths) -> bool:
+    """Return whether this primary process owns a registered tool's settings.
 
-    Model provider services double as provider keys that workers read, so they keep their existing placement.
+    The primary builds every tool, including tools whose calls run in a worker, so a worker-writable store never
+    configures it; routed calls receive the settings through a per-call lease instead.
     """
-    if (
-        tool_name not in TOOL_METADATA
-        or tool_name in PROVIDER_ENV_KEYS
-        or sandbox_proxy_config(runtime_paths).runner_mode
-    ):
-        return False
-    return not sandbox_proxy_enabled_for_tool(
-        tool_name,
-        runtime_paths=runtime_paths,
-        worker_tools_override=worker_tools_override,
-    )
+    return tool_name in TOOL_METADATA and not sandbox_proxy_config(runtime_paths).runner_mode
 
 
 def _call_proxy_sync(
@@ -950,7 +936,7 @@ def _call_proxy_sync(
     execution_env: dict[str, str] | None = None,
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
-    authored_worker_tools: list[str] | None = None,
+    cancellation: WorkerCallCancellation | None = None,
 ) -> object:
     from mindroom.tool_system.worker_arguments import prepare_worker_call_arguments  # noqa: PLC0415
 
@@ -998,6 +984,9 @@ def _call_proxy_sync(
         )
         payload.update(worker_payload)
         payload["config_snapshot"] = runner_config_snapshot(runtime_paths, manager_context.runtime_config)
+        if tool_name == "shell" and (cli_env := current_agent_cli_shell_env()) is not None:
+            # A minimal response's grant travels with each command to the agent's own worker.
+            execution_env = {**(execution_env or {}), **cli_env.env()}
         if execution_env:
             payload["execution_env"] = execution_env
         if extra_env_passthrough is not None:
@@ -1022,12 +1011,10 @@ def _call_proxy_sync(
             worker_handle=worker_handle,
             worker_manager=worker_manager,
             client_factory=httpx.Client,
-            # Leased settings of other tools the primary builds live where the dashboard saves them.
-            primary_built_service=functools.partial(
-                primary_owns_tool_settings,
-                runtime_paths=runtime_paths,
-                worker_tools_override=authored_worker_tools,
-            ),
+            # Leased tool settings come from the primary stores the dashboard saves them to.
+            primary_built_service=functools.partial(primary_owns_tool_settings, runtime_paths=runtime_paths),
+            worker_grantable_credentials=manager_context.worker_grantable_credentials,
+            cancellation=cancellation,
         )
         from mindroom.tool_system.media_attachments import finalize_tool_media  # noqa: PLC0415
         from mindroom.tool_system.media_transport import (  # noqa: PLC0415
@@ -1040,11 +1027,20 @@ def _call_proxy_sync(
         return result
 
 
+async def _run_sync_tool_call(call: Callable[[], object]) -> object:
+    """Run one call of a synchronous tool function exactly as its sync entrypoint would run, completion owners included."""
+    # Deferred: the tool hook bridge loads Agno, which the slim tool registry must not import.
+    from mindroom.tool_system.tool_hooks import run_sync_tool_entrypoint  # noqa: PLC0415
+
+    return await run_sync_tool_entrypoint(call, {})
+
+
 async def _run_in_worker_proxy_executor(call: Callable[[], object]) -> object:
     """Run one blocking worker proxy call outside asyncio's default executor."""
-    context = copy_context()
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_WORKER_PROXY_EXECUTOR, context.run, call)
+    # Deferred: the tool hook bridge loads Agno, which the slim tool registry must not import.
+    from mindroom.tool_system.tool_hooks import run_async_entrypoint_blocking_call  # noqa: PLC0415
+
+    return await run_async_entrypoint_blocking_call(call, executor=_WORKER_PROXY_EXECUTOR)
 
 
 def _wrap_sync_function(
@@ -1061,7 +1057,6 @@ def _wrap_sync_function(
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
     primary_placement: SupportsPrimaryCallPlacement | None = None,
-    authored_worker_tools: list[str] | None = None,
 ) -> Function:
     wrapped = function.model_copy(deep=False)
     entrypoint = function.entrypoint
@@ -1088,7 +1083,6 @@ def _wrap_sync_function(
             execution_env=execution_env,
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
-            authored_worker_tools=authored_worker_tools,
         )
 
     declare_tool_schema_source(proxy_entrypoint, entrypoint)
@@ -1096,7 +1090,7 @@ def _wrap_sync_function(
     return wrapped
 
 
-def _wrap_async_function(
+def _wrap_async_proxy(
     function: Function,
     tool_name: str,
     function_name: str,
@@ -1110,11 +1104,13 @@ def _wrap_async_function(
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
     primary_placement: SupportsPrimaryCallPlacement | None = None,
-    authored_worker_tools: list[str] | None = None,
 ) -> Function:
     wrapped = function.model_copy(deep=False)
     entrypoint = function.entrypoint
     assert entrypoint is not None
+    entrypoint_is_async = inspect.iscoroutinefunction(entrypoint)
+    # A sync function keeps the completion ownership its sync entrypoint had; an async one keeps prompt cancellation.
+    run_blocking = _run_in_worker_proxy_executor if entrypoint_is_async else _run_sync_tool_call
 
     @functools.wraps(entrypoint)
     async def proxy_entrypoint(*args: object, **kwargs: object) -> object:
@@ -1122,7 +1118,10 @@ def _wrap_async_function(
             function_name,
             inspect.signature(entrypoint).bind(*args, **kwargs).arguments,
         ):
-            return await entrypoint(*args, **kwargs)
+            if entrypoint_is_async:
+                return await entrypoint(*args, **kwargs)
+            return await _run_sync_tool_call(functools.partial(entrypoint, *args, **kwargs))
+        cancellation = WorkerCallCancellation()
         call = functools.partial(
             _call_proxy_sync,
             function_entrypoint=entrypoint,
@@ -1138,9 +1137,14 @@ def _wrap_async_function(
             execution_env=execution_env,
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
-            authored_worker_tools=authored_worker_tools,
+            cancellation=cancellation,
         )
-        return await _run_in_worker_proxy_executor(call)
+        try:
+            return await run_blocking(call)
+        except asyncio.CancelledError:
+            # The blocking request keeps running after this await is cancelled; stop it at the worker too.
+            cancellation.cancel()
+            raise
 
     declare_tool_schema_source(proxy_entrypoint, entrypoint)
     wrapped.entrypoint = proxy_entrypoint
@@ -1159,13 +1163,11 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
     extra_env_passthrough: str | None = None,
     worker_tools_override: list[str] | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
-    authored_worker_tools: list[str] | None = None,
 ) -> Toolkit:
     """Wrap toolkit functions so calls execute through the sandbox runner API.
 
     Note: mutates ``toolkit.functions`` and ``toolkit.async_functions`` in place.
     Callers must pass a freshly-created toolkit (``get_tool_by_name`` does this).
-    ``authored_worker_tools`` is the agent's configured routing, which decides where leased services are stored.
     """
     if not sandbox_proxy_enabled_for_tool(
         tool_name,
@@ -1196,12 +1198,11 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
             primary_placement=primary_placement,
-            authored_worker_tools=authored_worker_tools,
         )
         for function_name, function in original_functions.items()
     }
     toolkit.async_functions = {
-        function_name: _wrap_async_function(
+        function_name: _wrap_async_proxy(
             function,
             tool_name,
             function_name,
@@ -1214,8 +1215,8 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
             extra_env_passthrough=extra_env_passthrough,
             worker_target=worker_target,
             primary_placement=primary_placement,
-            authored_worker_tools=authored_worker_tools,
         )
-        for function_name, function in original_async_functions.items()
+        # Sync functions get an async proxy too, so stopping an async run stops their worker call.
+        for function_name, function in {**original_functions, **original_async_functions}.items()
     }
     return toolkit

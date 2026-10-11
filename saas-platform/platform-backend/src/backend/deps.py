@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 import hmac
+import ipaddress
 import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import jwt
 from backend import auth_monitor
 from backend.metrics import record_admin_verification, record_auth_event
-from backend.config import auth_client, logger, supabase
+from backend.config import TRUSTED_PROXY_NETWORKS, auth_client, logger, supabase
 from backend.utils.audit import AuditActor, record_audit_actor
 from fastapi import Header, HTTPException, Request
 from slowapi import Limiter
@@ -108,6 +109,11 @@ def _account_is_pending_deletion(account: dict[str, Any]) -> bool:
     return account.get("status") == PENDING_DELETION_ACCOUNT_STATUS and account.get("deleted_at") is not None
 
 
+def account_may_sign_in(account: dict[str, Any]) -> bool:
+    """Whether some platform route admits the account, so its owner must still be able to sign in."""
+    return _account_is_active(account) or _account_is_pending_deletion(account)
+
+
 def _require_account_access(account: dict[str, Any], *, allow_pending_deletion: bool) -> None:
     """Reject suspended, unverified, and deleted accounts; optionally admit accounts awaiting deletion."""
     if _account_is_active(account) or (allow_pending_deletion and _account_is_pending_deletion(account)):
@@ -115,19 +121,26 @@ def _require_account_access(account: dict[str, Any], *, allow_pending_deletion: 
     raise HTTPException(status_code=403, detail="Account is not active")
 
 
+def _ip_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
 def client_ip_from_request(request: Request) -> str:
-    """Return the end-user IP for auth monitoring and rate limiting."""
-    real_ip = request.headers.get("x-real-ip", "").strip()
-    if real_ip:
-        return real_ip
+    """Return the end-user IP for auth monitoring and rate limiting.
 
-    forwarded_for = request.headers.get("x-forwarded-for", "")
-    if forwarded_for:
-        first_ip = forwarded_for.split(",", maxsplit=1)[0].strip()
-        if first_ip:
-            return first_ip
-
-    return get_remote_address(request)
+    Only a trusted proxy (`TRUSTED_PROXY_CIDRS`) may name the client in `X-Real-IP`, which ingress-nginx overwrites;
+    any other caller is keyed by its own connection address, so it cannot choose its rate-limit or lockout key.
+    """
+    peer = get_remote_address(request)
+    peer_ip = _ip_address(peer)
+    if peer_ip is not None and any(peer_ip in network for network in TRUSTED_PROXY_NETWORKS):
+        real_ip = _ip_address(request.headers.get("x-real-ip", "").strip())
+        if real_ip is not None:
+            return str(real_ip)
+    return peer
 
 
 def rate_limit_key(request: Request) -> str:

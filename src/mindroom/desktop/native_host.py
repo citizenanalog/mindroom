@@ -265,7 +265,8 @@ class NativeDesktopHost:
             return {"status": self.status()}
         if action == "dashboard_configuration":
             _expect_keys(parameters, set())
-            return local_dashboard_configuration(self._runtime_paths)
+            # The port-owner check runs launchctl and lsof; the bridge tasks share this loop.
+            return await asyncio.to_thread(local_dashboard_configuration, self._runtime_paths)
         if action in {"configure", "set_allowed_apps", "set_browser_config", "set_local_access", "finish_setup"}:
             edited_keys = {
                 "configure": {"config"},
@@ -626,7 +627,6 @@ class NativeBridgeRuntime:
         self._supervisor: asyncio.Task[None] | None = None
         self._stopping = False
         self._fault: str | None = None
-        self._browser_connected = False
         self._filesystem: Any = None
         self._shell: Any = None
 
@@ -712,7 +712,8 @@ class NativeBridgeRuntime:
             }
         if self._bridge is None:
             return {"gui_mode": "stopped", "control_available": False, "browser_connected": False}
-        return {**self._bridge.local_status(), "browser_connected": self._browser_connected}
+        browser_connected = self._browser is not None and self._browser.running
+        return {**self._bridge.local_status(), "browser_connected": browser_connected}
 
     def grant_control(self, duration_seconds: int) -> dict[str, object]:
         """Grant a bounded local control lease."""
@@ -759,14 +760,12 @@ class NativeBridgeRuntime:
         if self._browser is None:
             raise ValueError("Browser integration is not configured.")
         await self._browser.execute("start", {})
-        self._browser_connected = True
 
     async def disconnect_browser(self) -> None:
         """Disconnect the installed-profile extension without stopping Matrix."""
         if self._browser is None:
             raise ValueError("Browser integration is not configured.")
         await self._browser.execute("stop", {})
-        self._browser_connected = False
 
     def _required_bridge(self) -> Any:
         if self._bridge is None:
@@ -800,7 +799,6 @@ class NativeBridgeRuntime:
         if self._browser is not None:
             await self._browser.close()
         self._browser = None
-        self._browser_connected = False
         if self._owner is not None:
             await self._owner.close()
         self._owner = None

@@ -1,10 +1,13 @@
 """Comprehensive HTTP API tests for instances endpoints."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+from tests.fake_supabase import FakeQuery, FakeResult, FakeSupabase
 
 
 class TestInstancesEndpoints:
@@ -341,6 +344,35 @@ class TestInstancesEndpoints:
         call_args = mock_provision_instance.call_args[1]
         assert call_args["data"]["instance_id"] == "789"  # Reusing same ID
 
+    def test_reprovision_claimed_by_another_replica_mints_no_key(self, client: TestClient, mock_verify_user: Mock):
+        """A deprovisioned instance that a request on another backend replica claims first is not deployed again."""
+        db = FakeSupabase(
+            {
+                "subscriptions": [{"id": "sub_123", "account_id": "acc_test_123", "tier": "pro", "status": "active"}],
+                "instances": [{"instance_id": "789", "subscription_id": "sub_123", "status": "deprovisioned"}],
+            }
+        )
+        read_instances = FakeQuery.execute
+
+        def claim_after_read(query: FakeQuery) -> FakeResult:
+            result = read_instances(query)
+            if query.table_name == "instances" and query.action == "select":
+                db.row("instances", instance_id="789")["status"] = "provisioning"
+            return result
+
+        service = "backend.services.provisioner_service"
+        with (
+            patch("backend.routes.instances.ensure_supabase", return_value=db),
+            patch.object(FakeQuery, "execute", claim_after_read),
+            patch(f"{service}.run_kubectl", AsyncMock(return_value=(0, "", ""))),
+            patch(f"{service}.create_openrouter_key") as mint,
+        ):
+            response = client.post("/my/instances/provision")
+
+        mint.assert_not_called()
+        assert response.status_code == 409
+        assert db.row("instances", instance_id="789")["status"] == "provisioning"
+
     def test_provision_user_instance_no_subscription(
         self, client: TestClient, mock_supabase: MagicMock, mock_verify_user: Mock
     ):
@@ -389,7 +421,7 @@ class TestInstancesEndpoints:
         response = client.post("/my/instances/provision")
 
         assert response.status_code == 402
-        assert "Upgrade" in response.json()["detail"]
+        assert "Choose a plan" in response.json()["detail"]
         mock_provision_instance.assert_not_called()
 
     def test_start_user_instance_success(
@@ -556,7 +588,6 @@ class TestInstancesEndpoints:
         self, mock_supabase: MagicMock, mock_check_deployment: AsyncMock, mock_kubectl: AsyncMock
     ):
         """Test background sync task functionality."""
-        import asyncio
         from backend.routes.instances import _background_sync_instance_status
 
         # Setup
@@ -577,7 +608,6 @@ class TestInstancesEndpoints:
         self, mock_supabase: MagicMock, mock_check_deployment: AsyncMock
     ):
         """Test background sync when deployment doesn't exist."""
-        import asyncio
         from backend.routes.instances import _background_sync_instance_status
 
         # Setup
@@ -592,11 +622,28 @@ class TestInstancesEndpoints:
         update_call = mock_supabase.table().update.call_args[0][0]
         assert update_call["status"] == "error"
 
+    def test_background_sync_keeps_a_claim_made_during_its_kubernetes_check(self):
+        """A provision claiming a deprovisioned instance during the sync is not undone by the status the sync read."""
+        from backend.routes.instances import _background_sync_instance_status
+
+        db = FakeSupabase({"instances": [{"instance_id": "789", "status": "deprovisioned"}]})
+
+        async def claim_during_check(_instance_id: str) -> bool:
+            db.row("instances", instance_id="789")["status"] = "provisioning"
+            return False
+
+        with (
+            patch("backend.routes.instances.ensure_supabase", return_value=db),
+            patch("backend.routes.instances.check_deployment_exists", side_effect=claim_during_check),
+        ):
+            asyncio.run(_background_sync_instance_status("789"))
+
+        assert db.row("instances", instance_id="789")["status"] == "provisioning"
+
     def test_background_sync_task_instance_row_missing(
         self, mock_supabase: MagicMock, mock_check_deployment: AsyncMock
     ):
         """Background sync returns early when the instance row vanished from the database."""
-        import asyncio
         from backend.routes.instances import _background_sync_instance_status
 
         mock_supabase.table().select().eq().execute.return_value = Mock(data=[])
@@ -608,7 +655,6 @@ class TestInstancesEndpoints:
 
     def test_background_sync_prevents_duplicate(self):
         """Test that background sync prevents duplicate syncs."""
-        import asyncio
         from backend.routes.instances import _background_sync_instance_status, _syncing_instances
 
         # Setup

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from mindroom import yaml_io
 from mindroom.constants import runtime_env_values
 from mindroom.matrix.identity import try_parse_historical_matrix_user_id
-from mindroom.private_instance_identity_store import (
+from mindroom.private_storage.private_instance_identity_store import (
     PrivateInstanceIdentityError,
     reconstruct_private_instance_worker_key,
 )
@@ -79,6 +79,7 @@ _WORKER_BACKEND_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["worker_backen
 _NAMESPACE_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["namespace"]
 _IMAGE_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["image"]
 _IMAGE_PULL_POLICY_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["image_pull_policy"]
+_IMAGE_PULL_SECRETS_JSON_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["image_pull_secrets_json"]
 _PORT_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["port"]
 _SERVICE_ACCOUNT_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["service_account"]
 _RUNTIME_CLASS_NAME_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["runtime_class_name"]
@@ -329,6 +330,18 @@ def _read_extra_containers_env(env: Mapping[str, str]) -> tuple[dict[str, object
     return containers
 
 
+def _read_image_pull_secrets_env(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Return Secret names from the chart's ``imagePullSecrets`` list of ``{"name": ...}`` objects."""
+    names: list[str] = []
+    for index, item in enumerate(read_json_object_list_env(env, _IMAGE_PULL_SECRETS_JSON_ENV)):
+        if set(item) != {"name"}:
+            msg = f"{_IMAGE_PULL_SECRETS_JSON_ENV}[{index}] must contain exactly one key, `name`."
+            raise WorkerBackendError(msg)
+        _validate_required_string(item, _IMAGE_PULL_SECRETS_JSON_ENV, index, "name")
+        names.append(cast("str", item["name"]).strip())
+    return tuple(names)
+
+
 def _read_extra_volumes_env(env: Mapping[str, str]) -> tuple[dict[str, object], ...]:
     volumes = read_json_object_list_env(env, _EXTRA_VOLUMES_JSON_ENV)
     for index, volume in enumerate(volumes):
@@ -449,6 +462,7 @@ class KubernetesWorkerBackendConfig:
     runtime_class_name: str | None = None
     tmp_size_limit: str | None = None
     user_resources: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    image_pull_secrets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject storage prefixes that are not strict relative descendants."""
@@ -534,6 +548,7 @@ class KubernetesWorkerBackendConfig:
             image=image,
             image_pull_policy=read_env(env, _IMAGE_PULL_POLICY_ENV, _DEFAULT_IMAGE_PULL_POLICY)
             or _DEFAULT_IMAGE_PULL_POLICY,
+            image_pull_secrets=_read_image_pull_secrets_env(env),
             worker_port=read_int_env(env, _PORT_ENV, _DEFAULT_WORKER_PORT),
             service_account_name=read_env(env, _SERVICE_ACCOUNT_ENV, _DEFAULT_SERVICE_ACCOUNT_NAME)
             or _DEFAULT_SERVICE_ACCOUNT_NAME,
@@ -584,7 +599,7 @@ def kubernetes_backend_config_signature(
     """Return a cache signature for one concrete Kubernetes backend config."""
     config = KubernetesWorkerBackendConfig.from_runtime(runtime_paths)
     credentials_encryption_key = runtime_paths.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV)
-    credentials_encryption_key_marker = credentials_encryption_key_hash(credentials_encryption_key) or ""
+    credentials_encryption_key_marker = _credentials_encryption_key_hash(credentials_encryption_key) or ""
     extra_env_json = stable_signature_json(config.extra_env)
     extra_labels_json = stable_signature_json(config.extra_labels)
     extra_annotations_json = stable_signature_json(config.extra_annotations)
@@ -636,6 +651,8 @@ def kubernetes_backend_config_signature(
         signature = (*signature, f"tmp-size-limit:{config.tmp_size_limit}")
     if config.user_resources:
         signature = (*signature, f"user-resources:{stable_signature_json(config.user_resources)}")
+    if config.image_pull_secrets:
+        signature = (*signature, f"image-pull-secrets:{stable_signature_json(config.image_pull_secrets)}")
     return signature
 
 
@@ -750,7 +767,7 @@ def resolve_kubeconfig_paths(runtime_paths: RuntimePaths) -> tuple[Path, ...]:
     return tuple(Path(path).expanduser().resolve() for path in configured_paths if path)
 
 
-def credentials_encryption_key_hash(encryption_key: str | None) -> str | None:
+def _credentials_encryption_key_hash(encryption_key: str | None) -> str | None:
     """Return a stable non-secret marker for the credential encryption key."""
     normalized_key = credentials_encryption_key_value(encryption_key)
     if normalized_key is None:

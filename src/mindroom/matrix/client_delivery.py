@@ -605,7 +605,7 @@ async def _upload_file_as_mxc(
         logger.exception("Failed to read file before upload", path=str(file_path))
         return None, None
 
-    return await _upload_media_bytes_as_mxc(
+    return await upload_media_bytes_as_mxc(
         client,
         room_id,
         file_bytes,
@@ -614,7 +614,7 @@ async def _upload_file_as_mxc(
     )
 
 
-async def _upload_media_bytes_as_mxc(
+async def upload_media_bytes_as_mxc(
     client: nio.AsyncClient,
     room_id: str,
     media_bytes: bytes,
@@ -707,10 +707,10 @@ async def send_file_message(
     file_path: str | Path,
     *,
     thread_id: str | None = None,
-    caption: str | None = None,
     latest_thread_event_id: str | None = None,
     filename: str | None = None,
     mimetype: str | None = None,
+    extra_content: dict[str, Any] | None = None,
 ) -> str | None:
     """Upload a file and send it with the appropriate Matrix message type.
 
@@ -743,11 +743,13 @@ async def send_file_message(
     msgtype = _msgtype_for_mimetype(mimetype)
     content: dict[str, Any] = {
         "msgtype": msgtype,
-        "body": caption or display_name,
+        "body": display_name,
         "info": info,
     }
     if msgtype == "m.file":
         content["filename"] = display_name
+    if extra_content:
+        content.update(extra_content)
     encrypted_file_payload = upload_payload.get("file")
     if isinstance(encrypted_file_payload, dict):
         content["file"] = encrypted_file_payload
@@ -770,6 +772,7 @@ async def send_runtime_encrypted_media_message(
     thread_id: str | None = None,
     caption: str | None = None,
     latest_thread_event_id: str | None = None,
+    extra_content: dict[str, Any] | None = None,
 ) -> str | None:
     """Send an existing encrypted MXC object without writing or uploading plaintext bytes."""
     msgtype = _msgtype_for_mimetype(attachment.mime_type)
@@ -781,6 +784,8 @@ async def send_runtime_encrypted_media_message(
     }
     if msgtype == "m.file":
         content["filename"] = attachment.filename
+    if extra_content:
+        content.update(extra_content)
     thread_relation = _thread_relation_content(thread_id, latest_thread_event_id)
     if thread_relation is not None:
         content["m.relates_to"] = thread_relation
@@ -811,7 +816,7 @@ async def send_audio_message(
     if not _can_send_to_encrypted_room(client, room_id, operation="send_audio_message"):
         return None
 
-    mxc_uri, upload_payload = await _upload_media_bytes_as_mxc(
+    mxc_uri, upload_payload = await upload_media_bytes_as_mxc(
         client,
         room_id,
         audio_bytes,
@@ -953,4 +958,5 @@ __all__ = [
     "send_message_result",
     "send_room_event_result",
     "send_runtime_encrypted_media_message",
+    "upload_media_bytes_as_mxc",
 ]

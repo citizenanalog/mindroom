@@ -55,12 +55,6 @@ async def export_user_data(user: Annotated[dict, Depends(verify_user_allow_delet
     # Get instances
     instances = instances_data.get_instances_for_account(sb, account_id)
 
-    # Get usage metrics (last 90 days)
-    usage_result = (
-        sb.table("usage_metrics").select("*").in_("subscription_id", [s["id"] for s in subscriptions]).execute()
-    )
-    usage_metrics = usage_result.data or []
-
     # Get audit logs (non-sensitive fields only)
     audit_result = (
         sb.table("audit_logs")
@@ -87,7 +81,6 @@ async def export_user_data(user: Annotated[dict, Depends(verify_user_allow_delet
         },
         "subscriptions": subscriptions,
         "instances": instances,
-        "usage_metrics": usage_metrics,
         "activity_history": audit_logs,
         "payments": payments,
         "data_processing_purposes": [
@@ -335,6 +328,9 @@ async def cancel_account_deletion(user: Annotated[dict, Depends(verify_user_allo
         )
     else:
         billing = ""
+    # After the billing resume, so a database error here cannot skip it, and before the reconcile, so held instances
+    # whose teardown date passed during the deletion are not uninstalled.
+    instance_lifecycle.restart_teardown_grace(account_id)
     # Instances held for the deletion restart only while their subscription is entitled.
     restart_errors = await instance_lifecycle.reconcile_account_instances(account_id)
     instances = (

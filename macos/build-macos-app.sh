@@ -28,6 +28,9 @@ Environment:
                      Public EdDSA key for Sparkle updates. If unset, the app
                      builds without enabling Sparkle update checks.
   UV_BINARY          uv binary to bundle. Defaults to the uv found on PATH.
+  SKIP_DESKTOP_HELPER_BUILD
+                     Set to 1 to bundle the helper that macos/build-desktop-helper.sh
+                     already built in dist/macos/desktop-helper instead of rebuilding it.
   INSTALL_DIR        Install destination. Defaults to /Applications.
   MINDROOM_SKIP_OPEN Set to 1 to skip opening the app after --install.
   NOTARIZE           Set to 1 to notarize and staple the DMG. Requires --dmg.
@@ -79,6 +82,7 @@ CODESIGN_IDENTITY=${CODESIGN_IDENTITY:--}
 APP_VERSION=${APP_VERSION:-}
 BUILD_VERSION=${BUILD_VERSION:-${GITHUB_RUN_NUMBER:-}}
 UV_BINARY=${UV_BINARY:-$(command -v uv || true)}
+SKIP_DESKTOP_HELPER_BUILD=${SKIP_DESKTOP_HELPER_BUILD:-0}
 INSTALL_DIR=${INSTALL_DIR:-/Applications}
 NOTARIZE=${NOTARIZE:-0}
 SPARKLE_PUBLIC_ED_KEY=${SPARKLE_PUBLIC_ED_KEY:-}
@@ -324,8 +328,12 @@ if [[ ! -d "$RESOURCE_BUNDLE" ]]; then
     exit 1
 fi
 
-echo "Building fixed-identity desktop helper..."
-UV_BINARY="$UV_BINARY" "$HELPER_BUILD_SCRIPT" --output "$HELPER_BUILD_DIR"
+if [[ "$SKIP_DESKTOP_HELPER_BUILD" == "1" ]]; then
+    echo "Using the prebuilt fixed-identity desktop helper..."
+else
+    echo "Building fixed-identity desktop helper..."
+    UV_BINARY="$UV_BINARY" "$HELPER_BUILD_SCRIPT" --output "$HELPER_BUILD_DIR"
+fi
 
 echo "Building app icon..."
 build_app_icon
@@ -352,6 +360,7 @@ cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Merge '$ICON_INFO_PLIST'" "$APP_DIR/Contents/Info.plist"
 ditto "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/Sparkle.framework"
 cp "$UV_BINARY" "$APP_DIR/Contents/Resources/bin/uv"
+bash "$ROOT_DIR/macos/bundle-llama-cpp.sh" "$APP_DIR/Contents/Resources/llama.cpp"
 ditto "$ICON_BUILD_DIR" "$APP_DIR/Contents/Resources"
 ditto "$RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/${APP_NAME}_${APP_NAME}.bundle"
 ditto "$HELPER_BUILD_DIR/dist/MindRoom Desktop Helper.app" "$HELPER_APP"
@@ -365,6 +374,10 @@ stamp_info_plist
 HELPER_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_DIR/Contents/Info.plist")
 HELPER_BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_DIR/Contents/Info.plist")
 sign_executable "$APP_DIR/Contents/Resources/bin/uv"
+for library in "$APP_DIR/Contents/Resources/llama.cpp/"*.dylib; do
+    if [[ ! -L "$library" ]]; then sign_executable "$library"; fi
+done
+sign_executable "$APP_DIR/Contents/Resources/llama.cpp/llama-server"
 HELPER_INFO="$HELPER_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $HELPER_VERSION" "$HELPER_INFO"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $HELPER_BUILD_VERSION" "$HELPER_INFO"

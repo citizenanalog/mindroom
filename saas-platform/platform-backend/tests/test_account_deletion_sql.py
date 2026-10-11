@@ -1,4 +1,4 @@
-"""Account deletion SQL, run against a throwaway PostgreSQL with stand-ins for the Supabase `auth` objects.
+"""Account SQL migrations, run against a throwaway PostgreSQL with stand-ins for the Supabase `auth` objects.
 
 The tests need the PostgreSQL server binaries (`initdb`, `pg_ctl`, `psql`). They use `POSTGRES_BIN_DIR`, else the
 real directory of `initdb` on PATH (following links, which on NixOS keeps its share directory reachable), else
@@ -22,6 +22,9 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "supabase/migrations"
 BASELINE = MIGRATIONS_DIR / "000_consolidated_complete_schema.sql"
 ACCOUNT_DELETION = MIGRATIONS_DIR / "005_account_deletion.sql"
 ONE_INSTANCE = MIGRATIONS_DIR / "007_one_instance_per_subscription.sql"
+ACTIVE_ADMIN = MIGRATIONS_DIR / "008_require_active_admin.sql"
+DROP_SUBSCRIPTION_LIMITS = MIGRATIONS_DIR / "009_drop_subscription_limits.sql"
+DROP_USAGE_METRICS = MIGRATIONS_DIR / "010_drop_usage_metrics.sql"
 
 SUPABASE_STANDINS = """
 DO $$ BEGIN
@@ -94,6 +97,33 @@ BEGIN
     ASSERT NOT has_function_privilege('authenticated', 'claim_account_hard_delete(uuid)', 'EXECUTE'), 'no user claim';
     ASSERT has_function_privilege('service_role', 'claim_account_hard_delete(uuid)', 'EXECUTE'), 'backend claims';
     ASSERT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'instances_subscription_id_key'), 'one instance';
+END $$;
+"""
+
+# The function before migration 008.
+PRE_008_IS_ADMIN = """
+CREATE OR REPLACE FUNCTION is_admin() RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (SELECT 1 FROM accounts WHERE id = auth.uid() AND is_admin = TRUE AND deleted_at IS NULL);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+"""
+
+ADMIN_STATUSES = f"""
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql AS $$ SELECT '{ACCOUNT_A}'::uuid $$;
+INSERT INTO auth.users (id, email) VALUES ('{ACCOUNT_A}', 'admin@example.com');
+UPDATE accounts SET is_admin = TRUE WHERE id = '{ACCOUNT_A}';
+DO $$
+DECLARE a UUID := '{ACCOUNT_A}';
+BEGIN
+    ASSERT is_admin(), 'an active admin passes';
+    UPDATE accounts SET status = 'suspended' WHERE id = a;
+    ASSERT NOT is_admin(), 'a suspended admin fails';
+    UPDATE accounts SET status = 'pending_verification' WHERE id = a;
+    ASSERT NOT is_admin(), 'an admin pending verification fails';
+    UPDATE accounts SET status = 'deleted' WHERE id = a;
+    ASSERT NOT is_admin(), 'a deleted admin fails';
+    ASSERT has_function_privilege('authenticated', 'is_admin()', 'EXECUTE'), 'RLS policies can still call it';
 END $$;
 """
 
@@ -225,3 +255,50 @@ def test_007_lists_duplicate_instances_and_changes_nothing(postgres: Postgres) -
     assert "subscription 10000000-0000-0000-0000-00000000000a has instances {1,2}" in refused.stderr
     has_constraint = "SELECT count(*) FROM pg_constraint WHERE conname = 'instances_subscription_id_key'"
     assert postgres.value("duplicates", has_constraint) == "0"
+
+
+@pytest.mark.parametrize("upgrade", [False, True], ids=["fresh", "upgrade"])
+def test_only_active_admins_pass_is_admin(postgres: Postgres, upgrade: bool) -> None:  # noqa: FBT001
+    database = "admin_upgrade" if upgrade else "admin_fresh"
+    postgres.create_database(database)
+    assert postgres.apply(database, BASELINE).returncode == 0
+    if upgrade:
+        assert postgres.run(database, PRE_008_IS_ADMIN).returncode == 0
+        assert postgres.apply(database, ACTIVE_ADMIN).returncode == 0
+
+    result = postgres.run(database, ADMIN_STATUSES)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_009_drops_the_subscription_limit_columns_and_keeps_the_rows(postgres: Postgres) -> None:
+    postgres.create_database("limits")
+    assert postgres.apply("limits", BASELINE).returncode == 0
+    old_schema = f"""
+        ALTER TABLE subscriptions  -- The schema before migration 009.
+            ADD COLUMN max_agents INTEGER DEFAULT 1,
+            ADD COLUMN max_messages_per_day INTEGER DEFAULT 100;
+        INSERT INTO auth.users (id, email) VALUES ('{ACCOUNT_A}', 'a@example.com');
+        INSERT INTO subscriptions (account_id, tier, status) VALUES ('{ACCOUNT_A}', 'hobby', 'active');
+    """
+    assert postgres.run("limits", old_schema).returncode == 0
+
+    assert postgres.apply("limits", DROP_SUBSCRIPTION_LIMITS).returncode == 0
+
+    limit_columns = (
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'subscriptions' "
+        "AND column_name IN ('max_agents', 'max_messages_per_day')"
+    )
+    assert postgres.value("limits", limit_columns) == "0"
+    assert postgres.value("limits", f"SELECT tier FROM subscriptions WHERE account_id = '{ACCOUNT_A}'") == "hobby"
+
+
+def test_010_drops_the_usage_metrics_table(postgres: Postgres) -> None:
+    postgres.create_database("usage")
+    assert postgres.apply("usage", BASELINE).returncode == 0
+    old_table = "CREATE TABLE usage_metrics (id UUID PRIMARY KEY, subscription_id UUID REFERENCES subscriptions(id));"
+    assert postgres.run("usage", old_table).returncode == 0  # The schema before migration 010.
+
+    assert postgres.apply("usage", DROP_USAGE_METRICS).returncode == 0
+
+    assert postgres.value("usage", "SELECT to_regclass('usage_metrics') IS NULL") == "t"

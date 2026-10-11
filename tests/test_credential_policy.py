@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mindroom.credential_policy import (
+from mindroom.credentials.policy import (
     _UNSUPPORTED_WORKER_GRANTABLE_CREDENTIALS,
     OAUTH_CREDENTIAL_FIELDS,
     credential_service_policy,
@@ -20,6 +20,9 @@ from mindroom.credential_policy import (
         ("github", "shared", True, False, False),
         ("github", "user", False, True, False),
         ("github", "user_agent", False, True, False),
+        # A Google Cloud tool's own settings are primary-owned like any other tool's, not installation-wide.
+        ("google_bigquery", "shared", True, False, False),
+        ("google_bigquery", "user_agent", False, True, False),
         # Local-only and OAuth services keep their own placement.
         ("google_gmail", "shared", False, False, True),
         ("github_oauth", "shared", True, False, False),

@@ -63,6 +63,7 @@ class TestAdminEndpoints:
         subscriptions_mock = MagicMock()
         subscriptions_mock.select.return_value = subscriptions_mock
         subscriptions_mock.eq.return_value = subscriptions_mock
+        subscriptions_mock.neq.return_value = subscriptions_mock
         subscriptions_mock.execute.return_value = Mock(data=[{}, {}, {}, {}, {}, {}, {}, {}])  # 8 active
 
         instances_mock = MagicMock()
@@ -98,6 +99,7 @@ class TestAdminEndpoints:
         data = response.json()
         assert data["accounts"] == 10
         assert data["active_subscriptions"] == 8
+        subscriptions_mock.neq.assert_called_with("tier", "free")
         assert data["running_instances"] == 7
 
     def test_admin_stats_unauthorized(self, client: TestClient):
@@ -338,15 +340,15 @@ class TestAdminEndpoints:
     def test_admin_refuses_to_activate_an_account_awaiting_deletion(
         self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock
     ):
-        """Setting active would leave deleted_at set, so the admin is pointed at the routes that restore access."""
+        """Setting active would leave deleted_at set, so the admin is pointed at the owner's cancel-deletion."""
         mock_supabase.table().select().eq().execute.return_value = Mock(data=[{"deleted_at": "2026-09-01T00:00:00Z"}])
 
         response = client.put("/admin/accounts/acc_123/status", json={"status": "active"})
 
         assert response.status_code == 409
-        detail = response.json()["detail"]
-        assert "Set its status to deleted" in detail
-        assert "PUT /admin/accounts/{account_id}" in detail
+        assert response.json()["detail"] == (
+            "Account is awaiting deletion. Set its status to deleted so the owner can cancel the deletion."
+        )
         mock_supabase.table().update.assert_not_called()
 
     def test_admin_activates_an_account_not_awaiting_deletion(
@@ -415,16 +417,6 @@ class TestAdminEndpoints:
         assert response.status_code == 200
         assert set(_auth_cache) == {"acc_other"}
         _auth_cache.clear()
-
-    def test_admin_logout(self, client: TestClient, mock_verify_admin: Mock):
-        """Test admin logout."""
-        # Make request
-        response = client.post("/admin/auth/logout")
-
-        # Verify
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is True
 
     def test_admin_list_resources(self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock):
         """Test admin listing resources."""
@@ -531,6 +523,7 @@ class TestAdminEndpoints:
         active_subs_mock = MagicMock()
         active_subs_mock.select = MagicMock(return_value=active_subs_mock)
         active_subs_mock.eq.return_value = active_subs_mock
+        active_subs_mock.neq.return_value = active_subs_mock
         active_subs_result = Mock()
         active_subs_result.count = 70
         active_subs_mock.execute.return_value = active_subs_result
@@ -547,14 +540,8 @@ class TestAdminEndpoints:
         subs_data_mock = MagicMock()
         subs_data_mock.select.return_value = subs_data_mock
         subs_data_mock.eq.return_value = subs_data_mock
+        subs_data_mock.neq.return_value = subs_data_mock
         subs_data_mock.execute.return_value = Mock(data=[{"tier": "byok"}, {"tier": "pro"}])
-
-        # Mock usage metrics for messages
-        usage_mock = MagicMock()
-        usage_mock.select.return_value = usage_mock
-        usage_mock.gte.return_value = usage_mock
-        usage_mock.order.return_value = usage_mock
-        usage_mock.execute.return_value = Mock(data=[])
 
         # Mock all instances for status counts
         all_instances_mock = MagicMock()
@@ -607,8 +594,6 @@ class TestAdminEndpoints:
 
                 mock.execute = MagicMock(side_effect=execute_side_effect)
                 return mock
-            elif table_name == "usage_metrics":
-                return usage_mock
             elif table_name == "audit_logs":
                 return audit_mock
             return MagicMock()
@@ -626,6 +611,8 @@ class TestAdminEndpoints:
         assert "total_instances" in data
         assert "subscription_revenue" in data
         assert data["total_accounts"] == 100
+        active_subs_mock.neq.assert_called_with("tier", "free")
+        subs_data_mock.neq.assert_called_with("tier", "free")
         assert data["active_subscriptions"] == 70
         assert data["total_instances"] == 2  # We have 2 instances total in the mock
         assert data["subscription_revenue"] == 128.0

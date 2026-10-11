@@ -19,14 +19,14 @@ from mindroom.api.dashboard_credential_scope import (
     resolve_dashboard_agent_execution_scope_request,
     resolve_dashboard_execution_scope_override,
 )
-from mindroom.credential_policy import credential_service_policy
-from mindroom.credentials import (
+from mindroom.credentials.manager import (
     CredentialsManager,
     delete_scoped_credentials,
     get_runtime_credentials_manager,
     load_scoped_credentials,
     save_scoped_credentials,
 )
+from mindroom.credentials.policy import credential_service_policy
 from mindroom.tool_system.catalog import ensure_tool_registry_loaded
 from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import (
@@ -55,7 +55,6 @@ class RequestCredentialsTarget:
     agent_name: str | None
     execution_identity: ToolExecutionIdentity | None
     allowed_shared_services: frozenset[str] | None = None
-    worker_tools: list[str] | None = None
 
 
 def loaded_runtime_config_for_credentials_request(
@@ -226,7 +225,6 @@ def resolve_request_credentials_target(
         agent_name=scope_request.agent_name,
         execution_identity=execution_identity,
         allowed_shared_services=config.get_worker_grantable_credentials(),
-        worker_tools=config.get_agent_worker_tools(scope_request.agent_name),
     )
 
 
@@ -301,15 +299,11 @@ def _service_uses_primary_runtime_global_store(service: str, target: RequestCred
 
 
 def target_primary_owns_tool_settings(service: str, target: RequestCredentialsTarget) -> bool:
-    """Return whether the target agent's primary process builds the tool that this service configures."""
+    """Return whether the primary owns the scoped settings of the tool that this service configures."""
     if target.worker_scope is None or target.agent_name is None:
         return False
     ensure_tool_registry_loaded(target.runtime_paths)
-    return primary_owns_tool_settings(
-        service,
-        runtime_paths=target.runtime_paths,
-        worker_tools_override=target.worker_tools,
-    )
+    return primary_owns_tool_settings(service, runtime_paths=target.runtime_paths)
 
 
 def worker_target_for_credentials_target(target: RequestCredentialsTarget) -> ResolvedWorkerTarget | None:
@@ -349,13 +343,21 @@ def delete_credentials_for_target(service: str, target: RequestCredentialsTarget
     if target.worker_scope is None:
         target.target_manager.delete_credentials(service)
         return
+    primary_built_tool = target_primary_owns_tool_settings(service, target)
     delete_scoped_credentials(
         service,
         credentials_manager=target.base_manager,
         worker_target=worker_target_for_credentials_target(target),
         worker_credentials_manager=target.target_manager,
-        primary_built_tool=target_primary_owns_tool_settings(service, target),
+        primary_built_tool=primary_built_tool,
     )
+    if primary_built_tool:
+        # LEGACY_COMPAT: Worker-store copies of settings the primary now owns.
+        # Legacy format: `<service>_credentials.json` in the agent's worker store, where the dashboard saved a scoped agent's tool settings; the dashboard no longer lists or reads that copy.
+        # Last legacy release: v2026.10.39 for `openai` and `groq`, v2026.10.8 for `homeassistant` and `spotify`, whose dedicated dashboard routes kept saving there, v2026.9.414 for other tools routed to a worker, and v2026.9.404 for the rest; replacement: v2026.10.40, v2026.10.9, v2026.9.415, and v2026.9.405 respectively save them in the primary's agent- or requester-scoped stores.
+        # Handling: deleting the settings also deletes that worker copy, so a deleted value stops reaching worker code.
+        # Coverage: tests/test_credentials.py::test_dashboard_delete_also_removes_the_worker_copy_of_tool_settings.
+        target.target_manager.delete_credentials(service)
 
 
 def primary_runtime_scoped_services_for_target(target: RequestCredentialsTarget) -> set[str]:

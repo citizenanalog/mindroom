@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 import ssl  # noqa: TC003 - Required for runtime get_type_hints on public transport constructors.
 from collections.abc import Awaitable, Callable, Iterable  # noqa: TC003
-from typing import NoReturn
+from typing import NoReturn, TypeVar
 from urllib.parse import SplitResult, urljoin, urlsplit
 
 import httpcore
@@ -54,6 +55,7 @@ _METADATA_IP_ADDRESSES = frozenset(
     },
 )
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+_AsyncNetworkStreamT = TypeVar("_AsyncNetworkStreamT")
 
 
 class ServerFetchUrlError(ValueError):
@@ -376,8 +378,15 @@ class _ServerFetchAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        return await _connect_validated_async(
-            validated_connect_addresses(host, port=port, allow_private_networks=self._allow_private_networks),
+        # The lookup blocks, so it runs in a thread to keep the event loop serving other work.
+        addresses = await asyncio.to_thread(
+            validated_connect_addresses,
+            host,
+            port=port,
+            allow_private_networks=self._allow_private_networks,
+        )
+        return await connect_validated_async(
+            addresses,
             lambda address: self._backend.connect_tcp(
                 address.compressed,
                 port,
@@ -414,15 +423,18 @@ def _connect_validated_sync(
     _deny("dns_resolution_failed")
 
 
-async def _connect_validated_async(
+async def connect_validated_async(
     addresses: list[_IPAddress],
-    connect: Callable[[_IPAddress], Awaitable[httpcore.AsyncNetworkStream]],
-) -> httpcore.AsyncNetworkStream:
-    last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+    connect: Callable[[_IPAddress], Awaitable[_AsyncNetworkStreamT]],
+    *,
+    connect_errors: tuple[type[Exception], ...] = (httpcore.ConnectError, httpcore.ConnectTimeout),
+) -> _AsyncNetworkStreamT:
+    """Dial the first reachable address from `validated_connect_addresses`, never the hostname itself."""
+    last_error: Exception | None = None
     for address in addresses:
         try:
             return await connect(address)
-        except (httpcore.ConnectError, httpcore.ConnectTimeout) as e:
+        except connect_errors as e:
             last_error = e
     if last_error is not None:
         raise last_error

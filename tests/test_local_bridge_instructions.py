@@ -73,7 +73,7 @@ def test_synapse_instructions_restart_selected_instance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Copying the restart hint must keep the bridge owner's instance selected."""
+    """Copying the restart hint must keep the bridge owner's instance selected, and Synapse must load the bridge's directory."""
     synapse_dir = tmp_path / "synapse"
     synapse_dir.mkdir()
     (synapse_dir / "homeserver.yaml").write_text("server_name: m-alpha.example.com\n")
@@ -89,6 +89,8 @@ def test_synapse_instructions_restart_selected_instance(
 
     output = bridge_manager.console.export_text()
     assert "./deploy.py restart alpha --only-matrix" in output
+    homeserver = yaml.safe_load((synapse_dir / "homeserver.yaml").read_text())
+    assert homeserver["app_service_config_files"] == ["/data/bridges/telegram/registration.yaml"]
 
 
 @pytest.mark.parametrize("operation", ["write", "protect", "register"])
@@ -212,6 +214,31 @@ def test_added_bridge_grants_admin_only_to_the_designated_operator(
     assert all(value not in registry for value in credential_args[1::2])
 
 
+def test_added_bridge_register_hint_parses_for_selected_instance(
+    bridge_manager: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copied next-step command must use a valid bridge type and the selected instance."""
+    result = _add_bridge(
+        bridge_manager,
+        tmp_path,
+        monkeypatch,
+        "telegram",
+        *_BRIDGE_CREDENTIAL_ARGS["telegram"],
+        "--admin",
+        _BRIDGE_ADMIN,
+    )
+
+    assert result.exit_code == 0, result.output
+    output = bridge_manager.console.export_text()
+    hint = next(line.strip() for line in output.splitlines() if line.strip().startswith("./bridge.py register "))
+    command = get_command(bridge_manager.app).commands["register"]
+    with command.make_context("register", shlex.split(hint)[2:]) as context:
+        assert context.params["bridge_type"] == bridge_manager.BridgeType.TELEGRAM
+        assert context.params["instance"] == "alpha"
+
+
 def test_bridge_add_rejects_an_admin_that_is_not_a_matrix_user_id(
     bridge_manager: ModuleType,
     tmp_path: Path,
@@ -323,12 +350,12 @@ def test_owner_only_bridge_files_need_no_read_permission(
     assert bridge_manager.console.export_text() == ""
 
 
-def test_unrestrictable_bridge_file_prints_the_exact_fix(
+def test_unrestrictable_bridge_file_asks_for_a_root_rerun(
     bridge_manager: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A readable bridge file the operator cannot chmod gets the command that can; owner-only files are left alone."""
+    """A readable bridge file the operator cannot chmod asks for a root rerun, never a sudo chmod of a swappable path."""
     config_file = tmp_path / "data" / "config.yaml"
     config_file.parent.mkdir()
     config_file.write_text("bridge: {}\n")
@@ -351,5 +378,6 @@ def test_unrestrictable_bridge_file_prints_the_exact_fix(
     bridge_manager._protect_bridge_secret_files(bridge)
 
     output = bridge_manager.console.export_text()
-    assert f"sudo chmod 600 {shlex.quote(str(config_file))}" in output
+    assert "Rerun this bridge.py command as root" in output
+    assert "sudo" not in output
     assert "registration.yaml" not in output

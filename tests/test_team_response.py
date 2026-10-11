@@ -44,8 +44,8 @@ from mindroom.ai_runtime import (
     install_queued_message_notice_hook,
     queued_message_signal_context,
 )
-from mindroom.approval_receipt import approval_receipt_context
-from mindroom.approval_response import require_ordered_pause_presentation
+from mindroom.approval.receipt import approval_receipt_context
+from mindroom.approval.response import require_ordered_pause_presentation
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
@@ -70,13 +70,13 @@ from mindroom.media_inputs import MediaInputs
 from mindroom.mid_turn import QueuedMessage
 from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
+from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.response_turn import (
     CompletedApprovalRun,
     PausedAttempt,
     ResponsePausedForApproval,
     apply_exact_approval_decisions,
 )
-from mindroom.synthetic_model import SyntheticModel
 from mindroom.team_exact_members import (
     ResolvedExactTeamMembers,
     materialize_exact_requested_team_members,
@@ -205,7 +205,6 @@ def test_hidden_team_stream_presentation_retains_only_internal_tool_identity() -
         show_tool_calls=False,
         state=presentation.to_state(),
         tool_trace=presentation.tool_trace,
-        prior_response_text=presentation.render_body(),
     )
     restored.complete_member_tool(
         "general",
@@ -278,7 +277,6 @@ async def test_team_continuation_publishes_progress_from_its_restored_document()
         show_tool_calls=True,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     published: list[str] = []
 
@@ -316,7 +314,6 @@ async def test_hidden_team_continuation_separates_text_across_the_tool_boundary(
         show_tool_calls=False,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     terminal = TeamRunOutput(
         run_id="run-1",
@@ -386,7 +383,6 @@ def test_hidden_team_separator_state_survives_a_chained_pause_in_another_scope()
         show_tool_calls=False,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     restored.append_member("first", "After tool.")
 
@@ -407,7 +403,6 @@ async def test_team_continuation_reuses_an_existing_visible_tool_separator() -> 
         show_tool_calls=True,
         state=prior.to_state(),
         tool_trace=prior.tool_trace,
-        prior_response_text=prior.render_body(),
     )
     terminal = TeamRunOutput(
         run_id="run-1",
@@ -511,7 +506,6 @@ def test_blocking_team_pause_uses_the_structured_member_slot() -> None:
         show_tool_calls=True,
         state=paused.response_presentation_state,
         tool_trace=paused.tool_trace,
-        prior_response_text=paused.response_text,
     )
     assert "Member answer." in restored.per_member["general"]
     assert "🔧 `inspect` [1] ⏳" in restored.per_member["general"]
@@ -619,7 +613,6 @@ def test_blocking_team_pause_scopes_reused_call_ids_to_distinct_members() -> Non
         show_tool_calls=True,
         state=paused.response_presentation_state,
         tool_trace=paused.tool_trace,
-        prior_response_text=paused.response_text,
     )
     assert [(entry.scope_key, entry.type) for entry in restored.tool_trace] == [
         ("agent:first", "tool_call_completed"),
@@ -1052,7 +1045,6 @@ async def test_team_continuation_executes_real_agno_confirmation(  # noqa: PLR09
             denial_reasons={tool_call_id: reason},
             refresh_scheduler=None,
             history_scope=persisted_scope,
-            prior_response_text=prior.render_body(),
             prior_tool_trace=prior.tool_trace,
             prior_presentation_state=prior.to_state(),
             show_tool_calls=True,
@@ -4586,7 +4578,10 @@ def test_materialized_private_ad_hoc_team_uses_opened_scope_id() -> None:
             config=config,
             execution_identity=identity,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=FakeModel(id="fake-model", provider="fake")),
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="fake-model", provider="fake"),
+        ),
     ):
         assert scope_context is not None
         team = build_materialized_team_instance(
@@ -4634,7 +4629,10 @@ async def test_private_ad_hoc_team_second_turn_replays_first_scoped_run() -> Non
             execution_identity=identity,
             create_session_if_missing=True,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=FakeModel(id="fake-model", provider="fake")),
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="fake-model", provider="fake"),
+        ),
     ):
         assert scope_context is not None
         assert scope_context.session is not None
@@ -4674,7 +4672,10 @@ async def test_private_ad_hoc_team_second_turn_replays_first_scoped_run() -> Non
             config=config,
             execution_identity=identity,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=FakeModel(id="fake-model", provider="fake")),
+        patch(
+            "mindroom.providers.model_loading.get_model_instance",
+            return_value=FakeModel(id="fake-model", provider="fake"),
+        ),
     ):
         assert scope_context is not None
         second_team = build_materialized_team_instance(

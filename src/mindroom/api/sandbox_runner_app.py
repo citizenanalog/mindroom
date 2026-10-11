@@ -4,7 +4,9 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mindroom import __version__
 from mindroom.api import sandbox_exec
@@ -15,9 +17,9 @@ from mindroom.api.sandbox_runner import (
     initialize_sandbox_runner_app,
     load_config_from_startup_runtime,
     startup_runner_token_from_env,
+    validate_runner_token,
 )
 from mindroom.api.sandbox_runner import router as sandbox_runner_router
-from mindroom.api.sandbox_runner_cli import router as sandbox_runner_cli_router
 from mindroom.api.sandbox_runner_scripts import (
     prepare_script_worker_before_serving,
 )
@@ -25,9 +27,9 @@ from mindroom.api.sandbox_runner_scripts import router as sandbox_runner_scripts
 from mindroom.api.worker_computer import router as worker_computer_router
 from mindroom.runtime_env_policy import WORKER_COMPUTER_ENABLED_ENV
 from mindroom.tool_system.worker_routing import resolved_worker_key_scope
-from mindroom.worker_browser import WorkerBrowserRuntime
 from mindroom.worker_computer.display import WorkerDisplay
 from mindroom.worker_computer.runtime import WorkerComputerRuntime
+from mindroom.worker_computer.worker_browser import WorkerBrowserRuntime
 from mindroom.workers.compatibility import worker_health_payload
 
 
@@ -77,11 +79,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await browser.close()
 
 
+class _RunnerTokenMiddleware:
+    """Refuse requests without the runner token before any route reads their bodies."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Check the token of every HTTP request except the health probe."""
+        if scope["type"] == "http" and scope["path"] != "/healthz":
+            request = Request(scope)
+            try:
+                await validate_runner_token(request, request.headers.get("x-mindroom-sandbox-token"))
+            except HTTPException as exc:
+                await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="MindRoom Sandbox Runner", lifespan=_lifespan)
+app.add_middleware(_RunnerTokenMiddleware)
 app.include_router(sandbox_runner_router)
 app.include_router(worker_computer_router)
 app.include_router(sandbox_runner_scripts_router)
-app.include_router(sandbox_runner_cli_router)
 
 
 @app.get("/healthz")
