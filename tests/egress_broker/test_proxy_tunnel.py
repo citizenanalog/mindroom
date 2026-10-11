@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import shutil
-import socket
 import time
 import urllib.request
 from typing import TYPE_CHECKING
@@ -16,14 +15,21 @@ import pytest
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.env import broker_execution_env
-from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.tokens import TokenSigner
 from tests.egress_broker.conftest import (
+    BODY_TOO_LARGE,
+    BROKER_ERROR,
     DEFAULT_CLAIMS,
+    MALFORMED,
+    PROXY_AUTHENTICATION_REQUIRED,
     audit_records,
     connect_request,
+    free_port,
+    plain_request,
     proxy_authorization,
     read_raw_response,
+    single_rule_config,
+    with_user_services,
 )
 
 if TYPE_CHECKING:
@@ -35,22 +41,12 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.audit import AuditLog
     from mindroom.egress_broker.proxy import EgressBroker
     from mindroom.egress_broker.tokens import WorkerClaims
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, Upstream, UpstreamCA
+    from tests.egress_broker.conftest import BrokerFactory, RawResponse, ServeFactory, Upstream, UpstreamCA
 
     RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
     ProxyClient = Callable[..., httpx.AsyncClient]
 
 
-PROXY_AUTHENTICATION_REQUIRED = {
-    "error": "proxy_authentication_required",
-    "message": "The sandbox's proxy credentials are missing or expired. Start a new tool call.",
-}
-MALFORMED = {"error": "bad_request", "message": "The request is malformed and was refused."}
-BROKER_ERROR = {
-    "error": "broker_error",
-    "message": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
-}
-BODY_TOO_LARGE = {"error": "request_body_too_large", "message": "The request body is larger than the broker accepts."}
 LOCALHOST_BLOCKED = {
     "error": "destination_blocked",
     "message": "localhost resolves to a private or internal address, which agents may not reach.",
@@ -65,18 +61,9 @@ def _host_not_allowed(*services: str) -> dict[str, object]:
     }
 
 
-def _config(host: str, *, path_prefix: str = "/") -> EgressBrokerConfig:
-    rule = EgressRule(host=host, path_prefix=path_prefix, auth=EgressAuth(type="bearer"))
-    return EgressBrokerConfig(services={"svc": EgressService(rules=[rule])})
-
-
-def _plain_get(upstream: Upstream, target: str, token: str) -> bytes:
-    """Return a raw absolute-form GET for `target` on `upstream`, which httpx would normalize."""
-    return (
-        f"GET http://localhost:{upstream.port}{target} HTTP/1.1\r\n"
-        f"Host: localhost:{upstream.port}\r\n"
-        f"Proxy-Authorization: {proxy_authorization(token)}\r\n\r\n"
-    ).encode()
+def _plain_get(upstream: Upstream, path: str, token: str) -> bytes:
+    """Return a raw absolute-form GET for `path` on `upstream`, which httpx would normalize."""
+    return plain_request(f"localhost:{upstream.port}", path=path, authorization=proxy_authorization(token))
 
 
 @pytest.mark.asyncio
@@ -207,12 +194,6 @@ async def test_python_urllib_and_curl_authenticate(
     assert "proxy-authorization" not in echoed["headers"]
 
 
-def _with_user_services(operator: EgressBrokerConfig, **user: EgressService) -> EgressRules:
-    """Return the operator's config merged with one scope's user services, as the broker builds them."""
-    effective = operator.model_copy(update={"services": {**operator.services, **user}})
-    return EgressRules(operator=operator, effective=effective)
-
-
 @pytest.mark.asyncio
 async def test_deny_ignores_user_rules_on_hosts_the_operator_does_not_name(
     broker: BrokerFactory,
@@ -221,10 +202,10 @@ async def test_deny_ignores_user_rules_on_hosts_the_operator_does_not_name(
     http_upstream: Upstream,
 ) -> None:
     """Under deny a host only a user service names is refused on CONNECT and plain HTTP and is never intercepted."""
-    operator = EgressBrokerConfig(unmatched_hosts="deny", services=_config("api.github.com").services)
+    operator = EgressBrokerConfig(unmatched_hosts="deny", services=single_rule_config("api.github.com").services)
     mine = EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])
     started = await broker(
-        rules_provider=lambda _claims: _with_user_services(operator, mine=mine),
+        rules_provider=lambda _claims: with_user_services(operator, mine=mine),
         secrets={"mine": "k"},
     )
     token = broker.token()
@@ -256,7 +237,7 @@ async def test_deny_lets_user_rules_work_on_operator_hosts(
     )
     mine = EgressService(rules=[EgressRule(host="localhost", path_prefix="/echo", auth=EgressAuth(type="bearer"))])
     await broker(
-        rules_provider=lambda _claims: _with_user_services(operator, mine=mine),
+        rules_provider=lambda _claims: with_user_services(operator, mine=mine),
         secrets={"op": "operator-key", "mine": "user-key"},
     )
 
@@ -283,7 +264,7 @@ async def test_operator_restriction_refuses_paths_only_a_user_rule_lists(
     )
     mine = EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])
     await broker(
-        rules_provider=lambda _claims: _with_user_services(operator, mine=mine),
+        rules_provider=lambda _claims: with_user_services(operator, mine=mine),
         secrets={"op": "operator-key", "mine": "user-key"},
         manage_url=lambda _claims: "https://m.test/connections/egress",
     )
@@ -417,7 +398,7 @@ async def test_plain_http_matched_rule_requires_tls(
     audit: AuditLog,
 ) -> None:
     """A plain request a rule matches is refused, so a secret never crosses an unencrypted connection."""
-    await broker(_config("localhost"), secrets={"svc": "s3cret"})
+    await broker(single_rule_config("localhost"), secrets={"svc": "s3cret"})
     client = proxy_client(broker.token())
 
     response = await client.get(http_upstream.url("/echo?page=2"))
@@ -444,7 +425,7 @@ async def test_plain_http_unmatched_path_on_rule_host_forwards_unmodified(
     audit: AuditLog,
 ) -> None:
     """A path no rule matches is forwarded by URL without credentials, and the Host header cannot reroute it."""
-    await broker(_config("localhost", path_prefix="/private"), secrets={"svc": "s3cret"})
+    await broker(single_rule_config("localhost", path_prefix="/private"), secrets={"svc": "s3cret"})
     client = proxy_client(broker.token())
 
     response = await client.get(http_upstream.url("/echo?page=2"), headers={"Host": "evil.example"})
@@ -474,7 +455,7 @@ async def test_plain_http_ambiguous_path_on_rule_host_gets_400(
     target: str,
 ) -> None:
     """Plain requests use the same route decision as tunnels: an ambiguous path on a rule host is refused."""
-    started = await broker(_config("localhost", path_prefix="/private"), secrets={"svc": "s3cret"})
+    started = await broker(single_rule_config("localhost", path_prefix="/private"), secrets={"svc": "s3cret"})
 
     response = await raw_proxy(started.port, _plain_get(http_upstream, f"{target}?page=2", broker.token()))
 
@@ -499,7 +480,7 @@ async def test_plain_http_ambiguous_path_on_host_without_rules_is_forwarded(
     audit: AuditLog,
 ) -> None:
     """Hosts without rules are untouched: the broker forwards their paths as sent and leaves them to the upstream."""
-    started = await broker(_config("api.github.com", path_prefix="/private"))
+    started = await broker(single_rule_config("api.github.com", path_prefix="/private"))
 
     response = await raw_proxy(started.port, _plain_get(http_upstream, "/private/../echo", broker.token()))
 
@@ -546,7 +527,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("config", "cookie_kept"),
-    [(None, True), (_config("localhost", path_prefix="/private"), False)],
+    [(None, True), (single_rule_config("localhost", path_prefix="/private"), False)],
     ids=["unmatched_host", "rule_host"],
 )
 async def test_plain_http_set_cookie_stripped_only_for_rule_hosts(
@@ -573,7 +554,7 @@ async def test_plain_http_denied_under_deny_policy(
     proxy_client: ProxyClient,
 ) -> None:
     """``unmatched_hosts: deny`` applies to plain requests too."""
-    await broker(EgressBrokerConfig(unmatched_hosts="deny", services=_config("api.github.com").services))
+    await broker(EgressBrokerConfig(unmatched_hosts="deny", services=single_rule_config("api.github.com").services))
     client = proxy_client(broker.token())
 
     response = await client.get(http_upstream.url("/echo"))
@@ -632,6 +613,7 @@ async def test_plain_http_drops_request_content_length_beside_chunked(
 async def test_plain_http_response_content_length_beside_chunked_is_reframed(
     broker: BrokerFactory,
     proxy_client: ProxyClient,
+    serve: ServeFactory,
 ) -> None:
     """An upstream response with both framings reaches the client whole, not cut at the Content-Length."""
 
@@ -643,15 +625,11 @@ async def test_plain_http_response_content_length_beside_chunked_is_reframed(
         await writer.drain()
         writer.close()
 
-    upstream = await asyncio.start_server(respond, "127.0.0.1", 0)
-    try:
-        await broker()
-        client = proxy_client(broker.token())
+    port = await serve(respond)
+    await broker()
+    client = proxy_client(broker.token())
 
-        response = await client.get(f"http://localhost:{upstream.sockets[0].getsockname()[1]}/")
-    finally:
-        upstream.close()
-        await upstream.wait_closed()
+    response = await client.get(f"http://localhost:{port}/")
 
     assert response.status_code == 200
     assert response.text == "hello"
@@ -665,19 +643,12 @@ async def test_plain_http_keepalive_reauthenticates_each_request(
 ) -> None:
     """Every request on a kept-alive connection must carry a valid token, not just the first."""
     started = await broker()
+    target = f"localhost:{http_upstream.port}"
     reader, writer = await asyncio.open_connection("127.0.0.1", started.port)
     try:
-
-        def request(authorization: str) -> bytes:
-            return (
-                f"GET {http_upstream.url('/echo')} HTTP/1.1\r\n"
-                f"Host: localhost:{http_upstream.port}\r\n"
-                f"Proxy-Authorization: {authorization}\r\n\r\n"
-            ).encode()
-
-        writer.write(request(proxy_authorization(broker.token())))
+        writer.write(plain_request(target, path="/echo", authorization=proxy_authorization(broker.token())))
         first = await read_raw_response(reader)
-        writer.write(request(proxy_authorization("mrb1.not.valid")))
+        writer.write(plain_request(target, path="/echo", authorization=proxy_authorization("mrb1.not.valid")))
         second = await read_raw_response(reader)
     finally:
         writer.transport.abort()
@@ -740,7 +711,7 @@ async def test_rules_provider_failure_gets_502_and_listener_survives(
     request = (
         connect_request("localhost:443", authorization=authorization)
         if transport == "connect"
-        else f"GET http://localhost:1/echo HTTP/1.1\r\nHost: localhost:1\r\nProxy-Authorization: {authorization}\r\n\r\n".encode()
+        else plain_request("localhost:1", path="/echo", authorization=authorization)
     )
 
     first = await raw_proxy(started.port, request)
@@ -798,13 +769,10 @@ async def test_plain_http_unreachable_upstream_gets_502(
     audit: AuditLog,
 ) -> None:
     """A refused upstream connection is reported as 502 and audited."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        closed_port = probe.getsockname()[1]
     await broker()
     client = proxy_client(broker.token())
 
-    response = await client.get(f"http://localhost:{closed_port}/echo")
+    response = await client.get(f"http://localhost:{free_port()}/echo")
 
     assert response.status_code == 502
     assert response.json() == {"error": "upstream_unreachable", "message": "localhost could not be reached."}

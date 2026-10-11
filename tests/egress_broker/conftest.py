@@ -6,6 +6,7 @@ import asyncio
 import base64
 import ipaddress
 import json
+import socket
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -20,7 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from mindroom.config.egress_broker import EgressBrokerConfig
+from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.ca import BrokerCA
 from mindroom.egress_broker.dial import DialPolicy
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.secrets import SecretResult
     from tests.egress_broker.raw_http import Script, UpstreamFactory
+
+type ServeFactory = Callable[..., Awaitable[int]]
 
 DEFAULT_CLAIMS = WorkerClaims(
     worker_key="worker-alice-code",
@@ -368,14 +371,32 @@ async def upstreams(upstream_ca: UpstreamCA, tmp_path: Path) -> AsyncIterator[Up
 
 
 @pytest_asyncio.fixture
-async def closing_listener() -> AsyncIterator[int]:
-    """Return the port of a loopback server that closes every connection it accepts."""
-    server = await asyncio.start_server(lambda _reader, writer: writer.close(), "127.0.0.1", 0)
-    try:
-        yield server.sockets[0].getsockname()[1]
-    finally:
+async def serve() -> AsyncIterator[ServeFactory]:
+    """Return ``start(handler, *, ssl_context=None)``: serve `handler` on a loopback port, closed after the test.
+
+    `start` returns the port; `handler` is an `asyncio.start_server` callback taking the stream reader and writer.
+    """
+    servers: list[asyncio.Server] = []
+
+    async def start(
+        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None] | None],
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> int:
+        server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=ssl_context)
+        servers.append(server)
+        return server.sockets[0].getsockname()[1]
+
+    yield start
+    for server in servers:
         server.close()
         await server.wait_closed()
+
+
+@pytest_asyncio.fixture
+async def closing_listener(serve: ServeFactory) -> int:
+    """Return the port of a loopback server that closes every connection it accepts."""
+    return await serve(lambda _reader, writer: writer.close())
 
 
 @pytest.fixture
@@ -505,9 +526,53 @@ async def proxy_client(broker: BrokerFactory) -> AsyncIterator[Callable[..., htt
         await client.aclose()
 
 
+# The refusal bodies several suites expect, as the broker serializes them (texts: `mindroom.egress_broker.messages`).
+PROXY_AUTHENTICATION_REQUIRED = {
+    "error": "proxy_authentication_required",
+    "message": "The sandbox's proxy credentials are missing or expired. Start a new tool call.",
+}
+MALFORMED = {"error": "bad_request", "message": "The request is malformed and was refused."}
+BROKER_ERROR = {
+    "error": "broker_error",
+    "message": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
+}
+BODY_TOO_LARGE = {"error": "request_body_too_large", "message": "The request body is larger than the broker accepts."}
+
+
+def single_rule_config(
+    host: str = "localhost",
+    *,
+    path_prefix: str = "/",
+    auth: EgressAuth | None = None,
+) -> EgressBrokerConfig:
+    """Return a config with one service, ``svc``, whose one rule covers `path_prefix` on `host` (bearer by default)."""
+    rule = EgressRule(host=host, path_prefix=path_prefix, auth=auth or EgressAuth(type="bearer"))
+    return EgressBrokerConfig(services={"svc": EgressService(rules=[rule])})
+
+
+def with_user_services(operator: EgressBrokerConfig, **user: EgressService) -> EgressRules:
+    """Return the operator's config merged with one scope's user services, as the broker builds them."""
+    effective = operator.model_copy(update={"services": {**operator.services, **user}})
+    return EgressRules(operator=operator, effective=effective)
+
+
+def free_port() -> int:
+    """Return a loopback port nothing listens on."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 def proxy_authorization(token: str) -> str:
     """Return the ``Proxy-Authorization`` value a worker sends: Basic with the token as user name."""
     return "Basic " + base64.b64encode(f"{token}:".encode()).decode()
+
+
+def plain_request(target: str, *, authorization: str, path: str = "/") -> bytes:
+    """Return a raw absolute-form GET for `path` on `target` (host:port), as a worker's plain HTTP client sends it."""
+    return (
+        f"GET http://{target}{path} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {authorization}\r\n\r\n"
+    ).encode()
 
 
 def connect_request(target: str, *, authorization: str | None = None) -> bytes:

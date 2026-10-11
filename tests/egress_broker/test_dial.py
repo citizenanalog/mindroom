@@ -17,7 +17,7 @@ from mindroom.egress_broker.dial import (
     DialPolicy,
     open_upstream,
 )
-from tests.egress_broker.conftest import connect_request, proxy_authorization
+from tests.egress_broker.conftest import connect_request, plain_request, proxy_authorization
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
@@ -259,7 +259,7 @@ async def test_broker_refuses_blocked_destinations_in_every_form(
     request = (
         connect_request(target, authorization=authorization)
         if transport == "connect"
-        else f"GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {authorization}\r\n\r\n".encode()
+        else plain_request(target, authorization=authorization)
     )
 
     with patch("mindroom.egress_broker.dial._dial", new_callable=AsyncMock) as dial_checked_address:

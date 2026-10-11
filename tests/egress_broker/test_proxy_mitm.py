@@ -7,7 +7,6 @@ import contextlib
 import json
 import os
 import shutil
-import socket
 import sqlite3
 import ssl
 import threading
@@ -28,14 +27,20 @@ from mindroom.egress_broker.ca import materialize_ca_bundle
 from mindroom.egress_broker.dial import DialPolicy
 from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.mitm import _verifying_context
-from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretNeedsReconnect, SecretUnavailable
 from tests.egress_broker.conftest import (
+    BODY_TOO_LARGE,
+    BROKER_ERROR,
     DEFAULT_CLAIMS,
+    MALFORMED,
+    PROXY_AUTHENTICATION_REQUIRED,
     audit_records,
     connect_request,
+    free_port,
     proxy_authorization,
     read_raw_response,
+    single_rule_config,
+    with_user_services,
 )
 
 if TYPE_CHECKING:
@@ -46,7 +51,7 @@ if TYPE_CHECKING:
 
     from mindroom.egress_broker.audit import AuditLog
     from mindroom.egress_broker.tokens import WorkerClaims
-    from tests.egress_broker.conftest import BrokerFactory, Upstream, UpstreamCA
+    from tests.egress_broker.conftest import BrokerFactory, RawResponse, ServeFactory, Upstream, UpstreamCA
 
     ProxyClient = Callable[..., httpx.AsyncClient]
 
@@ -54,31 +59,15 @@ MANAGE_URL = "https://m.test/connections/egress"
 CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
 SECRET = "s3cret"  # noqa: S105 - test credential the fake upstream expects
 _PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "git_askpass", "ssh_askpass"}
-MALFORMED = {"error": "bad_request", "message": "The request is malformed and was refused."}
 AMBIGUOUS_PATH = {
     "error": "bad_request",
     "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
     "Use a plain path.",
 }
-BROKER_ERROR = {
-    "error": "broker_error",
-    "message": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
-}
-BODY_TOO_LARGE = {"error": "request_body_too_large", "message": "The request body is larger than the broker accepts."}
 LOCALHOST_UNREACHABLE = {"error": "upstream_unreachable", "message": "localhost could not be reached."}
 RECONNECT_MESSAGE = (
     "The github account for svc must be connected again. Ask the user to reconnect at connect_url or manage_url."
 )
-
-
-def _config(
-    host: str = "localhost",
-    *,
-    path_prefix: str = "/",
-    auth: EgressAuth | None = None,
-) -> EgressBrokerConfig:
-    rule = EgressRule(host=host, path_prefix=path_prefix, auth=auth or EgressAuth(type="bearer"))
-    return EgressBrokerConfig(services={"svc": EgressService(rules=[rule])})
 
 
 async def _open_tunnel(
@@ -98,18 +87,25 @@ async def _open_tunnel(
     return reader, writer
 
 
+async def _exchange(broker: BrokerFactory, port: int, *messages: bytes) -> list[RawResponse]:
+    """Open a tunnel to ``localhost:<port>``, send each raw message in turn, and return the response read after each."""
+    reader, writer = await _open_tunnel(broker, f"localhost:{port}")
+    try:
+        responses = []
+        for message in messages:
+            writer.write(message)
+            responses.append(await read_raw_response(reader))
+    finally:
+        writer.transport.abort()
+    return responses
+
+
 def _websocket_handshake(port: int, *, connection: str = "Upgrade", upgrade: str = "websocket") -> bytes:
     return (
         f"GET /ws HTTP/1.1\r\nHost: localhost:{port}\r\n"
         f"Upgrade: {upgrade}\r\nConnection: {connection}\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     ).encode()
-
-
-def _closed_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
 
 async def _run(*command: str, env: dict[str, str]) -> tuple[int, str, str]:
@@ -135,7 +131,7 @@ def _env_without_proxies(**extra: str) -> dict[str, str]:
 @pytest.mark.parametrize("host", ["localhost", "LOCALHOST.", "localhost."])
 async def test_connect_to_rule_host_is_intercepted(broker: BrokerFactory, host: str) -> None:
     """A host with rules (case and one trailing dot normalized) gets the broker's certificate, not a blind tunnel."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
 
     # The client trusts only the broker CA, so the handshake alone proves the broker answered.
     _reader, writer = await _open_tunnel(broker, f"{host}:443")
@@ -154,7 +150,7 @@ async def test_injects_bearer_and_client_never_sees_secret(
     audit: AuditLog,
 ) -> None:
     """The upstream receives the injected secret; nothing the broker relays back to the client contains it."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/ok?page=2"))
@@ -185,7 +181,7 @@ async def test_placeholder_authorization_is_replaced(
     proxy_client: ProxyClient,
 ) -> None:
     """A client's placeholder Authorization is removed, so the upstream sees exactly one injected value."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo"), headers={"Authorization": "token mindroom-brokered"})
@@ -201,7 +197,7 @@ async def test_keepalive_injects_per_request(
     audit: AuditLog,
 ) -> None:
     """Each request on one tunnel is matched on its own path, over a single upstream connection."""
-    await broker(_config(path_prefix="/echo"), secrets={"svc": SECRET})
+    await broker(single_rule_config(path_prefix="/echo"), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     assert (await client.get(tls_upstream.url("/echo"))).status_code == 200
@@ -231,7 +227,7 @@ async def test_host_mismatch_is_refused(
     host_header: str,
 ) -> None:
     """A Host naming anything but the CONNECT host is refused before any secret lookup (no domain fronting)."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo"), headers={"Host": host_header})
@@ -258,7 +254,7 @@ async def test_matching_host_header_is_forwarded(
     host_header: str,
 ) -> None:
     """A Host naming the CONNECT host (any case, port, or trailing dot) reaches the upstream unchanged."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
     sent = host_header.format(port=tls_upstream.port)
 
@@ -284,13 +280,13 @@ async def test_non_origin_form_target_is_refused(
     target: str,
 ) -> None:
     """Inside a tunnel only origin-form targets are served; the CONNECT target alone decides the destination."""
-    await broker(_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    try:
-        writer.write(f"{method} {target} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
-        response = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+
+    [response] = await _exchange(
+        broker,
+        tls_upstream.port,
+        f"{method} {target} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode(),
+    )
 
     assert response.status == 400
     assert response.json() == MALFORMED
@@ -321,13 +317,13 @@ async def test_ambiguous_path_on_rule_host_is_refused(
     target: str,
 ) -> None:
     """A path an upstream could resolve differently is refused before matching, so it cannot borrow a rule."""
-    await broker(_config(path_prefix="/private"), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    try:
-        writer.write(f"GET {target}?page=2 HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
-        response = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
+    await broker(single_rule_config(path_prefix="/private"), secrets={"svc": SECRET})
+
+    [response] = await _exchange(
+        broker,
+        tls_upstream.port,
+        f"GET {target}?page=2 HTTP/1.1\r\nHost: localhost\r\n\r\n".encode(),
+    )
 
     assert response.status == 400
     assert response.headers["connection"] == "close"
@@ -394,9 +390,8 @@ async def test_user_restriction_refuses_operator_paths_in_tunnel(
         restrict_to_rules=True,
         rules=[EgressRule(host="localhost", path_prefix="/echo", auth=EgressAuth(type="bearer"))],
     )
-    effective = operator.model_copy(update={"services": {**operator.services, "limited": limited}})
     await broker(
-        rules_provider=lambda _claims: EgressRules(operator=operator, effective=effective),
+        rules_provider=lambda _claims: with_user_services(operator, limited=limited),
         secrets={"op": "operator-key", "limited": "user-key"},
         manage_url=lambda _claims: MANAGE_URL,
     )
@@ -448,9 +443,8 @@ async def test_limit_in_place_on_a_shared_agent_keeps_the_operator_key_and_names
         display_name="Local (echo)",
         rules=[EgressRule(host="localhost", path_prefix="/echo")],
     )
-    effective = operator.model_copy(update={"services": {**operator.services, "limited": limited}})
     await broker(
-        rules_provider=lambda _claims: EgressRules(operator=operator, effective=effective),
+        rules_provider=lambda _claims: with_user_services(operator, limited=limited),
         secrets={"op": "operator-key", "limited": "never-sent"},
         manage_url=lambda _claims: MANAGE_URL,
         scope_info=lambda _claims: ScopeInfo(shared=True, managers=managers),
@@ -484,7 +478,7 @@ async def test_redirect_is_returned_not_followed(
     proxy_client: ProxyClient,
 ) -> None:
     """A redirect reaches the client as-is; following it would be a new CONNECT and a new match."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/redirect"))
@@ -501,7 +495,7 @@ async def test_streamed_response_is_incremental(
     proxy_client: ProxyClient,
 ) -> None:
     """Response chunks are relayed as they arrive instead of after the whole body."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
     chunks: list[bytes] = []
     arrivals: list[float] = []
@@ -518,7 +512,7 @@ async def test_streamed_response_is_incremental(
 @pytest.mark.asyncio
 async def test_set_cookie_stripped(broker: BrokerFactory, tls_upstream: Upstream, proxy_client: ProxyClient) -> None:
     """Brokered hosts never set cookies in the worker, so sessions cannot outlive the injected credential."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/cookie"))
@@ -536,7 +530,7 @@ async def test_missing_secret_returns_403_with_manage_url(
     audit: AuditLog,
 ) -> None:
     """A matched service without a secret in the worker's scope tells the agent where to set one."""
-    await broker(_config(), manage_url=lambda _claims: MANAGE_URL)
+    await broker(single_rule_config(), manage_url=lambda _claims: MANAGE_URL)
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo"))
@@ -556,17 +550,27 @@ async def test_missing_secret_returns_403_with_manage_url(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scope_info",
+    [None, lambda _claims: ScopeInfo(shared=True, managers=("@alice:example.org",))],
+    ids=["personal", "shared-with-managers"],
+)
 async def test_missing_secret_offers_oauth_connect_link(
     broker: BrokerFactory,
     tls_upstream: Upstream,
     proxy_client: ProxyClient,
     audit: AuditLog,
+    scope_info: Callable[[WorkerClaims], ScopeInfo] | None,
 ) -> None:
-    """A service whose OAuth provider can be connected names it and the link beside the key page."""
+    """A service whose OAuth provider can be connected names it and the link beside the key page.
+
+    A shared agent's refusal offers the link too, instead of naming its managers.
+    """
     await broker(
-        _config(),
+        single_rule_config(),
         resolve_secret=lambda _claims, _service: SecretMissing(provider="github", connect_url=CONNECT_URL),
         manage_url=lambda _claims: MANAGE_URL,
+        scope_info=scope_info,
     )
     client = proxy_client(broker.token())
 
@@ -602,7 +606,7 @@ async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
         asked.append(claims)
         return ScopeInfo(shared=True, managers=("@alice:example.org",))
 
-    await broker(_config(), manage_url=lambda _claims: MANAGE_URL, scope_info=shared_scope)
+    await broker(single_rule_config(), manage_url=lambda _claims: MANAGE_URL, scope_info=shared_scope)
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo?page=2"))
@@ -616,36 +620,6 @@ async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
         "Only its credential managers (@alice:example.org) can add one, at manage_url.",
     }
     assert asked == [DEFAULT_CLAIMS]
-    assert tls_upstream.hits == []
-
-
-@pytest.mark.asyncio
-async def test_missing_secret_on_a_shared_agent_with_a_connect_link_offers_the_link(
-    broker: BrokerFactory,
-    tls_upstream: Upstream,
-    proxy_client: ProxyClient,
-) -> None:
-    """When the lookup hands out a connect link, the shared agent's refusal offers it instead of naming managers."""
-    await broker(
-        _config(),
-        resolve_secret=lambda _claims, _service: SecretMissing(provider="github", connect_url=CONNECT_URL),
-        manage_url=lambda _claims: MANAGE_URL,
-        scope_info=lambda _claims: ScopeInfo(shared=True, managers=("@alice:example.org",)),
-    )
-    client = proxy_client(broker.token())
-
-    response = await client.get(tls_upstream.url("/echo"))
-
-    assert response.status_code == 403
-    assert response.json() == {
-        "error": "credential_not_configured",
-        "service": "svc",
-        "manage_url": MANAGE_URL,
-        "provider": "github",
-        "connect_url": CONNECT_URL,
-        "message": "No svc credential is set for this agent. "
-        "Ask the user to connect it at connect_url or add a key at manage_url, then retry.",
-    }
     assert tls_upstream.hits == []
 
 
@@ -687,7 +661,11 @@ async def test_oauth_reconnect_required_gets_403_without_reaching_upstream(
     expected: dict[str, object],
 ) -> None:
     """A connection that cannot supply a token tells the agent to reconnect, or to reset first, and is audited."""
-    await broker(_config(), resolve_secret=lambda _claims, _service: result, manage_url=lambda _claims: MANAGE_URL)
+    await broker(
+        single_rule_config(),
+        resolve_secret=lambda _claims, _service: result,
+        manage_url=lambda _claims: MANAGE_URL,
+    )
     client = proxy_client(broker.token())
 
     with capture_logs() as logs:
@@ -711,7 +689,7 @@ async def test_oauth_refresh_outage_gets_retryable_503(
 ) -> None:
     """A provider outage is a retryable 503 that names the service and provider, with no reconnect prompt."""
     await broker(
-        _config(),
+        single_rule_config(),
         resolve_secret=lambda _claims, _service: SecretUnavailable(provider="github"),
         manage_url=lambda _claims: MANAGE_URL,
     )
@@ -749,10 +727,7 @@ async def test_resolve_secret_failure_gets_502_and_audit_row(
         msg = "store unavailable"
         raise RuntimeError(msg)
 
-    if failing == "resolve_secret":
-        await broker(_config(), resolve_secret=fail)
-    else:
-        await broker(_config(), manage_url=fail)
+    await broker(single_rule_config(), **{failing: fail})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo?page=2"))
@@ -783,7 +758,7 @@ async def test_audit_write_failure_is_logged_and_the_request_still_succeeds(
         raise sqlite3.OperationalError(msg)
 
     monkeypatch.setattr(audit, "record", failing_record)
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     with capture_logs() as logs:
@@ -800,21 +775,14 @@ async def test_audit_write_failure_is_logged_and_the_request_still_succeeds(
 @pytest.mark.asyncio
 async def test_expect_continue_upload(broker: BrokerFactory, tls_upstream: Upstream) -> None:
     """The broker answers ``Expect: 100-continue`` itself and then streams the whole body upstream."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     size = 2 * 1024 * 1024
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    try:
-        writer.write(
-            (
-                f"POST /upload HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n"
-                f"Content-Length: {size}\r\nExpect: 100-continue\r\n\r\n"
-            ).encode(),
-        )
-        interim = await read_raw_response(reader)
-        writer.write(b"x" * size)
-        final = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
+    head = (
+        f"POST /upload HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n"
+        f"Content-Length: {size}\r\nExpect: 100-continue\r\n\r\n"
+    ).encode()
+
+    interim, final = await _exchange(broker, tls_upstream.port, head, b"x" * size)
 
     assert interim.status == 100
     assert final.status == 200
@@ -831,7 +799,7 @@ async def test_body_over_limit_gets_413(
     proxy_client: ProxyClient,
 ) -> None:
     """A declared body over the broker limit is refused before the upstream sees anything."""
-    await broker(_config(), secrets={"svc": SECRET}, max_body_bytes=1024)
+    await broker(single_rule_config(), secrets={"svc": SECRET}, max_body_bytes=1024)
     client = proxy_client(broker.token())
 
     response = await client.post(tls_upstream.url("/upload"), content=b"x" * 2048)
@@ -848,10 +816,10 @@ async def test_upstream_unreachable_gets_502(
     audit: AuditLog,
 ) -> None:
     """A refused upstream connection inside an intercepted tunnel is a 502 for that request."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
-    response = await client.get(f"https://localhost:{_closed_port()}/echo")
+    response = await client.get(f"https://localhost:{free_port()}/echo")
 
     assert response.status_code == 502
     assert response.json() == LOCALHOST_UNREACHABLE
@@ -861,9 +829,13 @@ async def test_upstream_unreachable_gets_502(
 
 
 @pytest.mark.asyncio
-async def test_untrusted_upstream_certificate_gets_502(broker: BrokerFactory, proxy_client: ProxyClient) -> None:
+async def test_untrusted_upstream_certificate_gets_502(
+    broker: BrokerFactory,
+    proxy_client: ProxyClient,
+    serve: ServeFactory,
+) -> None:
     """The broker verifies the real upstream; one it cannot verify never receives the secret."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     received: list[bytes] = []
 
     async def record(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -871,13 +843,10 @@ async def test_untrusted_upstream_certificate_gets_502(broker: BrokerFactory, pr
         writer.close()
 
     # Signed by the broker CA, which the broker's upstream context does not trust.
-    upstream = await asyncio.start_server(record, "127.0.0.1", 0, ssl=broker.ca.server_context("localhost"))
-    try:
-        client = proxy_client(broker.token())
-        response = await client.get(f"https://localhost:{upstream.sockets[0].getsockname()[1]}/echo")
-    finally:
-        upstream.close()
-        await upstream.wait_closed()
+    port = await serve(record, ssl_context=broker.ca.server_context("localhost"))
+    client = proxy_client(broker.token())
+
+    response = await client.get(f"https://localhost:{port}/echo")
 
     assert response.status_code == 502
     assert response.json() == LOCALHOST_UNREACHABLE
@@ -893,7 +862,7 @@ async def test_blocked_upstream_gets_403(
     audit: AuditLog,
 ) -> None:
     """The dial guard covers intercepted upstreams: the default policy refuses loopback."""
-    await broker(_config(), secrets={"svc": SECRET}, dial_policy=DialPolicy())
+    await broker(single_rule_config(), secrets={"svc": SECRET}, dial_policy=DialPolicy())
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo"))
@@ -916,7 +885,7 @@ async def test_websocket_upgrade_spliced_with_injection(
     audit: AuditLog,
 ) -> None:
     """The websocket handshake is injected, then frames pass through untouched in both directions."""
-    started = await broker(_config(), secrets={"svc": SECRET})
+    started = await broker(single_rule_config(), secrets={"svc": SECRET})
     url = tls_upstream.url("/ws").replace("https://", "wss://")
 
     async with (
@@ -948,7 +917,7 @@ async def test_websocket_splice_ends_when_client_closes(
     audit: AuditLog,
 ) -> None:
     """Once the client goes away the upstream is closed too, even though the upstream would keep waiting."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
     writer.write(_websocket_handshake(tls_upstream.port))
     switched = await read_raw_response(reader)
@@ -967,7 +936,7 @@ async def test_websocket_splice_ends_when_client_closes(
 @pytest.mark.asyncio
 async def test_query_auth_type(broker: BrokerFactory, tls_upstream: Upstream, proxy_client: ProxyClient) -> None:
     """Query auth replaces the client's parameter value and keeps the others."""
-    await broker(_config(auth=EgressAuth(type="query", name="key")), secrets={"svc": SECRET})
+    await broker(single_rule_config(auth=EgressAuth(type="query", name="key")), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     response = await client.get(tls_upstream.url("/echo?key=client-value&page=2"))
@@ -982,7 +951,7 @@ async def test_upstream_connection_is_reused_until_upstream_closes(
     proxy_client: ProxyClient,
 ) -> None:
     """A tunnel keeps one upstream connection and dials a new one after the upstream answers ``Connection: close``."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     for path in ("/echo", "/echo", "/close", "/echo"):
@@ -999,6 +968,7 @@ async def test_upstream_connection_is_reused_until_upstream_closes(
 async def test_upstream_closed_between_requests_is_redialed(
     broker: BrokerFactory,
     upstream_ca: UpstreamCA,
+    serve: ServeFactory,
     tmp_path: Path,
 ) -> None:
     """An upstream that closes an idle connection without saying so gets a fresh connection for the next request."""
@@ -1016,9 +986,8 @@ async def test_upstream_closed_between_requests_is_redialed(
             await writer.wait_closed()
         closed.set()
 
-    upstream = await asyncio.start_server(respond, "127.0.0.1", 0, ssl=upstream_ca.server_context(tmp_path))
-    port = upstream.sockets[0].getsockname()[1]
-    await broker(_config(), secrets={"svc": SECRET})
+    port = await serve(respond, ssl_context=upstream_ca.server_context(tmp_path))
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     reader, writer = await _open_tunnel(broker, f"localhost:{port}")
     request = f"GET /a HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n".encode()
     try:
@@ -1030,8 +999,6 @@ async def test_upstream_closed_between_requests_is_redialed(
         second = await read_raw_response(reader)
     finally:
         writer.transport.abort()
-        upstream.close()
-        await upstream.wait_closed()
 
     assert (first.status, second.status) == (200, 200)
     assert second.body == b"ok"
@@ -1041,7 +1008,7 @@ async def test_upstream_closed_between_requests_is_redialed(
 @pytest.mark.asyncio
 async def test_client_connection_close_ends_tunnel(broker: BrokerFactory, tls_upstream: Upstream) -> None:
     """A client's ``Connection: close`` is honored: the broker answers and then closes the tunnel."""
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
     try:
         writer.write(f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\nConnection: close\r\n\r\n".encode())
@@ -1063,12 +1030,12 @@ async def test_open_tunnel_follows_config_changes(
     proxy_client: ProxyClient,
 ) -> None:
     """Rules are read per request, so a config change applies to tunnels that are already open."""
-    configs = [_config()]
+    configs = [single_rule_config()]
     await broker(rules_provider=lambda _claims: configs[-1], secrets={"svc": SECRET})
     client = proxy_client(broker.token())
 
     first = await client.get(tls_upstream.url("/echo"))
-    configs.append(EgressBrokerConfig(unmatched_hosts="deny", services=_config("api.github.com").services))
+    configs.append(EgressBrokerConfig(unmatched_hosts="deny", services=single_rule_config("api.github.com").services))
     second = await client.get(tls_upstream.url("/echo"))
 
     assert first.json()["headers"]["authorization"] == [f"Bearer {SECRET}"]
@@ -1082,7 +1049,7 @@ async def test_open_tunnel_follows_config_changes(
 
 
 @pytest.mark.asyncio
-async def test_rules_come_from_the_requesters_own_config(
+async def test_rules_come_from_the_requesters_ownsingle_rule_config(
     broker: BrokerFactory,
     tls_upstream: Upstream,
     proxy_client: ProxyClient,
@@ -1095,7 +1062,7 @@ async def test_rules_come_from_the_requesters_own_config(
 
     def per_requester(claims: WorkerClaims) -> EgressBrokerConfig:
         seen.append(claims.requester_id)
-        return _config() if claims == alice else EgressBrokerConfig()
+        return single_rule_config() if claims == alice else EgressBrokerConfig()
 
     await broker(rules_provider=per_requester, secrets={"svc": SECRET})
     alice_response = await proxy_client(broker.token(alice)).get(tls_upstream.url("/echo"))
@@ -1119,7 +1086,7 @@ async def test_client_rejecting_broker_ca_closes_without_secret_or_denial(
     audit: AuditLog,
 ) -> None:
     """A client that does not trust the broker CA just fails its handshake: no secret lookup, no denied row."""
-    started = await broker(_config(), secrets={"svc": SECRET})
+    started = await broker(single_rule_config(), secrets={"svc": SECRET})
     reader, writer = await asyncio.open_connection("127.0.0.1", started.port)
     writer.write(connect_request("localhost:443", authorization=proxy_authorization(broker.token())))
     assert (await read_raw_response(reader)).status == 200
@@ -1140,7 +1107,7 @@ async def test_client_rejecting_broker_ca_closes_without_secret_or_denial(
 @pytest.mark.skipif(shutil.which("curl") is None, reason="curl not installed")
 async def test_curl_through_broker(broker: BrokerFactory, tls_upstream: Upstream, tmp_path: Path) -> None:
     """Curl with only the proxy URL and the trust bundle reaches the upstream with the secret injected."""
-    started = await broker(_config(), secrets={"svc": SECRET})
+    started = await broker(single_rule_config(), secrets={"svc": SECRET})
     bundle, _ca_only = materialize_ca_bundle(broker.ca.cert_pem, tmp_path / "trust")
 
     returncode, stdout, stderr = await _run(
@@ -1165,7 +1132,7 @@ async def test_curl_through_broker(broker: BrokerFactory, tls_upstream: Upstream
 async def test_git_ls_remote_basic_auth(broker: BrokerFactory, tls_upstream: Upstream, tmp_path: Path) -> None:
     """git, with no credentials configured anywhere, authenticates through the injected Basic header."""
     started = await broker(
-        _config(auth=EgressAuth(type="basic", username="x-access-token")),
+        single_rule_config(auth=EgressAuth(type="basic", username="x-access-token")),
         secrets={"svc": SECRET},
     )
     bundle, _ca_only = materialize_ca_bundle(broker.ca.cert_pem, tmp_path / "trust")
@@ -1195,7 +1162,7 @@ async def test_git_ls_remote_basic_auth(broker: BrokerFactory, tls_upstream: Ups
 @pytest.mark.asyncio
 async def test_bytes_sent_before_connect_answer_get_400(broker: BrokerFactory) -> None:
     """Bytes sent with the CONNECT, before the broker answered it, cannot start TLS and are refused."""
-    started = await broker(_config(), secrets={"svc": SECRET})
+    started = await broker(single_rule_config(), secrets={"svc": SECRET})
     reader, writer = await asyncio.open_connection("127.0.0.1", started.port)
     try:
         writer.write(
@@ -1217,7 +1184,7 @@ async def test_client_hello_sent_before_connect_answer_still_reaches_tls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A ClientHello that arrives while the broker is still preparing its 200 is handed to the TLS handshake."""
-    started = await broker(_config(), secrets={"svc": SECRET})
+    started = await broker(single_rule_config(), secrets={"svc": SECRET})
     preparing, release = threading.Event(), threading.Event()
     server_context = broker.ca.server_context
 
@@ -1270,7 +1237,7 @@ async def test_secret_with_line_break_gets_502_without_leaking(
     audit: AuditLog,
 ) -> None:
     """A stored secret that is not a valid header value fails the request without reaching logs or the upstream."""
-    await broker(_config(), resolve_secret=lambda _claims, _service: Secret(f"{SECRET}\r\nX-Injected: y"))
+    await broker(single_rule_config(), resolve_secret=lambda _claims, _service: Secret(f"{SECRET}\r\nX-Injected: y"))
     client = proxy_client(broker.token())
 
     with capture_logs() as logs:
@@ -1312,20 +1279,14 @@ def test_default_upstream_context_adds_certifi_unless_trust_is_configured(
 @pytest.mark.asyncio
 async def test_non_websocket_upgrade_is_not_spliced(broker: BrokerFactory, tls_upstream: Upstream) -> None:
     """Only websocket upgrades are spliced; any other Upgrade is dropped and served as a normal request."""
-    await broker(_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    try:
-        writer.write(
-            (
-                f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n"
-                "Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n"
-            ).encode(),
-        )
-        upgraded = await read_raw_response(reader)
-        writer.write(f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n\r\n".encode())
-        following = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+    upgrade = (
+        f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n"
+        "Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n"
+    ).encode()
+    plain = f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n\r\n".encode()
+
+    upgraded, following = await _exchange(broker, tls_upstream.port, upgrade, plain)
 
     assert (upgraded.status, following.status) == (200, 200)
     seen = upgraded.json()["headers"]
@@ -1339,13 +1300,10 @@ async def test_websocket_handshake_forwards_only_connection_upgrade(
     tls_upstream: Upstream,
 ) -> None:
     """A websocket handshake reaches the upstream with ``Connection: Upgrade`` instead of the client's value."""
-    await broker(_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    try:
-        writer.write(_websocket_handshake(tls_upstream.port, connection="keep-alive, Upgrade", upgrade="WebSocket"))
-        switched = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+    handshake = _websocket_handshake(tls_upstream.port, connection="keep-alive, Upgrade", upgrade="WebSocket")
+
+    [switched] = await _exchange(broker, tls_upstream.port, handshake)
 
     assert switched.status == 101
     [seen] = tls_upstream.requests
@@ -1361,7 +1319,7 @@ async def test_expired_token_stops_open_tunnel(
 ) -> None:
     """The token is checked on every intercepted request, so a busy tunnel stops working when the token expires."""
     clock = [time.time()]
-    await broker(_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
 
     with patch("mindroom.egress_broker.tokens.time", SimpleNamespace(time=lambda: clock[0])):
         client = proxy_client(broker.token())
@@ -1373,10 +1331,7 @@ async def test_expired_token_stops_open_tunnel(
     assert second.status_code == 407
     assert second.headers["connection"] == "close"
     assert second.headers["proxy-authenticate"] == 'Basic realm="mindroom-egress-broker"'
-    assert second.json() == {
-        "error": "proxy_authentication_required",
-        "message": "The sandbox's proxy credentials are missing or expired. Start a new tool call.",
-    }
+    assert second.json() == PROXY_AUTHENTICATION_REQUIRED
     assert tls_upstream.hits == ["/echo"]
     assert broker.resolved == ["svc"]
 
@@ -1386,6 +1341,7 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
     broker: BrokerFactory,
     upstream_ca: UpstreamCA,
     audit: AuditLog,
+    serve: ServeFactory,
     tmp_path: Path,
 ) -> None:
     """A streamed body crossing the limit gets 413, and the half-sent upstream request's connection is closed."""
@@ -1401,9 +1357,8 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
             upstream_closed.set()
             writer.transport.abort()
 
-    upstream = await asyncio.start_server(receive, "127.0.0.1", 0, ssl=upstream_ca.server_context(tmp_path))
-    port = upstream.sockets[0].getsockname()[1]
-    await broker(_config(), secrets={"svc": SECRET}, max_body_bytes=1024)
+    port = await serve(receive, ssl_context=upstream_ca.server_context(tmp_path))
+    await broker(single_rule_config(), secrets={"svc": SECRET}, max_body_bytes=1024)
     reader, writer = await _open_tunnel(broker, f"localhost:{port}")
     try:
         writer.write(
@@ -1416,8 +1371,6 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
             await upstream_closed.wait()
     finally:
         writer.transport.abort()
-        upstream.close()
-        await upstream.wait_closed()
 
     assert response.status == 413
     assert response.json() == BODY_TOO_LARGE
@@ -1428,13 +1381,9 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
 @pytest.mark.asyncio
 async def test_http10_request_without_host_gets_tunnel_authority(broker: BrokerFactory, tls_upstream: Upstream) -> None:
     """An HTTP/1.0 request without Host is forwarded with the CONNECT authority as its Host."""
-    await broker(_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    try:
-        writer.write(b"GET /echo HTTP/1.0\r\n\r\n")
-        response = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+
+    [response] = await _exchange(broker, tls_upstream.port, b"GET /echo HTTP/1.0\r\n\r\n")
 
     assert response.status == 200
     seen = response.json()["headers"]
