@@ -47,17 +47,8 @@ def broker_execution_env(
     # Import here to avoid circular dependency with constants
     from mindroom.constants import WORKER_EGRESS_NO_PROXY, compose_worker_proxy_env  # noqa: PLC0415
 
-    # Build NO_PROXY: base + extra hosts (deduplicated)
-    base_no_proxy_entries = WORKER_EGRESS_NO_PROXY.split(",")
-    all_no_proxy_hosts = [*base_no_proxy_entries, *extra_no_proxy_hosts]
-    # Deduplicate while preserving order
-    seen = set()
-    unique_no_proxy = []
-    for host in all_no_proxy_hosts:
-        if host not in seen:
-            seen.add(host)
-            unique_no_proxy.append(host)
-    no_proxy = ",".join(unique_no_proxy)
+    # NO_PROXY: the base entries, then the extra hosts, each once and in first-seen order
+    no_proxy = ",".join(dict.fromkeys([*WORKER_EGRESS_NO_PROXY.split(","), *extra_no_proxy_hosts]))
 
     # Compose base proxy env
     env = compose_worker_proxy_env(
@@ -92,25 +83,15 @@ def primary_callback_hosts(runtime_paths: RuntimePaths) -> list[str]:
         "MINDROOM_AGENT_CLI_URL",
     ]
 
-    hosts = []
-    seen = set()
-
+    hosts: list[str | None] = []
     for name in env_names:
-        value = (runtime_paths.env_value(name) or "").strip()
-        if not value:
-            continue
-
         try:
-            parsed = urlsplit(value)
-            hostname = parsed.hostname
-            if hostname and hostname not in seen:
-                seen.add(hostname)
-                hosts.append(hostname)
+            # A blank value has no hostname.
+            hosts.append(urlsplit((runtime_paths.env_value(name) or "").strip()).hostname)
         except ValueError:
             # Unparsable URL, such as an unclosed IPv6 bracket, skip
             continue
-
-    return hosts
+    return list(dict.fromkeys(host for host in hosts if host))
 
 
 def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> bool:
@@ -120,16 +101,13 @@ def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> bool:
     files, and sets SSL_CERT_FILE (+ friends) to the combined bundle and
     NODE_EXTRA_CA_CERTS to the broker-only file.
 
-    Creates directory with mode 0700 if missing.
+    `materialize_ca_bundle` creates the directory with mode 0700 if missing.
 
     Returns True if the CA was present and materialized, False otherwise.
     """
     ca_pem = env.pop(BROKER_CA_PEM_ENV, None)
     if not ca_pem:
         return False
-
-    # Create directory if missing
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     # Import lazily to keep the runner import light
     from mindroom.egress_broker.ca import materialize_ca_bundle  # noqa: PLC0415

@@ -326,7 +326,7 @@ def _publish_unless_current(directory_fd: int, filename: str, content: bytes) ->
 
 
 def materialize_ca_bundle(ca_pem: str, directory: Path) -> tuple[Path, Path]:
-    """Materialize CA bundle files in the given directory.
+    """Materialize CA bundle files in the given directory, which is created with mode 0700 if missing.
 
     Returns (combined_bundle, broker_ca_only) where:
     - combined_bundle: system roots followed by broker CA
@@ -357,7 +357,7 @@ def materialize_ca_bundle(ca_pem: str, directory: Path) -> tuple[Path, Path]:
     combined += ca_pem
 
     # Ensure directory exists
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         _publish_unless_current(directory_fd, ca_only_path.name, ca_pem.encode("utf-8"))
