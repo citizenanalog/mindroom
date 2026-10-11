@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from mindroom.api import oauth
+from mindroom.api import config_lifecycle, oauth
 from mindroom.api.credentials_target import (
     resolve_request_credentials_target,
     worker_target_for_credentials_target,
@@ -90,8 +90,6 @@ async def _admin_oauth_status(
     so a stalled provider never stalls the panel. Any failure to read one provider's state, the worker backend check
     included, shows that service as not connectable instead of failing the panel.
     """
-    from mindroom.api import config_lifecycle  # noqa: PLC0415
-
     provider_id = service.oauth_provider
     if provider_id is None:
         return None
@@ -146,8 +144,6 @@ async def _load_service_statuses_for_target(
     target: RequestCredentialsTarget,
 ) -> list[_ServiceStatus]:
     """Build service status list for one target."""
-    from mindroom.api import config_lifecycle  # noqa: PLC0415
-
     config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
     if config is None:
         return []
@@ -181,16 +177,10 @@ def _resolve_scope_and_service(
     agent_name: str | None,
 ) -> tuple[RequestCredentialsTarget, ResolvedWorkerTarget | None, EgressService]:
     """Resolve the selected scope and the service, which must be one it uses: a config service or its own."""
-    from mindroom.api import config_lifecycle  # noqa: PLC0415
-
     config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
     if config is None:
         raise HTTPException(status_code=404, detail=f"Service '{name}' is not configured")
-    target = resolve_request_credentials_target(
-        request,
-        agent_name=agent_name,
-        service_names=(),
-    )
+    target = resolve_request_credentials_target(request, agent_name=agent_name)
     worker_target = worker_target_for_credentials_target(target)
     service = effective_services(config, target.base_manager, worker_target).get(name)
     if service is None:
@@ -200,7 +190,7 @@ def _resolve_scope_and_service(
 
 def _scope_worker_target(request: Request, agent_name: str | None) -> ResolvedWorkerTarget | None:
     """Return the worker target of the selected scope, the one the status listing uses for the same service."""
-    target = resolve_request_credentials_target(request, agent_name=agent_name, service_names=())
+    target = resolve_request_credentials_target(request, agent_name=agent_name)
     return worker_target_for_credentials_target(target)
 
 
@@ -213,11 +203,7 @@ async def get_services(
 
     Returns configured status and last-updated time, never secret values.
     """
-    target = resolve_request_credentials_target(
-        request,
-        agent_name=agent_name,
-        service_names=(),  # egress services are not in the normal service list
-    )
+    target = resolve_request_credentials_target(request, agent_name=agent_name)
 
     services = await _load_service_statuses_for_target(request, target)
     return ServicesResponse(services=services)
@@ -226,8 +212,6 @@ async def get_services(
 @router.get("/presets", response_model=PresetsResponse)
 def get_presets(request: Request) -> PresetsResponse:
     """List the built-in service presets with the rules, login, and placeholders each one sets, and the providers."""
-    from mindroom.api import config_lifecycle  # noqa: PLC0415
-
     return presets_response(load_oauth_providers_for_snapshot(config_lifecycle.bind_current_request_snapshot(request)))
 
 
