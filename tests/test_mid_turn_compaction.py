@@ -1931,6 +1931,29 @@ async def test_oversized_native_request_turns_native_off_and_compacts_as_text(
 
 
 @pytest.mark.asyncio
+async def test_oversized_native_request_in_a_stored_conversation_archives_the_turn(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    model = _NativeToolLoopModel(tool_rounds=5)
+    model.configure_native_compaction(threshold=2000)
+
+    output = await _run_in_session(_scoped_agent(model, config, paths, storage), "Do the task")
+
+    assert summary_calls.inputs
+    assert model.native_compaction is None
+    archived = archived_run_ids(storage)
+    assert archived[:2] == ["run-1", "run-2"]
+    assert archived[2].startswith(f"{output.run_id}:compaction-snapshot:")
+    stored = get_agent_session(storage, "session-1")
+    assert stored is not None
+    assert stored.summary is not None
+    assert stored.summary.summary == compaction_generations(storage, _SCOPE.key)[-1].summary
+
+
+@pytest.mark.asyncio
 async def test_failed_text_fallback_keeps_native_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     summary_calls.fail = True

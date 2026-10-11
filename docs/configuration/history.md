@@ -29,7 +29,7 @@ When the active model has a known `context_window`, MindRoom fits replayed histo
 Your configured `num_history_runs` stays unchanged; the reduction applies only to the run that needs it.
 Without a known `context_window` (and without `compaction.replay_window_tokens`), history is not fitted and automatic text compaction is unavailable.
 
-A known `context_window` also bounds every model request of a reply, including the requests after tool results; see [Compaction during a reply](#compaction-during-a-reply).
+With compaction enabled, a known `context_window` also bounds every model request of a reply, including the requests after tool results; see [Compaction during a reply](#compaction-during-a-reply).
 
 ```yaml
 models:
@@ -56,7 +56,7 @@ Set these fields under `defaults.compaction`, an agent's `compaction`, or a team
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | `false` disables automatic native and pre-reply text compaction for the scope |
+| `enabled` | bool | `true` | `false` disables automatic compaction for the scope, both before and during a reply |
 | `threshold_tokens` | int, >= 1 | `null` | Native provider trigger in tokens; on text-only routes a soft planning threshold that does not compact by itself while history still fits. Mutually exclusive with `threshold_percent` |
 | `threshold_percent` | float, > 0 and < 1 | `null` | The same trigger as a fraction of the effective replay window. When neither threshold is set, the trigger is 80% of that window |
 | `replay_window_tokens` | int, >= 1 | `null` | Cap replayed history and compaction planning below the model's real `context_window` without lowering the provider request limit. The smaller of the two applies; when the model window is unknown, this value alone sets the replay window |
@@ -85,10 +85,12 @@ After that compaction the model sees its system prompt, the summary, the user's 
 The tool calls still appear in the reply.
 If the summary and the current message together exceed the model's `context_window` minus `reserve_tokens`, the reply fails with `Saved conversation summary exceeds the available history budget` (see [Compacted history and redaction](#compacted-history-and-redaction)).
 If the summary model fails, the reply continues without compacting and may then fail with a provider error.
+With compaction disabled, or with a summary model too small to compact, nothing bounds the requests of a reply, and one that outgrows the model's window fails with a provider error.
 
 A compaction leaves the system prompt and tools unchanged, so provider prompt caching keeps working after it.
 Agents, teams, subagents, workflow participants, and minimal-mode agents all compact the same way.
-Team members, workflow participants, subagents, replies resuming after a tool approval, and scheduled tasks with a `history_limit` of `0` compact their own work without posting the notice.
+Team members, workflow participants, and scheduled tasks with a `history_limit` of `0` compact only their own work and post no notice.
+Subagents and replies resuming after a tool approval compact the conversation like any other reply but post no notice.
 
 ### Compacted history and redaction
 

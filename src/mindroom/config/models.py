@@ -717,8 +717,8 @@ class ModelConfig(BaseModel):
             "the default replay-planning window unless compaction.replay_window_tokens sets a smaller replay cap. "
             "An explicit compaction.model or compaction.fallback_model also needs its own context_window for "
             "summary generation. "
-            "It also bounds every model request of a reply, which compacts during the reply when its next request "
-            "would not fit"
+            "With compaction enabled, it also bounds every model request of a reply, which compacts during the reply "
+            "when its next request would not fit"
         ),
     )
     stream_idle_timeout_seconds: float | None = Field(

@@ -74,8 +74,10 @@ def owned_table(db: SqliteDb, table_type: Literal["runs", "sessions"]) -> Table:
 # Upstream PR: None identified for sharing the run transaction.
 # Remove when: Agno accepts a caller-owned transaction or an in-transaction persistence hook;
 # retain the owner's independent usage retention and atomic snapshot update.
-# Coverage: tests/test_usage_storage.py::test_usage_write_failure_rolls_back_the_run and
-# tests/test_history_archive.py::test_roll_back_restores_earlier_runs_of_the_hit_generation_in_order.
+# Coverage: tests/test_usage_storage.py::test_usage_write_failure_rolls_back_the_run,
+# tests/test_history_archive.py::test_roll_back_restores_earlier_runs_of_the_hit_generation_in_order, and
+# tests/test_compaction_redaction.py::test_rolling_back_a_running_team_turn_keeps_the_scopes_preserved_seen_ids
+# (``move_run_to_end``).
 def insert_run_row(
     transaction: Session,
     runs: Table,

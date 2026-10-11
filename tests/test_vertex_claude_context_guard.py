@@ -12,6 +12,7 @@ from anthropic.types import Message as AnthropicMessage
 from anthropic.types import ParsedMessage, Usage
 
 from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE, ModelSafeguardRefusalError
+from mindroom.providers.claude_native_compaction import ClaudeNativeCompaction
 from mindroom.providers.vertex_claude_compat import (
     MindroomVertexAIClaude,
 )
@@ -120,3 +121,21 @@ async def test_stream_attempt_forgets_earlier_start_usage() -> None:
             pass
 
     assert model.take_unfinished_stream_usage() is None
+
+
+@pytest.mark.asyncio
+async def test_vertex_requests_are_sent_without_trimming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mid-turn compaction bounds a request before it is built, so Vertex sends every message it is given."""
+    model = _model()
+    messages = _tool_loop_messages()
+    messages[-1].content = "r" * 400_000
+    sent: list[list[Message]] = []
+
+    async def capture(_self: object, request_messages: list[Message], *_args: object, **_kwargs: object) -> None:
+        sent.append(request_messages)
+
+    monkeypatch.setattr(ClaudeNativeCompaction, "ainvoke", capture)
+
+    await model.ainvoke(messages, Message(role="assistant"))
+
+    assert sent == [messages]
