@@ -10,14 +10,14 @@ from mindroom.config.main import Config
 
 def _shared_config(**agent_overrides: object) -> dict[str, object]:
     agent: dict[str, object] = {
-        "display_name": "Redwood",
+        "display_name": "Builder",
         "worker_scope": "shared",
         "tools": ["agent_repository"],
     }
     agent.update(agent_overrides)
     return {
         "agent_repositories": {"organization": "example-org", "prefix": "MindRoom"},
-        "agents": {"redwood": agent},
+        "agents": {"builder": agent},
     }
 
 
@@ -28,7 +28,7 @@ def test_shared_agent_repository_opt_in_uses_global_policy() -> None:
     assert config.agent_repositories is not None
     assert config.agent_repositories.organization == "example-org"
     assert config.agent_repositories.prefix == "MindRoom"
-    assert config._agent_tool_runtime_overrides("redwood", "agent_repository") == {
+    assert config._agent_tool_runtime_overrides("builder", "agent_repository") == {
         "organization": "example-org",
         "prefix": "MindRoom",
     }
@@ -87,15 +87,15 @@ def test_private_user_agent_repository_opt_in_is_valid() -> None:
             "Input should be 'MindRoom'",
         ),
         (
-            lambda data: data["agents"]["redwood"].update({"worker_scope": "user"}),  # type: ignore[index,union-attr]
+            lambda data: data["agents"]["builder"].update({"worker_scope": "user"}),  # type: ignore[index,union-attr]
             "non-private agents must use worker_scope=shared",
         ),
         (
-            lambda data: data["agents"]["redwood"].update({"worker_scope": "user_agent"}),  # type: ignore[index,union-attr]
+            lambda data: data["agents"]["builder"].update({"worker_scope": "user_agent"}),  # type: ignore[index,union-attr]
             "non-private agents must use worker_scope=shared",
         ),
         (
-            lambda data: data["agents"]["redwood"].update(  # type: ignore[index,union-attr]
+            lambda data: data["agents"]["builder"].update(  # type: ignore[index,union-attr]
                 {"tools": [{"agent_repository": {"organization": "other"}}]},
             ),
             "does not accept per-agent overrides",
@@ -138,6 +138,6 @@ def test_default_agent_repository_opt_in_is_rejected() -> None:
             {
                 "agent_repositories": {"organization": "example-org", "prefix": "MindRoom"},
                 "defaults": {"tools": ["agent_repository"], "worker_scope": "shared"},
-                "agents": {"redwood": {"display_name": "Redwood"}},
+                "agents": {"builder": {"display_name": "Builder"}},
             },
         )

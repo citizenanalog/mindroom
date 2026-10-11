@@ -38,9 +38,9 @@ def _runtime_paths(tmp_path: Path, token_file: Path) -> RuntimePaths:
 
 def _request() -> RepositoryEnsureRequest:
     return RepositoryEnsureRequest(
-        worker_key="v1:default:shared:redwood",
+        worker_key="v1:default:shared:builder",
         organization="example-org",
-        repository_name="MindRoom-redwood",
+        repository_name="MindRoom-builder",
     )
 
 
@@ -48,8 +48,8 @@ def _response() -> dict[str, object]:
     return {
         "repository_id": "42",
         "organization": "example-org",
-        "repository_name": "MindRoom-redwood",
-        "clone_url": "https://github.com/example-org/MindRoom-redwood.git",
+        "repository_name": "MindRoom-builder",
+        "clone_url": "https://github.com/example-org/MindRoom-builder.git",
     }
 
 
@@ -80,9 +80,9 @@ async def test_broker_posts_exact_trusted_request_without_repository_authority(
 
     assert seen["url"] == "http://agent-vault:14321/v1/internal/mindroom/repositories/ensure"
     assert seen["body"] == {
-        "worker_key": "v1:default:shared:redwood",
+        "worker_key": "v1:default:shared:builder",
         "organization": "example-org",
-        "repository_name": "MindRoom-redwood",
+        "repository_name": "MindRoom-builder",
     }
     headers = seen["headers"]
     assert isinstance(headers, dict)
@@ -207,7 +207,7 @@ async def test_broker_rejects_credentialed_clone_url(
     """Credential material cannot cross the broker response into local Git config."""
     token_file = tmp_path / "broker-token"
     token_file.write_text("control-plane-secret", encoding="utf-8")
-    payload = {**_response(), "clone_url": "https://token@github.com/example-org/MindRoom-redwood.git"}
+    payload = {**_response(), "clone_url": "https://token@github.com/example-org/MindRoom-builder.git"}
     broker = AgentVaultRepositoryBroker.from_runtime(_runtime_paths(tmp_path, token_file))
     monkeypatch.setattr(
         broker,
@@ -229,7 +229,7 @@ async def test_broker_rejects_malformed_clone_url_without_parser_error(
     """Malformed broker URLs must remain a fail-closed repository boundary error."""
     token_file = tmp_path / "broker-token"
     token_file.write_text("control-plane-secret", encoding="utf-8")
-    payload = {**_response(), "clone_url": "https://github.com:not-a-port/example-org/MindRoom-redwood.git"}
+    payload = {**_response(), "clone_url": "https://github.com:not-a-port/example-org/MindRoom-builder.git"}
     broker = AgentVaultRepositoryBroker.from_runtime(_runtime_paths(tmp_path, token_file))
     monkeypatch.setattr(
         broker,

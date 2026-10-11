@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 def _target() -> object:
     identity = ToolExecutionIdentity(
         channel="matrix",
-        agent_name="redwood",
+        agent_name="builder",
         requester_id="@ignored:example.test",
         room_id=None,
         thread_id=None,
@@ -55,7 +55,7 @@ def _target() -> object:
         session_id=None,
         tenant_id=None,
     )
-    return resolve_worker_target("shared", "redwood", identity)
+    return resolve_worker_target("shared", "builder", identity)
 
 
 def _runtime_paths(tmp_path: Path, *, broker_config: bool = False) -> RuntimePaths:
@@ -78,8 +78,8 @@ def _lease(repository_id: str = "42") -> RepositoryLease:
     return RepositoryLease(
         repository_id=repository_id,
         organization="example-org",
-        repository_name="MindRoom-redwood",
-        clone_url="https://github.com/example-org/MindRoom-redwood.git",
+        repository_name="MindRoom-builder",
+        clone_url="https://github.com/example-org/MindRoom-builder.git",
     )
 
 
@@ -146,10 +146,10 @@ async def test_ensure_binds_repository_and_configures_credential_free_origin(tmp
     payload = json.loads(await tool.ensure_my_repository())
 
     assert payload == {
-        "clone_url": "https://github.com/example-org/MindRoom-redwood.git",
+        "clone_url": "https://github.com/example-org/MindRoom-builder.git",
         "organization": "example-org",
         "repository_id": "42",
-        "repository_name": "MindRoom-redwood",
+        "repository_name": "MindRoom-builder",
         "status": "ok",
         "tool": "agent_repository",
         "workspace": str(workspace),
@@ -158,7 +158,7 @@ async def test_ensure_binds_repository_and_configures_credential_free_origin(tmp
         RepositoryEnsureRequest(
             worker_key=_target().worker_key,
             organization="example-org",
-            repository_name="MindRoom-redwood",
+            repository_name="MindRoom-builder",
         ),
     ]
     assert _git(workspace, "remote", "get-url", "origin") == _lease().clone_url
@@ -464,8 +464,8 @@ def test_push_url_without_fetch_url_is_an_origin_conflict(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     "origin",
     [
-        "git@github.com:example-org/MindRoom-redwood.git",
-        "ssh://git@github.com/example-org/MindRoom-redwood.git",
+        "git@github.com:example-org/MindRoom-builder.git",
+        "ssh://git@github.com/example-org/MindRoom-builder.git",
     ],
 )
 async def test_same_repository_over_ssh_is_an_origin_conflict(tmp_path: Path, origin: str) -> None:
@@ -488,7 +488,7 @@ async def test_same_repository_over_ssh_is_an_origin_conflict(tmp_path: Path, or
 @pytest.mark.parametrize(
     "origin",
     [
-        "git@github.com:example-org/MindRoom-redwood.git",
+        "git@github.com:example-org/MindRoom-builder.git",
         "https://evil.example/other.git",
     ],
 )
@@ -1194,7 +1194,7 @@ async def test_immutable_binding_collision_is_not_disclosed_or_rebound(tmp_path:
     request = RepositoryEnsureRequest(
         worker_key=target.worker_key,
         organization="example-org",
-        repository_name="MindRoom-redwood",
+        repository_name="MindRoom-builder",
     )
     RepositoryBindingStore(_runtime_paths(tmp_path)).bind(request, _lease(repository_id="7"))
     tool = _tool(tmp_path, broker=_FakeBroker(lease=_lease(repository_id="99")))
@@ -1235,7 +1235,7 @@ async def test_incomplete_existing_git_directory_fails_without_mutation(tmp_path
     git_directory.mkdir(parents=True)
     config = git_directory / "config"
     config.write_text(
-        '[remote "origin"]\n\turl = https://github.com/example-org/MindRoom-redwood.git\n',
+        '[remote "origin"]\n\turl = https://github.com/example-org/MindRoom-builder.git\n',
         encoding="utf-8",
     )
     config_before = config.read_bytes()

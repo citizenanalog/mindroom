@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 def _target(
     *,
-    agent_name: str = "redwood",
+    agent_name: str = "builder",
     worker_scope: str = "shared",
     requester_id: str | None = None,
     private: bool = False,
@@ -59,7 +59,7 @@ def _request(target: ResolvedWorkerTarget, name: str) -> RepositoryEnsureRequest
     )
 
 
-def _lease(name: str = "MindRoom-redwood", repository_id: str = "42") -> RepositoryLease:
+def _lease(name: str = "MindRoom-builder", repository_id: str = "42") -> RepositoryLease:
     return RepositoryLease(
         repository_id=repository_id,
         organization="example-org",
@@ -72,7 +72,7 @@ def test_shared_repository_name_has_no_requester_suffix() -> None:
     """Shared agents should own exactly one repository across requesters."""
     target = _target(requester_id="@ignored:example.test")
 
-    assert derive_repository_name(prefix="MindRoom", worker_target=target) == "MindRoom-redwood"
+    assert derive_repository_name(prefix="MindRoom", worker_target=target) == "MindRoom-builder"
 
 
 def test_private_repository_name_uses_matrix_requester_localpart() -> None:
@@ -150,7 +150,7 @@ def test_repository_binding_uses_configured_storage_root(tmp_path: Path) -> None
         process_env={},
     )
     target = _target()
-    request = _request(target, "MindRoom-redwood")
+    request = _request(target, "MindRoom-builder")
     store = RepositoryBindingStore(runtime_paths)
 
     binding = store.bind(request, _lease())
@@ -169,7 +169,7 @@ def test_repository_binding_is_idempotent_and_write_once(tmp_path: Path) -> None
         process_env={},
     )
     target = _target()
-    request = _request(target, "MindRoom-redwood")
+    request = _request(target, "MindRoom-builder")
     store = RepositoryBindingStore(runtime_paths)
 
     first = store.bind(request, _lease(repository_id="42"))
@@ -191,7 +191,7 @@ def test_repository_binding_rejects_non_integer_version(tmp_path: Path, invalid_
     target = _target()
     assert target.worker_key is not None
     store = RepositoryBindingStore(runtime_paths)
-    store.bind(_request(target, "MindRoom-redwood"), _lease())
+    store.bind(_request(target, "MindRoom-builder"), _lease())
     binding_path = next((runtime_paths.storage_root / "repository_bindings").glob("*.json"))
     payload = json.loads(binding_path.read_text(encoding="utf-8"))
     payload["version"] = invalid_version
@@ -209,7 +209,7 @@ def test_repository_binding_serializes_concurrent_writers(tmp_path: Path) -> Non
         process_env={},
     )
     target = _target()
-    request = _request(target, "MindRoom-redwood")
+    request = _request(target, "MindRoom-builder")
     store = RepositoryBindingStore(runtime_paths)
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -225,13 +225,13 @@ def test_repository_binding_serializes_concurrent_writers(tmp_path: Path) -> Non
     [
         replace(_lease(), organization="other"),
         replace(_lease(), repository_name="MindRoom-other"),
-        replace(_lease(), clone_url="https://token@github.com/example-org/MindRoom-redwood.git"),
-        replace(_lease(), clone_url="https://evil.test/example-org/MindRoom-redwood.git"),
-        replace(_lease(), clone_url=" https://github.com/example-org/MindRoom-redwood.git"),
-        replace(_lease(), clone_url="https://github.com/example-org/MindRoom-redwood.git\n"),
-        replace(_lease(), clone_url="https://github.com/example-org/MindRoom-redwood.git?"),
-        replace(_lease(), clone_url="https://github.com/example-org/MindRoom-redwood.git#"),
-        replace(_lease(), clone_url="https://GITHUB.com/example-org/MindRoom-redwood.git"),
+        replace(_lease(), clone_url="https://token@github.com/example-org/MindRoom-builder.git"),
+        replace(_lease(), clone_url="https://evil.test/example-org/MindRoom-builder.git"),
+        replace(_lease(), clone_url=" https://github.com/example-org/MindRoom-builder.git"),
+        replace(_lease(), clone_url="https://github.com/example-org/MindRoom-builder.git\n"),
+        replace(_lease(), clone_url="https://github.com/example-org/MindRoom-builder.git?"),
+        replace(_lease(), clone_url="https://github.com/example-org/MindRoom-builder.git#"),
+        replace(_lease(), clone_url="https://GITHUB.com/example-org/MindRoom-builder.git"),
     ],
 )
 def test_repository_binding_rejects_untrusted_lease_fields(
@@ -244,7 +244,7 @@ def test_repository_binding_rejects_untrusted_lease_fields(
         storage_path=tmp_path / "data",
         process_env={},
     )
-    request = _request(_target(), "MindRoom-redwood")
+    request = _request(_target(), "MindRoom-builder")
 
     with pytest.raises(RepositoryBindingError):
         RepositoryBindingStore(runtime_paths).bind(request, lease)
