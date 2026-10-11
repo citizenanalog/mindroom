@@ -141,7 +141,8 @@ class _BuiltRequests:
     target: weakref.ref[object]
     # Sessions by run id, oldest first; parallel delegations can run one member several times at once.
     sessions: dict[str, AgentSession | TeamSession] = field(default_factory=dict)
-    # Continuation builders get no run id, so the first request after one claims its session.
+    # Continuation builders get no run id, so the first request after one claims its session, replacing the
+    # session its run's earlier loop was built from.
     unclaimed: AgentSession | TeamSession | None = None
 
 
@@ -157,7 +158,8 @@ def built_request_session(target: Agent | Team, run_id: str) -> AgentSession | T
     built = _BUILT_REQUESTS.get(id(target))
     if built is None or built.target() is not target:
         return None
-    if run_id not in built.sessions and built.unclaimed is not None:
+    if built.unclaimed is not None:
+        built.sessions.pop(run_id, None)
         built.sessions[run_id], built.unclaimed = built.unclaimed, None
     return built.sessions.get(run_id)
 

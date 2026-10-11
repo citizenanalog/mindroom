@@ -1173,6 +1173,41 @@ async def test_approval_resume_after_mid_turn_compaction(tmp_path: Path, summary
 
 
 @pytest.mark.asyncio
+async def test_compaction_after_an_approval_resume_reaches_the_stored_session(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+
+    class _PausingLoop(_ToolLoopModel):
+        async def ainvoke(self, messages: list[Message], **kwargs: object) -> ModelResponse:
+            response = await super().ainvoke(messages, **kwargs)
+            if len(self.requests) == 5 and response.tool_calls:
+                response.tool_calls[0]["function"]["name"] = "approve_me"
+            return response
+
+    model = _PausingLoop(tool_rounds=12)
+    agent = _scoped_agent(model, config, paths, storage)
+    agent.tools = [probe, Function(name="approve_me", entrypoint=lambda: "approved", requires_confirmation=True)]
+    paused = await agent.arun("Do the task", session_id="session-1")
+    assert paused.status == RunStatus.paused
+    compactions_before_resume = len(summary_calls.inputs)
+    for requirement in paused.requirements or []:
+        requirement.confirm()
+
+    await agent.acontinue_run(run_id=paused.run_id, requirements=paused.requirements, session_id="session-1")
+
+    assert len(summary_calls.inputs) > compactions_before_resume
+    stored = get_agent_session(storage, "session-1")
+    generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert stored is not None
+    assert stored.summary is not None
+    assert generation is not None
+    assert stored.summary.summary == generation.summary
+
+
+@pytest.mark.asyncio
 async def test_team_approval_resume_after_mid_turn_compaction(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(
         tmp_path,
@@ -1223,6 +1258,16 @@ async def test_team_approval_resume_after_mid_turn_compaction(tmp_path: Path, su
     summaries = [message for message in resumed.messages if is_compaction_summary(message)]
     assert len(summaries) == 1
     assert summaries[0].content == next(m.content for m in paused_request.messages if is_compaction_summary(m))
+    stored = get_team_session(storage, "session-1")
+    generation = archive.latest_generation(
+        storage,
+        session_id="session-1",
+        scope_key=HistoryScope(kind="team", scope_id="test_team").key,
+    )
+    assert stored is not None
+    assert stored.summary is not None
+    assert generation is not None
+    assert stored.summary.summary == generation.summary
 
 
 @pytest.mark.asyncio
