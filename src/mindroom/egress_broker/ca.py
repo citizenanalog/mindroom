@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import ipaddress
 import os
 import ssl
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -54,10 +53,14 @@ class BrokerCA:
         self._ca_cert = ca_cert
         self._ca_key = ca_key
         self._cert_pem = cert_pem
-        self._directory = directory
 
-        # Leaf certificate and key (shared across all contexts in this process)
+        # Leaf key, shared across all contexts in this process; each leaf's chain file ends with the CA and this key.
         self._leaf_key = ec.generate_private_key(ec.SECP256R1())
+        self._chain_tail = self._ca_cert.public_bytes(serialization.Encoding.PEM) + self._leaf_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
 
         # Cache: host -> (context, valid_until_timestamp)
         self._cache: OrderedDict[str, tuple[ssl.SSLContext, float]] = OrderedDict()
@@ -71,12 +74,6 @@ class BrokerCA:
     def cert_pem(self) -> str:
         """Return CA certificate in PEM format."""
         return self._cert_pem
-
-    @property
-    def fingerprint(self) -> str:
-        """Return SHA-256 fingerprint of CA certificate in hex."""
-        der = self._ca_cert.public_bytes(serialization.Encoding.DER)
-        return hashlib.sha256(der).hexdigest()
 
     @staticmethod
     def load_or_create(
@@ -208,37 +205,14 @@ class BrokerCA:
         ctx: ssl.SSLContext,
         leaf_cert: x509.Certificate,
     ) -> None:
-        """Load leaf certificate and key into context via temp file."""
-        # Write cert chain (leaf + CA) and key to temp file
-        cert_pem = leaf_cert.public_bytes(serialization.Encoding.PEM)
-        ca_pem = self._ca_cert.public_bytes(serialization.Encoding.PEM)
-        key_pem = self._leaf_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
+        """Load the leaf, the CA, and the leaf key into `ctx` through a private temp file, since ssl reads only files.
 
-        # Create temp file in leaf temp directory
-        tmp_path = self._leaf_tmp_dir / f"tmp-{os.getpid()}-{time.time_ns()}.pem"
-        fd = os.open(
-            tmp_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        try:
-            # Write cert chain and key
-            os.write(fd, cert_pem + ca_pem + key_pem)
-            os.close(fd)
-            fd = -1  # Mark as closed
-
-            # Load into context
-            ctx.load_cert_chain(tmp_path)
-        finally:
-            if fd != -1:
-                os.close(fd)
-            # Unlink temp file
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
+        The file is created exclusively with mode 0600 in the 0700 leaf directory and removed once loaded.
+        """
+        with tempfile.NamedTemporaryFile(dir=self._leaf_tmp_dir, suffix=".pem") as tmp:
+            tmp.write(leaf_cert.public_bytes(serialization.Encoding.PEM) + self._chain_tail)
+            tmp.flush()
+            ctx.load_cert_chain(tmp.name)
 
 
 def _load_ca_key(key_path: Path, key_password: bytes | None) -> ec.EllipticCurvePrivateKey:
@@ -362,11 +336,8 @@ def materialize_ca_bundle(ca_pem: str, directory: Path) -> tuple[Path, Path]:
     Idempotent: existing files are reused only when their content matches,
     and every write goes through a temp file and an atomic rename.
     """
-    # Compute fingerprint for file naming
-    cert = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
-    der = cert.public_bytes(serialization.Encoding.DER)
-    fingerprint = hashlib.sha256(der).hexdigest()
-    prefix = fingerprint[:16]
+    # Name the files by the certificate's SHA-256 fingerprint
+    prefix = x509.load_pem_x509_certificate(ca_pem.encode("utf-8")).fingerprint(hashes.SHA256()).hex()[:16]
 
     combined_path = directory / f"bundle-{prefix}.pem"
     ca_only_path = directory / f"ca-{prefix}.pem"

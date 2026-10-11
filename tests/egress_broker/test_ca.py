@@ -30,7 +30,6 @@ def test_create_then_load_returns_same_ca(ca_dir: Path) -> None:
     """load_or_create returns same CA across calls."""
     ca1 = BrokerCA.load_or_create(ca_dir, key_password=None)
     ca2 = BrokerCA.load_or_create(ca_dir, key_password=None)
-    assert ca1.fingerprint == ca2.fingerprint
     assert ca1.cert_pem == ca2.cert_pem
 
 
