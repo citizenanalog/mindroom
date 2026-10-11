@@ -307,7 +307,7 @@ async def _compact_scope(
     assert scope is not None
     # Members' runs of this turn exist only in memory until the turn ends, and loading the stored row drops them.
     member_runs = [run for run in session.runs or [] if run.parent_run_id == run_response.run_id]
-    snapshots = _snapshots(run_response, layout)
+    snapshots = _snapshots(run_response, layout, policy.inputs)
     try:
         await run_blocking_until_complete(partial(_prepare_scope_session, storage, session, scope))
         try:
@@ -575,7 +575,11 @@ def _is_queued_notice(message: Message) -> bool:
     return isinstance(message.provider_data, dict) and bool(message.provider_data.get(QUEUED_MESSAGE_NOTICE_MARKER_KEY))
 
 
-def _snapshots(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list[RunOutput | TeamRunOutput]:
+def _snapshots(
+    run_response: RunOutput | TeamRunOutput,
+    layout: _Layout,
+    inputs: HistoryPreparationInputs,
+) -> list[RunOutput | TeamRunOutput]:
     """Return one completed run per folded exchange, oldest first, the first led by the prompt and the run's metadata.
 
     Separate runs let the summary chunker size the turn with the summary model's own estimator and summarize it in
@@ -583,9 +587,10 @@ def _snapshots(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list
     """
     origin = run_response.run_id or ""
     snapshots: list[RunOutput | TeamRunOutput] = []
+    budget_tokens = inputs.execution_plan.summary_input_budget_tokens or 0
     for index, exchange in enumerate(layout.exchanges):
-        lead = (layout.prompt,) if index == 0 and layout.prompt is not None else ()
-        run_messages = [message.model_copy(deep=True) for message in (*lead, *exchange)]
+        lead = (_prompt_context(layout.prompt, budget_tokens),) if index == 0 and layout.prompt is not None else ()
+        run_messages = [*lead, *(message.model_copy(deep=True) for message in exchange)]
         run_id = archive.snapshot_run_id(origin)
         # The run's metadata (provenance for redaction) is the same for every exchange, so the first snapshot holds it.
         metadata = deepcopy(run_response.metadata) if index == 0 else None
@@ -613,6 +618,20 @@ def _snapshots(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list
     return snapshots
 
 
+def _prompt_context(prompt: Message, budget_tokens: int) -> Message:
+    """Return a copy of the prompt for the summarizer's context, bounded so the exchange beside it always fits.
+
+    The prompt stays in the request verbatim, so the summary only needs enough of it to know what the work was for.
+    A quarter as many characters as budget tokens keeps it within a quarter of the input even when the summary
+    model counts bytes.
+    """
+    context = prompt.model_copy(deep=True)
+    limit = max(budget_tokens // 4, 1)
+    if isinstance(context.content, str) and len(context.content) > limit:
+        context.content = context.content[:limit] + "\n[The rest of this request is unchanged in the conversation.]"
+    return context
+
+
 async def _summarize_run_locally(
     binding: _MidTurnCompaction,
     inputs: HistoryPreparationInputs,
@@ -626,7 +645,7 @@ async def _summarize_run_locally(
     summary = await summarize_run_locally(
         resolved_inputs=inputs,
         previous_summary=layout.previous_run_local_summary,
-        snapshots=_snapshots(run_response, layout),
+        snapshots=_snapshots(run_response, layout, inputs),
         scope=scope,
         config=binding.config,
         runtime_paths=binding.runtime_paths,

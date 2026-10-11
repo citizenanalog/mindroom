@@ -534,6 +534,39 @@ async def test_turn_larger_than_one_summary_input_folds_whole_in_chunks(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_a_prompt_larger_than_the_summary_input_keeps_the_first_exchange_in_the_summary(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    *,
+    scoped: bool,
+) -> None:
+    config, paths = _config(tmp_path, context_window=60_000, summary_context_window=8_000)
+    model = _ToolLoopModel(tool_rounds=60)
+    facts = iter(range(100))
+
+    def probe() -> str:
+        """Return one tool result carrying a distinct fact."""
+        return f"FACT-{next(facts):02d} " + "r" * 4_000
+
+    if scoped:
+        storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+        seed_session(storage, _session("session-1"))
+        agent = _scoped_agent(model, config, paths, storage)
+    else:
+        agent = _agent(model, config, paths)
+    agent.tools = [probe]
+    # The prompt fits the model's window but not one summary input.
+    prompt = "Do the task. " + "p" * 40_000
+
+    output = await (_run_in_session(agent, prompt) if scoped else _run(agent, prompt))
+
+    assert str(output.content).endswith("done")
+    assert summary_calls.inputs
+    assert "FACT-00" in "\n".join(summary_calls.inputs)
+
+
+@pytest.mark.asyncio
 async def test_an_exchange_larger_than_the_summary_input_still_folds(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
