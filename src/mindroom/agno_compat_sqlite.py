@@ -13,7 +13,7 @@ from sqlalchemy.dialects.sqlite import insert
 from mindroom.usage.storage import project_usage, usage_table_sql, usage_upsert_sql
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Collection, Iterator
 
     from agno.db.sqlite import SqliteDb
     from agno.run.agent import RunOutput
@@ -67,7 +67,8 @@ def owned_table(db: SqliteDb, table_type: Literal["runs", "sessions"]) -> Table:
 # Upstream PR: https://github.com/agno-agi/agno/pull/9938
 # Remove when: The pinned adapter appends new runs after existing indexes even when
 # given a shortened session-list position; keep owner prompt sanitization.
-# Coverage: tests/test_agent_storage_runs.py::test_runs_appended_after_deleting_leading_runs_sort_after_the_survivors.
+# Coverage: tests/test_agent_storage_runs.py::test_runs_appended_after_deleting_leading_runs_sort_after_the_survivors and
+# tests/test_history_archive.py::test_roll_back_restores_runs_at_their_original_indexes_after_reopening.
 # AGNO_COMPAT: Run persistence has no caller-owned transaction extension point.
 # Reason: SqliteDb.upsert_run commits internally, preventing atomic application-owned usage writes.
 # Upstream issue: No matching transaction extension point identified; the run UPSERT is copied from Agno 3.0.9.
@@ -85,11 +86,14 @@ def insert_run_row(
     *,
     session_id: str,
     user_id: str | None,
+    run_index: int | None = None,
 ) -> Row[Any]:
-    """Upsert one run row at the end of its session inside the caller's transaction."""
+    """Upsert one run row at the end of its session, or at ``run_index``, inside the caller's transaction."""
     row = build_single_run_row(run, session_id=session_id, user_id=user_id, run_index=None)
     row["run_index"] = (
-        select(func.coalesce(func.max(runs.c.run_index) + 1, 0))
+        run_index
+        if run_index is not None
+        else select(func.coalesce(func.max(runs.c.run_index) + 1, 0))
         .where(runs.c.session_id == session_id)
         .scalar_subquery()
     )
@@ -106,6 +110,22 @@ def insert_run_row(
             },
         ).returning(runs.c.session_id, runs.c.run_id, runs.c.run_data, runs.c.created_at),
     ).one()
+
+
+def stored_run_indexes(
+    transaction: Session,
+    runs: Table,
+    run_ids: Collection[str],
+    *,
+    session_id: str,
+) -> dict[str, int]:
+    """Return the live-table index of each stored run, so an owner can later restore it in place."""
+    if not run_ids:
+        return {}
+    rows = transaction.execute(
+        select(runs.c.run_id, runs.c.run_index).where(runs.c.session_id == session_id, runs.c.run_id.in_(run_ids)),
+    )
+    return {run_id: run_index for run_id, run_index in rows if run_index is not None}
 
 
 def move_run_to_end(transaction: Session, runs: Table, run_id: str, *, session_id: str) -> None:

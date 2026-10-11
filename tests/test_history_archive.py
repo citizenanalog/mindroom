@@ -8,12 +8,14 @@ import pytest
 from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.run.agent import RunOutput
+from agno.run.base import RunStatus
 from agno.session.agent import AgentSession
 from agno.session.summary import SessionSummary
 
 from mindroom.agent_storage import create_state_storage, get_agent_session
 from mindroom.constants import MINDROOM_COMPACTION_METADATA_KEY, MINDROOM_MATRIX_HISTORY_METADATA_KEY
 from mindroom.history import archive
+from mindroom.history.archive_schema import archive_table_names
 from tests.conftest import seed_session
 from tests.history_helpers import StoredGeneration, archived_content, compaction_generations
 
@@ -134,6 +136,83 @@ def test_roll_back_restores_earlier_runs_of_the_hit_generation_in_order(storage:
     assert generation.summary == "generation one"
     # Restored runs leave the archive; removed ones stay as content-free tombstones.
     assert archived_content(storage, "session") == {"r1": True, "r4": False, "r4-member": False, "r5": False}
+
+
+def test_roll_back_restores_runs_at_their_original_indexes_after_reopening(tmp_path: Path) -> None:
+    """A restored run returns before a later run that compaction skipped, such as a pending approval."""
+    storage = _open(tmp_path)
+    paused = _run("p")
+    paused.status = RunStatus.paused
+    session = seed_session(
+        storage,
+        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), paused, _run("x")]),
+    )
+    _archive(storage, session, ["r1", "x"], "r1 and x")
+    hit = archive.find_archived_event(storage, session_id="session", scope_key=_SCOPE, event_id="$x")
+    assert hit is not None
+
+    archive.roll_back_to(storage, session_id="session", scope_key=_SCOPE, hit=hit, live_run_ids=())
+    storage.close()
+    reopened = _open(tmp_path)
+    try:
+        assert _live_run_ids(reopened) == ["r1", "p"]
+    finally:
+        reopened.close()
+
+
+def test_runs_archived_without_an_index_are_appended_in_archive_order(storage: SqliteDb) -> None:
+    """Rows archived before runs kept their index return after the live runs, as they always did."""
+    paused = _run("p")
+    paused.status = RunStatus.paused
+    session = seed_session(
+        storage,
+        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), _run("r2"), paused, _run("x")]),
+    )
+    _archive(storage, session, ["r1", "r2", "x"], "r1, r2, and x")
+    _, compacted_runs = archive_table_names("code_sessions")
+    with storage.db_engine.begin() as connection:
+        connection.exec_driver_sql(f"UPDATE {compacted_runs} SET run_index = NULL")  # noqa: S608
+    hit = archive.find_archived_event(storage, session_id="session", scope_key=_SCOPE, event_id="$x")
+    assert hit is not None
+
+    archive.roll_back_to(storage, session_id="session", scope_key=_SCOPE, hit=hit, live_run_ids=())
+
+    assert _live_run_ids(storage) == ["p", "r1", "r2"]
+
+
+def test_an_existing_archive_gains_the_new_columns(tmp_path: Path) -> None:
+    """Archives created before positioned generations read as unpositioned and accept the new fields."""
+    storage = _open(tmp_path)
+    session = _seed(storage, ["r1", "r2"])
+    compactions, compacted_runs = archive_table_names("code_sessions")
+    with storage.db_engine.begin() as connection:
+        for statement in _PREVIOUS_ARCHIVE_DDL:
+            connection.exec_driver_sql(statement.format(compactions=compactions, compacted_runs=compacted_runs))
+        connection.exec_driver_sql(
+            f"INSERT INTO {compactions} (session_id, scope_key, summary, created_at) VALUES ('session', ?, 'old', 0)",  # noqa: S608
+            (_SCOPE,),
+        )
+
+    _archive(storage, session, ["r1"], "new")
+
+    with storage.db_engine.begin() as connection:
+        generation_columns = {row[1] for row in connection.exec_driver_sql(f"PRAGMA table_info({compactions})")}
+        run_columns = {row[1] for row in connection.exec_driver_sql(f"PRAGMA table_info({compacted_runs})")}
+        positions = [row[0] for row in connection.exec_driver_sql(f"SELECT through_run_id FROM {compactions}")]  # noqa: S608
+    assert {"through_run_id", "covered_run_ids", "event_ids", "seen_event_ids"} <= generation_columns
+    assert "run_index" in run_columns
+    assert positions == [None, None]
+    storage.close()
+
+
+_PREVIOUS_ARCHIVE_DDL = (
+    "CREATE TABLE {compactions} (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, scope_key TEXT NOT NULL, "
+    "summary TEXT, summary_model TEXT, legacy INTEGER NOT NULL DEFAULT 0, legacy_event_ids TEXT, "
+    "created_at INTEGER NOT NULL)",
+    "CREATE TABLE {compacted_runs} (id INTEGER PRIMARY KEY, compaction_id INTEGER NOT NULL, session_id TEXT NOT NULL, "
+    "run_id TEXT NOT NULL, run_type TEXT, event_ids TEXT NOT NULL, seen_event_ids TEXT NOT NULL DEFAULT '[]', "
+    "run_data TEXT, UNIQUE(session_id, run_id))",
+)
 
 
 def test_roll_back_drops_member_runs_archived_before_their_hit_team_run(storage: SqliteDb) -> None:

@@ -30,7 +30,7 @@ from agno.db.utils import deserialize_run, get_run_type
 
 from mindroom import agno_compat_sqlite
 from mindroom.agent_storage import delete_run_subtrees, runs_without
-from mindroom.history.archive_schema import archive_schema_sql, archive_table_names
+from mindroom.history.archive_schema import archive_schema_sql, archive_table_names, upgrade_archive_schema
 from mindroom.usage.storage import quote_identifier
 
 if TYPE_CHECKING:
@@ -103,10 +103,20 @@ def archive_runs(
             (session_id, scope_key, summary, summary_model, int(time.time())),
         ).lastrowid
         if archived:
+            indexes = (
+                agno_compat_sqlite.stored_run_indexes(
+                    transaction,
+                    runs_table,
+                    [run_id for run_id, _ in archived],
+                    session_id=session_id,
+                )
+                if runs_table is not None
+                else {}
+            )
             connection.exec_driver_sql(
                 f"INSERT INTO {compacted_runs} "  # noqa: S608
-                "(compaction_id, session_id, run_id, run_type, event_ids, seen_event_ids, run_data) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, run_id) DO NOTHING",
+                "(compaction_id, session_id, run_id, run_type, event_ids, seen_event_ids, run_index, run_data) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, run_id) DO NOTHING",
                 [
                     (
                         compaction_id,
@@ -115,6 +125,7 @@ def archive_runs(
                         get_run_type(run),
                         json.dumps(sorted(event_ids.get(run_id, ()))),
                         json.dumps(sorted(seen_event_ids.get(run_id, ()))),
+                        indexes.get(run_id),
                         json.dumps(run.to_dict()),
                     )
                     for run_id, run in archived
@@ -369,14 +380,16 @@ def roll_back_to(
     with agno_compat_sqlite.run_deletion_transaction(db) as (transaction, runs_table, sessions_table):
         connection = transaction.connection()
         _ensure_tables(connection, db)
-        earlier = [
-            deserialize_run(run_type, run_data)
-            for run_type, run_data in connection.exec_driver_sql(
-                f"SELECT run_type, run_data FROM {compacted_runs} "  # noqa: S608
-                "WHERE compaction_id = ? AND id < ? AND run_data IS NOT NULL ORDER BY id",
-                (hit.generation_id, hit.archived_row_id),
-            )
-        ]
+        indexes: dict[str, int | None] = {}
+        earlier = []
+        for run_type, run_data, run_index in connection.exec_driver_sql(
+            f"SELECT run_type, run_data, run_index FROM {compacted_runs} "  # noqa: S608
+            "WHERE compaction_id = ? AND id < ? AND run_data IS NOT NULL ORDER BY id",
+            (hit.generation_id, hit.archived_row_id),
+        ):
+            run = deserialize_run(run_type, run_data)
+            indexes[run.run_id or ""] = run_index
+            earlier.append(run)
         # Member runs are archived with their team run and may precede it; the hit's own
         # members go with the hit. A snapshot of a running turn never becomes a live run.
         restored = [run for run in runs_without(earlier, [hit.run_id]) if snapshot_origin(run.run_id or "") is None]
@@ -397,7 +410,21 @@ def roll_back_to(
             restored_run_ids=[run.run_id for run in restored if run.run_id],
         )
         for run in restored:
-            agno_compat_sqlite.insert_run_row(transaction, runs, run, session_id=session_id, user_id=run.user_id)
+            # LEGACY_COMPAT: Archived runs without their live-table index.
+            # Legacy format: A ``compacted_runs`` row with a NULL ``run_index``, written before archived rows recorded
+            # the run's index in the live table.
+            # Last legacy release: v2026.10.252; replacement: the next release records ``run_index`` on every row.
+            # Handling: The run is appended after the live runs in archive order, as before, so it can follow an
+            # older live run that compaction skipped; rows with an index return to it.
+            # Coverage: tests/test_history_archive.py::test_runs_archived_without_an_index_are_appended_in_archive_order.
+            agno_compat_sqlite.insert_run_row(
+                transaction,
+                runs,
+                run,
+                session_id=session_id,
+                user_id=run.user_id,
+                run_index=indexes.get(run.run_id or ""),
+            )
         for run_id in keep_last:
             agno_compat_sqlite.move_run_to_end(transaction, runs, run_id, session_id=session_id)
 
@@ -462,3 +489,4 @@ def _table_names(db: SqliteDb) -> tuple[str, str]:
 def _ensure_tables(connection: Connection, db: SqliteDb) -> None:
     for statement in archive_schema_sql(db.session_table_name):
         connection.exec_driver_sql(statement)
+    upgrade_archive_schema(connection, db.session_table_name)
