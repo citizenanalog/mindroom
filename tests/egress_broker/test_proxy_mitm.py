@@ -1026,7 +1026,7 @@ async def test_open_tunnel_follows_config_changes(
 
 
 @pytest.mark.asyncio
-async def test_rules_come_from_the_requesters_ownsingle_rule_config(
+async def test_rules_come_from_the_requesters_own_config(
     broker: BrokerFactory,
     tls_upstream: Upstream,
     proxy_client: ProxyClient,
