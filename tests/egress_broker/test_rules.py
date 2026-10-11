@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import re
 
 import pytest
 import yaml
@@ -667,6 +668,224 @@ def test_restricted_by_names_the_first_restricting_service_of_the_failing_party(
         route = route_request(rules, "api.example.com", 443, path)
         assert route.match is not None
         assert (route.match.service, route.restricted_by) == (service, None)
+
+
+_HOST = "api.example.com"
+_OTHER = "other.example.com"
+
+
+def _restricted(*rules: EgressRule) -> EgressService:
+    return EgressService(restrict_to_rules=True, rules=list(rules))
+
+
+# Each case: (row of the `route_request` docstring table, operator services, user services, deny, host, path,
+# expected (host_has_rules, refusal, restricted_by, restricted_by_operator, matched service)).
+_ROUTE_DECISION_CASES = [
+    pytest.param(
+        1,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {},
+        False,
+        _OTHER,
+        "/x",
+        (False, None, None, False, None),
+        id="1-no-rule-names-the-host",
+    ),
+    pytest.param(
+        1,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {},
+        False,
+        _OTHER,
+        "/a/../b",
+        (False, None, None, False, None),
+        id="1-comes-before-the-ambiguous-path-check",
+    ),
+    pytest.param(
+        1,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"mine": EgressService(rules=[_rule(_OTHER)])},
+        True,
+        _OTHER,
+        "/x",
+        (False, None, None, False, None),
+        id="1-deny-keeps-a-user-rule-off-a-host-the-operator-does-not-name",
+    ),
+    pytest.param(
+        1,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"limit": _limit(_rule(_OTHER, "/ok"))},
+        True,
+        _OTHER,
+        "/no",
+        (False, None, None, False, None),
+        id="1-deny-keeps-a-user-limit-off-a-host-the-operator-does-not-name",
+    ),
+    pytest.param(
+        2,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {},
+        False,
+        _HOST,
+        "/a/../b",
+        (True, "bad_request", None, False, None),
+        id="2-ambiguous-path-is-refused-before-any-restriction",
+    ),
+    pytest.param(
+        3,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {"mine": EgressService(rules=[_rule(_HOST)])},
+        False,
+        _HOST,
+        "/b",
+        (True, "path_not_allowed", "op", True, None),
+        id="3-user-rules-cannot-open-an-operator-restricted-path",
+    ),
+    pytest.param(
+        3,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {"limit": _limit(_rule(_HOST, "/b"))},
+        False,
+        _HOST,
+        "/c",
+        (True, "path_not_allowed", "op", True, None),
+        id="3-operator-restriction-is-checked-before-the-user-limit",
+    ),
+    pytest.param(
+        3,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {},
+        True,
+        _HOST,
+        "/b",
+        (True, "path_not_allowed", "op", True, None),
+        id="3-operator-restriction-under-deny",
+    ),
+    pytest.param(
+        4,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"mine": _restricted(_rule(_HOST, "/mine"))},
+        False,
+        _HOST,
+        "/other",
+        (True, "path_not_allowed", "mine", False, None),
+        id="4-user-restrict-to-rules-narrows-the-operator-service",
+    ),
+    pytest.param(
+        4,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"limit": _limit(_rule(_HOST, "/ok"))},
+        False,
+        _HOST,
+        "/no",
+        (True, "path_not_allowed", "limit", False, None),
+        id="4-user-restrict-only-limit-narrows-the-operator-service",
+    ),
+    pytest.param(
+        4,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {"limit": _limit(_rule(_HOST, "/a/ok"))},
+        False,
+        _HOST,
+        "/a/no",
+        (True, "path_not_allowed", "limit", False, None),
+        id="4-user-limit-refuses-a-path-the-operator-restriction-allows",
+    ),
+    pytest.param(
+        4,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"limit": _limit(_rule(_HOST, "/ok"))},
+        True,
+        _HOST,
+        "/no",
+        (True, "path_not_allowed", "limit", False, None),
+        id="4-user-limit-on-an-operator-host-under-deny",
+    ),
+    pytest.param(
+        5,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"limit": _limit(_rule(_HOST, "/ok"))},
+        False,
+        _HOST,
+        "/ok/x",
+        (True, None, None, False, "op"),
+        id="5-restrict-only-rules-never-choose-the-credential",
+    ),
+    pytest.param(
+        5,
+        {},
+        {"limit": _limit(_rule(_HOST, "/ok"))},
+        False,
+        _HOST,
+        "/ok/x",
+        (True, None, None, False, None),
+        id="5-a-limit-alone-forwards-allowed-paths-without-credentials",
+    ),
+    pytest.param(
+        5,
+        {"op": EgressService(rules=[_rule(_HOST)])},
+        {"mine": EgressService(rules=[_rule(_HOST, "/mine")])},
+        False,
+        _HOST,
+        "/mine/x",
+        (True, None, None, False, "mine"),
+        id="5-the-more-specific-user-rule-chooses-the-credential",
+    ),
+    pytest.param(
+        5,
+        {"op": _restricted(_rule(_HOST, "/a"))},
+        {"mine": _restricted(_rule(_HOST, "/a/mine"))},
+        False,
+        _HOST,
+        "/a/mine/x",
+        (True, None, None, False, "mine"),
+        id="5-a-path-both-restrictions-allow-matches",
+    ),
+    pytest.param(
+        5,
+        {"op": EgressService(rules=[_rule(_HOST, "/a")])},
+        {},
+        True,
+        _HOST,
+        "/b",
+        (True, None, None, False, None),
+        id="5-no-matching-rule-goes-out-without-credentials-even-under-deny",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("row", "operator", "user", "deny", "host", "path", "expected"),
+    _ROUTE_DECISION_CASES,
+)
+def test_route_request_follows_its_decision_table(
+    row: int,
+    operator: dict[str, EgressService],
+    user: dict[str, EgressService],
+    deny: bool,
+    host: str,
+    path: str,
+    expected: tuple[bool, str | None, str | None, bool, str | None],
+) -> None:
+    """Each case exercises the row of the `route_request` docstring table it names, so the two cannot drift apart."""
+    route = route_request(_merged(operator, user, deny=deny), host, 443, path)
+
+    decision = (
+        route.host_has_rules,
+        route.refusal,
+        route.restricted_by,
+        route.restricted_by_operator,
+        route.match.service if route.match is not None else None,
+    )
+    assert decision == expected, f"row {row}"
+
+
+def test_route_decision_cases_cover_every_row_of_the_table() -> None:
+    """The cases above name exactly the rows the `route_request` docstring table has."""
+    table_rows = {int(row) for row in re.findall(r"^\s*\| (\d+) ", route_request.__doc__ or "", flags=re.MULTILINE)}
+
+    assert table_rows == {1, 2, 3, 4, 5}
+    assert {case.values[0] for case in _ROUTE_DECISION_CASES} == table_rows
 
 
 @pytest.mark.parametrize(

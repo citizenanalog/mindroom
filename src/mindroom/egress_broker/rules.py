@@ -350,18 +350,56 @@ def _restricting_service(services: Mapping[str, EgressService], host: str, port:
     )
 
 
+def _restriction_refusal(
+    party: Mapping[str, EgressService],
+    host: str,
+    port: int,
+    path: str,
+    *,
+    by_operator: bool,
+) -> Route | None:
+    """Return the `path_not_allowed` route when a service of `party` restricts the host and no rule of `party` matches.
+
+    Every rule of the party counts, `restrict_only` ones included. The refusal names the party's first restricting
+    service, and `by_operator` whether the party is the operator's.
+    """
+    restricted_by = _restricting_service(party, host, port)
+    if restricted_by is None or _best_match(party, host, port, path) is not None:
+        return None
+    return Route(
+        host_has_rules=True,
+        refusal="path_not_allowed",
+        restricted_by=restricted_by,
+        restricted_by_label=party[restricted_by].display_name or restricted_by,
+        restricted_by_operator=by_operator,
+    )
+
+
 def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     """Decide how to handle a request for `path` (origin-form, query removed) on `host`:`port`.
 
-    Hosts without applicable rules are left to `unmatched_hosts` whatever their path. On a host with rules,
-    an ambiguous path is refused before matching, so path tricks cannot select a different rule. Then the path must
-    pass each party's restriction: where an operator service on the host sets `restrict_to_rules` it must match an
-    operator rule, and where one of the requester's own services on the host sets it, it must match one of their
-    rules. So a user's limit narrows the operator's services on that host for that requester alone, and never opens
-    a path the operator's limit refuses. A refusal names the first restricting service of the party it failed.
-    A path that passes gets the most specific applicable rule, operator's or user's, or no credentials without one.
-    Rules of `restrict_only` services count in their party's check but never choose the credential, so a user's
-    limit in place keeps the operator's service, with the user's connection or key, for the paths it allows.
+    The first row whose condition holds decides:
+
+    | Row | Condition                                                         | Route                              |
+    |-----|-------------------------------------------------------------------|------------------------------------|
+    | 1   | No applicable rule names the host and port.                       | `host_has_rules=False`             |
+    | 2   | The path is ambiguous (`is_ambiguous_path`).                      | `refusal="bad_request"` (400)      |
+    | 3   | An operator service restricts the host; no operator rule matches. | `refusal="path_not_allowed"` (403) |
+    | 4   | A user service restricts the host; no user rule matches.          | `refusal="path_not_allowed"` (403) |
+    | 5   | Otherwise.                                                        | `match=match_rule(...)`, or None   |
+
+    Row 1 leaves the request to the caller's `unmatched_hosts`, whatever the path. `EgressRules.applicable` decides
+    which rules apply: under `deny` a user rule applies only on a host and port that an operator rule names.
+    Row 2 refuses before matching, so path tricks cannot select a different rule.
+    Rows 3 and 4 are each party's restriction (`_restriction_refusal`). A service with `restrict_to_rules` or
+    `restrict_only` and a rule for the host restricts it; the path must then match one of that party's rules,
+    `restrict_only` ones included. So a user's limit narrows the operator's services on that host for that requester
+    alone, and never opens a path the operator's limit refuses. The refusal names the party's first restricting
+    service and sets `restricted_by_operator` in row 3.
+    Row 5 chooses the credential: the most specific applicable rule, operator's or user's, outside `restrict_only`
+    services. So a user's limit in place keeps the operator's service, with the user's connection or key, for the
+    paths it allows. With no matching rule the request goes out without credentials; `unmatched_hosts` does not
+    apply, since the host has rules.
     """
     host = host.lower()
     config = rules.applicable(host, port)
@@ -372,17 +410,13 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     operator = rules.operator.services
     # A user service never takes an operator service's name, so the names tell the parties apart.
     user = {name: service for name, service in config.services.items() if name not in operator}
-    for party in (operator, user):
-        restricted_by = _restricting_service(party, host, port)
-        if restricted_by is not None and _best_match(party, host, port, path) is None:
-            return Route(
-                host_has_rules=True,
-                refusal="path_not_allowed",
-                restricted_by=restricted_by,
-                restricted_by_label=party[restricted_by].display_name or restricted_by,
-                restricted_by_operator=party is operator,
-            )
-    return Route(host_has_rules=True, match=_best_match(_credential_services(config.services), host, port, path))
+    operator_refusal = _restriction_refusal(operator, host, port, path, by_operator=True)
+    if operator_refusal is not None:
+        return operator_refusal
+    user_refusal = _restriction_refusal(user, host, port, path, by_operator=False)
+    if user_refusal is not None:
+        return user_refusal
+    return Route(host_has_rules=True, match=match_rule(config, host, port, path))
 
 
 def _inject_query_param(target: bytes, param_name: str, template: str, secret: str) -> bytes:
