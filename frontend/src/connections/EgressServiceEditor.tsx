@@ -329,7 +329,6 @@ export function EgressServiceEditor({
       )
       ?.focus();
   }, [focusRequest]);
-  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
 
   const set = (changes: Partial<EgressServiceForm>) => {
     setConfirmingSave(false);
@@ -471,11 +470,10 @@ export function EgressServiceEditor({
   };
 
   const remove = async () => {
-    if (!onDelete) return;
     setBusy("delete");
     setServerError(null);
     try {
-      await onDelete();
+      await onDelete?.();
     } catch (cause) {
       setServerError(
         reasonOf(cause, "Could not delete the service. Try again."),

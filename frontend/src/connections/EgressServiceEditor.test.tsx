@@ -1214,15 +1214,6 @@ describe("reporting unsaved changes", () => {
     });
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
   });
-
-  it("says it is clean again when it closes", async () => {
-    const onDirtyChange = vi.fn();
-    await renderEditor({ onDirtyChange });
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "x" } });
-    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
-    cleanup();
-    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
-  });
 });
 
 describe("a service with values emptied on purpose", () => {

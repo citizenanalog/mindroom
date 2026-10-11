@@ -349,14 +349,6 @@ describe("the account login a preset service keeps", () => {
       }),
     ).toEqual({ rules: [] });
   });
-
-  it("drops every preset's login on a shared target while the presets are still loading", () => {
-    const loading: EditorOptions = { ...sharedPersonal, presets: null };
-    expect(serialize({ preset: "openai" }, loading)).toEqual({
-      preset: "openai",
-      oauth_provider: null,
-    });
-  });
 });
 
 describe("the way the key is sent", () => {

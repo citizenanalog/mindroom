@@ -22,7 +22,7 @@ export interface EditorOptions {
   context: EditorContext;
   /** Shared and unscoped agents cannot use personal accounts, so OAuth is off. */
   sharedTarget: boolean;
-  /** The server's presets; `null` while they load, which a shared target treats as "may carry a login". */
+  /** The server's presets; `null` while they load, when the form cannot be saved yet. */
   presets: readonly EgressPreset[] | null;
   /**
    * What the server checks when a service is saved, from the presets
@@ -273,12 +273,11 @@ export function serializeService(
   return authored;
 }
 
-/** Whether a preset carries an account login; unknown while the presets are not loaded, so assume it may. */
+/** Whether a preset carries an account login. */
 export function presetHasLogin(
   presetId: string,
   options: Pick<EditorOptions, "presets">,
 ): boolean {
-  if (options.presets === null) return true;
   return presetOf(options.presets, presetId)?.oauth_provider != null;
 }
 

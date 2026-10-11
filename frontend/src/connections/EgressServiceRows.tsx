@@ -4,8 +4,6 @@ import { EgressServiceItem, type ServicePaths } from "./EgressServiceItem";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import type { EgressCredentialList, EgressCredentialService } from "./types";
 
-export type { RowAgent, ServiceEditing } from "./egressRowText";
-
 type AccountAction = "connect" | "disconnect";
 
 /** Where one service's secret is written and its account is connected. */

@@ -10,11 +10,8 @@ import {
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { githubRepositoryRules } from "./githubRepositoryRules";
-import {
-  EgressServiceRows as Rows,
-  type RowAgent,
-  type ServiceEditing,
-} from "./EgressServiceRows";
+import type { RowAgent, ServiceEditing } from "./egressRowText";
+import { EgressServiceRows as Rows } from "./EgressServiceRows";
 import type {
   EgressCredentialService,
   EgressOAuthStatus,

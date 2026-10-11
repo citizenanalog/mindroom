@@ -31,12 +31,11 @@ function InactiveServiceRow({
   const [error, setError] = useState<string | null>(null);
 
   const remove = async () => {
-    if (!onDelete) return;
     setConfirming(false);
     setBusy(true);
     setError(null);
     try {
-      await onDelete(service.name);
+      await onDelete?.(service.name);
     } catch (cause) {
       setError(
         cause instanceof Error && cause.message

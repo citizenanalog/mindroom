@@ -150,11 +150,10 @@ export function EgressServiceItem({
 
   const deleteService = async () => {
     setConfirm(null);
-    if (!serviceEditing) return;
     setBusy("delete");
     setError(null);
     try {
-      await serviceEditing.onDelete(service);
+      await serviceEditing?.onDelete(service);
     } catch (cause) {
       setError(
         cause instanceof Error && cause.message

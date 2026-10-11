@@ -12,10 +12,8 @@ import {
   DiscardEditsNotice,
   EgressServiceEditor,
 } from "@/connections/EgressServiceEditor";
-import {
-  EgressServiceRows,
-  type ServiceEditing,
-} from "@/connections/EgressServiceRows";
+import type { ServiceEditing } from "@/connections/egressRowText";
+import { EgressServiceRows } from "@/connections/EgressServiceRows";
 import type { RequestErrorMessages } from "@/connections/request";
 import type {
   AuthoredEgressService,

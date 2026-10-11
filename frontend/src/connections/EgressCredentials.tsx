@@ -16,12 +16,8 @@ import { ConnectionsHeader } from "./ConnectionsHeader";
 import { InactiveServices } from "./EgressInactiveServices";
 import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
 import { configPlaceholderOwners } from "./egressServiceNotes";
-import {
-  EgressServiceRows,
-  keyPath,
-  type RowAgent,
-  type ServiceEditing,
-} from "./EgressServiceRows";
+import type { RowAgent, ServiceEditing } from "./egressRowText";
+import { EgressServiceRows, keyPath } from "./EgressServiceRows";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
 import type {

@@ -13,31 +13,22 @@ const LINKS: readonly { page: Page; href: string; label: string }[] = [
   { page: "keys", href: "/connections/egress", label: "API keys and accounts" },
 ];
 
-/**
- * What someone sent here, such as a non-administrator turned away from the
- * dashboard, is told on arriving. A map, since the id comes from the address
- * and must never reach an inherited property such as `constructor`.
- */
-const NOTICES: ReadonlyMap<string, string> = new Map([
-  [
-    "admin-only",
-    "The dashboard is for administrators. Manage your agents' keys and accounts here.",
-  ],
-]);
+/** What a non-administrator turned away from the dashboard is told on arriving, with `notice=admin-only`. */
+const ADMIN_ONLY_NOTICE =
+  "The dashboard is for administrators. Manage your agents' keys and accounts here.";
 
 const dismissedKey = (id: string) => `connections-notice-dismissed:${id}`;
 
 /** The notice the address asks for, unless it was dismissed in this browser session. */
 function noticeFromAddress(): { id: string; text: string } | null {
-  const id = new URLSearchParams(window.location.search).get("notice") ?? "";
-  const text = NOTICES.get(id);
-  if (text === undefined) return null;
+  const id = new URLSearchParams(window.location.search).get("notice");
+  if (id !== "admin-only") return null;
   try {
     if (window.sessionStorage.getItem(dismissedKey(id)) !== null) return null;
   } catch {
     // Storage can be off, in which case the notice is simply shown.
   }
-  return { id, text };
+  return { id, text: ADMIN_ONLY_NOTICE };
 }
 
 /**
