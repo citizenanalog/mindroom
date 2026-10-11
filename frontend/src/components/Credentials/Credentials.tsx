@@ -464,15 +464,19 @@ export function Credentials() {
               <button
                 type="button"
                 aria-expanded={rawOpen}
-                aria-controls="raw-credential-payloads"
-                onClick={() => setRawOpen((open) => !open)}
+                aria-controls={rawOpen ? "raw-credential-payloads" : undefined}
+                onClick={() => {
+                  // Collapsing hides the payloads again, so they are never left showing.
+                  if (rawOpen) setIsJsonVisible(false);
+                  setRawOpen(!rawOpen);
+                }}
                 className="flex w-full items-center justify-between gap-2 text-left"
               >
                 Raw credential payloads (advanced)
                 <ChevronDown
                   aria-hidden="true"
                   className={cn(
-                    "h-5 w-5 shrink-0 text-muted-foreground transition-transform",
+                    "h-5 w-5 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none",
                     rawOpen && "rotate-180",
                   )}
                 />

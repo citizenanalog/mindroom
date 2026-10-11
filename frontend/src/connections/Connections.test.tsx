@@ -782,6 +782,81 @@ describe("connections", () => {
     },
   );
 
+  it.each([
+    [true, "Disconnect for Mail"],
+    [false, "Connect Mail"],
+  ])(
+    "reads the status once when the popup closes without answering, and treats connected=%s as the answer",
+    async (connectedAfter, expectedButton) => {
+      const popup = {
+        closed: false,
+        close: vi.fn(),
+        location: { href: "about:blank" },
+      };
+      vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+      let connected = false;
+      let statusReads = 0;
+      installApi({
+        "/api/connections/agents/personal/mail/status": async () => {
+          statusReads += 1;
+          return json({ ...status, connected });
+        },
+        "/api/connections/agents/personal/mail/connect": async () =>
+          json({
+            provider: "mail",
+            auth_url: "https://auth.example.com/start",
+            completion_origin: window.location.origin,
+          }),
+      });
+      render(<Connections />);
+      await expandAgent();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Connect Mail" }),
+      );
+      await waitFor(() =>
+        expect(popup.location.href).toBe("https://auth.example.com/start"),
+      );
+      const readsBefore = statusReads;
+      connected = connectedAfter;
+      popup.closed = true;
+      if (!connectedAfter)
+        expect(
+          await screen.findByRole("alert", {}, { timeout: 3000 }),
+        ).toHaveTextContent("Authorization was cancelled.");
+      expect(
+        await screen.findByRole(
+          "button",
+          { name: expectedButton },
+          { timeout: 3000 },
+        ),
+      ).toBeEnabled();
+      // One read to decide; a connection also reloads the portal's own status.
+      if (connectedAfter)
+        expect(statusReads - readsBefore).toBeGreaterThanOrEqual(1);
+      else expect(statusReads - readsBefore).toBe(1);
+    },
+  );
+
+  it("points an agent's toggle at its details only while they are shown", async () => {
+    installApi();
+    render(<Connections />);
+    const toggle = await screen.findByRole("button", {
+      name: "Expand Personal assistant",
+    });
+    expect(toggle).not.toHaveAttribute("aria-controls");
+    fireEvent.click(toggle);
+    const opened = screen.getByRole("button", {
+      name: "Collapse Personal assistant",
+    });
+    expect(
+      document.getElementById(opened.getAttribute("aria-controls") ?? ""),
+    ).not.toBeNull();
+    fireEvent.click(opened);
+    expect(
+      screen.getByRole("button", { name: "Expand Personal assistant" }),
+    ).not.toHaveAttribute("aria-controls");
+  });
+
   it("shows an empty state for no configured services", async () => {
     installApi({
       "/api/connections": async () => json(catalog([])),

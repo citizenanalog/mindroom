@@ -33,16 +33,23 @@ export const EMPTY_HELPER_INPUT: HelperInput = {
 };
 
 /**
- * The choices behind a limit service's rules, for opening it again, and
- * whether the helper can write exactly those rules back. When it cannot,
- * changing the repositories replaces rules the list does not show.
+ * The choices behind a limit service's rules, for opening it again, whether the
+ * helper can write exactly those rules back, and the labels it wrote, which
+ * the next apply may rewrite. When it cannot write the rules back, changing
+ * the repositories replaces rules the list does not show. Labels the person
+ * wrote themselves are not the helper's, so they stay.
  */
 export function restoredHelperInput(service: AuthoredEgressService | null): {
   input: HelperInput;
   exact: boolean;
+  labels: HelperLabels;
 } {
   if (service?.restrict_only !== true)
-    return { input: EMPTY_HELPER_INPUT, exact: true };
+    return {
+      input: EMPTY_HELPER_INPUT,
+      exact: true,
+      labels: { displayName: "", description: "" },
+    };
   const limit = parseGithubLimit(
     (service.rules ?? []).map((rule) => ({
       host: rule.host,
@@ -50,6 +57,7 @@ export function restoredHelperInput(service: AuthoredEgressService | null): {
       path_prefix: rule.path_prefix ?? "/",
     })),
   );
+  const written = githubLimitLabels(limit.repositories);
   return {
     input: {
       repositories: limit.repositories.join("\n"),
@@ -57,6 +65,12 @@ export function restoredHelperInput(service: AuthoredEgressService | null): {
       graphql: limit.graphql,
     },
     exact: limit.exact,
+    labels: {
+      displayName:
+        service.display_name === written.displayName ? written.displayName : "",
+      description:
+        service.description === written.description ? written.description : "",
+    },
   };
 }
 

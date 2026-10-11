@@ -191,7 +191,8 @@ export interface EgressRule {
   host: string;
   port?: number;
   path_prefix?: string;
-  auth: EgressAuth;
+  /** Required unless the service is restrict-only, whose rules send nothing and may leave it out. */
+  auth?: EgressAuth;
 }
 
 /** A service as written in config.yaml or stored for a user: a preset stays `{preset: "github"}`. */

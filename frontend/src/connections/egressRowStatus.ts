@@ -1,6 +1,6 @@
 import { formatList, sharedAccountStatus } from "./accountCopy";
 import { BROKERED_PLACEHOLDER } from "./egressServiceModel";
-import { limitedRepositories, parseGithubLimit } from "./githubLimits";
+import { GRAPHQL_CAVEAT, limitedTo, parseGithubLimit } from "./githubLimits";
 import type {
   EgressCredentialService,
   EgressOAuthStatus,
@@ -126,11 +126,16 @@ export function servicesUsingAccount(
     .map((other) => other.display_name);
 }
 
-/** "Limited to a/b" for a service whose rules reach only some repositories, unless its description already says so. */
+/**
+ * "Limited to a/b" for a service whose rules reach only some repositories,
+ * unless its description already says so. A limit that allows GraphQL adds
+ * that GraphQL reaches every repository the key can reach.
+ */
 export function limitedNote(service: EgressCredentialService): string | null {
-  const repositories = limitedRepositories(service.rules);
-  if (repositories.length === 0) return null;
-  const text = `Limited to ${repositories.join(", ")}`;
+  const limit = limitedTo(service.rules);
+  if (limit === null) return null;
+  const caveat = limit.graphql ? ` (${GRAPHQL_CAVEAT})` : "";
+  const text = `Limited to ${limit.repositories.join(", ")}${caveat}`;
   return service.description === text ? null : text;
 }
 
@@ -203,10 +208,15 @@ export function unsetNote(service: EgressCredentialService): string | null {
     : `While no key is set, requests to ${formatList(hosts)} are refused.`;
 }
 
-/** The repositories a limit names, as `a/b, c/*`; "selected paths" when its rules name none. */
+/**
+ * The repositories a limit names, as `a/b, c/*`, or "selected paths" when its
+ * rules name none, followed by what GraphQL reaches when the limit allows it.
+ */
 export function limitTarget(limit: EgressCredentialService): string {
-  const { repositories } = parseGithubLimit(limit.rules);
-  return repositories.length > 0 ? repositories.join(", ") : "selected paths";
+  const { repositories, graphql } = parseGithubLimit(limit.rules);
+  const target =
+    repositories.length > 0 ? repositories.join(", ") : "selected paths";
+  return graphql ? `${target} (${GRAPHQL_CAVEAT})` : target;
 }
 
 /**

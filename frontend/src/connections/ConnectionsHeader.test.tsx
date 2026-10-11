@@ -107,12 +107,17 @@ describe("connections header", () => {
 describe("the notice after a redirect from the dashboard", () => {
   const NOTICE =
     "The dashboard is for administrators. Manage your agents' keys and accounts here.";
-  afterEach(() => window.history.replaceState({}, "", "/"));
+  afterEach(() => {
+    window.history.replaceState({}, "", "/");
+    window.sessionStorage.clear();
+  });
 
-  it("tells someone sent here from the dashboard that it is for administrators", () => {
+  it("tells someone sent here from the dashboard that it is for administrators, politely", () => {
     window.history.replaceState({}, "", "/connections?notice=admin-only");
     renderHeader();
-    expect(screen.getByRole("alert")).toHaveTextContent(NOTICE);
+    // It is told on arrival and is not an error, so a screen reader reads it as a status.
+    expect(screen.getByRole("status")).toHaveTextContent(NOTICE);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("shows nothing without the notice, or for one it does not know", () => {
@@ -121,15 +126,79 @@ describe("the notice after a redirect from the dashboard", () => {
     cleanup();
     window.history.replaceState({}, "", "/connections?notice=something-else");
     renderHeader();
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
     cleanup();
     window.history.replaceState({}, "", "/connections?notice=");
     renderHeader();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it.each([
+    "__proto__",
+    "constructor",
+    "toString",
+    "hasOwnProperty",
+    "valueOf",
+    "ADMIN-ONLY",
+  ])("never reads %s from an inherited property of the notices", (id) => {
+    window.history.replaceState({}, "", `/connections?notice=${id}`);
+    renderHeader();
+    expect(screen.queryByRole("status")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.body).not.toHaveTextContent("[object");
+    expect(document.body).not.toHaveTextContent("function");
+  });
+
+  it("can be dismissed, and stays dismissed for the browser session", () => {
+    window.history.replaceState({}, "", "/connections?notice=admin-only");
+    renderHeader();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    cleanup();
+    renderHeader();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    // A new session has not dismissed it.
+    window.sessionStorage.clear();
+    cleanup();
+    renderHeader();
+    expect(screen.getByText(NOTICE)).toBeVisible();
+  });
+
+  it("is simply shown when storage is not available", () => {
+    window.history.replaceState({}, "", "/connections?notice=admin-only");
+    const blocked = vi
+      .spyOn(Storage.prototype, "getItem")
+      .mockImplementation(() => {
+        throw new Error("storage is off");
+      });
+    const blockedSet = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new Error("storage is off");
+      });
+    renderHeader();
+    expect(screen.getByText(NOTICE)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    blocked.mockRestore();
+    blockedSet.mockRestore();
   });
 });
 
 describe("the explanation behind How this works", () => {
+  it("keeps its chevron still for someone who prefers reduced motion", () => {
+    render(
+      <ConnectionsHeader current="keys" title="Your title" howItWorks="More.">
+        The intro.
+      </ConnectionsHeader>,
+    );
+    const chevron = screen
+      .getByRole("button", { name: "How this works" })
+      .querySelector("svg");
+    expect(chevron).toHaveClass("transition-transform");
+    expect(chevron).toHaveClass("motion-reduce:transition-none");
+  });
+
   it("is hidden until the disclosure is opened, and offered only when there is one", () => {
     render(
       <ConnectionsHeader
@@ -142,10 +211,15 @@ describe("the explanation behind How this works", () => {
     );
     const toggle = screen.getByRole("button", { name: "How this works" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
+    // There is nothing to point at while it is closed.
+    expect(toggle).not.toHaveAttribute("aria-controls");
     expect(screen.queryByText("The long explanation.")).toBeNull();
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("The long explanation.")).toBeVisible();
+    expect(
+      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
+    ).toHaveTextContent("The long explanation.");
     cleanup();
     renderHeader();
     expect(screen.queryByRole("button", { name: "How this works" })).toBeNull();

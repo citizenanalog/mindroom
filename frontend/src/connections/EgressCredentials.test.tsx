@@ -2013,8 +2013,11 @@ describe("limiting a GitHub service to repositories", () => {
     { host: "api.github.com", port: null, path_prefix: "/" },
     { host: "github.com", port: null, path_prefix: "/" },
   ];
+  // A limit's rules send nothing, so the server keeps them without auth.
   const limitRules = (repositories: string, graphql = false) =>
-    githubRepositoryRules(repositories, { uploads: false, graphql }).rules;
+    githubRepositoryRules(repositories, { uploads: false, graphql }).rules.map(
+      ({ auth: _auth, ...rule }) => rule,
+    );
   const limited = (
     name: string,
     repositories: string,
@@ -2244,7 +2247,9 @@ describe("limiting a GitHub service to repositories", () => {
       method: "PUT",
       path: `${SERVICES}/github-limited`,
       body: {
-        display_name: "GitHub (a/b)",
+        // The labels the editor wrote follow the list.
+        display_name: "GitHub (a/b, c/d)",
+        description: "Limited to a/b, c/d",
         rules: limitRules("a/b\nc/d"),
         restrict_to_rules: true,
         restrict_only: true,
@@ -2315,6 +2320,55 @@ describe("limiting a GitHub service to repositories", () => {
     // The server says why, as it does for every change to a service.
     expect(await screen.findByRole("alert")).toHaveTextContent("Not allowed");
     expect(within(await githubRow()).getByText("Limited to a/b")).toBeVisible();
+  });
+
+  it("says a limit that allows GraphQL reaches every repository through it", async () => {
+    const withGraphql = limited("github-limited", "a/b");
+    withGraphql.rules = [
+      ...(withGraphql.rules ?? []),
+      { host: "api.github.com", port: null, path_prefix: "/graphql" },
+    ];
+    listing[0].services.push(withGraphql);
+    render(<EgressCredentials />);
+    const caveat =
+      "Limited to a/b (plus GraphQL, which reaches every repository the key can reach)";
+    expect(within(await githubRow()).getByText(caveat)).toBeVisible();
+  });
+
+  it("turns every Change and Remove for a limit off while it is being removed, in both rows that show it", async () => {
+    listing[0].services.push(limited("github-limited", "a/b"));
+    let release: () => void = () => undefined;
+    const base = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, options) => {
+      if (options?.method === "DELETE")
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      return base(input, options);
+    });
+    render(<EgressCredentials />);
+    fireEvent.click(
+      within(await githubRow()).getByRole("button", {
+        name: "Remove limit for GitHub",
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Remove limit",
+      }),
+    );
+    const actions = () =>
+      [
+        "Change limit for GitHub",
+        "Remove limit for GitHub",
+        "Change limit for GitHub (a/b)",
+        "Remove limit for GitHub (a/b)",
+      ].map((name) => screen.getByRole("button", { name }));
+    await waitFor(() => {
+      for (const button of actions()) expect(button).toBeDisabled();
+    });
+    release();
+    await waitFor(() => expect(writes()).toHaveLength(1));
   });
 
   it("shows what a limited service is limited to", async () => {
@@ -2492,6 +2546,36 @@ describe("the latest recent requests", () => {
     );
     return screen.findByRole("table", { name: "Recent requests for personal" });
   };
+
+  it("keeps the chevron of Recent requests still for someone who prefers reduced motion", async () => {
+    render(<EgressCredentials />);
+    const toggle = within(
+      await screen.findByRole("region", { name: "Personal Mind" }),
+    ).getByRole("button", { name: "Recent requests" });
+    expect(toggle.querySelector("svg")).toHaveClass(
+      "motion-reduce:transition-none",
+    );
+  });
+
+  it("points Recent requests at its table only while the table is shown", async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/connections/me") return json(identity);
+      if (path === "/api/connections/egress") return json({ agents });
+      return json({ records: records(2) });
+    });
+    render(<EgressCredentials />);
+    const toggle = within(
+      await screen.findByRole("region", { name: "Personal Mind" }),
+    ).getByRole("button", { name: "Recent requests" });
+    expect(toggle).not.toHaveAttribute("aria-controls");
+    fireEvent.click(toggle);
+    expect(
+      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
+    ).not.toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).not.toHaveAttribute("aria-controls");
+  });
 
   it("shows the newest ten and a Show all button with the count", async () => {
     const table = await openLog(25);

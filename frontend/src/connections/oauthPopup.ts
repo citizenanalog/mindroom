@@ -33,10 +33,17 @@ function isAllowedOAuthUrl(url: URL, allowLoopbackHttp: boolean): boolean {
   );
 }
 
+/**
+ * Open the provider's consent page in a popup and settle when it answers.
+ * `confirmConnected`, when given, is asked once if the popup closes without
+ * answering, so a connection that completed before the answer was read is not
+ * reported as cancelled.
+ */
 export async function connectWithPopup(
   provider: string,
   authorize: () => Promise<OAuthAuthorization>,
   signal: AbortSignal,
+  confirmConnected?: () => Promise<boolean>,
 ): Promise<void> {
   if (signal.aborted) throw new Error("Authorization was cancelled.");
   const pageUrl = new URL(window.location.href);
@@ -55,6 +62,7 @@ export async function connectWithPopup(
       pollIntervalMs: 500,
       cancellationMessage: "Authorization was cancelled.",
       errorMessage: "Could not connect. Try again.",
+      confirmConnected,
       onSettled: (error, popupClosesItself) => {
         window.clearTimeout(deadline);
         signal.removeEventListener("abort", onAbort);

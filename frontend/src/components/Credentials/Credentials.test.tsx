@@ -167,6 +167,79 @@ describe("Credentials", () => {
     expect(screen.queryByPlaceholderText('{"api_key":"..."}')).toBeNull();
   });
 
+  it("hides the credentials again when the raw payloads are collapsed", async () => {
+    (global.fetch as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ["github_private"],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          service: "github_private",
+          has_credentials: true,
+          key_names: ["token"],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          service: "github_private",
+          credentials: { token: "ghp_test" },
+        }),
+      });
+
+    renderOpen();
+    const editor = (await screen.findByPlaceholderText(
+      '{"api_key":"..."}',
+    )) as HTMLTextAreaElement;
+    await waitFor(() => expect(editor.value).toContain("ghp_test"));
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    expect(screen.getByRole("button", { name: "Hide" })).toBeInTheDocument();
+    expect(editor).not.toHaveClass("blur-sm");
+
+    const toggle = screen.getByRole("button", {
+      name: "Raw credential payloads (advanced)",
+    });
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    // Opened again, the payload is hidden as it is on first opening.
+    expect(screen.getByRole("button", { name: "Show" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('{"api_key":"..."}')).toHaveClass(
+      "blur-sm",
+    );
+  });
+
+  it("keeps the heading's chevron still for someone who prefers reduced motion", () => {
+    (global.fetch as any).mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    render(<Credentials />);
+    const chevron = screen
+      .getByRole("button", { name: "Raw credential payloads (advanced)" })
+      .querySelector("svg");
+    expect(chevron).toHaveClass("motion-reduce:transition-none");
+  });
+
+  it("points the heading at the payloads only while they are shown", async () => {
+    (global.fetch as any).mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    render(<Credentials />);
+    const toggle = screen.getByRole("button", {
+      name: "Raw credential payloads (advanced)",
+    });
+    expect(toggle).not.toHaveAttribute("aria-controls");
+    fireEvent.click(toggle);
+    expect(
+      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
+    ).not.toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).not.toHaveAttribute("aria-controls");
+  });
+
   it("names the raw editor's save button Save payload", async () => {
     (global.fetch as any).mockResolvedValue({
       ok: true,

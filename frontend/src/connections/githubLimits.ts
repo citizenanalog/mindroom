@@ -50,6 +50,29 @@ export function limitedRepositories(rules: Rules): string[] {
 const isGraphql = (rule: EgressRuleSummary) =>
   hostOf(rule) === "api.github.com" && rule.path_prefix === GRAPHQL_PATH;
 
+/** What a limit is said to reach when GraphQL is among its rules. */
+export const GRAPHQL_CAVEAT =
+  "plus GraphQL, which reaches every repository the key can reach";
+
+/**
+ * The limit a service's rules put on GitHub, when every rule on a GitHub host
+ * names a repository the way the editor's helper writes them, apart from an
+ * allowed GraphQL rule; null for any other service. GraphQL is told apart
+ * because it reaches every repository the key can, so a limit that allows it
+ * must say so.
+ */
+export function limitedTo(
+  rules: Rules,
+): { repositories: string[]; graphql: boolean } | null {
+  const all = rules ?? [];
+  const repositories = limitedRepositories(
+    all.filter((rule) => !isGraphql(rule)),
+  );
+  return repositories.length > 0
+    ? { repositories, graphql: all.some(isGraphql) }
+    : null;
+}
+
 /** What the repository helper's choices were, read back from the rules it wrote. */
 export interface GithubLimit {
   /** `owner/repo` or `owner/*`, in rule order, from every rule that names a repository. */

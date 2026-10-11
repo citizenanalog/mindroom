@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import mindroomLogo from "../../../assets/logo/logo-mark-animated.svgz?url";
 import { requestConnection } from "./request";
 import type { ConnectionsIdentity } from "./types";
@@ -12,17 +13,38 @@ const LINKS: readonly { page: Page; href: string; label: string }[] = [
   { page: "keys", href: "/connections/egress", label: "API keys and accounts" },
 ];
 
-/** What a non-administrator who followed a link to the dashboard is told on arriving here. */
-const NOTICES: Record<string, string> = {
-  "admin-only":
+/**
+ * What someone sent here, such as a non-administrator turned away from the
+ * dashboard, is told on arriving. A map, since the id comes from the address
+ * and must never reach an inherited property such as `constructor`.
+ */
+const NOTICES: ReadonlyMap<string, string> = new Map([
+  [
+    "admin-only",
     "The dashboard is for administrators. Manage your agents' keys and accounts here.",
-};
+  ],
+]);
+
+const dismissedKey = (id: string) => `connections-notice-dismissed:${id}`;
+
+/** The notice the address asks for, unless it was dismissed in this browser session. */
+function noticeFromAddress(): { id: string; text: string } | null {
+  const id = new URLSearchParams(window.location.search).get("notice") ?? "";
+  const text = NOTICES.get(id);
+  if (text === undefined) return null;
+  try {
+    if (window.sessionStorage.getItem(dismissedKey(id)) !== null) return null;
+  } catch {
+    // Storage can be off, in which case the notice is simply shown.
+  }
+  return { id, text };
+}
 
 /**
  * Title, intro, who is signed in, and links between the Connections pages.
  * `howItWorks` is the longer explanation behind a disclosure under the intro.
  * A `notice` in the page's address, such as `admin-only` after a redirect,
- * shows its text above the page.
+ * shows its text above the page until it is dismissed for the session.
  *
  * The identity is a courtesy: when it cannot be loaded the header shows the
  * links without it, and the page's own requests report any real failure.
@@ -40,10 +62,7 @@ export function ConnectionsHeader({
 }) {
   const [identity, setIdentity] = useState<ConnectionsIdentity | null>(null);
   const [explaining, setExplaining] = useState(false);
-  const [notice] = useState(
-    () =>
-      NOTICES[new URLSearchParams(window.location.search).get("notice") ?? ""],
-  );
+  const [notice, setNotice] = useState(noticeFromAddress);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -78,14 +97,14 @@ export function ConnectionsHeader({
               <button
                 type="button"
                 aria-expanded={explaining}
-                aria-controls="how-this-works"
+                aria-controls={explaining ? "how-this-works" : undefined}
                 onClick={() => setExplaining(!explaining)}
                 className="inline-flex items-center gap-1 rounded-md font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 How this works
                 <ChevronDown
                   aria-hidden="true"
-                  className={`h-3.5 w-3.5 transition-transform ${explaining ? "rotate-180" : ""}`}
+                  className={`h-3.5 w-3.5 transition-transform motion-reduce:transition-none ${explaining ? "rotate-180" : ""}`}
                 />
               </button>
               {explaining && <p id="how-this-works">{howItWorks}</p>}
@@ -94,8 +113,26 @@ export function ConnectionsHeader({
         </div>
       </div>
       {notice && (
-        <Alert>
-          <AlertDescription>{notice}</AlertDescription>
+        // Told on arrival, not an error, so it is read politely.
+        <Alert role="status">
+          <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+            {notice.text}
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                try {
+                  window.sessionStorage.setItem(dismissedKey(notice.id), "1");
+                } catch {
+                  // Without storage it stays dismissed until the page is loaded again.
+                }
+                setNotice(null);
+              }}
+            >
+              Dismiss
+            </Button>
+          </AlertDescription>
         </Alert>
       )}
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b pb-3 text-sm">

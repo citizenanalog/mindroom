@@ -17,9 +17,10 @@ import {
   placeholderField,
   presetPlaceholderWarnings,
   ruleField,
+  ruleFormFrom,
   scopeNote,
   serializeService,
-  stripHostInput,
+  splitHostInput,
   suggestedName,
   usesMoreOptions,
   validateService,
@@ -260,12 +261,7 @@ describe("validating a service", () => {
 
   it.each([
     ["", "Host is required"],
-    [
-      "https://api.example.com",
-      "Enter only the host, without https:// or a path",
-    ],
     ["api.example.com:8443", "Host must not contain a port"],
-    ["api.example.com/v1", "Enter only the host, without https:// or a path"],
     ["*.*.example.com", "Host can only have one wildcard label"],
     ["*.com", "Wildcard host must have at least one domain part"],
     ["api.*.com", "Wildcard must be a single leading *. label"],
@@ -1465,28 +1461,35 @@ describe("the display name a new custom service gets", () => {
 
 describe("what the Website field keeps", () => {
   it.each([
-    ["httpbin.org", "httpbin.org"],
-    ["https://httpbin.org", "httpbin.org"],
-    ["http://httpbin.org/anything", "httpbin.org"],
-    ["https://httpbin.org/a?b=1#c", "httpbin.org"],
-    ["httpbin.org/anything", "httpbin.org"],
-    ["httpbin.org?x=1", "httpbin.org"],
-    ["https://api.example.com:8443/v1", "api.example.com:8443"],
-    ["*.example.com/x", "*.example.com"],
-    ["https://", ""],
-    ["https:/", "https:"],
-    ["", ""],
-  ])("turns %j into %j", (typed, kept) => {
-    expect(stripHostInput(typed)).toBe(kept);
+    ["httpbin.org", "httpbin.org", ""],
+    ["https://httpbin.org", "httpbin.org", ""],
+    ["http://httpbin.org/anything", "httpbin.org", "/anything"],
+    ["https://httpbin.org/a?b=1#c", "httpbin.org", "/a"],
+    ["httpbin.org/anything", "httpbin.org", "/anything"],
+    ["httpbin.org/v1/", "httpbin.org", "/v1/"],
+    ["httpbin.org/", "httpbin.org", "/"],
+    ["httpbin.org?x=1", "httpbin.org", ""],
+    ["httpbin.org#top", "httpbin.org", ""],
+    ["https://api.example.com:8443/v1", "api.example.com:8443", "/v1"],
+    ["*.example.com/x", "*.example.com", "/x"],
+    ["https://", "", ""],
+    ["https:/", "https:", "/"],
+    ["", "", ""],
+  ])("turns %j into the host %j and the path %j", (typed, host, path) => {
+    expect(splitHostInput(typed)).toEqual({ host, path });
   });
 });
 
 describe("a service that only limits paths", () => {
+  // Its rules send nothing, so the server keeps them without auth.
+  const noAuth = (rules: EgressRule[]): EgressRule[] =>
+    rules.map(({ auth: _auth, ...rule }) => rule);
   const limit: AuthoredEgressService = {
     display_name: "GitHub (a/b)",
     description: "Limited to a/b",
-    rules: githubRepositoryRules("a/b", { uploads: false, graphql: false })
-      .rules,
+    rules: noAuth(
+      githubRepositoryRules("a/b", { uploads: false, graphql: false }).rules,
+    ),
     restrict_to_rules: true,
     restrict_only: true,
   };
@@ -1496,6 +1499,35 @@ describe("a service that only limits paths", () => {
     expect(form.restrictOnly).toBe(true);
     expect(form.restrictToRules).toBe(true);
     expect(serializeService(form, personal, limit)).toEqual(limit);
+  });
+
+  it("opens a limit whose rules have no auth, with the default way of sending in the form", () => {
+    const form = formFromService("github-limited", limit);
+    expect(form.rules.map((rule) => rule.authType)).toEqual([
+      "bearer",
+      "bearer",
+      "bearer",
+    ]);
+    expect(form.rules[0]).toMatchObject({
+      host: "api.github.com",
+      username: "",
+      headerOrParam: "",
+      template: "",
+    });
+  });
+
+  it("writes the rules of a limit without auth, even when the form's rules came from the helper with it", () => {
+    const form = {
+      ...formFromService("github-limited", null),
+      restrictOnly: true,
+      rules: githubRepositoryRules("a/b", {
+        uploads: false,
+        graphql: false,
+      }).rules.map(ruleFormFrom),
+    };
+    const written = serializeService(form, personal);
+    expect(written.rules).toEqual(limit.rules);
+    expect(written.rules?.some((rule) => "auth" in rule)).toBe(false);
   });
 
   it("writes no login, placeholders, or preset, whatever the form holds", () => {
@@ -1517,6 +1549,7 @@ describe("a service that only limits paths", () => {
       restrictOnly: true,
       rules: [],
     };
+    // The helper shows this one beside the repositories.
     expect(validateService(form, personal, newService)).toEqual([
       {
         field: "rules",
@@ -1536,6 +1569,38 @@ describe("a service that only limits paths", () => {
         takenNames: ["github-limited"],
       }),
     ).toEqual([]);
+  });
+
+  it("refuses more than 50 rules, which a long list of repositories can make", () => {
+    const repositories = Array.from({ length: 17 }, (_, i) => `o/r${i}`);
+    const rules = noAuth(
+      githubRepositoryRules(repositories.join("\n"), {
+        uploads: false,
+        graphql: false,
+      }).rules,
+    );
+    expect(rules).toHaveLength(51);
+    const form = (count: number) => ({
+      ...formFromService("github-limited", { ...limit, rules }),
+      rules: rules.slice(0, count).map(ruleFormFrom),
+    });
+    expect(validateService(form(51), personal, newService)).toEqual([
+      { field: "form", message: "A service can have at most 50 rules" },
+    ]);
+    expect(validateService(form(50), personal, newService)).toEqual([]);
+    // The dashboard has no such limit.
+    expect(validateService(form(51), operator, newService)).toEqual([]);
+  });
+
+  it("refuses a limit larger than 16 KiB, as any personal service is", () => {
+    const form = {
+      ...formFromService("github-limited", limit),
+      displayName: "x".repeat(17 * 1024),
+    };
+    expect(validateService(form, personal, newService)).toEqual([
+      { field: "form", message: "A service can take at most 16 KiB" },
+    ]);
+    expect(validateService(form, operator, newService)).toEqual([]);
   });
 
   it("does not make the other forms restrict-only", () => {

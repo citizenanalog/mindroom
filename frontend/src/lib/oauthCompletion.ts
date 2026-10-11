@@ -7,6 +7,12 @@ interface OAuthCompletionOptions {
   /** What a popup that answered `error` reports. */
   errorMessage?: string;
   /**
+   * Asked once when the popup is found closed without an answer: it may have
+   * connected and closed before its message was read. When it resolves true the
+   * flow counts as connected; when it resolves false or fails, as cancelled.
+   */
+  confirmConnected?: () => Promise<boolean>;
+  /**
    * Called once. `popupClosesItself` is true when the popup's own page
    * answered, and closes itself after a moment so that its text can be read.
    */
@@ -78,7 +84,18 @@ export function watchOAuthCompletion(
     );
   };
   const poll = window.setInterval(() => {
-    if (popup.closed) finish(new Error(options.cancellationMessage));
+    if (!popup.closed) return;
+    // Nothing more to see once it is closed, so ask only once.
+    window.clearInterval(poll);
+    const cancelled = new Error(options.cancellationMessage);
+    if (!options.confirmConnected) {
+      finish(cancelled);
+      return;
+    }
+    options.confirmConnected().then(
+      (connected) => finish(connected ? undefined : cancelled),
+      () => finish(cancelled),
+    );
   }, options.pollIntervalMs);
   window.addEventListener("message", onMessage);
   return {

@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -8,7 +8,7 @@ import {
   type RuleFieldPart,
   type RuleForm,
   applyAuthChoice,
-  stripHostInput,
+  splitHostInput,
 } from "./egressServiceModel";
 
 /**
@@ -93,6 +93,8 @@ export function RuleHostField({
   extra,
 }: RuleEditing) {
   const id = useId();
+  // The path a pasted address carried into the Path prefix, until the next change.
+  const [moved, setMoved] = useState<string | null>(null);
   return (
     <Field
       id={`${id}-host`}
@@ -101,17 +103,32 @@ export function RuleHostField({
       error={errorFor("host")}
     >
       {(control) => (
-        <Input
-          {...control}
-          aria-label={extra ? `Rule ${index + 1} host` : undefined}
-          className={inputClass}
-          value={rule.host}
-          disabled={disabled}
-          // A pasted address keeps only its host.
-          onChange={(event) =>
-            onChange({ ...rule, host: stripHostInput(event.target.value) })
-          }
-        />
+        <>
+          <Input
+            {...control}
+            aria-label={extra ? `Rule ${index + 1} host` : undefined}
+            className={inputClass}
+            value={rule.host}
+            disabled={disabled}
+            // A pasted address keeps its host, and its path goes to the Path prefix when that is empty.
+            onChange={(event) => {
+              const { host, path } = splitHostInput(event.target.value);
+              const move =
+                path !== "" && path !== "/" && rule.pathPrefix.trim() === "";
+              setMoved(move ? path : null);
+              onChange({
+                ...rule,
+                host,
+                ...(move ? { pathPrefix: path } : {}),
+              });
+            }}
+          />
+          {moved !== null && (
+            <p role="status" className="text-xs text-muted-foreground">
+              Moved {moved} to Path prefix
+            </p>
+          )}
+        </>
       )}
     </Field>
   );

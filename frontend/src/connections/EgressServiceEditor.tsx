@@ -183,13 +183,11 @@ export function EgressServiceEditor({
   const [moreOpen, setMoreOpen] = useState(() => usesMoreOptions(form));
   const loadPresetsRef = useRef(loadPresets);
   const openedWith = useRef(form);
-  const helperLabels = useRef<HelperLabels>({
-    displayName: "",
-    description: "",
-  });
   // The repositories typed in the helper, which a save applies when the person
-  // did not. A limit that is edited starts with the ones it is limited to.
+  // did not. A limit that is edited starts with the ones it is limited to, and
+  // with the labels the helper wrote for them, which follow a changed list.
   const [restored] = useState(() => restoredHelperInput(service));
+  const helperLabels = useRef<HelperLabels>(restored.labels);
   const [helperInput, setHelperInput] = useState<HelperInput>(restored.input);
   const [helperErrors, setHelperErrors] = useState<string[]>([]);
   // The choices the form's rules were last written from, so a save writes
@@ -261,8 +259,10 @@ export function EgressServiceEditor({
     () =>
       JSON.stringify(form) !== JSON.stringify(openedWith.current) ||
       apiKey !== "" ||
-      helperSignature(helperInput) !== helperSignature(restored.input),
-    [form, apiKey, helperInput, restored],
+      // Text in a helper that is not shown is not a change.
+      (showGithubHelper &&
+        helperSignature(helperInput) !== helperSignature(restored.input)),
+    [form, apiKey, helperInput, restored, showGithubHelper],
   );
   const nameLocked = editing || saved;
   const disabled = busy !== null;
@@ -358,13 +358,17 @@ export function EgressServiceEditor({
 
   // Another preset has its own defaults, so what the loaded service emptied on
   // purpose no longer applies to it.
-  const choosePreset = (value: string) =>
+  const choosePreset = (value: string) => {
+    // The rules the helper wrote are gone with the preset's own, so typed
+    // repositories are to be applied again when the form is saved.
+    appliedHelper.current = null;
     set({
       preset: value,
       replacePresetRules: false,
       rules: form.rules.length > 0 ? form.rules : [emptyRule()],
       explicitlyEmpty: NOT_EXPLICITLY_EMPTY,
     });
+  };
 
   const applyTypedRepositories = () => {
     const result = githubRepositoryRules(helperInput.repositories, helperInput);
@@ -432,7 +436,7 @@ export function EgressServiceEditor({
             </div>
           )}
           {overlaps.map((warning) => (
-            <p key={warning} className={warningClass}>
+            <p key={warning} role="status" className={warningClass}>
               {warning}
             </p>
           ))}
@@ -501,7 +505,7 @@ export function EgressServiceEditor({
       {limiting && (
         <>
           {!restored.exact && (
-            <p className={warningClass}>
+            <p role="status" className={warningClass}>
               Some rules of this limit are not repositories from the list.
               Changing the list replaces them.
             </p>
@@ -521,7 +525,7 @@ export function EgressServiceEditor({
             size="sm"
             variant="ghost"
             aria-expanded={moreOpen}
-            aria-controls={`${id}-more`}
+            aria-controls={moreOpen ? `${id}-more` : undefined}
             onClick={() => setMoreOpen((open) => !open)}
           >
             More options

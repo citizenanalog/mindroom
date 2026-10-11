@@ -136,14 +136,14 @@ function RecentRequests({ agentName }: { agentName: string }) {
       <button
         type="button"
         aria-expanded={open}
-        aria-controls={`egress-log-${agentName}`}
+        aria-controls={open ? `egress-log-${agentName}` : undefined}
         onClick={toggle}
         className="flex w-full items-center justify-between gap-3 px-5 py-3 text-left text-sm font-medium hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         Recent requests
         <ChevronDown
           aria-hidden="true"
-          className={`h-4 w-4 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
+          className={`h-4 w-4 text-muted-foreground transition-transform motion-reduce:transition-none ${open ? "rotate-180" : ""}`}
         />
       </button>
       {open && (

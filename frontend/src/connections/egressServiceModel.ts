@@ -188,17 +188,19 @@ function hasCustomTemplate(template: string | undefined): boolean {
 }
 
 export function ruleFormFrom(rule: EgressRule): RuleForm {
+  // A rule of a service that only limits paths has no auth; the form shows the default.
+  const auth = rule.auth ?? { type: "bearer" as const };
   return {
     host: rule.host,
     port: rule.port === undefined ? "" : String(rule.port),
     pathPrefix: rule.path_prefix ?? "",
     authType:
-      rule.auth.type === "header" && hasCustomTemplate(rule.auth.template)
+      auth.type === "header" && hasCustomTemplate(auth.template)
         ? "template"
-        : rule.auth.type,
-    username: rule.auth.username ?? "",
-    headerOrParam: rule.auth.name ?? "",
-    template: rule.auth.template ?? "",
+        : auth.type,
+    username: auth.username ?? "",
+    headerOrParam: auth.name ?? "",
+    template: auth.template ?? "",
   };
 }
 
@@ -317,9 +319,12 @@ export function serializeService(
   if (form.description.trim()) authored.description = form.description.trim();
   else if (form.explicitlyEmpty.description) authored.description = "";
   if (form.restrictOnly) {
-    // It sends no key, so there is no login or placeholder to write, and the
-    // restriction is what it is for.
-    authored.rules = form.rules.map(ruleToAuthored);
+    // It sends no key, so its rules carry no auth and there is no login or
+    // placeholder to write; the restriction is what it is for.
+    authored.rules = form.rules.map((rule) => {
+      const { auth: _auth, ...withoutAuth } = ruleToAuthored(rule);
+      return withoutAuth;
+    });
     authored.restrict_to_rules = true;
     authored.restrict_only = true;
     return authored;
@@ -367,23 +372,24 @@ export function presetHasLogin(
   return presetOf(options.presets, presetId)?.oauth_provider != null;
 }
 
-const HOST_ONLY_MESSAGE = "Enter only the host, without https:// or a path";
-
 /**
- * What the Website field keeps of what was typed or pasted: no scheme, and
- * nothing from the first `/`, `?`, or `#` on, so a copied URL becomes its host.
+ * What the Website field keeps of what was typed or pasted: the host, without
+ * a scheme and cut at the first `/`, `?`, or `#`, and the path that was cut off
+ * (up to a `?` or `#`), which belongs in the Path prefix. A copied URL thus
+ * becomes its host plus a prefix.
  */
-export function stripHostInput(value: string): string {
+export function splitHostInput(value: string): { host: string; path: string } {
   const scheme = value.indexOf("://");
   const rest = scheme === -1 ? value : value.slice(scheme + 3);
   const end = rest.search(/[/?#]/);
-  return end === -1 ? rest : rest.slice(0, end);
+  if (end === -1) return { host: rest, path: "" };
+  const path = rest[end] === "/" ? rest.slice(end).split(/[?#]/)[0] : "";
+  return { host: rest.slice(0, end), path };
 }
 
 function hostError(host: string): string | null {
   const value = host.trim().toLowerCase();
   if (!value) return "Host is required";
-  if (/[/?#]/.test(value)) return HOST_ONLY_MESSAGE;
   if (value.includes(":"))
     return "Host must not contain a port (use the port field)";
   if (value.startsWith("*.")) {
@@ -573,12 +579,21 @@ export function validateService(
     if (message) problems.push({ field: "name", message });
   }
   if (form.restrictOnly) {
-    // The repository helper writes the rules and the server checks them again.
+    // The repository helper writes the rules and tells when there are none,
+    // and the server checks them again, but a long list can still pass the
+    // limits on a service's size. The form has no field for those, so they
+    // are told in its alert.
     if (form.rules.length === 0)
       problems.push({
         field: "rules",
         message: "Enter at least one repository, such as owner/repo",
       });
+    if (options.context === "personal" && form.rules.length > MAX_RULES)
+      problems.push({
+        field: "form",
+        message: `A service can have at most ${MAX_RULES} rules`,
+      });
+    problems.push(...sizeProblems(form, options, problems));
     return problems;
   }
   if (
@@ -634,16 +649,26 @@ export function validateService(
         : null;
     if (personalProblem) add(personalProblem.part, personalProblem.message);
   });
-  if (
-    options.context === "personal" &&
-    problems.length === 0 &&
-    serverJsonSize(serializeService(form, options)) > MAX_SERVICE_BYTES
-  )
-    problems.push({
-      field: "form",
-      message: `A service can take at most ${MAX_SERVICE_BYTES / 1024} KiB`,
-    });
+  problems.push(...sizeProblems(form, options, problems));
   return problems;
+}
+
+/** The size problem of a personal service, measured only once nothing else is wrong with it. */
+function sizeProblems(
+  form: EgressServiceForm,
+  options: EditorOptions,
+  found: readonly ServiceProblem[],
+): ServiceProblem[] {
+  return options.context === "personal" &&
+    found.length === 0 &&
+    serverJsonSize(serializeService(form, options)) > MAX_SERVICE_BYTES
+    ? [
+        {
+          field: "form",
+          message: `A service can take at most ${MAX_SERVICE_BYTES / 1024} KiB`,
+        },
+      ]
+    : [];
 }
 
 /**

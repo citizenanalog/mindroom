@@ -86,7 +86,9 @@ const columns: ColumnDef<AgentTableRow>[] = [
           className="flex w-full items-center gap-3 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label={`${row.getIsExpanded() ? "Collapse" : "Expand"} ${agent.agent_display_name}`}
           aria-expanded={row.getIsExpanded()}
-          aria-controls={`agent-tools-${agent.agent_name}`}
+          aria-controls={
+            row.getIsExpanded() ? `agent-tools-${agent.agent_name}` : undefined
+          }
           onClick={row.getToggleExpandedHandler()}
         >
           {row.getIsExpanded() ? (

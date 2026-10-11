@@ -2323,3 +2323,191 @@ describe("the other way to connect when an account is connected", () => {
     ).toHaveTextContent(/^Use an API key instead$/);
   });
 });
+
+describe("a limit's own row", () => {
+  const limit = (
+    changes: Partial<EgressCredentialService> = {},
+  ): EgressCredentialService => ({
+    ...github,
+    name: "github-limited",
+    display_name: "GitHub (a/b)",
+    description: "",
+    source: "user",
+    restrict_only: true,
+    rules: [{ host: "api.github.com", port: null, path_prefix: "/repos/a/b" }],
+    ...changes,
+  });
+
+  it("shows no empty line for a limit without a description", () => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[limit()]}
+        onChanged={vi.fn()}
+      />,
+    );
+    const paragraphs = Array.from(
+      row("GitHub (a/b)").querySelectorAll("p"),
+    ).map((paragraph) => paragraph.textContent);
+    expect(paragraphs).toEqual(["Limits requests to api.github.com"]);
+  });
+
+  it("shows the description when there is one", () => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[limit({ description: "Limited to a/b" })]}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(
+      within(row("GitHub (a/b)")).getByText("Limited to a/b"),
+    ).toBeVisible();
+  });
+});
+
+describe("what a limited service says it is limited to", () => {
+  const rules = (graphql: boolean) => [
+    ...githubRepositoryRules("a/b", { uploads: false, graphql }).rules.map(
+      (rule) => ({
+        host: rule.host,
+        port: null,
+        path_prefix: rule.path_prefix ?? "/",
+      }),
+    ),
+  ];
+  const custom = (graphql: boolean): EgressCredentialService => ({
+    ...github,
+    name: "mine",
+    display_name: "Mine",
+    description: "",
+    rules: rules(graphql),
+  });
+
+  it("names the repositories", () => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[custom(false)]}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(within(row("Mine")).getByText("Limited to a/b")).toBeVisible();
+  });
+
+  it("adds that GraphQL reaches every repository the key can reach when the limit allows it", () => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[custom(true)]}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(
+      within(row("Mine")).getByText(
+        "Limited to a/b (plus GraphQL, which reaches every repository the key can reach)",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says nothing of a limit when the rules also allow other GitHub paths", () => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[
+          {
+            ...custom(false),
+            rules: [
+              ...rules(false),
+              { host: "api.github.com", port: null, path_prefix: "/user" },
+            ],
+          },
+        ]}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/Limited to/)).toBeNull();
+  });
+});
+
+describe("a popup that closes without answering", () => {
+  let popup: {
+    closed: boolean;
+    close: ReturnType<typeof vi.fn>;
+    location: { href: string };
+  };
+  const answerWith = (connected: boolean | "fails") =>
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path.endsWith("/connect")) return json(authorization);
+      if (path === "/api/connections/agents/personal/github/status") {
+        if (connected === "fails") return json({}, 500);
+        return json({ provider: "github", connected });
+      }
+      return noContent();
+    });
+  const connectAndClose = async (onChanged = vi.fn()) => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[withAccount()]}
+        onChanged={onChanged}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
+    await waitFor(() =>
+      expect(popup.location.href).toBe(authorization.auth_url),
+    );
+    popup.closed = true;
+    return onChanged;
+  };
+
+  beforeEach(() => {
+    popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: "about:blank" },
+    };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+  });
+
+  it("counts a connection that completed before the answer was read, once its status says so", async () => {
+    answerWith(true);
+    const onChanged = await connectAndClose();
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1), {
+      timeout: 2000,
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    const statusReads = vi
+      .mocked(fetch)
+      .mock.calls.filter(([input]) => String(input).endsWith("/github/status"));
+    expect(statusReads).toHaveLength(1);
+  });
+
+  it("says cancelled when the status shows nothing was connected, after one read", async () => {
+    answerWith(false);
+    const onChanged = await connectAndClose();
+    expect(
+      await screen.findByRole("alert", {}, { timeout: 2000 }),
+    ).toHaveTextContent("Authorization was cancelled.");
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([input]) =>
+          String(input).endsWith("/github/status"),
+        ),
+    ).toHaveLength(1);
+  });
+
+  it("says cancelled when the status cannot be read", async () => {
+    answerWith("fails");
+    const onChanged = await connectAndClose();
+    expect(
+      await screen.findByRole("alert", {}, { timeout: 2000 }),
+    ).toHaveTextContent("Authorization was cancelled.");
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+});

@@ -1468,6 +1468,20 @@ describe("the basic form", () => {
     expect(screen.queryByLabelText("Display name")).toBeNull();
   });
 
+  it("points More options at its section only while that section is there", async () => {
+    await renderEditor();
+    const more = screen.getByRole("button", { name: "More options" });
+    expect(more).not.toHaveAttribute("aria-controls");
+    fireEvent.click(more);
+    const section = document.getElementById(
+      more.getAttribute("aria-controls") ?? "",
+    );
+    expect(section).not.toBeNull();
+    expect(section).toContainElement(screen.getByLabelText("Display name"));
+    fireEvent.click(more);
+    expect(more).not.toHaveAttribute("aria-controls");
+  });
+
   it("asks for a header name only when the key goes in a header", async () => {
     await renderEditor();
     expect(screen.queryByLabelText("Header name")).toBeNull();
@@ -2473,6 +2487,62 @@ describe("repositories typed in the helper and saved without pressing Use these 
   });
 });
 
+describe("typed repositories after the preset changes", () => {
+  const enter = (value: string) =>
+    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
+      target: { value },
+    });
+
+  it("applies them again on Save when the preset was switched away and back after applying", async () => {
+    const { onSave } = await renderEditor({
+      name: "github",
+      service: { preset: "github" },
+    });
+    enter("octocat/Hello-World");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use these repositories" }),
+    );
+    // The preset's own rules are back, and the repositories are still typed.
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "openai" },
+    });
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "github" },
+    });
+    expect(screen.getByLabelText("GitHub repositories")).toHaveValue(
+      "octocat/Hello-World",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave).toHaveBeenCalledWith(
+      "github",
+      expect.objectContaining({
+        restrict_to_rules: true,
+        rules: githubRepositoryRules("octocat/Hello-World", {
+          uploads: false,
+          graphql: false,
+        }).rules,
+      }),
+    );
+  });
+
+  it("does not count text in a helper that is no longer shown as unsaved changes", async () => {
+    const onDirtyChange = vi.fn();
+    await renderEditor({ onDirtyChange });
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "github" },
+    });
+    enter("octocat/Hello-World");
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+    // Back to a custom service as the form opened: only the hidden text differs.
+    fireEvent.change(screen.getByLabelText("Preset"), {
+      target: { value: "" },
+    });
+    expect(screen.queryByLabelText("GitHub repositories")).toBeNull();
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  });
+});
+
 describe("a limit: a service that only restricts GitHub repositories", () => {
   /** The limit form has no preset, so there is nothing to wait for. */
   const renderEditor = async (
@@ -2486,8 +2556,11 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     fireEvent.change(screen.getByLabelText("GitHub repositories"), {
       target: { value },
     });
+  // The rules of a limit send nothing, so the server keeps them without auth.
   const limitRules = (input: string, uploads = false, graphql = false) =>
-    githubRepositoryRules(input, { uploads, graphql }).rules;
+    githubRepositoryRules(input, { uploads, graphql }).rules.map(
+      ({ auth: _auth, ...rule }) => rule,
+    );
   const storedLimit = (
     input: string,
     changes: Partial<AuthoredEgressService> = {},
@@ -2614,22 +2687,18 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     const odd: AuthoredEgressService = storedLimit("a/b", {
       rules: [
         ...limitRules("a/b"),
-        {
-          host: "api.github.com",
-          path_prefix: "/user",
-          auth: { type: "bearer" },
-        },
+        { host: "api.github.com", path_prefix: "/user" },
       ],
     });
     const { onSave } = await renderEditor({
       name: "github-limited",
       service: odd,
     });
-    expect(
-      screen.getByText(
-        "Some rules of this limit are not repositories from the list. Changing the list replaces them.",
-      ),
-    ).toBeVisible();
+    const warning = screen.getByText(
+      "Some rules of this limit are not repositories from the list. Changing the list replaces them.",
+    );
+    expect(warning).toBeVisible();
+    expect(warning).toHaveAttribute("role", "status");
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("github-limited", odd);
@@ -2669,6 +2738,96 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   });
 });
 
+describe("a limit: relabelling, rules without auth, and long lists", () => {
+  const renderLimit = (props: Partial<EgressServiceEditorProps> = {}) => {
+    const merged = { ...baseProps(), ...props };
+    render(<EgressServiceEditor {...merged} />);
+    return { onSave: merged.onSave };
+  };
+  const noAuth = (rules: EgressRule[]): EgressRule[] =>
+    rules.map(({ auth: _auth, ...rule }) => rule);
+  const rulesFor = (input: string) =>
+    noAuth(
+      githubRepositoryRules(input, { uploads: false, graphql: false }).rules,
+    );
+  const enter = (value: string) =>
+    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
+      target: { value },
+    });
+
+  it("opens a limit the server keeps without auth on its rules, and saves it back the same", async () => {
+    const stored: AuthoredEgressService = {
+      display_name: "GitHub (a/b)",
+      description: "Limited to a/b",
+      rules: rulesFor("a/b"),
+      restrict_to_rules: true,
+      restrict_only: true,
+    };
+    expect(stored.rules?.every((rule) => rule.auth === undefined)).toBe(true);
+    const { onSave } = renderLimit({ name: "github-limited", service: stored });
+    expect(screen.getByLabelText("GitHub repositories")).toHaveValue("a/b");
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith("github-limited", stored);
+  });
+
+  it("relabels the limit it wrote when a repository is added, and keeps labels the person wrote", async () => {
+    const written = (input: string): AuthoredEgressService => ({
+      display_name: `GitHub (${input})`,
+      description: `Limited to ${input}`,
+      rules: rulesFor(input),
+      restrict_to_rules: true,
+      restrict_only: true,
+    });
+    const first = renderLimit({
+      name: "github-limited",
+      service: written("a/b"),
+    });
+    enter("a/b\nc/d");
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(first.onSave).toHaveBeenCalledTimes(1));
+    expect(first.onSave).toHaveBeenCalledWith("github-limited", {
+      display_name: "GitHub (a/b, c/d)",
+      description: "Limited to a/b, c/d",
+      rules: rulesFor("a/b\nc/d"),
+      restrict_to_rules: true,
+      restrict_only: true,
+    });
+    cleanup();
+    const second = renderLimit({
+      name: "github-limited",
+      service: {
+        ...written("a/b"),
+        display_name: "Work repositories",
+        description: "What the team uses",
+      },
+    });
+    enter("a/b\nc/d");
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(second.onSave).toHaveBeenCalledTimes(1));
+    expect(second.onSave).toHaveBeenCalledWith(
+      "github-limited",
+      expect.objectContaining({
+        display_name: "Work repositories",
+        description: "What the team uses",
+      }),
+    );
+  });
+
+  it("tells a list that makes more than 50 rules in the alert, and does not save", async () => {
+    const { onSave } = renderLimit({
+      initialRestrictOnly: true,
+      initialName: "github-limited",
+    });
+    enter(Array.from({ length: 17 }, (_, i) => `o/r${i}`).join("\n"));
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "A service can have at most 50 rules",
+    );
+    expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
 describe("the Website field", () => {
   const website = () => screen.getByLabelText("Website") as HTMLInputElement;
   const type = (value: string) =>
@@ -2702,6 +2861,68 @@ describe("the Website field", () => {
     expect(website()).toHaveAccessibleDescription(
       /Host must not contain a port \(use the port field\)/,
     );
+  });
+
+  it("moves the path of a pasted address into the Path prefix and says so", async () => {
+    const { onSave } = await renderEditor();
+    type("https://api.example.com/v1/items?page=2#top");
+    expect(website()).toHaveValue("api.example.com");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Moved /v1/items to Path prefix",
+    );
+    openMoreOptions();
+    expect(screen.getByLabelText("Path prefix")).toHaveValue("/v1/items");
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave).toHaveBeenCalledWith("api", {
+      display_name: "api.example.com",
+      rules: [
+        {
+          host: "api.example.com",
+          path_prefix: "/v1/items",
+          auth: { type: "bearer" },
+        },
+      ],
+    });
+  });
+
+  it("takes the note away with the next change, and moves nothing for a bare slash", async () => {
+    await renderEditor();
+    type("api.example.com/v1");
+    expect(screen.getByText("Moved /v1 to Path prefix")).toBeVisible();
+    type("api.example.org");
+    expect(screen.queryByText(/Moved .* to Path prefix/)).toBeNull();
+    cleanup();
+    await renderEditor();
+    type("api.example.com/");
+    expect(screen.queryByText(/Moved .* to Path prefix/)).toBeNull();
+    openMoreOptions();
+    expect(screen.getByLabelText("Path prefix")).toHaveValue("");
+  });
+
+  it("keeps a Path prefix that is already filled in, and drops the pasted path without a note", async () => {
+    await renderEditor();
+    openMoreOptions();
+    fireEvent.change(screen.getByLabelText("Path prefix"), {
+      target: { value: "/mine" },
+    });
+    type("https://api.example.com/other");
+    expect(website()).toHaveValue("api.example.com");
+    expect(screen.getByLabelText("Path prefix")).toHaveValue("/mine");
+    expect(screen.queryByText(/Moved .* to Path prefix/)).toBeNull();
+  });
+
+  it("moves the path of an extra rule's host into that rule's Path prefix", async () => {
+    await renderEditor();
+    type("a.example.com");
+    openMoreOptions();
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    fireEvent.change(screen.getByLabelText("Rule 2 host"), {
+      target: { value: "https://b.example.com/v2" },
+    });
+    expect(screen.getByLabelText("Rule 2 path prefix")).toHaveValue("/v2");
+    expect(screen.getByText("Moved /v2 to Path prefix")).toBeVisible();
+    expect(screen.getAllByLabelText("Path prefix")[0]).toHaveValue("");
   });
 
   it("strips an extra rule's host the same way", async () => {
@@ -2811,6 +3032,16 @@ describe("a website another service of the agent already sends a key to", () => 
     expect(screen.getByText(`GitHub${WARNING}`)).toBeVisible();
     type("Website", "API.example.com");
     expect(screen.queryByText(/already sends a key/)).toBeNull();
+  });
+
+  it("is announced as a status, not an alert, since the service can still be saved", async () => {
+    await renderEditor({ agentServices: [sending()] });
+    type("Website", "api.github.com");
+    expect(screen.getByText(`GitHub${WARNING}`)).toHaveAttribute(
+      "role",
+      "status",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("names every website they share once, for one service", async () => {

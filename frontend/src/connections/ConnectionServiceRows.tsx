@@ -100,6 +100,14 @@ export function ConnectionServiceRows({
             "POST",
           ),
         controller.signal,
+        // A popup that closed after connecting is a connection, not a cancel.
+        async () =>
+          (
+            await requestConnection<ConnectionStatus>(
+              `${basePath}/status`,
+              controller.signal,
+            )
+          ).connected,
       );
       if (!controller.signal.aborted) onConnectionChange();
     } catch (cause) {

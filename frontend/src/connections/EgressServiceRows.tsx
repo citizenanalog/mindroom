@@ -40,6 +40,8 @@ interface ServicePaths {
   secret: string;
   connect: string;
   disconnect: string;
+  /** Where the connection status of a provider is read, when the page has such a route. */
+  status?: (provider: string) => string;
 }
 
 function EgressServiceRow({
@@ -208,6 +210,7 @@ function EgressServiceRow({
     if (!oauth || busy !== null) return;
     const controller = new AbortController();
     operation.current = controller;
+    const statusPath = paths.status?.(oauth.provider);
     setBusy("connect");
     setError(null);
     try {
@@ -222,6 +225,16 @@ function EgressServiceRow({
             errorMessages,
           ),
         controller.signal,
+        // A popup that closed after connecting is a connection, not a cancel.
+        statusPath === undefined
+          ? undefined
+          : async () =>
+              (
+                await requestConnection<{ connected: boolean }>(
+                  statusPath,
+                  controller.signal,
+                )
+              ).connected,
       );
       if (!controller.signal.aborted) onChanged();
     } catch (cause) {
@@ -585,7 +598,12 @@ function EgressServiceRow({
   );
 }
 
-/** Change and Remove for a limit, with the question before it goes. `label` names what the buttons are for. */
+/**
+ * Change and Remove for a limit, with the question before it goes. `label`
+ * names what the buttons are for. The page turns every limit action off while
+ * one is being written (`serviceEditing.disabled`), so a limit shown in two
+ * rows cannot be removed twice.
+ */
 function LimitActions({
   limit,
   label,
@@ -673,12 +691,14 @@ function LimitRow({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 space-y-0.5">
           <span className="font-medium">{service.display_name}</span>
-          <p
-            className="max-w-md truncate text-xs text-muted-foreground"
-            title={service.description}
-          >
-            {service.description}
-          </p>
+          {service.description && (
+            <p
+              className="max-w-md truncate text-xs text-muted-foreground"
+              title={service.description}
+            >
+              {service.description}
+            </p>
+          )}
           {hosts && (
             <p className="break-words text-xs text-muted-foreground">{hosts}</p>
           )}
@@ -734,6 +754,8 @@ function servicePathsFor(
     secret: base,
     connect: `${base}/connect`,
     disconnect: `${base}/disconnect`,
+    status: (provider) =>
+      `/api/connections/agents/${encodeURIComponent(target.agentName)}/${encodeURIComponent(provider)}/status`,
   };
 }
 

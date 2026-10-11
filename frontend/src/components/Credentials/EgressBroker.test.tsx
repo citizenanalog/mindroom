@@ -1299,7 +1299,7 @@ describe("egress broker service editor", () => {
     ]);
   });
 
-  it("saves a new custom service with its website as the display name", async () => {
+  it("saves a new custom service from a pasted address: its host as the display name and its path as the prefix", async () => {
     render(<EgressBroker />);
     await screen.findByLabelText("GitHub");
     fireEvent.click(screen.getByRole("button", { name: "Add service" }));
@@ -1312,16 +1312,23 @@ describe("egress broker service editor", () => {
       ["egress_broker", "services", "httpbin"],
       {
         display_name: "httpbin.org",
-        rules: [{ host: "httpbin.org", auth: { type: "bearer" } }],
+        rules: [
+          {
+            host: "httpbin.org",
+            path_prefix: "/anything",
+            auth: { type: "bearer" },
+          },
+        ],
       },
     );
   });
 
   describe("a service in the config that only limits paths", () => {
+    // A limit's rules send nothing, so the config keeps them without auth.
     const limitRules = githubRepositoryRules("acme/app", {
       uploads: false,
       graphql: false,
-    }).rules;
+    }).rules.map(({ auth: _auth, ...rule }) => rule);
     const authoredLimit = {
       display_name: "GitHub (acme/app)",
       rules: limitRules,

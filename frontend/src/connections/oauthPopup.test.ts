@@ -355,4 +355,89 @@ describe("connection popup", () => {
       expect(popup.close).toHaveBeenCalledOnce();
     });
   });
+
+  describe("a popup that closes without answering", () => {
+    const open = async (confirmConnected?: () => Promise<boolean>) => {
+      const operation = connectWithPopup(
+        "mail",
+        async () => authorization,
+        controller.signal,
+        confirmConnected,
+      );
+      await Promise.resolve();
+      return { operation };
+    };
+
+    it("counts it as connected when the status says so, asking once", async () => {
+      const confirm = vi.fn(async () => true);
+      const { operation } = await open(confirm);
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(3000);
+      await expect(operation).resolves.toBeUndefined();
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("says cancelled when the status says nothing was connected", async () => {
+      const confirm = vi.fn(async () => false);
+      const { operation } = await open(confirm);
+      const rejection = expect(operation).rejects.toThrow(
+        "Authorization was cancelled.",
+      );
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(3000);
+      await rejection;
+      expect(confirm).toHaveBeenCalledTimes(1);
+    });
+
+    it("says cancelled when the status cannot be read", async () => {
+      const { operation } = await open(async () => {
+        throw new Error("Could not load connection status.");
+      });
+      const rejection = expect(operation).rejects.toThrow(
+        "Authorization was cancelled.",
+      );
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(3000);
+      await rejection;
+    });
+
+    it("does not ask when the popup answered, or when nothing asks for it", async () => {
+      const confirm = vi.fn(async () => true);
+      const { operation } = await open(confirm);
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: authorization.completion_origin,
+          source: popup as unknown as Window,
+          data: {
+            type: "mindroom-oauth",
+            provider: "mail",
+            status: "cancelled",
+          },
+        }),
+      );
+      await expect(operation).rejects.toThrow(/cancelled/i);
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(confirm).not.toHaveBeenCalled();
+    });
+
+    it("lets an abort win while the status is still being read", async () => {
+      let answer!: (connected: boolean) => void;
+      const { operation } = await open(
+        () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const rejection = expect(operation).rejects.toThrow(/cancelled/i);
+      popup.closed = true;
+      await vi.advanceTimersByTimeAsync(1000);
+      controller.abort();
+      await rejection;
+      answer(true);
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
 });
