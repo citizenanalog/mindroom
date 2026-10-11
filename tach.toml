@@ -1670,6 +1670,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.connections"
 depends_on = [
+    "mindroom.origins",
     "mindroom.matrix.users",
     "mindroom.matrix.media",
     "mindroom.api.auth",
@@ -1728,6 +1729,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.main"
 depends_on = [
+    "mindroom.origins",
     "mindroom.api.agent_cli",
     "mindroom.api.config_reload",
     "mindroom.api.response_activity",
