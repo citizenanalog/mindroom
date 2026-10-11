@@ -22,7 +22,7 @@ from mindroom.egress_broker._relay import (
     upstream_request_headers,
 )
 from mindroom.egress_broker.messages import refusal_body
-from mindroom.egress_broker.rules import RuleMatch, host_not_allowed, inject_credentials, route_request
+from mindroom.egress_broker.rules import RuleMatch, inject_credentials
 from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretNeedsReconnect, SecretUnavailable
 from mindroom.logging_config import get_logger
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from mindroom.egress_broker._relay import Relay
     from mindroom.egress_broker.ca import BrokerCA
     from mindroom.egress_broker.proxy import SecretResolver
-    from mindroom.egress_broker.rules import EgressRules, Route
+    from mindroom.egress_broker.rules import Route
     from mindroom.egress_broker.secrets import SecretResult
     from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 
@@ -178,16 +178,14 @@ class TlsInterceptor:
         host_header = next((value for name, value in request.headers if name == b"host"), None)
         if not await self._admit(client, entry, tunnel, origin_form=origin_form, host_header=host_header):
             return False
-        rules = await self._relay.read_rules(client, entry)
-        if rules is None:
+        route = await self._relay.route(client, entry, tunnel.port)
+        if route is None:
             return False
-        route = route_request(rules, tunnel.host, tunnel.port, entry.path)
         upstream_request = await self._upstream_request(
             client,
             entry,
             tunnel,
             request,
-            rules,
             route=route,
             host_header=host_header,
         )
@@ -228,18 +226,11 @@ class TlsInterceptor:
         entry: AuditEntry,
         tunnel: _Tunnel,
         request: h11.Request,
-        rules: EgressRules,
         *,
         route: Route,
         host_header: bytes | None,
     ) -> h11.Request | None:
         """Return the request to send upstream, injected when a rule matches; otherwise answer, audit, and return None."""
-        if not route.host_has_rules and rules.unmatched_hosts == "deny":
-            await self._relay.deny(client, entry, host_not_allowed(rules, tunnel.host))
-            return None
-        if route.refusal is not None:
-            await self._relay.refuse_route(client, entry, route)
-            return None
         headers = upstream_request_headers(list(request.headers), host=host_header or tunnel.authority)
         if _is_websocket_upgrade(list(request.headers)):
             if client.close_after_response:

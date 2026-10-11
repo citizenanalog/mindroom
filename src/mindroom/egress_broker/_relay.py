@@ -19,7 +19,7 @@ import h11
 from mindroom.egress_broker.audit import AuditRecord
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
 from mindroom.egress_broker.messages import refusal_body
-from mindroom.egress_broker.rules import strip_hop_by_hop
+from mindroom.egress_broker.rules import host_not_allowed, route_request, strip_hop_by_hop
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -406,11 +406,22 @@ class Relay:
             await self.reject(client, entry, 502, refusal_body("broker_error"))
             return None
 
-    async def refuse_route(self, client: Peer, entry: AuditEntry, route: Route) -> None:
-        """Answer and audit the refusal `route` decided for the entry's host and path; a failing callback is a 502.
+    async def route(self, client: Peer, entry: AuditEntry, port: int) -> Route | None:
+        """Return the route for the entry's host, `port`, and path; otherwise answer, audit a refusal, and return None.
 
-        The audit row names the restricting service of a `path_not_allowed` refusal, as a matched rule's row does.
+        A host without rules is denied under `unmatched_hosts: deny`. A path the route refuses (ambiguous, or unlisted
+        on a restricted host) is refused, and the audit row names the restricting service of a `path_not_allowed`
+        refusal, as a matched rule's row does. A failing rules provider or scope callback is a 502.
         """
+        rules = await self.read_rules(client, entry)
+        if rules is None:
+            return None
+        route = route_request(rules, entry.host, port, entry.path)
+        if not route.host_has_rules and rules.unmatched_hosts == "deny":
+            await self.deny(client, entry, host_not_allowed(rules, entry.host))
+            return None
+        if route.refusal is None:
+            return route
         entry.service = route.restricted_by
         try:
             scope = self.scope_info(entry.claims)
@@ -418,9 +429,10 @@ class Relay:
             # A callback the broker's owner supplies, which can raise anything.
             logger.warning("egress_broker_refusal_context_failed", error_type=type(exc).__name__)
             await self.reject(client, entry, 502, refusal_body("broker_error"))
-            return
+            return None
         body = route.refusal_body(host=entry.host, path=entry.path, manage_url=self.manage_url, scope=scope)
         await self.deny(client, entry, body, status=route.refusal_status)
+        return None
 
     async def open_upstream(
         self,

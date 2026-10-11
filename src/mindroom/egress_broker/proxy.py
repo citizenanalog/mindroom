@@ -24,7 +24,7 @@ from mindroom.egress_broker._relay import (
 )
 from mindroom.egress_broker.messages import refusal_body
 from mindroom.egress_broker.mitm import TlsInterceptor
-from mindroom.egress_broker.rules import host_not_allowed, route_request
+from mindroom.egress_broker.rules import host_not_allowed
 
 if TYPE_CHECKING:
     import ssl
@@ -255,15 +255,8 @@ class EgressBroker:
             return False
         path = target.split(b"?", 1)[0].decode("ascii")
         entry = AuditEntry(claims=claims, kind="request", method=request.method.decode("ascii"), host=host, path=path)
-        rules = await self._relay.read_rules(client, entry)
-        if rules is None:
-            return False
-        route = route_request(rules, host, port, path)
-        if rules.unmatched_hosts == "deny" and not route.host_has_rules:
-            await self._relay.deny(client, entry, host_not_allowed(rules, host))
-            return False
-        if route.refusal is not None:
-            await self._relay.refuse_route(client, entry, route)
+        route = await self._relay.route(client, entry, port)
+        if route is None:
             return False
         if route.match is not None:
             entry.service = route.match.service
