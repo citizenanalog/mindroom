@@ -13,6 +13,7 @@ type IndependentUsageKind = Literal[
     "memory_auto_flush",
     "dynamic_workflow",
     "live_voice",
+    "realtime_voice",
     "skill_learning",
     "routing",
     "room_topic",
