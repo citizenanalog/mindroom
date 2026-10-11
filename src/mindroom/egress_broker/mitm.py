@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from mindroom.egress_broker._relay import Relay
     from mindroom.egress_broker.ca import BrokerCA
     from mindroom.egress_broker.proxy import SecretResolver
-    from mindroom.egress_broker.rules import Route
     from mindroom.egress_broker.secrets import SecretResult
     from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 
@@ -162,8 +161,12 @@ class TlsInterceptor:
         finally:
             tunnel.drop_upstream()
 
-    async def _serve_request(self, client: Peer, *, tunnel: _Tunnel) -> bool:
-        """Serve one request inside the tunnel; return whether the tunnel stays open for another."""
+    async def _serve_request(self, client: Peer, *, tunnel: _Tunnel) -> bool:  # noqa: C901, PLR0911 - checks in order
+        """Serve one request inside the tunnel; return whether the tunnel stays open for another.
+
+        The token is checked again on every request, so a busy tunnel does not outlive the token's expiry.
+        A request must also be unable to reach anything but the CONNECT host.
+        """
         request = await client.next_event()
         if not isinstance(request, h11.Request):
             return False
@@ -175,38 +178,6 @@ class TlsInterceptor:
             host=tunnel.host,
             path=request.target.split(b"?", 1)[0].decode("ascii") if origin_form else "",
         )
-        host_header = next((value for name, value in request.headers if name == b"host"), None)
-        if not await self._admit(client, entry, tunnel, origin_form=origin_form, host_header=host_header):
-            return False
-        route = await self._relay.route(client, entry, tunnel.port)
-        if route is None:
-            return False
-        upstream_request = await self._upstream_request(
-            client,
-            entry,
-            tunnel,
-            request,
-            route=route,
-            host_header=host_header,
-        )
-        if upstream_request is None:
-            return False
-        return await self._forward(client, entry, tunnel, upstream_request, strip_cookies=route.host_has_rules)
-
-    async def _admit(
-        self,
-        client: Peer,
-        entry: AuditEntry,
-        tunnel: _Tunnel,
-        *,
-        origin_form: bool,
-        host_header: bytes | None,
-    ) -> bool:
-        """Return whether the request may proceed; otherwise answer the client, audit a refusal, and return False.
-
-        The token is checked again on every request, so a busy tunnel does not outlive the token's expiry.
-        A request must also be unable to reach anything but the CONNECT host.
-        """
         if self._signer.verify(tunnel.token) is None:
             await send_proxy_challenge(client)
             return False
@@ -214,42 +185,32 @@ class TlsInterceptor:
             # Absolute, authority, and asterisk forms could name another destination; only the CONNECT target routes.
             await self._relay.deny(client, entry, refusal_body("bad_request"), status=400)
             return False
+        host_header = next((value for name, value in request.headers if name == b"host"), None)
         if host_header is not None and _host_header_name(host_header) != tunnel.host:
             # Forwarding another Host to the same address is domain fronting: it could carry the secret elsewhere.
             await self._relay.deny(client, entry, refusal_body("host_mismatch"))
             return False
-        return True
-
-    async def _upstream_request(
-        self,
-        client: Peer,
-        entry: AuditEntry,
-        tunnel: _Tunnel,
-        request: h11.Request,
-        *,
-        route: Route,
-        host_header: bytes | None,
-    ) -> h11.Request | None:
-        """Return the request to send upstream, injected when a rule matches; otherwise answer, audit, and return None."""
+        route = await self._relay.route(client, entry, tunnel.port)
+        if route is None:
+            return False
         headers = upstream_request_headers(list(request.headers), host=host_header or tunnel.authority)
         if _is_websocket_upgrade(list(request.headers)):
             if client.close_after_response:
                 # Conflicting lengths mean the connection closes after this response, so it never becomes a splice.
                 await self._relay.deny(client, entry, refusal_body("bad_request"), status=400)
-                return None
+                return False
             headers += [(b"connection", b"Upgrade"), (b"upgrade", b"websocket")]
-        match = route.match
-        if match is None:
-            return h11.Request(method=request.method, target=request.target, headers=headers)
-        entry.service = match.service
-        secret = await self._secret(client, entry, match.service)
-        if secret is None:
-            return None
-        injected = _injected_request(request, headers, match, secret)
-        if injected is None:
-            logger.warning("egress_broker_secret_unusable", service=match.service)
-            await self._relay.reject(client, entry, 502, refusal_body("broker_error"))
-        return injected
+        if (match := route.match) is None:
+            upstream_request = h11.Request(method=request.method, target=request.target, headers=headers)
+        else:
+            entry.service = match.service
+            if (secret := await self._secret(client, entry, match.service)) is None:
+                return False
+            if (upstream_request := _injected_request(request, headers, match, secret)) is None:
+                logger.warning("egress_broker_secret_unusable", service=match.service)
+                await self._relay.reject(client, entry, 502, refusal_body("broker_error"))
+                return False
+        return await self._forward(client, entry, tunnel, upstream_request, strip_cookies=route.host_has_rules)
 
     async def _secret(self, client: Peer, entry: AuditEntry, service: str) -> str | None:
         """Return the worker scope's secret for `service`; otherwise answer the client, audit, and return None."""
