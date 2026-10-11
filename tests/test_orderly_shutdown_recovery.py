@@ -12,6 +12,7 @@ import nio
 import pytest
 
 from mindroom.agent_reply_membership_sync import AgentReplyMembershipSync
+from mindroom.agent_storage import create_state_storage
 from mindroom.cancellation import current_task_is_process_shutdown
 from mindroom.config.access import ResponderAccessConfig
 from mindroom.dispatch_callback_outcome import TurnDispatchOutcome
@@ -42,7 +43,7 @@ from tests.test_edit_regenerator import (
 )
 from tests.test_response_attempt import _Span
 from tests.test_response_delivery_gateway import _response_recovery_bot
-from tests.test_turn_store import _store
+from tests.test_turn_store import _store, _store_with_storage
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -85,7 +86,11 @@ async def test_orderly_shutdown_preserves_edit_callback_and_revision(
 ) -> None:
     """The edit is left pending for the successor runtime, then replay commits the exact edit."""
     principal = journal_store.principal("agent@alice")
-    store = await _store(journal_store, agent_name=AGENT_NAME)
+    store = await _store_with_storage(
+        journal_store,
+        create_state_storage(AGENT_NAME, tmp_path / "history", subdir="sessions", session_table="sessions"),
+        agent_name=AGENT_NAME,
+    )
     await store.record_responded_turn(_turn_record(source_event_prompts={ORIGINAL_EVENT_ID: "original"}))
     harness = _harness(tmp_path, turn_record=None)
     started = asyncio.Event()
