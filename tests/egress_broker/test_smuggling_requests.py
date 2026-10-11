@@ -117,7 +117,6 @@ _POST = "POST {t}/a HTTP/1.1\r\nHost: {h}\r\n{a}"
 _GET = "GET {t}/a HTTP/1.1\r\nHost: {h}\r\n{a}"
 # A request with no credentials and another Host: as plain HTTP it is unauthenticated, in a tunnel it is fronting.
 _SMUGGLED = "GET /smuggled HTTP/1.1\r\nHost: evil.example\r\n\r\n"
-_AFTER_SMUGGLE = {"plain": Outcome((200, 407), 1), "tunnel": Outcome((200, 403), 1)}
 # RFC 9112 section 6.1: after a request with both length headers the connection closes, so the rest is never read.
 _CLOSES_AFTER_BOTH_LENGTHS = {"plain": Outcome((200,), 1, closes=True), "tunnel": Outcome((200,), 1, closes=True)}
 _REJECTED_TE = "Content-Length: 5\r\nTransfer-Encoding: {value}\r\n\r\n0\r\n\r\n"
