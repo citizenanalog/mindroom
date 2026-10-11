@@ -421,6 +421,7 @@ function AgentSection({
   };
   const rowAgent: RowAgent = {
     displayName: agent.agent_display_name,
+    shared: agent.shared,
     managers: agent.managers,
     services: agent.services,
   };

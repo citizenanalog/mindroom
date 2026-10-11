@@ -59,6 +59,7 @@ const NOT_RUNNING_MESSAGE =
 const LOG_ERROR_MESSAGE = "Could not load the request log. Try again.";
 const LOG_TIMEOUT_MS = 30_000;
 const UNSCOPED_OPTION = "Agents without a scope";
+const UNSCOPED_AGENTS = "the agents without a scope";
 // The target that uses the one set of keys all agents without a worker scope share.
 const UNSCOPED_VALUE = "";
 // Brokered traffic only exists for agents that can run commands.
@@ -204,7 +205,14 @@ function keyScope(agent: Agent, defaults: Config["defaults"]): KeyScope {
   return scope === "shared" ? "shared" : "unscoped";
 }
 
-function ServiceSection({ agentName }: { agentName: string | null }) {
+function ServiceSection({
+  agentName,
+  agentLabel,
+}: {
+  agentName: string | null;
+  /** How the agent, or the agents without a scope, reads in a sentence. */
+  agentLabel: string;
+}) {
   const config = useConfigStore((state) => state.config);
   const dirtyRoots = useConfigStore((state) => state.dirtyRoots);
   const updateConfigValue = useConfigStore((state) => state.updateConfigValue);
@@ -446,6 +454,8 @@ function ServiceSection({ agentName }: { agentName: string | null }) {
             onChanged={() => void load()}
             errorMessages={SECRET_ERROR_MESSAGES}
             serviceEditing={serviceEditing}
+            // Only shared agents and the global store are offered here, so every key is shared.
+            agent={{ displayName: agentLabel, shared: true, services }}
           />
         </div>
       )}
@@ -716,6 +726,9 @@ export function EgressBroker() {
         <ServiceSection
           key={agentName === null ? "global" : `agent:${agentName}`}
           agentName={agentName}
+          agentLabel={
+            agentName === null ? UNSCOPED_AGENTS : (target?.label ?? agentName)
+          }
         />
         <LogSection />
       </CardContent>

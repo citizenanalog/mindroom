@@ -6,14 +6,32 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { githubRepositoryRules } from "./egressServiceModel";
 import {
-  EgressServiceRows,
+  EgressServiceRows as Rows,
   type RowAgent,
   type ServiceEditing,
 } from "./EgressServiceRows";
 import type { EgressCredentialService, EgressOAuthStatus } from "./types";
+
+type RowsProps =
+  ComponentProps<typeof Rows> extends infer P
+    ? P extends unknown
+      ? Omit<P, "agent"> & { agent?: RowAgent }
+      : never
+    : never;
+
+/** The rows as a page renders them: with a personal agent, unless a test passes another. */
+function EgressServiceRows(props: RowsProps) {
+  const agent = props.agent ?? {
+    displayName: "Personal Mind",
+    shared: props.services.some((service) => service.is_shared === true),
+    services: props.services,
+  };
+  return <Rows {...(props as ComponentProps<typeof Rows>)} agent={agent} />;
+}
 
 const github: EgressCredentialService = {
   name: "github",
@@ -80,7 +98,7 @@ afterEach(() => {
 });
 
 describe("egress service rows", () => {
-  it("shows name, description and the Set or Not set status", () => {
+  it("shows name, description and the Key saved or Not set status", () => {
     render(
       <EgressServiceRows
         agentName="personal"
@@ -92,13 +110,13 @@ describe("egress service rows", () => {
     expect(
       within(row("GitHub")).getByText("GitHub API and git over HTTPS"),
     ).toBeInTheDocument();
-    expect(within(row("OpenAI")).getByText("Set")).toBeInTheDocument();
+    expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
     expect(
-      within(row("GitHub")).getByRole("button", { name: "Set GitHub API key" }),
+      within(row("GitHub")).getByRole("button", { name: "Set key for GitHub" }),
     ).toBeInTheDocument();
     expect(
       within(row("OpenAI")).getByRole("button", {
-        name: "Replace OpenAI API key",
+        name: "Replace key for OpenAI",
       }),
     ).toBeInTheDocument();
   });
@@ -115,7 +133,7 @@ describe("egress service rows", () => {
       />,
     );
     expect(
-      screen.getByText(`Updated ${new Date(updatedAt).toLocaleDateString()}`),
+      screen.getByText(`Key saved ${new Date(updatedAt).toLocaleDateString()}`),
     ).toBeInTheDocument();
   });
 
@@ -128,7 +146,7 @@ describe("egress service rows", () => {
         onChanged={onChanged}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     const input = screen.getByLabelText("GitHub API key");
     expect(input).toHaveAttribute("type", "password");
     fireEvent.change(input, { target: { value: "abc" } });
@@ -145,7 +163,7 @@ describe("egress service rows", () => {
     );
     expect(screen.queryByLabelText("GitHub API key")).toBeNull();
     // Reopening the editor must not show the previous value.
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     expect(screen.getByLabelText("GitHub API key")).toHaveValue("");
   });
 
@@ -157,7 +175,7 @@ describe("egress service rows", () => {
         onChanged={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
     });
@@ -177,7 +195,7 @@ describe("egress service rows", () => {
         onChanged={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
     });
@@ -195,7 +213,7 @@ describe("egress service rows", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Replace OpenAI API key" }),
+      screen.getByRole("button", { name: "Replace key for OpenAI" }),
     );
     fireEvent.change(screen.getByLabelText("OpenAI API key"), {
       target: { value: "sk-typed" },
@@ -204,7 +222,7 @@ describe("egress service rows", () => {
     expect(fetch).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("OpenAI API key")).toBeNull();
     fireEvent.click(
-      screen.getByRole("button", { name: "Replace OpenAI API key" }),
+      screen.getByRole("button", { name: "Replace key for OpenAI" }),
     );
     expect(screen.getByLabelText("OpenAI API key")).toHaveValue("");
   });
@@ -217,7 +235,7 @@ describe("egress service rows", () => {
         onChanged={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "   " },
@@ -237,7 +255,7 @@ describe("egress service rows", () => {
         onChanged={onChanged}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
     });
@@ -259,7 +277,7 @@ describe("egress service rows", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove OpenAI API key" }),
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     expect(fetch).not.toHaveBeenCalled();
     fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
@@ -283,7 +301,7 @@ describe("egress service rows", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove OpenAI API key" }),
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
     expect(fetch).not.toHaveBeenCalled();
@@ -308,7 +326,7 @@ describe("egress service rows", () => {
         onChanged={vi.fn()}
       />,
     );
-    expect(within(row("OpenAI")).getByText("Set")).toBeInTheDocument();
+    expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.getByText("Managed by credential managers")).toBeVisible();
   });
@@ -322,7 +340,7 @@ describe("egress service rows", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove OpenAI API key" }),
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     expect(
       await screen.findByText(
@@ -340,7 +358,7 @@ describe("egress service rows", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove OpenAI API key" }),
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     expect(
       await screen.findByText(
@@ -358,7 +376,7 @@ describe("egress service rows", () => {
         onChanged={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
     });
@@ -381,7 +399,7 @@ describe("egress service rows", () => {
       />,
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove OpenAI API key" }),
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     vi.mocked(fetch).mockImplementation(async () => json({}, 404));
     fireEvent.click(
@@ -393,7 +411,7 @@ describe("egress service rows", () => {
 
     vi.mocked(fetch).mockImplementation(async () => json({}, 403));
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove OpenAI API key" }),
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     fireEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", {
@@ -448,7 +466,7 @@ describe("connected accounts", () => {
       within(github).getByRole("button", { name: "Connect GitHub" }),
     ).toBeEnabled();
     expect(
-      within(github).queryByRole("button", { name: "Set GitHub API key" }),
+      within(github).queryByRole("button", { name: "Set key for GitHub" }),
     ).toBeNull();
 
     fireEvent.click(
@@ -604,7 +622,9 @@ describe("connected accounts", () => {
     expect(
       screen.getByRole("button", { name: "Connect GitHub" }),
     ).toBeEnabled();
-    expect(screen.queryByRole("button", { name: /API key/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /^(Set|Replace|Remove) key for / }),
+    ).toBeNull();
     expect(
       screen.getByText("API key managed by credential managers"),
     ).toBeVisible();
@@ -623,7 +643,11 @@ describe("connected accounts", () => {
         onChanged={vi.fn()}
       />,
     );
-    expect(within(row("GitHub")).getByText("Connected")).toBeInTheDocument();
+    expect(
+      within(row("GitHub")).getByText(
+        "Connected · shared with everyone using Personal Mind",
+      ),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.getByText("Managed by credential managers")).toBeVisible();
   });
@@ -725,10 +749,10 @@ describe("connected accounts", () => {
     expect(within(github).getByText("Using API key")).toBeInTheDocument();
     expect(within(github).queryByText(/Connected as/)).toBeNull();
     expect(
-      within(github).getByRole("button", { name: "Replace GitHub API key" }),
+      within(github).getByRole("button", { name: "Replace key for GitHub" }),
     ).toBeInTheDocument();
     expect(
-      within(github).getByRole("button", { name: "Remove GitHub API key" }),
+      within(github).getByRole("button", { name: "Remove key for GitHub" }),
     ).toBeInTheDocument();
     expect(
       within(github).queryByRole("button", { name: "Use an API key instead" }),
@@ -779,10 +803,12 @@ describe("connected accounts", () => {
     expect(
       screen.getByRole("button", { name: "Disconnect GitHub" }),
     ).toBeEnabled();
-    expect(screen.queryByRole("button", { name: /API key/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /^(Set|Replace|Remove) key for / }),
+    ).toBeNull();
   });
 
-  it("explains that personal accounts are not used in a shared sandbox", () => {
+  it("explains that personal accounts cannot be used by a shared agent", () => {
     render(
       <EgressServiceRows
         agentName="shared_dev"
@@ -798,7 +824,7 @@ describe("connected accounts", () => {
     const github = row("GitHub");
     expect(
       within(github).getByText(
-        "Personal accounts are not used in a shared sandbox; add an API key or ask an administrator",
+        "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
       ),
     ).toBeVisible();
     expect(
@@ -905,7 +931,7 @@ describe("connected accounts", () => {
     expect(screen.queryByRole("button", { name: /Connect/ })).toBeNull();
     expect(screen.queryByText("Use an API key instead")).toBeNull();
     expect(
-      screen.getByRole("button", { name: "Set GitHub API key" }),
+      screen.getByRole("button", { name: "Set key for GitHub" }),
     ).toBeInTheDocument();
   });
 });
@@ -1009,7 +1035,7 @@ describe("egress service rows with service editing", () => {
     ).toBeDisabled();
     // The key controls are not part of a service write.
     expect(
-      screen.getByRole("button", { name: "Set Mine API key" }),
+      screen.getByRole("button", { name: "Set key for Mine" }),
     ).toBeEnabled();
   });
 
@@ -1094,6 +1120,9 @@ describe("egress service rows with service editing", () => {
 describe("rows with an agent's wording", () => {
   const agent = (overrides: Partial<RowAgent> = {}): RowAgent => ({
     displayName: "Personal Mind",
+    shared: (overrides.services ?? []).some(
+      (service) => service.is_shared === true,
+    ),
     managers: [],
     services: [],
     ...overrides,
@@ -1129,16 +1158,16 @@ describe("rows with an agent's wording", () => {
     ).toBeInTheDocument();
     expect(within(row("GitHub")).getByText("Not set")).toBeInTheDocument();
     expect(
-      within(row("GitHub")).getByRole("button", { name: "Set GitHub API key" }),
+      within(row("GitHub")).getByRole("button", { name: "Set key for GitHub" }),
     ).toHaveTextContent(/^Set key$/);
     expect(
       within(row("OpenAI")).getByRole("button", {
-        name: "Replace OpenAI API key",
+        name: "Replace key for OpenAI",
       }),
     ).toHaveTextContent(/^Replace key$/);
     expect(
       within(row("OpenAI")).getByRole("button", {
-        name: "Remove OpenAI API key",
+        name: "Remove key for OpenAI",
       }),
     ).toHaveTextContent(/^Remove key$/);
   });
@@ -1146,21 +1175,6 @@ describe("rows with an agent's wording", () => {
   it("says Key saved without a date when the server sends none", () => {
     renderRows([keyed({ updated_at: null, key_updated_at: null })]);
     expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
-  });
-
-  it("keeps the dashboard's Updated and Set wording without an agent", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[keyed()]}
-        onChanged={vi.fn()}
-      />,
-    );
-    expect(
-      within(row("OpenAI")).getByText(
-        `Updated ${new Date("2026-10-05T12:00:00+00:00").toLocaleDateString()}`,
-      ),
-    ).toBeInTheDocument();
   });
 
   it("notes that a connected account is kept while an API key is in use", () => {
@@ -1299,22 +1313,68 @@ describe("rows with an agent's wording", () => {
       expect(window.open).not.toHaveBeenCalled();
     });
 
-    it("does not ask on a personal agent", async () => {
-      const personal = { ...sharedGoogle, is_shared: false };
-      renderRows([personal], agent({ services: [personal] }));
+    it("starts one connection however fast Continue is clicked", async () => {
+      vi.mocked(fetch).mockImplementation(() => new Promise(() => {}));
+      renderRows(
+        [sharedGoogle],
+        agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
+      );
       fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      const dialog = await screen.findByRole("dialog");
+      const button = within(dialog).getByRole("button", { name: "Continue" });
+      fireEvent.click(button);
+      fireEvent.click(button);
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([url]) => String(url).endsWith("/connect")),
+      ).toHaveLength(1);
+    });
+
+    it("asks when the agent is shared even if the service cannot tell, as on the dashboard", async () => {
+      const unknown = { ...sharedGoogle, is_shared: null };
+      renderRows(
+        [unknown],
+        agent({ shared: true, displayName: "Shared Dev", services: [unknown] }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      expect(
+        await screen.findByRole("dialog", {
+          name: "Connect a shared account?",
+        }),
+      ).toBeVisible();
+    });
+
+    it("does not ask for a requester's own account that a shared sandbox uses by opt-in", async () => {
+      const optedIn = withAccount(
+        { shared_worker_opt_in: true },
+        { is_shared: true },
+      );
+      renderRows([optedIn], agent({ services: [optedIn] }));
+      fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
       await waitFor(() => expect(fetch).toHaveBeenCalled());
       expect(screen.queryByRole("dialog")).toBeNull();
     });
 
-    it("does not ask without an agent, as on the dashboard", async () => {
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={[sharedGoogle]}
-          onChanged={vi.fn()}
-        />,
+    it("does not call that account shared with everyone either", () => {
+      const optedIn = withAccount(
+        {
+          connected: true,
+          account_label: "octocat",
+          shared_worker_opt_in: true,
+        },
+        { is_shared: true, configured: true, active_source: "oauth" },
       );
+      renderRows([optedIn], agent({ services: [optedIn] }));
+      expect(
+        within(row("GitHub")).getByText("Connected as octocat"),
+      ).toBeVisible();
+      expect(screen.queryByText(/shared with everyone/)).toBeNull();
+    });
+
+    it("does not ask on a personal agent", async () => {
+      const personal = { ...sharedGoogle, is_shared: false };
+      renderRows([personal], agent({ services: [personal] }));
       fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
       await waitFor(() => expect(fetch).toHaveBeenCalled());
       expect(screen.queryByRole("dialog")).toBeNull();
@@ -1374,7 +1434,11 @@ describe("rows with an agent's wording", () => {
         agent({ managers: ["@bob:example.org"], services: [readOnly] }),
       );
       expect(screen.queryByText(/Managed by credential managers/)).toBeNull();
-      expect(screen.queryByRole("button", { name: /API key/ })).toBeNull();
+      expect(
+        screen.queryByRole("button", {
+          name: /^(Set|Replace|Remove) key for /,
+        }),
+      ).toBeNull();
     });
 
     it("still says it where the managers are not known", () => {
@@ -1450,24 +1514,6 @@ describe("rows with an agent's wording", () => {
       );
       await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     });
-
-    it("keeps the dashboard's wording without an agent", async () => {
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={[connectedGithub]}
-          onChanged={vi.fn()}
-        />,
-      );
-      fireEvent.click(
-        screen.getByRole("button", { name: "Disconnect GitHub" }),
-      );
-      expect(
-        await screen.findByText(
-          "This removes the saved GitHub connection. Agents lose access through it until an account is connected again.",
-        ),
-      ).toBeVisible();
-    });
   });
 
   describe("limiting a GitHub service to repositories", () => {
@@ -1498,7 +1544,7 @@ describe("rows with an agent's wording", () => {
         serviceEditing: limiting({ onLimitToRepositories }),
       });
       const button = within(row("GitHub")).getByRole("button", {
-        name: "Limit GitHub to repositories",
+        name: "Limit to repositories for GitHub",
       });
       expect(button).toHaveTextContent("Limit to repositories");
       fireEvent.click(button);
@@ -1532,14 +1578,18 @@ describe("rows with an agent's wording", () => {
         serviceEditing: limiting({ limitDisabled: true }),
       });
       expect(
-        screen.getByRole("button", { name: "Limit GitHub to repositories" }),
+        screen.getByRole("button", {
+          name: "Limit to repositories for GitHub",
+        }),
       ).toBeDisabled();
       cleanup();
       renderRows([base()], undefined, {
         serviceEditing: limiting({ disabled: true }),
       });
       expect(
-        screen.getByRole("button", { name: "Limit GitHub to repositories" }),
+        screen.getByRole("button", {
+          name: "Limit to repositories for GitHub",
+        }),
       ).toBeDisabled();
     });
 
@@ -1582,6 +1632,45 @@ describe("rows with an agent's wording", () => {
       ]);
       expect(screen.getAllByText("Limited to a/b")).toHaveLength(1);
     });
+  });
+
+  it("gives every key and limit button an accessible name that starts with its visible text", () => {
+    const limitable = {
+      ...github,
+      name: "gh",
+      display_name: "GitHub",
+      source: "config" as const,
+      rules: [{ host: "api.github.com", port: null, path_prefix: "/" }],
+    };
+    const keyed = { ...openai, name: "openai", display_name: "OpenAI" };
+    renderRows([limitable, keyed], undefined, {
+      serviceEditing: {
+        editableSource: "user",
+        onEdit: vi.fn(),
+        onDelete: vi.fn(async () => undefined),
+        deleteWarning: () => "",
+        onLimitToRepositories: vi.fn(),
+      },
+    });
+    const labels = [
+      "Set key",
+      "Replace key",
+      "Remove key",
+      "Limit to repositories",
+    ];
+    const buttons = screen
+      .getAllByRole("button")
+      .filter((button) => labels.includes(button.textContent ?? ""));
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "Set key",
+      "Limit to repositories",
+      "Replace key",
+      "Remove key",
+    ]);
+    for (const button of buttons)
+      expect(button.getAttribute("aria-label")).toMatch(
+        new RegExp(`^${button.textContent} for (GitHub|OpenAI)$`),
+      );
   });
 
   it("shows no administrator badge when no label is given", () => {

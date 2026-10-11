@@ -3,25 +3,25 @@ import { Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { disconnectDescription, personalAccountRefusal } from "./accountCopy";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
-  disconnectDescription,
-  personalAccountRefusal,
-  sharedAccountStatus,
-} from "./accountCopy";
-import { coversGithub, limitedRepositories } from "./githubLimits";
+  limitedNote,
+  removeWarning,
+  type RowAgent,
+  type ServiceEditing,
+  servicesUsingAccount,
+  sharesAccount,
+  statusLabel,
+} from "./egressRowStatus";
+import { coversGithub } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
-import type { EgressCredentialService, EgressServiceSource } from "./types";
+import type { EgressCredentialService } from "./types";
+
+export type { RowAgent, ServiceEditing } from "./egressRowStatus";
 
 type AccountAction = "connect" | "disconnect";
 
@@ -30,86 +30,6 @@ interface ServicePaths {
   secret: string;
   connect: string;
   disconnect: string;
-}
-
-/**
- * Controls for the services a viewer defines themselves, and a label for the
- * ones someone else defined. `source` tells them apart.
- */
-export interface ServiceEditing {
-  /** Services with this `source` get Edit and Delete, when the viewer can manage them. */
-  editableSource: EgressServiceSource;
-  /** Turns Edit and Delete off while something else is being written. */
-  disabled?: boolean;
-  /** The service whose editor is open: opening it again would only offer to discard what is typed there. */
-  editingName?: string | null;
-  onEdit: (service: EgressCredentialService) => void;
-  /** Rejects with an Error whose message the row shows. */
-  onDelete: (service: EgressCredentialService) => Promise<void>;
-  deleteWarning: (service: EgressCredentialService) => string;
-  /** Label for services of another source; the personal page groups its rows instead. */
-  labels?: Partial<Record<EgressServiceSource, string>>;
-  /**
-   * Offers Limit to repositories on an administrator's service that reaches
-   * GitHub, when the viewer can manage the agent.
-   */
-  onLimitToRepositories?: (service: EgressCredentialService) => void;
-  /** Turns Limit to repositories off while the editor is open. */
-  limitDisabled?: boolean;
-}
-
-/**
- * The agent a list of rows belongs to. Giving it selects the wording of the
- * personal pages; without it the rows read as on the administrator dashboard.
- */
-export interface RowAgent {
-  displayName: string;
-  /**
-   * The credential managers' Matrix IDs, when the response names them. Where
-   * the page says who manages a shared agent, the rows leave it out.
-   */
-  managers?: string[];
-  /** Every service of the agent: disconnecting a provider names the ones that use it. */
-  services: EgressCredentialService[];
-}
-
-function statusLabel(
-  service: EgressCredentialService,
-  agent: RowAgent | undefined,
-): string {
-  const oauth = service.oauth;
-  if (oauth) {
-    if (service.active_source === "key") return "Using API key";
-    if (service.active_source === "oauth") {
-      // Everyone who uses a shared agent acts as its connected account.
-      if (agent && service.is_shared === true && !oauth.service_account)
-        return sharedAccountStatus(oauth.account_label, agent.displayName);
-      return oauth.account_label
-        ? `Connected as ${oauth.account_label}`
-        : "Connected";
-    }
-    return oauth.reset_required ? "Reset required" : "Not set";
-  }
-  if (!service.configured) return "Not set";
-  const updated = service.updated_at ? new Date(service.updated_at) : null;
-  const date =
-    updated && !Number.isNaN(updated.getTime())
-      ? updated.toLocaleDateString()
-      : null;
-  if (agent) return date ? `Key saved ${date}` : "Key saved";
-  return date ? `Updated ${date}` : "Set";
-}
-
-function removeWarning(service: EgressCredentialService): string {
-  if (service.is_global)
-    return "This deletes the global key, which every agent without a worker scope shares. Those agents lose access to this service until a key is set again.";
-  if (service.is_shared === null)
-    return "This deletes the saved key. The agent loses access to this service until a key is set again.";
-  // A shared agent's key, or for an agent without a worker scope the global
-  // key, so other agents may rely on it too.
-  if (service.is_shared)
-    return "This deletes the shared key. Everyone who relies on it loses access to this service until a key is set again.";
-  return "This deletes your saved key. Your agent loses access to this service until you set a key again.";
 }
 
 function EgressServiceRow({
@@ -125,7 +45,7 @@ function EgressServiceRow({
   onChanged: () => void;
   errorMessages?: RequestErrorMessages;
   serviceEditing?: ServiceEditing;
-  agent?: RowAgent;
+  agent: RowAgent;
 }) {
   const [editing, setEditing] = useState(false);
   const [secret, setSecret] = useState("");
@@ -161,25 +81,14 @@ function EgressServiceRow({
     service.source === "config" &&
     service.can_manage &&
     coversGithub(service.rules);
-  const repositories = limitedRepositories(service.rules);
-  const limitedText = repositories.length
-    ? `Limited to ${repositories.join(", ")}`
-    : null;
+  const limitedText = limitedNote(service);
   // Everyone using a shared agent acts as the account connected there.
-  const asksAboutSharedAccount =
-    agent !== undefined &&
-    service.is_shared === true &&
-    oauth?.unavailable_reason === null;
+  const asksAboutSharedAccount = sharesAccount(agent, oauth);
   // The page names a shared agent's managers once, and a refused personal
   // account row says whom to ask itself, so the row only does without it.
   const managersNamed =
-    agent?.managers !== undefined ||
-    (agent !== undefined && oauth?.unavailable_reason === "shared_sandbox");
-  const providerServices = oauth
-    ? (agent?.services ?? [])
-        .filter((other) => other.oauth?.provider === oauth.provider)
-        .map((other) => other.display_name)
-    : [];
+    agent.managers !== undefined ||
+    oauth?.unavailable_reason === "shared_sandbox";
 
   useEffect(() => () => operation.current?.abort(), []);
 
@@ -264,7 +173,8 @@ function EgressServiceRow({
   };
 
   const connect = async () => {
-    if (!oauth) return;
+    // A second click on Continue, while the first connect is under way, starts nothing.
+    if (!oauth || busy !== null) return;
     const controller = new AbortController();
     operation.current = controller;
     setBusy("connect");
@@ -336,7 +246,7 @@ function EgressServiceRow({
           >
             {service.description}
           </p>
-          {limitedText && service.description !== limitedText && (
+          {limitedText && (
             <p className="text-xs text-muted-foreground">{limitedText}</p>
           )}
         </div>
@@ -347,7 +257,7 @@ function EgressServiceRow({
           >
             {statusLabel(service, agent)}
           </Badge>
-          {agent && service.active_source === "key" && oauth?.connected && (
+          {service.active_source === "key" && oauth?.connected && (
             <span className="text-xs text-muted-foreground">
               Your connected {oauth.display_name} account is kept for other
               services.
@@ -363,21 +273,15 @@ function EgressServiceRow({
               Uses a shared service account
             </span>
           )}
-          {oauth?.unavailable_reason === "shared_sandbox" &&
-            (agent ? (
-              <span className="text-xs text-muted-foreground">
-                {personalAccountRefusal(
-                  oauth.display_name,
-                  service.can_manage,
-                  agent.managers,
-                )}
-              </span>
-            ) : (
-              <span className="text-xs text-muted-foreground">
-                Personal accounts are not used in a shared sandbox; add an API
-                key or ask an administrator
-              </span>
-            ))}
+          {oauth?.unavailable_reason === "shared_sandbox" && (
+            <span className="text-xs text-muted-foreground">
+              {personalAccountRefusal(
+                oauth.display_name,
+                service.can_manage,
+                agent.managers,
+              )}
+            </span>
+          )}
           {oauth?.shared_worker_opt_in && (
             <span className="text-xs text-amber-600 dark:text-amber-400">
               Everyone using this agent can act with the connected account until
@@ -456,28 +360,23 @@ function EgressServiceRow({
                 size="sm"
                 variant="outline"
                 disabled={busy !== null}
-                aria-label={`${service.key_configured ? "Replace" : "Set"} ${keyLabel}`}
+                aria-label={`${service.key_configured ? "Replace" : "Set"} key for ${service.display_name}`}
                 onClick={() => {
                   setError(null);
                   setEditing(true);
                 }}
               >
-                {service.key_configured ? "Replace" : "Set"}
-                {agent && " key"}
+                {service.key_configured ? "Replace key" : "Set key"}
               </Button>
               {service.key_configured && (
                 <Button
                   size="sm"
                   variant="outline"
                   disabled={busy !== null}
-                  aria-label={`Remove ${keyLabel}`}
+                  aria-label={`Remove key for ${service.display_name}`}
                   onClick={() => setConfirm("key")}
                 >
-                  {busy === "remove"
-                    ? "Removing…"
-                    : agent
-                      ? "Remove key"
-                      : "Remove"}
+                  {busy === "remove" ? "Removing…" : "Remove key"}
                 </Button>
               )}
             </>
@@ -491,7 +390,7 @@ function EgressServiceRow({
                 serviceEditing.disabled ||
                 serviceEditing.limitDisabled
               }
-              aria-label={`Limit ${service.display_name} to repositories`}
+              aria-label={`Limit to repositories for ${service.display_name}`}
               onClick={() => serviceEditing.onLimitToRepositories?.(service)}
             >
               Limit to repositories
@@ -573,52 +472,25 @@ function EgressServiceRow({
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
-      <Dialog
+      <ConfirmDialog
         open={confirm === "key"}
-        onOpenChange={(open) => !open && setConfirm(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Remove {keyLabel}?</DialogTitle>
-            <DialogDescription>{removeWarning(service)}</DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirm(null)}>
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={() => void remove()}>
-              Remove
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Remove ${keyLabel}?`}
+        description={removeWarning(service)}
+        confirmLabel="Remove"
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => void remove()}
+      />
       {canEditService && serviceEditing && (
-        <Dialog
+        <ConfirmDialog
           open={confirm === "service"}
-          onOpenChange={(open) => !open && setConfirm(null)}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Delete {service.display_name}?</DialogTitle>
-              <DialogDescription>
-                {serviceEditing.deleteWarning(service)}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setConfirm(null)}>
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={() => void deleteService()}
-              >
-                Delete
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          title={`Delete ${service.display_name}?`}
+          description={serviceEditing.deleteWarning(service)}
+          confirmLabel="Delete"
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => void deleteService()}
+        />
       )}
-      {oauth && agent && (
+      {oauth && (
         <SharedAccountDialog
           open={confirm === "shared"}
           agent={agent.displayName}
@@ -631,35 +503,18 @@ function EgressServiceRow({
         />
       )}
       {oauth && (
-        <Dialog
+        <ConfirmDialog
           open={confirm === "account"}
-          onOpenChange={(open) => !open && setConfirm(null)}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>
-                {oauth.connected ? "Disconnect" : "Reset"} {oauth.display_name}?
-              </DialogTitle>
-              <DialogDescription>
-                {agent
-                  ? disconnectDescription(
-                      oauth.display_name,
-                      agent.displayName,
-                      providerServices,
-                    )
-                  : `This removes the saved ${oauth.display_name} connection. Agents lose access through it until an account is connected again.`}
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setConfirm(null)}>
-                Cancel
-              </Button>
-              <Button variant="destructive" onClick={() => void disconnect()}>
-                {oauth.connected ? "Disconnect" : "Reset connection"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          title={`${oauth.connected ? "Disconnect" : "Reset"} ${oauth.display_name}?`}
+          description={disconnectDescription(
+            oauth.display_name,
+            agent.displayName,
+            servicesUsingAccount(agent, oauth),
+          )}
+          confirmLabel={oauth.connected ? "Disconnect" : "Reset connection"}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => void disconnect()}
+        />
       )}
     </li>
   );
@@ -717,8 +572,8 @@ export function EgressServiceRows({
   errorMessages?: RequestErrorMessages;
   /** Edit and delete controls for the services the viewer defines. */
   serviceEditing?: ServiceEditing;
-  /** The agent the rows belong to, on the personal pages. */
-  agent?: RowAgent;
+  /** The agent the rows belong to, for the wording that depends on it. */
+  agent: RowAgent;
 }) {
   return (
     <ul>

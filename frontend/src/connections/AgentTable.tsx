@@ -12,6 +12,7 @@ import { ChevronDown, ChevronRight, Search } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { sharedAgentNote } from "./accountCopy";
 import { AgentTools } from "./AgentTools";
 import { AgentAvatar } from "./AgentAvatar";
 import { EgressServiceRows } from "./EgressServiceRows";
@@ -32,22 +33,16 @@ const accountKey = (agentName: string, provider: string) =>
 
 /**
  * How many of an agent's accounts and keys are set, out of all of them: its
- * connectable services plus its egress services. The catalog carries no account
- * state for a service, so a service counts once its status has loaded (when the
- * agent is opened) or an egress service of the same provider says it is
- * connected.
+ * connectable services plus its egress services. A service counts as connected
+ * by the catalog, until its status loads (when the agent is opened) and says
+ * otherwise, as after a connect or disconnect.
  */
 function accountCounts(agent: AgentTableRow) {
   const egress = agent.egress_services ?? [];
-  const connectedProviders = new Set(
-    egress.flatMap((service) =>
-      service.oauth?.connected ? [service.oauth.provider] : [],
-    ),
-  );
   const connectedServices = agent.services.filter(
     (service) =>
       agent.accounts[accountKey(agent.agent_name, service.provider)] ??
-      connectedProviders.has(service.provider),
+      service.connected === true,
   );
   return {
     set:
@@ -170,6 +165,61 @@ const columns: ColumnDef<AgentTableRow>[] = [
   },
 ];
 
+/** An agent's brokered API keys and accounts, when the viewer may use its egress credentials. */
+function AgentEgress({
+  agent,
+  onChanged,
+}: {
+  agent: AgentConnections;
+  onChanged: () => void;
+}) {
+  const services = agent.egress_services;
+  // An array, even an empty one, marks an agent that can use egress credentials.
+  if (!Array.isArray(services)) return null;
+  // The catalog gives the agent's scope only through its services, which all share it.
+  const shared = services.some((service) => service.is_shared === true);
+  return (
+    <div className="border-t border-border/60">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
+        <h3 className="text-xs font-medium text-muted-foreground">
+          API keys and accounts
+        </h3>
+        <a
+          href={`/connections/egress#egress-agent-${agent.agent_name}`}
+          className="text-xs font-medium text-primary underline-offset-4 hover:underline"
+        >
+          Manage services
+        </a>
+      </div>
+      {shared && agent.managers !== undefined && (
+        <p className="px-5 pt-2 text-xs text-muted-foreground">
+          {sharedAgentNote(
+            services.some((service) => service.can_manage),
+            agent.managers,
+          )}
+        </p>
+      )}
+      {services.length ? (
+        <EgressServiceRows
+          agentName={agent.agent_name}
+          services={services}
+          onChanged={onChanged}
+          agent={{
+            displayName: agent.agent_display_name,
+            shared,
+            managers: agent.managers,
+            services,
+          }}
+        />
+      ) : (
+        <p className="px-5 py-4 text-sm text-muted-foreground">
+          No services are set up for this agent yet.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function AgentTable({
   agents,
   mcp,
@@ -246,7 +296,7 @@ export function AgentTable({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="relative flex-1 max-sm:basis-full sm:w-64">
+          <div className="relative flex-1 max-sm:basis-full sm:w-80">
             <Search
               className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground"
               aria-hidden="true"
@@ -341,37 +391,10 @@ export function AgentTable({
                           onConnectionChange={onConnectionChange}
                           onAccountStatus={onAccountStatus}
                         />
-                        {/* An array, even an empty one, marks an agent that can use egress credentials. */}
-                        {Array.isArray(row.original.egress_services) ? (
-                          <div className="border-t border-border/60">
-                            <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
-                              <h3 className="text-xs font-medium text-muted-foreground">
-                                API keys and accounts
-                              </h3>
-                              <a
-                                href={`/connections/egress#egress-agent-${row.original.agent_name}`}
-                                className="text-xs font-medium text-primary underline-offset-4 hover:underline"
-                              >
-                                Manage services
-                              </a>
-                            </div>
-                            {row.original.egress_services.length ? (
-                              <EgressServiceRows
-                                agentName={row.original.agent_name}
-                                services={row.original.egress_services}
-                                onChanged={onEgressChange}
-                                agent={{
-                                  displayName: row.original.agent_display_name,
-                                  services: row.original.egress_services,
-                                }}
-                              />
-                            ) : (
-                              <p className="px-5 py-4 text-sm text-muted-foreground">
-                                No services are set up for this agent yet.
-                              </p>
-                            )}
-                          </div>
-                        ) : null}
+                        <AgentEgress
+                          agent={row.original}
+                          onChanged={onEgressChange}
+                        />
                       </section>
                     </td>
                   </tr>

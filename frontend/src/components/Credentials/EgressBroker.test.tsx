@@ -246,12 +246,12 @@ describe("egress broker panel", () => {
     // A service without a display name falls back to its key.
     expect(
       within(row("openai")).getByText(
-        `Updated ${new Date(openai.updated_at).toLocaleDateString()}`,
+        `Key saved ${new Date(openai.updated_at).toLocaleDateString()}`,
       ),
     ).toBeInTheDocument();
     expect(
       within(row("openai")).getByRole("button", {
-        name: "Replace openai API key",
+        name: "Replace key for openai",
       }),
     ).toBeInTheDocument();
     expect(requests("/api/egress-broker/services")[0].search).toBe("");
@@ -449,7 +449,7 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     const input = screen.getByLabelText("GitHub API key");
     expect(input).toHaveAttribute("type", "password");
     fireEvent.change(input, { target: { value: "ghp_secret" } });
@@ -477,7 +477,7 @@ describe("egress broker key target", () => {
       expect(requests("/api/egress-broker/services")).toHaveLength(2),
     );
     // Reopening the editor must not show the previous value.
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     expect(screen.getByLabelText("GitHub API key")).toHaveValue("");
   });
 
@@ -485,7 +485,7 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "ghp_secret" },
     });
@@ -506,7 +506,7 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "coder-only" },
     });
@@ -518,7 +518,7 @@ describe("egress broker key target", () => {
     );
     await screen.findByText("GitHub");
     expect(screen.queryByDisplayValue("coder-only")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     expect(screen.getByLabelText("GitHub API key")).toHaveValue("");
     expect(
       requests("/api/egress-broker/services/github/secret", "PUT"),
@@ -568,7 +568,7 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Remove openai API key" }),
+      screen.getByRole("button", { name: "Remove key for openai" }),
     );
     expect(
       within(screen.getByRole("dialog")).getByText(
@@ -585,7 +585,7 @@ describe("egress broker key target", () => {
     cleanup();
     render(<EgressBroker />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Remove openai API key" }),
+      await screen.findByRole("button", { name: "Remove key for openai" }),
     );
     expect(
       within(screen.getByRole("dialog")).getByText(
@@ -600,7 +600,7 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Remove openai API key" }),
+      await screen.findByRole("button", { name: "Remove key for openai" }),
     );
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", {
@@ -626,7 +626,7 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
 
     mutationResponse = () => json({ detail: "Service 'github' is gone" }, 404);
-    fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
     });
@@ -672,6 +672,17 @@ describe("egress broker connected accounts", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "Connect GitHub" }),
     );
+    // Everyone who uses the shared agent acts as the account, so the admin is asked first.
+    const question = await screen.findByRole("dialog", {
+      name: "Connect a shared account?",
+    });
+    expect(
+      within(question).getByText(
+        "Everyone who uses Agent coder will act as the GitHub account you pick. Use a team account, not your personal one.",
+      ),
+    ).toBeVisible();
+    expect(popup.location.href).toBe("about:blank");
+    fireEvent.click(within(question).getByRole("button", { name: "Continue" }));
     await waitFor(() =>
       expect(popup.location.href).toBe(authorization.auth_url),
     );
@@ -701,7 +712,11 @@ describe("egress broker connected accounts", () => {
         },
       }),
     );
-    expect(await screen.findByText("Connected as octocat")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Connected as octocat · shared with everyone using Agent coder",
+      ),
+    ).toBeInTheDocument();
     expect(requests("/api/egress-broker/services")).toHaveLength(2);
   });
 
@@ -718,14 +733,22 @@ describe("egress broker connected accounts", () => {
     mutationResponse = () =>
       json({ status: "disconnected", provider: "github" });
     render(<EgressBroker />);
-    expect(await screen.findByText("Connected as octocat")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Connected as octocat · shared with everyone using the agents without a scope",
+      ),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Disconnect GitHub" }));
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Disconnect",
-      }),
-    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Disconnect GitHub?",
+    });
+    expect(
+      within(dialog).getByText(
+        "This removes the saved GitHub connection for the agents without a scope. These services stop working until an account is connected again: GitHub.",
+      ),
+    ).toBeVisible();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Disconnect" }));
 
     await waitFor(() =>
       expect(
@@ -1636,7 +1659,7 @@ describe("egress broker service editor", () => {
     expect(within(row("GitHub")).queryByText("User service")).toBeNull();
     // The key can still be set on it.
     expect(
-      within(row("Mine")).getByRole("button", { name: "Set Mine API key" }),
+      within(row("Mine")).getByRole("button", { name: "Set key for Mine" }),
     ).toBeInTheDocument();
   });
 

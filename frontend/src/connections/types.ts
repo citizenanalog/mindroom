@@ -2,6 +2,12 @@ export interface ConnectionService {
   provider: string;
   is_shared: boolean;
   can_manage: boolean;
+  /**
+   * Whether the account is connected, as the viewer's status would show it,
+   * read without refreshing the token. Absent in responses from before the
+   * server sent it.
+   */
+  connected?: boolean;
   display_name: string;
   description: string;
   icon: string | null;
@@ -13,6 +19,12 @@ export interface AgentConnections {
   agent_display_name: string;
   is_shared: boolean;
   can_use: boolean;
+  /**
+   * A shared or unscoped agent's credential managers (Matrix IDs); empty for any
+   * other agent, and for an agent with none only administrators manage it.
+   * Absent in responses from before the server sent it.
+   */
+  managers?: string[];
   services: ConnectionService[];
   tools: ConnectionTool[];
   /**

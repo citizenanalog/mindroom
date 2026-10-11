@@ -3,14 +3,11 @@ import { CheckCircle2, Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { disconnectDescription, sharedAccountStatus } from "./accountCopy";
+  disconnectDescription,
+  sharedAccountStatus,
+  sharedAgentNote,
+} from "./accountCopy";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { requestConnection } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
@@ -87,6 +84,8 @@ export function ConnectionServiceRows({
   useEffect(() => () => operation.current?.abort(), []);
 
   const connect = async () => {
+    // A second click on Continue, while the first connect is under way, starts nothing.
+    if (busy !== null) return;
     const controller = new AbortController();
     operation.current = controller;
     setBusy("connect");
@@ -247,7 +246,9 @@ export function ConnectionServiceRows({
                 )}
                 {!loading && status && !service.can_manage && (
                   <span className="text-xs text-muted-foreground">
-                    Managed by credential managers
+                    {agent.managers === undefined
+                      ? "Managed by credential managers"
+                      : sharedAgentNote(false, agent.managers)}
                   </span>
                 )}
                 {!loading && status && service.can_manage && (
@@ -317,39 +318,20 @@ export function ConnectionServiceRows({
                     void connect();
                   }}
                 />
-                <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-                  <DialogContent>
-                    <DialogHeader>
-                      <DialogTitle>
-                        {status?.reset_required ? "Reset" : "Disconnect"}{" "}
-                        {service.display_name}?
-                      </DialogTitle>
-                      <DialogDescription>
-                        {disconnectDescription(
-                          service.display_name,
-                          agent.agent_display_name,
-                          dependents,
-                        )}
-                      </DialogDescription>
-                    </DialogHeader>
-                    <DialogFooter>
-                      <Button
-                        variant="outline"
-                        onClick={() => setConfirmOpen(false)}
-                      >
-                        Cancel
-                      </Button>
-                      <Button
-                        variant="destructive"
-                        onClick={() => void disconnect()}
-                      >
-                        {status?.reset_required
-                          ? "Reset connection"
-                          : "Disconnect"}
-                      </Button>
-                    </DialogFooter>
-                  </DialogContent>
-                </Dialog>
+                <ConfirmDialog
+                  open={confirmOpen}
+                  title={`${status?.reset_required ? "Reset" : "Disconnect"} ${service.display_name}?`}
+                  description={disconnectDescription(
+                    service.display_name,
+                    agent.agent_display_name,
+                    dependents,
+                  )}
+                  confirmLabel={
+                    status?.reset_required ? "Reset connection" : "Disconnect"
+                  }
+                  onCancel={() => setConfirmOpen(false)}
+                  onConfirm={() => void disconnect()}
+                />
               </td>
             )}
           </tr>

@@ -103,7 +103,7 @@ describe("egress credentials page", () => {
       name: "Personal Mind",
     });
     expect(
-      within(personal).getByRole("button", { name: "Set GitHub API key" }),
+      within(personal).getByRole("button", { name: "Set key for GitHub" }),
     ).toBeInTheDocument();
     const shared = screen.getByRole("region", { name: "Shared Dev" });
     expect(within(shared).getByText("Not set")).toBeInTheDocument();
@@ -164,7 +164,7 @@ describe("egress credentials page", () => {
     });
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Set GitHub API key" }),
+      await screen.findByRole("button", { name: "Set key for GitHub" }),
     );
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
@@ -172,7 +172,7 @@ describe("egress credentials page", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "Replace GitHub API key" }),
+        screen.getByRole("button", { name: "Replace key for GitHub" }),
       ).toBeInTheDocument(),
     );
   });
@@ -669,9 +669,11 @@ describe("egress services on the personal page", () => {
     ).toBeNull();
     // The key can still be set on it, as before.
     expect(
-      within(row).getByRole("button", { name: "Set GitHub API key" }),
+      within(row).getByRole("button", { name: "Set key for GitHub" }),
     ).toBeInTheDocument();
-    expect(within(screen.getByLabelText("My API"))).toBeTruthy();
+    expect(
+      within(screen.getByLabelText("My API")).queryByText(/administrator/),
+    ).toBeNull();
   });
 
   it("offers Add service by the agent's own can_manage flag", async () => {
@@ -1783,7 +1785,7 @@ describe("rows grouped by who added them", () => {
     ]);
   });
 
-  it("keeps the agents in the order the API sends them, also after a reload", async () => {
+  it("keeps the agents in the order the API sends them", async () => {
     const listing = [
       agentOf({ agent_name: "z", agent_display_name: "Zed", services: [] }),
       agentOf({ agent_name: "a", agent_display_name: "Alpha", services: [] }),
@@ -1976,7 +1978,7 @@ describe("limiting a GitHub service to repositories", () => {
     render(<EgressCredentials />);
     fireEvent.click(
       await screen.findByRole("button", {
-        name: "Limit GitHub to repositories",
+        name: "Limit to repositories for GitHub",
       }),
     );
     await presetsReady();
@@ -1985,7 +1987,7 @@ describe("limiting a GitHub service to repositories", () => {
     expect(screen.getByRole("button", { name: "Save service" })).toBeVisible();
     // The editor is open, so a second one is not started.
     expect(
-      screen.getByRole("button", { name: "Limit GitHub to repositories" }),
+      screen.getByRole("button", { name: "Limit to repositories for GitHub" }),
     ).toBeDisabled();
   });
 
@@ -1994,7 +1996,7 @@ describe("limiting a GitHub service to repositories", () => {
     render(<EgressCredentials />);
     fireEvent.click(
       await screen.findByRole("button", {
-        name: "Limit GitHub to repositories",
+        name: "Limit to repositories for GitHub",
       }),
     );
     await presetsReady();
