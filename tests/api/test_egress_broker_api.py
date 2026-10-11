@@ -11,7 +11,7 @@ import pytest
 import yaml
 from fastapi import HTTPException
 
-from mindroom.api import egress_broker, egress_status, oauth
+from mindroom.api import egress_status, oauth
 from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
@@ -823,7 +823,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shared-sandbox check can fail on its own, and that costs only the service that needs it."""
-    real = egress_broker.shared_worker_oauth
+    real = egress_status.shared_worker_oauth
 
     def broken(provider: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
         if provider.requester_scoped_credentials:
@@ -831,7 +831,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
             raise RuntimeError(msg)
         return real(provider, *args, **kwargs)
 
-    monkeypatch.setattr(egress_broker, "shared_worker_oauth", broken)
+    monkeypatch.setattr(egress_status, "shared_worker_oauth", broken)
     response = oauth_broker_client.get("/api/egress-broker/services")
 
     assert response.status_code == 200, response.text

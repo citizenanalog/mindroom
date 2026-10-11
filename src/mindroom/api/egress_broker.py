@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, replace
-from functools import partial
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -29,25 +28,19 @@ from mindroom.api.egress_status import (
     oauth_provider_of_service,
     presets_response,
     rule_summaries,
-    unavailable_egress_oauth_status,
 )
-from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
 from mindroom.egress_broker.secrets import delete_secret, save_secret
 from mindroom.egress_broker.service import active_audit_log, active_ca_pem
 from mindroom.egress_broker.user_services import ServiceSource, service_source
-from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 
 if TYPE_CHECKING:
     from mindroom.api.credentials_target import RequestCredentialsTarget
     from mindroom.config.egress_broker import EgressService
-    from mindroom.config.main import Config
-    from mindroom.egress_broker.secrets import OAuthStatus
     from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 router = APIRouter(prefix="/api/egress-broker", tags=["egress-broker"])
-logger = get_logger(__name__)
 
 
 class _ServiceStatus(EgressSourceStatus):
@@ -78,68 +71,6 @@ class PutSecretRequest(BaseModel):
     secret: str
 
 
-async def _admin_oauth_status(
-    request: Request,
-    config: Config,
-    target: RequestCredentialsTarget,
-    name: str,
-    service: EgressService,
-) -> OAuthStatus | None:
-    """Load a provider's connection state for the selected scope with the dashboard's OAuth status helper.
-
-    The router's dependency has authenticated the request. The token refresh is skipped, as on the personal page,
-    so a stalled provider never stalls the panel. Any failure to read one provider's state, the worker backend check
-    included, shows that service as not connectable instead of failing the panel.
-    """
-    provider_id = service.oauth_provider
-    if provider_id is None:
-        return None
-    provider = load_oauth_providers_for_snapshot(config_lifecycle.bind_current_request_snapshot(request)).get(
-        provider_id,
-    )
-    if provider is None:
-        return None
-    worker_target = worker_target_for_credentials_target(target)
-    try:
-        access = shared_worker_oauth(
-            provider,
-            worker_target,
-            opted_in=service.oauth_on_shared_workers,
-            runtime_paths=target.runtime_paths,
-        )
-        if access == "refused":
-            return shared_worker_unavailable_status(provider, target.runtime_paths)
-        result = await oauth.authenticated_connection_status(
-            provider_id,
-            request,
-            agent_name=target.agent_name,
-            refresh=False,
-        )
-        status = await egress_oauth_status(
-            result,
-            can_manage=True,
-            stored_connection=partial(
-                oauth_status,
-                provider_id,
-                worker_target,
-                service=name,
-                config=config,
-                runtime_paths=target.runtime_paths,
-                credentials_manager=target.base_manager,
-            ),
-        )
-    except Exception as exc:
-        # OAuth provider code, plugin providers included, can raise anything.
-        logger.warning(
-            "egress_oauth_status_unavailable",
-            service=name,
-            provider_id=provider_id,
-            error_type=type(exc).__name__,
-        )
-        return unavailable_egress_oauth_status(provider)
-    return replace(status, shared_worker_opt_in=access == "allowed")
-
-
 async def _load_service_statuses_for_target(
     request: Request,
     target: RequestCredentialsTarget,
@@ -155,7 +86,23 @@ async def _load_service_statuses_for_target(
     # Reading the scope's own services touches the credential store, so it stays off the event loop.
     scope_services = await asyncio.to_thread(effective_services, config, target.base_manager, worker_target)
     for name, service_config in scope_services.items():
-        oauth_part = await _admin_oauth_status(request, config, target, name, service_config)
+        oauth_part = await egress_oauth_status(
+            request,
+            name,
+            service_config,
+            worker_target,
+            config=config,
+            runtime_paths=target.runtime_paths,
+            manager=target.base_manager,
+            can_manage=True,
+            # The router's dependency has authenticated the request, so the dashboard's status helper can read it.
+            connection_status=lambda provider: oauth.authenticated_connection_status(
+                provider.id,
+                request,
+                agent_name=target.agent_name,
+                refresh=False,
+            ),
+        )
         sources = await egress_service_status(target.base_manager, worker_target, service_config, name, oauth_part)
         services.append(
             _ServiceStatus(

@@ -24,7 +24,6 @@ from structlog.testing import capture_logs
 from mindroom.api import (
     config_lifecycle,
     connections,
-    egress_listing,
     egress_logs,
     egress_status,
     egress_user_services,
@@ -2402,7 +2401,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
     if failure == "unsupported backend":
         _use_worker_backend(portal, "no-such-backend")
     else:
-        real = egress_listing.shared_worker_oauth
+        real = egress_status.shared_worker_oauth
 
         def broken(provider: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
             if provider.requester_scoped_credentials:
@@ -2410,7 +2409,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
                 raise RuntimeError(msg)
             return real(provider, *args, **kwargs)
 
-        monkeypatch.setattr(egress_listing, "shared_worker_oauth", broken)
+        monkeypatch.setattr(egress_status, "shared_worker_oauth", broken)
 
     listing = portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"])
     catalog = portal["client"].get("/api/connections", headers=portal["headers"]["alice"])

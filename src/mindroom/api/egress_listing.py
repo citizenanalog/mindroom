@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, replace
-from functools import partial
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import APIRouter, Request
@@ -25,32 +24,24 @@ from mindroom.api.egress_status import (
     egress_service_status,
     presets_response,
     rule_summaries,
-    service_oauth_provider,
-    unavailable_egress_oauth_status,
 )
 from mindroom.credentials.manager import get_runtime_credentials_manager
-from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
 from mindroom.egress_broker.user_services import (
     InactiveUserService,
     ServiceSource,
     inactive_user_services,
     service_source,
 )
-from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
 
 if TYPE_CHECKING:
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
-    from mindroom.config.egress_broker import EgressService
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
-    from mindroom.egress_broker.secrets import OAuthStatus
-    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 router = APIRouter()
-logger = get_logger(__name__)
 
 
 class EgressCredentialService(EgressSourceStatus):
@@ -112,71 +103,6 @@ class EgressCredentialsResponse(BaseModel):
     agents: list[EgressCredentialAgent]
 
 
-async def _personal_oauth_status(
-    request: Request,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    manager: CredentialsManager,
-    target: ResolvedWorkerTarget,
-    service_name: str,
-    service: EgressService,
-    *,
-    can_manage: bool,
-) -> OAuthStatus | None:
-    """Load a service's provider connection state for one agent with the helper behind the portal's status route.
-
-    The token refresh is skipped so a listing never waits on the provider; an unknown provider has no status, and
-    any failure to read one provider's state, the worker backend check included, shows that service as not
-    connectable instead of failing the listing.
-    Requester-scoped connections (GitHub and Atlassian) belong to the requester, so every user of the agent manages
-    their own, except where the broker refuses them in a shared sandbox (`shared_worker_oauth`).
-    """
-    provider = service_oauth_provider(config_lifecycle.bind_current_request_snapshot(request), service)
-    if provider is None:
-        return None
-    try:
-        access = shared_worker_oauth(
-            provider,
-            target,
-            opted_in=service.oauth_on_shared_workers,
-            runtime_paths=runtime_paths,
-        )
-        if access == "refused":
-            return shared_worker_unavailable_status(provider, runtime_paths)
-        result = await oauth.agent_connection_status(
-            request,
-            provider,
-            runtime_paths,
-            manager,
-            target,
-            config=config,
-            refresh=False,
-        )
-        status = await egress_oauth_status(
-            result,
-            can_manage=can_manage or provider.requester_scoped_credentials,
-            stored_connection=partial(
-                oauth_status,
-                provider.id,
-                target,
-                service=service_name,
-                config=config,
-                runtime_paths=runtime_paths,
-                credentials_manager=manager,
-            ),
-        )
-    except Exception as exc:
-        # OAuth provider code, plugin providers included, can raise anything.
-        logger.warning(
-            "egress_oauth_status_unavailable",
-            service=service_name,
-            provider_id=provider.id,
-            error_type=type(exc).__name__,
-        )
-        return unavailable_egress_oauth_status(provider)
-    return replace(status, shared_worker_opt_in=access == "allowed")
-
-
 async def egress_services_for_agent(
     request: Request,
     agent_name: str,
@@ -204,19 +130,24 @@ async def egress_services_for_agent(
     services = await asyncio.to_thread(effective_services, config, manager, target)
     rows = []
     for name, service in services.items():
-        oauth_part = (
-            await _personal_oauth_status(
+        oauth_part = await egress_oauth_status(
+            request,
+            name,
+            service,
+            target,
+            config=config,
+            runtime_paths=runtime_paths,
+            manager=manager,
+            can_manage=can_manage,
+            connection_status=lambda provider: oauth.agent_connection_status(
                 request,
-                config,
+                provider,
                 runtime_paths,
                 manager,
                 target,
-                name,
-                service,
-                can_manage=can_manage,
-            )
-            if service.oauth_provider is not None
-            else None
+                config=config,
+                refresh=False,
+            ),
         )
         sources = await egress_service_status(manager, target, service, name, oauth_part)
         rows.append(

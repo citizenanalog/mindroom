@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException
@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from mindroom.api import config_lifecycle, oauth
 from mindroom.config.egress_broker import RESERVED_PLACEHOLDER_NAMES, RESERVED_PLACEHOLDER_PREFIXES, EgressService
-from mindroom.egress_broker.oauth_source import shared_worker_oauth
+from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.secrets import EgressServiceStatus, OAuthStatus, service_status
 from mindroom.egress_broker.user_services import (
@@ -27,23 +27,26 @@ from mindroom.egress_broker.user_services import (
     PLACEHOLDER_VALUE_MAX_LENGTH,
     effective_config,
 )
+from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.oauth.service import oauth_provider_service_account_configured
 from mindroom.workers.backend import WorkerBackendError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
 
     from fastapi import Request
 
     from mindroom.api.config_lifecycle import ApiSnapshot
     from mindroom.config.egress_broker import EgressAuth
     from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
     from mindroom.egress_broker.audit import AuditRecord
     from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
+logger = get_logger(__name__)
 
 RESTRICT_ONLY_KEY_REFUSAL = "This service only limits paths and never sends a key, so it cannot store one"
 
@@ -268,49 +271,83 @@ class EgressSourceStatus(BaseModel):
 
 
 async def egress_oauth_status(
-    result: oauth.OAuthStatusResponse,
+    request: Request,
+    name: str,
+    service: EgressService,
+    worker_target: ResolvedWorkerTarget | None,
     *,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    manager: CredentialsManager,
     can_manage: bool,
-    stored_connection: Callable[[], OAuthStatus | None],
-) -> OAuthStatus:
-    """Return a service's OAuth status as the broker sees it.
+    connection_status: Callable[[OAuthProvider], Awaitable[oauth.OAuthStatusResponse]],
+) -> OAuthStatus | None:
+    """Return a service's OAuth status as the broker sees it, or None without a provider the registry knows.
 
-    Without a service account this is what the Connections portal shows the same viewer. A service account is not
-    a token the broker can inject, so with one `connected` only reflects a stored personal connection that the
-    broker would still use (`stored_connection` reads it like the broker does), and nothing is connectable.
+    `connection_status` loads the provider's state without a token refresh, so a stalled provider never stalls a page:
+    the personal page passes the helper behind the portal's status route, the admin panel the dashboard's. A provider
+    the broker refuses in a shared sandbox (`shared_worker_oauth`) is reported unavailable before any state is read.
+    Without a service account the status is what the Connections portal shows the same viewer; requester-scoped
+    connections (GitHub, Atlassian) belong to the requester, so every user of the agent manages their own. A service
+    account is not a token the broker can inject, so with one `connected` only reflects a stored personal connection
+    that the broker would still use, and nothing is connectable. Any failure to read one provider's state, the worker
+    backend check included, shows that service as not connectable instead of failing the page.
     """
-    if not result.has_service_account_config:
-        view: oauth.PersonalConnectionView = oauth.personal_connection_view(result, can_manage=can_manage)
-        return OAuthStatus(
-            provider=result.provider,
-            display_name=result.display_name,
-            connected=view.connected,
-            account_label=view.account_label,
-            can_connect=view.can_connect,
-            reset_required=view.reset_required,
+    provider = service_oauth_provider(config_lifecycle.bind_current_request_snapshot(request), service)
+    if provider is None:
+        return None
+    try:
+        access = shared_worker_oauth(
+            provider,
+            worker_target,
+            opted_in=service.oauth_on_shared_workers,
+            runtime_paths=runtime_paths,
         )
-    stored = await asyncio.to_thread(stored_connection)
-    return OAuthStatus(
-        provider=result.provider,
-        display_name=result.display_name,
-        connected=stored is not None and stored.connected,
-        account_label=None,
-        can_connect=False,
-        reset_required=result.reset_required,
-        service_account=True,
-    )
-
-
-def unavailable_egress_oauth_status(provider: OAuthProvider) -> OAuthStatus:
-    """Return the status shown while a provider's connection state cannot be loaded, so one failure spares the page."""
-    return OAuthStatus(
-        provider=provider.id,
-        display_name=provider.display_name,
-        connected=False,
-        account_label=None,
-        can_connect=False,
-        reset_required=False,
-    )
+        if access == "refused":
+            return shared_worker_unavailable_status(provider, runtime_paths)
+        result = await connection_status(provider)
+        if result.has_service_account_config:
+            stored = await asyncio.to_thread(
+                oauth_status,
+                provider.id,
+                worker_target,
+                service=name,
+                config=config,
+                runtime_paths=runtime_paths,
+                credentials_manager=manager,
+            )
+            status = OAuthStatus(
+                provider=result.provider,
+                display_name=result.display_name,
+                connected=stored is not None and stored.connected,
+                account_label=None,
+                can_connect=False,
+                reset_required=result.reset_required,
+                service_account=True,
+            )
+        else:
+            view: oauth.PersonalConnectionView = oauth.personal_connection_view(
+                result,
+                can_manage=can_manage or provider.requester_scoped_credentials,
+            )
+            status = OAuthStatus(provider=result.provider, display_name=result.display_name, **asdict(view))
+    except Exception as exc:
+        # OAuth provider code, plugin providers included, can raise anything.
+        logger.warning(
+            "egress_oauth_status_unavailable",
+            service=name,
+            provider_id=provider.id,
+            error_type=type(exc).__name__,
+        )
+        return OAuthStatus(
+            provider=provider.id,
+            display_name=provider.display_name,
+            connected=False,
+            account_label=None,
+            can_connect=False,
+            reset_required=False,
+        )
+    return replace(status, shared_worker_opt_in=access == "allowed")
 
 
 async def egress_service_status(
