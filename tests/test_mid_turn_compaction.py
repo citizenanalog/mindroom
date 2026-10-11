@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -370,6 +371,29 @@ async def test_request_sizing_counts_the_turns_thinking(
 
     assert summary_calls.inputs
     assert any(is_compaction_summary(message) for message in model.requests[1].messages)
+
+
+@pytest.mark.asyncio
+async def test_request_sizing_runs_off_the_event_loop(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, paths = _config(tmp_path)
+    loop_thread = threading.get_ident()
+    sizing_threads: list[int] = []
+    original = mid_turn_compaction.estimate_request_messages_tokens
+
+    def recording(*args: Any, **kwargs: Any) -> int:  # noqa: ANN401
+        sizing_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mid_turn_compaction, "estimate_request_messages_tokens", recording)
+
+    await _run(_agent(_ToolLoopModel(tool_rounds=5), config, paths), "Do the task")
+
+    assert sizing_threads
+    assert loop_thread not in sizing_threads
 
 
 @pytest.mark.asyncio

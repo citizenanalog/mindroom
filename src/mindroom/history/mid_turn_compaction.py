@@ -207,7 +207,8 @@ async def _prepare_request(
     policy = _policy(binding)
     if policy is None:
         return
-    request_tokens = _request_tokens(binding, policy, messages, tools, loaded_ids)
+    # Sizing can tokenize the whole request, so it stays off the event loop that serves every room.
+    request_tokens = await asyncio.to_thread(_request_tokens, binding, policy, messages, tools, loaded_ids)
     if request_tokens <= policy.limit:
         return
     session = _scoped_session(binding, built_session, run_response)
@@ -227,8 +228,9 @@ async def _prepare_request(
         )
         policy.replay_model.configure_native_compaction(threshold=None)
     _finish(messages, layout, summary_message, run_response)
-    _require_fit(policy, messages, tools, summary_message)
-    if _estimated_request_tokens(policy, messages, tools) > policy.limit:
+    rewritten_tokens = await asyncio.to_thread(_estimated_request_tokens, policy, messages, tools)
+    _require_fit(policy, rewritten_tokens, summary_message)
+    if rewritten_tokens > policy.limit:
         # What stays (system prompt, tools, summary, prompt) exceeds the replay window on its own; compacting again
         # would only summarize each new tool result before the model ever saw it.
         logger.warning(
@@ -395,14 +397,8 @@ def _policy(binding: _MidTurnCompaction) -> _Policy | None:
     )
 
 
-def _require_fit(
-    policy: _Policy,
-    messages: list[Message],
-    tools: list[dict[str, Any]] | None,
-    summary_message: Message,
-) -> None:
+def _require_fit(policy: _Policy, tokens: int, summary_message: Message) -> None:
     """Refuse to send a rewritten request whose kept messages and summary exceed the model's own window."""
-    tokens = _estimated_request_tokens(policy, messages, tools)
     if tokens <= policy.fit_limit:
         return
     summary_tokens = estimate_text_tokens(str(summary_message.content))
