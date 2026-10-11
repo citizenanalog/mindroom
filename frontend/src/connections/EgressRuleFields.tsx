@@ -1,17 +1,14 @@
 import { useId, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  AUTH_CHOICES,
-  DEFAULT_TEMPLATE,
-  type RuleAuthChoice,
-} from "./egressRuleAuth";
+import { AUTH_CHOICES, DEFAULT_TEMPLATE } from "./egressRuleAuth";
 import {
   type RuleForm,
   applyAuthChoice,
   splitHostInput,
 } from "./egressServiceForm";
 import type { RuleFieldPart } from "./egressServiceValidation";
+import type { EgressRuleAuthType } from "./types";
 
 /**
  * The editor's labelled fields and the fields of one rule. The first rule is
@@ -213,7 +210,7 @@ export function RuleSendFields({
             disabled={disabled}
             onChange={(event) =>
               onChange(
-                applyAuthChoice(rule, event.target.value as RuleAuthChoice),
+                applyAuthChoice(rule, event.target.value as EgressRuleAuthType),
               )
             }
           >

@@ -82,8 +82,10 @@ export interface EgressOAuthStatus {
 export type EgressServiceSource = "config" | "user";
 
 /**
- * How a listed rule sends the key. A custom header template reads `template`,
- * and a restrict-only service's rule, which sends nothing, reads `null`.
+ * How a rule sends the key, in the listing and in the editor's form. A custom
+ * template is header auth with a value template, which the authored format
+ * does not tell apart; a listed rule of a restrict-only service, which sends
+ * nothing, reads `null`.
  */
 export type EgressRuleAuthType = EgressAuthType | "template";
 

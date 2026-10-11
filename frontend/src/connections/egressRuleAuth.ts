@@ -1,4 +1,4 @@
-import type { EgressAuthType } from "./types";
+import type { EgressRuleAuthType } from "./types";
 
 /**
  * How a rule sends the key: the ways the form offers, the `{secret}` value
@@ -8,20 +8,16 @@ import type { EgressAuthType } from "./types";
 /** Where a value template puts the key; it must appear in the template exactly once. */
 export const DEFAULT_TEMPLATE = "{secret}";
 
-/**
- * How a rule sends the key, as the form offers it. A custom template is header
- * auth with a value template, which the wire format does not tell apart.
- */
-export type RuleAuthChoice = EgressAuthType | "template";
-
-export const AUTH_CHOICES: readonly { value: RuleAuthChoice; label: string }[] =
-  [
-    { value: "bearer", label: "Bearer token" },
-    { value: "header", label: "Header" },
-    { value: "basic", label: "Basic" },
-    { value: "query", label: "Query parameter" },
-    { value: "template", label: "Custom template" },
-  ];
+export const AUTH_CHOICES: readonly {
+  value: EgressRuleAuthType;
+  label: string;
+}[] = [
+  { value: "bearer", label: "Bearer token" },
+  { value: "header", label: "Header" },
+  { value: "basic", label: "Basic" },
+  { value: "query", label: "Query parameter" },
+  { value: "template", label: "Custom template" },
+];
 
 /** Whether a template is one of the user's own, not empty and not the plain `{secret}`. */
 export function hasCustomTemplate(template: string | undefined): boolean {

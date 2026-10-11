@@ -1,7 +1,8 @@
-import { type RuleAuthChoice, hasCustomTemplate } from "./egressRuleAuth";
+import { hasCustomTemplate } from "./egressRuleAuth";
 import type {
   AuthoredEgressService,
   EgressAuth,
+  EgressRuleAuthType,
   EgressValidation,
   EgressPreset,
   EgressRule,
@@ -37,7 +38,7 @@ export interface RuleForm {
   host: string;
   port: string;
   pathPrefix: string;
-  authType: RuleAuthChoice;
+  authType: EgressRuleAuthType;
   username: string;
   headerOrParam: string;
   template: string;
@@ -163,7 +164,7 @@ export function usesOwnRules(form: EgressServiceForm): boolean {
 /** Switch how a rule sends the key; plain Header sends the key as it is, so it drops a custom template. */
 export function applyAuthChoice(
   rule: RuleForm,
-  authType: RuleAuthChoice,
+  authType: EgressRuleAuthType,
 ): RuleForm {
   return {
     ...rule,
