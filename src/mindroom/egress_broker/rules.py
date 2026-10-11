@@ -403,63 +403,18 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
 
 
 def _inject_query_param(target: bytes, param_name: str, template: str, secret: str) -> bytes:
-    """Inject a query parameter with template substitution.
+    """Put the templated secret in the target's query, keeping the path and every other pair byte for byte.
 
-    Preserves exact encoding of other parameters byte-for-byte.
-    Replaces all occurrences of the param with one at the first occurrence position.
+    Every pair whose decoded name is `param_name` is removed, and the new pair takes the first one's place, or goes
+    last when there is none. The name and value are percent-encoded once.
     """
-    target_str = target.decode("latin-1")
-    parsed = urlsplit(target_str)
-    path = parsed.path
-    raw_query = parsed.query
-
-    if not raw_query:
-        # No existing query string, just append the new param
-        value = template.replace("{secret}", secret)
-        encoded_value = quote(value, safe="")
-        encoded_name = quote(param_name, safe="")
-        new_target_str = f"{path}?{encoded_name}={encoded_value}"
-        return new_target_str.encode("latin-1")
-
-    # Split query on "&" to preserve exact encoding of other params
-    param_pairs = raw_query.split("&")
-    first_index = None
-    filtered_pairs = []
-
-    # Find first occurrence and filter out all occurrences
-    for _i, pair in enumerate(param_pairs):
-        # Split on first "=" to get name and value
-        if "=" in pair:
-            pair_name, _ = pair.split("=", 1)
-            decoded_name = unquote(pair_name)
-        else:
-            # Handle param without value (e.g., "?flag")
-            decoded_name = unquote(pair)
-
-        if decoded_name == param_name:
-            if first_index is None:
-                first_index = len(filtered_pairs)
-            # Skip this param (remove all occurrences)
-        else:
-            filtered_pairs.append(pair)
-
-    # Build the new param with template applied and encoded once
-    value = template.replace("{secret}", secret)
-    encoded_value = quote(value, safe="")
-    encoded_name = quote(param_name, safe="")
-    new_param = f"{encoded_name}={encoded_value}"
-
-    # Insert at first occurrence position or append
-    if first_index is not None:
-        filtered_pairs.insert(first_index, new_param)
-    else:
-        filtered_pairs.append(new_param)
-
-    # Rebuild query string
-    new_query = "&".join(filtered_pairs)
-    new_target_str = f"{path}?{new_query}"
-
-    return new_target_str.encode("latin-1")
+    parsed = urlsplit(target.decode("latin-1"))
+    new_param = f"{quote(param_name, safe='')}={quote(template.replace('{secret}', secret), safe='')}"
+    pairs = parsed.query.split("&") if parsed.query else []
+    matches = [i for i, pair in enumerate(pairs) if unquote(pair.split("=", 1)[0]) == param_name]
+    kept = [pair for i, pair in enumerate(pairs) if i not in matches]
+    kept.insert(matches[0] if matches else len(kept), new_param)
+    return f"{parsed.path}?{'&'.join(kept)}".encode("latin-1")
 
 
 def inject_credentials(
@@ -468,47 +423,18 @@ def inject_credentials(
     auth: EgressAuth,
     secret: str,
 ) -> tuple[list[tuple[bytes, bytes]], bytes]:
-    """Inject credentials into headers or request target.
-
-    Returns new headers list and new target.
-    """
-    new_headers = list(headers)
-
-    if auth.type == "bearer":
-        # Remove any existing Authorization header
-        new_headers = [(k, v) for k, v in new_headers if k.lower() != b"authorization"]
-        # Add Bearer token
-        new_headers.append((b"authorization", f"Bearer {secret}".encode()))
-        return new_headers, target
-
-    if auth.type == "basic":
-        # Remove any existing Authorization header
-        new_headers = [(k, v) for k, v in new_headers if k.lower() != b"authorization"]
-        # Encode username:secret in base64
-        credentials = f"{auth.username}:{secret}".encode()
-        encoded = base64.b64encode(credentials)
-        new_headers.append((b"authorization", b"Basic " + encoded))
-        return new_headers, target
-
-    if auth.type == "header":
-        # auth.name is guaranteed non-None by validators
-        assert auth.name is not None
-        # Remove any existing header with this name
-        header_name = auth.name.lower().encode()
-        new_headers = [(k, v) for k, v in new_headers if k.lower() != header_name]
-        # Add new header with template substitution
-        value = auth.template.replace("{secret}", secret)
-        new_headers.append((header_name, value.encode()))
-        return new_headers, target
-
+    """Return the headers and target with the credential injected, replacing any header of the same name."""
     if auth.type == "query":
-        # auth.name is guaranteed non-None by validators
-        assert auth.name is not None
-        new_target = _inject_query_param(target, auth.name, auth.template, secret)
-        return new_headers, new_target
-
-    # Should never reach here if auth is valid
-    return new_headers, target
+        assert auth.name is not None  # The config requires a name for query auth.
+        return list(headers), _inject_query_param(target, auth.name, auth.template, secret)
+    if auth.type == "header":
+        assert auth.name is not None  # The config requires a name for header auth.
+        name, value = auth.name.lower().encode(), auth.template.replace("{secret}", secret).encode()
+    elif auth.type == "basic":
+        name, value = b"authorization", b"Basic " + base64.b64encode(f"{auth.username}:{secret}".encode())
+    else:  # bearer, the last of the four auth types the config allows
+        name, value = b"authorization", f"Bearer {secret}".encode()
+    return [(k, v) for k, v in headers if k.lower() != name] + [(name, value)], target
 
 
 def _parse_connection_header(headers: list[tuple[bytes, bytes]]) -> set[str]:
