@@ -1,0 +1,999 @@
+"""Unit tests for the pure turn policy decisions in turn_policy.py.
+
+These are characterization tests for TurnPolicy.plan_turn: they pin down the
+current ignore/route/respond behavior so the planned refactor of this layer
+has a direct safety net that does not go through bot-level integration tests.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+import nio
+import pytest
+
+from mindroom.authorization import ReplyMembershipPendingError
+from mindroom.config.access import ResponderAccessConfig
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
+from mindroom.config.participation import ParticipationConfig
+from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.conversation_resolver import MessageContext
+from mindroom.dispatch_source import ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND
+from mindroom.entity_resolution import entity_identity_registry
+from mindroom.logging_config import get_logger
+from mindroom.matrix.thread_history_result import thread_history_result
+from mindroom.message_target import MessageTarget
+from mindroom.teams import TeamIntent, TeamMode, TeamOutcome
+from mindroom.turn_origin import TurnIntent
+from mindroom.turn_policy import PreparedDispatch, TurnPolicy
+from tests.access_schema_support import with_responder_access
+from tests.authorization_helpers import (
+    make_test_turn_policy_deps,
+)
+from tests.conftest import (
+    bind_runtime_paths,
+    make_matrix_client_mock,
+    make_visible_message,
+    request_envelope,
+    runtime_paths_for,
+    test_runtime_paths,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from mindroom.matrix.client import ResolvedVisibleMessage
+    from mindroom.matrix.identity import MatrixID
+    from mindroom.turn_policy import _ResponderAvailability
+
+_ROOM_ID = "!test:localhost"
+_SENDER = "@user:localhost"
+_EVENT_ID = "$event:localhost"
+
+
+@dataclass(frozen=True)
+class _RuntimeStub:
+    """Minimal SupportsClientConfigOrchestrator stand-in for pure policy tests."""
+
+    client: nio.AsyncClient | None
+    config: Config
+    orchestrator: None = None
+    runtime_started_at: float = 0.0
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> Config:
+    """Two-agent config bound to isolated runtime paths."""
+    return bind_runtime_paths(
+        Config(
+            agents={
+                "general": AgentConfig(display_name="General"),
+                "research": AgentConfig(display_name="Research"),
+            },
+        ),
+        test_runtime_paths(tmp_path),
+    )
+
+
+def _policy_for(config: Config, agent_name: str) -> TurnPolicy:
+    runtime_paths = runtime_paths_for(config)
+    registry = entity_identity_registry(config, runtime_paths)
+    return TurnPolicy(
+        make_test_turn_policy_deps(
+            runtime=_RuntimeStub(client=None, config=config),
+            logger=get_logger("test_turn_policy"),
+            runtime_paths=runtime_paths,
+            agent_name=agent_name,
+            matrix_id=registry.current_id(agent_name),
+        ),
+    )
+
+
+def _entity_id(config: Config, entity_name: str) -> MatrixID:
+    return entity_identity_registry(config, runtime_paths_for(config)).current_id(entity_name)
+
+
+def _room_with_members(*user_ids: str, room_id: str = _ROOM_ID) -> nio.MatrixRoom:
+    room = nio.MatrixRoom(room_id, "@mindroom_general:localhost")
+    for user_id in user_ids:
+        room.add_member(user_id, user_id, None)
+    return room
+
+
+def _context(
+    *,
+    mentioned: list[MatrixID] | None = None,
+    am_i_mentioned: bool = False,
+    thread_id: str | None = None,
+    thread_history: list[ResolvedVisibleMessage] | None = None,
+    full_history: bool = True,
+) -> MessageContext:
+    history: object = thread_history or []
+    if full_history:
+        history = thread_history_result(thread_history or [], is_full_history=True)
+    return MessageContext(
+        am_i_mentioned=am_i_mentioned,
+        is_thread=thread_id is not None,
+        thread_id=thread_id,
+        thread_history=history,
+        mentioned_agents=mentioned or [],
+        has_non_agent_mentions=False,
+    )
+
+
+def _dispatch(context: MessageContext, *, agent_name: str, room_id: str = _ROOM_ID) -> PreparedDispatch:
+    target = MessageTarget.resolve(room_id, context.thread_id, _EVENT_ID)
+    envelope = request_envelope(
+        room_id=room_id,
+        reply_to_event_id=_EVENT_ID,
+        thread_id=context.thread_id,
+        prompt="hello agents",
+        user_id=_SENDER,
+        target=target,
+        agent_name=agent_name,
+    )
+    return PreparedDispatch(
+        requester_user_id=_SENDER,
+        context=context,
+        target=target,
+        correlation_id="corr-test",
+        envelope=envelope,
+    )
+
+
+def _text_event(body: str) -> nio.RoomMessageText:
+    return nio.RoomMessageText.from_dict(
+        {
+            "content": {"body": body, "msgtype": "m.text"},
+            "event_id": _EVENT_ID,
+            "sender": _SENDER,
+            "origin_server_ts": 1_000_000,
+            "room_id": _ROOM_ID,
+            "type": "m.room.message",
+        },
+    )
+
+
+async def _plan(
+    policy: TurnPolicy,
+    room: nio.MatrixRoom,
+    dispatch: PreparedDispatch,
+    *,
+    is_dm: bool = False,
+    has_active_response: bool = False,
+) -> object:
+    return await policy.plan_turn(
+        room,
+        _text_event("hello agents"),
+        dispatch,
+        is_dm=is_dm,
+        has_active_response_for_target=lambda _target: has_active_response,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mentioned_agent_responds_individually(config: Config) -> None:
+    """A direct mention of one agent yields an individual respond plan."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(mentioned=[_entity_id(config, "general")], am_i_mentioned=True)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "respond"
+    assert plan.response_action is not None
+    assert plan.response_action.kind == "individual"
+
+
+@pytest.mark.asyncio
+async def test_mention_of_other_agent_is_ignored(config: Config) -> None:
+    """An agent must stay silent when only another agent is mentioned."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(mentioned=[_entity_id(config, "research")])
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("sender_allowed", [True, False])
+async def test_mentioned_agent_not_configured_for_room_rejects_only_allowed_senders(
+    tmp_path: Path,
+    sender_allowed: bool,
+) -> None:
+    """A joined agent that a configured room does not list explains itself only to senders it accepts."""
+    config = bind_runtime_paths(
+        with_responder_access(
+            Config(
+                agents={
+                    "general": AgentConfig(display_name="General"),
+                    "research": AgentConfig(display_name="Research", rooms=[_ROOM_ID]),
+                },
+            ),
+            "general",
+            users=[_SENDER if sender_allowed else "@owner:localhost"],
+        ),
+        test_runtime_paths(tmp_path),
+    )
+    config.agents["research"].access = ResponderAccessConfig(users=[_SENDER])
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(mentioned=[_entity_id(config, "general")], am_i_mentioned=True)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    if not sender_allowed:
+        assert plan.kind == "ignore"
+        return
+    assert plan.kind == "respond"
+    assert plan.response_action is not None
+    assert plan.response_action.kind == "reject"
+    assert plan.response_action.rejection_message == (
+        "This room is managed in the MindRoom configuration, and I'm not one of its agents, so I can't answer here. "
+        "To talk to me, create a new room and invite me. In this room, you can ask Research."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("case", ["explained", "sender_denied", "not_joined"])
+async def test_team_mention_with_agent_not_configured_for_room_explains_it(tmp_path: Path, case: str) -> None:
+    """Only a team request rejected solely by the configured room's boundary gets the room explanation."""
+    general_users = ["@owner:localhost"] if case == "sender_denied" else [_SENDER]
+    config = bind_runtime_paths(
+        Config(
+            agents={
+                "general": AgentConfig(display_name="General", access=ResponderAccessConfig(users=general_users)),
+                "research": AgentConfig(
+                    display_name="Research",
+                    rooms=[_ROOM_ID],
+                    access=ResponderAccessConfig(users=[_SENDER]),
+                ),
+            },
+        ),
+        test_runtime_paths(tmp_path),
+    )
+    members = [_SENDER, _entity_id(config, "research").full_id]
+    if case != "not_joined":
+        members.append(_entity_id(config, "general").full_id)
+    room = _room_with_members(*members)
+    mentioned = [_entity_id(config, "general"), _entity_id(config, "research")]
+
+    owner_plan = await _plan(
+        _policy_for(config, "research"),
+        room,
+        _dispatch(_context(mentioned=mentioned, am_i_mentioned=True), agent_name="research"),
+    )
+    other_plan = await _plan(
+        _policy_for(config, "general"),
+        room,
+        _dispatch(_context(mentioned=mentioned, am_i_mentioned=True), agent_name="general"),
+    )
+
+    assert owner_plan.kind == "respond"
+    assert owner_plan.response_action is not None
+    assert owner_plan.response_action.kind == "reject"
+    if case == "explained":
+        assert owner_plan.response_action.rejection_message == (
+            "This room is managed in the MindRoom configuration, and General isn't one of its agents, so it can't "
+            "answer here. To talk to General, create a new room and invite it. In this room, you can ask Research."
+        )
+    else:
+        assert owner_plan.response_action.rejection_message == owner_plan.response_action.form_team.reason
+    assert other_plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mention_research", [False, True])
+async def test_unmentioned_agent_not_configured_for_room_stays_silent(config: Config, mention_research: bool) -> None:
+    """An agent that a configured room does not list never volunteers the rejection."""
+    config.agents["research"].rooms = [_ROOM_ID]
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(mentioned=[_entity_id(config, "research")] if mention_research else None)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_room_message_with_multiple_responders_is_ignored(config: Config) -> None:
+    """With several visible responders, no agent self-selects for an untagged room message."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+
+    plan = await _plan(policy, room, _dispatch(_context(), agent_name="general"))
+
+    assert plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_room_message_with_single_responder_responds(config: Config) -> None:
+    """The only visible responder answers untagged room messages."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id)
+
+    plan = await _plan(policy, room, _dispatch(_context(), agent_name="general"))
+
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "individual"
+
+
+@pytest.mark.asyncio
+async def test_thread_continuation_by_sole_thread_agent_responds(config: Config) -> None:
+    """An agent keeps answering an untagged thread it already owns."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    history = [
+        make_visible_message(sender=_SENDER, body="please help"),
+        make_visible_message(sender=_entity_id(config, "general").full_id, body="sure thing"),
+    ]
+    context = _context(thread_id="$thread:localhost", thread_history=history)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "individual"
+
+
+@pytest.mark.asyncio
+async def test_thread_owned_by_other_agent_is_ignored(config: Config) -> None:
+    """An agent must not hijack an untagged thread owned by a different agent."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    history = [
+        make_visible_message(sender=_SENDER, body="please help"),
+        make_visible_message(sender=_entity_id(config, "research").full_id, body="on it"),
+    ]
+    context = _context(thread_id="$thread:localhost", thread_history=history)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_thread_with_two_participating_agents_forms_implicit_team_for_owner(config: Config) -> None:
+    """Two agents already in one thread re-form an implicit team owned by the lowest agent ID."""
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    history = [
+        make_visible_message(sender=_SENDER, body="please help"),
+        make_visible_message(sender=_entity_id(config, "general").full_id, body="general here"),
+        make_visible_message(sender=_entity_id(config, "research").full_id, body="research here"),
+    ]
+    context = _context(thread_id="$thread:localhost", thread_history=history)
+
+    owner_plan = await _plan(
+        _policy_for(config, "general"),
+        room,
+        _dispatch(context, agent_name="general"),
+    )
+    other_plan = await _plan(
+        _policy_for(config, "research"),
+        room,
+        _dispatch(context, agent_name="research"),
+    )
+
+    assert owner_plan.kind == "respond"
+    assert owner_plan.response_action.kind == "team"
+    assert owner_plan.response_action.form_team.outcome is TeamOutcome.TEAM
+    assert owner_plan.response_action.form_team.intent is TeamIntent.IMPLICIT_THREAD_TEAM
+    # Formation is pure: thread-history teams carry the COLLABORATE provisional mode.
+    assert owner_plan.response_action.form_team.mode is TeamMode.COLLABORATE
+    assert other_plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_mentioning_two_agents_forms_explicit_team_for_owner_only(config: Config) -> None:
+    """Tagging multiple agents forms one team surfaced by the lowest agent ID."""
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    mentioned = [_entity_id(config, "general"), _entity_id(config, "research")]
+
+    owner_plan = await _plan(
+        _policy_for(config, "general"),
+        room,
+        _dispatch(_context(mentioned=mentioned, am_i_mentioned=True), agent_name="general"),
+    )
+    other_plan = await _plan(
+        _policy_for(config, "research"),
+        room,
+        _dispatch(_context(mentioned=mentioned, am_i_mentioned=True), agent_name="research"),
+    )
+
+    assert owner_plan.kind == "respond"
+    assert owner_plan.response_action.kind == "team"
+    assert owner_plan.response_action.form_team.intent is TeamIntent.EXPLICIT_MEMBERS
+    # Formation is pure: explicitly tagged teams carry the COORDINATE provisional mode.
+    assert owner_plan.response_action.form_team.mode is TeamMode.COORDINATE
+    assert other_plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_dm_room_with_multiple_agents_forms_auto_team(config: Config) -> None:
+    """Untagged DM-room messages auto-team all visible agents."""
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+
+    plan = await _plan(
+        _policy_for(config, "general"),
+        room,
+        _dispatch(_context(), agent_name="general"),
+        is_dm=True,
+    )
+
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "team"
+    assert plan.response_action.form_team.intent is TeamIntent.DM_AUTO_TEAM
+    assert plan.response_action.form_team.mode is TeamMode.COLLABORATE
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+async def test_unauthorized_sender_is_ignored_even_when_mentioned(tmp_path: Path) -> None:
+    """A sender outside the per-agent reply allowlist never gets a response."""
+    config = bind_runtime_paths(
+        with_responder_access(
+            Config(agents={"general": AgentConfig(display_name="General")}),
+            "general",
+            users=["@owner:localhost"],
+        ),
+        test_runtime_paths(tmp_path),
+    )
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id)
+    context = _context(mentioned=[_entity_id(config, "general")], am_i_mentioned=True)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "ignore"
+
+
+def test_internal_agent_sender_bypasses_reply_allowlist(tmp_path: Path) -> None:
+    """Bot-to-bot senders are system participants and bypass per-agent reply allowlists."""
+    config = bind_runtime_paths(
+        with_responder_access(
+            Config(
+                agents={
+                    "general": AgentConfig(display_name="General"),
+                    "research": AgentConfig(display_name="Research"),
+                },
+            ),
+            "general",
+            users=["@owner:localhost"],
+        ),
+        test_runtime_paths(tmp_path),
+    )
+    policy = _policy_for(config, "general")
+
+    assert policy.can_reply_to_sender_in_room(_entity_id(config, "research").full_id, "!room:localhost") is True
+
+
+@pytest.mark.asyncio
+async def test_unavailable_thread_history_skips_with_multiple_responders(config: Config) -> None:
+    """Degraded thread policy history must not be treated as an empty thread."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    # A plain non-empty sequence carries no completeness signal, so planning history is unavailable.
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[make_visible_message(sender=_SENDER, body="earlier")],
+        full_history=False,
+    )
+    assert context.planning_thread_history_unavailable
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_thread_history_still_responds_as_single_visible_responder(config: Config) -> None:
+    """The only visible responder continues a thread even when policy history degraded."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id)
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[make_visible_message(sender=_SENDER, body="earlier")],
+        full_history=False,
+    )
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name="general"))
+
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "individual"
+
+
+@pytest.mark.asyncio
+async def test_active_response_queues_untagged_thread_follow_up(config: Config) -> None:
+    """A human follow-up in a thread with an in-flight response enters the queued path."""
+    policy = _policy_for(config, "general")
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    history = [
+        make_visible_message(sender=_SENDER, body="please help"),
+        make_visible_message(sender=_entity_id(config, "research").full_id, body="on it"),
+    ]
+    context = _context(thread_id="$thread:localhost", thread_history=history)
+
+    plan = await _plan(
+        policy,
+        room,
+        _dispatch(context, agent_name="general"),
+        has_active_response=True,
+    )
+
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "individual"
+
+
+@pytest.mark.asyncio
+async def test_router_routes_untagged_message_with_multiple_candidates(config: Config) -> None:
+    """The router produces a route plan when several responders could answer."""
+    policy = _policy_for(config, ROUTER_AGENT_NAME)
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+
+    plan = await _plan(policy, room, _dispatch(_context(), agent_name=ROUTER_AGENT_NAME))
+
+    assert plan.kind == "route"
+    assert plan.router_event is not None
+
+
+@pytest.mark.asyncio
+async def test_router_ignores_untagged_message_with_single_candidate(config: Config) -> None:
+    """The router stays out of the way when only one responder candidate exists."""
+    policy = _policy_for(config, ROUTER_AGENT_NAME)
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id)
+
+    plan = await _plan(policy, room, _dispatch(_context(), agent_name=ROUTER_AGENT_NAME))
+
+    assert plan.kind == "ignore"
+    assert plan.ignore_reason == "router"
+
+
+@pytest.mark.asyncio
+async def test_router_ignores_message_with_explicit_agent_mention(config: Config) -> None:
+    """Explicitly tagged messages bypass routing entirely."""
+    policy = _policy_for(config, ROUTER_AGENT_NAME)
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(mentioned=[_entity_id(config, "general")])
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name=ROUTER_AGENT_NAME))
+
+    assert plan.kind == "ignore"
+    assert plan.ignore_reason == "router"
+
+
+@pytest.mark.asyncio
+async def test_router_only_mention_returns_rules_of_engagement_rejection(config: Config) -> None:
+    """Tagging only the router yields the guidance rejection instead of routing."""
+    policy = _policy_for(config, ROUTER_AGENT_NAME)
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(mentioned=[_entity_id(config, ROUTER_AGENT_NAME)])
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name=ROUTER_AGENT_NAME))
+
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "reject"
+    assert "Rules of engagement" in plan.response_action.rejection_message
+
+
+@pytest.mark.asyncio
+async def test_router_ignores_thread_already_owned_by_an_agent(config: Config) -> None:
+    """The router never re-routes a thread that already has a visible agent owner."""
+    policy = _policy_for(config, ROUTER_AGENT_NAME)
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    history = [
+        make_visible_message(sender=_SENDER, body="please help"),
+        make_visible_message(sender=_entity_id(config, "general").full_id, body="answering"),
+    ]
+    context = _context(thread_id="$thread:localhost", thread_history=history)
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name=ROUTER_AGENT_NAME))
+
+    assert plan.kind == "ignore"
+    assert plan.ignore_reason == "router"
+
+
+@pytest.mark.asyncio
+async def test_router_ignores_thread_with_unavailable_policy_history(config: Config) -> None:
+    """Routing is skipped rather than guessed when thread policy history degraded."""
+    policy = _policy_for(config, ROUTER_AGENT_NAME)
+    room = _room_with_members(_SENDER, _entity_id(config, "general").full_id, _entity_id(config, "research").full_id)
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[make_visible_message(sender=_SENDER, body="earlier")],
+        full_history=False,
+    )
+
+    plan = await _plan(policy, room, _dispatch(context, agent_name=ROUTER_AGENT_NAME))
+
+    assert plan.kind == "ignore"
+    assert plan.ignore_reason == "router"
+
+
+def test_prepared_dispatch_rejects_mismatched_envelope_target() -> None:
+    """PreparedDispatch enforces that envelope and dispatch describe the same delivery."""
+    target = MessageTarget.resolve(_ROOM_ID, None, _EVENT_ID)
+    other_target = MessageTarget.resolve(_ROOM_ID, "$thread:localhost", _EVENT_ID)
+    envelope = request_envelope(
+        room_id=_ROOM_ID,
+        reply_to_event_id=_EVENT_ID,
+        target=other_target,
+        agent_name="general",
+    )
+
+    with pytest.raises(ValueError, match="must match the resolved dispatch target"):
+        PreparedDispatch(
+            requester_user_id=_SENDER,
+            context=_context(),
+            target=target,
+            correlation_id="corr-test",
+            envelope=envelope,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("scenario", ["explicit", "unmentioned", "router", "thread", "members", "configured_team"])
+async def test_planning_preserves_relevant_pending_candidates(config: Config, scenario: str) -> None:
+    """Unknown target or competing membership cannot become a completed plan."""
+    config.agents["general"].access = ResponderAccessConfig(users=[_SENDER])
+    config.agents["research"].access = ResponderAccessConfig(current_room_members=True, members_of_rooms=[])
+    config.router.access = ResponderAccessConfig(users=[_SENDER])
+    if scenario == "configured_team":
+        config = bind_runtime_paths(
+            Config.model_validate(
+                {
+                    **config.model_dump(),
+                    "teams": {
+                        "crew": {
+                            "display_name": "Crew",
+                            "role": "Help together",
+                            "agents": ["general", "research"],
+                            "access": {"current_room_members": True},
+                        },
+                    },
+                },
+            ),
+            runtime_paths_for(config),
+        )
+    agent_name = "research" if scenario == "explicit" else "general"
+    if scenario == "router":
+        agent_name = ROUTER_AGENT_NAME
+    elif scenario == "configured_team":
+        agent_name = "crew"
+    policy = _policy_for(config, agent_name)
+    ids = [_entity_id(config, name) for name in [*config.agents, *config.teams]]
+    room = _room_with_members(_SENDER, *(value.full_id for value in ids))
+    mentioned = []
+    if scenario in {"explicit", "configured_team"}:
+        mentioned = [_entity_id(config, agent_name)]
+    elif scenario == "members":
+        mentioned = ids
+    history = [make_visible_message(sender=_entity_id(config, "research").full_id, body="Earlier answer")]
+    context = _context(
+        mentioned=mentioned,
+        am_i_mentioned=bool(mentioned),
+        thread_id="$root" if scenario == "thread" else None,
+        thread_history=history if scenario == "thread" else [],
+    )
+    with pytest.raises(ReplyMembershipPendingError):
+        await _plan(policy, room, _dispatch(context, agent_name=agent_name))
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+async def test_explicit_allowed_target_ignores_unrelated_pending_responder(config: Config) -> None:
+    """An independent explicit grant needs no unrelated responder's membership."""
+    config.agents["general"].access = ResponderAccessConfig(users=[_SENDER])
+    config.agents["research"].access = ResponderAccessConfig(current_room_members=True, members_of_rooms=[])
+    room = _room_with_members(_SENDER, *(_entity_id(config, name).full_id for name in config.agents))
+    context = _context(mentioned=[_entity_id(config, "general")], am_i_mentioned=True)
+    plan = await _plan(_policy_for(config, "general"), room, _dispatch(context, agent_name="general"))
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "individual"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("stable_owner", [True, False])
+async def test_proven_member_denial_requires_stable_rejection_owner(config: Config, stable_owner: bool) -> None:
+    """A real denial rejects despite pending membership only when its owner cannot change."""
+    allowed_name, pending_name = ("general", "research") if stable_owner else ("research", "general")
+    config.agents[allowed_name].access = ResponderAccessConfig(users=[_SENDER])
+    config.agents[pending_name].access = ResponderAccessConfig(current_room_members=True, members_of_rooms=[])
+    config = bind_runtime_paths(
+        Config.model_validate(
+            {
+                **config.model_dump(),
+                "agents": {
+                    **{name: agent.model_dump() for name, agent in config.agents.items()},
+                    "secret": {
+                        "display_name": "Secret",
+                        "access": {"users": [], "current_room_members": False, "members_of_rooms": []},
+                    },
+                },
+            },
+        ),
+        runtime_paths_for(config),
+    )
+    ids = [_entity_id(config, name) for name in config.agents]
+    room = _room_with_members(_SENDER, *(value.full_id for value in ids))
+    context = _context(mentioned=ids, am_i_mentioned=True)
+    policy = _policy_for(config, allowed_name)
+    if not stable_owner:
+        with pytest.raises(ReplyMembershipPendingError):
+            await _plan(policy, room, _dispatch(context, agent_name=allowed_name))
+        return
+    plan = await _plan(policy, room, _dispatch(context, agent_name=allowed_name))
+    assert plan.kind == "respond"
+    assert plan.response_action.kind == "reject"
+    assert "secret" in plan.response_action.rejection_message
+    assert pending_name not in plan.response_action.rejection_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("agent_name", ["general", ROUTER_AGENT_NAME])
+async def test_current_room_grant_preserves_existing_thread_owner(config: Config, agent_name: str) -> None:
+    """Room-authorized thread participation must survive a later thread visibility filter."""
+    config.agents["general"].access = ResponderAccessConfig(current_room_members=True, members_of_rooms=[])
+    config.agents["research"].access = ResponderAccessConfig(users=[_SENDER])
+    config.router.access = ResponderAccessConfig(users=[_SENDER])
+    policy = _policy_for(config, agent_name)
+    room = _room_with_members(_SENDER, *(_entity_id(config, name).full_id for name in config.agents))
+    client = make_matrix_client_mock(user_id=_entity_id(config, agent_name).full_id)
+    client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[room.room_id])
+    client.joined_members.return_value = nio.JoinedMembersResponse(
+        members=[nio.RoomMember(_SENDER, None, None)],
+        room_id=room.room_id,
+    )
+    await policy.deps.agent_reply_memberships.refresh(config, runtime_paths_for(config), client)
+    history = [make_visible_message(sender=_entity_id(config, "general").full_id, body="Earlier answer")]
+    context = _context(thread_id="$root", thread_history=history)
+    plan = await _plan(policy, room, _dispatch(context, agent_name=agent_name))
+    assert plan.kind == ("respond" if agent_name == "general" else "ignore")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_sender", ["@other:localhost", _SENDER])
+@pytest.mark.parametrize("active_follow_up", [False, True])
+async def test_adaptive_participation_counts_current_sender(
+    config: Config,
+    history_sender: str,
+    active_follow_up: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an actual second human makes an untagged turn adaptive."""
+    config.agents["general"].participation = ParticipationConfig()
+    room = _room_with_members(_SENDER, "@other:localhost", _entity_id(config, "general").full_id)
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[
+            make_visible_message(sender=history_sender, body="earlier"),
+            make_visible_message(sender=_entity_id(config, "general").full_id, body="answer"),
+        ],
+    )
+    dispatch = _dispatch(context, agent_name="general")
+    if active_follow_up:
+        dispatch = replace(
+            dispatch,
+            envelope=replace(dispatch.envelope, dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND),
+        )
+    snapshots = 0
+    original_snapshot = TurnPolicy.responder_availability
+
+    def snapshot(policy: TurnPolicy) -> _ResponderAvailability:
+        nonlocal snapshots
+        snapshots += 1
+        return original_snapshot(policy)
+
+    monkeypatch.setattr(TurnPolicy, "responder_availability", snapshot)
+    plan = await _plan(_policy_for(config, "general"), room, dispatch)
+    assert plan.kind == "respond"
+    assert (plan.response_action.participation is not None) == (history_sender != _SENDER)
+    assert snapshots == 1, "One dispatch must reuse its responder liveness snapshot"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["idle", "active", "backlog"])
+async def test_adaptive_participation_existing_thread_agent_decides(config: Config, mode: str) -> None:
+    """Every authorized agent already in the thread can decide whether to continue."""
+    config.agents["research"].participation = ParticipationConfig()
+    room = _room_with_members(_SENDER, "@other:localhost", _entity_id(config, "research").full_id)
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[
+            make_visible_message(sender="@other:localhost", body="earlier"),
+            make_visible_message(sender=_entity_id(config, "research").full_id, body="answer"),
+        ],
+    )
+    dispatch = _dispatch(context, agent_name="research")
+    if mode == "backlog":
+        dispatch = replace(
+            dispatch,
+            envelope=replace(dispatch.envelope, dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND),
+        )
+    plan = await _plan(_policy_for(config, "research"), room, dispatch, has_active_response=mode == "active")
+    assert plan.kind == "respond"
+    assert plan.response_action.participation is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["agent_mention", "human_mention", "unavailable", "scheduled", "unauthorized", "bot_history"],
+)
+@pytest.mark.usefixtures("enforce_turn_authorization")
+async def test_adaptive_participation_exclusions(config: Config, mode: str) -> None:
+    """Mention intent, degraded context, and access rules cannot become adaptive turns."""
+    config.agents["general"].participation = ParticipationConfig()
+    config.bot_accounts = ["@bridge:localhost"]
+    with_responder_access(config, "general", users=["@owner:localhost" if mode == "unauthorized" else _SENDER])
+    room = _room_with_members(_SENDER, "@other:localhost", _entity_id(config, "general").full_id)
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[
+            make_visible_message(
+                sender="@bridge:localhost" if mode == "bot_history" else "@other:localhost",
+                body="earlier",
+            ),
+            make_visible_message(sender=_entity_id(config, "general").full_id, body="answer"),
+        ],
+        full_history=mode != "unavailable",
+    )
+    if mode == "agent_mention":
+        context = replace(context, mentioned_agents=[_entity_id(config, "general")], am_i_mentioned=True)
+    if mode == "human_mention":
+        context = replace(context, has_non_agent_mentions=True)
+    if mode == "unavailable":
+        context = replace(context, requires_model_history_refresh=True)
+    dispatch = _dispatch(context, agent_name="general")
+    if mode == "scheduled":
+        dispatch = replace(
+            dispatch,
+            envelope=replace(
+                dispatch.envelope,
+                origin=replace(
+                    dispatch.envelope.origin,
+                    intent=TurnIntent.SCHEDULED_FIRE,
+                ),
+            ),
+        )
+    plan = await _plan(_policy_for(config, "general"), room, dispatch)
+    assert plan.response_action is None or plan.response_action.participation is None
+    if mode in {"unauthorized", "human_mention"}:
+        assert plan.kind == "ignore"
+    if mode == "agent_mention":
+        assert plan.kind == "respond"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["idle", "active", "backlog"])
+@pytest.mark.parametrize("thread_agent", [None, "research"])
+async def test_adaptive_participation_never_recruits_room_agents(
+    config: Config,
+    mode: str,
+    thread_agent: str | None,
+) -> None:
+    """Agent opt-in must not let a nonparticipant join even through an active queue."""
+    config.agents["general"].participation = ParticipationConfig()
+    room = _room_with_members(
+        _SENDER,
+        "@other:localhost",
+        *(_entity_id(config, name).full_id for name in config.agents),
+    )
+    history = [make_visible_message(sender="@other:localhost", body="earlier")]
+    if thread_agent:
+        history.append(make_visible_message(sender=_entity_id(config, thread_agent).full_id, body="answer"))
+    context = _context(thread_id="$thread:localhost", thread_history=history)
+    dispatch = _dispatch(context, agent_name="general")
+    if mode == "backlog":
+        dispatch = replace(
+            dispatch,
+            envelope=replace(dispatch.envelope, dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND),
+        )
+    policy = _policy_for(config, "general")
+    plan = await _plan(policy, room, dispatch, has_active_response=mode == "active")
+    assert plan.kind == "ignore"
+    assert policy.adaptive_participation(context=context, room=room, requester_user_id=_SENDER) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_participation_only_checks_existing_agents_in_fifty_agent_room(config: Config, enabled: bool) -> None:
+    """Two thread agents may judge; the other 48 room agents and router stay out."""
+    config.agents.update({f"idle_{index}": AgentConfig(display_name=f"Idle {index}") for index in range(48)})
+    config = bind_runtime_paths(config, runtime_paths_for(config))
+    if enabled:
+        for agent in config.agents.values():
+            agent.participation = ParticipationConfig()
+    room = _room_with_members(
+        _SENDER,
+        "@other:localhost",
+        *(_entity_id(config, name).full_id for name in config.agents),
+    )
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[
+            make_visible_message(sender="@other:localhost", body="earlier"),
+            make_visible_message(sender=_SENDER, body="my earlier question"),
+            make_visible_message(sender=_entity_id(config, "general").full_id, body="first answer"),
+            make_visible_message(sender=_entity_id(config, "research").full_id, body="second answer"),
+        ],
+    )
+    for name in (*config.agents, ROUTER_AGENT_NAME):
+        policy = _policy_for(config, name)
+        plan = await _plan(policy, room, _dispatch(context, agent_name=name))
+        selected = policy.adaptive_participation(context=context, room=room, requester_user_id=_SENDER)
+        if enabled and name in {"general", "research"}:
+            assert plan.kind == "respond", name
+            assert plan.response_action.participation is not None, name
+            assert selected is not None, name
+        else:
+            assert plan.kind == "ignore", name
+            assert selected is None, name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_name", ["general", "research", ROUTER_AGENT_NAME])
+@pytest.mark.parametrize("room_id", ["!ad-hoc:localhost", "!another:localhost"])
+async def test_participation_follows_only_opted_in_agent(
+    config: Config,
+    agent_name: str,
+    room_id: str,
+) -> None:
+    """An agent's opt-in works in ad hoc rooms without enabling its peers."""
+    config.agents["general"].participation = ParticipationConfig(instructions="Only add useful context.")
+    assert all(not agent.rooms for agent in config.agents.values())
+    assert not config.rooms
+    room = _room_with_members(
+        _SENDER,
+        "@other:localhost",
+        *(_entity_id(config, name).full_id for name in config.agents),
+        room_id=room_id,
+    )
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[
+            make_visible_message(sender="@other:localhost", body="earlier"),
+            make_visible_message(sender=_entity_id(config, "general").full_id, body="first answer"),
+            make_visible_message(sender=_entity_id(config, "research").full_id, body="second answer"),
+        ],
+    )
+    policy = _policy_for(config, agent_name)
+    plan = await _plan(policy, room, _dispatch(context, agent_name=agent_name, room_id=room_id))
+    selected = policy.adaptive_participation(context=context, room=room, requester_user_id=_SENDER)
+    if agent_name == "general":
+        assert plan.kind == "respond"
+        assert plan.response_action.participation is config.agents["general"].participation
+        assert selected is config.agents["general"].participation
+    else:
+        assert plan.kind == "ignore"
+        assert selected is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_router_does_not_recruit_when_current_sender_is_second_human(config: Config, enabled: bool) -> None:
+    """The current human counts even before their message appears in thread history."""
+    for name in config.agents:
+        config.agents[name].participation = ParticipationConfig() if enabled else None
+        config.agents[name].access = ResponderAccessConfig(users=[_SENDER])
+    config.router.access = ResponderAccessConfig(users=[_SENDER])
+    room = _room_with_members(
+        _SENDER,
+        "@other:localhost",
+        *(_entity_id(config, name).full_id for name in config.agents),
+    )
+    context = _context(
+        thread_id="$thread:localhost",
+        thread_history=[make_visible_message(sender="@other:localhost", body="earlier")],
+    )
+    for name in (*config.agents, ROUTER_AGENT_NAME):
+        plan = await _plan(_policy_for(config, name), room, _dispatch(context, agent_name=name))
+        assert plan.kind == "ignore", name

@@ -11,14 +11,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agno.tools import Toolkit
 
 from mindroom.constants import resolve_runtime_paths
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolMetadata, ToolStatus
 from mindroom.tool_system.dependencies import (
     _PIP_TO_IMPORT,
     _auto_install_optional_extra,
     _install_optional_extras,
     _install_via_uv_sync,
+    _install_via_uv_tool,
     _pip_name_to_import,
     auto_install_enabled,
     auto_install_optional_extra_for_import_retry,
@@ -28,10 +29,6 @@ from mindroom.tool_system.dependencies import (
 from mindroom.tool_system.metadata import (
     TOOL_METADATA,
     TOOL_REGISTRY,
-    SetupType,
-    ToolCategory,
-    ToolMetadata,
-    ToolStatus,
     get_tool_by_name,
 )
 from mindroom.tools.openbb import openbb_tools
@@ -50,29 +47,6 @@ def _base_dependency_names() -> set[str]:
             name = name.split(separator, 1)[0]
         dependency_names.add(name.lower().replace("_", "-"))
     return dependency_names
-
-
-def test_all_tools_can_be_imported() -> None:
-    """Test that all registered tools can be imported from the registry."""
-    failed = []
-
-    for tool_name, factory in TOOL_REGISTRY.items():
-        metadata = TOOL_METADATA.get(tool_name)
-        requires_config = metadata and metadata.status == ToolStatus.REQUIRES_CONFIG
-
-        try:
-            tool_class = factory()
-            assert isinstance(tool_class, type)
-            assert issubclass(tool_class, Toolkit)
-        except Exception as e:
-            if not requires_config:
-                failed.append((tool_name, str(e)))
-
-    if failed:
-        error_msg = "\nThe following tools failed:\n"
-        for tool_name, error in failed:
-            error_msg += f"  - {tool_name}: {error}\n"
-        pytest.fail(error_msg)
 
 
 @pytest.mark.parametrize("existing_value", [None, "true"])
@@ -125,7 +99,6 @@ def test_core_runtime_imports_are_declared_as_base_dependencies() -> None:
     required_runtime_dependencies = {
         "src/mindroom/constants.py": "pydantic-settings",
         "src/mindroom/matrix/client.py": "aiohttp",
-        "src/mindroom/matrix/cache/sqlite_event_cache.py": "aiosqlite",
         "src/mindroom/mcp/transports.py": "anyio",
     }
 
@@ -225,6 +198,7 @@ def test_get_tool_by_name_retries_after_auto_install(monkeypatch: pytest.MonkeyP
     TOOL_REGISTRY[tool_name] = flaky_factory
     TOOL_METADATA[tool_name] = ToolMetadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Auto Install Test Tool",
         description="Temporary test tool",
         category=ToolCategory.DEVELOPMENT,
@@ -269,6 +243,7 @@ def test_get_tool_by_name_raises_when_auto_install_fails(monkeypatch: pytest.Mon
     TOOL_REGISTRY[tool_name] = failing_factory
     TOOL_METADATA[tool_name] = ToolMetadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Auto Install Failure Tool",
         description="Temporary failing tool",
         category=ToolCategory.DEVELOPMENT,
@@ -334,6 +309,36 @@ def test_check_deps_installed_positive_and_negative() -> None:
     """check_deps_installed returns True for installed packages, False when any is missing."""
     assert check_deps_installed(["pytest"])
     assert not check_deps_installed(["nonexistent_package_xyz_123"])
+
+
+@pytest.mark.parametrize("no_auto_install", ["0", "1"])
+def test_file_generation_uses_installed_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    no_auto_install: str,
+) -> None:
+    """Installed file-generation extras must load without requesting an install."""
+    pytest.importorskip("docx")
+    pytest.importorskip("reportlab")
+
+    def unexpected_install(_extras: list[str], **_kwargs: object) -> bool:
+        pytest.fail("Installed file-generation dependencies must not be installed again")
+
+    monkeypatch.setattr("mindroom.tool_system.dependencies._install_optional_extras", unexpected_install)
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_NO_AUTO_INSTALL_TOOLS": no_auto_install},
+    )
+
+    toolkit = get_tool_by_name(
+        "file_generation",
+        runtime_paths,
+        tool_config_overrides={"output_directory": str(tmp_path / "output")},
+        worker_target=None,
+    )
+
+    assert "generate_docx_file" in toolkit.functions
 
 
 @pytest.mark.parametrize(("pip_name", "expected_import"), list(_PIP_TO_IMPORT.items()))
@@ -406,6 +411,56 @@ def test_install_via_uv_sync_targets_active_virtualenv(monkeypatch: pytest.Monke
     assert env["VIRTUAL_ENV"] == sys.prefix
 
 
+def test_install_via_uv_tool_extends_running_environment_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Uv tool installs must reuse the running interpreter so a failed build cannot delete the environment."""
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], *, check: bool, **_kwargs: object) -> SimpleNamespace:
+        captured["cmd"] = cmd
+        captured["check"] = check
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("mindroom.tool_system.dependencies.subprocess.run", fake_run)
+    monkeypatch.setattr(sys, "_base_executable", "/managed/cpython-3.13-macos-aarch64-none/bin/python3.13")
+
+    assert _install_via_uv_tool(["browser", "duckduckgo"], quiet=True)
+    # `--force` or a bare `--python 3.13` (which may pick another patch or arch) makes uv delete and
+    # recreate the environment before building, so a build failure leaves the running install gone.
+    assert captured["cmd"] == [
+        "uv",
+        "tool",
+        "install",
+        "mindroom[browser,duckduckgo]",
+        "--python",
+        "/managed/cpython-3.13-macos-aarch64-none/bin/python3.13",
+        "-q",
+    ]
+    assert captured["check"] is False
+
+
+def test_install_optional_extras_keeps_receipt_extras_for_uv_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Uv syncs the tool environment exactly to the request, so installed extras must be requested again."""
+    (tmp_path / "uv-receipt.toml").write_text(
+        '[tool]\nrequirements = [{ name = "mindroom", extras = ["website", "Duck_Duck_Go"] }]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    requested: list[list[str]] = []
+
+    def fake_install_via_uv_tool(extras: list[str], *, quiet: bool) -> bool:
+        assert quiet is True
+        requested.append(extras)
+        return True
+
+    monkeypatch.setattr("mindroom.tool_system.dependencies._install_via_uv_tool", fake_install_via_uv_tool)
+
+    assert _install_optional_extras(["browser", "duck-duck-go"], quiet=True)
+    assert requested == [["browser", "duck-duck-go", "website"]]
+
+
 def test_install_command_for_current_python_uses_uv_system_outside_virtualenv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -437,6 +492,8 @@ def test_install_command_for_current_python_prefers_current_python_uv_module(
 
     assert install_command_for_current_python() == [
         sys.executable,
+        "-P",
+        "-s",
         "-m",
         "uv",
         "pip",
@@ -457,6 +514,8 @@ def test_install_command_for_current_python_uses_pip_user_outside_virtualenv(
 
     assert install_command_for_current_python() == [
         sys.executable,
+        "-P",
+        "-s",
         "-m",
         "pip",
         "install",

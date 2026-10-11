@@ -17,10 +17,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def _attachment_records_to_media(
+def attachment_records_to_media(
     attachment_records: list[AttachmentRecord],
 ) -> tuple[list[Audio], list[Image], list[File], list[Video]]:
-    """Convert persisted attachments into Agno media objects."""
+    """Convert attachment records into Agno media objects."""
     audio: list[Audio] = []
     images: list[Image] = []
     files: list[File] = []
@@ -32,6 +32,7 @@ def _attachment_records_to_media(
         if record.kind == "audio":
             audio.append(
                 Audio(
+                    id=record.attachment_id,
                     filepath=str(record.local_path),
                     mime_type=record.mime_type,
                 ),
@@ -39,6 +40,7 @@ def _attachment_records_to_media(
         elif record.kind == "image":
             images.append(
                 Image(
+                    id=record.attachment_id,
                     filepath=str(record.local_path),
                     mime_type=record.mime_type,
                 ),
@@ -46,6 +48,7 @@ def _attachment_records_to_media(
         elif record.kind == "file":
             try:
                 file_media = File(
+                    id=record.attachment_id,
                     filepath=str(record.local_path),
                     mime_type=record.mime_type,
                     filename=record.filename,
@@ -54,6 +57,7 @@ def _attachment_records_to_media(
                 # Agno validates file MIME types against a strict allow-list.
                 # Fall back to filepath+filename so arbitrary attachments still work.
                 file_media = File(
+                    id=record.attachment_id,
                     filepath=str(record.local_path),
                     filename=record.filename,
                 )
@@ -61,6 +65,7 @@ def _attachment_records_to_media(
         elif record.kind == "video":
             videos.append(
                 Video(
+                    id=record.attachment_id,
                     filepath=str(record.local_path),
                     mime_type=record.mime_type,
                 ),
@@ -69,14 +74,14 @@ def _attachment_records_to_media(
     return audio, images, files, videos
 
 
-def resolve_attachment_media(
+def resolve_scoped_attachments(
     storage_path: Path,
     attachment_ids: list[str],
     *,
     room_id: str | None = None,
     thread_id: str | None = None,
-) -> tuple[list[str], list[Audio], list[Image], list[File], list[Video]]:
-    """Resolve attachment IDs into Agno media objects.
+) -> list[AttachmentRecord]:
+    """Resolve attachment IDs into records scoped to the current context.
 
     When *room_id* is provided, only attachments registered for the current
     room/thread context are included. Mismatched records are dropped with a
@@ -99,21 +104,13 @@ def resolve_attachment_media(
                 room_id=room_id,
                 thread_id=thread_id,
             )
-    resolved_attachment_ids = [record.attachment_id for record in attachment_records]
-    attachment_audio, attachment_images, attachment_files, attachment_videos = _attachment_records_to_media(
-        attachment_records,
-    )
     emit_elapsed_timing(
-        "response_payload.resolve_attachment_media",
+        "response_payload.resolve_scoped_attachments",
         started,
         room_id=room_id,
         thread_id=thread_id,
         requested_attachment_count=len(attachment_ids),
         resolved_attachment_count=len(attachment_records),
         rejected_attachment_count=rejected_count,
-        audio_count=len(attachment_audio),
-        image_count=len(attachment_images),
-        file_count=len(attachment_files),
-        video_count=len(attachment_videos),
     )
-    return resolved_attachment_ids, attachment_audio, attachment_images, attachment_files, attachment_videos
+    return attachment_records

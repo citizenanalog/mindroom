@@ -3,14 +3,19 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
+from openai import AuthenticationError
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
+from mindroom.embeddings.embedder_health import capture_embedder_health_recorder, get_embedder_failure
+from mindroom.embeddings.errors import EmbedderRequestError
 from mindroom.memory import MemoryPromptParts
 from mindroom.memory import add_agent_memory as public_add_agent_memory
 from mindroom.memory import build_memory_prompt_parts as public_build_memory_prompt_parts
@@ -21,9 +26,10 @@ from mindroom.memory import search_agent_memories as public_search_agent_memorie
 from mindroom.memory import store_conversation_memory as public_store_conversation_memory
 from mindroom.memory import update_agent_memory as public_update_agent_memory
 from mindroom.memory._mem0_backend import _mem0_storage_paths_for_scope_user_id
-from mindroom.memory._policy import agent_scope_user_id
 from mindroom.memory._prompting import format_memories_as_context
 from mindroom.memory._shared import MemoryNotFoundError
+from mindroom.memory.config import _Mem0StrictOpenAIEmbedder
+from mindroom.memory_scope_ids import agent_scope_user_id
 from mindroom.prompts import MEMORY_CONTEXT_PROMPT_TEMPLATE
 from mindroom.tool_system.worker_routing import agent_state_root_path, agent_workspace_root_path
 from tests.conftest import bind_runtime_paths, make_visible_message, runtime_paths_for
@@ -60,7 +66,7 @@ async def search_agent_memories(
     config: Config,
     limit: int = 3,
 ) -> list[MemoryResult]:
-    return await public_search_agent_memories(
+    outcome = await public_search_agent_memories(
         query,
         agent_name,
         storage_path,
@@ -68,6 +74,8 @@ async def search_agent_memories(
         runtime_paths_for(config),
         limit,
     )
+    assert outcome.degraded_reason is None
+    return outcome.results
 
 
 async def list_all_agent_memories(
@@ -234,7 +242,7 @@ class TestMemoryFacade:
 
     @pytest.mark.asyncio
     async def test_memory_instance_creation(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory) as mock_create:
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await add_agent_memory("Test content", "test_agent", storage_path, config)
             assert mock_create.call_args[0][0] == agent_state_root_path(storage_path, "test_agent")
 
@@ -243,7 +251,7 @@ class TestMemoryFacade:
 
     @pytest.mark.asyncio
     async def test_add_agent_memory(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await add_agent_memory(
                 "Test memory content",
                 "test_agent",
@@ -260,6 +268,46 @@ class TestMemoryFacade:
             assert call_args[1]["metadata"]["test"] == "value"
 
     @pytest.mark.asyncio
+    async def test_add_agent_memory_surfaces_embedding_failure_swallowed_by_mem0(
+        self,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """An empty normal return from Mem0 cannot turn a failed write into success."""
+        failure_detail = "embedder authentication failed (HTTP 401)"
+
+        class FailingEmbedder:
+            def get_embedding(self, _text: str) -> list[float]:
+                raise EmbedderRequestError(failure_detail)
+
+            def get_embeddings_batch(self, _texts: list[str]) -> list[list[float]]:
+                raise EmbedderRequestError(failure_detail)
+
+        class SwallowingMemory:
+            def __init__(self) -> None:
+                self.embedding_model = _Mem0StrictOpenAIEmbedder(FailingEmbedder())
+
+            async def add(self, messages: list[dict], **_kwargs: object) -> dict[str, list]:
+                try:
+                    self.embedding_model.embed_batch([message["content"] for message in messages])
+                except EmbedderRequestError:
+                    for message in messages:
+                        with suppress(EmbedderRequestError):
+                            self.embedding_model.embed(message["content"])
+                return {"results": []}
+
+        try:
+            with (
+                patch("mindroom.memory._backend.create_memory_instance", return_value=SwallowingMemory()),
+                pytest.raises(EmbedderRequestError, match="embedder authentication failed"),
+            ):
+                await add_agent_memory("Never stored", "test_agent", storage_path, config)
+
+            assert get_embedder_failure() == "embedder authentication failed (HTTP 401)"
+        finally:
+            capture_embedder_health_recorder().record(None)
+
+    @pytest.mark.asyncio
     async def test_add_agent_memory_error_handling(
         self,
         mock_memory: AsyncMock,
@@ -269,7 +317,7 @@ class TestMemoryFacade:
         mock_memory.add.side_effect = Exception("Memory error")
 
         with (
-            patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory),
+            patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
             pytest.raises(Exception, match="Memory error"),
         ):
             await add_agent_memory("Test content", "test_agent", storage_path, config)
@@ -281,7 +329,7 @@ class TestMemoryFacade:
         ]
         mock_memory.search.return_value = {"results": mock_results}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             results = await search_agent_memories("calculation", "calculator", storage_path, config, limit=5)
 
             mock_memory.search.assert_called_once_with(
@@ -300,7 +348,7 @@ class TestMemoryFacade:
     ) -> None:
         mock_memory.search.return_value = {"results": [{"memory": "test"}]}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             results = await search_agent_memories("query", "agent", storage_path, config)
             assert results == [{"memory": "test"}]
 
@@ -313,9 +361,185 @@ class TestMemoryFacade:
     ) -> None:
         mock_memory.search.return_value = [{"memory": "test"}]
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             results = await search_agent_memories("query", "agent", storage_path, config)
             assert results == []
+
+    @pytest.mark.asyncio
+    async def test_mem0_search_classifies_propagated_auth_error(
+        self,
+        mock_memory: AsyncMock,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+        response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
+        mock_memory.search.side_effect = AuthenticationError("Error code: 401", response=response, body=None)
+
+        try:
+            with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
+                outcome = await public_search_agent_memories(
+                    "query",
+                    "agent",
+                    storage_path,
+                    config,
+                    runtime_paths_for(config),
+                )
+
+            assert outcome.results == []
+            assert outcome.degraded_reason == "embedder authentication failed (HTTP 401)"
+            # Mem0 traffic never passes through MindRoom's embedder, so the
+            # backend itself must keep /api/health in sync.
+            assert get_embedder_failure() == "embedder authentication failed (HTTP 401)"
+        finally:
+            capture_embedder_health_recorder().record(None)
+
+    @pytest.mark.asyncio
+    async def test_mem0_search_classifies_provider_failure_during_initialization(
+        self,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """Provider failure while constructing Mem0 degrades instead of aborting the turn."""
+        request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+        response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
+        error = AuthenticationError("Error code: 401", response=response, body=None)
+
+        with patch("mindroom.memory._backend.create_memory_instance", side_effect=error):
+            outcome = await public_search_agent_memories(
+                "query",
+                "agent",
+                storage_path,
+                config,
+                runtime_paths_for(config),
+            )
+
+        assert outcome.results == []
+        assert outcome.degraded_reason == "embedder authentication failed (HTTP 401)"
+        capture_embedder_health_recorder().record(None)
+
+    @pytest.mark.asyncio
+    async def test_mem0_team_scope_failure_preserves_agent_scope_results(
+        self,
+        mock_memory: AsyncMock,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """A later team outage keeps already-retrieved personal memories."""
+        config.teams = {"helpers": MockTeamConfig(agents=["agent", "calculator"])}
+        request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+        response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
+        mock_memory.search.side_effect = [
+            {"results": [{"id": "personal", "memory": "available personal memory"}]},
+            AuthenticationError("Error code: 401", response=response, body=None),
+        ]
+
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
+            outcome = await public_search_agent_memories(
+                "query",
+                "agent",
+                storage_path,
+                config,
+                runtime_paths_for(config),
+            )
+
+        assert [result["id"] for result in outcome.results] == ["personal"]
+        assert outcome.degraded_reason == "embedder authentication failed (HTTP 401)"
+        capture_embedder_health_recorder().record(None)
+
+    @pytest.mark.asyncio
+    async def test_mem0_later_scope_success_clears_earlier_scope_failure(
+        self,
+        mock_memory: AsyncMock,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """Outcome stays partial while process health follows the latest real request."""
+        config.teams = {
+            "first": MockTeamConfig(agents=["agent", "calculator"]),
+            "second": MockTeamConfig(agents=["agent", "finance"]),
+        }
+        request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+        response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
+        auth_error_message = "Error code: 401"
+        calls = 0
+
+        async def search(*_args: object, **_kwargs: object) -> dict[str, list[dict]]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"results": [{"id": "personal", "memory": "personal"}]}
+            if calls == 2:
+                raise AuthenticationError(auth_error_message, response=response, body=None)
+            # A real successful Mem0 request clears health inside
+            # MindRoomOpenAIEmbedder; this fake must model that side effect.
+            capture_embedder_health_recorder().record(None)
+            return {"results": [{"id": "team", "memory": "team"}]}
+
+        mock_memory.search.side_effect = search
+        capture_embedder_health_recorder().record("embedder authentication failed (HTTP 401)")
+        try:
+            with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
+                outcome = await public_search_agent_memories(
+                    "query",
+                    "agent",
+                    storage_path,
+                    config,
+                    runtime_paths_for(config),
+                )
+
+            assert [result["id"] for result in outcome.results] == ["personal", "team"]
+            assert outcome.degraded_reason == "embedder authentication failed (HTTP 401)"
+            assert get_embedder_failure() is None
+        finally:
+            capture_embedder_health_recorder().record(None)
+
+    @pytest.mark.asyncio
+    async def test_mem0_search_success_clears_recorded_failure(
+        self,
+        mock_memory: AsyncMock,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """A completed mem0 search (even empty) proves recovery and clears stale health."""
+        mock_memory.search.return_value = {"results": []}
+        capture_embedder_health_recorder().record("embedder authentication failed (HTTP 401)")
+        try:
+            with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
+                outcome = await public_search_agent_memories(
+                    "query",
+                    "agent",
+                    storage_path,
+                    config,
+                    runtime_paths_for(config),
+                )
+
+            assert outcome.results == []
+            assert outcome.degraded_reason is None
+            assert get_embedder_failure() is None
+        finally:
+            capture_embedder_health_recorder().record(None)
+
+    @pytest.mark.asyncio
+    async def test_mem0_search_non_provider_error_raises(
+        self,
+        mock_memory: AsyncMock,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        mock_memory.search.side_effect = RuntimeError("sqlite corrupt")
+
+        with (
+            patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
+            pytest.raises(RuntimeError, match="sqlite corrupt"),
+        ):
+            await public_search_agent_memories(
+                "query",
+                "agent",
+                storage_path,
+                config,
+                runtime_paths_for(config),
+            )
 
     @pytest.mark.asyncio
     async def test_get_agent_memory_allows_agent_scope(
@@ -326,7 +550,7 @@ class TestMemoryFacade:
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Own memory", "user_id": "agent_test_agent"}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             result = await get_agent_memory("mem-1", "test_agent", storage_path, config)
 
         assert result is not None
@@ -342,7 +566,7 @@ class TestMemoryFacade:
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Other memory", "user_id": "agent_other_agent"}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             result = await get_agent_memory("mem-1", "test_agent", storage_path, config)
 
         assert result is None
@@ -358,7 +582,7 @@ class TestMemoryFacade:
         config.teams = {"test_team": MockTeamConfig(agents=["helper", "test_agent"])}
         mock_memory.get.return_value = {"id": "mem-team", "memory": "Team memory", "user_id": "team_helper+test_agent"}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             result = await get_agent_memory("mem-team", "test_agent", storage_path, config)
 
         assert result is not None
@@ -374,7 +598,7 @@ class TestMemoryFacade:
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-member", "memory": "Member memory", "user_id": "agent_helper"}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             result = await get_agent_memory("mem-member", ["helper", "test_agent"], storage_path, config)
 
         assert result is None
@@ -391,7 +615,7 @@ class TestMemoryFacade:
         config.memory.team_reads_member_memory = True
         mock_memory.get.return_value = {"id": "mem-member", "memory": "Member memory", "user_id": "agent_helper"}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             result = await get_agent_memory("mem-member", ["helper", "test_agent"], storage_path, config)
 
         assert result is not None
@@ -408,7 +632,7 @@ class TestMemoryFacade:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Other memory", "user_id": "agent_other_agent"}
 
         with (
-            patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory),
+            patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
             pytest.raises(ValueError, match="No memory found with id=mem-1"),
         ):
             await update_agent_memory("mem-1", "Updated content", "test_agent", storage_path, config)
@@ -425,7 +649,7 @@ class TestMemoryFacade:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Other memory", "user_id": "agent_other_agent"}
 
         with (
-            patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory),
+            patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
             pytest.raises(ValueError, match="No memory found with id=mem-1"),
         ):
             await delete_agent_memory("mem-1", "test_agent", storage_path, config)
@@ -464,7 +688,7 @@ class TestMemoryFacade:
         agent_memories = [{"memory": "I previously calculated 2+2=4", "id": "1"}]
         mock_memory.search.return_value = {"results": agent_memories}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             prompt_parts = await build_memory_prompt_parts(
                 "What is 3+3?",
                 "calculator",
@@ -474,9 +698,9 @@ class TestMemoryFacade:
 
         assert prompt_parts.session_preamble == ""
         assert "[Automatically extracted agent memories - may not be relevant to current context]" in (
-            prompt_parts.turn_context
+            prompt_parts.transient_turn_context
         )
-        assert "I previously calculated 2+2=4" in prompt_parts.turn_context
+        assert "I previously calculated 2+2=4" in prompt_parts.transient_turn_context
 
     @pytest.mark.asyncio
     async def test_build_memory_prompt_parts_no_memories(
@@ -487,10 +711,32 @@ class TestMemoryFacade:
     ) -> None:
         mock_memory.search.return_value = {"results": []}
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", storage_path, config)
 
         assert prompt_parts == MemoryPromptParts()
+
+    @pytest.mark.asyncio
+    async def test_build_memory_prompt_parts_surfaces_degradation_without_matches(
+        self,
+        mock_memory: AsyncMock,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """The automatic per-turn path carries the degradation notice, not silence."""
+        request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+        response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
+        mock_memory.search.side_effect = AuthenticationError("Error code: 401", response=response, body=None)
+
+        try:
+            with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
+                prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", storage_path, config)
+        finally:
+            capture_embedder_health_recorder().record(None)
+
+        assert "Semantic memory search is unavailable this turn" in prompt_parts.transient_turn_context
+        assert "embedder authentication failed (HTTP 401)" in prompt_parts.transient_turn_context
+        assert "Do not claim to have checked stored memories." in prompt_parts.transient_turn_context
 
     @pytest.mark.asyncio
     async def test_disabled_backend_build_memory_prompt_parts_skips_mem0(
@@ -501,7 +747,7 @@ class TestMemoryFacade:
         config.memory.backend = "none"
 
         with patch(
-            "mindroom.memory.functions.create_memory_instance",
+            "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("disabled memory must not create Mem0"),
         ) as mock_create:
             prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", storage_path, config)
@@ -511,7 +757,7 @@ class TestMemoryFacade:
 
     @pytest.mark.asyncio
     async def test_store_conversation_memory(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await store_conversation_memory(
                 "What is 2+2?",
                 "calculator",
@@ -533,7 +779,7 @@ class TestMemoryFacade:
         storage_path: Path,
         config: Config,
     ) -> None:
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await store_conversation_memory("", "agent", storage_path, "session123", config)
 
         mock_memory.add.assert_not_called()
@@ -547,7 +793,7 @@ class TestMemoryFacade:
         config.memory.backend = "none"
 
         with patch(
-            "mindroom.memory.functions.create_memory_instance",
+            "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("disabled memory must not create Mem0"),
         ) as mock_create:
             await store_conversation_memory("Remember this", "calculator", storage_path, "session123", config)
@@ -569,7 +815,7 @@ class TestMemoryFacade:
         storage_path: Path,
         config: Config,
     ) -> None:
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await store_conversation_memory("What is 2+2?", "calculator", storage_path, "session123", config)
 
         assert mock_memory.add.call_count == 1
@@ -589,7 +835,7 @@ class TestMemoryFacade:
             make_visible_message(sender="@user:matrix.org", body="Yes please"),
         ]
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await store_conversation_memory(
                 "What is 2+2?",
                 "calculator",
@@ -617,7 +863,7 @@ class TestMemoryFacade:
     ) -> None:
         team_agents = ["calculator", "data_analyst", "finance"]
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await store_conversation_memory(
                 "Analyze our Q4 financial data",
                 team_agents,
@@ -644,7 +890,7 @@ class TestMemoryFacade:
         config.memory.backend = "file"
         config.agents["calculator"].memory_backend = "mem0"
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory) as mock_create:
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await store_conversation_memory("What is 2+2?", "calculator", storage_path, "session123", config)
 
         mock_create.assert_called_once_with(
@@ -664,7 +910,7 @@ class TestMemoryFacade:
         config.memory.backend = "file"
         config.agents["calculator"].memory_backend = "mem0"
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory) as mock_create:
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await store_conversation_memory(
                 "Analyze our quarterly metrics",
                 ["calculator", "finance"],
@@ -695,6 +941,33 @@ class TestMemoryFacade:
         assert not mem0_team_memory_file.exists()
 
     @pytest.mark.asyncio
+    async def test_store_conversation_memory_team_skips_disabled_members(
+        self,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        config.memory.backend = "file"
+        config.agents["calculator"].memory_backend = "none"
+
+        with patch(
+            "mindroom.memory._backend.create_memory_instance",
+            side_effect=AssertionError("file and disabled members must not create Mem0"),
+        ):
+            await store_conversation_memory(
+                "Disabled member team insight",
+                ["calculator", "finance"],
+                storage_path,
+                "session-team",
+                config,
+            )
+
+        team_id = "team_calculator+finance"
+        assert "Disabled member team insight" in _team_file_memory_path(storage_path, "finance", team_id).read_text(
+            encoding="utf-8",
+        )
+        assert not _team_file_memory_path(storage_path, "calculator", team_id).exists()
+
+    @pytest.mark.asyncio
     async def test_mixed_team_memory_reads_through_each_members_effective_backend(
         self,
         storage_path: Path,
@@ -705,7 +978,7 @@ class TestMemoryFacade:
         config.teams = {"mixed_team": MockTeamConfig(agents=["calculator", "finance"])}
         mem0_stores: dict[Path, FakeMem0ScopedMemory] = {}
 
-        with patch("mindroom.memory.functions.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
+        with patch("mindroom.memory._backend.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
             await store_conversation_memory(
                 "Mixed backend team insight",
                 ["calculator", "finance"],
@@ -776,7 +1049,7 @@ class TestMemoryFacade:
             metadata={"type": "conversation", "is_team": True, "team_members": ["calculator", "finance"]},
         )
 
-        with patch("mindroom.memory.functions.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
+        with patch("mindroom.memory._backend.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
             stale_result = await get_agent_memory("mem-1", "calculator", storage_path, config)
             with pytest.raises(MemoryNotFoundError):
                 await update_agent_memory("mem-1", "fresh mem0 team copy", "calculator", storage_path, config)
@@ -815,7 +1088,7 @@ class TestMemoryFacade:
         config.memory.backend = "none"
 
         with patch(
-            "mindroom.memory.functions.create_memory_instance",
+            "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("disabled memory must not create Mem0"),
         ) as mock_create:
             await add_agent_memory("Remember this", "general", storage_path, config)
@@ -843,7 +1116,7 @@ class TestMemoryFacade:
         team_agents = ["calculator", "finance"]
         mem0_stores: dict[Path, FakeMem0ScopedMemory] = {}
 
-        with patch("mindroom.memory.functions.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
+        with patch("mindroom.memory._backend.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
             await store_conversation_memory(
                 "Mixed team stale-sensitive memory",
                 team_agents,
@@ -925,7 +1198,7 @@ class TestMemoryFacade:
         team_agents = ["calculator", "finance"]
         mem0_stores: dict[Path, FakeMem0ScopedMemory] = {}
 
-        with patch("mindroom.memory.functions.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
+        with patch("mindroom.memory._backend.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
             await store_conversation_memory(
                 "Retired alpha source",
                 team_agents,
@@ -980,7 +1253,7 @@ class TestMemoryFacade:
         team_agents = ["calculator", "finance"]
         mem0_stores: dict[Path, FakeMem0ScopedMemory] = {}
 
-        with patch("mindroom.memory.functions.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
+        with patch("mindroom.memory._backend.create_memory_instance", side_effect=_fake_mem0_factory(mem0_stores)):
             await store_conversation_memory(
                 "Explicit tool delete source",
                 team_agents,
@@ -1027,7 +1300,7 @@ class TestMemoryFacade:
 
         mock_memory.search = AsyncMock(side_effect=search_side_effect)
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             results = await search_agent_memories("test query", "calculator", storage_path, config, limit=5)
 
         assert len(results) == 2
@@ -1046,7 +1319,7 @@ class TestMemoryFacade:
         config.memory.file.path = str(storage_path / "memory-files")
         config.agents["general"].memory_backend = "file"
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory) as mock_create:
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await add_agent_memory("Remember this", "general", storage_path, config)
 
         mock_create.assert_not_called()
@@ -1064,7 +1337,7 @@ class TestMemoryFacade:
         config.memory.backend = "file"
         config.agents["general"].memory_backend = "mem0"
 
-        with patch("mindroom.memory.functions.create_memory_instance", return_value=mock_memory) as mock_create:
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await add_agent_memory("Remember this", "general", storage_path, config)
 
         mock_create.assert_called_once_with(
@@ -1091,7 +1364,7 @@ class TestMemoryFacade:
         calculator_memory_id = calculator_memories[0]["id"]
 
         with patch(
-            "mindroom.memory.functions.create_memory_instance",
+            "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("Mem0 should not be used for file-backed team context"),
         ):
             allowed = await get_agent_memory(

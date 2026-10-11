@@ -24,10 +24,36 @@ class TestStripeRoutesEndpoints:
             mock.return_value = sb
             yield sb
 
+    @pytest.fixture(autouse=True)
+    def account_pending_deletion(self):
+        """Accounts are not pending deletion unless a test says so."""
+        with patch("backend.services.provisioner_service.account_pending_deletion", return_value=False) as pending:
+            yield pending
+
+    @pytest.mark.parametrize("path", ["/stripe/checkout", "/stripe/portal"])
+    def test_account_pending_deletion_cannot_change_billing(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_stripe: Mock,
+        mock_verify_user: Mock,
+        account_pending_deletion: Mock,
+        path: str,
+    ):
+        """Teardown cancels any subscription without refund, so a pending account must cancel the deletion first."""
+        account_pending_deletion.return_value = True
+
+        response = client.post(path, json={"tier": "pro", "billing_cycle": "monthly"})
+
+        assert response.status_code == 409
+        mock_stripe.checkout.Session.create.assert_not_called()
+        mock_stripe.billing_portal.Session.create.assert_not_called()
+
     @pytest.fixture
     def mock_stripe(self):
         """Mock Stripe client."""
         with patch("backend.routes.stripe_routes.stripe") as mock:
+            mock.api_key = "sk_test_mock"
             yield mock
 
     @pytest.fixture
@@ -62,7 +88,7 @@ class TestStripeRoutesEndpoints:
             mock_stripe.checkout.Session.create.return_value = mock_checkout_session
 
             # Make request
-            response = client.post("/stripe/checkout", json={"tier": "starter", "billing_cycle": "monthly"})
+            response = client.post("/stripe/checkout", json={"tier": "byok", "billing_cycle": "monthly"})
 
             # Verify
             assert response.status_code == 200
@@ -91,7 +117,7 @@ class TestStripeRoutesEndpoints:
         assert data["url"] == "https://billing.stripe.com/session/test_123"
 
     def test_create_customer_portal_no_customer(
-        self, client: TestClient, mock_supabase: MagicMock, mock_verify_user: Mock
+        self, client: TestClient, mock_supabase: MagicMock, mock_stripe: Mock, mock_verify_user: Mock
     ):
         """Test creating portal session when no Stripe customer exists."""
         # Setup
@@ -150,17 +176,17 @@ class TestStripeRoutesEndpoints:
             mock_supabase.table().update().eq().execute.return_value = Mock()
 
             # Make request
-            response = client.post("/stripe/checkout", json={"tier": "starter", "billing_cycle": "monthly"})
+            response = client.post("/stripe/checkout", json={"tier": "byok", "billing_cycle": "monthly"})
 
             # Verify
             assert response.status_code == 200
             data = response.json()
             assert data["url"] == "https://checkout.stripe.com/pay/cs_test_123"
 
-    def test_checkout_with_quantity(
+    def test_checkout_uses_single_flat_price(
         self, client: TestClient, mock_supabase: MagicMock, mock_stripe: Mock, mock_verify_user: Mock
     ):
-        """Test creating checkout with quantity for professional plan."""
+        """Test creating checkout for a flat-priced plan."""
         # Setup
         mock_supabase.table().select().eq().single().execute.return_value = Mock(
             data={"stripe_customer_id": "cus_test_123"}
@@ -175,15 +201,89 @@ class TestStripeRoutesEndpoints:
             mock_checkout_session.url = "https://checkout.stripe.com/pay/cs_test_123"
             mock_stripe.checkout.Session.create.return_value = mock_checkout_session
 
-            # Make request with quantity
-            response = client.post(
-                "/stripe/checkout", json={"tier": "professional", "billing_cycle": "monthly", "quantity": 5}
-            )
+            response = client.post("/stripe/checkout", json={"tier": "pro", "billing_cycle": "monthly"})
 
             # Verify
             assert response.status_code == 200
             data = response.json()
             assert data["url"] == "https://checkout.stripe.com/pay/cs_test_123"
+            call_args = mock_stripe.checkout.Session.create.call_args.kwargs
+            assert call_args["line_items"] == [{"price": "price_test_123", "quantity": 1}]
+
+    @pytest.mark.parametrize(
+        ("history", "expects_trial"),
+        [
+            ([], True),
+            ([Mock(status="canceled", trial_start=None)], True),
+            ([Mock(status="canceled", trial_start=1_780_000_000)], False),
+        ],
+    )
+    def test_checkout_grants_a_trial_only_to_a_customer_who_never_had_one(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_stripe: Mock,
+        mock_verify_user: Mock,
+        history: list[Mock],
+        expects_trial: bool,
+    ):
+        """A cancelled trial stays in the customer's Stripe history, so checking out again starts without one."""
+        mock_supabase.table().select().eq().single().execute.return_value = Mock(
+            data={"stripe_customer_id": "cus_test_123"}
+        )
+        mock_stripe.Subscription.list.return_value.auto_paging_iter.return_value = history
+        mock_stripe.checkout.Session.create.return_value = Mock(url="https://checkout.stripe.com/pay/cs_test_123")
+
+        with patch("backend.routes.stripe_routes.get_stripe_price_id", return_value="price_test_123"):
+            response = client.post("/stripe/checkout", json={"tier": "pro", "billing_cycle": "monthly"})
+
+        assert response.status_code == 200
+        mock_stripe.Subscription.list.assert_called_once_with(customer="cus_test_123", status="all", limit=100)
+        params = mock_stripe.checkout.Session.create.call_args.kwargs
+        assert ("trial_period_days" in params["subscription_data"]) is expects_trial
+
+    @pytest.mark.parametrize(
+        ("status", "opens_portal"),
+        [
+            ("active", True),
+            ("trialing", True),
+            ("past_due", True),
+            ("unpaid", True),
+            ("paused", True),
+            ("incomplete", True),
+            ("canceled", False),
+            ("incomplete_expired", False),
+        ],
+    )
+    def test_checkout_sends_a_customer_with_an_unended_subscription_to_the_portal(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_stripe: Mock,
+        mock_verify_user: Mock,
+        status: str,
+        opens_portal: bool,
+    ):
+        """A subscription Stripe can still bill or resume must be fixed in the portal, not duplicated by a new checkout."""
+        mock_supabase.table().select().eq().single().execute.return_value = Mock(
+            data={"stripe_customer_id": "cus_test_123"}
+        )
+        mock_stripe.Subscription.list.return_value.auto_paging_iter.return_value = [
+            Mock(id="sub_existing", status=status, trial_start=None)
+        ]
+        mock_stripe.billing_portal.Session.create.return_value = Mock(url="https://billing.stripe.com/session/x")
+        mock_stripe.checkout.Session.create.return_value = Mock(url="https://checkout.stripe.com/pay/cs_test_123")
+
+        with patch("backend.routes.stripe_routes.get_stripe_price_id", return_value="price_test_123"):
+            response = client.post("/stripe/checkout", json={"tier": "hobby", "billing_cycle": "monthly"})
+
+        assert response.status_code == 200
+        if opens_portal:
+            mock_stripe.checkout.Session.create.assert_not_called()
+            assert response.json()["url"] == "https://billing.stripe.com/session/x"
+        else:
+            mock_stripe.billing_portal.Session.create.assert_not_called()
+            assert response.json()["url"] == "https://checkout.stripe.com/pay/cs_test_123"
 
     def test_checkout_stripe_error(
         self, client: TestClient, mock_supabase: MagicMock, mock_stripe: Mock, mock_verify_user: Mock
@@ -202,13 +302,15 @@ class TestStripeRoutesEndpoints:
             mock_stripe.checkout.Session.create.side_effect = Exception("Checkout error")
 
             # Make request
-            response = client.post("/stripe/checkout", json={"tier": "starter", "billing_cycle": "monthly"})
+            response = client.post("/stripe/checkout", json={"tier": "byok", "billing_cycle": "monthly"})
 
             # Verify
             assert response.status_code == 500
             assert "Failed to create checkout" in response.json()["detail"]
 
-    def test_portal_account_not_found(self, client: TestClient, mock_supabase: MagicMock, mock_verify_user: Mock):
+    def test_portal_account_not_found(
+        self, client: TestClient, mock_supabase: MagicMock, mock_stripe: Mock, mock_verify_user: Mock
+    ):
         """Test portal when account not found."""
         # Setup
         mock_supabase.table().select().eq().single().execute.return_value = Mock(data=None)
@@ -222,30 +324,5 @@ class TestStripeRoutesEndpoints:
 
     def test_unauthorized_access(self, client: TestClient):
         """Test accessing endpoints without authentication."""
-        from main import app  # noqa: PLC0415
-        from backend.deps import verify_user_optional
-
-        # Mock pricing functions, user dependency, and Stripe
-        with (
-            patch("backend.routes.stripe_routes.get_stripe_price_id", return_value="price_test_123"),
-            patch("backend.routes.stripe_routes.is_trial_enabled_for_plan", return_value=False),
-            patch("backend.routes.stripe_routes.stripe") as mock_stripe,
-        ):
-            # Mock the checkout session creation
-            mock_checkout_session = Mock()
-            mock_checkout_session.url = "https://checkout.stripe.com/pay/cs_test_123"
-            mock_stripe.checkout.Session.create.return_value = mock_checkout_session
-
-            def override_verify_user_optional():
-                return None  # Return None to simulate no user
-
-            app.dependency_overrides[verify_user_optional] = override_verify_user_optional
-            try:
-                # When there's no authenticated user, checkout should still work
-                # as stripe_routes allows optional user for checkout
-                response = client.post("/stripe/checkout", json={"tier": "starter", "billing_cycle": "monthly"})
-                # The route actually allows unauthenticated access
-                assert response.status_code == 200
-                assert response.json()["url"] == "https://checkout.stripe.com/pay/cs_test_123"
-            finally:
-                app.dependency_overrides.clear()
+        response = client.post("/stripe/checkout", json={"tier": "byok", "billing_cycle": "monthly"})
+        assert response.status_code == 401

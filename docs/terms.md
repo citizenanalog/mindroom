@@ -1,7 +1,7 @@
-<!-- This page exists for iOS App Store submission requirements. Not included in sidebar nav. -->
 ---
 icon: lucide/file-text
 ---
+
 
 # Terms of Service
 
@@ -49,7 +49,7 @@ MindRoom clients connect to Matrix homeservers.
 
 ## Open Source
 
-MindRoom is open source, and source code for the app and related services is publicly available at `https://github.com/mindroom-ai`.
+MindRoom is open source, and source code for the app and related services is publicly available at [github.com/mindroom-ai](https://github.com/mindroom-ai).
 
 ## Content and Moderation
 
@@ -73,4 +73,4 @@ We may update these Terms from time to time. Continued use after changes are pub
 
 For questions about these Terms, contact:
 
-- `support@mindroom.chat`
+- [MindRoom GitHub issues](https://github.com/mindroom-ai/mindroom/issues)

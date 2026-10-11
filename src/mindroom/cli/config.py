@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -15,19 +16,46 @@ from typing import TYPE_CHECKING, Literal
 
 import typer
 from rich.console import Console
+from rich.markup import escape
+from rich.syntax import Syntax
 
 from mindroom import constants
+from mindroom.atomic_file import atomic_write_bytes_at, existing_file_mode
+from mindroom.cli.agent_docs import ensure_config_agent_docs
+from mindroom.cli.env_file import upsert_env_values, write_private_env_text
+from mindroom.model_defaults import (
+    CONFIG_INIT_ADDITIONAL_MODELS,
+    CONFIG_INIT_HELPER_MODELS,
+    CONFIG_INIT_MODEL_ALTERNATIVES,
+    CONFIG_INIT_MODEL_PRESETS,
+    LLAMA_CPP_BASE_URL_DEFAULT,
+    LLAMA_CPP_GEMMA,
+    LLAMA_CPP_QWEN,
+    LOCAL_OPENAI_API_KEY_DEFAULT,
+    OLLAMA_GEMMA,
+    OLLAMA_HOST_DEFAULT,
+    OLLAMA_QWEN,
+    SENTENCE_TRANSFORMERS_DEFAULT,
+    llama_cpp_server_command,
+)
+from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root
+from mindroom.runtime_env_policy import (
+    AWS_BEDROCK_CLAUDE_ENV_BY_KEY,
+    AZURE_OPENAI_ENV_BY_KEY,
+    ENV_TEMPLATE_PLACEHOLDERS,
+    VERTEXAI_CLAUDE_ENV_BY_KEY,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
-    import yaml  # type: ignore[import-untyped]
-    from pydantic import ValidationError
-
-    from mindroom.config.main import Config, ConfigRuntimeValidationError
+    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.model_defaults import ModelPreset
 
 console = Console()
+# Warnings go to stderr so `config init --print` output stays valid YAML.
+_err_console = Console(stderr=True)
 
 config_app = typer.Typer(
     name="config",
@@ -37,63 +65,106 @@ config_app = typer.Typer(
 )
 
 # Reusable option definitions
-_CONFIG_PATH_OPTION: Path | None = typer.Option(
+CONFIG_PATH_OPTION: Path | None = typer.Option(
     None,
     "--path",
     "-p",
     help="Override auto-detection and use this config file path.",
 )
 
-_ConfigInitProfile = Literal["full", "minimal", "public"]
-_ProviderPreset = Literal["anthropic", "codex", "openai", "openrouter", "vertexai_claude"]
+_MatrixServerPreset = Literal["self-hosted", "mindroom.chat"]
+_ProviderPreset = Literal[
+    "anthropic",
+    "bedrock_claude",
+    "azure",
+    "codex",
+    "kimi",
+    "llama_cpp",
+    "ollama",
+    "openai",
+    "openrouter",
+    "vertexai_claude",
+]
 
-_DEFAULT_MODEL_PRESETS: dict[_ProviderPreset, tuple[str, str, int]] = {
-    "anthropic": ("anthropic", "claude-sonnet-4-6", 1_000_000),
-    "codex": ("codex", "gpt-5.5", 258_000),
-    "openai": ("openai", "gpt-5.4", 258_000),
-    "openrouter": ("openrouter", "anthropic/claude-sonnet-4.6", 1_000_000),
-    "vertexai_claude": ("vertexai_claude", "claude-sonnet-4-6", 1_000_000),
+_OLLAMA_HOST = OLLAMA_HOST_DEFAULT
+_LLAMA_CPP_BASE_URL = LLAMA_CPP_BASE_URL_DEFAULT
+_PROVIDER_PRESET_ALIASES: dict[str, _ProviderPreset] = {
+    "anthropic": "anthropic",
+    "bedrock_claude": "bedrock_claude",
+    "azure": "azure",
+    "azure_openai": "azure",
+    "azure-openai": "azure",
+    "claude": "anthropic",
+    "codex": "codex",
+    "kimi": "kimi",
+    "llama.cpp": "llama_cpp",
+    "llama-cpp": "llama_cpp",
+    "llama_cpp": "llama_cpp",
+    "ollama": "ollama",
+    "openai": "openai",
+    "openrouter": "openrouter",
+    "vertexai_claude": "vertexai_claude",
+    "vertexai": "vertexai_claude",
+    "vertex": "vertexai_claude",
+    "vertexai-anthropic": "vertexai_claude",
+    "vertex-anthropic": "vertexai_claude",
 }
 
 _PUBLIC_HOSTED_ENV_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("MATRIX_HOMESERVER", "https://mindroom.chat"),
     ("MATRIX_SERVER_NAME", "mindroom.chat"),
     ("MINDROOM_PROVISIONING_URL", "https://mindroom.chat"),
+    ("MINDROOM_NAMESPACE", ""),
     ("MATRIX_REGISTRATION_TOKEN", ""),
 )
-_CANONICAL_INIT_PROFILES: tuple[str, ...] = (
-    "full",
-    "minimal",
-    "public",
-    "public-codex",
-    "public-vertexai-anthropic",
+_MATRIX_SERVER_CHOICES_TEXT = "self-hosted or mindroom.chat"
+_MATRIX_SERVER_HELP = (
+    "Matrix defaults: self-hosted = configure your own homeserver; mindroom.chat = hosted Matrix pairing defaults."
 )
-_MATRIX_DELIVERY_TEMPLATE_BLOCK = """\
-matrix_delivery:
-  ignore_unverified_devices: false"""
+_PROVIDER_HELP = "Default model provider for the generated config."
+_PROVIDER_CHOICES_TEXT = (
+    "anthropic, azure, bedrock_claude, codex, kimi, llama.cpp, ollama, openai, openrouter, or vertexai_claude"
+)
+# Presets that need exactly one API key, which first-run setup asks for; the others need logins or more settings.
+_API_KEY_PRESET_LABELS: dict[_ProviderPreset, str] = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+}
 
-
-def _config_init_storage_plan(
-    config_dir: Path,
-    env_path: Path,
-    *,
-    replace_env_file: bool,
-) -> tuple[Path, bool]:
-    """Return the storage root and whether the starter config can use the env placeholder."""
-    runtime_paths = constants.resolve_runtime_paths(config_path=config_dir / "config.yaml")
-    if replace_env_file:
-        return runtime_paths.storage_root, True
-    if "MINDROOM_STORAGE_PATH" in runtime_paths.env_file_values and env_path.is_file():
-        return runtime_paths.storage_root, True
-    return runtime_paths.storage_root, False
+# First-run setup for presets without a single API key; MindRoom starts right after, and `.env` is read only at startup.
+_FIRST_RUN_PROVIDER_STEPS: dict[_ProviderPreset, str] = {
+    "azure": "Set your Azure OpenAI key and endpoint in {env_path}, confirm the config model deployment name, "
+    "and restart `mindroom run`",
+    "bedrock_claude": "Set your AWS Bedrock region and credentials in {env_path} and restart `mindroom run`",
+    "vertexai_claude": "Set your Vertex AI project and region in {env_path}, sign in with Google auth, "
+    "and restart `mindroom run`",
+    "codex": "Run `codex login` in another terminal",
+    "kimi": "Run `kimi` and `/login` in another terminal",
+    "ollama": "Start Ollama and pull the local models",
+    "llama_cpp": "Start llama.cpp server with the local model",
+}
 
 
 def _config_init_owner_user_id(config_path: Path) -> str | None:
-    """Return the paired owner MXID available to config init, if one was persisted."""
+    """Return the paired owner MXID available to config init, warning when a persisted one cannot be used."""
     from mindroom.cli.owner import parse_owner_matrix_user_id  # noqa: PLC0415
 
     runtime_paths = constants.resolve_runtime_paths(config_path=config_path)
-    return parse_owner_matrix_user_id(runtime_paths.env_value(constants.OWNER_MATRIX_USER_ID_ENV))
+    raw_owner_user_id = (runtime_paths.env_value(constants.OWNER_MATRIX_USER_ID_ENV) or "").strip()
+    owner_user_id = parse_owner_matrix_user_id(raw_owner_user_id)
+    if raw_owner_user_id and owner_user_id is None:
+        source = (
+            "the environment"
+            if constants.OWNER_MATRIX_USER_ID_ENV in runtime_paths.process_env
+            else str(runtime_paths.env_path)
+        )
+        _err_console.print(
+            f"[yellow]Warning:[/yellow] {constants.OWNER_MATRIX_USER_ID_ENV} in {escape(source)} "
+            f"is not a valid Matrix user ID ({escape(repr(raw_owner_user_id))}), "
+            "so the owner placeholders in config.yaml were left for you to replace.",
+        )
+    return owner_user_id
 
 
 def _default_mind_workspace(storage_root: Path) -> Path:
@@ -103,62 +174,91 @@ def _default_mind_workspace(storage_root: Path) -> Path:
     return agent_workspace_root_path(storage_root, "mind")
 
 
-def _path_string_for_config(path: Path, config_dir: Path) -> str:
-    """Render one filesystem path for config.yaml, preferring config-relative paths when possible."""
-    resolved_path = path.expanduser().resolve()
-    try:
-        relative_path = resolved_path.relative_to(config_dir.resolve())
-    except ValueError:
-        return str(resolved_path)
-    return f"./{relative_path.as_posix()}"
+_MIND_CONFIG_PATH_NOTE_START = "<!-- mindroom:config-path:start -->"
+_MIND_CONFIG_PATH_NOTE_END = "<!-- mindroom:config-path:end -->"
 
 
-def _default_mind_knowledge_base_path(
-    config_dir: Path,
-    *,
-    storage_root: Path,
-    use_storage_env_placeholder: bool,
-) -> str:
-    """Return the starter knowledge-base path anchored to the chosen runtime storage root."""
-    if use_storage_env_placeholder:
-        return "${MINDROOM_STORAGE_PATH}/agents/mind/workspace/memory"
-    return _path_string_for_config(_default_mind_workspace(storage_root) / "memory", config_dir)
+def _ensure_mind_workspace(workspace_path: Path, *, config_path: Path, force: bool) -> None:
+    """Create the default Mind workspace files used by starter configs.
 
-
-def _ensure_mind_workspace(workspace_path: Path, *, force: bool) -> None:
-    """Create the default Mind workspace files used by the full/public templates."""
+    Worker code can write this workspace, so TOOLS.md is read and replaced without following links.
+    A rewrite keeps the permissions TOOLS.md already has.
+    """
     from mindroom.workspaces import ensure_workspace_template  # noqa: PLC0415
 
     ensure_workspace_template(workspace_path, template="mind", force=force)
+    note = (
+        f"{_MIND_CONFIG_PATH_NOTE_START}\n"
+        "## MindRoom Installation\n\n"
+        f"- Active config file: {json.dumps(str(config_path.resolve()))}\n"
+        f"{_MIND_CONFIG_PATH_NOTE_END}"
+    )
+    with open_directory_within_root(workspace_path) as workspace_fd:
+        content = read_regular_file_within_root(workspace_fd, "TOOLS.md").decode("utf-8")
+        start = content.find(_MIND_CONFIG_PATH_NOTE_START)
+        end = content.find(_MIND_CONFIG_PATH_NOTE_END, start)
+        if start >= 0 and end >= 0:
+            end += len(_MIND_CONFIG_PATH_NOTE_END)
+            updated = f"{content[:start]}{note}{content[end:]}"
+        else:
+            updated = f"{content.rstrip()}\n\n{note}\n"
+        if updated != content:
+            file_mode = existing_file_mode(workspace_fd, "TOOLS.md")
+            atomic_write_bytes_at(
+                workspace_fd,
+                "TOOLS.md",
+                updated.encode("utf-8"),
+                file_mode=0o644 if file_mode is None else file_mode,
+            )
 
 
 def _write_env_file(
     env_path: Path,
-    selected_profile: _ConfigInitProfile,
+    matrix_server: _MatrixServerPreset,
     selected_preset: _ProviderPreset,
     *,
     storage_root: Path,
     replace_existing: bool,
+    provider_api_key: str | None = None,
 ) -> bool:
     """Create or update .env and return whether the file changed."""
     if not env_path.exists():
-        env_path.write_text(_env_template(selected_profile, selected_preset, storage_root), encoding="utf-8")
+        write_private_env_text(env_path, _env_template(matrix_server, selected_preset, storage_root, provider_api_key))
         console.print(f"[green]Env file created:[/green] {env_path}")
         return True
 
     if not replace_existing:
-        # `connect` can create .env before `config init`; public profiles still
+        # `connect` can create .env before `config init`; mindroom.chat still
         # need hosted Matrix defaults, so preserve user-owned values and append
         # only the missing hosted keys.
-        if selected_profile == "public":
-            return _append_missing_env_defaults(
-                env_path,
-                _PUBLIC_HOSTED_ENV_DEFAULTS,
-                title="Hosted Matrix defaults for public profiles",
+        changed = matrix_server == "mindroom.chat" and _append_missing_env_defaults(
+            env_path,
+            _PUBLIC_HOSTED_ENV_DEFAULTS,
+            title="Hosted Matrix defaults for mindroom.chat",
+        )
+        if changed:
+            console.print(f"[green]Env file updated:[/green] {env_path}")
+        # `mindroom run` serves the dashboard on every interface by default, so a kept
+        # .env without a dashboard key gets one; an explicitly empty key stays empty,
+        # and an exported key takes precedence over .env, so it gets none.
+        if "MINDROOM_API_KEY" not in os.environ and _append_missing_env_defaults(
+            env_path,
+            (("MINDROOM_API_KEY", _new_dashboard_api_key()),),
+            title="Dashboard API key protecting /api/*; the dashboard login page asks for it",
+        ):
+            # A service already running without a key reads .env only at startup.
+            console.print(
+                f"[green]Generated MINDROOM_API_KEY in {env_path}[/green]; "
+                "restart MindRoom if it is already running to apply it.",
             )
-        return False
+            changed = True
+        if provider_api_key and (env_key := _preset_api_key_env(selected_preset)):
+            upsert_env_values(env_path, {env_key: provider_api_key})
+            console.print(f"[green]Env file updated:[/green] {env_path} ({env_key})")
+            changed = True
+        return changed
 
-    env_path.write_text(_env_template(selected_profile, selected_preset, storage_root), encoding="utf-8")
+    write_private_env_text(env_path, _env_template(matrix_server, selected_preset, storage_root, provider_api_key))
     console.print(f"[green]Env file overwritten:[/green] {env_path}")
     return True
 
@@ -186,53 +286,78 @@ def _append_missing_env_defaults(
 
     appended_lines = [f"# {title}", *(f"{key}={value}" for key, value in missing_defaults)]
     appended_content = "\n".join(appended_lines)
-    env_path.write_text(f"{current_content}{separator}{appended_content}\n", encoding="utf-8")
-    console.print(f"[green]Env file updated:[/green] {env_path}")
+    write_private_env_text(env_path, f"{current_content}{separator}{appended_content}\n")
     return True
 
 
-def _should_replace_env_file(env_path: Path, *, force: bool) -> bool:
+def _should_replace_env_file(env_path: Path, *, force: bool, no_input: bool) -> bool:
     """Return whether config init should create or overwrite the full env template."""
     if not env_path.exists():
         return True
-    return force or typer.confirm(f"Overwrite existing .env file ({env_path})?", default=False)
+    if force:
+        return True
+    if no_input:
+        return False
+    return typer.confirm(f"Overwrite existing .env file ({env_path})?", default=False)
 
 
-def _config_init_env_hint(selected_profile: _ConfigInitProfile, selected_preset: _ProviderPreset) -> str:
+def _config_init_env_hint(matrix_server: _MatrixServerPreset, selected_preset: _ProviderPreset) -> str:
     """Return the env setup hint shown after `mindroom config init`."""
-    if selected_preset == "codex":
-        if selected_profile == "public":
-            return "Run `codex login` before starting MindRoom (Matrix homeserver is prefilled)"
-        return "Set your Matrix homeserver and run `codex login` before starting MindRoom"
-    if selected_preset == "vertexai_claude":
-        if selected_profile == "public":
-            return "Set your Vertex AI project/region and Google auth (Matrix homeserver is prefilled)"
-        return "Set your Matrix homeserver, Vertex AI project/region, and Google auth"
-    if selected_profile == "public":
-        return "Set your API keys (Matrix homeserver is prefilled)"
-    return "Set your API keys and Matrix homeserver"
+    hosted_hints: dict[_ProviderPreset, str] = {
+        "azure": "Set your Azure OpenAI key/endpoint and confirm the config model deployment name",
+        "bedrock_claude": "Set AWS Bedrock region and credentials (Matrix homeserver is prefilled)",
+        "codex": "Run `codex login` before starting MindRoom (Matrix homeserver is prefilled)",
+        "kimi": "Run `kimi` and `/login` before starting MindRoom (Matrix homeserver is prefilled)",
+        "vertexai_claude": "Set your Vertex AI project/region and Google auth (Matrix homeserver is prefilled)",
+        "ollama": "Start Ollama and pull the local models (Matrix homeserver is prefilled)",
+        "llama_cpp": "Start llama.cpp server with the local model (Matrix homeserver is prefilled)",
+    }
+    standalone_hints: dict[_ProviderPreset, str] = {
+        "azure": "Set your Matrix homeserver, Azure OpenAI key/endpoint, and config model deployment name",
+        "bedrock_claude": "Set your Matrix homeserver, AWS Bedrock region, and AWS credentials",
+        "codex": "Set your Matrix homeserver and run `codex login` before starting MindRoom",
+        "kimi": "Set your Matrix homeserver and run `kimi` and `/login` before starting MindRoom",
+        "vertexai_claude": "Set your Matrix homeserver, Vertex AI project/region, and Google auth",
+        "ollama": "Set your Matrix homeserver, start Ollama, and pull the local models",
+        "llama_cpp": "Set your Matrix homeserver and start llama.cpp server with the local model",
+    }
+    if matrix_server == "mindroom.chat":
+        return hosted_hints.get(selected_preset, "Set your API keys (Matrix homeserver is prefilled)")
+    return standalone_hints.get(selected_preset, "Set your API keys and Matrix homeserver")
 
 
 def _print_config_init_next_steps(
     env_path: Path,
     *,
     env_changed: bool,
-    selected_profile: _ConfigInitProfile,
+    matrix_server: _MatrixServerPreset,
     selected_preset: _ProviderPreset,
 ) -> None:
-    """Print post-init guidance for the selected profile."""
+    """Print post-init guidance for the selected Matrix server and provider."""
     console.print("\nNext steps:")
     if env_changed:
-        env_hint = _config_init_env_hint(selected_profile, selected_preset)
+        env_hint = _config_init_env_hint(matrix_server, selected_preset)
         console.print(f"  [cyan]Edit {env_path}[/cyan]  {env_hint}")
-    if selected_profile == "public":
-        console.print(
-            "  [cyan]mindroom connect --pair-code XXXX[/cyan]  "
-            "Pair with hosted Matrix (get code from chat.mindroom.chat)",
-        )
+    _print_local_model_commands(selected_preset)
     console.print("  [cyan]mindroom config edit[/cyan]      Customize your config")
     console.print("  [cyan]mindroom config validate[/cyan]  Verify it's valid")
     console.print("  [cyan]mindroom run[/cyan]              Start the system")
+    if matrix_server == "mindroom.chat":
+        console.print("  On first run, MindRoom prints a link to approve with your MindRoom Chat account.")
+
+
+def _print_local_model_commands(selected_preset: _ProviderPreset) -> None:
+    """Print the commands that start the local model server for local presets."""
+    if selected_preset == "ollama":
+        console.print(f"  [cyan]ollama pull {OLLAMA_GEMMA}[/cyan]         Pull the default local model")
+        console.print(f"  [cyan]ollama pull {OLLAMA_QWEN}[/cyan]   Pull the larger local model option")
+    if selected_preset == "llama_cpp":
+        console.print(
+            f"  [cyan]{llama_cpp_server_command(LLAMA_CPP_GEMMA)}[/cyan]  Start the default local model server",
+        )
+        console.print(
+            f"  [cyan]{llama_cpp_server_command(LLAMA_CPP_QWEN)}[/cyan]  Start the larger local model option",
+        )
 
 
 def _config_discovery_env(path: Path | None = None) -> dict[str, str]:
@@ -256,6 +381,11 @@ def print_config_search_locations(process_env: Mapping[str, str], *, title: str)
     console.print(title)
     for line in _format_config_search_locations(process_env):
         console.print(line)
+
+
+def _yaml_syntax(content: str, *, line_numbers: bool, word_wrap: bool) -> Syntax:
+    """Return the shared Rich YAML renderer used by config display commands."""
+    return Syntax(content, "yaml", theme="monokai", line_numbers=line_numbers, word_wrap=word_wrap)
 
 
 def _resolve_config_path(
@@ -310,7 +440,7 @@ def _get_editor() -> str:
 
 
 def format_validation_errors(
-    exc: ValidationError | ConfigRuntimeValidationError | yaml.YAMLError | OSError | UnicodeError,
+    exc: Exception,
     config_path: Path | None = None,
 ) -> None:
     """Print config validation errors in a user-friendly format."""
@@ -343,96 +473,223 @@ def config_init(
         "-f",
         help="Overwrite existing config without prompting.",
     ),
-    minimal: bool = typer.Option(
-        False,
-        "--minimal",
-        help="Generate a bare-minimum config instead of a richer example.",
-    ),
-    profile: str = typer.Option(
-        "full",
-        "--profile",
-        help=(
-            "Template profile: full, minimal, public, public-codex, or public-vertexai-anthropic "
-            "(hosted Matrix with provider defaults)."
-        ),
+    matrix_server: str = typer.Option(
+        "mindroom.chat",
+        "--matrix-server",
+        help=f"{_MATRIX_SERVER_HELP} Choices: {_MATRIX_SERVER_CHOICES_TEXT}.",
     ),
     provider: str | None = typer.Option(
         None,
         "--provider",
-        help="Provider preset for generated config: anthropic, codex, openai, openrouter, or vertexai_claude.",
+        help=f"{_PROVIDER_HELP} Choices: {_PROVIDER_CHOICES_TEXT}.",
+    ),
+    print_config: bool = typer.Option(
+        False,
+        "--print",
+        help="Print generated config YAML with syntax highlighting instead of writing files.",
+    ),
+    no_input: bool = typer.Option(
+        False,
+        "--no-input",
+        help="Never prompt: keep an existing config.yaml unchanged, create anything missing, and use the default provider preset.",
     ),
 ) -> None:
-    """Create a starter config.yaml with example agents and models.
+    """Create a starter config.yaml with a personal agent and model.
 
-    Generates a YAML config with starter agents, one model, and sensible defaults.
+    Generates a YAML config with the Mind agent, one model, and sensible defaults.
     """
     target = _resolve_config_path(path)
     env_path = target.parent / ".env"
 
-    if target.exists() and not force:
+    # With --no-input an existing config.yaml is kept, but .env handling still
+    # runs so a missing .env is recreated and hosted defaults are appended.
+    keep_existing_config = False
+    if target.exists() and not force and not print_config:
         console.print(f"[yellow]Config file already exists:[/yellow] {target}")
-        if not typer.confirm("Overwrite existing config file?"):
+        if no_input:
+            console.print("Keeping existing config.yaml. Use --force to overwrite.")
+            keep_existing_config = True
+        elif not typer.confirm("Overwrite existing config file?"):
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(0)
 
-    selected_profile, selected_preset = _resolve_config_init_selection(
-        profile,
-        minimal=minimal,
+    selected_matrix_server, selected_preset = _resolve_config_init_selection(
+        matrix_server,
         provider=provider,
-    )
-    replace_env_file = _should_replace_env_file(env_path, force=force)
-    storage_root, use_storage_env_placeholder = _config_init_storage_plan(
-        target.parent,
-        env_path,
-        replace_env_file=replace_env_file,
+        interactive=not print_config and not no_input,
     )
 
-    if selected_profile == "minimal":
-        content = _minimal_template(selected_preset)
-    else:
-        full_profile: Literal["full", "public"] = "public" if selected_profile == "public" else "full"
-        content = _full_template(
-            selected_preset,
-            target.parent,
-            storage_root=storage_root,
-            use_storage_env_placeholder=use_storage_env_placeholder,
-            profile=full_profile,
-        )
+    if print_config:
+        content = _starter_config(target, selected_matrix_server, selected_preset)
+        console.print(_yaml_syntax(content, line_numbers=False, word_wrap=False), soft_wrap=True)
+        return
 
-    # `connect` can run before `config init`, when no config exists to patch.
-    # In that order, connect persists the owner MXID in .env so init can render
-    # authorization defaults without leaving pairing placeholders behind.
-    if owner_user_id := _config_init_owner_user_id(target):
-        from mindroom.cli.owner import replace_owner_placeholders_in_text  # noqa: PLC0415
-
-        content = replace_owner_placeholders_in_text(content, owner_user_id)
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-
-    if selected_profile != "minimal":
-        _ensure_mind_workspace(_default_mind_workspace(storage_root), force=force)
-
-    env_changed = _write_env_file(
+    env_changed = _write_starter_setup(
+        target,
         env_path,
-        selected_profile,
+        constants.resolve_runtime_paths(config_path=target).storage_root,
+        selected_matrix_server,
         selected_preset,
-        storage_root=storage_root,
-        replace_existing=replace_env_file,
+        force=force,
+        replace_env_file=_should_replace_env_file(env_path, force=force, no_input=no_input),
+        keep_existing_config=keep_existing_config,
     )
-
-    console.print(f"[green]Config created:[/green] {target}")
     _print_config_init_next_steps(
         env_path,
         env_changed=env_changed,
-        selected_profile=selected_profile,
+        matrix_server=selected_matrix_server,
         selected_preset=selected_preset,
     )
 
 
+def create_first_run_config(
+    runtime_paths: RuntimePaths,
+    *,
+    provider: str | None,
+    interactive: bool,
+) -> None:
+    """Write the hosted starter config that `mindroom run` found missing, asking a terminal for what is still open.
+
+    Without a terminal nothing is asked, so `provider` is required and a missing key is skipped.
+    """
+    config_path = runtime_paths.config_path
+    env_path = runtime_paths.env_path
+    if provider is None:
+        selected_preset = None
+    elif (selected_preset := _normalize_provider_preset(provider)) is None:
+        msg = f"Invalid --provider value. Use: {_PROVIDER_CHOICES_TEXT}."
+        raise ValueError(msg)
+    console.print(f"[yellow]No MindRoom config found at {config_path}.[/yellow]")
+    console.print(
+        "Let's create one for MindRoom Chat (mindroom.chat). "
+        "For your own Matrix server, press Ctrl+C and run `mindroom config init --matrix-server self-hosted`.",
+    )
+    selected_preset = selected_preset or _prompt_provider_preset()
+    provider_api_key = _prompt_provider_key(selected_preset, runtime_paths, env_path, interactive=interactive)
+    _write_starter_setup(
+        config_path,
+        env_path,
+        runtime_paths.storage_root,
+        "mindroom.chat",
+        selected_preset,
+        force=False,
+        replace_env_file=False,
+        provider_api_key=provider_api_key,
+    )
+    if selected_preset not in _API_KEY_PRESET_LABELS:
+        console.print("\nMindRoom keeps starting; your agents can answer once you:")
+        console.print(f"  {_FIRST_RUN_PROVIDER_STEPS[selected_preset].format(env_path=env_path)}")
+        _print_local_model_commands(selected_preset)
+    console.print()
+
+
+def _prompt_provider_key(
+    selected_preset: _ProviderPreset,
+    runtime_paths: RuntimePaths,
+    env_path: Path,
+    *,
+    interactive: bool,
+) -> str | None:
+    """Ask a terminal for the preset's API key with hidden input; return None when none was typed or none is needed."""
+    from mindroom.credentials.sync import get_secret_from_env  # noqa: PLC0415
+
+    label = _API_KEY_PRESET_LABELS.get(selected_preset)
+    env_key = _preset_api_key_env(selected_preset)
+    if label is None or env_key is None:
+        return None
+    if get_secret_from_env(env_key, runtime_paths):
+        console.print(f"Using {env_key} from your environment.")
+        return None
+    value = (
+        typer.prompt(
+            f"{label} API key (input hidden, press Enter to skip)",
+            default="",
+            show_default=False,
+            hide_input=True,
+        ).strip()
+        if interactive
+        else ""
+    )
+    if not value:
+        console.print(
+            f"Skipped. Connect your provider in the dashboard once MindRoom is running, "
+            f"or add {env_key} to {env_path} and restart `mindroom run`.",
+        )
+        return None
+    # Any exported value is blank or a template placeholder, and it would take precedence over
+    # the saved key when this process reloads its environment.
+    os.environ.pop(env_key, None)
+    return value
+
+
+def _starter_config(
+    target: Path,
+    matrix_server: _MatrixServerPreset,
+    selected_preset: _ProviderPreset,
+) -> str:
+    """Return the rendered starter config for one config path."""
+    content = _full_template(selected_preset, matrix_server=matrix_server)
+
+    # `connect` can run before `config init`, when no config exists to patch.
+    # In that order, connect persists the owner MXID in .env so init can render
+    # owner access defaults without leaving pairing placeholders behind.
+    if owner_user_id := _config_init_owner_user_id(target):
+        from mindroom.cli.owner import replace_owner_placeholders_in_text  # noqa: PLC0415
+
+        content = replace_owner_placeholders_in_text(content, owner_user_id)
+    return content
+
+
+def _write_starter_setup(
+    target: Path,
+    env_path: Path,
+    storage_root: Path,
+    matrix_server: _MatrixServerPreset,
+    selected_preset: _ProviderPreset,
+    *,
+    force: bool,
+    replace_env_file: bool,
+    keep_existing_config: bool = False,
+    provider_api_key: str | None = None,
+) -> bool:
+    """Write `.env`, the starter config, Mind workspace, and agent docs; return whether `.env` changed.
+
+    `.env` comes first so a failed write leaves no config that would skip first-run setup next time.
+    """
+    content = _starter_config(target, matrix_server, selected_preset)
+    env_changed = _write_env_file(
+        env_path,
+        matrix_server,
+        selected_preset,
+        storage_root=storage_root,
+        replace_existing=replace_env_file,
+        provider_api_key=provider_api_key,
+    )
+    if not keep_existing_config:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    _ensure_mind_workspace(_default_mind_workspace(storage_root), config_path=target, force=force)
+
+    created_doc = ensure_config_agent_docs(
+        target.parent,
+        config_path=target,
+        storage_root=storage_root,
+        force=force,
+    )
+    if created_doc is not None:
+        console.print(f"[green]Agent docs created:[/green] {created_doc.name}")
+
+    if keep_existing_config:
+        console.print(f"[green]Config unchanged:[/green] {target}")
+    else:
+        console.print(f"[green]Config created:[/green] {target}")
+    return env_changed
+
+
 @config_app.command("show")
 def config_show(
-    path: Path | None = _CONFIG_PATH_OPTION,
+    path: Path | None = CONFIG_PATH_OPTION,
     raw: bool = typer.Option(
         False,
         "--raw",
@@ -460,16 +717,13 @@ def config_show(
         print(content, end="")
         return
 
-    from rich.syntax import Syntax  # noqa: PLC0415
-
     console.print(f"[bold green]Config file:[/bold green] {config_file}\n")
-    syntax = Syntax(content, "yaml", theme="monokai", line_numbers=True, word_wrap=True)
-    console.print(syntax)
+    console.print(_yaml_syntax(content, line_numbers=True, word_wrap=True))
 
 
 @config_app.command("edit")
 def config_edit(
-    path: Path | None = _CONFIG_PATH_OPTION,
+    path: Path | None = CONFIG_PATH_OPTION,
 ) -> None:
     """Open config.yaml in your default editor.
 
@@ -537,6 +791,17 @@ def config_validate(
         format_validation_errors(exc, config_path)
         raise typer.Exit(1) from None
 
+    from mindroom.automations.registry import automation_reference_errors, compile_automations  # noqa: PLC0415
+    from mindroom.tool_system.plugins import isolated_plugin_runtime  # noqa: PLC0415
+
+    with isolated_plugin_runtime(config, runtime_paths, skip_broken_plugins=True) as plugins:
+        automation_errors = automation_reference_errors(config, compile_automations(plugins))
+    if automation_errors:
+        console.print("[red]Issues found:[/red]")
+        for error in automation_errors:
+            console.print(f"  {error}")
+        raise typer.Exit(1)
+
     console.print("[green]Configuration is valid.[/green]\n")
     console.print(f"  Agents: {len(config.agents)} ({', '.join(config.agents.keys()) or 'none'})")
     console.print(f"  Teams:  {len(config.teams)} ({', '.join(config.teams.keys()) or 'none'})")
@@ -548,9 +813,42 @@ def config_validate(
     check_env_keys(config, runtime_paths=runtime_paths)
 
 
+@config_app.command("resolve")
+def config_resolve(
+    path: Path | None = CONFIG_PATH_OPTION,
+) -> None:
+    """Print the fully merged config YAML with all !include tags resolved.
+
+    Keys are sorted, so diffing the output before and after splitting a config
+    into include files proves the split is equivalent to the monolith.
+    """
+    runtime_paths = activate_cli_runtime(path)
+    config_path = runtime_paths.config_path
+
+    if not config_path.exists():
+        console.print(f"[red]Error:[/red] Configuration file not found: {config_path}")
+        console.print("\nRun [cyan]mindroom config init[/cyan] to create one.")
+        raise typer.Exit(1)
+
+    from mindroom import yaml_io  # noqa: PLC0415
+    from mindroom.config.main import CONFIG_LOAD_USER_ERROR_TYPES  # noqa: PLC0415
+    from mindroom.config.yaml_includes import load_yaml_config_source  # noqa: PLC0415
+
+    try:
+        data, _source_files = load_yaml_config_source(config_path)
+    except CONFIG_LOAD_USER_ERROR_TYPES as exc:
+        format_validation_errors(exc, config_path)
+        raise typer.Exit(1) from None
+
+    print(
+        yaml_io.safe_dump(data, default_flow_style=False, sort_keys=True, allow_unicode=True),
+        end="",
+    )
+
+
 @config_app.command("path")
 def config_path_cmd(
-    path: Path | None = _CONFIG_PATH_OPTION,
+    path: Path | None = CONFIG_PATH_OPTION,
 ) -> None:
     """Show the resolved config file path and search locations."""
     process_env = _config_discovery_env(path)
@@ -567,37 +865,109 @@ def config_path_cmd(
 # ---------------------------------------------------------------------------
 
 
-def load_config_quiet(
-    runtime_paths: RuntimePaths,
-    *,
-    tolerate_plugin_load_errors: bool = False,
-) -> Config:
-    """Load config while temporarily suppressing structlog output.
+def _call_config_loader_quietly(loader: Callable[[], Config]) -> Config:
+    """Call one config loader while temporarily suppressing structlog output.
 
     structlog's default PrintLogger bypasses stdlib log levels, so we
     route it through stdlib with the root level at WARNING for the
-    duration of the load then reset so later callers (e.g. the bot)
-    can configure structlog themselves.
+    duration of the load then restore the default so later callers
+    (e.g. the bot) can configure structlog themselves.
     """
     import structlog  # noqa: PLC0415
 
-    from mindroom.config.main import load_config  # noqa: PLC0415
+    from mindroom.logging_config import configure_default_logging, uses_default_logging  # noqa: PLC0415
 
-    was_configured = structlog.is_configured()
-    if not was_configured:
+    was_default = uses_default_logging()
+    if was_default:
         logging.basicConfig(format="%(message)s", level=logging.WARNING)
         structlog.configure(
             wrapper_class=structlog.stdlib.BoundLogger,
             logger_factory=structlog.stdlib.LoggerFactory(),
         )
     try:
-        return load_config(
+        return loader()
+    finally:
+        if was_default:
+            configure_default_logging()
+
+
+def load_config_quiet(
+    runtime_paths: RuntimePaths,
+    *,
+    tolerate_plugin_load_errors: bool = False,
+) -> Config:
+    """Load config while temporarily suppressing structlog output."""
+    from mindroom.config.main import load_config  # noqa: PLC0415
+
+    return _call_config_loader_quietly(
+        lambda: load_config(
             runtime_paths,
             tolerate_plugin_load_errors=tolerate_plugin_load_errors,
+        ),
+    )
+
+
+def validate_config_source_quiet(
+    runtime_paths: RuntimePaths,
+    *,
+    source: bytes,
+    original: bytes,
+    tolerate_plugin_load_errors: bool = False,
+) -> Config:
+    """Validate one supplied source and apply automatic migrations without config logs."""
+    from mindroom.config.main import validate_loaded_config_source  # noqa: PLC0415
+    from mindroom.config.yaml_includes import load_yaml_config_source_with_digests  # noqa: PLC0415
+
+    def validate() -> Config:
+        data, source_digests, uses_includes = load_yaml_config_source_with_digests(
+            runtime_paths.config_path,
+            source=source,
         )
-    finally:
-        if not was_configured:
-            structlog.reset_defaults()
+        config, _source_digests = validate_loaded_config_source(
+            data,
+            source_digests,
+            original,
+            runtime_paths,
+            uses_includes=uses_includes,
+            tolerate_plugin_load_errors=tolerate_plugin_load_errors,
+        )
+        return config
+
+    return _call_config_loader_quietly(validate)
+
+
+@config_app.command("use-local-model")
+def config_use_local_model(
+    model: str = typer.Option(..., help="Model ID served by the local inference engine."),
+    base_url: str = typer.Option(..., help="OpenAI-compatible local server URL."),
+    api_key: str = typer.Option(LOCAL_OPENAI_API_KEY_DEFAULT, help="Local server authentication key."),
+    path: Path | None = CONFIG_PATH_OPTION,
+) -> None:
+    """Use a local model as the default, keeping explicitly selected agent models.
+
+    A backup is saved before replacing YAML. Configurations composed with
+    !include must be edited in their authored source files instead.
+    """
+    # This module imports the CLI helpers above; defer it to avoid a circular import.
+    from mindroom.cli.local_model_config import apply_local_model  # noqa: PLC0415
+
+    apply_local_model(model=model, base_url=base_url, api_key=api_key, path=path)
+
+
+def _shared_key_providers(config: Config, runtime_paths: RuntimePaths) -> set[str]:
+    """Return the providers with a model that has no credential of its own, so it needs the shared key."""
+    # model_loading pulls in the Agno runtime, which CLI startup must not import.
+    from mindroom.providers.model_loading import model_uses_own_credential  # noqa: PLC0415
+
+    try:
+        return {
+            model.provider
+            for name, model in config.models.items()
+            if not model_uses_own_credential(name, model, runtime_paths)
+        }
+    except (OSError, ValueError):
+        # Without the credential store, dashboard keys are unknown, so every provider needs its shared key.
+        return {model.provider for model in config.models.values()}
 
 
 def _find_missing_env_keys(
@@ -605,12 +975,38 @@ def _find_missing_env_keys(
     runtime_paths: RuntimePaths,
 ) -> list[tuple[str, str]]:
     """Return (provider, env_key) pairs for configured providers missing env vars."""
-    from mindroom.credentials_sync import get_secret_from_env  # noqa: PLC0415
-    from mindroom.runtime_env_policy import VERTEXAI_CLAUDE_ENV_BY_KEY  # noqa: PLC0415
+    from mindroom.credentials.sync import get_secret_from_env  # noqa: PLC0415
 
     providers_used: set[str] = {model.provider for model in config.models.values()}
+    shared_key_providers = _shared_key_providers(config, runtime_paths)
     missing: list[tuple[str, str]] = []
     for provider in sorted(providers_used):
+        if provider == "bedrock_claude":
+            provider_models = [model for model in config.models.values() if model.provider == provider]
+            if any((model.extra_kwargs or {}).get("aws_region") for model in provider_models):
+                continue
+            if any((model.extra_kwargs or {}).get("aws_profile") for model in provider_models) or get_secret_from_env(
+                AWS_BEDROCK_CLAUDE_ENV_BY_KEY["profile"],
+                runtime_paths=runtime_paths,
+            ):
+                continue
+            region_keys = (
+                AWS_BEDROCK_CLAUDE_ENV_BY_KEY["region"],
+                AWS_BEDROCK_CLAUDE_ENV_BY_KEY["default_region"],
+            )
+            if not any(get_secret_from_env(env_key, runtime_paths=runtime_paths) for env_key in region_keys):
+                missing.append((provider, AWS_BEDROCK_CLAUDE_ENV_BY_KEY["region"]))
+            continue
+        if provider == "azure":
+            azure_env_keys = [AZURE_OPENAI_ENV_BY_KEY["endpoint"]]
+            if provider in shared_key_providers:
+                azure_env_keys.insert(0, AZURE_OPENAI_ENV_BY_KEY["api_key"])
+            missing.extend(
+                (provider, env_key)
+                for env_key in azure_env_keys
+                if not get_secret_from_env(env_key, runtime_paths=runtime_paths)
+            )
+            continue
         if provider == "vertexai_claude":
             missing.extend(
                 (provider, env_key)
@@ -619,57 +1015,44 @@ def _find_missing_env_keys(
             )
             continue
         env_key = constants.env_key_for_provider(provider)
-        if env_key and not get_secret_from_env(env_key, runtime_paths=runtime_paths):
+        # OLLAMA_HOST is a host, not a key, so a model's own key never replaces it.
+        needs_env_key = provider == "ollama" or provider in shared_key_providers
+        if env_key and needs_env_key and not get_secret_from_env(env_key, runtime_paths=runtime_paths):
             missing.append((provider, env_key))
     return missing
 
 
 def _resolve_config_init_selection(
-    profile: str,
+    matrix_server: str,
     *,
-    minimal: bool,
     provider: str | None,
-) -> tuple[_ConfigInitProfile, _ProviderPreset]:
-    """Resolve the requested `config init` profile and provider preset."""
-    profile_value = "minimal" if minimal else profile.strip().lower()
-    normalized_profile = _normalize_init_profile(profile_value)
-    if normalized_profile is None:
-        msg = f"Invalid profile '{profile}'. Expected one of: {', '.join(_CANONICAL_INIT_PROFILES)}"
-        raise typer.BadParameter(msg)
-    selected_profile, profile_preset = normalized_profile
-
+    interactive: bool = True,
+) -> tuple[_MatrixServerPreset, _ProviderPreset]:
+    """Resolve the requested Matrix server and provider preset."""
+    selected_matrix_server = _normalize_matrix_server_preset(matrix_server)
+    if selected_matrix_server is None:
+        console.print(f"[red]Invalid --matrix-server value.[/red] Use: {_MATRIX_SERVER_CHOICES_TEXT}.")
+        raise typer.Exit(1)
     provider_preset = _normalize_provider_preset(provider) if provider else None
     if provider and provider_preset is None:
-        console.print(
-            "[red]Invalid --provider value.[/red] Use: anthropic, codex, openai, openrouter, or vertexai_claude.",
-        )
+        console.print(f"[red]Invalid --provider value.[/red] Use: {_PROVIDER_CHOICES_TEXT}.")
         raise typer.Exit(1)
 
-    if selected_profile == "minimal":
-        return selected_profile, provider_preset or "openai"
     if provider_preset is not None:
-        return selected_profile, provider_preset
-    if profile_preset is not None:
-        return selected_profile, profile_preset
-    if selected_profile == "public":
-        return selected_profile, "openai"
-    return selected_profile, _prompt_provider_preset()
+        return selected_matrix_server, provider_preset
+    if selected_matrix_server == "mindroom.chat" or not interactive:
+        return selected_matrix_server, "openai"
+    return selected_matrix_server, _prompt_provider_preset()
 
 
-def _normalize_init_profile(profile: str) -> tuple[_ConfigInitProfile, _ProviderPreset | None] | None:
-    """Normalize `config init --profile` values and profile aliases."""
-    aliases: dict[str, tuple[_ConfigInitProfile, _ProviderPreset | None]] = {
-        "full": ("full", None),
-        "minimal": ("minimal", None),
-        "public": ("public", None),
-        "public-codex": ("public", "codex"),
-        "codex": ("public", "codex"),
-        "public-vertexai-anthropic": ("public", "vertexai_claude"),
-        "public-vertexai-claude": ("public", "vertexai_claude"),
-        "vertexai-anthropic": ("public", "vertexai_claude"),
-        "vertexai-claude": ("public", "vertexai_claude"),
-    }
-    return aliases.get(profile.strip().lower())
+def _normalize_matrix_server_preset(matrix_server: str) -> _MatrixServerPreset | None:
+    """Normalize Matrix server presets used by config init."""
+    value = matrix_server.strip().lower()
+    if value == "self-hosted":
+        return "self-hosted"
+    if value == "mindroom.chat":
+        return "mindroom.chat"
+    return None
 
 
 def check_env_keys(config: Config, runtime_paths: RuntimePaths) -> None:
@@ -684,62 +1067,86 @@ def check_env_keys(config: Config, runtime_paths: RuntimePaths) -> None:
 
 def _normalize_provider_preset(provider: str) -> _ProviderPreset | None:
     """Normalize provider preset values used by prompts and CLI flags."""
-    normalized = provider.strip().lower()
-    aliases: dict[str, _ProviderPreset] = {
-        "anthropic": "anthropic",
-        "claude": "anthropic",
-        "a": "anthropic",
-        "codex": "codex",
-        "openai": "openai",
-        "o": "openai",
-        "openrouter": "openrouter",
-        "or": "openrouter",
-        "r": "openrouter",
-        "vertexai_claude": "vertexai_claude",
-        "vertexai": "vertexai_claude",
-        "vertex": "vertexai_claude",
-        "vertexai-anthropic": "vertexai_claude",
-        "vertex-anthropic": "vertexai_claude",
-    }
-    return aliases.get(normalized)
+    return _PROVIDER_PRESET_ALIASES.get(provider.strip().lower())
 
 
 def _prompt_provider_preset() -> _ProviderPreset:
     """Prompt the user for a starter provider preset."""
     while True:
         raw_value = typer.prompt(
-            "Choose provider preset [anthropic/codex/openai/openrouter/vertexai_claude]",
+            "Choose provider preset [anthropic/azure/bedrock_claude/codex/kimi/llama.cpp/ollama/openai/openrouter/vertexai_claude]",
             default="openai",
             show_default=True,
         )
         provider_preset = _normalize_provider_preset(raw_value)
         if provider_preset is not None:
             return provider_preset
-        console.print("[red]Invalid choice.[/red] Enter anthropic, codex, openai, openrouter, or vertexai_claude.")
+        console.print(f"[red]Invalid choice.[/red] Enter {_PROVIDER_CHOICES_TEXT}.")
+
+
+def _model_settings_block(model_preset: ModelPreset) -> str:
+    """Render the YAML settings of one generated model config."""
+    lines = [
+        f"provider: {model_preset.provider}",
+        f"id: {model_preset.id}",
+    ]
+    if model_preset.display_name is not None:
+        lines.append(f"display_name: {model_preset.display_name}")
+    if model_preset.context_window is not None:
+        lines.append(f"context_window: {model_preset.context_window}")
+    if model_preset.provider == "ollama":
+        lines.append(f"host: {_OLLAMA_HOST}")
+    extra_kwargs: list[str] = []
+    if model_preset.provider == "llama_cpp":
+        extra_kwargs.extend([f"api_key: {LOCAL_OPENAI_API_KEY_DEFAULT}", f"base_url: {_LLAMA_CPP_BASE_URL}"])
+    if model_preset.reasoning_effort is not None:
+        extra_kwargs.append(f"reasoning_effort: {model_preset.reasoning_effort}")
+    if extra_kwargs:
+        lines.append("extra_kwargs:")
+        lines.extend(f"  {line}" for line in extra_kwargs)
+    return textwrap.indent("\n".join(lines), "    ")
 
 
 def _model_template_block(provider_preset: _ProviderPreset) -> str:
     """Render the provider-specific YAML fragment for models.default."""
-    provider, model_id, context_window = _DEFAULT_MODEL_PRESETS[provider_preset]
-    lines = [f"provider: {provider}", f"id: {model_id}", f"context_window: {context_window}"]
-    if provider_preset == "codex":
+    return _model_settings_block(CONFIG_INIT_MODEL_PRESETS[provider_preset])
+
+
+def _additional_models_template_block(provider_preset: _ProviderPreset) -> str:
+    """Render optional additional named model presets under `models:`."""
+    return "".join(
+        f"\n  {name}:\n{_model_settings_block(model_preset)}"
+        for name, model_preset in CONFIG_INIT_ADDITIONAL_MODELS.get(provider_preset, ())
+    )
+
+
+def _commented_model_options_template_block(provider_preset: _ProviderPreset) -> str:
+    """Render commented model alternatives for the selected provider preset."""
+    alternatives = CONFIG_INIT_MODEL_ALTERNATIVES.get(provider_preset)
+    if not alternatives:
+        return ""
+
+    lines = [
+        "",
+        "  # Other model options for this provider:",
+    ]
+    for name, model_preset in alternatives:
         lines.extend(
             [
-                "# Prompt caching is enabled automatically per active agent session.",
-                "extra_kwargs:",
-                "  reasoning_effort: medium",
+                f"  # {name}:",
+                f"  #   provider: {model_preset.provider}",
+                f"  #   id: {model_preset.id}",
             ],
         )
-    return textwrap.indent("\n".join(lines), "    ")
+        if model_preset.context_window is not None:
+            lines.append(f"  #   context_window: {model_preset.context_window}")
+    return "\n".join(lines)
 
 
 def _full_template(
     provider_preset: _ProviderPreset,
-    config_dir: Path,
     *,
-    storage_root: Path,
-    use_storage_env_placeholder: bool,
-    profile: Literal["full", "public"] = "full",
+    matrix_server: _MatrixServerPreset,
 ) -> str:
     """Return a provider-aware starter config.
 
@@ -747,13 +1154,13 @@ def _full_template(
     Requester-private agents remain an opt-in advanced config surface.
     """
     model_block = _model_template_block(provider_preset)
-    mind_memory_knowledge_path = _default_mind_knowledge_base_path(
-        config_dir,
-        storage_root=storage_root,
-        use_storage_env_placeholder=use_storage_env_placeholder,
-    )
+    additional_models_block = _additional_models_template_block(provider_preset)
+    commented_model_options_block = _commented_model_options_template_block(provider_preset)
+    helper_model = CONFIG_INIT_HELPER_MODELS.get(provider_preset)
+    router_model = helper_model or "default"
+    thread_summary_model_block = f"\n  thread_summary_model: {helper_model}" if helper_model else ""
 
-    if profile == "public":
+    if matrix_server == "mindroom.chat":
         mindroom_user_block = ""
     else:
         mindroom_user_block = textwrap.dedent("""\
@@ -772,19 +1179,9 @@ def _full_template(
 
 models:
   default:
-{model_block}
+{model_block}{additional_models_block}{commented_model_options_block}
 
 agents:
-  assistant:
-    display_name: Assistant
-    role: A helpful general-purpose assistant
-    model: default
-    rooms:
-      - lobby
-    accept_invites: true
-    tools: []
-    instructions:
-      - Be helpful and conversational
   mind:
     display_name: Mind
     role: Personal assistant with persistent file-based identity and memory
@@ -795,6 +1192,11 @@ agents:
     rooms:
       - personal
     accept_invites: true
+    access:
+      current_room_members: false
+      members_of_rooms:
+        - personal
+      users: []
     context_files:
       - SOUL.md
       - AGENTS.md
@@ -802,18 +1204,23 @@ agents:
       - IDENTITY.md
       - TOOLS.md
       - HEARTBEAT.md
-    knowledge_bases:
-      - mind_memory
     tools:
       - shell
       - coding
+      - memory
+      - name: config_manager
+        defer: true
       - duckduckgo
       - website
       - browser
       - scheduler
-      - subagents
+      - update_awareness
+      - todo
       - matrix_message
+      - name: thread_model
+        defer: true
       - thread_tags
+      - thread_summary
     skills:
       - mindroom-docs
     instructions:
@@ -821,80 +1228,87 @@ agents:
       - Important long-term context is persisted by the configured MindRoom memory backend. If something must be preserved exactly, write or update the relevant file directly.
       - MEMORY.md is curated long-term memory; daily files are short-lived notes and logs.
       - Ask before external or destructive actions.
-      - Before answering prior-history questions, search memory files first when a knowledge base is configured.
+      - Before answering prior-history questions, use search_memories first.
+      - When helping with MindRoom setup, follow AGENTS.md and check the live state — don't guess.
+      - Meet the user at their technical level. If they ask you to configure something, do it; skip YAML or shell details unless they ask.
 
 router:
-  model: default
+  model: {router_model}
   accept_invites: true
 {mindroom_user_block}
-matrix_room_access:
-  mode: single_user_private
-  multi_user_join_rule: public
-  publish_to_room_directory: false
-  invite_only_rooms: []
-  reconcile_existing_rooms: false
+administrators:
+  # MindRoom Chat pairing writes the paired owner's Matrix user ID here.
+  - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
+room_defaults:
+  join_policy: invite
+  listed: false
+  invite_users:
+    - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
+  admins:
+    - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
 
 matrix_space:
   enabled: true
   name: MindRoom
 
-{_MATRIX_DELIVERY_TEMPLATE_BLOCK}
-
-knowledge_bases:
-  mind_memory:
-    path: {mind_memory_knowledge_path}
-    watch: true
-
-# File-based memory requires no external LLM, and starter configs use a local embedder for knowledge indexing.
+# File-based memory requires no external LLM.
 memory:
   backend: file
   embedder:
     provider: sentence_transformers
     config:
-      model: sentence-transformers/all-MiniLM-L6-v2
+      model: {SENTENCE_TRANSFORMERS_DEFAULT}
   file:
     max_entrypoint_lines: 200
+  search:
+    mode: semantic
+    include:
+      - memory/**/*.md
+    include_entrypoint: false
   auto_flush:
     enabled: true
 
 authorization:
-  default_room_access: false
-  global_users:
-    # Replace with your Matrix user ID (example: @alice:mindroom.chat).
-    - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
-  agent_reply_permissions:
-    "*":
-      # Replace with your Matrix user ID (example: @alice:mindroom.chat).
-      - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
+  config_command_enabled: false
 
 defaults:
+  # Execution tools (shell, file, python, coding, docker) run directly in the
+  # MindRoom process. For isolation, run them in a sandboxed worker instead:
+  # deploy the sandbox runner (Docker Compose or Kubernetes) and remove this
+  # line — or replace [] with the tools to route, e.g. [shell, file, python].
+  # See https://docs.mindroom.chat/deployment/sandbox-proxy/
+  worker_tools: []
   tools:
     - scheduler
-  markdown: true
+    - update_awareness
+  markdown: true{thread_summary_model_block}
   compaction:
     enabled: true
 """
 
 
 def _env_template(
-    profile: _ConfigInitProfile,
+    matrix_server: _MatrixServerPreset,
     provider_preset: _ProviderPreset,
     storage_root: Path,
+    provider_api_key: str | None = None,
 ) -> str:
     """Return a starter .env file for standalone deployments.
 
     Generates a random dashboard API key.
     """
-    api_key = secrets.token_urlsafe(32)
-    if profile == "public":
+    api_key = _new_dashboard_api_key()
+    if matrix_server == "mindroom.chat":
         matrix_homeserver = "https://mindroom.chat"
         extra_matrix = (
             "# Matrix server_name override (needed when federation hostname differs)\n"
             "MATRIX_SERVER_NAME=mindroom.chat\n\n"
-            "# Hosted pairing/provisioning API for `mindroom connect` and token issuance\n"
+            "# Hosted provisioning API; lets `mindroom run` pair with your MindRoom Chat account\n"
             "MINDROOM_PROVISIONING_URL=https://mindroom.chat\n\n"
-            "# Required for homeservers that gate bot registration (recommended in public mode)\n"
-            "# Keep this secret; do not commit real values.\n"
+            "# Optional hosted installation namespace. Leave blank for existing unnamespaced rooms.\n"
+            "MINDROOM_NAMESPACE=\n\n"
+            "# Leave MATRIX_REGISTRATION_TOKEN empty on mindroom.chat; pairing replaces it.\n"
+            "# Setting any token skips pairing. Keep real values secret; do not commit them.\n"
             "MATRIX_REGISTRATION_TOKEN="
         )
     else:
@@ -903,7 +1317,7 @@ def _env_template(
             "# Matrix registration token (only needed if your homeserver requires it)\n# MATRIX_REGISTRATION_TOKEN="
         )
 
-    provider_lines_text = _provider_env_template(provider_preset)
+    provider_lines_text = _provider_env_template(provider_preset, provider_api_key)
     storage_root_block = (
         "# Runtime storage root for canonical agent state, sessions, logs, and credentials\n"
         f"MINDROOM_STORAGE_PATH={storage_root.expanduser().resolve()}\n\n"
@@ -918,10 +1332,9 @@ MATRIX_HOMESERVER={matrix_homeserver}
 {storage_root_block}{provider_lines_text}
 
 # Dashboard API key — protects the /api/* dashboard endpoints.
-# When set, all dashboard requests require: Authorization: Bearer <key>
-# The auth header is injected at the proxy layer (nginx / Vite dev server),
-# so the key never appears in the browser JS bundle.
-# Remove or comment out to allow open access (fine for localhost).
+# The bundled dashboard's login page asks for it; API clients send `Authorization: Bearer <key>`.
+# Set it empty (MINDROOM_API_KEY=) to allow open access; `mindroom run` listens on
+# every interface by default, so do that only with `--api-host 127.0.0.1`.
 MINDROOM_API_KEY={api_key}
 
 # OpenAI-compatible API authentication (separate from dashboard auth)
@@ -933,89 +1346,156 @@ MINDROOM_API_KEY={api_key}
 """
 
 
-def _minimal_template(provider_preset: _ProviderPreset = "openai") -> str:
-    """Return a bare-minimum inline config."""
-    model_block = _model_template_block(provider_preset)
-    return f"""\
-# MindRoom Configuration (minimal)
-
-models:
-  default:
-{model_block}
-
-agents:
-  assistant:
-    display_name: Assistant
-    role: A helpful assistant
-    model: default
-    rooms:
-      - lobby
-    accept_invites: true
-
-router:
-  model: default
-  accept_invites: true
-
-# Set username before first run; once created, it cannot be changed.
-# You can still change display_name later.
-mindroom_user:
-  username: mindroom_user
-  display_name: MindRoomUser
-
-matrix_space:
-  enabled: true
-  name: MindRoom
-
-{_MATRIX_DELIVERY_TEMPLATE_BLOCK}
-
-authorization:
-  default_room_access: false
-  global_users:
-    # Replace with your Matrix user ID (example: @alice:mindroom.chat).
-    - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
-  agent_reply_permissions:
-    "*":
-      # Replace with your Matrix user ID (example: @alice:mindroom.chat).
-      - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
-
-defaults:
-  tools:
-    - scheduler
-  markdown: true
-  compaction:
-    enabled: true
-"""
+# Where `mindroom run`, and so the login service, serves the dashboard API unless told otherwise.
+DEFAULT_API_HOST = "0.0.0.0"  # noqa: S104
+DEFAULT_API_PORT = 8765
 
 
-def _provider_env_template(provider_preset: _ProviderPreset) -> str:
-    """Return the provider-specific section of the starter .env file."""
+def warn_dashboard_without_key(address: str, remedy: str) -> None:
+    """Warn that anyone who can reach the dashboard API at ``address`` can administer MindRoom."""
+    console.print(
+        f"[yellow]Warning:[/yellow] The dashboard API listens on {address} without MINDROOM_API_KEY, "
+        "so anyone who can reach that address can administer MindRoom.",
+    )
+    console.print(f"  {remedy}")
+
+
+def worker_dashboard_api_key_needed(runtime_paths: constants.RuntimePaths) -> bool:
+    """Return whether dedicated workers could reach the dashboard API while `MINDROOM_API_KEY` is unset.
+
+    Worker shells keep network access to the primary, so an open API would hand them
+    MindRoom's configuration. An explicitly empty key keeps open access.
+    """
+    from mindroom.workers.runtime import primary_worker_backend_is_dedicated  # noqa: PLC0415
+
+    return runtime_paths.env_value("MINDROOM_API_KEY") is None and primary_worker_backend_is_dedicated(runtime_paths)
+
+
+def ensure_worker_dashboard_api_key(runtime_paths: constants.RuntimePaths, *, dashboard_has_credential: bool) -> bool:
+    """Give the dashboard API a key when dedicated workers could otherwise call it without one."""
+    if dashboard_has_credential or not worker_dashboard_api_key_needed(runtime_paths):
+        return False
+    env_path = runtime_paths.env_path
+    try:
+        if not env_path.exists():
+            write_private_env_text(env_path, "")
+        _append_missing_env_defaults(
+            env_path,
+            (("MINDROOM_API_KEY", _new_dashboard_api_key()),),
+            title="Dashboard API key protecting /api/* from dedicated workers; the dashboard login page asks for it",
+        )
+    except OSError as exc:
+        # Read-only configuration mounts keep the open API; minimal mode then names the missing key.
+        console.print(
+            f"[yellow]Warning:[/yellow] Dedicated workers can reach the dashboard API without MINDROOM_API_KEY, "
+            f"and {env_path} could not be updated: {escape(str(exc))}",
+        )
+        return False
+    console.print(
+        f"[green]Generated MINDROOM_API_KEY in {env_path}[/green] because dedicated workers can reach the "
+        "dashboard API; the dashboard login page asks for this key.",
+    )
+    return True
+
+
+def _new_dashboard_api_key() -> str:
+    """Return a random MINDROOM_API_KEY for a new or kept `.env`."""
+    return secrets.token_urlsafe(32)
+
+
+def _preset_api_key_env(provider_preset: _ProviderPreset) -> str | None:
+    """Return the API key env var of the preset's model provider, if it has one."""
+    return constants.env_key_for_provider(CONFIG_INIT_MODEL_PRESETS[provider_preset].provider)
+
+
+def _provider_env_template(  # noqa: PLR0911
+    provider_preset: _ProviderPreset,
+    provider_api_key: str | None = None,
+) -> str:
+    """Return the provider-specific section of the starter .env file.
+
+    Without a `provider_api_key` typed at first run, the preset's key is an uncommented placeholder to edit.
+    """
     if provider_preset == "codex":
         return textwrap.dedent("""\
-        # Codex CLI subscription authentication
+        # Codex CLI ChatGPT authentication
         # Run `codex login` before starting MindRoom.
         # MindRoom reads ChatGPT OAuth tokens from ~/.codex/auth.json by default.
         # CODEX_HOME=~/.codex
         """).rstrip()
 
-    if provider_preset == "vertexai_claude":
+    if provider_preset == "kimi":
         return textwrap.dedent("""\
+        # Kimi Code CLI OAuth authentication
+        # Run `kimi` and `/login` before starting MindRoom.
+        # MindRoom reads OAuth tokens from ~/.kimi-code/credentials/kimi-code.json by default.
+        # KIMI_CODE_HOME=~/.kimi-code
+        """).rstrip()
+
+    if provider_preset == "vertexai_claude":
+        return textwrap.dedent(f"""\
         # Vertex AI Claude configuration
-        ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id
-        CLOUD_ML_REGION=us-central1
+        {VERTEXAI_CLAUDE_ENV_BY_KEY["project_id"]}={ENV_TEMPLATE_PLACEHOLDERS[VERTEXAI_CLAUDE_ENV_BY_KEY["project_id"]]}
+        {VERTEXAI_CLAUDE_ENV_BY_KEY["region"]}=global
 
         # Authenticate with Google Application Default Credentials before running:
         # gcloud auth application-default login
         # or set GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
         """).rstrip()
 
-    required_env_key = constants.env_key_for_provider(provider_preset)
-    key_placeholders = {
-        "ANTHROPIC_API_KEY": "your-anthropic-key-here",
-        "OPENAI_API_KEY": "your-openai-key-here",
-        "OPENROUTER_API_KEY": "your-openrouter-key-here",
-    }
+    if provider_preset == "azure":
+        return textwrap.dedent(f"""\
+        # Azure OpenAI configuration
+        {AZURE_OPENAI_ENV_BY_KEY["api_key"]}={ENV_TEMPLATE_PLACEHOLDERS[AZURE_OPENAI_ENV_BY_KEY["api_key"]]}
+        {AZURE_OPENAI_ENV_BY_KEY["endpoint"]}={ENV_TEMPLATE_PLACEHOLDERS[AZURE_OPENAI_ENV_BY_KEY["endpoint"]]}
+
+        # Optional: override Agno's Azure OpenAI default API version.
+        # {AZURE_OPENAI_ENV_BY_KEY["api_version"]}=2024-10-21
+
+        # In config.yaml, set models.default.id to your Azure OpenAI deployment name.
+        """).rstrip()
+
+    if provider_preset == "bedrock_claude":
+        return textwrap.dedent("""\
+        # Amazon Bedrock Claude configuration
+        AWS_REGION=us-east-1
+
+        # Use standard AWS credential resolution.
+        # Static credentials are supported through .env:
+        # AWS_ACCESS_KEY_ID=your-access-key-id
+        # AWS_SECRET_ACCESS_KEY=your-secret-access-key
+        # AWS_SESSION_TOKEN=your-session-token
+        #
+        # Or use a local AWS profile / IAM role:
+        # AWS_PROFILE=your-profile
+        """).rstrip()
+
+    if provider_preset == "ollama":
+        return textwrap.dedent(f"""\
+        # Ollama local model server
+        OLLAMA_HOST={_OLLAMA_HOST}
+
+        # Pull the starter local models before running MindRoom:
+        # ollama pull {OLLAMA_GEMMA}
+        # ollama pull {OLLAMA_QWEN}
+        """).rstrip()
+
+    if provider_preset == "llama_cpp":
+        return textwrap.dedent(f"""\
+        # llama.cpp OpenAI-compatible local server
+        OPENAI_BASE_URL={_LLAMA_CPP_BASE_URL}
+        OPENAI_API_KEY={LOCAL_OPENAI_API_KEY_DEFAULT}
+
+        # Start llama.cpp with one of the configured local models before running MindRoom.
+        # {llama_cpp_server_command(LLAMA_CPP_GEMMA)}
+        # {llama_cpp_server_command(LLAMA_CPP_QWEN)}
+        """).rstrip()
+
+    required_env_key = _preset_api_key_env(provider_preset)
     provider_lines: list[str] = ["# AI provider API keys (set the uncommented keys for this preset)"]
     for env_key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
-        prefix = "" if env_key == required_env_key else "# "
-        provider_lines.append(f"{prefix}{env_key}={key_placeholders[env_key]}")
+        if env_key == required_env_key:
+            provider_lines.append(f"{env_key}={provider_api_key or ENV_TEMPLATE_PLACEHOLDERS[env_key]}")
+        else:
+            provider_lines.append(f"# {env_key}={ENV_TEMPLATE_PLACEHOLDERS[env_key]}")
     return "\n".join(provider_lines)

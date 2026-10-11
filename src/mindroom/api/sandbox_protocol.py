@@ -14,20 +14,20 @@ class SandboxSubprocessEnvelope(BaseModel):
 
     request: dict[str, Any] = Field(default_factory=dict)
     runtime_paths: dict[str, Any] = Field(default_factory=dict)
-    committed_config: str = ""
+    config_yaml: str
 
 
 def serialize_subprocess_envelope(
     *,
     request: dict[str, Any],
     runtime_paths: dict[str, Any],
-    committed_config: str,
+    config_yaml: str,
 ) -> str:
     """Serialize the explicit parent-to-child subprocess payload."""
     return SandboxSubprocessEnvelope(
         request=dict(request),
         runtime_paths=dict(runtime_paths),
-        committed_config=committed_config,
+        config_yaml=config_yaml,
     ).model_dump_json()
 
 

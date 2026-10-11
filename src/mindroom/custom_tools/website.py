@@ -15,6 +15,15 @@ from agno.tools import Toolkit
 from agno.utils.log import log_debug, log_error, log_warning
 from bs4 import BeautifulSoup, Tag
 
+from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes_sync
+from mindroom.custom_tools.agno_compat_website_reader import crawl_with_callbacks, queue_crawl_url
+from mindroom.server_fetch_url import (
+    ServerFetchHTTPTransport,
+    ServerFetchUrlError,
+    validate_server_fetch_redirect_url,
+    validate_server_fetch_url,
+)
+
 _PREFERRED_CONTENT_SELECTORS = (
     "main",
     "article",
@@ -47,6 +56,11 @@ _UNWANTED_SELECTORS = (
 _LOW_VALUE_NAME_PATTERN = re.compile(r"(?:^|[-_])(nav|navbar|menu|search|modal|header|footer|sidebar)(?:$|[-_])")
 _FAILED_CRAWL_CONTENT = "Failed to extract any content"
 _FAILED_STARTING_URL = "Failed to crawl starting URL"
+_TOO_MANY_REDIRECTS = "Too many redirects while crawling website"
+_MAX_PAGE_BYTES = 2 * 1024 * 1024
+# The codings httpx decodes, plus the legacy `x-gzip` alias; any of them lets a small body stand for a huge one.
+_COMPRESSED_CONTENT_CODINGS = frozenset({"gzip", "x-gzip", "deflate", "br", "zstd"})
+_MAX_REDIRECTS = 10
 
 
 def _normalize_text(text: str) -> str:
@@ -95,17 +109,76 @@ def _best_text_candidate(candidates: list[Tag], *, min_chars: int = 40) -> str |
 
 def _safe_url_for_log(url: str) -> str:
     """Return a URL safe for logs by dropping credentials, query, and fragment data."""
-    parts = urlsplit(url)
-    host = parts.hostname or ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _safe_malformed_url_for_log(url)
+
+    try:
+        host = parts.hostname or ""
+    except ValueError:
+        netloc = parts.netloc.rsplit("@", maxsplit=1)[-1]
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    netloc = f"{host}:{parts.port}" if parts.port is not None else host
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _safe_malformed_url_for_log(url: str) -> str:
+    """Best-effort URL log sanitizer for strings the standard parser rejects."""
+    cleaned_url = url.split("#", maxsplit=1)[0].split("?", maxsplit=1)[0]
+    scheme_separator = "://"
+    if scheme_separator not in cleaned_url:
+        return cleaned_url
+
+    scheme, rest = cleaned_url.split(scheme_separator, maxsplit=1)
+    authority, slash, path = rest.partition("/")
+    authority = authority.rsplit("@", maxsplit=1)[-1]
+    return f"{scheme}{scheme_separator}{authority}{slash}{path}"
 
 
 def _normalized_hostname(url: str) -> str:
     """Return the normalized hostname component for crawl domain checks."""
-    return (urlparse(url).hostname or "").rstrip(".").lower()
+    try:
+        return (urlparse(url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
+def _server_fetch_get(
+    url: str,
+    *,
+    timeout: int,
+    follow_redirects: bool,
+    proxy: str | None = None,
+) -> httpx.Response:
+    """Fetch a URL through the server-fetch transport when no proxy is configured.
+
+    The body is requested uncompressed and read raw up to a limit, so no page is inflated or buffered whole.
+    """
+    # With a configured proxy, URL and redirect validation happen before this handoff.
+    # The proxy owns target DNS resolution and egress policy from here.
+    route: dict[str, Any] = {"proxy": proxy} if proxy else {"transport": ServerFetchHTTPTransport()}
+    with (
+        httpx.Client(follow_redirects=follow_redirects, headers={"Accept-Encoding": "identity"}, **route) as client,
+        client.stream("GET", url, timeout=timeout) as response,
+    ):
+        codings = {value.strip().lower() for value in response.headers.get_list("content-encoding", split_commas=True)}
+        if not codings.isdisjoint(_COMPRESSED_CONTENT_CODINGS):
+            msg = "The page must use identity content encoding."
+            raise httpx.DecodingError(msg, request=response.request)
+        try:
+            body = collect_bounded_bytes_sync(response.iter_raw(), max_bytes=_MAX_PAGE_BYTES)
+        except ByteLimitExceededError as error:
+            msg = f"The page exceeds {_MAX_PAGE_BYTES} bytes."
+            raise httpx.DecodingError(msg, request=response.request) from error
+    return httpx.Response(response.status_code, headers=response.headers, content=body, request=response.request)
 
 
 def _url_matches_crawl_host(url: str, crawl_host: str) -> bool:
@@ -127,15 +200,16 @@ class _MindRoomWebsiteReader(WebsiteReader):
 
             href_str = str(link["href"])
             full_url = urljoin(current_url, href_str)
-            parsed_url = urlparse(full_url)
+            try:
+                parsed_url = urlparse(full_url)
+            except ValueError:
+                continue
             if not _url_matches_crawl_host(full_url, crawl_host) or parsed_url.path.endswith(
                 (".pdf", ".jpg", ".png"),
             ):
                 continue
 
-            full_url_str = str(full_url)
-            if full_url_str not in self._visited and (full_url_str, current_depth + 1) not in self._urls_to_crawl:
-                self._urls_to_crawl.append((full_url_str, current_depth + 1))
+            queue_crawl_url(self, str(full_url), current_depth + 1)
 
     def _should_skip_crawl_url(
         self,
@@ -148,8 +222,7 @@ class _MindRoomWebsiteReader(WebsiteReader):
     ) -> bool:
         """Return whether a queued crawl URL is outside the current crawl budget."""
         return (
-            current_url in self._visited
-            or not _url_matches_crawl_host(current_url, crawl_host)
+            not _url_matches_crawl_host(current_url, crawl_host)
             or (current_depth > self.max_depth and current_url != starting_url)
             or num_links >= self.max_links
         )
@@ -161,6 +234,68 @@ class _MindRoomWebsiteReader(WebsiteReader):
             return
 
         log_warning(f"HTTP status error while crawling {safe_current_url}: {error.response.status_code}")
+
+    def _get_validated_response(self, current_url: str) -> tuple[httpx.Response, str]:
+        """Fetch a URL while validating every redirect hop before following it."""
+        request_url = validate_server_fetch_url(current_url)
+        fetch_kwargs = {"proxy": self.proxy} if self.proxy else {}
+        for _redirect_count in range(_MAX_REDIRECTS + 1):
+            response = _server_fetch_get(
+                request_url,
+                timeout=self.timeout,
+                follow_redirects=False,
+                **fetch_kwargs,
+            )
+            if not response.is_redirect:
+                return response, request_url
+            request_url = validate_server_fetch_redirect_url(request_url, response.headers.get("location"))
+
+        request = httpx.Request("GET", current_url)
+        raise httpx.TooManyRedirects(_TOO_MANY_REDIRECTS, request=request)
+
+    def _record_current_url(
+        self,
+        *,
+        current_url: str,
+        current_depth: int,
+        starting_url: str,
+        crawler_result: dict[str, str],
+        crawl_host: str,
+    ) -> int:
+        """Fetch one crawl URL and return the number of content pages recorded."""
+        safe_current_url = _safe_url_for_log(current_url)
+        try:
+            log_debug(f"Crawling: {safe_current_url}")
+            response, fetched_url = self._get_validated_response(current_url)
+            if current_url != starting_url and not _url_matches_crawl_host(fetched_url, crawl_host):
+                log_debug(f"Skipping redirected URL outside crawl host: {_safe_url_for_log(fetched_url)}")
+                return 0
+            response.raise_for_status()
+            return self._record_response_content(
+                response,
+                current_url=fetched_url,
+                current_depth=current_depth,
+                crawl_host=crawl_host,
+                crawler_result=crawler_result,
+            )
+        except ServerFetchUrlError:
+            log_warning(f"Rejected server-side fetch URL while crawling {_safe_url_for_log(current_url)}")
+            if current_url == starting_url and not crawler_result:
+                raise
+        except httpx.HTTPStatusError as e:
+            self._log_http_status_error(safe_current_url=safe_current_url, error=e)
+            if current_url == starting_url and not crawler_result and not (300 <= e.response.status_code < 400):
+                raise
+        except httpx.RequestError as e:
+            log_warning(f"Request error while crawling {safe_current_url}: {e.__class__.__name__}")
+            if current_url == starting_url and not crawler_result:
+                raise
+        except Exception as e:
+            log_warning(f"Failed to crawl {safe_current_url}: {e.__class__.__name__}")
+            if current_url == starting_url and not crawler_result:
+                raise httpx.RequestError(_FAILED_STARTING_URL, request=None) from e
+
+        return 0
 
     def _documents_from_crawl(
         self,
@@ -204,54 +339,27 @@ class _MindRoomWebsiteReader(WebsiteReader):
 
     def crawl(self, url: str, starting_depth: int = 1) -> dict[str, str]:
         """Crawl a website while logging only sanitized URL forms."""
-        num_links = 0
-        crawler_result: dict[str, str] = {}
-        crawl_host = _normalized_hostname(url)
-
-        self._visited = set()
-        self._urls_to_crawl = [(url, starting_depth)]
-        while self._urls_to_crawl:
-            current_url, current_depth = self._urls_to_crawl.pop(0)
-            if self._should_skip_crawl_url(
+        starting_url = validate_server_fetch_url(url)
+        crawl_host = _normalized_hostname(starting_url)
+        crawler_result = crawl_with_callbacks(
+            self,
+            starting_url,
+            starting_depth,
+            should_skip=lambda current_url, current_depth, num_links: self._should_skip_crawl_url(
                 current_url=current_url,
-                starting_url=url,
+                starting_url=starting_url,
                 current_depth=current_depth,
                 num_links=num_links,
                 crawl_host=crawl_host,
-            ):
-                continue
-
-            self._visited.add(current_url)
-            self.delay()
-            safe_current_url = _safe_url_for_log(current_url)
-
-            try:
-                log_debug(f"Crawling: {safe_current_url}")
-                response = (
-                    httpx.get(current_url, timeout=self.timeout, proxy=self.proxy, follow_redirects=True)
-                    if self.proxy
-                    else httpx.get(current_url, timeout=self.timeout, follow_redirects=True)
-                )
-                response.raise_for_status()
-                num_links += self._record_response_content(
-                    response,
-                    current_url=current_url,
-                    current_depth=current_depth,
-                    crawl_host=crawl_host,
-                    crawler_result=crawler_result,
-                )
-            except httpx.HTTPStatusError as e:
-                self._log_http_status_error(safe_current_url=safe_current_url, error=e)
-                if current_url == url and not crawler_result and not (300 <= e.response.status_code < 400):
-                    raise
-            except httpx.RequestError as e:
-                log_warning(f"Request error while crawling {safe_current_url}: {e.__class__.__name__}")
-                if current_url == url and not crawler_result:
-                    raise
-            except Exception as e:
-                log_warning(f"Failed to crawl {safe_current_url}: {e.__class__.__name__}")
-                if current_url == url and not crawler_result:
-                    raise httpx.RequestError(_FAILED_STARTING_URL, request=None) from e
+            ),
+            record=lambda current_url, current_depth, crawler_result: self._record_current_url(
+                current_url=current_url,
+                current_depth=current_depth,
+                starting_url=starting_url,
+                crawler_result=crawler_result,
+                crawl_host=crawl_host,
+            ),
+        )
 
         if not crawler_result:
             raise httpx.RequestError(_FAILED_CRAWL_CONTENT, request=None)

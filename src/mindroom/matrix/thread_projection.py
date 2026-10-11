@@ -1,4 +1,17 @@
-"""Matrix thread ordering and projection helpers."""
+"""Matrix thread ordering and projection helpers.
+
+Ordering and projection invariants:
+
+1. Thread order is root first, then ``(origin_server_ts, stable input order, event_id)``.
+
+2. Within one equal-timestamp group, relation ancestors precede their descendants (topological order
+   seeded by input order); events outside any relation chain keep their plain sort position.
+
+3. ``resolve_thread_ids_for_event_infos`` derives membership for a local event graph by iterating the
+   canonical resolver (``thread_membership``) to a fixpoint, so transitive implied membership (reply to
+   a reply to a threaded event) resolves regardless of input order.
+   It is the only sanctioned way to batch-resolve membership; it adds no rules of its own.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +19,16 @@ import heapq
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from mindroom.matrix.event_info import EventInfo
-from mindroom.matrix.thread_membership import map_backed_thread_membership_access, resolve_event_thread_membership
+from mindroom.matrix.thread_membership import (
+    map_backed_thread_membership_access,
+    resolve_event_thread_membership,
+    resolve_map_backed_related_event_thread_membership,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
+
+    from mindroom.matrix.thread_membership import MapBackedRelationWalks
 
 _TThreadItem = TypeVar("_TThreadItem")
 
@@ -19,17 +38,6 @@ class _SupportsThreadMessageOrdering(Protocol):
 
     event_id: str
     timestamp: int
-
-
-class SupportsVisibleThreadMessage(Protocol):
-    """Minimal protocol for visible-message cleanup thread analysis."""
-
-    event_id: str
-    visible_event_id: str
-    thread_id: str | None
-    timestamp: int
-    latest_event_id: str
-    content: Mapping[str, Any]
 
 
 def _thread_history_input_order(
@@ -260,90 +268,6 @@ def ordered_event_ids_from_scanned_event_sources(
     ]
 
 
-def _visible_thread_message_is_better_candidate(
-    candidate: SupportsVisibleThreadMessage,
-    current: SupportsVisibleThreadMessage,
-) -> bool:
-    """Return whether one visible message copy should replace the current event winner."""
-    return (
-        candidate.thread_id is not None,
-        candidate.timestamp,
-        candidate.latest_event_id,
-    ) > (
-        current.thread_id is not None,
-        current.timestamp,
-        current.latest_event_id,
-    )
-
-
-def _visible_thread_key(
-    message: SupportsVisibleThreadMessage,
-    thread_root_ids: set[str],
-) -> str | None:
-    """Return the canonical cleanup thread bucket for one visible message."""
-    if message.thread_id is not None:
-        return message.thread_id
-    if message.event_id in thread_root_ids:
-        return message.event_id
-    return None
-
-
-def _related_event_id_by_visible_event_id(
-    messages: Sequence[SupportsVisibleThreadMessage],
-) -> dict[str, str]:
-    """Return same-thread relation edges keyed by the visible event state."""
-    related_event_id_by_event_id: dict[str, str] = {}
-    for message in messages:
-        related_event_id = EventInfo.from_event({"content": dict(message.content)}).next_related_event_id(
-            message.visible_event_id,
-        )
-        if isinstance(related_event_id, str):
-            related_event_id_by_event_id[message.visible_event_id] = related_event_id
-    return related_event_id_by_event_id
-
-
-def latest_visible_thread_event_id_by_thread(
-    messages: Sequence[SupportsVisibleThreadMessage],
-) -> dict[str, str]:
-    """Return the latest visible event ID for each thread in one cleanup scan."""
-    thread_root_ids = {message.thread_id for message in messages if message.thread_id is not None}
-    best_message_by_visible_event_id: dict[str, SupportsVisibleThreadMessage] = {}
-    messages_by_thread: dict[str, list[SupportsVisibleThreadMessage]] = {}
-
-    for message in messages:
-        existing_message = best_message_by_visible_event_id.get(message.visible_event_id)
-        if existing_message is not None and not _visible_thread_message_is_better_candidate(message, existing_message):
-            continue
-        best_message_by_visible_event_id[message.visible_event_id] = message
-
-    for message in best_message_by_visible_event_id.values():
-        thread_key = _visible_thread_key(message, thread_root_ids)
-        if thread_key is None:
-            continue
-        messages_by_thread.setdefault(thread_key, []).append(message)
-
-    latest_visible_event_ids: dict[str, str] = {}
-    for thread_key, thread_messages in messages_by_thread.items():
-        ordered_messages = list(thread_messages)
-        _sort_thread_items_root_first(
-            ordered_messages,
-            thread_id=thread_key,
-            event_id_getter=lambda message: message.visible_event_id,
-            timestamp_getter=lambda message: message.timestamp,
-            input_order_by_event_id={message.visible_event_id: index for index, message in enumerate(thread_messages)},
-            related_event_id_by_event_id=_related_event_id_by_visible_event_id(thread_messages),
-        )
-        root_index = next(
-            (index for index, message in enumerate(ordered_messages) if message.event_id == thread_key),
-            None,
-        )
-        if root_index not in (None, 0):
-            ordered_messages.insert(0, ordered_messages.pop(root_index))
-        latest_visible_event_ids[thread_key] = ordered_messages[-1].visible_event_id
-
-    return latest_visible_event_ids
-
-
 async def resolve_thread_ids_for_event_infos(
     room_id: str,
     *,
@@ -361,17 +285,27 @@ async def resolve_thread_ids_for_event_infos(
     progress_made = True
     while progress_made:
         progress_made = False
+        # Walks are reused within one pass. An event resolved after a walk was recorded can only hide a thread
+        # from it, and the next pass finds that thread.
+        walks: MapBackedRelationWalks = {}
         for event_id in ordered_event_ids:
             if event_id in resolved:
                 continue
             event_info = event_infos.get(event_id)
             if event_info is None:
                 continue
-            resolution = await resolve_event_thread_membership(
-                room_id,
-                event_info,
-                access=access,
-            )
+            related_event_id = event_info.next_related_event_id("")
+            if event_info.thread_id is None and related_event_id is not None:
+                resolution = await resolve_map_backed_related_event_thread_membership(
+                    room_id,
+                    related_event_id,
+                    event_infos=event_infos,
+                    resolved_thread_ids=resolved,
+                    access=access,
+                    walks=walks,
+                )
+            else:
+                resolution = await resolve_event_thread_membership(room_id, event_info, access=access)
             if not resolution.is_threaded:
                 continue
             assert resolution.thread_id is not None
@@ -382,8 +316,6 @@ async def resolve_thread_ids_for_event_infos(
 
 
 __all__ = [
-    "SupportsVisibleThreadMessage",
-    "latest_visible_thread_event_id_by_thread",
     "ordered_event_ids_from_scanned_event_sources",
     "resolve_thread_ids_for_event_infos",
     "sort_thread_event_sources_root_first",

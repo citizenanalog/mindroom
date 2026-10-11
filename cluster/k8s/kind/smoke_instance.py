@@ -145,7 +145,7 @@ def provision_via_platform_api(
             {
                 "subscription_id": "smoke-subscription",
                 "account_id": account_id,
-                "tier": "starter",
+                "tier": "byok",
             },
         ).encode("utf-8"),
     )
@@ -207,7 +207,7 @@ def deploy_instance_directly(
             "--set",
             f"synapse_image_pull_policy={synapse_image_pull_policy}",
             "--set-json",
-            "authorizationGlobalUsers=[]",
+            "administrators=[]",
             "--set",
             "openai_key=test-openai",
             "--set",

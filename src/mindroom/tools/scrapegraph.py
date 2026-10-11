@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.scrapegraph import ScrapeGraphTools
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="scrapegraph",
+    file_access=ToolFileAccess.NONE,
     display_name="ScrapeGraph",
     description="Extract structured data from webpages using AI and natural language prompts",
     category=ToolCategory.RESEARCH,
@@ -56,13 +58,6 @@ if TYPE_CHECKING:
             default=False,
         ),
         ConfigField(
-            name="enable_agentic_crawler",
-            label="Enable Agentic Crawler",
-            type="boolean",
-            required=False,
-            default=False,
-        ),
-        ConfigField(
             name="enable_scrape",
             label="Enable Scrape",
             type="boolean",
@@ -77,6 +72,20 @@ if TYPE_CHECKING:
             default=False,
         ),
         ConfigField(
+            name="crawl_poll_interval",
+            label="Crawl Poll Interval",
+            type="number",
+            required=False,
+            default=3,
+        ),
+        ConfigField(
+            name="crawl_max_wait",
+            label="Crawl Max Wait",
+            type="number",
+            required=False,
+            default=180,
+        ),
+        ConfigField(
             name="all",
             label="All",
             type="boolean",
@@ -86,7 +95,7 @@ if TYPE_CHECKING:
     ],
     dependencies=["scrapegraph-py"],
     docs_url="https://docs.agno.com/tools/toolkits/web_scrape/scrapegraph",
-    function_names=("agentic_crawler", "crawl", "markdownify", "scrape", "searchscraper", "smartscraper"),
+    function_names=("crawl", "markdownify", "scrape", "searchscraper", "smartscraper"),
 )
 def scrapegraph_tools() -> type[ScrapeGraphTools]:
     """Return ScrapeGraph tools for web data extraction."""

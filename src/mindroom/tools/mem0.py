@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.mem0 import Mem0Tools
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="mem0",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
     display_name="Mem0 Memory",
     description="Persistent memory system that stores, retrieves, searches, and manages user memories and context",
     category=ToolCategory.PRODUCTIVITY,  # Database tools → Productivity
@@ -20,13 +23,6 @@ if TYPE_CHECKING:
     icon="Brain",
     icon_color="text-purple-600",  # Memory/brain theme
     config_fields=[
-        ConfigField(
-            name="config",
-            label="Config",
-            type="text",
-            required=False,
-            default=None,
-        ),
         ConfigField(
             name="api_key",
             label="API Key",

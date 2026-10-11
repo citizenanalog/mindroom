@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
+import threading
 from dataclasses import dataclass
+from errno import EACCES, EINVAL, ENODATA, ENOTSUP, EPERM
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mindroom.constants import RuntimePaths, resolve_config_relative_path
+from mindroom.atomic_file import atomic_write_file_at
+from mindroom.constants import RuntimePaths, config_relative_path
+from mindroom.path_confinement import (
+    open_directory_within_root,
+    open_regular_file_within_root,
+    resolve_path_within_root,
+)
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
+from mindroom.tool_system.worker_routing import private_root_name
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
@@ -17,12 +28,39 @@ if TYPE_CHECKING:
 
 _MIND_TEMPLATE_DIR = Path(__file__).resolve().parent / "cli" / "templates" / "mind_data"
 
+# Agent builds now run on worker threads (#1260), so concurrent scaffolding of
+# the same workspace must not interleave template copies or link reconciliation.
+_WORKSPACE_MUTATION_LOCK = threading.Lock()
+
+
+def _copy_xattrs(source_fd: int, destination_fd: int) -> None:
+    """Best-effort copy extended attributes with the same exclusions as copy2."""
+    list_xattrs = getattr(os, "listxattr", None)
+    get_xattr = getattr(os, "getxattr", None)
+    set_xattr = getattr(os, "setxattr", None)
+    if list_xattrs is None or get_xattr is None or set_xattr is None:
+        return
+    try:
+        names = list_xattrs(source_fd)
+    except OSError as exc:
+        if exc.errno in {ENOTSUP, ENODATA, EINVAL}:
+            return
+        raise
+    for name in names:
+        try:
+            value = get_xattr(source_fd, name)
+            set_xattr(destination_fd, name, value)
+        except OSError as exc:
+            if exc.errno not in {EACCES, EPERM, ENOTSUP, ENODATA, EINVAL}:
+                raise
+
 
 @dataclass(frozen=True)
 class ResolvedAgentWorkspace:
     """Resolved workspace paths for one agent in one execution scope."""
 
     root: Path
+    lexical_root: Path
     context_files: tuple[Path, ...]
     file_memory_path: Path | None
 
@@ -35,6 +73,67 @@ class _EffectiveAgentWorkspace:
     file_memory_path: str | None
 
 
+def validate_local_copy_source_path(
+    source_path: Path,
+    *,
+    field_name: str,
+) -> Path:
+    """Resolve one existing local copy-source path and reject symlink traversal."""
+    lexical_source_path = source_path.expanduser()
+    absolute_source_path = (
+        lexical_source_path if lexical_source_path.is_absolute() else (Path.cwd() / lexical_source_path)
+    )
+    current = Path(absolute_source_path.anchor) if absolute_source_path.anchor else Path()
+    for part in absolute_source_path.parts[1:] if absolute_source_path.anchor else absolute_source_path.parts:
+        current = current / part
+        if current.is_symlink():
+            msg = f"{field_name} must not contain symlinks: {current}"
+            raise ValueError(msg)
+    resolved_source_path = absolute_source_path.resolve()
+    if not resolved_source_path.exists():
+        msg = f"{field_name} does not exist: {resolved_source_path}"
+        raise ValueError(msg)
+    return resolved_source_path
+
+
+def iter_local_copy_source_entries(source_dir: Path) -> list[tuple[Path, Path]]:
+    """Return copy-source entries in deterministic order without following symlinks."""
+    entries: list[tuple[Path, Path]] = []
+
+    def _walk(current_dir: Path) -> None:
+        for source_path in sorted(current_dir.iterdir()):
+            relative_path = source_path.relative_to(source_dir)
+            entries.append((source_path, relative_path))
+            if source_path.is_dir() and not source_path.is_symlink():
+                _walk(source_path)
+
+    _walk(source_dir)
+    return entries
+
+
+def validate_local_copy_source_dir(
+    source_dir: Path,
+    *,
+    field_name: str,
+) -> Path:
+    """Resolve one local copy-source directory and reject symlinked content."""
+    resolved_source_dir = validate_local_copy_source_path(
+        source_dir,
+        field_name=field_name,
+    )
+    if not resolved_source_dir.is_dir():
+        msg = f"{field_name} is not a directory: {resolved_source_dir}"
+        raise ValueError(msg)
+    for source_path, _ in iter_local_copy_source_entries(resolved_source_dir):
+        if source_path.is_symlink():
+            msg = f"{field_name} must not contain symlinks: {source_path}"
+            raise ValueError(msg)
+        if not source_path.is_dir() and not source_path.is_file():
+            msg = f"{field_name} must contain only regular files and directories: {source_path}"
+            raise ValueError(msg)
+    return resolved_source_dir
+
+
 def resolve_relative_path_within_root(
     root: Path,
     relative_path: str | Path,
@@ -43,20 +142,11 @@ def resolve_relative_path_within_root(
     root_label: str = "canonical root",
 ) -> Path:
     """Resolve one relative path under a canonical root and reject symlink escapes."""
-    lexical_root = root.expanduser()
-    resolved_root = lexical_root.resolve()
-    candidate_path = lexical_root / relative_path
-    current = lexical_root
-    for part in Path(relative_path).parts:
-        current = current / part
-        if current.is_symlink():
-            msg = f"{field_name} must stay within the {root_label}: {resolved_root}"
-            raise ValueError(msg)
-    candidate = candidate_path.resolve()
-    if not candidate.is_relative_to(resolved_root):
-        msg = f"{field_name} must stay within the {root_label}: {resolved_root}"
-        raise ValueError(msg)
-    return candidate
+    try:
+        return resolve_path_within_root(root.expanduser(), relative_path, symlinks="reject")
+    except ValueError:
+        msg = f"{field_name} must stay within the {root_label}: {root.expanduser().resolve()}"
+        raise ValueError(msg) from None
 
 
 def resolve_relative_path_within_root_preserving_leaf(
@@ -68,30 +158,12 @@ def resolve_relative_path_within_root_preserving_leaf(
 ) -> Path:
     """Resolve one relative path under a canonical root without following the final component."""
     lexical_root = root.expanduser()
-    resolved_root = lexical_root.resolve()
-    candidate_path = lexical_root / relative_path
-    relative = Path(relative_path)
-    if relative.is_absolute():
-        msg = f"{field_name} must stay within the {root_label}: {resolved_root}"
-        raise ValueError(msg)
-    if relative == Path():
-        return resolved_root
-
-    current = lexical_root
-    for index, part in enumerate(relative.parts):
-        if part == "..":
-            msg = f"{field_name} must stay within the {root_label}: {resolved_root}"
-            raise ValueError(msg)
-        current = current / part
-        if index < len(relative.parts) - 1 and current.is_symlink():
-            msg = f"{field_name} must stay within the {root_label}: {resolved_root}"
-            raise ValueError(msg)
-
-    candidate_parent = candidate_path.parent.resolve()
-    if not candidate_parent.is_relative_to(resolved_root):
-        msg = f"{field_name} must stay within the {root_label}: {resolved_root}"
-        raise ValueError(msg)
-    return candidate_path
+    try:
+        resolved = resolve_path_within_root(lexical_root, relative_path, symlinks="preserve_leaf")
+    except ValueError:
+        msg = f"{field_name} must stay within the {root_label}: {lexical_root.resolve()}"
+        raise ValueError(msg) from None
+    return resolved if Path(relative_path) == Path() else lexical_root / relative_path
 
 
 def resolve_workspace_relative_path(
@@ -111,30 +183,15 @@ def resolve_workspace_relative_path(
 
 def validate_workspace_template_dir(template_dir: Path) -> Path:
     """Resolve one workspace template directory and ensure it exists."""
-    resolved_template_dir = template_dir.expanduser().resolve()
-    if not resolved_template_dir.is_dir():
-        msg = f"Workspace template directory does not exist: {resolved_template_dir}"
-        raise ValueError(msg)
-    for source_path, _ in _iter_workspace_template_entries(resolved_template_dir):
-        if source_path.is_symlink():
-            msg = f"Workspace template directory must not contain symlinks: {source_path}"
-            raise ValueError(msg)
-    return resolved_template_dir
+    return validate_local_copy_source_dir(
+        template_dir,
+        field_name="Workspace template directory",
+    )
 
 
 def _iter_workspace_template_entries(template_dir: Path) -> list[tuple[Path, Path]]:
     """Return template entries in deterministic order without following symlinks."""
-    entries: list[tuple[Path, Path]] = []
-
-    def _walk(current_dir: Path) -> None:
-        for source_path in sorted(current_dir.iterdir()):
-            relative_path = source_path.relative_to(template_dir)
-            entries.append((source_path, relative_path))
-            if source_path.is_dir() and not source_path.is_symlink():
-                _walk(source_path)
-
-    _walk(template_dir)
-    return entries
+    return iter_local_copy_source_entries(template_dir)
 
 
 def _copy_workspace_template(
@@ -147,20 +204,46 @@ def _copy_workspace_template(
     workspace_path.mkdir(parents=True, exist_ok=True)
     resolved_template_dir = validate_workspace_template_dir(template_dir)
 
-    for source_path, relative_path in _iter_workspace_template_entries(resolved_template_dir):
-        destination_path = resolve_relative_path_within_root(
-            workspace_path,
-            relative_path,
-            field_name="workspace template destination",
-            root_label="workspace root",
-        )
-        if source_path.is_dir():
-            destination_path.mkdir(parents=True, exist_ok=True)
-            continue
-        if destination_path.exists() and not force:
-            continue
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_path, destination_path)
+    with (
+        _WORKSPACE_MUTATION_LOCK,
+        open_directory_within_root(workspace_path) as workspace_fd,
+        open_directory_within_root(resolved_template_dir) as template_fd,
+    ):
+        for source_path, relative_path in _iter_workspace_template_entries(resolved_template_dir):
+            resolve_relative_path_within_root(
+                workspace_path,
+                relative_path,
+                field_name="workspace template destination",
+                root_label="workspace root",
+            )
+            if source_path.is_dir():
+                with open_directory_within_root(workspace_fd, relative_path, create=True):
+                    pass
+                continue
+            with open_directory_within_root(workspace_fd, relative_path.parent, create=True) as parent_fd:
+                if not force:
+                    try:
+                        os.stat(relative_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        continue
+                with open_regular_file_within_root(template_fd, relative_path) as source_fd:
+                    source_file = os.fdopen(os.dup(source_fd), "rb")
+                    with source_file:
+                        source_stat = os.fstat(source_file.fileno())
+                        with atomic_write_file_at(
+                            parent_fd,
+                            relative_path.name,
+                            file_mode=stat.S_IMODE(source_stat.st_mode),
+                        ) as output_file:
+                            shutil.copyfileobj(source_file, output_file)
+                            output_file.flush()
+                            os.utime(
+                                output_file.fileno(),
+                                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+                            )
+                            _copy_xattrs(source_file.fileno(), output_file.fileno())
 
 
 def ensure_workspace_template(
@@ -202,37 +285,44 @@ def _build_workspace_knowledge_links(
 
 
 def _remove_stale_workspace_knowledge_links(
+    knowledge_fd: int,
     knowledge_root: Path,
     *,
     protected_paths: Collection[Path],
     workspace_root: Path,
     desired_links: Mapping[Path, Path],
 ) -> None:
-    for existing_path in knowledge_root.iterdir():
-        if (
-            existing_path.is_symlink()
-            and existing_path not in desired_links
-            and existing_path not in protected_paths
-            and existing_path.resolve().is_relative_to(workspace_root)
-        ):
-            existing_path.unlink()
-
-
-def _apply_workspace_knowledge_links(desired_links: Mapping[Path, Path]) -> None:
-    for link_path, resolved_target in desired_links.items():
-        if link_path.is_symlink():
-            if link_path.resolve() == resolved_target:
-                continue
-            link_path.unlink()
-        elif link_path.exists():
-            if link_path.resolve() == resolved_target:
-                continue
-            msg = f"Workspace knowledge link path already exists and is not a symlink: {link_path}"
-            raise ValueError(msg)
-        if resolved_target == link_path:
+    """Remove stale links into the workspace by reading, never following, each link."""
+    for entry in list(os.scandir(knowledge_fd)):
+        existing_path = knowledge_root / entry.name
+        if not entry.is_symlink() or existing_path in desired_links or existing_path in protected_paths:
             continue
-        link_path.parent.mkdir(parents=True, exist_ok=True)
-        link_path.symlink_to(resolved_target, target_is_directory=True)
+        target = Path(os.path.normpath(knowledge_root / os.readlink(entry.name, dir_fd=knowledge_fd)))
+        if target.is_relative_to(workspace_root):
+            os.unlink(entry.name, dir_fd=knowledge_fd)
+
+
+def _apply_workspace_knowledge_links(
+    knowledge_fd: int,
+    knowledge_root: Path,
+    desired_links: Mapping[Path, Path],
+) -> None:
+    """Point each desired link at its target through descriptors pinned below the knowledge root."""
+    for link_path, resolved_target in desired_links.items():
+        relative_link = link_path.relative_to(knowledge_root)
+        with open_directory_within_root(knowledge_fd, relative_link.parent, create=True) as parent_fd:
+            try:
+                existing = os.stat(relative_link.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and stat.S_ISLNK(existing.st_mode):
+                if os.readlink(relative_link.name, dir_fd=parent_fd) == str(resolved_target):
+                    continue
+                os.unlink(relative_link.name, dir_fd=parent_fd)
+            elif existing is not None:
+                msg = f"Workspace knowledge link path already exists and is not a symlink: {link_path}"
+                raise ValueError(msg)
+            os.symlink(resolved_target, relative_link.name, target_is_directory=True, dir_fd=parent_fd)
 
 
 def ensure_workspace_knowledge_links(
@@ -246,6 +336,8 @@ def ensure_workspace_knowledge_links(
     Each knowledge base becomes visible under ``<workspace>/knowledge/<base_id>``.
     Targets outside the workspace are intentionally excluded because the default
     file-aware tools enforce workspace containment after resolving symlinks.
+    The knowledge directory is pinned by a no-follow walk from the workspace as spelled, so a workspace
+    replaced by a link is refused, and existing links are read, never followed.
     """
     workspace_path.mkdir(parents=True, exist_ok=True)
     workspace_root = workspace_path.resolve()
@@ -256,26 +348,27 @@ def ensure_workspace_knowledge_links(
     )
     if not knowledge_paths and not knowledge_root.exists():
         return
-    knowledge_root.mkdir(parents=True, exist_ok=True)
-    desired_links = _build_workspace_knowledge_links(
-        workspace_root=workspace_root,
-        knowledge_root=knowledge_root,
-        knowledge_paths=knowledge_paths,
-    )
-    _remove_stale_workspace_knowledge_links(
-        knowledge_root,
-        protected_paths=protected_paths,
-        workspace_root=workspace_root,
-        desired_links=desired_links,
-    )
-    _apply_workspace_knowledge_links(desired_links)
-
-
-def _private_root_name(agent_name: str, config: Config) -> str:
-    agent_config = config.agents.get(agent_name)
-    if agent_config is None or agent_config.private is None or agent_config.private.root is None:
-        return f"{agent_name}_data"
-    return agent_config.private.root
+    with (
+        _WORKSPACE_MUTATION_LOCK,
+        open_directory_within_root(
+            workspace_path,
+            knowledge_root.relative_to(workspace_root),
+            create=True,
+        ) as knowledge_fd,
+    ):
+        desired_links = _build_workspace_knowledge_links(
+            workspace_root=workspace_root,
+            knowledge_root=knowledge_root,
+            knowledge_paths=knowledge_paths,
+        )
+        _remove_stale_workspace_knowledge_links(
+            knowledge_fd,
+            knowledge_root,
+            protected_paths=protected_paths,
+            workspace_root=workspace_root,
+            desired_links=desired_links,
+        )
+        _apply_workspace_knowledge_links(knowledge_fd, knowledge_root, desired_links)
 
 
 def _effective_workspace(
@@ -289,24 +382,37 @@ def _effective_workspace(
         return None
     private_config = agent_config.private
     return _EffectiveAgentWorkspace(
-        root_path=_private_root_name(agent_name, config),
+        root_path=private_root_name(agent_name, private_config.root),
         template_dir=(
-            resolve_config_relative_path(private_config.template_dir, runtime_paths)
+            config_relative_path(private_config.template_dir, runtime_paths)
             if private_config.template_dir is not None
             else None
         ),
         context_files=tuple(private_config.context_files or ()),
-        file_memory_path="." if config.get_agent_memory_backend(agent_name) == "file" else None,
+        file_memory_path="." if config.resolve_entity(agent_name).memory_backend == "file" else None,
     )
 
 
-def _template_unavailable_for_dedicated_worker(template_dir: Path, runtime_paths: RuntimePaths) -> bool:
-    """Return whether a dedicated worker should rely on the control plane's existing scaffold."""
-    return (
-        runtime_paths.env_flag(SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"])
-        and bool(runtime_paths.env_value(SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"], default=""))
-        and not template_dir.expanduser().is_dir()
+def runs_in_dedicated_worker(runtime_paths: RuntimePaths) -> bool:
+    """Return whether this process is a sandbox runner pinned to one dedicated worker."""
+    return runtime_paths.env_flag(SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"]) and bool(
+        runtime_paths.env_value(SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"], default=""),
     )
+
+
+def control_plane_owns_private_templates(runtime_paths: RuntimePaths) -> bool:
+    """Return whether this runtime is a sandbox runner that relies on the control plane's private templates.
+
+    The primary validates private template paths against its own config directory
+    and seeds requester workspaces from them; a runner resolves the same paths
+    against its own config location, where they need not exist.
+    """
+    return runtime_paths.env_flag(SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"])
+
+
+def _template_unavailable_in_sandbox_runner(template_dir: Path, runtime_paths: RuntimePaths) -> bool:
+    """Return whether a sandbox runner should rely on the control plane's existing scaffold."""
+    return control_plane_owns_private_templates(runtime_paths) and not template_dir.expanduser().is_dir()
 
 
 def _resolve_workspace(
@@ -323,8 +429,9 @@ def _resolve_workspace(
         return None
 
     if agent_config.private is None:
-        if config.get_agent_memory_backend(agent_name) != "file":
+        if config.resolve_entity(agent_name).memory_backend != "file":
             return None
+        lexical_root = state_storage_path.expanduser() / "workspace"
         root = resolve_workspace_relative_path(
             state_storage_path,
             "workspace",
@@ -334,6 +441,7 @@ def _resolve_workspace(
             root.mkdir(parents=True, exist_ok=True)
         return ResolvedAgentWorkspace(
             root=root,
+            lexical_root=lexical_root,
             context_files=(),
             file_memory_path=root,
         )
@@ -345,6 +453,7 @@ def _resolve_workspace(
         msg = f"Private agent '{agent_name}' requires an active execution identity to resolve requester-local state"
         raise ValueError(msg)
 
+    lexical_root = state_storage_path.expanduser() / workspace.root_path
     root = resolve_workspace_relative_path(
         state_storage_path,
         workspace.root_path,
@@ -355,7 +464,7 @@ def _resolve_workspace(
         root.mkdir(parents=True, exist_ok=True)
         if template_dir is not None:
             assert template_dir is not None
-            if not _template_unavailable_for_dedicated_worker(template_dir, runtime_paths):
+            if not _template_unavailable_in_sandbox_runner(template_dir, runtime_paths):
                 _copy_workspace_template(root, template_dir=template_dir)
 
     context_files = tuple(
@@ -380,6 +489,7 @@ def _resolve_workspace(
 
     return ResolvedAgentWorkspace(
         root=root,
+        lexical_root=lexical_root,
         context_files=context_files,
         file_memory_path=file_memory_path,
     )

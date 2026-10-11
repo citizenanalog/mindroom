@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from mindroom.history.policy import manual_compaction_unavailable_message, resolve_history_execution_plan
-from mindroom.history.runtime import open_scope_session_context
+from mindroom.history.session_context import open_scope_session_context
 from mindroom.history.storage import add_pending_force_compaction_scope, read_scope_state, set_force_compaction_state
 from mindroom.logging_config import get_logger
 
@@ -44,7 +44,7 @@ def request_compaction_before_next_reply(
     session_state: dict[str, object] | None = None,
     record_pending_scope_in_session_state: bool = False,
 ) -> _ManualCompactionRequestResult:
-    """Schedule destructive compaction before the next reply in the current history scope."""
+    """Schedule text compaction before the next reply in the current history scope."""
     if session_id is None:
         return _ManualCompactionRequestResult("Error: No active session available. Cannot determine session.")
 
@@ -115,14 +115,14 @@ def _resolve_active_compaction_settings(
             room_id=room_id,
             runtime_paths=runtime_paths if room_id is not None else None,
         )
-        return runtime_model, config.get_entity_compaction_config(agent_name)
+        return runtime_model, config.resolve_entity(agent_name).compaction_config
 
     if agent.team_id not in config.teams:
         runtime_model = config.resolve_runtime_model(
             entity_name=None,
             active_model_name=active_model_name,
         )
-        return runtime_model, config.get_default_compaction_config()
+        return runtime_model, config.resolve_entity(None).compaction_config
 
     runtime_model = config.resolve_runtime_model(
         entity_name=agent.team_id,
@@ -130,7 +130,7 @@ def _resolve_active_compaction_settings(
         room_id=room_id,
         runtime_paths=runtime_paths,
     )
-    return runtime_model, config.get_entity_compaction_config(agent.team_id)
+    return runtime_model, config.resolve_entity(agent.team_id).compaction_config
 
 
 def _validate_compaction_budget(
@@ -140,7 +140,7 @@ def _validate_compaction_budget(
     active_context_window: int | None,
     compaction_config: CompactionConfig,
 ) -> str | None:
-    """Return a user-facing error when destructive compaction is unavailable."""
+    """Return a user-facing error when text compaction is unavailable."""
     execution_plan = resolve_history_execution_plan(
         config=config,
         compaction_config=compaction_config,

@@ -7,8 +7,13 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 from mindroom import constants, runtime_env_policy
 from mindroom.api import sandbox_exec
+from mindroom.workers.backends._dedicated_worker_common import build_dedicated_worker_runtime_paths
+from mindroom.workers.backends.docker_config import docker_backend_config_signature
+from mindroom.workers.backends.kubernetes_config import kubernetes_backend_config_signature
 
 _POLICY_OWNED_ENV_PREFIXES = (
     "MINDROOM_CREDENTIAL_SEEDS_",
@@ -17,31 +22,119 @@ _POLICY_OWNED_ENV_PREFIXES = (
     "MINDROOM_SHARED_CREDENTIALS_",
     "MINDROOM_WORKER_BACKEND",
 )
-_POLICY_OWNED_ENV_EXTRA_NAMES = frozenset(runtime_env_policy.VERTEXAI_CLAUDE_ENV_BY_KEY.values())
+_POLICY_OWNED_ENV_EXTRA_NAMES = frozenset(
+    {
+        *runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY.values(),
+        *runtime_env_policy.VERTEXAI_CLAUDE_ENV_BY_KEY.values(),
+    },
+)
 _PYTHON_STRING_LITERAL_RE = re.compile(
     r"""(?P<prefix>[rubfRUBF]*)?(?P<quote>["'])(?P<value>[A-Z][A-Z0-9_]+)(?P=quote)""",
 )
 _PROJECTION_MATRIX_ENV_NAMES = (
+    runtime_env_policy.CONTROL_STATE_PATH_ENV,
+    runtime_env_policy.SESSION_STORAGE_PATH_ENV,
     runtime_env_policy.CREDENTIALS_ENCRYPTION_KEY_ENV,
+    *runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY.values(),
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_SERVICE_ACCOUNT_FILE",
     "GOOGLE_DELEGATED_USER",
     runtime_env_policy.KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["extra_env_json"],
     runtime_env_policy.KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["storage_subpath_prefix"],
+    runtime_env_policy.MATRIX_APPSERVICE_TOKEN_ENV,
+    runtime_env_policy.MATRIX_APPSERVICE_TOKEN_FILE_ENV,
+    runtime_env_policy.MATRIX_MANAGED_ACCOUNT_AUTH_ENV,
     runtime_env_policy.SANDBOX_RUNTIME_ENV_BY_KEY["proxy_token"],
     runtime_env_policy.SHARED_CREDENTIALS_PATH_ENV,
     "OPENAI_API_KEY",
 )
 _PROJECTION_MATRIX_EXPECTATIONS = {
-    runtime_env_policy.CREDENTIALS_ENCRYPTION_KEY_ENV: {
+    runtime_env_policy.MATRIX_APPSERVICE_TOKEN_ENV: {
         "public_worker_startup_env": False,
-        "isolated_worker_runtime_env": True,
-        "trusted_tool_runtime_paths": True,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": False,
         "execution_tool_runtime_paths": False,
         "shell_passthrough_env": False,
     },
-    "GOOGLE_APPLICATION_CREDENTIALS": {
+    runtime_env_policy.MATRIX_APPSERVICE_TOKEN_FILE_ENV: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": False,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": False,
+    },
+    runtime_env_policy.MATRIX_MANAGED_ACCOUNT_AUTH_ENV: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": False,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": False,
+    },
+    runtime_env_policy.CONTROL_STATE_PATH_ENV: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": False,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": False,
+    },
+    runtime_env_policy.SESSION_STORAGE_PATH_ENV: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": False,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": False,
+    },
+    runtime_env_policy.CREDENTIALS_ENCRYPTION_KEY_ENV: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": False,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": False,
+    },
+    runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY["access_key"]: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": True,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": True,
+    },
+    runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY["secret_key"]: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": True,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": True,
+    },
+    runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY["session_token"]: {
+        "public_worker_startup_env": False,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": True,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": True,
+    },
+    runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY["region"]: {
         "public_worker_startup_env": True,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": True,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": True,
+    },
+    runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY["default_region"]: {
+        "public_worker_startup_env": True,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": True,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": True,
+    },
+    runtime_env_policy.AWS_BEDROCK_CLAUDE_ENV_BY_KEY["profile"]: {
+        "public_worker_startup_env": True,
+        "isolated_worker_runtime_env": False,
+        "trusted_tool_runtime_paths": True,
+        "execution_tool_runtime_paths": False,
+        "shell_passthrough_env": True,
+    },
+    "GOOGLE_APPLICATION_CREDENTIALS": {
+        "public_worker_startup_env": False,
         "isolated_worker_runtime_env": False,
         "trusted_tool_runtime_paths": True,
         "execution_tool_runtime_paths": False,
@@ -128,6 +221,7 @@ def test_public_worker_startup_env_excludes_control_and_secret_values() -> None:
     """Public worker startup serialization keeps only non-secret runtime values."""
     env = {
         "MINDROOM_CONFIG_PATH": "/app/config.yaml",
+        "MINDROOM_CONTROL_STATE_PATH": "/app/control-state",
         "MINDROOM_STORAGE_PATH": "/app/storage",
         "MINDROOM_SANDBOX_PROXY_TOKEN": "proxy-secret",
         "MINDROOM_SANDBOX_PROXY_URL": "http://runner.example.invalid",
@@ -158,6 +252,12 @@ def test_public_worker_startup_env_excludes_control_and_secret_values() -> None:
         "AGNO_TELEMETRY": "false",
         "POD_NAMESPACE": "mindroom",
         "CUSTOMER_ID": "customer-123",
+        "AWS_ACCESS_KEY_ID": "aws-access-id",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "AWS_SESSION_TOKEN": "aws-session",
+        "AWS_REGION": "us-east-1",
+        "AWS_DEFAULT_REGION": "us-west-2",
+        "AWS_PROFILE": "dev-profile",
     }
 
     result = runtime_env_policy.public_worker_startup_env(env)
@@ -170,6 +270,9 @@ def test_public_worker_startup_env_excludes_control_and_secret_values() -> None:
         "AGNO_TELEMETRY": "false",
         "POD_NAMESPACE": "mindroom",
         "CUSTOMER_ID": "customer-123",
+        "AWS_REGION": "us-east-1",
+        "AWS_DEFAULT_REGION": "us-west-2",
+        "AWS_PROFILE": "dev-profile",
         "MINDROOM_SANDBOX_RUNNER_MODE": "true",
         "MINDROOM_SANDBOX_RUNNER_EXECUTION_MODE": "subprocess",
         "MINDROOM_SANDBOX_RUNNER_PORT": "8766",
@@ -178,6 +281,30 @@ def test_public_worker_startup_env_excludes_control_and_secret_values() -> None:
         "MINDROOM_SANDBOX_DEDICATED_WORKER_ROOT": "/app/worker/workers/worker-key",
         "MINDROOM_KUBERNETES_WORKER_STORAGE_SUBPATH_PREFIX": "workers",
     }
+
+
+def test_public_runtime_paths_do_not_reintroduce_worker_local_file_secret_paths(tmp_path: Path) -> None:
+    """Public startup serialization never re-admits ambient file-secret env vars."""
+    storage_root = tmp_path / "worker"
+    projected_secret = storage_root / ".runtime" / "file-secrets" / "OPENAI_API_KEY_FILE" / "openai.key"
+    stray_secret = tmp_path / "other" / ".runtime" / "file-secrets" / "GITHUB_TOKEN_FILE" / "token"
+    runtime_paths = constants.resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=storage_root,
+        process_env={
+            "OPENAI_API_KEY_FILE": str(projected_secret),
+            "GITHUB_TOKEN_FILE": str(stray_secret),
+            "MATRIX_HOMESERVER": "https://matrix.example.invalid",
+        },
+    )
+
+    assert runtime_env_policy.public_worker_startup_env(runtime_paths.process_env) == {
+        "MATRIX_HOMESERVER": "https://matrix.example.invalid",
+    }
+
+    public_runtime = constants.serialize_public_runtime_paths(runtime_paths)
+
+    assert public_runtime["process_env"] == {"MATRIX_HOMESERVER": "https://matrix.example.invalid"}
 
 
 def test_shell_passthrough_globs_do_not_expose_runtime_control_env() -> None:
@@ -224,13 +351,11 @@ def test_env_projection_matrix_documents_sensitive_runtime_boundaries(tmp_path: 
         runtime_paths,
         {},
         include_base_execution_env=True,
-        include_credentials_encryption_key=True,
     )
     execution_tool_runtime_paths = sandbox_exec.tool_runtime_paths_with_request_env(
         runtime_paths,
         {},
         include_base_execution_env=False,
-        include_credentials_encryption_key=False,
     )
     public_worker_startup_env = runtime_env_policy.public_worker_startup_env(process_env)
     isolated_worker_runtime_env = runtime_env_policy.isolated_worker_runtime_env(process_env)
@@ -382,6 +507,7 @@ def test_worker_extra_env_drops_protected_controls_but_keeps_runner_timeout() ->
         "MINDROOM_API_KEY": "runtime-api-key",
         "MINDROOM_CONFIG_PATH": "/unsafe/config.yaml",
         "MINDROOM_LOCAL_CLIENT_SECRET": "runtime-client-secret",
+        "MINDROOM_PLATFORM_SSO_SECRET": "runtime-dashboard-signing-key",
         "MINDROOM_SHARED_CREDENTIALS_PATH": "/unsafe/shared-credentials",
         "MINDROOM_STORAGE_PATH": "/unsafe/storage",
         "MINDROOM_SANDBOX_RUNNER_SUBPROCESS_TIMEOUT_SECONDS": "45",
@@ -402,6 +528,15 @@ def test_worker_extra_env_drops_protected_controls_but_keeps_runner_timeout() ->
     }
 
 
+@pytest.mark.parametrize("name", ["MINDROOM_API_KEY", "MINDROOM_PLATFORM_SSO_SECRET"])
+def test_dashboard_credentials_stay_out_of_tool_env(name: str) -> None:
+    """Dashboard credentials and signing keys never reach shell passthrough or trusted tool env."""
+    assert not runtime_env_policy.is_shell_passthrough_allowed_env_name(name)
+    assert not runtime_env_policy.is_trusted_tool_runtime_process_env_name(name)
+    assert not runtime_env_policy.is_trusted_tool_runtime_env_file_name(name)
+    assert not runtime_env_policy.is_isolated_worker_runtime_env_name(name)
+
+
 def test_runtime_control_env_literals_stay_in_policy_module() -> None:
     """Python callers should import centralized runtime env names from the policy module."""
     source_root = Path(__file__).resolve().parents[1] / "src" / "mindroom"
@@ -419,3 +554,47 @@ def test_runtime_control_env_literals_stay_in_policy_module() -> None:
             violations[str(path.relative_to(source_root))] = leaked_names
 
     assert violations == {}
+
+
+def test_worker_computer_flag_survives_dedicated_startup_and_changes_backend_identity(tmp_path: Path) -> None:
+    """Opt-in reaches both worker backends and invalidates cached backend configuration."""
+    flag = runtime_env_policy.WORKER_COMPUTER_ENABLED_ENV
+    env = {
+        "MINDROOM_DOCKER_WORKER_IMAGE": "worker:test",
+        "MINDROOM_DOCKER_WORKER_SECURITY_POLICY": "computer",
+        "MINDROOM_KUBERNETES_WORKER_IMAGE": "worker:test",
+        "MINDROOM_KUBERNETES_WORKER_STORAGE_PVC_NAME": "storage",
+    }
+    disabled = constants.resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env=env,
+    )
+    enabled = constants.resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={**env, flag: "true"},
+    )
+    for backend in ("docker", "kubernetes"):
+        worker = build_dedicated_worker_runtime_paths(
+            runtime_paths=enabled,
+            backend_name=backend,
+            worker_key="worker",
+            config_path=tmp_path / "worker-config.yaml",
+            dedicated_root=tmp_path / "worker",
+            worker_port=8766,
+            shared_storage_root=str(tmp_path / "shared"),
+            extra_env={},
+        )
+        assert worker.env_flag(flag)
+        assert runtime_env_policy.sandbox_runner_runtime_state_env(dict(worker.process_env))[flag] == "true"
+    for signature in (docker_backend_config_signature, kubernetes_backend_config_signature):
+        assert signature(disabled, auth_token=None) != signature(enabled, auth_token=None)
+
+
+def test_computer_origins_remain_primary_runtime_configuration() -> None:
+    """Browser origin policy must not enter worker startup or execution env."""
+    env = {"MINDROOM_COMPUTER_ALLOWED_ORIGINS": '["https://chat.example.org"]'}
+    assert runtime_env_policy.public_worker_startup_env(env) == {}
+    assert runtime_env_policy.isolated_worker_runtime_env(env) == {}
+    assert runtime_env_policy.worker_extra_env(env) == {}

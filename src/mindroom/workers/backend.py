@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from mindroom.workers.models import WorkerMaintenanceResult
 
 if TYPE_CHECKING:
     from mindroom.workers.models import ProgressSink, WorkerHandle, WorkerSpec, WorkerStatus
@@ -36,7 +38,11 @@ class WorkerBackend(Protocol):
     """Backend contract for realizing persistent workers."""
 
     backend_name: str
+    cleanup_locator: str | None
     idle_timeout_seconds: float
+
+    def shutdown(self) -> None:
+        """Release backend-owned runtime resources before discarding this manager."""
 
     def ensure_worker(
         self,
@@ -47,26 +53,41 @@ class WorkerBackend(Protocol):
     ) -> WorkerHandle:
         """Resolve or create the worker described by *spec*."""
 
-    def get_worker(self, worker_key: str, *, now: float | None = None) -> WorkerHandle | None:
-        """Return the current handle for *worker_key*, if known."""
-
     def touch_worker(self, worker_key: str, *, now: float | None = None) -> WorkerHandle | None:
         """Update last-used bookkeeping for *worker_key*."""
 
     def list_workers(self, *, include_idle: bool = True, now: float | None = None) -> list[WorkerHandle]:
         """List known workers."""
 
-    def evict_worker(
-        self,
-        worker_key: str,
-        *,
-        preserve_state: bool = True,
-        now: float | None = None,
-    ) -> WorkerHandle | None:
-        """Evict a worker and optionally retain its state."""
-
     def cleanup_idle_workers(self, *, now: float | None = None) -> list[WorkerHandle]:
         """Apply idle cleanup to known workers."""
 
-    def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
-        """Persist a worker failure for observability."""
+    def record_failure(
+        self,
+        worker_key: str,
+        failure_reason: str,
+        *,
+        now: float | None = None,
+        startup_count: int | None = None,
+    ) -> WorkerHandle:
+        """Persist a worker failure; one from a start the backend has since replaced may be ignored."""
+
+
+@runtime_checkable
+class _MaintainingWorkerBackend(Protocol):
+    """Backends that own a maintenance pass richer than idle cleanup."""
+
+    def maintain_workers(self, *, now: float | None = None) -> WorkerMaintenanceResult:
+        """Run one backend-specific maintenance pass."""
+
+
+def maintain_workers(backend: WorkerBackend, *, now: float | None = None) -> WorkerMaintenanceResult:
+    """Run one maintenance pass, using the backend's own pass when it has one.
+
+    Kept a function rather than a ``WorkerBackend`` default so the protocol stays
+    structural: inheriting it would turn every doc-only method in this file into a
+    ``None``-returning default that silently satisfies the interface.
+    """
+    if isinstance(backend, _MaintainingWorkerBackend):
+        return backend.maintain_workers(now=now)
+    return WorkerMaintenanceResult(cleaned=tuple(backend.cleanup_idle_workers(now=now)), reconciled=())

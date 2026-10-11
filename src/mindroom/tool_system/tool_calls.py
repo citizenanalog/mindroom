@@ -19,6 +19,7 @@ from mindroom.redaction import redact_sensitive_data, redact_sensitive_text
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from mindroom.approval.tool_approval import BackgroundScriptToolOrigin
     from mindroom.constants import RuntimePaths
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
@@ -54,9 +55,33 @@ class _ToolCallRecordDict(TypedDict, total=False):
     arguments: _JsonValue
     success: bool
     result: _JsonValue
+    timing: _JsonValue
     error_type: str
     error_message: str
     traceback: str
+    origin: str
+    run_id: str
+    call_id: str
+    toolkit_name: str
+    function_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallTiming:
+    """Optional phase timing breakdown for one tool call."""
+
+    before_hooks_ms: float | None = None
+    tool_body_ms: float | None = None
+    result_ready_ms: float | None = None
+
+    def as_dict(self) -> dict[str, float]:
+        """Return JSON-safe timing fields, omitting phases that were not measured."""
+        fields = {
+            "before_hooks_ms": self.before_hooks_ms,
+            "result_ready_ms": self.result_ready_ms,
+            "tool_body_ms": self.tool_body_ms,
+        }
+        return {key: _sanitize_duration_ms(value) for key, value in fields.items() if value is not None}
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +101,16 @@ class _ToolCallRecord:
     duration_ms: float
     arguments: _JsonValue
     success: bool
+    timing: ToolCallTiming | None = None
     result: _JsonValue | None = None
     error_type: str | None = None
     error_message: str | None = None
     traceback: str | None = None
+    origin: str | None = None
+    run_id: str | None = None
+    call_id: str | None = None
+    toolkit_name: str | None = None
+    function_name: str | None = None
 
     def as_dict(self) -> _ToolCallRecordDict:
         """Return the record in JSON-serializable dictionary form."""
@@ -92,24 +123,30 @@ class _ToolCallRecord:
             "arguments": self.arguments,
             "success": self.success,
         }
-        if self.agent_name is not None:
-            record["agent_name"] = self.agent_name
-        if self.channel is not None:
-            record["channel"] = self.channel
-        if self.room_id is not None:
-            record["room_id"] = self.room_id
-        if self.thread_id is not None:
-            record["thread_id"] = self.thread_id
-        if self.requester_id is not None:
-            record["requester_id"] = self.requester_id
-        if self.session_id is not None:
-            record["session_id"] = self.session_id
+        context_fields: dict[str, str | None] = {
+            "agent_name": self.agent_name,
+            "channel": self.channel,
+            "room_id": self.room_id,
+            "thread_id": self.thread_id,
+            "requester_id": self.requester_id,
+            "session_id": self.session_id,
+        }
+        record.update({key: value for key, value in context_fields.items() if value is not None})
+        if self.timing is not None:
+            timing = self.timing.as_dict()
+            if timing:
+                record["timing"] = cast("_JsonValue", timing)
         if self.success or self.result is not None:
             record["result"] = self.result
         optional_fields: tuple[tuple[str, str | None], ...] = (
             ("error_type", self.error_type),
             ("error_message", self.error_message),
             ("traceback", self.traceback),
+            ("origin", self.origin),
+            ("run_id", self.run_id),
+            ("call_id", self.call_id),
+            ("toolkit_name", self.toolkit_name),
+            ("function_name", self.function_name),
         )
         record.update({key: value for key, value in optional_fields if value is not None})
         return cast("_ToolCallRecordDict", record)
@@ -131,14 +168,20 @@ def sanitize_failure_text(value: str, *, max_length: int = _MAX_STRING_LENGTH) -
     return redact_sensitive_text(value, max_length=max_length)
 
 
-def sanitize_failure_value(value: object, *, depth: int = 0) -> _JsonValue:
-    """Recursively redact and bound one arbitrary value for durable failure logging."""
+def sanitize_failure_value(
+    value: object,
+    *,
+    depth: int = 0,
+    token_placeholders: dict[str, str] | None = None,
+) -> _JsonValue:
+    """Recursively redact and bound one value for durable failure logging, or for review with ``token_placeholders``."""
     max_depth = max(_MAX_REDACTION_DEPTH - depth, 0) if depth > 0 else _MAX_REDACTION_DEPTH
     return redact_sensitive_data(
         value,
         max_string_length=_MAX_STRING_LENGTH,
         max_collection_items=_MAX_COLLECTION_ITEMS,
         max_depth=max_depth,
+        token_placeholders=token_placeholders,
     )
 
 
@@ -166,6 +209,7 @@ def _build_tool_failure_record(
     arguments: dict[str, object],
     error: BaseException,
     duration_ms: float,
+    timing: ToolCallTiming | None = None,
     agent_name: str | None,
     channel: str | None,
     room_id: str | None,
@@ -174,6 +218,7 @@ def _build_tool_failure_record(
     requester_id: str | None,
     session_id: str | None,
     correlation_id: str,
+    origin: BackgroundScriptToolOrigin | None = None,
 ) -> _ToolCallRecord:
     """Build one sanitized durable record for a failing tool call."""
     return _ToolCallRecord(
@@ -190,9 +235,11 @@ def _build_tool_failure_record(
         duration_ms=_sanitize_duration_ms(duration_ms),
         arguments=sanitize_failure_value(arguments),
         success=False,
+        timing=timing,
         error_type=type(error).__name__,
         error_message=_safe_error_message(error),
         traceback=_safe_traceback(error),
+        **_origin_record_fields(origin),
     )
 
 
@@ -202,6 +249,7 @@ def _build_tool_success_record(
     arguments: dict[str, object],
     result: object,
     duration_ms: float,
+    timing: ToolCallTiming | None = None,
     agent_name: str | None,
     channel: str | None,
     room_id: str | None,
@@ -210,6 +258,7 @@ def _build_tool_success_record(
     requester_id: str | None,
     session_id: str | None,
     correlation_id: str,
+    origin: BackgroundScriptToolOrigin | None = None,
 ) -> _ToolCallRecord:
     """Build one sanitized durable record for a successful tool call."""
     return _ToolCallRecord(
@@ -226,8 +275,29 @@ def _build_tool_success_record(
         duration_ms=_sanitize_duration_ms(duration_ms),
         arguments=sanitize_failure_value(arguments),
         success=True,
+        timing=timing,
         result=sanitize_failure_value(result),
+        **_origin_record_fields(origin),
     )
+
+
+def _origin_record_fields(origin: BackgroundScriptToolOrigin | None) -> dict[str, str | None]:
+    """Return durable audit fields for a typed automation origin."""
+    if origin is None:
+        return {
+            "origin": None,
+            "run_id": None,
+            "call_id": None,
+            "toolkit_name": None,
+            "function_name": None,
+        }
+    return {
+        "origin": "background_script",
+        "run_id": origin.run_id,
+        "call_id": origin.call_id,
+        "toolkit_name": origin.toolkit_name,
+        "function_name": origin.function_name,
+    }
 
 
 def _tool_call_log_path(runtime_paths: RuntimePaths) -> Path:
@@ -268,6 +338,7 @@ def record_tool_failure(
     arguments: dict[str, object],
     error: BaseException,
     duration_ms: float,
+    timing: ToolCallTiming | None = None,
     agent_name: str | None,
     room_id: str | None,
     thread_id: str | None,
@@ -277,6 +348,7 @@ def record_tool_failure(
     correlation_id: str,
     execution_identity: ToolExecutionIdentity | None,
     runtime_paths: RuntimePaths | None,
+    origin: BackgroundScriptToolOrigin | None = None,
 ) -> _ToolCallRecord:
     """Persist one sanitized tool failure record when runtime paths are available."""
     record = _build_tool_failure_record(
@@ -284,6 +356,7 @@ def record_tool_failure(
         arguments=arguments,
         error=error,
         duration_ms=duration_ms,
+        timing=timing,
         agent_name=agent_name,
         channel=execution_identity.channel if execution_identity is not None else None,
         room_id=room_id,
@@ -292,6 +365,7 @@ def record_tool_failure(
         requester_id=requester_id,
         session_id=session_id,
         correlation_id=correlation_id,
+        origin=origin,
     )
     if runtime_paths is None:
         logger.debug(
@@ -317,6 +391,7 @@ def record_tool_success(
     arguments: dict[str, object],
     result: object,
     duration_ms: float,
+    timing: ToolCallTiming | None = None,
     agent_name: str | None,
     room_id: str | None,
     thread_id: str | None,
@@ -326,6 +401,7 @@ def record_tool_success(
     correlation_id: str,
     execution_identity: ToolExecutionIdentity | None,
     runtime_paths: RuntimePaths | None,
+    origin: BackgroundScriptToolOrigin | None = None,
 ) -> _ToolCallRecord:
     """Persist one sanitized tool success record when runtime paths are available."""
     record = _build_tool_success_record(
@@ -333,6 +409,7 @@ def record_tool_success(
         arguments=arguments,
         result=result,
         duration_ms=duration_ms,
+        timing=timing,
         agent_name=agent_name,
         channel=execution_identity.channel if execution_identity is not None else None,
         room_id=room_id,
@@ -341,6 +418,7 @@ def record_tool_success(
         requester_id=requester_id,
         session_id=session_id,
         correlation_id=correlation_id,
+        origin=origin,
     )
     if runtime_paths is None:
         logger.debug(

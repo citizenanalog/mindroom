@@ -2,47 +2,64 @@
 
 from __future__ import annotations
 
-import asyncio
-import tempfile
+import hashlib
 import threading
 import weakref
-from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from copy import deepcopy
-from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
 from mindroom import constants
+from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+from mindroom.config.legacy_access import validate_access_migration_source
 from mindroom.config.main import (
     CONFIG_LOAD_USER_ERROR_TYPES,
     Config,
+    ConfigLoadUserError,
     ConfigRuntimeValidationError,
     iter_config_validation_messages,
+    validate_loaded_config_source,
 )
-from mindroom.config.main import load_config as load_runtime_config_model
-from mindroom.file_watcher import watch_file
+from mindroom.config.yaml_includes import (
+    load_yaml_config_source_with_digests,
+    partial_source_files,
+    partial_source_uses_includes,
+    source_files_fingerprint,
+)
+from mindroom.event_journal.opening import pending_event_journal_restart
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+    from pathlib import Path
+
+    from mindroom.agent_cli.session import TurnToolRegistry
+    from mindroom.api.computers import ComputerRuntime
+    from mindroom.api.mcp_gateway import GatewayRuntime
+    from mindroom.api.usage_export import UsageExportRunner
+    from mindroom.config.reload_status import ConfigReloadStatus
+    from mindroom.external_triggers.store import TriggerDeliverySnapshot
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.knowledge.watch import KnowledgeSourceWatcher
+    from mindroom.response_activity import ActiveScriptRunInfo, ResponseIdentity
+    from mindroom.response_admission import ResponseAdmissionGate
+    from mindroom.thread_export.workspace_sync import WorkspaceThreadExportRunner
+    from mindroom.worker_computer.sessions import ComputerSessionStore
+    from mindroom.workers.backend import WorkerBackend
 
 logger = get_logger(__name__)
 _UNSET = object()
 _REQUEST_SNAPSHOT_SCOPE_KEY = "api_snapshot"
 CONFIG_GENERATION_HEADER = "x-mindroom-config-generation"
+CONFIG_USES_INCLUDES_HEADER = "x-mindroom-config-uses-includes"
+CONFIG_PENDING_RESTART_HEADER = "x-mindroom-config-pending-restart"
 _REGISTERED_API_APPS: weakref.WeakSet[FastAPI] = weakref.WeakSet()
 _REGISTERED_API_APPS_LOCK = threading.Lock()
-
-type _WatchFileFn = Callable[
-    [Path | str, Callable[[], Awaitable[None]], asyncio.Event | None],
-    Awaitable[None],
-]
 
 
 @dataclass(frozen=True)
@@ -52,17 +69,31 @@ class ConfigLoadResult:
     success: bool
     error_status_code: int | None = None
     error_detail: object | None = None
+    uses_includes: bool | None = False
 
 
 @dataclass
 class ApiSnapshot:
-    """One published API runtime snapshot."""
+    """One published API runtime snapshot.
+
+    ``generation`` is what consumers bind to, so it only advances when the
+    config they see actually changes. ``revision`` advances on every
+    publication without exception, including ones that deliberately leave the
+    generation alone -- a refused or failed load. Writers compare-and-swap on
+    ``revision``: a request that pinned a snapshot before such a publication
+    would otherwise still pass a generation check and commit its stale copy of
+    the payload over whatever the operator had just edited on disk.
+    """
 
     generation: int
     runtime_paths: constants.RuntimePaths
     config_data: dict[str, Any]
+    revision: int = 0
     runtime_config: Config | None = None
     config_load_result: ConfigLoadResult | None = None
+    source_fingerprint: str | None = None
+    source_files: frozenset[Path] | None = None
+    uses_includes: bool | None = None
     auth_state: Any | None = None
 
 
@@ -74,6 +105,19 @@ class ApiState:
     snapshot: ApiSnapshot
 
 
+@dataclass(frozen=True)
+class ExternalTriggerRuntime:
+    """Runtime objects needed to deliver accepted external triggers."""
+
+    client: object
+    conversation_reader: object
+    config_generation: int
+    is_trigger_snapshot_ready: Callable[[TriggerDeliverySnapshot], Awaitable[bool]]
+    agent_reply_memberships: AgentReplyMembershipIndex
+    response_admission_gate: ResponseAdmissionGate
+    wait_for_admission_or_shutdown: Callable[[], Awaitable[bool]]
+
+
 @dataclass
 class _MindroomAppState:
     """Single typed namespace for FastAPI ``app.state`` attributes used across the API."""
@@ -83,6 +127,21 @@ class _MindroomAppState:
     orchestrator_knowledge_refresh_scheduler: KnowledgeRefreshScheduler | None = None
     knowledge_source_watcher: KnowledgeSourceWatcher | None = None
     knowledge_refresh_scheduler: KnowledgeRefreshScheduler | None = None
+    thread_export_runner: WorkspaceThreadExportRunner | None = None
+    leave_matrix_room: Callable[[str, str], Awaitable[bool]] | None = None
+    external_trigger_runtime: ExternalTriggerRuntime | None = None
+    agent_reply_memberships: AgentReplyMembershipIndex = field(default_factory=AgentReplyMembershipIndex)
+    response_admission_gate: ResponseAdmissionGate | None = None
+    openai_responses: set[ResponseIdentity] = field(default_factory=set)
+    active_calls: Callable[[], list[ResponseIdentity]] | None = None
+    active_script_runs: Callable[[], Awaitable[list[ActiveScriptRunInfo]]] | None = None
+    config_reload_status: Callable[[], ConfigReloadStatus] | None = None
+    script_worker_keepalive: Callable[[WorkerBackend], None] | None = None
+    mcp_gateway_runtime: GatewayRuntime | None = None
+    computer_runtime: ComputerRuntime | None = None
+    computer_sessions: ComputerSessionStore | None = None
+    agent_cli_registry: TurnToolRegistry | None = None
+    usage_export_runner: UsageExportRunner | None = None
 
 
 def ensure_app_state(api_app: FastAPI) -> _MindroomAppState:
@@ -114,7 +173,7 @@ def require_api_state(api_app: FastAPI) -> ApiState:
 
 
 def _config_error_detail(
-    exc: ValidationError | ConfigRuntimeValidationError | yaml.YAMLError | OSError | UnicodeError,
+    exc: ConfigLoadUserError,
 ) -> list[dict[str, object]]:
     """Return one shared API error payload for invalid current config."""
     return [
@@ -127,15 +186,40 @@ def _config_error_detail(
     ]
 
 
+def _source_fingerprint(source: bytes | str) -> str:
+    """Return the stable identity used for raw config stale-write protection."""
+    source_bytes = source.encode("utf-8") if isinstance(source, str) else source
+    return hashlib.sha256(source_bytes).hexdigest()
+
+
 def _load_config_result(
     runtime_paths: constants.RuntimePaths,
-) -> tuple[ConfigLoadResult, dict[str, Any] | None, Config | None]:
+) -> tuple[ConfigLoadResult, dict[str, Any] | None, Config | None, str | None, frozenset[Path] | None]:
     """Load and validate one config file without mutating shared app state."""
+    source_fingerprint: str | None = None
+    source_files: frozenset[Path] | None = None
+    uses_includes: bool | None = None
     try:
-        runtime_config = load_runtime_config_model(
+        source_bytes = runtime_paths.config_path.read_bytes()
+        source_fingerprint = _source_fingerprint(source_bytes)
+        # Parse the bytes already read so a mid-load file edit can never publish
+        # config under a fingerprint computed from different content.
+        data, source_digests, uses_includes = load_yaml_config_source_with_digests(
+            runtime_paths.config_path,
+            source=source_bytes,
+        )
+        source_files = frozenset(source_digests)
+        source_fingerprint = source_files_fingerprint(runtime_paths.config_path, source_digests)
+        runtime_config, source_digests = validate_loaded_config_source(
+            data,
+            source_digests,
+            source_bytes,
             runtime_paths,
+            uses_includes=uses_includes,
             tolerate_plugin_load_errors=True,
         )
+        source_files = frozenset(source_digests)
+        source_fingerprint = source_files_fingerprint(runtime_paths.config_path, source_digests)
         validated_payload = runtime_config.authored_model_dump()
     except CONFIG_LOAD_USER_ERROR_TYPES as exc:
         detail = _config_error_detail(exc)
@@ -144,17 +228,76 @@ def _load_config_result(
             config_path=str(runtime_paths.config_path),
             errors=detail,
         )
-        return ConfigLoadResult(success=False, error_status_code=422, error_detail=detail), None, None
+        if source_files is None:
+            # A parse-time failure never reached the full set; the files read
+            # so far keep the watcher covering a broken new include file.
+            source_files = partial_source_files(exc)
+        if uses_includes is None:
+            uses_includes = partial_source_uses_includes(exc)
+        return (
+            ConfigLoadResult(
+                success=False,
+                error_status_code=422,
+                error_detail=detail,
+                uses_includes=uses_includes,
+            ),
+            None,
+            None,
+            source_fingerprint,
+            source_files,
+        )
     except Exception:
         logger.exception("Failed to load API config", config_path=str(runtime_paths.config_path))
         return (
-            ConfigLoadResult(success=False, error_status_code=500, error_detail="Failed to load configuration"),
+            ConfigLoadResult(
+                success=False,
+                error_status_code=500,
+                error_detail="Failed to load configuration",
+                uses_includes=uses_includes,
+            ),
             None,
             None,
+            source_fingerprint,
+            source_files,
         )
     else:
+        logger.info(
+            "loaded_agent_configuration",
+            path=str(runtime_paths.config_path),
+            source_file_count=len(source_files),
+        )
+        logger.info("loaded_agent_configuration_count", agent_count=len(runtime_config.agents))
         logger.info("Loaded API config", config_path=str(runtime_paths.config_path))
-        return ConfigLoadResult(success=True), validated_payload, runtime_config
+        return (
+            ConfigLoadResult(success=True, uses_includes=uses_includes),
+            validated_payload,
+            runtime_config,
+            source_fingerprint,
+            source_files,
+        )
+
+
+def _source_fingerprint_for_published_runtime_config(
+    runtime_paths: constants.RuntimePaths,
+    validated_payload: dict[str, Any],
+) -> tuple[str, frozenset[Path] | None, bool | None]:
+    """Return the runtime fingerprint and source metadata safe to publish.
+
+    Unmatched disk bytes cannot identify the runtime config, so their source set
+    stays unpublished. Observed include usage still blocks structured writes;
+    a negative or missing observation cannot clear the previous include guard.
+    """
+    canonical_source = yaml.dump(
+        validated_payload,
+        default_flow_style=False,
+        sort_keys=True,
+        allow_unicode=True,
+    )
+    canonical_fingerprint = _source_fingerprint(canonical_source)
+    result, disk_payload, _disk_config, disk_fingerprint, disk_source_files = _load_config_result(runtime_paths)
+    if result.success and disk_payload == validated_payload and disk_fingerprint is not None:
+        return disk_fingerprint, disk_source_files, result.uses_includes
+    return canonical_fingerprint, None, True if result.uses_includes else None
 
 
 def _raise_for_config_load_result(result: ConfigLoadResult | None) -> None:
@@ -167,27 +310,75 @@ def _raise_for_config_load_result(result: ConfigLoadResult | None) -> None:
     )
 
 
-def _raise_missing_loaded_config() -> None:
+def _raise_missing_loaded_config() -> NoReturn:
     """Raise the shared missing-config HTTP error used by cached API reads and writes."""
     raise HTTPException(status_code=500, detail="Failed to load configuration")
+
+
+class _ConfigComposedFromIncludesError(ConfigRuntimeValidationError):
+    """Structured config write rejected because the config uses include tags."""
+
+
+_CONFIG_COMPOSED_FROM_INCLUDES_MESSAGE = "configuration uses !include; edit the source files instead"
+_CONFIG_COMPOSED_FROM_INCLUDES_ERROR_CODE = "config_composed_from_includes"
+
+
+def _composed_from_includes_http_error(exc: _ConfigComposedFromIncludesError) -> HTTPException:
+    """Return the includes-rejection 409 with a machine-readable code.
+
+    The code lets clients tell this permanent rejection apart from the
+    retryable stale-write 409, which carries a plain string detail.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={"code": _CONFIG_COMPOSED_FROM_INCLUDES_ERROR_CODE, "message": str(exc)},
+    )
+
+
+def _raise_when_composed_from_includes(
+    runtime_paths: constants.RuntimePaths,
+    committed_uses_includes: bool | None,
+) -> None:
+    """Reject structured config writes that would silently flatten include files.
+
+    Committed include usage remains protective when source becomes unreadable.
+    Negative or missing metadata can be stale, so inspect the current source.
+    Empty included directories need the same protection as populated ones.
+    """
+    if committed_uses_includes:
+        raise _ConfigComposedFromIncludesError(_CONFIG_COMPOSED_FROM_INCLUDES_MESSAGE)
+    try:
+        _, _source_digests, uses_includes = load_yaml_config_source_with_digests(runtime_paths.config_path)
+    except CONFIG_LOAD_USER_ERROR_TYPES as exc:
+        uses_includes = partial_source_uses_includes(exc)
+        if uses_includes is None and not isinstance(exc, FileNotFoundError):
+            # An incomplete scan cannot establish that replacing the source is
+            # safe. Complete tag-free scans still allow monolith recovery.
+            msg = "could not determine whether configuration uses !include; edit the source files instead"
+            raise ConfigRuntimeValidationError(msg) from exc
+    if uses_includes:
+        raise _ConfigComposedFromIncludesError(_CONFIG_COMPOSED_FROM_INCLUDES_MESSAGE)
 
 
 def _save_config_to_file(
     config: dict[str, Any],
     runtime_paths: constants.RuntimePaths,
-) -> None:
+    *,
+    committed_uses_includes: bool | None,
+) -> str:
     """Save config to YAML file with deterministic ordering."""
+    _raise_when_composed_from_includes(runtime_paths, committed_uses_includes)
     config_path = runtime_paths.config_path
     tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        yaml.dump(
-            config,
-            f,
-            default_flow_style=False,
-            sort_keys=True,
-            allow_unicode=True,
-        )
+    source = yaml.dump(
+        config,
+        default_flow_style=False,
+        sort_keys=True,
+        allow_unicode=True,
+    )
+    tmp_path.write_text(source, encoding="utf-8")
     constants.safe_replace(tmp_path, config_path)
+    return _source_fingerprint(source)
 
 
 def _save_raw_config_source_to_file(
@@ -201,16 +392,13 @@ def _save_raw_config_source_to_file(
     constants.safe_replace(tmp_path, config_path)
 
 
-def _persist_runtime_validated_config(
+def persist_runtime_validated_config(
     runtime_config: Config,
     runtime_paths: constants.RuntimePaths,
 ) -> None:
-    """Persist one validated config and immediately publish matching committed API snapshots."""
+    """Persist one already-validated config and immediately publish matching committed API snapshots."""
     validated_payload = runtime_config.authored_model_dump()
     matching_states = [state for state in _registered_api_states() if state.snapshot.runtime_paths == runtime_paths]
-    if not matching_states:
-        _save_config_to_file(validated_payload, runtime_paths=runtime_paths)
-        return
 
     with ExitStack() as stack:
         locked_snapshots: list[tuple[ApiState, ApiSnapshot]] = []
@@ -221,13 +409,24 @@ def _persist_runtime_validated_config(
                 continue
             locked_snapshots.append((state, snapshot))
 
-        _save_config_to_file(validated_payload, runtime_paths=runtime_paths)
+        include_states = [
+            snapshot.uses_includes for _, snapshot in locked_snapshots if snapshot.uses_includes is not None
+        ]
+        committed_uses_includes = any(include_states) if include_states else None
+        source_fingerprint = _save_config_to_file(
+            validated_payload,
+            runtime_paths=runtime_paths,
+            committed_uses_includes=committed_uses_includes,
+        )
         for state, snapshot in locked_snapshots:
             state.snapshot = _published_snapshot(
                 snapshot,
                 config_data=deepcopy(validated_payload),
                 runtime_config=runtime_config,
                 config_load_result=ConfigLoadResult(success=True),
+                source_fingerprint=source_fingerprint,
+                source_files=frozenset({runtime_paths.config_path.resolve()}),
+                uses_includes=False,
             )
 
 
@@ -246,7 +445,7 @@ def validate_and_persist_config_payload(
 ) -> Config:
     """Validate and persist one authored config payload against the active runtime."""
     validated_config, _ = _validated_config_payload(raw_config, runtime_paths)
-    _persist_runtime_validated_config(validated_config, runtime_paths)
+    persist_runtime_validated_config(validated_config, runtime_paths)
     return validated_config
 
 
@@ -291,6 +490,13 @@ def bind_current_request_snapshot(request: Request) -> ApiSnapshot:
         return store_request_snapshot(request, app_state.snapshot)
 
 
+def rebind_current_request_snapshot(request: Request) -> ApiSnapshot:
+    """Replace a request's pinned snapshot with the app's current publication."""
+    app_state = require_api_state(request.app)
+    with app_state.config_lock:
+        return store_request_snapshot(request, app_state.snapshot)
+
+
 def _request_or_current_snapshot(request: Request) -> ApiSnapshot:
     """Return the request-bound snapshot when present, else the current app snapshot."""
     bound_snapshot = request_snapshot(request)
@@ -307,9 +513,12 @@ def _published_snapshot(
     config_data: dict[str, Any] | None = None,
     runtime_config: Config | None | object = _UNSET,
     config_load_result: ConfigLoadResult | None | object = _UNSET,
+    source_fingerprint: str | None | object = _UNSET,
+    source_files: frozenset[Path] | None | object = _UNSET,
+    uses_includes: bool | None | object = _UNSET,
     auth_state: object = _UNSET,
 ) -> ApiSnapshot:
-    """Return one new published snapshot with an incremented generation."""
+    """Return one new published snapshot, always with a fresh commit revision."""
     updated_runtime_paths = snapshot.runtime_paths if runtime_paths is None else runtime_paths
     updated_config_data = snapshot.config_data if config_data is None else config_data
     updated_runtime_config = (
@@ -320,14 +529,25 @@ def _published_snapshot(
         if config_load_result is _UNSET
         else cast("ConfigLoadResult | None", config_load_result)
     )
+    updated_source_fingerprint = (
+        snapshot.source_fingerprint if source_fingerprint is _UNSET else cast("str | None", source_fingerprint)
+    )
+    updated_source_files = (
+        snapshot.source_files if source_files is _UNSET else cast("frozenset[Path] | None", source_files)
+    )
+    updated_uses_includes = snapshot.uses_includes if uses_includes is _UNSET else cast("bool | None", uses_includes)
     updated_auth_state = snapshot.auth_state if auth_state is _UNSET else auth_state
     return replace(
         snapshot,
         generation=snapshot.generation + 1 if increment_generation else snapshot.generation,
+        revision=snapshot.revision + 1,
         runtime_paths=updated_runtime_paths,
         config_data=updated_config_data,
         runtime_config=updated_runtime_config,
         config_load_result=updated_load_result,
+        source_fingerprint=updated_source_fingerprint,
+        source_files=updated_source_files,
+        uses_includes=updated_uses_includes,
         auth_state=updated_auth_state,
     )
 
@@ -377,7 +597,7 @@ def _commit_mutated_snapshot[T](
     api_app: FastAPI,
     initial_state: ApiState,
     *,
-    expected_generation: int,
+    expected_revision: int,
     runtime_paths: constants.RuntimePaths,
     validated_payload: dict[str, Any],
     validated_config: Config,
@@ -387,15 +607,22 @@ def _commit_mutated_snapshot[T](
     with initial_state.config_lock:
         current_state = require_api_state(api_app)
         current = current_state.snapshot
-        if current.generation != expected_generation or current.runtime_paths != runtime_paths:
+        if current.revision != expected_revision or current.runtime_paths != runtime_paths:
             _raise_for_config_load_result(current.config_load_result)
             raise _stale_snapshot_error()
-        _save_config_to_file(validated_payload, runtime_paths=runtime_paths)
+        source_fingerprint = _save_config_to_file(
+            validated_payload,
+            runtime_paths=runtime_paths,
+            committed_uses_includes=current.uses_includes,
+        )
         current_state.snapshot = _published_snapshot(
             current,
             config_data=validated_payload,
             runtime_config=validated_config,
             config_load_result=ConfigLoadResult(success=True),
+            source_fingerprint=source_fingerprint,
+            source_files=frozenset({runtime_paths.config_path.resolve()}),
+            uses_includes=False,
         )
         return result
 
@@ -411,31 +638,31 @@ def _validate_replacement_payload(
 def _validate_raw_config_source(
     source: str,
     runtime_paths: constants.RuntimePaths,
-) -> tuple[Config, dict[str, Any]]:
-    """Validate raw YAML source against the current runtime without mutating the live file."""
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=runtime_paths.config_path.parent,
-        prefix=f"{runtime_paths.config_path.name}.validation.",
-        suffix=".tmp",
-        delete=False,
-    ) as tmp:
-        tmp.write(source)
-        validation_path = Path(tmp.name)
-    validation_runtime_paths = replace(runtime_paths, config_path=validation_path)
-    try:
-        runtime_config = load_runtime_config_model(validation_runtime_paths)
-        return runtime_config, runtime_config.authored_model_dump()
-    finally:
-        validation_path.unlink(missing_ok=True)
+) -> tuple[Config, dict[str, Any], frozenset[Path], str]:
+    """Validate raw YAML source against the current runtime without mutating the live file.
+
+    Parsing the source as the live config path keeps include semantics identical
+    to the post-save reload (relative paths, containment, self-include cycles)
+    and yields the same include-aware fingerprint the next disk load computes,
+    so a raw save of a split config does not trigger a spurious generation bump.
+    """
+    data, source_digests, uses_includes = load_yaml_config_source_with_digests(
+        runtime_paths.config_path,
+        source=source.encode("utf-8"),
+    )
+    source_files = frozenset(source_digests)
+    validate_access_migration_source(data, uses_includes=uses_includes)
+    runtime_config = Config.validate_with_runtime(data, runtime_paths)
+    runtime_config.record_source_metadata(runtime_paths.config_path, source_digests, uses_includes=uses_includes)
+    source_fingerprint = source_files_fingerprint(runtime_paths.config_path, source_digests)
+    return runtime_config, runtime_config.authored_model_dump(), source_files, source_fingerprint
 
 
 def _commit_replaced_snapshot(
     api_app: FastAPI,
     initial_state: ApiState,
     *,
-    expected_generation: int,
+    expected_revision: int,
     runtime_paths: constants.RuntimePaths,
     validated_payload: dict[str, Any],
     validated_config: Config,
@@ -444,14 +671,21 @@ def _commit_replaced_snapshot(
     with initial_state.config_lock:
         current_state = require_api_state(api_app)
         current = current_state.snapshot
-        if current.generation != expected_generation or current.runtime_paths != runtime_paths:
+        if current.revision != expected_revision or current.runtime_paths != runtime_paths:
             raise _stale_snapshot_error()
-        _save_config_to_file(validated_payload, runtime_paths=runtime_paths)
+        source_fingerprint = _save_config_to_file(
+            validated_payload,
+            runtime_paths=runtime_paths,
+            committed_uses_includes=current.uses_includes,
+        )
         current_state.snapshot = _published_snapshot(
             current,
             config_data=validated_payload,
             runtime_config=validated_config,
             config_load_result=ConfigLoadResult(success=True),
+            source_fingerprint=source_fingerprint,
+            source_files=frozenset({runtime_paths.config_path.resolve()}),
+            uses_includes=False,
         )
         return current_state.snapshot.generation
 
@@ -460,24 +694,29 @@ def _commit_raw_replaced_snapshot(
     api_app: FastAPI,
     initial_state: ApiState,
     *,
-    expected_generation: int,
+    expected_revision: int,
     runtime_paths: constants.RuntimePaths,
     validated_payload: dict[str, Any],
     validated_config: Config,
     source: str,
+    source_files: frozenset[Path],
+    source_fingerprint: str,
 ) -> int:
     """Commit one raw replacement payload if the targeted snapshot is still current."""
     with initial_state.config_lock:
         current_state = require_api_state(api_app)
         current = current_state.snapshot
-        if current.generation != expected_generation or current.runtime_paths != runtime_paths:
+        if current.revision != expected_revision or current.runtime_paths != runtime_paths:
             raise _stale_snapshot_error()
         _save_raw_config_source_to_file(source, runtime_paths=runtime_paths)
         current_state.snapshot = _published_snapshot(
             current,
             config_data=validated_payload,
             runtime_config=validated_config,
-            config_load_result=ConfigLoadResult(success=True),
+            config_load_result=ConfigLoadResult(success=True, uses_includes=validated_config.uses_includes),
+            source_fingerprint=source_fingerprint,
+            source_files=source_files,
+            uses_includes=validated_config.uses_includes,
         )
         return current_state.snapshot.generation
 
@@ -505,7 +744,7 @@ def _build_and_commit_mutation[T](
         return _commit_mutated_snapshot(
             api_app,
             initial_state,
-            expected_generation=snapshot.generation,
+            expected_revision=snapshot.revision,
             runtime_paths=snapshot.runtime_paths,
             validated_payload=validated_payload,
             validated_config=validated_config,
@@ -514,7 +753,9 @@ def _build_and_commit_mutation[T](
     except HTTPException:
         raise
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors(include_context=False)) from e
+        raise HTTPException(status_code=422, detail=e.errors(include_context=False, include_input=False)) from e
+    except _ConfigComposedFromIncludesError as e:
+        raise _composed_from_includes_http_error(e) from e
     except ConfigRuntimeValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from e
     except Exception as e:
@@ -542,7 +783,7 @@ def _build_and_commit_replacement(
         return _commit_replaced_snapshot(
             api_app,
             initial_state,
-            expected_generation=snapshot.generation,
+            expected_revision=snapshot.revision,
             runtime_paths=snapshot.runtime_paths,
             validated_payload=validated_payload,
             validated_config=validated_config,
@@ -550,7 +791,9 @@ def _build_and_commit_replacement(
     except HTTPException:
         raise
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors(include_context=False)) from e
+        raise HTTPException(status_code=422, detail=e.errors(include_context=False, include_input=False)) from e
+    except _ConfigComposedFromIncludesError as e:
+        raise _composed_from_includes_http_error(e) from e
     except ConfigRuntimeValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from e
     except Exception as e:
@@ -574,15 +817,20 @@ def _build_and_commit_raw_replacement(
         snapshot = initial_snapshot
     try:
         _raise_if_generation_mismatch(snapshot, expected_generation)
-        validated_config, validated_payload = _validate_raw_config_source(source, snapshot.runtime_paths)
+        validated_config, validated_payload, source_files, source_fingerprint = _validate_raw_config_source(
+            source,
+            snapshot.runtime_paths,
+        )
         return _commit_raw_replaced_snapshot(
             api_app,
             initial_state,
-            expected_generation=snapshot.generation,
+            expected_revision=snapshot.revision,
             runtime_paths=snapshot.runtime_paths,
             validated_payload=validated_payload,
             validated_config=validated_config,
             source=source,
+            source_files=source_files,
+            source_fingerprint=source_fingerprint,
         )
     except HTTPException:
         raise
@@ -596,24 +844,98 @@ def load_config_into_app(runtime_paths: constants.RuntimePaths, api_app: FastAPI
     """Load config from disk into one API app's committed config cache."""
     initial_state = require_api_state(api_app)
     snapshot = initial_state.snapshot
-    result, validated_payload, runtime_config = _load_config_result(runtime_paths)
+    result, validated_payload, runtime_config, source_fingerprint, source_files = _load_config_result(runtime_paths)
     with initial_state.config_lock:
         current_state = require_api_state(api_app)
         current = current_state.snapshot
-        if current.generation != snapshot.generation or current.runtime_paths != runtime_paths:
+        if current.revision != snapshot.revision or current.runtime_paths != runtime_paths:
             logger.info(
                 "Discarding stale API config load after runtime swap",
                 load_config_path=str(runtime_paths.config_path),
                 active_config_path=str(current.runtime_paths.config_path),
             )
             return False
+        same_source = source_fingerprint is not None and source_fingerprint == current.source_fingerprint
+        # A failed load publishes the union of the last good source set and the
+        # files the failed attempt read, so the watcher never loses last-good
+        # coverage while still covering newly added include files whose edit
+        # broke the config; the next successful load replaces the union with
+        # the real set, shrinking it back.
+        published_source_files = source_files if source_files is not None else current.source_files
+        if not result.success and source_files is not None and current.source_files is not None:
+            published_source_files = source_files | current.source_files
+        published_uses_includes = result.uses_includes if result.uses_includes is not None else current.uses_includes
+        if not result.success and current.uses_includes:
+            published_uses_includes = True
         current_state.snapshot = _published_snapshot(
             current,
+            increment_generation=not same_source,
             config_data=validated_payload if validated_payload is not None else current.config_data,
             runtime_config=runtime_config if runtime_config is not None else current.runtime_config,
             config_load_result=result,
+            source_fingerprint=source_fingerprint,
+            source_files=published_source_files,
+            uses_includes=published_uses_includes,
         )
     return result.success
+
+
+def _publish_runtime_config_into_app(
+    runtime_config: Config,
+    runtime_paths: constants.RuntimePaths,
+    api_app: FastAPI,
+) -> bool:
+    """Publish one already-validated runtime config into one API app's committed cache."""
+    initial_state = require_api_state(api_app)
+    snapshot = initial_state.snapshot
+    validated_payload = runtime_config.authored_model_dump()
+    source_fingerprint, source_files, uses_includes = _source_fingerprint_for_published_runtime_config(
+        runtime_paths,
+        validated_payload,
+    )
+    if uses_includes is None and runtime_config.uses_includes:
+        # A failed disk observation cannot erase the incoming source's include
+        # evidence. A newer committed source still wins under the lock below.
+        uses_includes = True
+    with initial_state.config_lock:
+        current_state = require_api_state(api_app)
+        current = current_state.snapshot
+        if current.runtime_paths != runtime_paths:
+            logger.info(
+                "Discarding stale API config publish after runtime swap",
+                publish_config_path=str(runtime_paths.config_path),
+                active_config_path=str(current.runtime_paths.config_path),
+            )
+            return False
+        same_config = current.config_data == validated_payload
+        if current.revision != snapshot.revision and not same_config:
+            logger.info(
+                "Discarding stale API config publish after config changed",
+                publish_config_path=str(runtime_paths.config_path),
+            )
+            return False
+        published_source_fingerprint: str | None = source_fingerprint
+        if current.revision != snapshot.revision:
+            # Equal payloads still permit runtime publication, but a newer
+            # commit owns the source metadata observed after this read began.
+            published_source_fingerprint = current.source_fingerprint
+            source_files = current.source_files
+            uses_includes = current.uses_includes
+        same_source = published_source_fingerprint == current.source_fingerprint
+        published_uses_includes = uses_includes if uses_includes is not None else current.uses_includes
+        current_state.snapshot = _published_snapshot(
+            current,
+            increment_generation=not (same_source or same_config),
+            config_data=validated_payload,
+            runtime_config=runtime_config,
+            config_load_result=ConfigLoadResult(success=True, uses_includes=published_uses_includes),
+            source_fingerprint=published_source_fingerprint,
+            # A publish that cannot be tied to disk keeps the last known source
+            # set so the watcher still covers the previous include files.
+            source_files=source_files if source_files is not None else current.source_files,
+            uses_includes=published_uses_includes,
+        )
+    return True
 
 
 def read_app_committed_runtime_config(
@@ -624,12 +946,9 @@ def read_app_committed_runtime_config(
     with initial_state.config_lock:
         snapshot = require_api_state(api_app).snapshot
         _raise_for_config_load_result(snapshot.config_load_result)
-        if not snapshot.config_data:
+        if not snapshot.config_data or snapshot.runtime_config is None:
             _raise_missing_loaded_config()
-        runtime_paths = snapshot.runtime_paths
-        if snapshot.runtime_config is not None:
-            return snapshot.runtime_config, runtime_paths
-        return Config.model_validate(snapshot.config_data, context={"runtime_paths": runtime_paths}), runtime_paths
+        return snapshot.runtime_config, snapshot.runtime_paths
 
 
 def read_committed_config[T](
@@ -662,12 +981,9 @@ def read_committed_runtime_config(
     """Read one validated runtime config and runtime from one coherent request snapshot."""
     snapshot = _request_or_current_snapshot(request)
     _raise_for_config_load_result(snapshot.config_load_result)
-    if not snapshot.config_data:
+    if not snapshot.config_data or snapshot.runtime_config is None:
         _raise_missing_loaded_config()
-    runtime_paths = snapshot.runtime_paths
-    if snapshot.runtime_config is not None:
-        return snapshot.runtime_config, runtime_paths
-    return Config.model_validate(snapshot.config_data, context={"runtime_paths": runtime_paths}), runtime_paths
+    return snapshot.runtime_config, snapshot.runtime_paths
 
 
 def write_committed_config[T](
@@ -702,6 +1018,25 @@ def replace_committed_config(
     )
 
 
+def config_pending_restart(request: Request) -> bool:
+    """Return whether the committed config names an event journal that is not the open one.
+
+    ``event_journal`` is read once, when the store is opened, so an edit to it
+    is saved and then does nothing until a restart. The dashboard shows the
+    saved value either way, and this is what stops that from being a lie.
+    """
+    snapshot = _request_or_current_snapshot(request)
+    if snapshot.runtime_config is None:
+        return False
+    return pending_event_journal_restart(snapshot.runtime_config, snapshot.runtime_paths)
+
+
+def config_uses_includes(request: Request) -> bool:
+    """Return whether the committed config uses include or expansion tags."""
+    snapshot = _request_or_current_snapshot(request)
+    return snapshot.uses_includes is True
+
+
 def read_raw_config_source(request: Request) -> str:
     """Read the raw config source text for the current runtime."""
     snapshot = _request_or_current_snapshot(request)
@@ -728,19 +1063,3 @@ def replace_raw_config_source(
         initial_snapshot=request_snapshot(request),
         expected_generation=expected_generation,
     )
-
-
-async def _watch_config(
-    stop_event: asyncio.Event,
-    runtime_paths: constants.RuntimePaths,
-    on_config_change: Callable[[], bool],
-    *,
-    watch_file_impl: _WatchFileFn = watch_file,
-) -> None:
-    """Watch the runtime config file and reload the in-memory cache when it changes."""
-
-    async def _handle_config_change() -> None:
-        logger.info("Config file changed", path=str(runtime_paths.config_path))
-        on_config_change()
-
-    await watch_file_impl(runtime_paths.config_path, _handle_config_change, stop_event)

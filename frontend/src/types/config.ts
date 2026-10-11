@@ -2,13 +2,11 @@ import type { PROVIDERS } from "@/lib/providers";
 
 export type ProviderType = keyof typeof PROVIDERS;
 export type MemoryBackend = "mem0" | "file" | "none";
+export type MemorySearchMode = "keyword" | "semantic";
 export type WorkerScope = "shared" | "user" | "user_agent";
 export type PrivateWorkerScope = Exclude<WorkerScope, "shared">;
 export type AgentPolicySource =
-  | "private.per"
-  | "agent.worker_scope"
-  | "defaults.worker_scope"
-  | "unscoped";
+  "private.per" | "agent.worker_scope" | "defaults.worker_scope" | "unscoped";
 export type AgentPoliciesByAgent = Record<string, AgentPolicy>;
 export const DEFAULT_PRIVATE_KNOWLEDGE_PATH = "memory";
 export const SHARED_CONTEXT_FILE_PLACEHOLDER = "SOUL.md";
@@ -16,8 +14,13 @@ export const SHARED_CONTEXT_FILE_PLACEHOLDER = "SOUL.md";
 export interface ModelConfig {
   provider: ProviderType;
   id: string;
+  display_name?: string | null;
+  icon?: string | null;
+  api?: "responses" | "chat_completions" | null;
   context_window?: number | null;
+  stream_idle_timeout_seconds?: number | null;
   host?: string; // For ollama
+  api_key?: string | null; // Model-specific key from config.yaml
   extra_kwargs?: Record<string, unknown>; // Additional provider-specific parameters
 }
 
@@ -28,6 +31,7 @@ export interface MemoryConfig {
     provider: string;
     config: {
       model: string;
+      credentials_service?: string;
       host?: string;
       dimensions?: number;
     };
@@ -35,6 +39,12 @@ export interface MemoryConfig {
   file?: {
     path?: string | null;
     max_entrypoint_lines?: number;
+    max_entrypoint_tokens?: number;
+  };
+  search?: {
+    mode?: MemorySearchMode;
+    include?: string[];
+    include_entrypoint?: boolean;
   };
   auto_flush?: {
     enabled?: boolean;
@@ -75,6 +85,7 @@ export interface KnowledgeGitConfig {
 }
 
 export interface KnowledgeBaseConfig {
+  mode?: "semantic" | "files";
   description?: string;
   path: string;
   watch: boolean;
@@ -102,37 +113,63 @@ export interface AgentPrivateConfig {
 }
 
 export type LearningMode = "always" | "agentic";
-export type CultureMode = "automatic" | "agentic" | "manual";
 
 export type ThreadMode = "thread" | "room";
+
+export interface ResponderAccessConfig {
+  current_room_members?: boolean;
+  members_of_rooms?: string[];
+  users?: string[];
+}
 
 export interface CompactionConfig {
   enabled?: boolean;
   threshold_tokens?: number | null;
   threshold_percent?: number | null;
+  replay_window_tokens?: number | null;
   reserve_tokens?: number;
+  timeout_seconds?: number | null;
   model?: string | null;
+  fallback_model?: string | null;
 }
 
 const DEFAULT_INHERITED_TOOLS = ["scheduler"] as const;
 
+// Every authored compaction field except the model names, which carry their own
+// clear semantics. Keep in sync with CompactionOverrideConfig in the backend:
+// authoring any of these marks the override as authored, which the backend
+// resolves to enabled compaction.
+const COMPACTION_NON_MODEL_FIELDS: readonly (keyof CompactionConfig)[] = [
+  "enabled",
+  "threshold_tokens",
+  "threshold_percent",
+  "replay_window_tokens",
+  "reserve_tokens",
+  "timeout_seconds",
+];
+
+function hasAuthoredNonModelCompactionField(
+  compaction: CompactionConfig,
+): boolean {
+  return COMPACTION_NON_MODEL_FIELDS.some(
+    (field) => compaction[field] !== undefined,
+  );
+}
+
 function isPureCompactionModelClear(compaction: CompactionConfig): boolean {
+  const modelFields = [compaction.model, compaction.fallback_model];
   return (
-    compaction.model === null &&
-    compaction.enabled === undefined &&
-    compaction.threshold_tokens === undefined &&
-    compaction.threshold_percent === undefined &&
-    compaction.reserve_tokens === undefined
+    modelFields.some((value) => value === null) &&
+    modelFields.every((value) => value === null || value === undefined) &&
+    !hasAuthoredNonModelCompactionField(compaction)
   );
 }
 
 function isEmptyCompactionOverride(compaction: CompactionConfig): boolean {
   return (
-    compaction.enabled === undefined &&
     compaction.model === undefined &&
-    compaction.threshold_tokens === undefined &&
-    compaction.threshold_percent === undefined &&
-    compaction.reserve_tokens === undefined
+    compaction.fallback_model === undefined &&
+    !hasAuthoredNonModelCompactionField(compaction)
   );
 }
 
@@ -190,6 +227,8 @@ export interface Agent {
   skills: string[];
   instructions: string[];
   rooms: string[];
+  access?: ResponderAccessConfig;
+  credential_managers?: string[];
   knowledge_bases?: string[];
   context_files?: string[]; // Workspace-relative files loaded into each freshly built agent instance
   markdown?: boolean; // Per-agent markdown override
@@ -209,6 +248,7 @@ export interface Agent {
   num_history_messages?: number | null; // Max messages from history (mutually exclusive with num_history_runs)
   compress_tool_results?: boolean; // Compress tool results in history
   max_tool_calls_from_history?: number | null; // Max tool call messages replayed from history
+  max_tool_calls_per_turn?: number | null; // Max tool calls one turn may execute
   allow_self_config?: boolean; // Allow agent to modify its own configuration via a tool
 }
 
@@ -218,20 +258,19 @@ export interface Team {
   role: string;
   agents: string[]; // List of agent IDs
   rooms: string[];
+  access?: ResponderAccessConfig;
   mode: "coordinate" | "collaborate";
-  model?: string; // Optional team-specific model
+  model?: string | null; // Optional team-specific model; explicit null is invalid at runtime
   compaction?: CompactionConfig | null; // Per-team required-compaction overrides
   num_history_runs?: number | null; // Number of prior scoped runs to include as team history
   num_history_messages?: number | null; // Max team-scoped history messages (mutually exclusive with num_history_runs)
   max_tool_calls_from_history?: number | null; // Max tool call messages replayed from team history
+  max_tool_calls_per_turn?: number | null; // Max tool calls one turn may execute
 }
 
-export interface Culture {
-  id: string; // The key in the cultures object
-  description: string;
-  agents: string[]; // List of agent IDs
-  mode: CultureMode;
-}
+export type TeamConfig = Omit<Team, "id" | "rooms"> & {
+  rooms?: string[];
+};
 
 export interface Room {
   id: string; // Room identifier
@@ -241,11 +280,30 @@ export interface Room {
   model?: string; // Room-specific model override
 }
 
+export interface RoomConfig {
+  display_name?: string;
+  description?: string;
+  join_policy?: "invite" | "knock" | "public";
+  listed?: boolean;
+  encrypted?: boolean;
+  invite_users?: string[];
+  admins?: string[];
+}
+
+export interface RoomDefaultsConfig {
+  join_policy?: "invite" | "knock" | "public";
+  listed?: boolean;
+  encrypted?: boolean;
+  invite_users?: string[];
+  admins?: string[];
+}
+
 export interface VoiceSTTConfig {
-  provider: string;
+  provider: "openai" | "openai_compatible";
   model: string;
   api_key?: string;
   host?: string;
+  extra_kwargs?: Record<string, unknown>;
 }
 
 export interface VoiceLLMConfig {
@@ -260,12 +318,12 @@ export interface VoiceConfig {
 }
 
 export interface Config {
+  administrators?: string[];
   memory: MemoryConfig;
   knowledge_bases?: Record<string, KnowledgeBaseConfig>;
-  cultures?: Record<string, Omit<Culture, "id">>; // Culture configurations
   models: Record<string, ModelConfig>;
   agents: Record<string, Omit<Agent, "id">>;
-  defaults: {
+  defaults?: {
     markdown: boolean;
     learning?: boolean;
     learning_mode?: LearningMode;
@@ -275,19 +333,23 @@ export interface Config {
     worker_tools?: string[]; // Tool names to route through scoped workers by default for all agents
     tools?: string[];
     enable_streaming?: boolean;
+    large_message_strategy?: "sidecar" | "split"; // Oversized message delivery strategy (defaults to sidecar)
     show_stop_button?: boolean;
     num_history_runs?: number | null;
     num_history_messages?: number | null;
     compress_tool_results?: boolean;
     max_tool_calls_from_history?: number | null;
+    max_tool_calls_per_turn?: number; // Default per-turn tool-call budget (1000)
     allow_self_config?: boolean;
   };
   router: {
     model: string;
+    access?: ResponderAccessConfig;
   };
+  rooms?: Record<string, RoomConfig>; // Managed Matrix room metadata
+  room_defaults?: RoomDefaultsConfig; // Defaults for managed Matrix rooms
   room_models?: Record<string, string>; // Room-specific model overrides for teams
-  teams?: Record<string, Omit<Team, "id">>; // Teams configuration
-  tools?: Record<string, unknown>; // Tool configurations
+  teams?: Record<string, TeamConfig>; // Teams configuration
   voice?: VoiceConfig; // Voice configuration
 }
 
@@ -349,18 +411,21 @@ function normalizeCompactionConfig(
     return compaction;
   }
 
-  const normalizedModel =
-    compaction.model === null
+  const normalizeModelName = (
+    modelName: string | null | undefined,
+  ): string | null | undefined =>
+    modelName === null
       ? null
-      : compaction.model?.trim()
-        ? compaction.model.trim()
+      : modelName?.trim()
+        ? modelName.trim()
         : undefined;
   const hasExplicitNullClear = Object.values(compaction).some(
     (value) => value === null,
   );
   const normalizedCompaction: CompactionConfig = {
     ...compaction,
-    model: normalizedModel,
+    model: normalizeModelName(compaction.model),
+    fallback_model: normalizeModelName(compaction.fallback_model),
   };
 
   if (

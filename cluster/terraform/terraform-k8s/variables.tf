@@ -114,7 +114,7 @@ variable "stripe_secret_key" {
 }
 
 variable "stripe_webhook_secret" {
-  description = "Stripe webhook secret"
+  description = "Stripe webhook secret (required when stripe_secret_key is set)"
   type        = string
   sensitive   = true
   default     = ""
@@ -163,6 +163,13 @@ variable "anthropic_api_key" {
 
 variable "openrouter_api_key" {
   description = "OpenRouter API key for MindRoom instances"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "openrouter_provisioning_api_key" {
+  description = "OpenRouter management API key for provisioning per-customer included AI budget keys"
   type        = string
   sensitive   = true
   default     = ""

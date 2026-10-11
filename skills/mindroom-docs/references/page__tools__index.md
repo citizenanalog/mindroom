@@ -1,13 +1,18 @@
 # Tools
 
 MindRoom includes 100+ built-in tools and presets that agents can use to work with files, services, external APIs, and Matrix-native workflows.
+This page covers enabling tools, per-agent tool settings, function filters, presets, update awareness, and dependency installation.
+To find a specific tool, see [Browse By Topic](#browse-by-topic).
 
 ## Enabling Tools
 
-Tools are enabled per-agent in the configuration.
-Each tool entry can be a plain string or a single-key dict with inline config overrides:
+List tools under an agent's `tools`, or under `defaults.tools` to give them to every agent:
 
 ```yaml
+defaults:
+  tools:
+    - scheduler
+
 agents:
   assistant:
     display_name: Assistant
@@ -15,88 +20,164 @@ agents:
     model: sonnet
     tools:
       - file
-      - shell:
-          extra_env_passthrough: "DAWARICH_*"
+      - shell
       - github
       - duckduckgo
 ```
 
-You can also assign tools to all agents globally:
+Each agent gets its own `tools` plus `defaults.tools`, without duplicates.
+The `defaults.tools` default and the per-agent `include_default_tools` opt-out are described in [Agent Configuration](https://docs.mindroom.chat/configuration/agents/).
+Configured MCP servers appear as tools named `mcp_<server_id>`; see [MCP](https://docs.mindroom.chat/mcp/).
+When [`config_manager` or `self_config`](https://docs.mindroom.chat/tools/agent-orchestration/#access-redaction-and-saving) replaces an agent's tool list, tools that stay keep their inline settings.
+
+## Per-Agent Tool Configuration
+
+A tool entry can be a plain name or a single-key mapping of the tool name to inline settings.
+Inline settings change the tool for that agent only.
+Settings under `defaults.tools` apply to every agent that includes default tools.
 
 ```yaml
 defaults:
   tools:
     - scheduler
+    - shell:
+        enable_run_shell_command: true     # every agent
+
+agents:
+  code:
+    tools:
+      - file                               # no inline settings
+      - shell:                             # this agent only
+          extra_env_passthrough: "DAWARICH_*"
+  research:
+    tools:
+      - shell                              # uses the defaults.tools settings
+      - duckduckgo
 ```
 
-`defaults.tools` are merged into each agent's own `tools` list with duplicates removed.
-Set `defaults.tools: []` to disable global default tools, or set `agents.<name>.include_default_tools: false` to opt out a specific agent.
-When the same tool appears in both `defaults.tools` and an agent's `tools` with inline overrides, the per-agent overrides take priority, with non-overlapping keys merged from both.
-See [Per-Agent Tool Configuration](https://docs.mindroom.chat/configuration/agents/#per-agent-tool-configuration) for the full override syntax and merge order.
-Configured MCP servers also appear here as dynamic tools named `mcp_<server_id>`.
-See [MCP](https://docs.mindroom.chat/mcp/) for the `mcp_servers` config and naming rules.
+Each tool's page lists the settings it accepts.
+
+### Security Restrictions
+
+Some fields cannot be set inline:
+
+- `password` fields, such as API keys and tokens, must be set through the dashboard or credential store.
+- Fields MindRoom manages itself, such as `base_dir`, cannot be overridden.
+- Per-agent-only fields, such as the [`usage_stats`](https://docs.mindroom.chat/usage/#usage_stats) tool's `admin_scope`, are rejected in `defaults.tools`.
+
+MindRoom rejects these fields, unknown field names, and values of the wrong type when the config loads, and the unknown-field error lists the allowed fields.
+
+### How Settings Combine
+
+From lowest to highest priority, a tool's settings come from:
+
+1. The tool's built-in defaults.
+2. Saved tool settings from the dashboard or credential store.
+3. `defaults.tools` inline settings.
+4. `agents.<name>.tools` inline settings.
+5. Values MindRoom sets for the agent's runtime, such as its workspace directory.
+
+When a tool appears in both `defaults.tools` and an agent's `tools`, the settings merge field by field.
+Per-agent values win for the same field, and fields set in only one place are kept.
+
+### Clearing An Inherited Override
+
+Set a field to `__MINDROOM_INHERIT__` to keep a tool but drop one inherited `defaults.tools` setting:
+
+```yaml
+defaults:
+  tools:
+    - shell:
+        extra_env_passthrough: "DAWARICH_*"
+        enable_run_shell_command: true
+
+agents:
+  research:
+    tools:
+      - shell:
+          extra_env_passthrough: __MINDROOM_INHERIT__
+```
+
+`research` still inherits `enable_run_shell_command: true`, while `extra_env_passthrough` falls back to the saved tool setting, or to the tool's default when none is saved.
+To drop every default tool and all their settings for an agent instead, set `include_default_tools: false`.
+
+### Filtering Toolkit Functions
+
+Most built-in toolkits accept `include_tools` and `exclude_tools` inline settings to limit which of their functions the agent sees.
+`include_tools` is an allowlist, and `exclude_tools` removes functions from what remains.
+Use the function names the toolkit exposes.
+Tools that do not support filtering reject these fields when the config loads.
+
+```yaml
+agents:
+  research:
+    tools:
+      - searxng:
+          include_tools:
+            - search_web
+            - news_search
+            - image_search
+```
+
+A name the toolkit does not provide fails when the tool loads with `Included tool(s) not present in the toolkit: <names>` or `Excluded tool(s) not present in the toolkit: <names>`.
 
 ## Browse By Topic
 
 - [Execution & Coding](https://docs.mindroom.chat/tools/execution-and-coding/) - Local files, shell, Python, coding helpers, and worker-routed execution tools.
-- [Data & Databases](https://docs.mindroom.chat/tools/data-and-databases/) - SQL, databases, Google Drive files, spreadsheets, tabular analysis, and financial/business datasets.
+- [Background Python Scripts](https://docs.mindroom.chat/tools/background-scripts/) - Long-running Python scripts that call the agent's tools and wake it when something changes.
+- [Worker Computer](https://docs.mindroom.chat/tools/worker-computer/) - A visible browser in the agent's worker that the user can watch and control.
+- [Desktop Bridge](https://docs.mindroom.chat/tools/desktop/) - Operate allowlisted apps, read selected folders, and run approved commands on a local computer.
+- [Minimal Agent Mode](https://docs.mindroom.chat/tools/agent-cli/) - One Bash tool instead of full tool schemas, to cut tokens per request.
+- [Data & Databases](https://docs.mindroom.chat/tools/data-and-databases/) - SQL, databases, Google Docs and Drive files, spreadsheets, tabular analysis, and financial/business datasets.
 - [Web Search](https://docs.mindroom.chat/tools/web-search/) - Search engines and search APIs.
 - [Web Scraping & Browser](https://docs.mindroom.chat/tools/web-scraping-and-browser/) - Crawlers, extractors, browser automation, and page-reading tools.
-- [Research Sources](https://docs.mindroom.chat/tools/research-sources/) - ArXiv, Wikipedia, PubMed, and Hacker News.
+- [Research Sources](https://docs.mindroom.chat/tools/research-sources/) - ArXiv, Google Scholar, Wikipedia, PubMed, and Hacker News.
 - [AI & Generation](https://docs.mindroom.chat/tools/ai-and-generation/) - Image, video, speech, and transcription APIs.
 - [Media & Content](https://docs.mindroom.chat/tools/media-and-content/) - Media processing, brand/media retrieval, and Spotify.
-- [Matrix & Attachments](https://docs.mindroom.chat/tools/matrix-and-attachments/) - Matrix-native messaging, thread tags and summaries, low-level Matrix API access, and attachment-aware workflows.
+- [Matrix & Attachments](https://docs.mindroom.chat/tools/matrix-and-attachments/) - Matrix-native messaging and voice messages, thread tags, resolution, moves, summaries, model overrides, low-level Matrix API access, and attachment-aware workflows.
+- [Matrix Message Tool](https://docs.mindroom.chat/tools/matrix-message/) - Send, read, edit, and react to messages with `matrix_message`.
+- [Agent Chat UI Actions](https://docs.mindroom.chat/tools/chat-ui/) - Bounded requests to reveal an agent computer, open Settings, open Members, or show an [interactive canvas](https://docs.mindroom.chat/canvases/) in MindRoom Chat.
 - [Messaging & Social](https://docs.mindroom.chat/tools/messaging-and-social/) - Email, chat, and social/community integrations.
-- [Project Management](https://docs.mindroom.chat/tools/project-management/) - Git hosting, issue trackers, docs platforms, and task managers.
-- [Calendar & Scheduling](https://docs.mindroom.chat/tools/calendar-and-scheduling/) - Calendar APIs and MindRoom scheduling tools.
-- [Memory & Storage](https://docs.mindroom.chat/tools/memory-and-storage/) - Explicit memory tools and external memory providers.
-- [Agent Orchestration](https://docs.mindroom.chat/tools/agent-orchestration/) - Subagents, delegation, config tools, OpenClaw compatibility, and Claude Agent sessions.
+- [Project Management](https://docs.mindroom.chat/tools/project-management/) - Git hosting, issue trackers, docs platforms, per-thread work plans, and task managers.
+- [Atlassian Cloud](https://docs.mindroom.chat/tools/atlassian/) - Per-user OAuth Jira and Confluence Cloud access, additional connected sites, and attachment downloads.
+- [Calendar & Scheduling](https://docs.mindroom.chat/tools/calendar-and-scheduling/) - Calendar and task APIs and MindRoom scheduling tools.
+- [Memory & Storage](https://docs.mindroom.chat/tools/memory-and-storage/) - Mem0 and Zep external memory services; the built-in [`memory`](https://docs.mindroom.chat/memory/#memory) tool is documented with the memory system.
+- [Agent Orchestration](https://docs.mindroom.chat/tools/agent-orchestration/) - Delegation, Dynamic Workflows, report publishing, config tools, and Claude Agent sessions.
+- [Dynamic Tools](https://docs.mindroom.chat/tools/dynamic-tools/) - Per-tool lazy loading for optional agent capabilities.
 - [Automation & Platforms](https://docs.mindroom.chat/tools/automation-and-platforms/) - Infrastructure automation, generic APIs, and platform aggregators.
 - [Location, Commerce, & Home](https://docs.mindroom.chat/tools/location-commerce-and-home/) - Maps, weather, commerce, and Home Assistant.
 
 ## Tool Presets And Implied Tools
 
-Some entries are config-only presets rather than runtime toolkits.
-`openclaw_compat` expands to a native bundle of MindRoom tools.
-Some tools also imply companion tools through `Config.IMPLIED_TOOLS`.
-Today `matrix_message` implies `attachments`, so the effective tool set includes both even when only `matrix_message` is configured explicitly.
+`openclaw_compat` is a preset that expands to a bundle of MindRoom tools; see [OpenClaw Workspace Import](https://docs.mindroom.chat/openclaw/).
+Enabling `matrix_message` also enables its [companion tools](https://docs.mindroom.chat/tools/matrix-message/#setup).
 
-## Tool Runtime Context
+## MindRoom Update Awareness
 
-When a tool runs inside a Matrix-connected agent, it receives a `ToolRuntimeContext` via a context variable.
-This context carries the current `room_id`, source `thread_id`, canonical `resolved_thread_id`, `requester_id`, `agent_name`, the Matrix client, the active config, and runtime paths.
-`thread_id` preserves the raw inbound thread provenance, while `resolved_thread_id` is the canonical thread scope after compatible plain replies and other transitive resolution are applied.
-Tools like `matrix_message`, `matrix_room`, `thread_tags`, and `matrix_api` use this context to act on the correct room and canonical thread without the caller passing explicit IDs.
-`thread_tags` can also target another authorized room, but it still checks the target room's canonical thread root and requester membership before writing the shared tag state.
-`thread_tags.tag_thread()` and `thread_tags.untag_thread()` still use the active thread when the caller explicitly repeats the current `room_id`.
-`thread_tags.list_thread_tags()` uses the active thread by default, but passing `room_id` without `thread_id` forces room-wide listing even from inside an active thread.
-`thread_tags.list_thread_tags(tag=...)` narrows both thread-specific and room-wide responses to the requested tag only.
-`thread_tags.list_thread_tags(include_tag=..., exclude_tag=...)` filters which threads are returned: `include_tag` keeps only threads with that tag, `exclude_tag` removes threads with that tag. Both can be combined. Unlike `tag` (which narrows the output payload), these filter which threads appear at all.
-`thread_tags` also validates and normalizes predefined payload schemas for `blocked.data.blocked_by`, `waiting.data.waiting_on`, `priority.data.level`, and `due.data.deadline`.
-`thread_tags` intentionally replaces the removed experimental `thread_resolution` tool and does not auto-read old `com.mindroom.thread.resolution` markers.
-`matrix_api` defaults `room_id` to the active room, supports authorized cross-room targeting, never infers event IDs or state keys from thread context, and now also supports room-scoped full-text search through `action="search"`.
+Enable the `update_awareness` tool to tell the agent which MindRoom version is installed and which release is the latest on PyPI.
 
-## Worker-Routed Execution
+```yaml
+defaults:
+  tools:
+    - update_awareness
+```
 
-Some tools default to running in a sandboxed worker container instead of the primary agent process.
-The current worker-routed defaults are `file`, `shell`, `python`, and `coding`.
-Use [Sandbox Proxy Isolation](https://docs.mindroom.chat/deployment/sandbox-proxy/) for deployment details and worker-scope behavior.
-
-## Shared-Only Integrations
-
-Some dashboard integrations are restricted to shared or unscoped execution and cannot be used by agents with isolating worker scopes.
-The current shared-only integrations are `spotify`, `homeassistant`, and all configured `mcp_<server_id>` tools.
+MindRoom checks PyPI at most once every 24 hours and caches the result in `mindroom_data/cache/update_awareness.json`.
+When a newer release exists, the agent mentions it briefly at a natural moment, once per conversation, and does not install it unless the user asks.
+The agent can also call `get_mindroom_update_status()` to report both versions.
 
 ## Automatic Dependency Installation
 
-Each tool declares its optional Python dependencies in `pyproject.toml`.
-When a tool is enabled but its dependencies are missing, MindRoom can auto-install the required extra at runtime.
-Set `MINDROOM_NO_AUTO_INSTALL_TOOLS=1` to disable that behavior.
+When an enabled tool's optional Python dependencies are missing, MindRoom installs them the first time the tool loads.
+Set `MINDROOM_NO_AUTO_INSTALL_TOOLS=1` to disable this.
+When auto-install is disabled or fails, the tool fails to load with `Missing dependencies for tool '<tool>': <packages>`.
+Install the tool's extra manually, for example `pip install 'mindroom[<tool>]'` or `uv sync --extra <tool>` in a source checkout.
 
 ## Related Docs
 
 - [MCP](https://docs.mindroom.chat/mcp/) - Configure native MCP client servers and expose them as MindRoom tools.
 - [Plugins](https://docs.mindroom.chat/plugins/) - Extend MindRoom with custom tools and skills.
+- [Sandbox Proxy](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-routing) - Which tools run in isolated workers and which stay in the primary runtime.
+- [OAuth Onboarding In Conversation](https://docs.mindroom.chat/oauth-framework/#mindroom-managed-oauth-onboarding-in-conversation) - How agents send users links to connect OAuth tools.
 - [Attachments](https://docs.mindroom.chat/attachments/) - Attachment lifecycle and context scoping.
 - [Scheduling](https://docs.mindroom.chat/scheduling/) - Chat command scheduling and task behavior.
-- [OpenClaw Workspace Import](https://docs.mindroom.chat/openclaw/) - `openclaw_compat` preset and workspace portability.

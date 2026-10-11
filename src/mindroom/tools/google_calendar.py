@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import (
+from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
-    register_tool_with_metadata,
 )
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from mindroom.custom_tools.google_calendar import GoogleCalendarTools
@@ -19,11 +20,13 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="google_calendar",
+    file_access=ToolFileAccess.NONE,
     display_name="Google Calendar",
-    description="View and schedule meetings with Google Calendar",
+    description="View calendars and create or update events in Google Calendar",
     category=ToolCategory.PRODUCTIVITY,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.OAUTH,
+    requires_primary_runtime=True,
     auth_provider="google_calendar",
     icon="SiGooglecalendar",
     icon_color="text-blue-600",  # Google Calendar blue
@@ -42,7 +45,7 @@ if TYPE_CHECKING:
             label="Allow Updates",
             type="boolean",
             required=False,
-            default=False,
+            default=True,
             description="Allow the agent to create, update, and delete calendar events",
         ),
     ],
@@ -50,6 +53,7 @@ if TYPE_CHECKING:
         ToolManagedInitArg.RUNTIME_PATHS,
         ToolManagedInitArg.CREDENTIALS_MANAGER,
         ToolManagedInitArg.WORKER_TARGET,
+        ToolManagedInitArg.RUNTIME_CONFIG,
     ),
     dependencies=["google-api-python-client", "google-auth", "google-auth-httplib2", "google-auth-oauthlib"],
     docs_url="https://docs.agno.com/tools/toolkits/others/googlecalendar",

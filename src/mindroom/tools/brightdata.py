@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.brightdata import BrightDataTools
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="brightdata",
+    file_access=ToolFileAccess.NONE,
+    worker_inert_agent_functions=("get_screenshot",),
     display_name="BrightData",
     description="Web scraping, search engine queries, screenshots, and structured data extraction",
     category=ToolCategory.RESEARCH,

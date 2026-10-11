@@ -1,0 +1,1312 @@
+"""Tests for the built-in todo tool."""
+
+from __future__ import annotations
+
+import json
+import sys
+import threading
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from agno.agent import Agent as AgnoAgent
+from agno.team.team import Team as AgnoTeam
+
+import mindroom.custom_tools.todo as todo_module
+import mindroom.custom_tools.todo_template_render as todo_template_render_module
+import mindroom.tool_system.skills as skills_module
+import mindroom.tools  # noqa: F401
+from mindroom.config.access import ResponderAccessConfig
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
+from mindroom.custom_tools.todo_state import todos_path
+from mindroom.message_target import MessageTarget
+from mindroom.session_ids import create_session_id
+from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from mindroom.tool_system.tool_schema_cache import cached_processed_schema
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import (
+    bind_runtime_paths,
+    make_conversation_reader_mock,
+    make_relation_lookup,
+    plant_workspace_entry,
+    runtime_paths_for,
+    test_runtime_paths,
+)
+from tests.identity_helpers import entity_ids
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def _config(tmp_path: Path) -> Config:
+    return bind_runtime_paths(
+        Config(agents={"code": AgentConfig(display_name="Code", rooms=["!room:localhost"])}),
+        runtime_paths=test_runtime_paths(tmp_path),
+    )
+
+
+def _restricted_config(tmp_path: Path) -> Config:
+    """Return a room where anyone listed may use `code`, but only `@user` may address `secret`."""
+    return bind_runtime_paths(
+        Config(
+            agents={
+                "code": AgentConfig(
+                    display_name="Code",
+                    rooms=["!room:localhost"],
+                    access=ResponderAccessConfig(
+                        users=["@user:localhost", "@attacker:localhost", "@bridge:localhost"],
+                    ),
+                ),
+                "secret": AgentConfig(
+                    display_name="Secret",
+                    rooms=["!room:localhost"],
+                    access=ResponderAccessConfig(users=["@user:localhost"]),
+                ),
+            },
+            bot_accounts=["@bridge:localhost"],
+        ),
+        runtime_paths=test_runtime_paths(tmp_path),
+    )
+
+
+def _agent() -> AgnoAgent:
+    return AgnoAgent(name="Code", id="code")
+
+
+def _tool_context(
+    config: Config,
+    *,
+    agent_name: str = "code",
+    room_id: str = "!room:localhost",
+    thread_id: str | None = None,
+    resolved_thread_id: str | None = "$thread-root",
+    requester_id: str = "@user:localhost",
+) -> ToolRuntimeContext:
+    return make_test_tool_runtime_context(
+        agent_name=agent_name,
+        target=MessageTarget(
+            room_id=room_id,
+            source_thread_id=thread_id,
+            resolved_thread_id=resolved_thread_id,
+            reply_to_event_id=None,
+            session_id=create_session_id(room_id, resolved_thread_id),
+        ),
+        requester_id=requester_id,
+        client=AsyncMock(),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
+        room=MagicMock(),
+        storage_path=None,
+    )
+
+
+def _todos_path(config: Config, *, room_id: str, thread_id: str) -> Path:
+    return todos_path(runtime_paths_for(config).storage_root / "todo", room_id, thread_id)
+
+
+def _read_todos(
+    config: Config,
+    *,
+    room_id: str = "!room:localhost",
+    thread_id: str = "$thread-root",
+) -> dict[str, object]:
+    return json.loads(_todos_path(config, room_id=room_id, thread_id=thread_id).read_text(encoding="utf-8"))
+
+
+def _workspace_template_dir(config: Config) -> Path:
+    return runtime_paths_for(config).storage_root / "agents" / "code" / "workspace" / "todo" / "templates"
+
+
+def _write_workspace_template(config: Config, name: str, text: str) -> None:
+    template_dir = _workspace_template_dir(config)
+    template_dir.mkdir(parents=True, exist_ok=True)
+    (template_dir / f"{name}.yaml.j2").write_text(text, encoding="utf-8")
+
+
+def test_todo_is_registered_as_builtin_tool(tmp_path: Path) -> None:
+    """Todo should be available without configuring an external plugin."""
+    config = _config(tmp_path)
+
+    assert "todo" in TOOL_METADATA
+    metadata = TOOL_METADATA["todo"]
+    assert metadata.display_name == "Todo"
+    assert metadata.setup_type == "none"
+    assert metadata.requires_room_context is True
+    assert set(metadata.function_names) == {
+        "add_todo",
+        "list_todos",
+        "plan",
+        "update_todo",
+        "apply_template",
+        "list_templates",
+    }
+
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    assert tool.__class__.__name__ == "TodoTools"
+    assert tool.name == "todo"
+
+
+def test_todo_tool_schemas_include_model_visible_arguments(tmp_path: Path) -> None:
+    """Runtime annotations should resolve so Agno exposes tool-call arguments."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    schemas: dict[str, dict[str, object]] = {}
+    for name, function in tool.functions.items():
+        snapshot = cached_processed_schema(function, strict=False)
+        assert snapshot is not None
+        schemas[name] = snapshot.parameters
+
+    plan_params = schemas["plan"]["properties"]
+    add_params = schemas["add_todo"]["properties"]
+    update_params = schemas["update_todo"]["properties"]
+    apply_template_params = schemas["apply_template"]["properties"]
+
+    assert "tasks" in plan_params
+    assert "title" in add_params
+    assert {"todo_id", "status"}.issubset(update_params)
+    assert {"name", "params"}.issubset(apply_template_params)
+
+
+def test_todo_plan_and_complete_persist_under_current_thread(tmp_path: Path) -> None:
+    """Tool calls should persist a per-thread work plan under MindRoom state."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        result = tool.plan(agent=_agent(), tasks="[high] Design API\nImplement storage")
+
+    assert "Created 2 item" in result
+    state = _read_todos(config)
+    assert state["room_id"] == "!room:localhost"
+    assert state["thread_id"] == "$thread-root"
+    assert [item["title"] for item in state["items"]] == ["Design API", "Implement storage"]
+    assert [item["priority"] for item in state["items"]] == ["high", "medium"]
+    assert [item["assigned_agent"] for item in state["items"]] == ["code", "code"]
+
+    first_id = state["items"][0]["id"]
+    second_id = state["items"][1]["id"]
+    with tool_runtime_context(_tool_context(config)):
+        dep_result = tool.update_todo(agent=_agent(), todo_id=second_id, depends_on=first_id)
+        complete_result = tool.update_todo(agent=_agent(), todo_id=first_id, status="done")
+
+    assert "depends_on" in dep_result
+    assert "Now unblocked" in complete_result
+    updated = _read_todos(config)
+    assert updated["items"][0]["status"] == "done"
+    assert updated["items"][1]["depends_on"] == [first_id]
+    assert updated["items"][0]["completed_at"] == updated["items"][0]["updated_at"] == updated["updated_at"]
+
+
+def test_add_todo_rejects_empty_title(tmp_path: Path) -> None:
+    """A blank title should not create an actionable item."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        result = tool.add_todo(agent=_agent(), title="   ")
+
+    assert result == "Title cannot be empty."
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+def test_todo_defaults_to_member_agent_inside_team_context(tmp_path: Path) -> None:
+    """Team-scoped calls should not use the team id as an invalid assignee."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    member_agent = AgnoAgent(name="Code", id="code")
+
+    with tool_runtime_context(_tool_context(config, agent_name="dev_team")):
+        plan_result = tool.plan(agent=member_agent, tasks="Team plan")
+        add_result = tool.add_todo(agent=member_agent, title="  Team item  ")
+        template_result = tool.apply_template(
+            agent=member_agent,
+            name="mindroom-dev",
+            params={"ISSUE_REF": "ISSUE-1", "REPO": "mindroom"},
+        )
+
+    assert "Created 1 item" in plan_result
+    assert "Created" in add_result
+    assert "Applied template `mindroom-dev`" in template_result
+    state = _read_todos(config)
+    by_title = {item["title"]: item for item in state["items"]}  # type: ignore[union-attr]
+    assert by_title["Team plan"]["assigned_agent"] == "code"
+    assert by_title["Team item"]["title"] == "Team item"
+    assert by_title["Team item"]["assigned_agent"] == "code"
+    assert "dev_team" not in {item["assigned_agent"] for item in state["items"]}  # type: ignore[union-attr]
+
+
+def test_plan_default_and_template_explicit_assignee_precedence(tmp_path: Path) -> None:
+    """Plan and template defaults use the caller, while explicit template assignees win."""
+    config = bind_runtime_paths(
+        Config(
+            agents={
+                "code": AgentConfig(display_name="Code", rooms=["!room:localhost"]),
+                "reviewer": AgentConfig(display_name="Reviewer", rooms=["!room:localhost"]),
+            },
+        ),
+        runtime_paths=test_runtime_paths(tmp_path),
+    )
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "assignee-precedence",
+        """name: assignee-precedence
+version: "1"
+description: Assignee precedence regression.
+todos:
+  - title: Default template item
+  - title: Explicit template item
+    assigned_agent: reviewer
+""",
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.plan(agent=_agent(), tasks="Default plan item")
+        tool.apply_template(agent=_agent(), name="assignee-precedence", params={})
+
+    by_title = {item["title"]: item["assigned_agent"] for item in _read_todos(config)["items"]}  # type: ignore[index]
+    assert by_title == {
+        "Default plan item": "code",
+        "Default template item": "code",
+        "Explicit template item": "reviewer",
+    }
+
+
+def test_todo_team_object_default_assignee_is_unassigned(tmp_path: Path) -> None:
+    """If Agno passes the team object, the team id should not be stored as an assignee."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    team = AgnoTeam(name="dev_team", members=[AgnoAgent(name="code")])
+
+    with tool_runtime_context(_tool_context(config, agent_name="dev_team")):
+        result = tool.add_todo(agent=team, title="Team-owned item")
+
+    assert "Created" in result
+    state = _read_todos(config)
+    assert state["items"][0]["assigned_agent"] == ""  # type: ignore[index]
+
+
+def test_todo_thread_storage_keys_do_not_collide_for_similar_ids(tmp_path: Path) -> None:
+    """Matrix IDs that normalize to the same slug should still use separate state files."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    first_room = "!room-a:localhost"
+    second_room = "!room_a:localhost"
+
+    assert _todos_path(config, room_id=first_room, thread_id="$thread-root") != _todos_path(
+        config,
+        room_id=second_room,
+        thread_id="$thread-root",
+    )
+
+    with tool_runtime_context(_tool_context(config, room_id=first_room)):
+        tool.plan(agent=_agent(), tasks="First room item")
+    with tool_runtime_context(_tool_context(config, room_id=second_room)):
+        tool.plan(agent=_agent(), tasks="Second room item")
+
+    first_state = _read_todos(config, room_id=first_room)
+    second_state = _read_todos(config, room_id=second_room)
+    assert first_state["items"][0]["title"] == "First room item"  # type: ignore[index]
+    assert second_state["items"][0]["title"] == "Second room item"  # type: ignore[index]
+
+
+def test_update_todo_validates_before_mutating_and_can_clear_dependencies(tmp_path: Path) -> None:
+    """Rejected updates should not persist earlier field changes, and empty depends_on clears deps."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.plan(agent=_agent(), tasks="Root\nChild")
+    state = _read_todos(config)
+    root_id = state["items"][0]["id"]  # type: ignore[index]
+    child_id = state["items"][1]["id"]  # type: ignore[index]
+
+    with tool_runtime_context(_tool_context(config)):
+        invalid_result = tool.update_todo(
+            agent=_agent(),
+            todo_id=child_id,
+            title="Mutated title",
+            depends_on="missing",
+        )
+
+    assert "Dependency `missing` not found" in invalid_result
+    unchanged = _read_todos(config)
+    assert unchanged["items"][1]["title"] == "Child"  # type: ignore[index]
+
+    with tool_runtime_context(_tool_context(config)):
+        blank_title_result = tool.update_todo(agent=_agent(), todo_id=child_id, title="   ")
+
+    assert blank_title_result == "Title cannot be empty."
+    unchanged = _read_todos(config)
+    assert unchanged["items"][1]["title"] == "Child"  # type: ignore[index]
+
+    with tool_runtime_context(_tool_context(config)):
+        set_result = tool.update_todo(agent=_agent(), todo_id=child_id, depends_on=root_id)
+        clear_result = tool.update_todo(agent=_agent(), todo_id=child_id, depends_on="")
+
+    assert "depends_on" in set_result
+    assert "depends_on=[]" in clear_result
+    cleared = _read_todos(config)
+    assert cleared["items"][1]["depends_on"] == []  # type: ignore[index]
+
+
+def test_update_todo_rejects_runtime_dependency_cycle(tmp_path: Path) -> None:
+    """Runtime dependency edits should reject cycles and leave existing state unchanged."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.plan(agent=_agent(), tasks="Root\nChild")
+    state = _read_todos(config)
+    root_id = state["items"][0]["id"]  # type: ignore[index]
+    child_id = state["items"][1]["id"]  # type: ignore[index]
+
+    with tool_runtime_context(_tool_context(config)):
+        set_child_dep = tool.update_todo(agent=_agent(), todo_id=child_id, depends_on=root_id)
+        cycle_result = tool.update_todo(agent=_agent(), todo_id=root_id, depends_on=child_id)
+
+    assert "depends_on" in set_child_dep
+    assert cycle_result == f"Adding dependency `{child_id}` would create a cycle."
+    updated = _read_todos(config)
+    assert updated["items"][0]["depends_on"] == []  # type: ignore[index]
+    assert updated["items"][1]["depends_on"] == [root_id]  # type: ignore[index]
+
+
+def test_todo_bundled_templates_are_visible_and_apply(tmp_path: Path) -> None:
+    """Built-in templates should ship with the package and create dependent todos."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+        preview = tool.apply_template(
+            agent=_agent(),
+            name="mindroom-dev",
+            params={"ISSUE_REF": "ISSUE-9", "REPO": "mindroom"},
+            dry_run=True,
+        )
+        result = tool.apply_template(
+            agent=_agent(),
+            name="mindroom-dev",
+            params={"ISSUE_REF": "ISSUE-9", "REPO": "mindroom"},
+        )
+
+    assert "`mindroom-dev`" in listing
+    assert "Preview:" in preview
+    assert "ISSUE-9" in preview
+    assert "- `BRANCH`: `issue-9`" in preview
+    assert "- `BASE`: `origin/main`" in preview
+    assert "Applied template `mindroom-dev`" in result
+    state = _read_todos(config)
+    items = state["items"]
+    assert len(items) > 1
+    assert any(item["depends_on"] for item in items)
+
+
+def test_mindroom_dev_template_keeps_free_text_params_exactly(tmp_path: Path) -> None:
+    """Quotes, backslashes, and emoji in free-text params should reach the todo titles as typed."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    issue_ref = 'Fix "quoted" C:\\temp 🐛'
+    branch = 'fix/"quoted"'
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.apply_template(
+            agent=_agent(),
+            name="mindroom-dev",
+            params={"ISSUE_REF": issue_ref, "BRANCH": branch, "REPO": "mindroom"},
+        )
+
+    titles = [item["title"] for item in _read_todos(config)["items"]]
+    assert titles[0] == f"Create living report for {issue_ref} in the repo notes or task file"
+    assert titles[1] == f"Create implementation plan for {issue_ref} on {branch}"
+    assert titles[3] == f"Run focused automated tests for {issue_ref}"
+    assert titles[-1] == f"Push {branch} and open PR if IS_PR is true"
+
+
+def test_parallel_review_loop_template_allows_unanimous_approval_exit(tmp_path: Path) -> None:
+    """The review-loop template should not force a rerun after first-round approval."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.apply_template(
+            agent=_agent(),
+            name="parallel-review-loop",
+            params={"N_REVIEWERS": 8},
+        )
+
+    items = _read_todos(config)["items"]
+    decision = items[-1]
+
+    assert len(items) == 5
+    assert "re-apply this template" in decision["title"]
+    assert "approve the same current revision" in decision["title"]
+    assert decision["depends_on"] == [items[3]["id"]]
+
+
+def test_mindroom_dev_template_rejects_unknown_param(tmp_path: Path) -> None:
+    """Built-in template params should be schema-checked with extra values forbidden."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with (
+        tool_runtime_context(_tool_context(config)),
+        pytest.raises(ValueError, match="UNKNOWN: Extra inputs are not permitted"),
+    ):
+        tool.apply_template(
+            agent=_agent(),
+            name="mindroom-dev",
+            params={"ISSUE_REF": "ISSUE-9", "REPO": "mindroom", "UNKNOWN": "x"},
+        )
+
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+def test_workspace_template_rejects_out_of_range_depends_on(tmp_path: Path) -> None:
+    """Template depends_on indexes should point at existing authored items."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "bad-dependency-index",
+        """name: bad-dependency-index
+version: "1"
+description: Bad dependency index.
+todos:
+  - title: One
+    depends_on: [2]
+""",
+    )
+
+    with (
+        tool_runtime_context(_tool_context(config)),
+        pytest.raises(ValueError, match=r"depends_on index 2 is out of range 1\.\.1"),
+    ):
+        tool.apply_template(agent=_agent(), name="bad-dependency-index", params={})
+
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+def test_workspace_template_renders_priority_and_depends_on_from_params(tmp_path: Path) -> None:
+    """Jinja in priority and depends_on values should be validated after rendering, like every other value."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "templated-fields",
+        _template_text(
+            "templated-fields",
+            '  - title: One\n  - title: Two\n    priority: "{{ PRIORITY }}"\n    depends_on: ["{{ DEP }}"]\n',
+        ),
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.apply_template(agent=_agent(), name="templated-fields", params={"PRIORITY": "high", "DEP": 1})
+        with pytest.raises(ValueError, match=r"document validation failed: todos\.1\.priority"):
+            tool.apply_template(agent=_agent(), name="templated-fields", params={"PRIORITY": "urgent", "DEP": 1})
+
+    first, second = _read_todos(config)["items"]
+    assert second["priority"] == "high"
+    assert second["depends_on"] == [first["id"]]
+
+
+def test_workspace_template_rejects_dependency_cycle(tmp_path: Path) -> None:
+    """Template expansion should reject cyclic dependency graphs before writing state."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "cyclic-template",
+        """name: cyclic-template
+version: "1"
+description: Cyclic template.
+todos:
+  - title: A
+    depends_on: [2]
+  - title: B
+    depends_on: [1]
+""",
+    )
+
+    with (
+        tool_runtime_context(_tool_context(config)),
+        pytest.raises(ValueError, match="dependency cycle"),
+    ):
+        tool.apply_template(agent=_agent(), name="cyclic-template", params={})
+
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+def test_workspace_template_root_symlink_escape_is_rejected(tmp_path: Path) -> None:
+    """Workspace template discovery should fail closed if the template dir escapes the workspace."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    outside = tmp_path / "outside-templates"
+    outside.mkdir()
+    template_dir = _workspace_template_dir(config)
+    template_dir.parent.mkdir(parents=True, exist_ok=True)
+    template_dir.symlink_to(outside, target_is_directory=True)
+
+    with tool_runtime_context(_tool_context(config)), pytest.raises(ValueError, match="escapes workspace"):
+        tool.list_templates(agent=_agent())
+
+
+def test_list_templates_skips_malformed_workspace_template(tmp_path: Path) -> None:
+    """One broken workspace template should not hide valid workspace or built-in templates."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "valid-workspace",
+        """name: valid-workspace
+version: "1"
+description: Valid workspace template.
+todos:
+  - title: Workspace task
+""",
+    )
+    (_workspace_template_dir(config) / "broken.yaml.j2").write_text(
+        'name: broken\nversion: "1"\ndescription: Broken\ntodos: [\n',
+        encoding="utf-8",
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+
+    assert "`valid-workspace`" in listing
+    assert "`mindroom-dev`" in listing
+    assert "`broken`" not in listing
+
+
+# Only Linux enforces the render child's address-space cap; elsewhere workspace templates only substitute.
+_NEEDS_MEMORY_CAP = pytest.mark.skipif(sys.platform != "linux", reason="needs RLIMIT_AS")
+
+
+def _template_text(name: str, todos: str, *, description: str = "Workspace template.") -> str:
+    return f'name: {name}\nversion: "1"\ndescription: "{description}"\ntodos:\n{todos}'
+
+
+@pytest.mark.parametrize(
+    ("templates", "params", "error"),
+    [
+        pytest.param(
+            {"hostile": _template_text("hostile", "  - title: One\n", description="{{ 'a' * 10**10 }}")},
+            {},
+            "memory limit",
+            id="memory",
+            marks=_NEEDS_MEMORY_CAP,
+        ),
+        pytest.param(
+            {"hostile": _template_text("hostile", "  - title: One\n", description="{{ ''.__class__.__mro__ }}")},
+            {},
+            "unsafe template expression",
+            id="sandbox-escape",
+            marks=_NEEDS_MEMORY_CAP,
+        ),
+        pytest.param(
+            {"hostile": _template_text("hostile", "  - title: One\n", description="{{ X }}" * 100)},
+            {"X": "a" * 1000},
+            "templates rendered by one call exceed",
+            id="rendered-size",
+        ),
+        pytest.param(
+            {
+                "hostile": _template_text(
+                    "hostile",
+                    '  - sub_template: middle\n    params: {A: "' + "1," * 600 + '", P: "\\\\n    depends_on: ["}\n',
+                ),
+                "middle": _template_text(
+                    "middle",
+                    '  - sub_template: leaf\n    params: {A: "{{A}}", P: "{{P}}"}\n' * 50,
+                ),
+                "leaf": _template_text("leaf", "  - title: a\n  - title: b\n") + "# {{P}}" + "{{A}}" * 53 + "1]\n",
+            },
+            {},
+            "templates rendered by one call exceed",
+            id="rendered-size-across-sub-templates",
+        ),
+        pytest.param(
+            {
+                "hostile": _template_text(
+                    "hostile",
+                    "  - sub_template: leaf\n    params: {A: &a [x, x], B: [*a, *a]}\n",
+                ),
+                "leaf": _template_text("leaf", "  - title: Leaf\n"),
+            },
+            {},
+            "aliases",
+            id="aliases",
+        ),
+        pytest.param(
+            {
+                "hostile": _template_text("hostile", "  - sub_template: middle\n" * 20),
+                "middle": _template_text("middle", "  - sub_template: leaf\n" * 20),
+                "leaf": _template_text("leaf", "  - title: Leaf\n" * 20),
+            },
+            {},
+            "at most 100 todos",
+            id="fan-out",
+        ),
+        pytest.param(
+            {
+                "hostile": _template_text("hostile", "  - sub_template: leaf\n" * 40),
+                "leaf": _template_text("leaf", "  - title: Leaf\n") + "#" * 2048 + "\n",
+            },
+            {},
+            "templates read by one call exceed",
+            id="combined-size",
+        ),
+    ],
+)
+def test_workspace_templates_cannot_make_the_primary_render_unbounded_work(
+    tmp_path: Path,
+    templates: dict[str, str],
+    params: dict[str, str],
+    error: str,
+) -> None:
+    """Worker-written templates render under memory, sandbox, alias, size, and fan-out limits."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    for name, text in templates.items():
+        _write_workspace_template(config, name, text)
+
+    with tool_runtime_context(_tool_context(config)), pytest.raises(ValueError, match=error):
+        tool.apply_template(agent=_agent(), name="hostile", params=params, dry_run=True)
+
+
+@_NEEDS_MEMORY_CAP
+def test_workspace_templates_render_jinja_conditionals_and_filters(tmp_path: Path) -> None:
+    """Workspace templates keep full inline Jinja, rendered outside the primary."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "deploy",
+        _template_text(
+            "deploy",
+            "  - title: \"{% if REPO == 'cinny' %}Deploy Cinny{% else %}No deploy for {{ REPO }}{% endif %}\"\n"
+            "  - title: \"Push {{ BRANCH | default('main') | upper }}\"\n"
+            "    depends_on: [1]\n",
+        ),
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        cinny = tool.apply_template(agent=_agent(), name="deploy", params={"REPO": "cinny"}, dry_run=True)
+        other = tool.apply_template(agent=_agent(), name="deploy", params={"REPO": "x"}, dry_run=True)
+
+    assert "- 1. [medium] Deploy Cinny" in cinny
+    assert "- 2. [medium] Push MAIN (depends on 1)" in cinny
+    assert "- 1. [medium] No deploy for x" in other
+
+
+def test_template_renderer_only_substitutes_where_memory_cannot_be_capped() -> None:
+    """Where the address-space limit cannot be installed, expressions are refused before any of them runs."""
+    request = {"template": "{% if true %}x{% endif %}", "params": {}, "max_chars": 100}
+    substitution = {"template": "Fix {{ ISSUE }}", "params": {"ISSUE": "X-1"}, "max_chars": 100}
+
+    refused = todo_template_render_module._render(request, memory_limited=False)
+    rendered = todo_template_render_module._render(substitution, memory_limited=False)
+
+    assert "only substitute" in refused["error"]
+    assert rendered == {"rendered": "Fix X-1"}
+
+
+def test_workspace_template_render_waits_for_another_render_within_its_deadline() -> None:
+    """A render that overlaps another waits for the single slot instead of failing, but never past its time limit."""
+    slots = todo_template_render_module._render_slots
+    render = todo_template_render_module.render_workspace_template
+    slots.acquire()
+    release = threading.Timer(0.2, slots.release)
+    release.start()
+    try:
+        assert render("Fix {{ X }}", {"X": 1}, max_chars=100, timeout_seconds=5) == "Fix 1"
+    finally:
+        release.join()
+
+    slots.acquire()
+    try:
+        with pytest.raises(ValueError, match="time limit"):
+            render("Fix {{ X }}", {"X": 2}, max_chars=100, timeout_seconds=0.1)
+    finally:
+        slots.release()
+
+
+@_NEEDS_MEMORY_CAP
+def test_workspace_template_that_spins_is_stopped_at_the_call_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template that loops without end is killed when the call's render time runs out."""
+    monkeypatch.setattr(todo_module, "_MAX_TEMPLATE_RENDER_SECONDS", 1.0)
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    loops = "{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}"
+    _write_workspace_template(config, "hostile", _template_text("hostile", f"  - title: '{loops}One'\n"))
+
+    with tool_runtime_context(_tool_context(config)), pytest.raises(ValueError, match="time"):
+        tool.apply_template(agent=_agent(), name="hostile", params={}, dry_run=True)
+
+
+def test_workspace_template_file_above_size_cap_is_refused_and_unlisted(tmp_path: Path) -> None:
+    """A workspace template file above 64 KiB is never read in full by the primary."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(config, "oversized", _template_text("oversized", "  - title: One\n") + "#" * 64 * 1024)
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+        with pytest.raises(ValueError, match="exceeds its size limit"):
+            tool.apply_template(agent=_agent(), name="oversized", params={}, dry_run=True)
+
+    assert "`mindroom-dev`" in listing
+    assert "`oversized`" not in listing
+
+
+def test_list_templates_stops_reading_workspace_templates_after_its_budget(tmp_path: Path) -> None:
+    """However many templates worker code plants, one listing reads and returns a bounded amount of their text."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    for index in range(20):
+        name = f"planted-{index:02}"
+        _write_workspace_template(config, name, _template_text(name, "  - title: One\n", description="d" * 60 * 1024))
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+
+    assert "`planted-00`" in listing
+    assert "`planted-19`" not in listing
+    assert "`mindroom-dev`" in listing
+
+
+def test_list_templates_examines_only_the_first_workspace_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """However many entries worker code plants, one listing examines a bounded number of them."""
+    monkeypatch.setattr(skills_module, "_MAX_WORKSPACE_SKILL_SCANNED_ENTRIES", 4)
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    for index in range(10):
+        name = f"planted-{index:02}"
+        _write_workspace_template(config, name, _template_text(name, "  - title: One\n"))
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+
+    assert listing.count("| `workspace` |") == 4
+    assert "`mindroom-dev`" in listing
+
+
+def test_list_templates_charges_unreadable_workspace_templates_against_its_budget(tmp_path: Path) -> None:
+    """Templates that fail to decode still count, and the unread ones still shadow built-ins of the same name."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    template_dir = _workspace_template_dir(config)
+    template_dir.mkdir(parents=True)
+    for index in range(20):
+        (template_dir / f"invalid-{index:02}.yaml.j2").write_bytes(b"\xff" * 60 * 1024)
+    _write_workspace_template(config, "mindroom-dev", _template_text("mindroom-dev", "  - title: One\n"))
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+
+    assert "`mindroom-dev`" not in listing
+    assert "`parallel-review-loop`" in listing
+
+
+@pytest.mark.parametrize("unlisted", ["unscanned", "unparseable"])
+def test_list_templates_hides_builtins_that_unlisted_workspace_templates_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unlisted: str,
+) -> None:
+    """A workspace template the listing leaves out still hides the built-in of its name, because apply_template uses it."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    if unlisted == "unscanned":
+        # The entry scan stops before reaching the template, as when worker code fills the window with other entries.
+        monkeypatch.setattr(skills_module, "_MAX_WORKSPACE_SKILL_SCANNED_ENTRIES", 0)
+        _write_workspace_template(config, "mindroom-dev", _template_text("mindroom-dev", "  - title: Workspace todo\n"))
+    else:
+        _write_workspace_template(config, "mindroom-dev", 'name: mindroom-dev\nversion: "1"\ntodos: [\n')
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+
+    assert "`mindroom-dev`" not in listing
+    assert "`parallel-review-loop`" in listing
+
+
+def test_workspace_template_shadow_uses_workspace_params_schema(tmp_path: Path) -> None:
+    """A workspace template that shadows a built-in name should not inherit the built-in schema."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "mindroom-dev",
+        """name: mindroom-dev
+version: "custom"
+description: Custom workspace shadow.
+todos:
+  - title: Custom {{ CUSTOM }}
+""",
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+        preview = tool.apply_template(
+            agent=_agent(),
+            name="mindroom-dev",
+            params={"CUSTOM": "workspace"},
+            dry_run=True,
+        )
+        result = tool.apply_template(
+            agent=_agent(),
+            name="mindroom-dev",
+            params={"CUSTOM": "workspace"},
+        )
+
+    assert "| `workspace` | `mindroom-dev` | `custom` | Custom workspace shadow. | - |" in listing
+    assert "ISSUE_REF" not in listing
+    assert "Custom workspace" in preview
+    assert "Custom workspace" in result
+
+
+def test_team_member_context_uses_member_workspace_templates(tmp_path: Path) -> None:
+    """Team member calls should resolve workspace templates from the member agent, not the team context."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    member_agent = AgnoAgent(name="Code", id="code")
+    _write_workspace_template(
+        config,
+        "team-member-template",
+        """name: team-member-template
+version: "1"
+description: Member workspace template.
+todos:
+  - title: Member workspace task
+""",
+    )
+
+    with tool_runtime_context(_tool_context(config, agent_name="dev_team")):
+        listing = tool.list_templates(agent=member_agent)
+        result = tool.apply_template(
+            agent=member_agent,
+            name="team-member-template",
+            params={},
+        )
+
+    assert "| `workspace` | `team-member-template` | `1` | Member workspace template. | - |" in listing
+    assert "Applied template `team-member-template`" in result
+    state = _read_todos(config)
+    assert state["items"][0]["title"] == "Member workspace task"  # type: ignore[index]
+    assert state["items"][0]["assigned_agent"] == "code"  # type: ignore[index]
+
+
+def test_missing_todo_read_and_error_paths_do_not_create_thread_state(tmp_path: Path) -> None:
+    """Read-only and missing-item failures should not create empty per-thread state files."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    path = _todos_path(config, room_id="!room:localhost", thread_id="$thread-root")
+
+    with tool_runtime_context(_tool_context(config)):
+        list_result = tool.list_todos(agent=_agent())
+        complete_result = tool.update_todo(agent=_agent(), todo_id="missing", status="done")
+        update_result = tool.update_todo(agent=_agent(), todo_id="missing", title="Still missing")
+        add_result = tool.add_todo(agent=_agent(), title="Blocked item", depends_on="missing")
+
+    assert list_result == "No items in this thread's work plan."
+    assert complete_result == "Todo `missing` not found."
+    assert update_result == "Todo `missing` not found."
+    assert add_result == "Dependency `missing` not found."
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_template_includes_depend_on_all_roots_and_unblock_after_all_terminals(tmp_path: Path) -> None:
+    """Nested templates should preserve multi-root and multi-leaf dependency boundaries."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "multi-child",
+        """name: multi-child
+version: "1"
+description: Child graph with two roots and one terminal.
+todos:
+  - title: Child root A
+  - title: Child root B
+  - title: Child join
+    depends_on: [1, 2]
+""",
+    )
+    _write_workspace_template(
+        config,
+        "parent-flow",
+        """name: parent-flow
+version: "1"
+description: Parent graph using nested child graph.
+todos:
+  - title: Setup
+  - sub_template: multi-child
+    depends_on: [1]
+  - title: After child
+    depends_on: [2]
+""",
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.apply_template(agent=_agent(), name="parent-flow", params={})
+
+    state = _read_todos(config)
+    by_title = {item["title"]: item for item in state["items"]}  # type: ignore[union-attr]
+    setup_id = by_title["Setup"]["id"]
+    child_root_a_id = by_title["Child root A"]["id"]
+    child_root_b_id = by_title["Child root B"]["id"]
+    child_join_id = by_title["Child join"]["id"]
+
+    assert by_title["Child root A"]["depends_on"] == [setup_id]
+    assert by_title["Child root B"]["depends_on"] == [setup_id]
+    assert by_title["Child join"]["depends_on"] == [child_root_a_id, child_root_b_id]
+    assert by_title["After child"]["depends_on"] == [child_join_id]
+
+
+def test_repeated_template_dependencies_are_stored_once(tmp_path: Path) -> None:
+    """Each repeat of a sub-template index would add all its terminals again, so a dependency is stored once."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(config, "leaf", _template_text("leaf", "  - title: Leaf\n" * 3))
+    repeated = ", ".join(["1"] * 1000)
+    _write_workspace_template(
+        config,
+        "parent",
+        _template_text("parent", f"  - sub_template: leaf\n  - title: After leaf\n    depends_on: [{repeated}]\n"),
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.apply_template(agent=_agent(), name="parent", params={})
+
+    items = _read_todos(config)["items"]
+    assert items[-1]["depends_on"] == [item["id"] for item in items[:3]]
+
+
+def test_apply_template_rejects_unknown_assigned_agent(tmp_path: Path) -> None:
+    """Templates should not write assignees outside the configured agent set."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "bad-assignee",
+        """name: bad-assignee
+version: "1"
+description: Invalid assignee.
+todos:
+  - title: Owned elsewhere
+    assigned_agent: missing
+""",
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        result = tool.apply_template(agent=_agent(), name="bad-assignee", params={})
+
+    assert "Unknown agent 'missing'" in result
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+@pytest.mark.parametrize(
+    ("template_title", "params"),
+    [
+        ("   ", {}),
+        ("  {{ TITLE }}  ", {"TITLE": "   "}),
+    ],
+    ids=["literal-whitespace", "rendered-whitespace"],
+)
+def test_apply_template_rejects_empty_stripped_titles(
+    tmp_path: Path,
+    template_title: str,
+    params: dict[str, str],
+) -> None:
+    """Literal and rendered template titles must be nonempty before persistence."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "empty-title",
+        f"""name: empty-title
+version: "1"
+description: Invalid empty title.
+todos:
+  - title: "{template_title}"
+""",
+    )
+
+    with (
+        tool_runtime_context(_tool_context(config)),
+        pytest.raises(ValueError, match="Todo `title` must not be empty"),
+    ):
+        tool.apply_template(agent=_agent(), name="empty-title", params=params)
+
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+def test_todo_refuses_assigning_work_to_agent_the_requester_cannot_address(tmp_path: Path) -> None:
+    """A requester outside an agent's access policy cannot queue work that would wake that agent."""
+    config = _restricted_config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "handoff",
+        """name: handoff
+version: "1"
+description: Hand work to secret.
+todos:
+  - title: Exfiltrate secrets
+    assigned_agent: secret
+""",
+    )
+    refusal = "Cannot give or change todo work for 'secret': that agent is not allowed to reply to you in this room."
+
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        add_result = tool.add_todo(agent=_agent(), title="Exfiltrate secrets", assigned_agent="secret")
+        template_result = tool.apply_template(agent=_agent(), name="handoff", params={})
+        own_result = tool.add_todo(agent=_agent(), title="Own work")
+        own_id = _read_todos(config)["items"][0]["id"]
+        reassign_result = tool.update_todo(agent=_agent(), todo_id=own_id, assigned_agent="secret")
+
+    assert add_result == refusal
+    assert template_result == refusal
+    assert reassign_result == refusal
+    assert "assigned to code" in own_result
+    items = _read_todos(config)["items"]
+    assert [(item["title"], item["assigned_agent"]) for item in items] == [("Own work", "code")]
+    assert items[0]["requester_id"] == "@attacker:localhost"
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+def test_todo_plan_refuses_default_assignee_the_requester_cannot_address(tmp_path: Path) -> None:
+    """A plan for a member whose own access is narrower than its caller's is refused for that requester."""
+    config = _restricted_config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        result = tool.plan(agent=AgnoAgent(name="Secret", id="secret"), tasks="Exfiltrate secrets")
+
+    assert result == (
+        "Cannot give or change todo work for 'secret': that agent is not allowed to reply to you in this room."
+    )
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+def test_todo_refuses_changing_work_assigned_to_agent_the_requester_cannot_address(tmp_path: Path) -> None:
+    """Rewriting another requester's queued work must not inherit that requester's access."""
+    config = _restricted_config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.add_todo(agent=_agent(), title="Review the release", assigned_agent="secret")
+    item_id = _read_todos(config)["items"][0]["id"]
+    before = _read_todos(config)
+
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        retitle_result = tool.update_todo(agent=_agent(), todo_id=item_id, title="Exfiltrate secrets")
+        unassign_result = tool.update_todo(agent=_agent(), todo_id=item_id, assigned_agent=" ")
+
+    assert retitle_result.startswith("Cannot give or change todo work for 'secret'")
+    assert unassign_result.startswith("Cannot give or change todo work for 'secret'")
+    assert _read_todos(config) == before
+    assert before["items"][0]["requester_id"] == "@user:localhost"
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+def test_todo_attributes_items_to_whoever_wrote_the_title(tmp_path: Path) -> None:
+    """Writing a title records the current requester, human or not, and other changes keep that attribution."""
+    config = _restricted_config(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    tool = get_tool_by_name("todo", runtime_paths, worker_target=None)
+    agent_requester = entity_ids(config, runtime_paths)["code"].full_id
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.plan(agent=_agent(), tasks="Planned")
+        tool.add_todo(agent=_agent(), title="Added", assigned_agent="secret")
+        tool.apply_template(agent=_agent(), name="parallel-review-loop", params={"N_REVIEWERS": 1})
+    items = _read_todos(config)["items"]
+    assert {item["requester_id"] for item in items} == {"@user:localhost"}
+
+    planned_id = items[0]["id"]
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        tool.update_todo(agent=_agent(), todo_id=planned_id, priority="high", status="open")
+    assert _read_todos(config)["items"][0]["requester_id"] == "@user:localhost"
+
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        tool.update_todo(agent=_agent(), todo_id=planned_id, title="Attacker title")
+    assert _read_todos(config)["items"][0]["requester_id"] == "@attacker:localhost"
+
+    with tool_runtime_context(_tool_context(config, requester_id="@bridge:localhost")):
+        bridge_result = tool.update_todo(agent=_agent(), todo_id=planned_id, title="Bridged")
+    assert bridge_result.startswith(f"Updated `{planned_id}`")
+    assert _read_todos(config)["items"][0]["requester_id"] == "@bridge:localhost"
+
+    # Agent-to-agent turns are always allowed to address agents, so an agent may queue work for `secret`.
+    with tool_runtime_context(_tool_context(config, requester_id=agent_requester)):
+        agent_result = tool.add_todo(agent=_agent(), title="Agent handoff", assigned_agent="secret")
+    items = _read_todos(config)["items"]
+    assert "assigned to secret" in agent_result
+    assert (items[-1]["title"], items[-1]["requester_id"]) == ("Agent handoff", agent_requester)
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+def test_todo_write_records_requester_on_legacy_item(tmp_path: Path) -> None:
+    """The first write to an item from before requester attribution records the writer, within its access."""
+    config = _restricted_config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.add_todo(agent=_agent(), title="Legacy secret work", assigned_agent="secret")
+        tool.add_todo(agent=_agent(), title="Legacy code work")
+    path = _todos_path(config, room_id="!room:localhost", thread_id="$thread-root")
+    state = _read_todos(config)
+    for item in state["items"]:
+        del item["requester_id"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+    secret_id, code_id = (item["id"] for item in state["items"])
+
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        refused_update = tool.update_todo(agent=_agent(), todo_id=secret_id, priority="high")
+        refused_handoff = tool.update_todo(agent=_agent(), todo_id=code_id, assigned_agent="secret")
+    assert refused_update.startswith("Cannot give or change todo work for 'secret'")
+    assert refused_handoff.startswith("Cannot give or change todo work for 'secret'")
+    assert _read_todos(config) == state
+
+    with tool_runtime_context(_tool_context(config)):
+        tool.update_todo(agent=_agent(), todo_id=secret_id, priority="high")
+        tool.update_todo(agent=_agent(), todo_id=code_id, assigned_agent="secret")
+    items = _read_todos(config)["items"]
+    assert [(item["title"], item["assigned_agent"], item["requester_id"]) for item in items] == [
+        ("Legacy secret work", "secret", "@user:localhost"),
+        ("Legacy code work", "secret", "@user:localhost"),
+    ]
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+def test_todo_reassignment_keeps_title_author_bound_by_new_assignee_policy(tmp_path: Path) -> None:
+    """An authorized human cannot launder another requester's title into an agent that author cannot address."""
+    config = _restricted_config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+
+    with tool_runtime_context(_tool_context(config, requester_id="@attacker:localhost")):
+        tool.add_todo(agent=_agent(), title="Exfiltrate secrets")
+    item_id = _read_todos(config)["items"][0]["id"]
+    before = _read_todos(config)
+
+    with tool_runtime_context(_tool_context(config)):
+        reassign_result = tool.update_todo(agent=_agent(), todo_id=item_id, assigned_agent="secret", priority="high")
+        assert _read_todos(config) == before
+        rewrite_result = tool.update_todo(
+            agent=_agent(),
+            todo_id=item_id,
+            title="Review the release",
+            assigned_agent="secret",
+        )
+
+    assert reassign_result == (
+        f"Cannot give todo `{item_id}` to 'secret': "
+        "the person who wrote it is not allowed to address that agent in this room."
+    )
+    assert rewrite_result.startswith(f"Updated `{item_id}`")
+    item = _read_todos(config)["items"][0]
+    assert (item["title"], item["assigned_agent"], item["requester_id"]) == (
+        "Review the release",
+        "secret",
+        "@user:localhost",
+    )
+
+
+@pytest.mark.parametrize("planted", ["link", "fifo"])
+def test_workspace_template_swapped_after_resolution_is_not_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    planted: str,
+) -> None:
+    """A template replaced by a link or FIFO after it resolved is refused, never read into todos."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "swapped",
+        'name: swapped\nversion: "1"\ndescription: Own template.\ntodos:\n  - title: Own task\n',
+    )
+    victim = tmp_path / "victim.yaml.j2"
+    victim.write_text(
+        'name: swapped\nversion: "1"\ndescription: Victim.\ntodos:\n  - title: victim-only note\n',
+        encoding="utf-8",
+    )
+    resolve_template_path = todo_module._resolve_template_path
+
+    def resolve_then_swap(name: str, template_roots: object) -> object:
+        resolved = resolve_template_path(name, template_roots)
+        plant_workspace_entry(resolved[0], planted, victim)
+        return resolved
+
+    monkeypatch.setattr(todo_module, "_resolve_template_path", resolve_then_swap)
+
+    with tool_runtime_context(_tool_context(config)), pytest.raises((OSError, ValueError)):
+        tool.apply_template(agent=_agent(), name="swapped", params={})
+
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()
+
+
+def test_workspace_template_is_read_through_an_operator_linked_agents_directory(tmp_path: Path) -> None:
+    """An operator symlink for the agents directory still serves workspace templates."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    agents = runtime_paths_for(config).storage_root / "agents"
+    real_agents = tmp_path / "agents-volume"
+    real_agents.mkdir()
+    agents.symlink_to(real_agents, target_is_directory=True)
+    _write_workspace_template(
+        config,
+        "linked",
+        'name: linked\nversion: "1"\ndescription: Linked template.\ntodos:\n  - title: Linked task\n',
+    )
+
+    with tool_runtime_context(_tool_context(config)):
+        listing = tool.list_templates(agent=_agent())
+        result = tool.apply_template(agent=_agent(), name="linked", params={})
+
+    assert "`linked`" in listing
+    assert "Linked task" in result
+
+
+def test_workspace_template_is_not_read_through_a_replaced_workspace(tmp_path: Path) -> None:
+    """A workspace replaced by a link never supplies templates from the link's target."""
+    config = _config(tmp_path)
+    tool = get_tool_by_name("todo", runtime_paths_for(config), worker_target=None)
+    _write_workspace_template(
+        config,
+        "swapped",
+        'name: swapped\nversion: "1"\ndescription: Own template.\ntodos:\n  - title: Own task\n',
+    )
+    workspace = _workspace_template_dir(config).parent.parent
+    victim = tmp_path / "victim-workspace"
+    (victim / "todo" / "templates").mkdir(parents=True)
+    (victim / "todo" / "templates" / "swapped.yaml.j2").write_text(
+        'name: swapped\nversion: "1"\ndescription: Victim.\ntodos:\n  - title: victim-only note\n',
+        encoding="utf-8",
+    )
+    workspace.rename(tmp_path / "moved-workspace")
+    workspace.symlink_to(victim, target_is_directory=True)
+
+    with tool_runtime_context(_tool_context(config)), pytest.raises((OSError, ValueError)):
+        tool.apply_template(agent=_agent(), name="swapped", params={})
+
+    assert not _todos_path(config, room_id="!room:localhost", thread_id="$thread-root").exists()

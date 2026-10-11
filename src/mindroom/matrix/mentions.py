@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mindroom.constants import ROUTER_AGENT_NAME
-from mindroom.entity_resolution import entity_identity_registry
+from mindroom.entity_resolution import current_entity_id, entity_identity_registry
 from mindroom.matrix.identity import MatrixID, parse_current_matrix_user_id
-from mindroom.matrix.message_builder import build_message_content, markdown_to_html
+from mindroom.matrix.message_builder import build_message_content, markdown_fenced_code_ranges, markdown_to_html
+from mindroom.matrix_identifiers import unnamespaced_agent_name_from_username_localpart
 from mindroom.tool_system.events import build_tool_trace_content, ensure_visible_tool_marker_spacing
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.entity_resolution import EntityIdentityRegistry
@@ -20,6 +24,14 @@ if TYPE_CHECKING:
 
 _ENTITY_MENTION_PATTERN = re.compile(r"(?<![\w])@(?P<localpart>\w+)(?::[^\s]+)?", flags=re.IGNORECASE)
 _FULL_MATRIX_ID_CANDIDATE_PATTERN = re.compile(r"(?<![-A-Za-z0-9._=/+])@\S+")
+# Matrix user IDs are at most 255 bytes, so no longer prefix of a token can be one.
+_MAX_MATRIX_USER_ID_LENGTH = 255
+# The longest token prefix shaped like a current-grammar user ID, so each token is validated once.
+_MATRIX_USER_ID_PREFIX_PATTERN = re.compile(
+    r"@[a-z0-9._=/+-]+:(?:\[[0-9A-Fa-f:.]{2,45}\]|[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*)(?::[0-9]{1,5})?",
+)
+# A Matrix event holds at most 64 KiB, so only a resolved long-text sidecar body is longer.
+_MAX_INBOUND_MENTION_SCAN_CHARS = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,8 @@ def parse_mentions_in_text(
     text: str,
     config: Config,
     runtime_paths: RuntimePaths,
+    *,
+    allow_generated_agent_localparts: bool = True,
 ) -> tuple[str, list[str], str]:
     """Parse text for agent/team mentions and return processed text with user IDs.
 
@@ -55,6 +69,7 @@ def parse_mentions_in_text(
         text: Text that may contain @entity_name mentions
         config: Application configuration
         runtime_paths: Explicit runtime context for namespace-aware mention resolution
+        allow_generated_agent_localparts: Whether generated localparts like @mindroom_agent are aliases
 
     Returns:
         Tuple of (plain_text, list_of_mentioned_user_ids, markdown_text_with_links)
@@ -69,6 +84,7 @@ def parse_mentions_in_text(
         tokens,
         registry=registry,
         config=config,
+        allow_generated_agent_localparts=allow_generated_agent_localparts,
     )
 
     return (
@@ -83,8 +99,8 @@ def resolve_mentioned_user_ids_from_text(
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[str]:
-    """Resolve visible text mention tokens to Matrix user IDs."""
-    tokens = _scan_mention_tokens(text)
+    """Resolve visible text mention tokens to Matrix user IDs, scanning at most one Matrix event's worth of text."""
+    tokens = _scan_mention_tokens(_inbound_mention_scan_text(text))
     if not tokens:
         return []
 
@@ -93,26 +109,57 @@ def resolve_mentioned_user_ids_from_text(
         tokens,
         registry=registry,
         config=config,
+        allow_generated_agent_localparts=False,
     )
     return _mentioned_user_ids_from_replacements(replacements)
 
 
+def _inbound_mention_scan_text(text: str) -> str:
+    """Return at most one Matrix event's worth of text, without a token the limit would cut."""
+    if len(text) <= _MAX_INBOUND_MENTION_SCAN_CHARS:
+        return text
+    scan_text = text[:_MAX_INBOUND_MENTION_SCAN_CHARS]
+    if scan_text[-1].isspace() or text[_MAX_INBOUND_MENTION_SCAN_CHARS].isspace():
+        return scan_text
+    # Drop the cut token so a longer mention never resolves as its prefix.
+    cut_token = scan_text.rsplit(maxsplit=1)[-1]
+    return scan_text[: len(scan_text) - len(cut_token)]
+
+
+def format_entity_mention(
+    entity_name: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> tuple[str, list[str], str]:
+    """Return one configured entity mention without resolving unrelated entities."""
+    resolution = _entity_mention_resolution_from_user_id(
+        entity_name,
+        current_entity_id(entity_name, runtime_paths).full_id,
+        config=config,
+    )
+    return resolution.plain_text, [resolution.user_id], resolution.markdown_text
+
+
 def _mentioned_user_ids_from_replacements(replacements: list[_MentionReplacement]) -> list[str]:
     """Return replacement user IDs without duplicates while preserving mention order."""
-    mentioned_user_ids: list[str] = []
-    for replacement in replacements:
-        if replacement.user_id not in mentioned_user_ids:
-            mentioned_user_ids.append(replacement.user_id)
-    return mentioned_user_ids
+    return list(dict.fromkeys(replacement.user_id for replacement in replacements))
 
 
 def _scan_mention_tokens(text: str) -> list[_MentionToken]:
     """Return ordered mention tokens from one message body."""
-    tokens = _scan_explicit_matrix_id_tokens(text)
+    if "@" not in text:
+        return []
+
+    fenced_code_ranges = markdown_fenced_code_ranges(text)
+    tokens = [
+        token
+        for token in _scan_explicit_matrix_id_tokens(text)
+        if not _range_overlaps_existing(token.start, token.end, fenced_code_ranges)
+    ]
     tokens.extend(
         _scan_entity_alias_tokens(
             text,
-            occupied_ranges=[(token.start, token.end) for token in tokens],
+            occupied_ranges=sorted([*fenced_code_ranges, *((token.start, token.end) for token in tokens)]),
         ),
     )
     return sorted(tokens, key=lambda token: token.start)
@@ -169,6 +216,7 @@ def _resolve_mention_tokens(
     *,
     registry: EntityIdentityRegistry,
     config: Config,
+    allow_generated_agent_localparts: bool,
 ) -> list[_MentionReplacement]:
     """Resolve scanned tokens into render-ready replacements."""
     replacements: list[_MentionReplacement] = []
@@ -177,6 +225,7 @@ def _resolve_mention_tokens(
             token,
             registry=registry,
             config=config,
+            allow_generated_agent_localparts=allow_generated_agent_localparts,
         )
         if resolution is None:
             continue
@@ -197,6 +246,7 @@ def _resolve_mention_token(
     *,
     registry: EntityIdentityRegistry,
     config: Config,
+    allow_generated_agent_localparts: bool,
 ) -> _MentionResolution | None:
     """Resolve one scanned mention token into an entity or literal-user target."""
     if token.explicit_user_id is not None:
@@ -210,6 +260,7 @@ def _resolve_mention_token(
         has_server_name=token.has_server_name,
         registry=registry,
         config=config,
+        allow_generated_agent_localparts=allow_generated_agent_localparts,
     )
 
 
@@ -240,11 +291,16 @@ def _resolve_entity_alias_token(
     has_server_name: bool,
     registry: EntityIdentityRegistry,
     config: Config,
+    allow_generated_agent_localparts: bool,
 ) -> _MentionResolution | None:
     """Resolve one alias-style token to a local configured agent or team, if any."""
     if has_server_name:
         return None
-    if entity_name := _find_matching_entity_name_for_localpart(localpart, config):
+    if entity_name := _find_matching_entity_name_for_localpart(
+        localpart,
+        config,
+        allow_generated_agent_localparts=allow_generated_agent_localparts,
+    ):
         return _entity_mention_resolution(
             entity_name,
             registry=registry,
@@ -260,11 +316,23 @@ def _entity_mention_resolution(
     config: Config,
 ) -> _MentionResolution:
     """Return rendering data for one resolved local agent or team mention."""
-    entity_config = config.agents.get(entity_name) or config.teams[entity_name]
-    resolved_user_id = registry.current_id(entity_name).full_id
+    return _entity_mention_resolution_from_user_id(
+        entity_name,
+        registry.current_id(entity_name).full_id,
+        config=config,
+    )
+
+
+def _entity_mention_resolution_from_user_id(
+    entity_name: str,
+    resolved_user_id: str,
+    *,
+    config: Config,
+) -> _MentionResolution:
+    """Return rendering data for one resolved entity user ID."""
     return _MentionResolution(
         plain_text=resolved_user_id,
-        markdown_text=f"[@{entity_config.display_name}](https://matrix.to/#/{resolved_user_id})",
+        markdown_text=f"[@{config.entity_display_name(entity_name)}](https://matrix.to/#/{resolved_user_id})",
         user_id=resolved_user_id,
     )
 
@@ -279,12 +347,11 @@ def _literal_user_resolution(user_id: str) -> _MentionResolution:
 
 
 def _extract_longest_valid_matrix_user_id(token: str) -> str | None:
-    """Return the longest valid Matrix user ID prefix from one non-whitespace token."""
-    for end in range(len(token), 0, -1):
-        candidate = token[:end]
-        if _is_valid_explicit_matrix_user_id(candidate):
-            return candidate
-    return None
+    """Return the longest token prefix shaped like a current-grammar Matrix user ID, when that prefix validates."""
+    match = _MATRIX_USER_ID_PREFIX_PATTERN.match(token[:_MAX_MATRIX_USER_ID_LENGTH])
+    if match is None or not _is_valid_explicit_matrix_user_id(match.group(0)):
+        return None
+    return match.group(0)
 
 
 def _is_valid_explicit_matrix_user_id(candidate: str) -> bool:
@@ -299,11 +366,31 @@ def _is_valid_explicit_matrix_user_id(candidate: str) -> bool:
 def _find_matching_entity_name_for_localpart(
     localpart: str,
     config: Config,
+    *,
+    allow_generated_agent_localparts: bool,
 ) -> str | None:
     """Return the configured agent or team name matched by one localpart string, if any."""
-    lower_localpart = localpart.lower()
+    entities = [*config.agents, *config.teams]
 
-    for entity_name in [*config.agents, *config.teams]:
+    if entity_name := _find_matching_entity_name(localpart, entities):
+        return entity_name
+
+    if not allow_generated_agent_localparts:
+        return None
+
+    generated_name = unnamespaced_agent_name_from_username_localpart(localpart)
+    if generated_name is None or generated_name.lower().startswith("user_"):
+        return None
+    return _find_matching_entity_name(generated_name, entities)
+
+
+def _find_matching_entity_name(
+    localpart: str,
+    entities: list[str],
+) -> str | None:
+    """Return the configured entity name matched by one localpart candidate."""
+    lower_localpart = localpart.lower()
+    for entity_name in entities:
         if entity_name == ROUTER_AGENT_NAME:
             continue
         if entity_name.lower() == lower_localpart:
@@ -314,17 +401,21 @@ def _find_matching_entity_name_for_localpart(
 def resolve_entity_name_for_mention_localpart(
     localpart: str,
     config: Config,
+    *,
+    allow_generated_agent_localparts: bool = True,
 ) -> str | None:
     """Return the configured agent or team name matched by one Matrix mention localpart."""
     return _find_matching_entity_name_for_localpart(
         localpart,
         config,
+        allow_generated_agent_localparts=allow_generated_agent_localparts,
     )
 
 
 def _range_overlaps_existing(start: int, end: int, ranges: list[tuple[int, int]]) -> bool:
-    """Return whether one text span overlaps any existing replacement span."""
-    return any(start < existing_end and end > existing_start for existing_start, existing_end in ranges)
+    """Return whether a text span overlaps sorted, disjoint existing spans."""
+    index = bisect_left(ranges, (end,)) - 1
+    return index >= 0 and start < ranges[index][1]
 
 
 def _apply_replacements(
@@ -366,6 +457,8 @@ def format_message_with_mentions(
     latest_thread_event_id: str | None = None,
     tool_trace: list[ToolTraceEntry] | None = None,
     extra_content: dict[str, Any] | None = None,
+    *,
+    markdown_renderer: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """Parse text for mentions and create properly formatted Matrix message.
 
@@ -380,6 +473,7 @@ def format_message_with_mentions(
         latest_thread_event_id: Optional latest event ID in thread (for fallback compatibility)
         tool_trace: Optional structured tool trace metadata
         extra_content: Optional custom metadata fields merged into content
+        markdown_renderer: Optional response-scoped renderer for repeated Markdown input
 
     Returns:
         Properly formatted content dict for room_send
@@ -394,7 +488,8 @@ def format_message_with_mentions(
 
     # Convert markdown (with links) to HTML
     # The markdown converter will properly handle the [@DisplayName](url) format
-    formatted_html = markdown_to_html(markdown_text)
+    render_markdown = markdown_to_html if markdown_renderer is None else markdown_renderer
+    formatted_html = render_markdown(markdown_text)
     tool_trace_content = build_tool_trace_content(tool_trace)
     merged_extra_content: dict[str, Any] = {}
     if tool_trace_content:

@@ -7,19 +7,51 @@ from typing import TYPE_CHECKING
 import pytest
 
 from mindroom.config.agent import AgentConfig, TeamConfig
+from mindroom.config.calls import CallsConfig, RealtimeCallProfile
 from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME, resolve_runtime_paths
 from mindroom.entity_resolution import (
     DuplicateManagedEntityIdentityError,
     MissingManagedEntityAccountError,
     configured_bot_user_ids_for_room,
+    configured_call_agent_name_for_room,
     entity_identity_registry,
+    persisted_bot_user_ids,
 )
 from mindroom.matrix.state import MatrixState
 from tests.conftest import bind_runtime_paths, runtime_paths_for
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def _call_config(tmp_path: Path, **accept_invites_by_agent: bool) -> Config:
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={},
+    )
+    return bind_runtime_paths(
+        Config(
+            agents={
+                name: AgentConfig(display_name=name.title(), accept_invites=accept_invites)
+                for name, accept_invites in accept_invites_by_agent.items()
+            },
+            calls=CallsConfig(
+                enabled=True,
+                profiles={
+                    "voice": RealtimeCallProfile(
+                        backend="realtime",
+                        model="gpt-realtime",
+                        credentials_service="openai",
+                        voice="marin",
+                    ),
+                },
+                agents=dict.fromkeys(accept_invites_by_agent, "voice"),
+            ),
+        ),
+        runtime_paths=runtime_paths,
+    )
 
 
 def test_configured_bot_user_ids_for_room_includes_agents_teams_and_router(tmp_path: Path) -> None:
@@ -100,6 +132,101 @@ def test_configured_bot_user_ids_for_room_uses_persisted_current_user_ids(tmp_pa
     }
 
 
+def test_configured_call_agent_includes_authorized_ad_hoc_invited_room(tmp_path: Path) -> None:
+    """A calls-enabled agent may answer in a room accepted through its invite policy."""
+    config = _call_config(tmp_path, general=True, other=False)
+    runtime_paths = runtime_paths_for(config)
+    assert (
+        configured_call_agent_name_for_room(
+            config,
+            "!agent-call:server",
+            runtime_paths,
+            invited_rooms_by_agent={"general": {"!agent-call:server"}},
+        )
+        == "general"
+    )
+
+
+def test_configured_call_agent_rejects_ambiguous_invited_room(tmp_path: Path) -> None:
+    """One ad-hoc room cannot silently select between two calls-enabled invitees."""
+    config = _call_config(tmp_path, general=True, other=True)
+    runtime_paths = runtime_paths_for(config)
+    with pytest.raises(ValueError, match="general, other"):
+        configured_call_agent_name_for_room(
+            config,
+            "!agent-call:server",
+            runtime_paths,
+            invited_rooms_by_agent={
+                "general": {"!agent-call:server"},
+                "other": {"!agent-call:server"},
+            },
+        )
+
+
+def test_explicit_call_room_owner_overrides_ambiguous_invited_membership(tmp_path: Path) -> None:
+    """Explicit room configuration wins over stale overlapping invite state."""
+    config = _call_config(tmp_path, general=True, other=True)
+    config.agents["general"].rooms = ["!agent-call:server"]
+
+    assert (
+        configured_call_agent_name_for_room(
+            config,
+            "!agent-call:server",
+            runtime_paths_for(config),
+            invited_rooms_by_agent={
+                "general": {"!agent-call:server"},
+                "other": {"!agent-call:server"},
+            },
+        )
+        == "general"
+    )
+
+
+def test_configured_call_agent_ignores_stale_invites_when_acceptance_is_disabled(tmp_path: Path) -> None:
+    """Disabling invite acceptance revokes persisted ad-hoc call-room ownership."""
+    config = _call_config(tmp_path, general=False)
+    runtime_paths = runtime_paths_for(config)
+    assert (
+        configured_call_agent_name_for_room(
+            config,
+            "!agent-call:server",
+            runtime_paths,
+            invited_rooms_by_agent={"general": {"!agent-call:server"}},
+        )
+        is None
+    )
+
+
+def test_configured_call_agent_uses_live_invited_room_state(tmp_path: Path) -> None:
+    """Call ownership follows the invite lifecycle's current in-memory state."""
+    config = _call_config(tmp_path, general=True)
+    runtime_paths = runtime_paths_for(config)
+    invited_rooms: set[str] = set()
+    invited_rooms_by_agent = {"general": invited_rooms}
+
+    assert (
+        configured_call_agent_name_for_room(
+            config,
+            "!agent-call:server",
+            runtime_paths,
+            invited_rooms_by_agent=invited_rooms_by_agent,
+        )
+        is None
+    )
+
+    invited_rooms.add("!agent-call:server")
+
+    assert (
+        configured_call_agent_name_for_room(
+            config,
+            "!agent-call:server",
+            runtime_paths,
+            invited_rooms_by_agent=invited_rooms_by_agent,
+        )
+        == "general"
+    )
+
+
 def test_entity_identity_registry_uses_only_persisted_current_ids(tmp_path: Path) -> None:
     """Runtime identity should be exact persisted entity aliases to Matrix IDs."""
     config = bind_runtime_paths(
@@ -141,6 +268,25 @@ def test_entity_identity_registry_requires_prepared_entity_accounts(tmp_path: Pa
 
     with pytest.raises(MissingManagedEntityAccountError, match="router"):
         entity_identity_registry(config, runtime_paths)
+
+
+def test_persisted_bot_user_ids_keep_removed_entities_and_skip_internal_user(tmp_path: Path) -> None:
+    """Every persisted bot account counts, whether or not it is configured, but the internal user never does."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={},
+    )
+    state = MatrixState()
+    state.add_account(f"agent_{ROUTER_AGENT_NAME}", "mindroom_router", "pw", domain="server")
+    state.add_account("agent_retired", "mindroom_retired", "pw", domain="server")
+    state.add_account("agent_legacy", "mindroom_legacy", "pw")
+    state.add_account("agent_user", "mindroom_user", "pw", domain="server")
+    state.save(runtime_paths=runtime_paths)
+
+    assert persisted_bot_user_ids(runtime_paths) == frozenset(
+        {"@mindroom_router:server", "@mindroom_retired:server", "@mindroom_legacy:localhost"},
+    )
 
 
 def test_entity_identity_registry_rejects_duplicate_persisted_entity_ids(tmp_path: Path) -> None:

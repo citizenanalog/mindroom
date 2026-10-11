@@ -4,17 +4,48 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn
+
+if TYPE_CHECKING:
+    import pytest
 
 from mindroom import constants as constants_mod
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
-from mindroom.matrix.mentions import format_message_with_mentions, parse_mentions_in_text
+from mindroom.matrix import mentions as mentions_module
+from mindroom.matrix.mentions import (
+    format_message_with_mentions,
+    parse_mentions_in_text,
+    resolve_mentioned_user_ids_from_text,
+)
 from mindroom.matrix.state import MatrixState
 from mindroom.tool_system.events import _TOOL_TRACE_KEY, ToolTraceEntry
+from tests.cpu_budget_helpers import cpu_budget
 from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
 
 _BOUND_RUNTIME_PATHS: dict[int, constants_mod.RuntimePaths] = {}
+
+
+def test_bulk_mentions_bound_overlap_and_deduplication_work() -> None:
+    """Bulk mention scanning and ordered deduplication finish within a bounded CPU budget."""
+    distinct_user_ids = [f"@a{index}:b" for index in range(10_000)]
+    for user_ids, expected_user_ids in (
+        (["@a:b"] * 12_000, ["@a:b"]),
+        ([*distinct_user_ids, *distinct_user_ids[:2]], distinct_user_ids),
+    ):
+        text = " ".join(user_ids) + " "
+        with cpu_budget(0.5):
+            tokens = mentions_module._scan_mention_tokens(text)
+        assert [token.explicit_user_id for token in tokens] == user_ids
+
+        replacements = [
+            mentions_module._MentionReplacement(start=0, end=0, plain_text="", markdown_text="", user_id=user_id)
+            for user_id in user_ids
+        ]
+        with cpu_budget(0.5):
+            mentioned_user_ids = mentions_module._mentioned_user_ids_from_replacements(replacements)
+        assert mentioned_user_ids == expected_user_ids
 
 
 def _default_runtime_paths() -> constants_mod.RuntimePaths:
@@ -98,6 +129,69 @@ class TestMentionParsing:
         assert processed == "Hey @actual_calculator:localhost can you help with this?"
         assert mentions == ["@actual_calculator:localhost"]
 
+    def test_parse_without_at_skips_regex_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Plain text without @ cannot contain mentions, so skip regex scanner work."""
+        config = _make_config(_default_runtime_paths())
+
+        def fail_scan(*_args: object, **_kwargs: object) -> NoReturn:
+            msg = "mention regex scanner should not run without @"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr("mindroom.matrix.mentions._scan_explicit_matrix_id_tokens", fail_scan)
+        monkeypatch.setattr("mindroom.matrix.mentions._scan_entity_alias_tokens", fail_scan)
+
+        processed, mentions, markdown = _parse_mentions_in_text("plain **markdown** text", config)
+
+        assert processed == "plain **markdown** text"
+        assert markdown == "plain **markdown** text"
+        assert mentions == []
+
+    def test_parse_validates_at_most_one_user_id_length_of_an_overlong_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 64 KiB single-token body validates only prefixes a Matrix user ID could be, not every prefix."""
+        config = _make_config(_default_runtime_paths())
+        validated: list[str] = []
+        original = mentions_module._is_valid_explicit_matrix_user_id
+
+        def counting_validation(candidate: str) -> bool:
+            validated.append(candidate)
+            return original(candidate)
+
+        monkeypatch.setattr(mentions_module, "_is_valid_explicit_matrix_user_id", counting_validation)
+        token = "@calculator:localhost" + "x" * (64 * 1024)
+
+        _parse_mentions_in_text(token, config)
+
+        assert len(validated) <= 255
+        assert max(map(len, validated)) <= 255
+
+    def test_resolving_a_2_mib_sidecar_body_stays_within_a_cpu_budget(self) -> None:
+        """A resolved long-text body full of mention-like tokens costs a bounded scan, and real mentions still resolve."""
+        config = _make_config(_default_runtime_paths())
+        runtime_paths = _runtime_paths_for(config)
+        for token in ("@" + "a" * 100 + ":!" + "b" * 150, "@a"):
+            body = "@calculator please ask @alice:example.org " + " ".join([token] * (2 * 1024 * 1024 // len(token)))
+            with cpu_budget(0.2):
+                user_ids = resolve_mentioned_user_ids_from_text(body, config, runtime_paths)
+            assert user_ids == ["@actual_calculator:localhost", "@alice:example.org"]
+
+    def test_resolving_an_overlong_body_drops_the_token_cut_by_the_scan_limit(self) -> None:
+        """A mention straddling the scan limit is dropped instead of resolving its cut-off prefix."""
+        config = _make_config(_default_runtime_paths())
+        runtime_paths = _runtime_paths_for(config)
+        limit = mentions_module._MAX_INBOUND_MENTION_SCAN_CHARS
+        for mention, kept_length, expected_user_ids in (
+            ("@calculator_notes", len("@calculator"), ["@actual_email:localhost"]),
+            ("@alice:example.org", len("@alice:example.o"), ["@actual_email:localhost"]),
+            ("@calculator ", len("@calculator"), ["@actual_email:localhost", "@actual_calculator:localhost"]),
+        ):
+            filler = "@email " + "x" * (limit - len("@email ") - kept_length - 1) + " "
+            body = filler + mention + " trailing"
+            assert body[:limit] == filler + mention[:kept_length]
+            assert resolve_mentioned_user_ids_from_text(body, config, runtime_paths) == expected_user_ids
+
     def test_parse_multiple_mentions(self) -> None:
         """Test parsing multiple agent mentions."""
         config = _make_config(_default_runtime_paths())
@@ -109,15 +203,15 @@ class TestMentionParsing:
         assert set(mentions) == {"@actual_calculator:localhost", "@actual_general:localhost"}
         assert len(mentions) == 2
 
-    def test_parse_with_generated_looking_localpart_does_not_resolve(self) -> None:
-        """Generated-looking localparts are not aliases unless configured exactly."""
+    def test_parse_with_generated_looking_localpart_resolves_entity_alias(self) -> None:
+        """Generated Matrix localparts also work as stable entity aliases."""
         config = _make_config(_default_runtime_paths())
 
         text = "Ask @mindroom_calculator for help"
         processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "Ask @mindroom_calculator for help"
-        assert mentions == []
+        assert processed == "Ask @actual_calculator:localhost for help"
+        assert mentions == ["@actual_calculator:localhost"]
 
     def test_parse_with_generated_looking_full_mxid_stays_literal(self) -> None:
         """Generated-looking full MXIDs are preserved as explicit literal users."""
@@ -316,8 +410,8 @@ class TestMentionParsing:
         assert content["body"] == "@actual_general_live:localhost could you help with this?"
         assert content["m.mentions"]["user_ids"] == ["@actual_general_live:localhost"]
 
-    def test_format_message_rejects_stale_generated_username_after_drift(self, tmp_path: Path) -> None:
-        """After username drift, stale generated localparts should not retarget the live account."""
+    def test_format_message_resolves_generated_alias_after_username_drift(self, tmp_path: Path) -> None:
+        """Generated aliases target the current account even after username drift."""
         runtime_paths = constants_mod.resolve_runtime_paths(
             config_path=tmp_path / "config.yaml",
             storage_path=tmp_path / "mindroom_data",
@@ -336,8 +430,8 @@ class TestMentionParsing:
             "@mindroom_general could you help with this?",
         )
 
-        assert content["body"] == "@mindroom_general could you help with this?"
-        assert "m.mentions" not in content
+        assert content["body"] == "@actual_general_live:localhost could you help with this?"
+        assert content["m.mentions"]["user_ids"] == ["@actual_general_live:localhost"]
 
     def test_format_message_rejects_stale_generated_full_mxid_after_drift(self, tmp_path: Path) -> None:
         """After username drift, stale generated full MXIDs should stay literal."""
@@ -526,6 +620,47 @@ class TestMentionParsing:
             == '<p>Mind ID is <a href="https://matrix.to/#/@mindroom_mind_5ckzneqq:mindroom.chat">'
             "@mindroom_mind_5ckzneqq:mindroom.chat</a>.</p>\n"
         )
+
+    def test_format_message_keeps_fenced_matrix_ids_literal(self) -> None:
+        """Fenced commands should not turn literal Matrix IDs into Markdown links."""
+        config = _make_config(_default_runtime_paths())
+        text = (
+            "Ask @calculator before running:\n\n"
+            "```bash\n"
+            "mindroom desktop pair --user-id @alice:example.org "
+            "--controller-user-id @actual_code:localhost\n"
+            "```\n\n"
+            "Then ask @code."
+        )
+
+        content = _format_message_with_mentions(config, text)
+
+        assert content["body"] == (
+            "Ask @actual_calculator:localhost before running:\n\n"
+            "```bash\n"
+            "mindroom desktop pair --user-id @alice:example.org "
+            "--controller-user-id @actual_code:localhost\n"
+            "```\n\n"
+            "Then ask @actual_code:localhost."
+        )
+        assert content["m.mentions"]["user_ids"] == [
+            "@actual_calculator:localhost",
+            "@actual_code:localhost",
+        ]
+        assert "https://matrix.to/#/@alice:example.org" not in content["formatted_body"]
+        assert content["formatted_body"].count("https://matrix.to/#/@actual_code:localhost") == 1
+
+    def test_format_message_rejects_invalid_backtick_fence_opener(self) -> None:
+        """Backticks in a backtick fence info string should leave later prose outside code."""
+        config = _make_config(_default_runtime_paths())
+
+        content = _format_message_with_mentions(
+            config,
+            "```bash `invalid\nPing @alice:example.org",
+        )
+
+        assert content["m.mentions"]["user_ids"] == ["@alice:example.org"]
+        assert "https://matrix.to/#/@alice:example.org" in content["formatted_body"]
 
     def test_format_message_with_full_matrix_user_id_excludes_sentence_period(self) -> None:
         """Sentence punctuation should not become part of a full Matrix ID mention."""
@@ -717,8 +852,8 @@ class TestMentionParsing:
         assert mentions == ["@actual_mindroom_dev:localhost"]
         assert processed == "@actual_mindroom_dev:localhost can you look at this?"
 
-    def test_generated_localpart_for_prefixed_agent_key_does_not_resolve(self) -> None:
-        """Generated-looking localparts are not aliases for prefixed config keys."""
+    def test_generated_localpart_for_prefixed_agent_key_resolves(self) -> None:
+        """Generated aliases also work for entity keys that start with mindroom_."""
         runtime_paths = _default_runtime_paths()
         config = _bind_config(
             runtime_paths,
@@ -730,8 +865,8 @@ class TestMentionParsing:
         text = "@mindroom_mindroom_dev help"
         processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert mentions == []
-        assert processed == "@mindroom_mindroom_dev help"
+        assert mentions == ["@actual_mindroom_dev:localhost"]
+        assert processed == "@actual_mindroom_dev:localhost help"
 
     def test_prefixed_agent_key_alias_survives_persisted_username_drift(self, tmp_path: Path) -> None:
         """Configured entity keys remain stable mention aliases after username drift."""
@@ -801,14 +936,14 @@ class TestMentionParsing:
         assert mentions == ["@actual_mindroom_calculator:localhost"]
         assert processed == "@actual_mindroom_calculator:localhost help"
 
-    def test_uppercase_generated_looking_mentions_do_not_resolve_without_exact_alias(self) -> None:
-        """Generated-looking aliases do not resolve through prefix stripping."""
+    def test_uppercase_generated_looking_mentions_resolve_case_insensitively(self) -> None:
+        """Generated aliases resolve with the same case-insensitive matching as direct aliases."""
         config = _make_config(_default_runtime_paths())
 
         processed, mentions, _markdown = _parse_mentions_in_text("@MINDROOM_calculator help", config)
 
-        assert mentions == []
-        assert processed == "@MINDROOM_calculator help"
+        assert mentions == ["@actual_calculator:localhost"]
+        assert processed == "@actual_calculator:localhost help"
 
     def test_case_insensitive_mentions(self) -> None:
         """Test that mentions are case-insensitive."""

@@ -1,14 +1,17 @@
 """Admin-only routes for platform management."""
 
-from collections import defaultdict
-from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from backend.config import PROVISIONER_API_KEY, logger
-from pydantic import BaseModel
-from backend.deps import ensure_supabase, limiter, verify_admin
-from backend.utils.audit import create_audit_log
+from backend.config import ENABLE_CLEANUP_SCHEDULER, INSTANCE_TEARDOWN_GRACE_DAYS, logger
+from backend.deps import (
+    ACTIVE_ACCOUNT_STATUS,
+    account_may_sign_in,
+    ensure_supabase,
+    invalidate_account_auth_cache,
+    limiter,
+    verify_admin,
+)
 from backend.models import (
     ActionResult,
     AdminAccountDetailsResponse,
@@ -16,26 +19,24 @@ from backend.models import (
     AdminDashboardMetricsResponse,
     AdminDeleteResponse,
     AdminGetOneResponse,
+    AdminInstanceLifecycleResponse,
     AdminListResponse,
-    AdminLogoutResponse,
     AdminStatsOut,
     AdminUpdateResponse,
     ProvisionResponse,
     SyncResult,
     UpdateAccountStatusResponse,
 )
-from backend.routes.provisioner import (
-    provision_instance,
-    restart_instance_provisioner,
-    start_instance_provisioner,
-    stop_instance_provisioner,
-    sync_instances,
-    uninstall_instance,
-)
+from backend.pricing import PRICING_CONFIG_MODEL
+from backend.services import instance_lifecycle, instances_data, provisioner_service
+from backend.utils.audit import create_audit_log
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 
 router = APIRouter()
-ALLOWED_RESOURCES = {"accounts", "subscriptions", "instances", "audit_logs", "usage_metrics"}
+ALLOWED_RESOURCES = {"accounts", "subscriptions", "instances", "audit_logs"}
+# The accounts.status CHECK constraint allows exactly these values.
+ACCOUNT_STATUSES = ("active", "suspended", "deleted", "pending_verification")
 
 
 def audit_log_entry(
@@ -53,6 +54,17 @@ def audit_log_entry(
     )
 
 
+def _monthly_plan_prices_usd() -> dict[str, int]:
+    """Return configured monthly prices in dollars for automatic MRR estimates."""
+    prices: dict[str, int] = {}
+    for tier, plan in PRICING_CONFIG_MODEL.plans.items():
+        if isinstance(plan.price_monthly, int):
+            prices[tier] = plan.price_monthly // 100
+        else:
+            prices[tier] = 0
+    return prices
+
+
 @router.get("/admin/stats", response_model=AdminStatsOut)
 @limiter.limit("30/minute")
 async def get_admin_stats(request: Request, admin: Annotated[dict, Depends(verify_admin)]) -> dict[str, Any]:  # noqa: FAST002, B008, ARG001
@@ -62,7 +74,9 @@ async def get_admin_stats(request: Request, admin: Annotated[dict, Depends(verif
 
     try:
         accounts = sb.table("accounts").select("*", count="exact").execute()
-        subscriptions = sb.table("subscriptions").select("*", count="exact").eq("status", "active").execute()
+        subscriptions = (
+            sb.table("subscriptions").select("*", count="exact").eq("status", "active").neq("tier", "free").execute()
+        )
         instances = sb.table("instances").select("*", count="exact").eq("status", "running").execute()
 
         # Get recent activity for dashboard
@@ -91,26 +105,15 @@ async def get_admin_stats(request: Request, admin: Annotated[dict, Depends(verif
         raise HTTPException(status_code=500, detail="Failed to fetch statistics") from e
 
 
-# Generic proxy for instance management actions
-async def _proxy_to_provisioner(
-    request: Request,
-    provisioner_func: Callable,
-    instance_id: int,
-    admin: Annotated[dict, Depends(verify_admin)],  # noqa: ARG001
-) -> dict[str, Any]:
-    """Proxy request to provisioner with API key."""
-    return await provisioner_func(request, instance_id, f"Bearer {PROVISIONER_API_KEY}")
-
-
 @router.post("/admin/instances/{instance_id}/start", response_model=ActionResult)
 @limiter.limit("10/minute")
 async def admin_start_instance(
-    request: Request,
+    request: Request,  # noqa: ARG001
     instance_id: int,
     admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008
 ) -> dict[str, Any]:
-    """Start an instance (admin proxy)."""
-    result = await _proxy_to_provisioner(request, start_instance_provisioner, instance_id, admin)
+    """Start an instance."""
+    result = await provisioner_service.start_instance(instance_id)
     audit_log_entry(account_id=admin["user_id"], action="start", resource_type="instance", resource_id=str(instance_id))
     return result
 
@@ -118,12 +121,12 @@ async def admin_start_instance(
 @router.post("/admin/instances/{instance_id}/stop", response_model=ActionResult)
 @limiter.limit("10/minute")
 async def admin_stop_instance(
-    request: Request,
+    request: Request,  # noqa: ARG001
     instance_id: int,
     admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008
 ) -> dict[str, Any]:
-    """Stop an instance (admin proxy)."""
-    result = await _proxy_to_provisioner(request, stop_instance_provisioner, instance_id, admin)
+    """Stop an instance."""
+    result = await provisioner_service.stop_instance(instance_id)
     audit_log_entry(account_id=admin["user_id"], action="stop", resource_type="instance", resource_id=str(instance_id))
     return result
 
@@ -131,12 +134,12 @@ async def admin_stop_instance(
 @router.post("/admin/instances/{instance_id}/restart", response_model=ActionResult)
 @limiter.limit("10/minute")
 async def admin_restart_instance(
-    request: Request,
+    request: Request,  # noqa: ARG001
     instance_id: int,
     admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008
 ) -> dict[str, Any]:
-    """Restart an instance (admin proxy)."""
-    result = await _proxy_to_provisioner(request, restart_instance_provisioner, instance_id, admin)
+    """Restart an instance."""
+    result = await provisioner_service.restart_instance(instance_id)
     audit_log_entry(
         account_id=admin["user_id"], action="restart", resource_type="instance", resource_id=str(instance_id)
     )
@@ -146,12 +149,12 @@ async def admin_restart_instance(
 @router.delete("/admin/instances/{instance_id}/uninstall", response_model=ActionResult)
 @limiter.limit("2/minute")
 async def admin_uninstall_instance(
-    request: Request,
+    request: Request,  # noqa: ARG001
     instance_id: int,
     admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008
 ) -> dict[str, Any]:
-    """Uninstall an instance (admin proxy)."""
-    result = await _proxy_to_provisioner(request, uninstall_instance, instance_id, admin)
+    """Uninstall an instance."""
+    result = await provisioner_service.uninstall_instance(instance_id)
     audit_log_entry(
         account_id=admin["user_id"], action="uninstall", resource_type="instance", resource_id=str(instance_id)
     )
@@ -170,41 +173,60 @@ async def admin_provision_instance(
     sb = ensure_supabase()
 
     # Get instance details
-    result = sb.table("instances").select("*").eq("instance_id", str(instance_id)).execute()
-    if not result.data:
+    instance = instances_data.get_instance(sb, instance_id)
+    if instance is None:
         raise HTTPException(status_code=404, detail="Instance not found")
 
-    instance = result.data[0]
     if instance.get("status") not in ["deprovisioned", "error"]:
         raise HTTPException(status_code=400, detail="Instance must be deprovisioned or in error state to provision")
 
-    # Call provisioner with existing instance data
+    # The subscription's tier, not the instance's copy of an older one, decides the resources and AI budget.
+    subscriptions = sb.table("subscriptions").select("tier").eq("id", instance["subscription_id"]).limit(1).execute()
+    if not subscriptions.data:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Call the provisioner service with existing instance data
     data = {
         "subscription_id": instance.get("subscription_id"),
         "account_id": instance.get("account_id"),
-        "tier": instance.get("tier", "free"),
+        "tier": subscriptions.data[0]["tier"],
         "instance_id": instance_id,  # Re-use existing instance ID
     }
 
-    # provision_instance expects: request, data, authorization, background_tasks
-    result = await provision_instance(
-        request=request, data=data, authorization=f"Bearer {PROVISIONER_API_KEY}", background_tasks=background_tasks
-    )
+    result = await provisioner_service.provision_instance(sb, data=data, background_tasks=background_tasks)
     audit_log_entry(
         account_id=admin["user_id"],
         action="provision",
         resource_type="instance",
         resource_id=str(instance_id),
-        details={"account_id": instance.get("account_id"), "tier": instance.get("tier")},
+        details={"account_id": instance.get("account_id"), "tier": data["tier"]},
     )
     return result
 
 
+@router.get("/admin/instance-lifecycle", response_model=AdminInstanceLifecycleResponse)
+@limiter.limit("30/minute")
+async def get_instance_lifecycle(
+    request: Request,  # noqa: ARG001
+    admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008, ARG001
+) -> dict[str, Any]:
+    """Show the last nightly cleanup run, instances pending teardown, and stuck lifecycle states."""
+    runs = ensure_supabase().table("cleanup_runs").select("*").order("started_at", desc=True).limit(1).execute()
+    pending, stuck = instance_lifecycle.lifecycle_overview()
+    return {
+        "cleanup_scheduler_enabled": ENABLE_CLEANUP_SCHEDULER,
+        "teardown_grace_days": INSTANCE_TEARDOWN_GRACE_DAYS,
+        "last_run": runs.data[0] if runs.data else None,
+        "pending_teardown": pending,
+        "stuck": stuck,
+    }
+
+
 @router.post("/admin/sync-instances", response_model=SyncResult)
 @limiter.limit("5/minute")
-async def admin_sync_instances(request: Request, admin: Annotated[dict, Depends(verify_admin)]) -> dict[str, Any]:  # noqa: FAST002, B008
-    """Sync instance states between database and Kubernetes (admin proxy)."""
-    result = await sync_instances(request, f"Bearer {PROVISIONER_API_KEY}")
+async def admin_sync_instances(request: Request, admin: Annotated[dict, Depends(verify_admin)]) -> dict[str, Any]:  # noqa: FAST002, B008, ARG001
+    """Sync instance states between database and Kubernetes."""
+    result = await provisioner_service.sync_instances(ensure_supabase())
     audit_log_entry(
         account_id=admin["user_id"],
         action="sync",
@@ -241,15 +263,13 @@ async def get_account_details(
         )
 
         # Get instances if exist
-        instances_result = (
-            sb.table("instances").select("*").eq("account_id", account_id).order("created_at", desc=True).execute()
-        )
+        instances = instances_data.get_instances_for_account(sb, account_id, newest_first=True)
 
         # Build response
         return {
             "account": account,
             "subscription": subscription_result.data[0] if subscription_result.data else None,
-            "instances": instances_result.data if instances_result.data else [],
+            "instances": instances,
         }
     except HTTPException:
         raise
@@ -265,6 +285,19 @@ class UpdateAccountStatusRequest(BaseModel):
     reason: str | None = None
 
 
+def _update_account_auth_ban(sb: Any, account: dict[str, Any]) -> None:
+    """Ban Auth sign-in for a saved account that every platform route refuses; failed updates can be retried.
+
+    An account awaiting deletion stays unbanned so its owner can still cancel the deletion.
+    """
+    try:
+        sb.auth.admin.update_user_by_id(
+            account["id"], {"ban_duration": "none" if account_may_sign_in(account) else "876000h"}
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to update account authentication") from exc
+
+
 @router.put("/admin/accounts/{account_id}/status", response_model=UpdateAccountStatusResponse)
 async def update_account_status(
     account_id: str,
@@ -274,11 +307,20 @@ async def update_account_status(
     """Update account status (active, suspended, etc)."""
     sb = ensure_supabase()
 
-    valid_statuses = ["active", "suspended", "deleted", "pending_verification"]
-    if request.status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")
+    if request.status not in ACCOUNT_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {list(ACCOUNT_STATUSES)}")
 
     try:
+        # Setting active would leave deleted_at set, which keeps the account refused everywhere.
+        if request.status == ACTIVE_ACCOUNT_STATUS:
+            account = sb.table("accounts").select("deleted_at").eq("id", account_id).execute()
+            if account.data and account.data[0].get("deleted_at") is not None:
+                raise HTTPException(  # noqa: TRY301
+                    status_code=409,
+                    detail=(
+                        "Account is awaiting deletion. Set its status to deleted so the owner can cancel the deletion."
+                    ),
+                )
         result = (
             sb.table("accounts")
             .update({"status": request.status, "updated_at": datetime.now(UTC).isoformat()})
@@ -288,6 +330,8 @@ async def update_account_status(
 
         if not result.data:
             raise HTTPException(status_code=404, detail="Account not found")  # noqa: TRY301
+        # The database's id spelling is the one cached auth entries carry.
+        invalidate_account_auth_cache(result.data[0]["id"])
 
         audit_log_entry(
             account_id=admin["user_id"],
@@ -296,17 +340,14 @@ async def update_account_status(
             resource_id=account_id,
             details={"status": request.status, "reason": request.reason},
         )
+        _update_account_auth_ban(sb, result.data[0])
 
         return {"status": "success", "account_id": account_id, "new_status": request.status}  # noqa: TRY300
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Error updating account status")
         raise HTTPException(status_code=500, detail="Failed to update account status") from e
-
-
-@router.post("/admin/auth/logout", response_model=AdminLogoutResponse)
-async def admin_logout() -> dict[str, bool]:
-    """Admin logout placeholder."""
-    return {"success": True}
 
 
 @router.get("/admin/metrics/dashboard", response_model=AdminDashboardMetricsResponse)
@@ -321,37 +362,24 @@ async def get_dashboard_metrics(
 
     try:
         accounts = sb.table("accounts").select("*", count="exact", head=True).execute()
-        active_subs = sb.table("subscriptions").select("*", count="exact", head=True).eq("status", "active").execute()
-        _ = sb.table("instances").select("*", count="exact", head=True).eq("status", "running").execute()
-
-        subs_data = sb.table("subscriptions").select("tier").eq("status", "active").execute()
-        tier_prices = {"starter": 49, "professional": 199, "enterprise": 999, "free": 0}
-        mrr = sum(tier_prices.get(sub.get("tier", "free"), 0) for sub in (subs_data.data or []))
-
-        seven_days_ago = (datetime.now(UTC) - timedelta(days=7)).isoformat()
-        messages = (
-            sb.table("usage_metrics")
-            .select("metric_date, messages_sent")
-            .gte("metric_date", seven_days_ago)
-            .order("metric_date")
+        active_subs = (
+            sb.table("subscriptions")
+            .select("*", count="exact", head=True)
+            .eq("status", "active")
+            .neq("tier", "free")
             .execute()
         )
+        _ = sb.table("instances").select("*", count="exact", head=True).eq("status", "running").execute()
 
-        if messages.data:
-            by_date = defaultdict(int)
-            for m in messages.data:
-                date = m["metric_date"][:10]
-                by_date[date] += m.get("messages_sent", 0)
-            _ = [  # noqa: F841
-                {"date": date, "messages_sent": count} for date, count in sorted(by_date.items())
-            ]
+        subs_data = sb.table("subscriptions").select("tier").eq("status", "active").neq("tier", "free").execute()
+        tier_prices = _monthly_plan_prices_usd()
+        mrr = sum(tier_prices.get(sub.get("tier", "free"), 0) for sub in (subs_data.data or []))
 
-        all_instances = sb.table("instances").select("status").execute()
+        all_instances = instances_data.list_instances(sb, columns="status")
         status_counts: dict[str, int] = {}
-        if all_instances.data:
-            for inst in all_instances.data:
-                status = inst.get("status", "unknown")
-                status_counts[status] = status_counts.get(status, 0) + 1
+        for inst in all_instances:
+            status = inst.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
 
         audit_logs = (
             sb.table("audit_logs")
@@ -387,7 +415,7 @@ async def get_dashboard_metrics(
         return {
             "total_accounts": accounts.count or 0,
             "active_subscriptions": active_subs.count or 0,
-            "total_instances": len(all_instances.data) if all_instances.data else 0,
+            "total_instances": len(all_instances),
             "instances_by_status": instances_by_status,
             "subscription_revenue": float(mrr),
             "subscriptions_by_tier": subscriptions_by_tier,
@@ -429,8 +457,6 @@ async def admin_get_list(  # noqa: C901
             query = sb.table("subscriptions").select("*, accounts(email, full_name)", count="exact")
         elif resource == "audit_logs":
             query = sb.table("audit_logs").select("*, accounts(email)", count="exact")
-        elif resource == "usage_metrics":
-            query = sb.table("usage_metrics").select("*, accounts(email, full_name)", count="exact")
         else:
             query = sb.table(resource).select("*", count="exact")
 
@@ -541,8 +567,14 @@ async def admin_update(
             resource_id=resource_id,
             details={"data": data},
         )
+        if resource == "accounts" and result.data:
+            invalidate_account_auth_cache(result.data[0]["id"])
+            if data.keys() & {"status", "deleted_at"}:
+                _update_account_auth_ban(sb, result.data[0])
 
         return {"data": result.data[0] if result.data else None}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Error updating resource")
         raise HTTPException(status_code=400, detail="Invalid request") from None
@@ -565,69 +597,69 @@ async def admin_delete_account_complete(
         raise HTTPException(status_code=404, detail="Account not found")
 
     account = account_result.data[0]
+    # The stored id is canonical, whatever spelling the path used, so cache and auth lookups match it.
+    account_id = account["id"]
     logger.info(
         f"Admin {admin['user_id']} initiating complete deletion of account {account_id} ({account.get('email')})"
     )
 
-    # 1. First, get all instances for this account
-    instances_result = sb.table("instances").select("*").eq("account_id", account_id).execute()
-    instances = instances_result.data or []
+    # 1. Mark the account pending deletion, so nothing provisions, starts, or bills it again during teardown, and
+    # claim it for teardown, so the customer can no longer restore it and hard_delete_account accepts it.
+    sb.rpc(
+        "soft_delete_account",
+        {"target_account_id": account_id, "reason": "admin_complete_deletion", "requested_by": admin["user_id"]},
+    ).execute()
+    invalidate_account_auth_cache(account_id)
+    claimed = (
+        sb.table("accounts")
+        .update({"hard_delete_started_at": datetime.now(UTC).isoformat()})
+        .eq("id", account_id)
+        .not_.is_("deleted_at", "null")
+        .execute()
+        .data
+    )
+    if not claimed:
+        detail = "The account could not be marked pending deletion, so nothing was deleted; retry the deletion"
+        raise HTTPException(status_code=500, detail=detail)
 
-    # 2. Deprovision all instances
-    for instance in instances:
-        instance_id = instance.get("instance_id")
-        if instance.get("status") not in ["deprovisioned", "terminated"]:
-            logger.info(f"Deprovisioning instance {instance_id} for account {account_id}")
-            try:
-                # Call the uninstall endpoint via provisioner
-                await uninstall_instance(instance_id=instance_id, api_key=PROVISIONER_API_KEY)
-            except Exception as e:
-                logger.error(f"Failed to deprovision instance {instance_id}: {e}")
-                # Continue with other instances even if one fails
-
-    # 3. Cancel any active Stripe subscriptions
-    if account.get("stripe_customer_id"):
-        try:
-            import stripe
-            from backend.config import STRIPE_API_KEY
-
-            stripe.api_key = STRIPE_API_KEY
-
-            # List and cancel all subscriptions for this customer
-            subscriptions = stripe.Subscription.list(customer=account["stripe_customer_id"], status="active")
-            for subscription in subscriptions.data:
-                logger.info(f"Canceling Stripe subscription {subscription.id}")
-                stripe.Subscription.cancel(subscription.id)
-
-            # Delete the Stripe customer (optional - you may want to keep for records)
-            # stripe.Customer.delete(account["stripe_customer_id"])
-
-        except Exception as e:
-            logger.error(f"Failed to cancel Stripe subscriptions: {e}")
-            # Continue with deletion even if Stripe fails
-
-    # 4. Delete the account (cascade deletion will handle related records)
+    # 2. Cancel Stripe billing and uninstall every instance; the rows are the only record of what to tear down,
+    # so they stay until this succeeds.
+    instances = instances_data.get_instances_for_account(sb, account_id)
     try:
-        sb.table("accounts").delete().eq("id", account_id).execute()
-
-        # Log the complete deletion
-        audit_log_entry(
-            account_id=admin["user_id"],
-            action="delete_complete",
-            resource_type="accounts",
-            resource_id=account_id,
-            details={
-                "deleted_email": account.get("email"),
-                "instances_deprovisioned": len(instances),
-                "had_stripe_customer": bool(account.get("stripe_customer_id")),
-            },
-        )
-
-        logger.info(f"Successfully deleted account {account_id} and all associated resources")
-
+        await instance_lifecycle.tear_down_account(account_id)
     except Exception as e:
-        logger.exception(f"Error deleting account {account_id}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}") from None
+        logger.exception("Tearing down account %s failed; its rows are kept", account_id)
+        detail = (
+            "Teardown failed, so the account rows were kept, but Stripe billing may already be cancelled and "
+            f"some instances uninstalled; retry the deletion: {e!s}"
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
+
+    # 3. Delete the account's instance, subscription, and audit rows, then the login, whose account row goes with it.
+    try:
+        sb.rpc("hard_delete_account", {"target_account_id": account_id}).execute()
+        await instance_lifecycle.delete_auth_user(account_id)
+        invalidate_account_auth_cache(account_id)
+    except Exception as e:
+        logger.exception("Deleting the rows or auth user of account %s failed; its account row is kept", account_id)
+        detail = (
+            "Billing and instances are torn down, but deleting the account's rows or login failed, so the account "
+            f"row was kept; retry the deletion: {e!s}"
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
+
+    audit_log_entry(
+        account_id=admin["user_id"],
+        action="delete_complete",
+        resource_type="accounts",
+        resource_id=account_id,
+        details={
+            "deleted_email": account.get("email"),
+            "instances_deprovisioned": len(instances),
+            "had_stripe_customer": bool(account.get("stripe_customer_id")),
+        },
+    )
+    logger.info(f"Successfully deleted account {account_id} and all associated resources")
 
     return {"data": {"id": account_id}}
 

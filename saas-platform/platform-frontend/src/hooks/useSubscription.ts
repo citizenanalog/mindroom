@@ -2,27 +2,11 @@
 
 import { useEffect, useState } from 'react'
 import { useAuth } from './useAuth'
-import { apiCall } from '@/lib/api'
+import { apiCall, type Subscription } from '@/lib/api'
 import { subscriptionCache } from '@/lib/cache'
 import { logger } from '@/lib/logger'
 
-export interface Subscription {
-  id: string
-  account_id: string
-  tier: 'free' | 'starter' | 'professional' | 'enterprise'
-  status: 'active' | 'cancelled' | 'past_due' | 'trialing'
-  stripe_subscription_id: string | null
-  stripe_customer_id: string | null
-  current_period_start: string | null
-  current_period_end: string | null
-  trial_ends_at: string | null
-  cancelled_at: string | null
-  max_agents: number
-  max_messages_per_day: number
-  max_storage_gb: number
-  created_at: string
-  updated_at: string
-}
+export type { Subscription }
 
 export function useSubscription() {
   const cachedSubscription = subscriptionCache.get('user-subscription') as Subscription | null

@@ -1,4 +1,10 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { AgentEditor } from "./AgentEditor";
 import { useConfigStore } from "@/store/configStore";
@@ -9,6 +15,7 @@ import {
   SHARED_CONTEXT_FILE_PLACEHOLDER,
 } from "@/types/config";
 import { useTools } from "@/hooks/useTools";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
 
 // Mock the store
 vi.mock("@/store/configStore", () => ({
@@ -17,6 +24,10 @@ vi.mock("@/store/configStore", () => ({
 
 vi.mock("@/components/ui/toaster", () => ({
   toast: vi.fn(),
+}));
+
+vi.mock("@/hooks/useConfigSchema", () => ({
+  useConfigSchema: vi.fn(() => ({ schema: null, error: null, retry: vi.fn() })),
 }));
 
 // Mock useTools hook
@@ -31,7 +42,7 @@ vi.mock("@/hooks/useTools", () => ({
       },
       {
         name: "delegate",
-        display_name: "Agent Delegation",
+        display_name: "Subagents",
         setup_type: "none",
         status: "available",
       },
@@ -161,7 +172,7 @@ describe("AgentEditor", () => {
         },
         {
           name: "delegate",
-          display_name: "Agent Delegation",
+          display_name: "Subagents",
           setup_type: "none",
           status: "available",
         },
@@ -330,6 +341,157 @@ describe("AgentEditor", () => {
     expect(screen.getByLabelText("Weather")).toBeInTheDocument();
   });
 
+  it("shows backend tool descriptions inline and rich metadata in a details popover", () => {
+    (useTools as any).mockReturnValue({
+      tools: [
+        {
+          name: "shell",
+          display_name: "Shell Commands",
+          description:
+            "Run shell commands in the agent workspace with timeout handling.",
+          helper_text: "Use this for tests, scripts, and workspace automation.",
+          setup_type: "none",
+          status: "available",
+          default_execution_target: "worker",
+          docs_url: "https://docs.example.com/shell",
+          dependencies: ["bash"],
+          function_names: [
+            "run_command",
+            "read_process",
+            "stop_process",
+            "list_processes",
+            "send_stdin",
+            "write_file",
+            "extra_function",
+          ],
+        },
+        {
+          name: "file",
+          display_name: "File",
+          description: "Read and write workspace files.",
+          setup_type: "none",
+          status: "available",
+        },
+      ],
+      loading: false,
+      statusAuthoritative: true,
+    });
+
+    render(<AgentEditor />);
+
+    const inlineSummary = screen.getByText(
+      "Run shell commands in the agent workspace with timeout handling.",
+    );
+    expect(inlineSummary).toBeInTheDocument();
+    expect(inlineSummary).toHaveClass("line-clamp-2");
+    expect(
+      screen.getByRole("checkbox", { name: "Shell Commands" }),
+    ).not.toHaveAttribute("aria-label");
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show Shell Commands tool details",
+      }),
+    );
+
+    const details = screen.getByRole("dialog", {
+      name: "Shell Commands tool details",
+    });
+    expect(
+      within(details).getByText(
+        "Use this for tests, scripts, and workspace automation.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(details).getByRole("link", { name: "Open documentation" }),
+    ).toHaveAttribute("href", "https://docs.example.com/shell");
+    expect(within(details).getByText("Setup")).toBeInTheDocument();
+    expect(within(details).getByText("None")).toBeInTheDocument();
+    expect(within(details).getByText("Default Runtime")).toBeInTheDocument();
+    expect(within(details).getByText("Worker")).toBeInTheDocument();
+    expect(within(details).getByText("run_command")).toBeInTheDocument();
+    expect(within(details).getByText("+1 more")).toBeInTheDocument();
+  });
+
+  it("omits placeholder noise for tools without optional metadata", () => {
+    (useTools as any).mockReturnValue({
+      tools: [
+        {
+          name: "file",
+          display_name: "File",
+          description: "Read and write workspace files.",
+          setup_type: "none",
+          status: "available",
+          docs_url: "javascript:alert(1)",
+        },
+      ],
+      loading: false,
+      statusAuthoritative: true,
+    });
+
+    render(<AgentEditor />);
+
+    expect(
+      screen.getByText("Read and write workspace files."),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show File tool details" }),
+    );
+
+    const details = screen.getByRole("dialog", {
+      name: "File tool details",
+    });
+    expect(
+      within(details).queryByText("No helper text"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(details).queryByText("No documentation"),
+    ).not.toBeInTheDocument();
+    expect(within(details).queryByText("No functions")).not.toBeInTheDocument();
+    expect(
+      within(details).queryByRole("link", { name: "Open documentation" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers lazy loading only for tools whose entries may set it", () => {
+    const lazyAgent = { ...mockAgent, tools: ["calculator", "dynamic_tools"] };
+    (useConfigStore as any).mockReturnValue({
+      ...mockStore,
+      agents: [lazyAgent],
+      config: { ...mockConfig, agents: { test_agent: lazyAgent } },
+      getAgentToolOverrides: vi.fn(() => null),
+    });
+    (useTools as any).mockReturnValue({
+      tools: [
+        {
+          name: "calculator",
+          display_name: "Calculator",
+          setup_type: "none",
+          status: "available",
+          lazy_loading_supported: true,
+        },
+        {
+          name: "dynamic_tools",
+          display_name: "Dynamic Tools",
+          setup_type: "none",
+          status: "available",
+          lazy_loading_supported: false,
+        },
+      ],
+      loading: false,
+      statusAuthoritative: true,
+    });
+
+    render(<AgentEditor />);
+
+    // A control-plane tool with no fields has no settings to open.
+    expect(
+      screen.queryByRole("button", { name: "Dynamic Tools" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Calculator" }));
+    expect(screen.getByLabelText("Load lazily")).toBeInTheDocument();
+  });
+
   it("shows customized indicators and opens the inline tool settings panel for checked tools", () => {
     const shellAgent = { ...mockAgent, tools: ["shell"] };
     const getAgentToolOverrides = vi.fn((agentId: string, toolName: string) =>
@@ -370,6 +532,9 @@ describe("AgentEditor", () => {
     render(<AgentEditor />);
 
     expect(screen.getByText("Customized")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: "Shell Commands" }),
+    ).toHaveAttribute("aria-label", "Shell Commands");
     fireEvent.click(screen.getByRole("button", { name: "Shell Commands" }));
 
     expect(
@@ -1045,6 +1210,15 @@ describe("AgentEditor", () => {
     });
   });
 
+  it("preserves explicit compaction fallback model clears during normalization", () => {
+    expect(
+      normalizeAgentUpdates(mockAgent, { compaction: { fallback_model: null } })
+        .compaction,
+    ).toEqual({
+      fallback_model: null,
+    });
+  });
+
   it("enables authored compaction overrides and clears the inherited sibling threshold", () => {
     expect(
       normalizeAgentUpdates(mockAgent, {
@@ -1060,6 +1234,45 @@ describe("AgentEditor", () => {
     });
   });
 
+  it("preserves replay-window-only compaction overrides as enabled", () => {
+    expect(
+      normalizeAgentUpdates(mockAgent, {
+        compaction: { replay_window_tokens: 200_000 },
+      }).compaction,
+    ).toEqual({
+      enabled: true,
+      replay_window_tokens: 200_000,
+    });
+  });
+
+  it("preserves timeout-only compaction overrides as enabled", () => {
+    expect(
+      normalizeAgentUpdates(mockAgent, {
+        compaction: { timeout_seconds: 300 },
+      }).compaction,
+    ).toEqual({
+      enabled: true,
+      timeout_seconds: 300,
+    });
+  });
+
+  it("authors a replay window from the editor", async () => {
+    render(<AgentEditor />);
+
+    fireEvent.change(screen.getByLabelText("Replay Window Tokens"), {
+      target: { value: "200000" },
+    });
+
+    await waitFor(() => {
+      expect(mockStore.updateAgent).toHaveBeenCalledWith(
+        "test_agent",
+        expect.objectContaining({
+          compaction: { replay_window_tokens: 200_000 },
+        }),
+      );
+    });
+  });
+
   it("treats authored compaction overrides as enabled in the editor", () => {
     const compactionAgent: Agent = {
       ...mockAgent,
@@ -1071,6 +1284,30 @@ describe("AgentEditor", () => {
       config: {
         ...mockConfig,
         agents: { test_agent: compactionAgent },
+      },
+    });
+
+    render(<AgentEditor />);
+
+    expect(
+      screen.getByRole("checkbox", {
+        name: /enable automatic required compaction/i,
+      }),
+    ).toBeChecked();
+  });
+
+  it("treats a timeout-only override as enabled even when defaults disable compaction", () => {
+    const compactionAgent: Agent = {
+      ...mockAgent,
+      compaction: { timeout_seconds: 300 },
+    };
+    (useConfigStore as any).mockReturnValue({
+      ...mockStore,
+      agents: [compactionAgent],
+      config: {
+        ...mockConfig,
+        agents: { test_agent: compactionAgent },
+        defaults: { ...mockConfig.defaults, compaction: { enabled: false } },
       },
     });
 
@@ -1172,6 +1409,35 @@ describe("AgentEditor", () => {
     ).not.toBeChecked();
   });
 
+  it("shows automatic required compaction as disabled for a pure fallback model clear when defaults are disabled", () => {
+    const compactionAgent: Agent = {
+      ...mockAgent,
+      compaction: { fallback_model: null },
+    };
+    (useConfigStore as any).mockReturnValue({
+      ...mockStore,
+      agents: [compactionAgent],
+      config: {
+        ...mockConfig,
+        defaults: {
+          ...mockConfig.defaults,
+          compaction: {
+            enabled: false,
+            reserve_tokens: 16384,
+            threshold_percent: 0.8,
+          },
+        },
+        agents: { test_agent: compactionAgent },
+      },
+    });
+
+    render(<AgentEditor />);
+
+    expect(
+      screen.getByLabelText("Enable automatic required compaction"),
+    ).not.toBeChecked();
+  });
+
   it("shows automatic required compaction as disabled for an empty authored override when defaults are disabled", () => {
     const compactionAgent: Agent = {
       ...mockAgent,
@@ -1199,6 +1465,35 @@ describe("AgentEditor", () => {
     expect(
       screen.getByLabelText("Enable automatic required compaction"),
     ).not.toBeChecked();
+  });
+
+  it("shows replay-window-only compaction as enabled when defaults are disabled", () => {
+    const compactionAgent: Agent = {
+      ...mockAgent,
+      compaction: { replay_window_tokens: 200_000 },
+    };
+    (useConfigStore as any).mockReturnValue({
+      ...mockStore,
+      agents: [compactionAgent],
+      config: {
+        ...mockConfig,
+        defaults: {
+          ...mockConfig.defaults,
+          compaction: {
+            enabled: false,
+            reserve_tokens: 16384,
+            threshold_percent: 0.8,
+          },
+        },
+        agents: { test_agent: compactionAgent },
+      },
+    });
+
+    render(<AgentEditor />);
+
+    expect(
+      screen.getByLabelText("Enable automatic required compaction"),
+    ).toBeChecked();
   });
 
   it("shows automatic required compaction as enabled when defaults.compaction is omitted", () => {
@@ -1376,9 +1671,25 @@ describe("AgentEditor", () => {
     expect(screen.getByRole("checkbox", { name: "File" })).toBeTruthy();
 
     // delegate should NOT appear even though useTools returns it
-    expect(
-      screen.queryByRole("checkbox", { name: /agent delegation/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Subagents" })).toBeNull();
+  });
+
+  it("allows a single agent to enable and disable fresh self subagents", () => {
+    render(<AgentEditor />);
+    const self = screen.getByRole("checkbox", {
+      name: /this agent/i,
+    });
+    expect(self).not.toBeChecked();
+    fireEvent.click(self);
+    expect(mockStore.updateAgent).toHaveBeenLastCalledWith(
+      "test_agent",
+      expect.objectContaining({ delegate_to: ["test_agent"] }),
+    );
+    fireEvent.click(self);
+    expect(mockStore.updateAgent).toHaveBeenLastCalledWith(
+      "test_agent",
+      expect.objectContaining({ delegate_to: [] }),
+    );
   });
 
   it("updates tools when checkboxes are toggled", () => {
@@ -1735,5 +2046,164 @@ describe("AgentEditor", () => {
 
     // Should be exactly 10 updates, not hundreds or thousands
     expect(updateCount).toBe(10);
+  });
+
+  it("edits fields the editor does not render through More settings", () => {
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          AgentConfig: {
+            type: "object",
+            properties: {
+              display_name: { type: "string" },
+              worker_scope: {
+                anyOf: [
+                  { enum: ["shared", "user", "user_agent"], type: "string" },
+                  { type: "null" },
+                ],
+                default: null,
+              },
+              participation: {
+                anyOf: [
+                  { $ref: "#/$defs/ParticipationConfig" },
+                  { type: "null" },
+                ],
+                default: null,
+                description: "Opt-in adaptive participation",
+              },
+            },
+          },
+          ParticipationConfig: {
+            type: "object",
+            properties: {
+              debounce_seconds: { type: "number", default: 3 },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<AgentEditor />);
+    const section = screen.getByRole("button", { name: /More settings/ });
+    expect(section).toHaveTextContent("Worker scope, Participation");
+    fireEvent.click(section);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Configure participation" }),
+    );
+
+    expect(mockStore.updateAgent).toHaveBeenCalledWith("test_agent", {
+      participation: {},
+    });
+  });
+
+  it("edits compaction fields the editor does not render through More compaction settings", () => {
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          AgentConfig: { type: "object", properties: {} },
+          CompactionOverrideConfig: {
+            type: "object",
+            properties: {
+              model: { anyOf: [{ type: "string" }, { type: "null" }] },
+              fallback_model: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+                default: null,
+                "x-mindroom": { reference: "model" },
+              },
+              timeout_seconds: {
+                anyOf: [
+                  { exclusiveMinimum: 0, type: "number" },
+                  { type: "null" },
+                ],
+                default: null,
+              },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<AgentEditor />);
+    const section = screen.getByRole("button", {
+      name: /More compaction settings/,
+    });
+    expect(section).toHaveTextContent("Fallback model, Timeout seconds");
+    fireEvent.click(section);
+    fireEvent.change(
+      screen.getByRole("spinbutton", { name: "Timeout seconds" }),
+      { target: { value: "30" } },
+    );
+    expect(mockStore.updateAgent).toHaveBeenLastCalledWith("test_agent", {
+      compaction: { timeout_seconds: 30 },
+    });
+  });
+
+  it("edits private knowledge chunking through More private knowledge settings", () => {
+    const privateAgent: Agent = {
+      ...mockAgent,
+      private: {
+        per: "user",
+        knowledge: { enabled: true, path: "memory", watch: true },
+      },
+    };
+    (useConfigStore as any).mockReturnValue({
+      ...mockStore,
+      agents: [privateAgent],
+      diagnostics: [],
+      agentPoliciesByAgent: makeAgentPolicies({
+        is_private: true,
+        effective_execution_scope: "user",
+        scope_label: "private.per=user",
+        scope_source: "private.per",
+        private_workspace_enabled: true,
+        private_agent_knowledge_enabled: true,
+      }),
+    });
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          AgentConfig: { type: "object", properties: {} },
+          AgentPrivateKnowledgeConfig: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              chunk_size: { type: "integer", default: 5000, minimum: 128 },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<AgentEditor />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /More private knowledge settings/ }),
+    );
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Chunk size" }), {
+      target: { value: "2000" },
+    });
+
+    expect(mockStore.updateAgent).toHaveBeenLastCalledWith("test_agent", {
+      private: {
+        per: "user",
+        knowledge: {
+          enabled: true,
+          path: "memory",
+          watch: true,
+          chunk_size: 2000,
+        },
+      },
+    });
   });
 });

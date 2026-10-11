@@ -8,19 +8,29 @@ from types import MappingProxyType
 from typing import cast
 
 __all__ = [
+    "AGENT_VAULT_ACCESS_ENV_BY_KEY",
+    "AWS_BEDROCK_CLAUDE_ENV_BY_KEY",
+    "AZURE_OPENAI_ENV_BY_KEY",
+    "COMPUTER_ALLOWED_ORIGINS_ENV",
+    "CONTROL_STATE_PATH_ENV",
     "CREDENTIALS_ENCRYPTION_KEY_ENV",
     "CREDENTIAL_SEEDS_FILE_ENV",
     "CREDENTIAL_SEEDS_JSON_ENV",
+    "ENV_TEMPLATE_PLACEHOLDERS",
     "KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY",
     "KUBERNETES_WORKER_BACKEND_CONFIG_ENV_NAMES",
+    "MATRIX_APPSERVICE_TOKEN_ENV",
+    "MATRIX_APPSERVICE_TOKEN_FILE_ENV",
+    "MATRIX_MANAGED_ACCOUNT_AUTH_ENV",
     "SANDBOX_RUNTIME_ENV_BY_KEY",
     "SANDBOX_STARTUP_MANIFEST_PATH_ENV",
+    "SESSION_STORAGE_PATH_ENV",
     "SHARED_CREDENTIALS_PATH_ENV",
     "VENDOR_TELEMETRY_ENV_VALUES",
     "VERTEXAI_CLAUDE_ENV_BY_KEY",
-    "credentials_encryption_key_from_env",
+    "WORKER_COMPUTER_ENABLED_ENV",
+    "WORKER_EGRESS_PROXY_ENV_BY_KEY",
     "credentials_encryption_key_value",
-    "execution_tool_runtime_env",
     "is_isolated_worker_runtime_env_name",
     "is_public_worker_startup_env_name",
     "is_runtime_control_env_name",
@@ -28,6 +38,7 @@ __all__ = [
     "is_shell_passthrough_allowed_env_name",
     "is_trusted_tool_runtime_env_file_name",
     "is_trusted_tool_runtime_process_env_name",
+    "is_unset_env_value",
     "is_worker_backend_config_env_name",
     "is_worker_extra_env_name",
     "isolated_worker_runtime_env",
@@ -44,11 +55,73 @@ SANDBOX_STARTUP_MANIFEST_PATH_ENV = "MINDROOM_SANDBOX_STARTUP_MANIFEST_PATH"
 CREDENTIAL_SEEDS_JSON_ENV = "MINDROOM_CREDENTIAL_SEEDS_JSON"
 CREDENTIAL_SEEDS_FILE_ENV = "MINDROOM_CREDENTIAL_SEEDS_FILE"
 CREDENTIALS_ENCRYPTION_KEY_ENV = "MINDROOM_CREDENTIALS_ENCRYPTION_KEY"
+CONTROL_STATE_PATH_ENV = "MINDROOM_CONTROL_STATE_PATH"
+SESSION_STORAGE_PATH_ENV = "MINDROOM_SESSION_STORAGE_PATH"
 SHARED_CREDENTIALS_PATH_ENV = "MINDROOM_SHARED_CREDENTIALS_PATH"
+MATRIX_MANAGED_ACCOUNT_AUTH_ENV = "MATRIX_MANAGED_ACCOUNT_AUTH"
+MATRIX_APPSERVICE_TOKEN_ENV = "MATRIX_APPSERVICE_TOKEN"  # noqa: S105 - environment variable name
+MATRIX_APPSERVICE_TOKEN_FILE_ENV = "MATRIX_APPSERVICE_TOKEN_FILE"  # noqa: S105 - environment variable name
+AWS_BEDROCK_CLAUDE_ENV_BY_KEY: Mapping[str, str] = MappingProxyType(
+    {
+        "access_key": "AWS_ACCESS_KEY_ID",
+        "secret_key": "AWS_SECRET_ACCESS_KEY",
+        "session_token": "AWS_SESSION_TOKEN",
+        "region": "AWS_REGION",
+        "default_region": "AWS_DEFAULT_REGION",
+        "profile": "AWS_PROFILE",
+    },
+)
 VERTEXAI_CLAUDE_ENV_BY_KEY: Mapping[str, str] = MappingProxyType(
     {
         "project_id": "ANTHROPIC_VERTEX_PROJECT_ID",
         "region": "CLOUD_ML_REGION",
+    },
+)
+AZURE_OPENAI_ENV_BY_KEY: Mapping[str, str] = MappingProxyType(
+    {
+        "api_key": "AZURE_OPENAI_API_KEY",
+        "endpoint": "AZURE_OPENAI_ENDPOINT",
+        "api_version": "AZURE_OPENAI_API_VERSION",
+        "deployment": "AZURE_OPENAI_DEPLOYMENT",
+    },
+)
+# Values the starter `.env` template writes for credentials the user must replace.
+ENV_TEMPLATE_PLACEHOLDERS: Mapping[str, str] = MappingProxyType(
+    {
+        "ANTHROPIC_API_KEY": "your-anthropic-key-here",
+        "OPENAI_API_KEY": "your-openai-key-here",
+        "OPENROUTER_API_KEY": "your-openrouter-key-here",
+        AZURE_OPENAI_ENV_BY_KEY["api_key"]: "your-azure-openai-key-here",
+        AZURE_OPENAI_ENV_BY_KEY["endpoint"]: "https://your-resource.openai.azure.com",
+        VERTEXAI_CLAUDE_ENV_BY_KEY["project_id"]: "your-gcp-project-id",
+    },
+)
+AGENT_VAULT_ACCESS_ENV_BY_KEY: Mapping[str, str] = MappingProxyType(
+    {
+        "api_url": "MINDROOM_AGENT_VAULT_ACCESS_API_URL",
+        "admin_token": "MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN",
+        # File alternative to admin_token, read per call: a Secret mounted as a
+        # volume refreshes in place, so token rotation by a re-run of the vault
+        # bootstrap takes effect without a process restart (env values would
+        # need one).
+        "admin_token_file": "MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN_FILE",
+        "ui_base_url": "MINDROOM_AGENT_VAULT_ACCESS_UI_BASE_URL",
+        "email_domain": "MINDROOM_AGENT_VAULT_ACCESS_EMAIL_DOMAIN",
+        "vault_name_prefix": "MINDROOM_AGENT_VAULT_ACCESS_VAULT_NAME_PREFIX",
+        "owner_email": "MINDROOM_AGENT_VAULT_ACCESS_OWNER_EMAIL",
+    },
+)
+
+# Single source of truth for the per-worker egress proxy env contract. The
+# Kubernetes backend (writer) sets these on the worker pod; the sandbox runner
+# (reader, mindroom.constants.worker_proxy_execution_env) consumes them. Both
+# import from here so a rename cannot silently desync writer and reader.
+WORKER_EGRESS_PROXY_ENV_BY_KEY: Mapping[str, str] = MappingProxyType(
+    {
+        "proxy_url": "MINDROOM_WORKER_EGRESS_PROXY_URL",
+        "token_file": "MINDROOM_WORKER_EGRESS_PROXY_TOKEN_FILE",
+        "vault": "MINDROOM_WORKER_EGRESS_PROXY_VAULT",
+        "ca_file": "MINDROOM_WORKER_EGRESS_PROXY_CA_FILE",
     },
 )
 
@@ -80,29 +153,44 @@ KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY: Mapping[str, str] = MappingProxyTyp
         "namespace": "MINDROOM_KUBERNETES_WORKER_NAMESPACE",
         "image": "MINDROOM_KUBERNETES_WORKER_IMAGE",
         "image_pull_policy": "MINDROOM_KUBERNETES_WORKER_IMAGE_PULL_POLICY",
+        "image_pull_secrets_json": "MINDROOM_KUBERNETES_WORKER_IMAGE_PULL_SECRETS_JSON",
         "port": "MINDROOM_KUBERNETES_WORKER_PORT",
         "service_account": "MINDROOM_KUBERNETES_WORKER_SERVICE_ACCOUNT_NAME",
+        "runtime_class_name": "MINDROOM_KUBERNETES_WORKER_RUNTIME_CLASS_NAME",
         "storage_pvc": "MINDROOM_KUBERNETES_WORKER_STORAGE_PVC_NAME",
         "storage_mount_path": "MINDROOM_KUBERNETES_WORKER_STORAGE_MOUNT_PATH",
         "storage_subpath_prefix": "MINDROOM_KUBERNETES_WORKER_STORAGE_SUBPATH_PREFIX",
-        "config_map_name": "MINDROOM_KUBERNETES_WORKER_CONFIG_MAP_NAME",
-        "config_key": "MINDROOM_KUBERNETES_WORKER_CONFIG_KEY",
-        "config_path": "MINDROOM_KUBERNETES_WORKER_CONFIG_PATH",
         "idle_timeout": "MINDROOM_KUBERNETES_WORKER_IDLE_TIMEOUT_SECONDS",
         "ready_timeout": "MINDROOM_KUBERNETES_WORKER_READY_TIMEOUT_SECONDS",
         "name_prefix": "MINDROOM_KUBERNETES_WORKER_NAME_PREFIX",
         "node_name": "MINDROOM_KUBERNETES_WORKER_NODE_NAME",
         "colocate_with_control_plane_node": "MINDROOM_KUBERNETES_WORKER_COLOCATE_WITH_CONTROL_PLANE_NODE",
+        "reconcile_pod_templates": "MINDROOM_KUBERNETES_WORKER_RECONCILE_POD_TEMPLATES",
         "extra_env_json": "MINDROOM_KUBERNETES_WORKER_ENV_JSON",
         "extra_labels_json": "MINDROOM_KUBERNETES_WORKER_LABELS_JSON",
         "extra_annotations_json": "MINDROOM_KUBERNETES_WORKER_ANNOTATIONS_JSON",
+        "extra_containers_json": "MINDROOM_KUBERNETES_WORKER_EXTRA_CONTAINERS_JSON",
+        "extra_volumes_json": "MINDROOM_KUBERNETES_WORKER_EXTRA_VOLUMES_JSON",
         "owner_deployment_name": "MINDROOM_KUBERNETES_WORKER_OWNER_DEPLOYMENT_NAME",
         "memory_request": "MINDROOM_KUBERNETES_WORKER_MEMORY_REQUEST",
         "memory_limit": "MINDROOM_KUBERNETES_WORKER_MEMORY_LIMIT",
         "cpu_request": "MINDROOM_KUBERNETES_WORKER_CPU_REQUEST",
         "cpu_limit": "MINDROOM_KUBERNETES_WORKER_CPU_LIMIT",
+        "tmp_size_limit": "MINDROOM_KUBERNETES_WORKER_TMP_SIZE_LIMIT",
+        "user_resources_json": "MINDROOM_KUBERNETES_WORKER_USER_RESOURCES_JSON",
+        "script_resource_profiles_json": "MINDROOM_KUBERNETES_SCRIPT_RESOURCE_PROFILES_JSON",
+        "default_script_resource_profile": "MINDROOM_KUBERNETES_DEFAULT_SCRIPT_RESOURCE_PROFILE",
         "enable_service_links": "MINDROOM_KUBERNETES_WORKER_ENABLE_SERVICE_LINKS",
         "auth_secret_name": "MINDROOM_KUBERNETES_WORKER_AUTH_SECRET_NAME",
+        "seccomp_profile_json": "MINDROOM_KUBERNETES_WORKER_SECCOMP_PROFILE_JSON",
+        "agent_vault_enabled": "MINDROOM_KUBERNETES_AGENT_VAULT_ENABLED",
+        "agent_vault_vault_name_prefix": "MINDROOM_KUBERNETES_AGENT_VAULT_VAULT_NAME_PREFIX",
+        "agent_vault_cli_image": "MINDROOM_KUBERNETES_AGENT_VAULT_CLI_IMAGE",
+        "agent_vault_api_url": "MINDROOM_KUBERNETES_AGENT_VAULT_API_URL",
+        "agent_vault_proxy_url": "MINDROOM_KUBERNETES_AGENT_VAULT_PROXY_URL",
+        "agent_vault_owner_email": "MINDROOM_KUBERNETES_AGENT_VAULT_OWNER_EMAIL",
+        "agent_vault_bootstrap_secret_name": "MINDROOM_KUBERNETES_AGENT_VAULT_BOOTSTRAP_SECRET_NAME",
+        "agent_vault_worker_ca_configmap_name": "MINDROOM_KUBERNETES_AGENT_VAULT_WORKER_CA_CONFIGMAP_NAME",
     },
 )
 KUBERNETES_WORKER_BACKEND_CONFIG_ENV_NAMES = frozenset(KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY.values())
@@ -123,6 +211,7 @@ SANDBOX_RUNTIME_ENV_BY_KEY: Mapping[str, str] = MappingProxyType(
         "runner_port": "MINDROOM_SANDBOX_RUNNER_PORT",
         "runner_subprocess_timeout_seconds": "MINDROOM_SANDBOX_RUNNER_SUBPROCESS_TIMEOUT_SECONDS",
         "shared_storage_root": "MINDROOM_SANDBOX_SHARED_STORAGE_ROOT",
+        "unsafe_allow_local_execution_tools": "MINDROOM_UNSAFE_ALLOW_LOCAL_EXECUTION_TOOLS",
         "worker_endpoint": "MINDROOM_SANDBOX_WORKER_ENDPOINT",
         "worker_idle_timeout_seconds": "MINDROOM_SANDBOX_WORKER_IDLE_TIMEOUT_SECONDS",
     },
@@ -137,12 +226,22 @@ _CREDENTIAL_SEED_DECLARATION_ENV_NAMES = frozenset(
 )
 _RUNTIME_STARTUP_ENV_PREFIXES = ("MINDROOM_", "MATRIX_", "BROWSER_")
 _VENDOR_TELEMETRY_ENV_NAMES = frozenset(VENDOR_TELEMETRY_ENV_VALUES)
+_AWS_BEDROCK_CLAUDE_PUBLIC_STARTUP_ENV_NAMES = frozenset(
+    {
+        AWS_BEDROCK_CLAUDE_ENV_BY_KEY["default_region"],
+        AWS_BEDROCK_CLAUDE_ENV_BY_KEY["profile"],
+        AWS_BEDROCK_CLAUDE_ENV_BY_KEY["region"],
+    },
+)
 _RUNTIME_STARTUP_ENV_EXTRA_KEYS = frozenset(
     {
         "ACCOUNT_ID",
         "ANTHROPIC_VERTEX_BASE_URL",
+        *_AWS_BEDROCK_CLAUDE_PUBLIC_STARTUP_ENV_NAMES,
         "CUSTOMER_ID",
-        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AZURE_OPENAI_API_VERSION",
+        "AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_ENDPOINT",
         "GOOGLE_CLOUD_LOCATION",
         "GOOGLE_CLOUD_PROJECT",
         "OLLAMA_HOST",
@@ -160,8 +259,12 @@ _ISOLATED_RUNTIME_ENV_EXTRA_KEYS = frozenset(
         *_VENDOR_TELEMETRY_ENV_NAMES,
     },
 )
+COMPUTER_ALLOWED_ORIGINS_ENV = "MINDROOM_COMPUTER_ALLOWED_ORIGINS"
+WORKER_COMPUTER_ENABLED_ENV = "MINDROOM_WORKER_COMPUTER_ENABLED"
+
 _PUBLIC_WORKER_SANDBOX_STARTUP_ENV_NAMES = frozenset(
     {
+        WORKER_COMPUTER_ENABLED_ENV,
         SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"],
         SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_root"],
         SANDBOX_RUNTIME_ENV_BY_KEY["runner_execution_mode"],
@@ -182,6 +285,7 @@ _WORKER_EXTRA_ENV_SANDBOX_ENV_NAMES = frozenset(
 )
 _SANDBOX_RUNNER_STARTUP_ENV_NAMES = frozenset(
     {
+        WORKER_COMPUTER_ENABLED_ENV,
         SANDBOX_RUNTIME_ENV_BY_KEY["runner_execution_mode"],
         SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"],
         SANDBOX_RUNTIME_ENV_BY_KEY["runner_port"],
@@ -196,6 +300,9 @@ _WORKER_EXTRA_ENV_GENERATED_NAMES = frozenset(
     {
         "HOME",
         "MINDROOM_CONFIG_PATH",
+        COMPUTER_ALLOWED_ORIGINS_ENV,
+        CONTROL_STATE_PATH_ENV,
+        SESSION_STORAGE_PATH_ENV,
         SHARED_CREDENTIALS_PATH_ENV,
         "MINDROOM_STORAGE_PATH",
         "PATH",
@@ -206,19 +313,19 @@ _RUNTIME_STARTUP_EXCLUDED_NAMES = frozenset(
     {
         *_CREDENTIAL_SEED_DECLARATION_ENV_NAMES,
         CREDENTIALS_ENCRYPTION_KEY_ENV,
+        COMPUTER_ALLOWED_ORIGINS_ENV,
+        CONTROL_STATE_PATH_ENV,
+        SESSION_STORAGE_PATH_ENV,
         "MINDROOM_EVENT_CACHE_DATABASE_URL",
         "MINDROOM_LOCAL_CLIENT_ID",
+        MATRIX_APPSERVICE_TOKEN_ENV,
+        MATRIX_APPSERVICE_TOKEN_FILE_ENV,
+        MATRIX_MANAGED_ACCOUNT_AUTH_ENV,
         SANDBOX_RUNTIME_ENV_BY_KEY["proxy_token"],
         SANDBOX_STARTUP_MANIFEST_PATH_ENV,
     },
 )
-_RUNTIME_STARTUP_SECRET_SUFFIXES = (
-    "_API_KEY",
-    "_API_KEYS",
-    "_PASSWORD",
-    "_SECRET",
-    "_TOKEN",
-)
+_RUNTIME_STARTUP_SECRET_SUFFIXES = ("_API_KEY", "_API_KEYS", "_PASSWORD", "_SECRET", "_TOKEN")
 _RUNTIME_DATABASE_URL_NAMES = frozenset({"DATABASE_URL"})
 _RUNTIME_DATABASE_URL_SUFFIXES = ("_DATABASE_URL",)
 _EXECUTION_RUNTIME_EXCLUDED_NAMES = frozenset(
@@ -226,18 +333,27 @@ _EXECUTION_RUNTIME_EXCLUDED_NAMES = frozenset(
         *_RUNTIME_STARTUP_EXCLUDED_NAMES,
         "MINDROOM_API_KEY",
         "MINDROOM_LOCAL_CLIENT_SECRET",
+        "MINDROOM_PLATFORM_SSO_SECRET",
     },
 )
 _NON_SANDBOX_RUNTIME_CONTROL_ENV_NAMES = frozenset(
     {
         CREDENTIALS_ENCRYPTION_KEY_ENV,
+        COMPUTER_ALLOWED_ORIGINS_ENV,
+        CONTROL_STATE_PATH_ENV,
+        SESSION_STORAGE_PATH_ENV,
         "MINDROOM_API_KEY",
         "MINDROOM_LOCAL_CLIENT_SECRET",
+        "MINDROOM_PLATFORM_SSO_SECRET",
+        MATRIX_APPSERVICE_TOKEN_ENV,
+        MATRIX_APPSERVICE_TOKEN_FILE_ENV,
+        MATRIX_MANAGED_ACCOUNT_AUTH_ENV,
     },
 )
 _SANDBOX_SUBPROCESS_SYSTEM_ENV_NAMES = frozenset(
     {
         "CURL_CA_BUNDLE",
+        "GIT_SSL_CAINFO",
         "HOME",
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -247,6 +363,7 @@ _SANDBOX_SUBPROCESS_SYSTEM_ENV_NAMES = frozenset(
         "LD_LIBRARY_PATH",
         "NIX_LD",
         "NIX_LD_LIBRARY_PATH",
+        "NODE_EXTRA_CA_CERTS",
         "NO_PROXY",
         "PATH",
         "PYTHONPATH",
@@ -308,7 +425,7 @@ def is_public_worker_startup_env_name(name: str) -> bool:
         return False
     if is_worker_backend_config_env_name(name) and name not in _WORKER_RUNTIME_STATE_ENV_NAMES:
         return False
-    if is_runtime_database_url_env_name(name):
+    if is_runtime_database_url_env_name(name) or name.endswith("_FILE"):
         return False
     if name.startswith(_SANDBOX_RUNTIME_ENV_PREFIX) and name not in _PUBLIC_WORKER_SANDBOX_STARTUP_ENV_NAMES:
         return False
@@ -319,7 +436,7 @@ def is_public_worker_startup_env_name(name: str) -> bool:
 
 def is_isolated_worker_runtime_env_name(name: str) -> bool:
     """Return whether inherited env may remain visible inside isolated workers."""
-    if name in _EXECUTION_RUNTIME_EXCLUDED_NAMES and name != CREDENTIALS_ENCRYPTION_KEY_ENV:
+    if name in _EXECUTION_RUNTIME_EXCLUDED_NAMES:
         return False
     if is_worker_backend_config_env_name(name) and name not in _WORKER_RUNTIME_STATE_ENV_NAMES:
         return False
@@ -362,6 +479,11 @@ def is_worker_extra_env_name(name: str) -> bool:
     return name not in _VENDOR_TELEMETRY_ENV_NAMES and not is_runtime_control_env_name(name)
 
 
+def is_unset_env_value(name: str, value: str) -> bool:
+    """Return whether an env value is blank or an unedited starter-template placeholder, so it counts as unset."""
+    return not value.strip() or value == ENV_TEMPLATE_PLACEHOLDERS.get(name)
+
+
 def public_worker_startup_env(env: Mapping[str, str]) -> dict[str, str]:
     """Return the env safe to serialize into public worker startup manifests."""
     return {key: value for key, value in env.items() if is_public_worker_startup_env_name(key)}
@@ -370,15 +492,6 @@ def public_worker_startup_env(env: Mapping[str, str]) -> dict[str, str]:
 def isolated_worker_runtime_env(env: Mapping[str, str]) -> dict[str, str]:
     """Return inherited env safe for isolated worker RuntimePaths."""
     return {key: value for key, value in env.items() if is_isolated_worker_runtime_env_name(key)}
-
-
-def execution_tool_runtime_env(env: Mapping[str, str]) -> dict[str, str]:
-    """Return env safe for sandboxed tool execution snapshots."""
-    return {
-        key: value
-        for key, value in env.items()
-        if is_isolated_worker_runtime_env_name(key) and key != CREDENTIALS_ENCRYPTION_KEY_ENV
-    }
 
 
 def sandbox_runner_startup_process_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -421,11 +534,6 @@ def credentials_encryption_key_value(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
-
-
-def credentials_encryption_key_from_env(env: Mapping[str, str]) -> str | None:
-    """Return the credential encryption key from an env mapping."""
-    return credentials_encryption_key_value(env.get(CREDENTIALS_ENCRYPTION_KEY_ENV))
 
 
 def sandbox_shell_system_env(env: Mapping[str, str]) -> Mapping[str, str]:

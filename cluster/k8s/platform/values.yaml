@@ -5,13 +5,49 @@ domain: mindroom.chat  # Base domain - override with --set domain based on envir
 # Image settings
 registry: ghcr.io/mindroom-ai
 imageTag: latest
+frontendImageTag: ""
+backendImageTag: ""
 imagePullPolicy: Always
+imagePullSecrets: []
 
 # Replicas
 replicas: 1
 
+resources:
+  frontend:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  backend:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+autoscaling:
+  enabled: false
+  frontend:
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70
+  backend:
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 65
+
 cleanupScheduler:
-  enabled: "false"
+  enabled: "true"
+  # Days an instance of an inactive subscription stays stopped (data kept) before teardown.
+  teardownGraceDays: 30
+
+platformSecrets:
+  create: true
+  name: platform-secrets
 
 # These should be overridden in values-staging.yaml and values-prod.yaml
 supabase:
@@ -30,8 +66,12 @@ provisioner:
   instanceCredentialsEncryptionSecret: ""
   instanceBaseDomain: ""
   instanceStorageClassName: ""
+  # Namespace of the ingress-nginx controller pods that instance NetworkPolicies admit; empty keeps the instance
+  # chart default (ingress-nginx). kube-hetzner's nginx addon installs into `nginx` unless ingress_target_namespace is set.
+  instanceIngressControllerNamespace: ""
   instanceMindroomImage: ""
   instanceMindroomImagePullPolicy: ""
+  instanceImagePullSecretNames: []
   instanceSynapseImage: ""
   instanceSynapseImagePullPolicy: ""
   trustedUpstreamAuth:
@@ -40,6 +80,7 @@ provisioner:
     emailHeader: ""
     matrixUserIdHeader: ""
     emailToMatrixUserIdTemplate: ""
+    emailDomain: ""
     requireJwt: "false"
     jwtHeader: ""
     jwksUrl: ""
@@ -49,17 +90,43 @@ provisioner:
     jwtUserIdClaim: ""
     jwtMatrixUserIdClaim: ""
 
+matrixOidc:
+  enabled: "false"
+  issuer: ""
+  clientId: "mindroom-synapse"
+  clientSecret: ""
+  privateKey: ""
+  keyId: "mindroom-platform"
+
 # Optional AI API keys
 apiKeys:
   openai: ""
   anthropic: ""
   openrouter: ""
+  openrouterProvisioning: ""
+  google: ""
+  deepseek: ""
+
+# Peers whose X-Real-IP header names the client for backend rate limits and the auth-failure lockout; any other caller is
+# keyed by its own address. Instance pods cannot reach the backend port, so the private ranges cover an in-cluster
+# controller without trusting tenants, provided it sets X-Real-IP from the client connection, as the reference Terraform
+# configures ingress-nginx. Narrow the ranges to the controller's pod network.
+trustedProxyCidrs:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
 
 # Ingress options
 ingress:
   # NGINX blocks configuration-snippet by default in many setups (incl. kind example)
   # Keep disabled for local kind; enable in hardened clusters if allowed.
   enableConfigurationSnippet: false
+  proxyReadTimeout: "300"
+  proxySendTimeout: "300"
+
+# The apex mindroom.chat is the Matrix server name and must stay on hetzner-matrix.
+apexRedirect:
+  enabled: false
 
 monitoring:
   enabled: true

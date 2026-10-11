@@ -1,22 +1,63 @@
-"""Native Matrix messaging toolkit for send/read/react/reply actions."""
+"""Four conversation-aware Matrix message actions for agents."""
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from dataclasses import replace
+from functools import partial
+from pathlib import Path  # noqa: TC003 - tool config sync evaluates constructor type hints at runtime.
 from threading import Lock
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from agno.tools import Toolkit
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from mindroom.custom_tools import matrix_conversation_operations
-from mindroom.custom_tools.attachment_helpers import normalize_str_list, resolve_context_thread_id, room_access_allowed
+from mindroom.custom_tools.attachment_helpers import (
+    normalize_str_list,
+    resolve_context_thread_id,
+    resolve_requested_room_id,
+    room_access_allowed,
+)
+from mindroom.custom_tools.matrix_agent_discovery import available_room_agents
 from mindroom.custom_tools.matrix_helpers import check_rate_limit
+from mindroom.custom_tools.matrix_message_idempotency import (
+    MatrixMessageIdempotencyError,
+    claim_matrix_message_send,
+)
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
+from mindroom.matrix.message_extras import parse_message_extra_sections
+from mindroom.requester_identity import is_human_requester_id
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
+
+if TYPE_CHECKING:
+    from mindroom.config.models import FileAccess
+    from mindroom.custom_tools.matrix_message_idempotency import MatrixMessageSendClaim
+    from mindroom.matrix.message_extras import MessageExtraSection
+
+
+class MatrixMessageExtra(BaseModel):
+    """Model-facing fields for one optional collapsible section."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    title: str
+    content: str
+    content_type: Literal["text/plain", "text/markdown", "text/html"] = "text/markdown"
+    collapsed: bool = True
+
+
+def _optional_string(value: str | None, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        msg = f"{name} must be a non-empty string when provided."
+        raise ValueError(msg)
+    return value.strip()
 
 
 class MatrixMessageTools(Toolkit):
-    """Native Matrix messaging actions for general agents."""
+    """Send, read, edit, and react in the current or an explicitly selected conversation."""
 
     _rate_limit_lock: ClassVar[Lock] = Lock()
     _recent_actions: ClassVar[dict[tuple[str, str, str], deque[float]]] = defaultdict(deque)
@@ -25,97 +66,26 @@ class MatrixMessageTools(Toolkit):
     _MAX_ATTACHMENTS_PER_CALL: ClassVar[int] = 5
     _DEFAULT_READ_LIMIT: ClassVar[int] = 20
     _MAX_READ_LIMIT: ClassVar[int] = 50
-    _ROOM_TIMELINE_SENTINEL: ClassVar[str] = "room"
-    _VALID_ACTIONS: ClassVar[frozenset[str]] = frozenset(
-        {"send", "thread-reply", "reply", "react", "read", "room-threads", "thread-list", "edit", "context"},
-    )
-    _operations: ClassVar[matrix_conversation_operations.MatrixMessageOperations] = (
-        matrix_conversation_operations.MatrixMessageOperations()
-    )
+    _VALID_ACTIONS: ClassVar[frozenset[str]] = frozenset({"send", "read", "edit", "react"})
 
-    def __init__(self) -> None:
-        super().__init__(
-            name="matrix_message",
-            tools=[self.matrix_message],
+    def __init__(
+        self,
+        *,
+        tool_output_workspace_root: Path | None = None,
+        file_access: FileAccess = "workspace",
+    ) -> None:
+        self._operations = matrix_conversation_operations.MatrixMessageOperations(
+            tool_output_workspace_root=tool_output_workspace_root,
+            file_access=file_access,
         )
+        super().__init__(name="matrix_message", tools=[self.matrix_message])
 
     @staticmethod
     def _payload(status: str, **kwargs: object) -> str:
         return custom_tool_payload("matrix_message", status, **kwargs)
 
     @classmethod
-    def _operation_result_payload(
-        cls,
-        result: matrix_conversation_operations.MatrixMessageOperationResult,
-    ) -> str:
-        return cls._payload(result.status, **result.fields)
-
-    @classmethod
-    def _context_error(cls) -> str:
-        return cls._payload(
-            "error",
-            message="Matrix messaging tool context is unavailable in this runtime path.",
-        )
-
-    @classmethod
-    def _read_limit(cls, limit: int | None) -> int:
-        if limit is None:
-            return cls._DEFAULT_READ_LIMIT
-        return max(1, min(limit, cls._MAX_READ_LIMIT))
-
-    @staticmethod
-    def _action_supports_attachments(action: str) -> bool:
-        return action in {"send", "thread-reply", "reply"}
-
-    def _validate_matrix_message_request(
-        self,
-        context: ToolRuntimeContext,
-        *,
-        action: str,
-        room_id: str,
-        attachment_count: int,
-    ) -> str | None:
-        supports_attachments = self._action_supports_attachments(action)
-        if action not in self._VALID_ACTIONS:
-            return self._payload(
-                "error",
-                action=action,
-                message=(
-                    "Unsupported action. Use send, reply, thread-reply, react, read, room-threads, thread-list, edit, or context."
-                ),
-            )
-        if attachment_count and not supports_attachments:
-            return self._payload(
-                "error",
-                action=action,
-                message="attachment_ids and attachment_file_paths are only supported for send, reply, and thread-reply actions.",
-            )
-        if supports_attachments and attachment_count > self._MAX_ATTACHMENTS_PER_CALL:
-            return self._payload(
-                "error",
-                action=action,
-                message=(
-                    f"attachment_ids plus attachment_file_paths cannot exceed "
-                    f"{self._MAX_ATTACHMENTS_PER_CALL} per call."
-                ),
-            )
-        if action != "context" and not room_access_allowed(context, room_id):
-            return self._payload(
-                "error",
-                action=action,
-                room_id=room_id,
-                message="Not authorized to access the target room.",
-            )
-        return None
-
-    @classmethod
-    def _check_rate_limit(
-        cls,
-        context: ToolRuntimeContext,
-        room_id: str,
-        *,
-        weight: int = 1,
-    ) -> str | None:
+    def _check_rate_limit(cls, context: ToolRuntimeContext, room_id: str, *, weight: int = 1) -> str | None:
         return check_rate_limit(
             lock=cls._rate_limit_lock,
             recent_actions=cls._recent_actions,
@@ -127,184 +97,208 @@ class MatrixMessageTools(Toolkit):
             weight=weight,
         )
 
-    def _message_context(
+    async def matrix_message(  # noqa: C901, PLR0911, PLR0912
         self,
-        context: ToolRuntimeContext,
-        *,
-        room_id: str | None,
-        thread_id: str | None,
-        normalized_action: str,
-    ) -> str:
-        resolved_room_id = room_id or context.room_id
-        resolved_thread_id = resolve_context_thread_id(
-            context,
-            room_id=resolved_room_id,
-            thread_id=thread_id,
-            allow_context_fallback=True,
-            room_timeline_sentinel=self._ROOM_TIMELINE_SENTINEL,
-        )
-        if room_id and not room_access_allowed(context, resolved_room_id):
-            return self._payload(
-                "error",
-                action=normalized_action,
-                room_id=resolved_room_id,
-                message="Not authorized to access the target room.",
-            )
-        reply_to = context.reply_to_event_id if resolved_room_id == context.room_id else None
-        return self._payload(
-            "ok",
-            action="context",
-            room_id=resolved_room_id,
-            thread_id=resolved_thread_id,
-            reply_to_event_id=reply_to,
-            requester_id=context.requester_id,
-            agent_name=context.agent_name,
-        )
-
-    async def matrix_message(  # noqa: PLR0911
-        self,
-        action: str = "send",
+        action: Literal["send", "read", "edit", "react"] = "send",
         message: str | None = None,
-        attachment_ids: list[str] | None = None,
-        attachment_file_paths: list[str] | None = None,
+        recipient: str | None = None,
         room_id: str | None = None,
-        target: str | None = None,
         thread_id: str | None = None,
-        ignore_mentions: bool = True,
+        new_thread: bool = False,
+        event_id: str | None = None,
+        attachments: list[str] | None = None,
+        message_extras: list[MatrixMessageExtra] | None = None,
         limit: int | None = None,
-        page_token: str | None = None,
+        idempotency_key: str | None = None,
     ) -> str:
-        """Send, reply, react to, read, edit, or inspect Matrix messages using current room and thread context defaults.
+        """Send, read, edit, or react to Matrix messages.
 
-        Actions:
-        - send: Send text and optional attachments to a room.
-          It defaults to the current room.
-          When the effective target is room-level, text+attachment sends post the text to the room timeline and thread attachments under that text event.
-          When the effective target is room-level and you send multiple attachments without text, the first attachment is posted to the room timeline and the remaining attachments are threaded under it.
-          In `thread_mode: room`, room-level sends stay plain room messages and do not auto-thread attachments unless you pass an explicit `thread_id`.
-        - reply: Send text and optional attachments into a thread.
-          It defaults to the current thread when one can be resolved and errors if no thread is available.
-        - thread-reply: Same threading behavior as `reply`, kept as a separate action name for agent convenience.
-        - react: React to `target` with `message` as the emoji, defaulting to thumbs-up when `message` is empty.
-        - read: Read recent messages from the current thread when one is active, otherwise from the room timeline.
-        - room-threads: List thread roots in a room with pagination support via `page_token`.
-        - thread-list: List messages in a thread and include edit options keyed by event ID.
-          It uses the current thread when one is active, otherwise you must pass `thread_id`.
-        - edit: Edit a previously sent message identified by `target`.
-          It uses the current thread by default when editing from threaded context.
-        - context: Return room, thread, reply target, requester, and agent metadata so you can plan a later tool call.
+        `send` and `read` use the current conversation. Set new_thread=True to start a separate thread, thread_id to continue another thread, or thread_id="room" for the room timeline. Another room never inherits the current thread.
 
-        Thread targeting:
-        - `send` is room-level by default even if the current conversation is inside a thread.
-        - `send` only creates a new attachment thread when its effective thread target is room-level.
-          If you pass an explicit `thread_id`, both text and attachments stay in that existing thread.
-        - `thread_mode: room` disables implicit attachment auto-threading for room-level sends.
-          Pass an explicit `thread_id` when you intentionally want threaded output from the tool.
-        - `reply` and `thread-reply` inherit the current thread when possible.
-        - `read`, `edit`, and `context` also inherit the current thread when possible.
-        - `thread_id="room"` is a sentinel meaning "force room-level scope and do not inherit the current thread."
-          Use it when you want the room timeline instead of the active thread.
+        Set recipient to an agent/team name from matrix_room(action="agents") to request a response, including from yourself for a human requester. Only that recipient is dispatched; without recipient, names in the body do not start agents. Room-mode recipients use the room timeline and cannot accept new_thread or an explicit thread. Sending returns immediately; run_subagent waits for an answer.
 
-        Mention handling with `ignore_mentions`:
-        - This flag only affects text sends for `send`, `reply`, and `thread-reply`.
-        - Default `True`: the tool writes `com.mindroom.skip_mentions=True` into the outgoing event content.
-          The bot runtime checks that flag and suppresses mention-triggered agent dispatch, so visible mentions do not page agents.
-        - `False`: the tool does not set the skip flag, so normal mention handling stays active.
-          When the requester is a human rather than the sending bot, the tool also writes `com.mindroom.original_sender=<human requester id>`, not the bot ID.
-          Downstream authorization and reply-permission checks then treat the event as coming from the original human requester.
-        - self-trigger: an agent can mention itself with `ignore_mentions=False` to intentionally create a new turn.
-          Use the same pattern for deliberate cross-agent handoffs when another agent should actually wake up and respond.
+        Send text, attachments, or both. attachments is an ordered list of att_* IDs or file paths inside the agent workspace (max 5). Use ./ for a filename starting with att_. Files arrive before recipient dispatch.
 
-        Safety:
-        - The default `ignore_mentions=True` exists to prevent accidental infinite loops and noisy mutual paging between agents.
-        - Set `ignore_mentions=False` only for intentional dispatch.
-          Prefer one deliberate handoff message over repeated self-mentions or agent-to-agent pings.
-
-        Attachments:
-        - Attachments are only supported for `send`, `reply`, and `thread-reply`.
-        - `attachment_ids` are context-scoped `att_*` IDs.
-        - `attachment_file_paths` are local file paths that will be registered into the current attachment context before sending.
-        - The combined limit of `attachment_ids` plus `attachment_file_paths` is 5 per call.
-        - A send or reply call may include text, attachments, or both, but not neither.
+        edit/react require event_id; react uses message as emoji (default 👍). message_extras adds optional collapsible sections to send/edit. Interactive prompts require normal response delivery. Use matrix_room for room details and thread discovery.
 
         Args:
-            action (str): Supported actions are `send`, `reply`, `thread-reply`, `react`, `read`, `room-threads`, `thread-list`, `edit`, and `context`; they send text or attachments, react to an event, read messages, list room thread roots or thread messages, edit a prior event, or return targeting metadata.
-            message (str | None): Text body for `send`, `reply`, `thread-reply`, and `edit`; reaction emoji for `react` with a thumbs-up default when empty; use `None` for `read`, `room-threads`, `thread-list`, and `context`.
-            attachment_ids (list[str] | None): Context-scoped `att_*` attachment IDs; only valid for `send`, `reply`, and `thread-reply`, and the combined total with `attachment_file_paths` cannot exceed 5.
-            attachment_file_paths (list[str] | None): Local file paths to register and send in the current context; only valid for `send`, `reply`, and `thread-reply`, and the combined total with `attachment_ids` cannot exceed 5.
-            room_id (str | None): Optional target room ID or alias; defaults to the current room context when omitted.
-            target (str | None): Event ID to react to for `react` or to edit for `edit`.
-            thread_id (str | None): Optional explicit thread target; `thread_id="room"` forces room-level scope instead of inheriting the current thread.
-            ignore_mentions (bool): Text-send safety flag for `send`, `reply`, and `thread-reply`; default `True` writes `com.mindroom.skip_mentions=True` to suppress mention-triggered agent dispatch, while `False` keeps mentions active and also writes `com.mindroom.original_sender=<human requester id>` when the requester is not the sending bot.
-            limit (int | None): Maximum messages returned for `read` or `thread-list`, or thread roots returned for `room-threads`; defaults to 20 and is capped at 50.
-            page_token (str | None): Pagination token for `room-threads`, returned by a previous `room-threads` call to fetch the next page of thread roots.
+            action: send, read, edit, or react.
+            message: Text to send/edit, or reaction emoji.
+            recipient: Agent/team name to request a response from; send only.
+            room_id: Room ID or configured room name; current room by default.
+            thread_id: Thread root ID; current conversation by default, "room" for room timeline.
+            new_thread: Start a separate thread; send only, cannot combine with thread_id.
+            event_id: Message event ID to edit or react to.
+            attachments: Ordered att_* IDs or workspace file paths; send only, maximum 5.
+            message_extras: Collapsible sections with title/content; optional content_type and collapsed.
+            limit: Messages to read, 1-50; default 20.
+            idempotency_key: Nonblank key (max 256 characters) for durable text-only send retries.
+                Same requester, agent, room, and key replay the first prepared message and target.
+                Completed receipts last eight days; pending sends never expire.
 
         """
         context = get_tool_runtime_context()
         if context is None:
-            return self._context_error()
-
+            return self._payload("error", message="Matrix messaging tool context is unavailable in this runtime path.")
+        if idempotency_key is None:
+            context = replace(context, config=context.current_config, config_provider=None)
+        if not isinstance(action, str) or action.strip().lower() not in self._VALID_ACTIONS:
+            return self._payload("error", message="Unsupported action. Use send, read, edit, or react.")
         normalized_action = action.strip().lower()
-        normalized_attachment_ids, attachment_ids_error = normalize_str_list(
-            attachment_ids,
-            field_name="attachment_ids",
-        )
-        if attachment_ids_error is not None:
-            return self._payload(
-                "error",
-                action=normalized_action or action,
-                message=attachment_ids_error,
-            )
-        normalized_attachment_file_paths, attachment_file_paths_error = normalize_str_list(
-            attachment_file_paths,
-            field_name="attachment_file_paths",
-        )
-        if attachment_file_paths_error is not None:
-            return self._payload(
-                "error",
-                action=normalized_action or action,
-                message=attachment_file_paths_error,
-            )
-        resolved_room_id = room_id or context.room_id
-        attachment_count = len(normalized_attachment_ids) + len(normalized_attachment_file_paths)
-        validation_error = self._validate_matrix_message_request(
-            context,
-            action=normalized_action,
-            room_id=resolved_room_id,
-            attachment_count=attachment_count,
-        )
-        if validation_error is not None:
-            return validation_error
-
-        if normalized_action == "context":
-            return self._message_context(
-                context,
-                room_id=room_id,
-                thread_id=thread_id,
-                normalized_action=normalized_action,
-            )
-
-        action_weight = 1 + attachment_count if self._action_supports_attachments(normalized_action) else 1
-        if (limit_error := self._check_rate_limit(context, resolved_room_id, weight=action_weight)) is not None:
-            return self._payload(
-                "error",
-                action=normalized_action,
-                room_id=resolved_room_id,
-                message=limit_error,
-            )
-
-        result = await self._operations.dispatch_action(
-            context,
+        try:
+            recipient = _optional_string(recipient, "recipient")
+            thread_id = _optional_string(thread_id, "thread_id")
+            event_id = _optional_string(event_id, "event_id")
+        except ValueError as exc:
+            return self._payload("error", action=normalized_action, message=str(exc))
+        if not isinstance(new_thread, bool):
+            return self._payload("error", message="new_thread must be a boolean.")
+        if message is not None and not isinstance(message, str):
+            return self._payload("error", message="message must be a string.")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)):
+            return self._payload("error", message="limit must be an integer.")
+        if attachments is not None and not isinstance(attachments, list):
+            return self._payload("error", message="attachments must be a list of attachment IDs or file paths.")
+        references, attachment_error = normalize_str_list(attachments, field_name="attachments")
+        if attachment_error is not None:
+            return self._payload("error", message=attachment_error)
+        if len(references) > self._MAX_ATTACHMENTS_PER_CALL:
+            return self._payload("error", message="attachments cannot exceed 5 per call.")
+        if normalized_action != "send" and (recipient is not None or new_thread or references):
+            return self._payload("error", message="recipient, new_thread, and attachments are only supported for send.")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 256:
+                return self._payload("error", message="idempotency_key must be nonblank and at most 256 characters.")
+            if normalized_action != "send" or attachments:
+                return self._payload(
+                    "error",
+                    message="idempotency_key is only supported for text sends without attachments.",
+                )
+        if new_thread and thread_id is not None:
+            return self._payload("error", message="Use either new_thread=True or thread_id, not both.")
+        if event_id is not None and normalized_action not in {"edit", "react"}:
+            return self._payload("error", message="event_id is only supported for edit and react.")
+        parsed_extras = None
+        if message_extras:
+            if normalized_action not in {"send", "edit"}:
+                return self._payload("error", message="message_extras is only supported for send and edit.")
+            try:
+                sections = TypeAdapter(list[MatrixMessageExtra]).validate_python(message_extras)
+                parsed_extras = parse_message_extra_sections([section.model_dump() for section in sections])
+            except (TypeError, ValueError) as exc:
+                return self._payload("error", message=str(exc))
+        resolved_room_id, room_error = resolve_requested_room_id(context, room_id)
+        if room_error is not None or resolved_room_id is None:
+            return self._payload("error", message=room_error)
+        if not await room_access_allowed(context, resolved_room_id):
+            return self._payload("error", room_id=resolved_room_id, message="Not authorized to access the target room.")
+        dispatch = partial(
+            self._dispatch_action,
             action=normalized_action,
             message=message,
-            attachment_ids=normalized_attachment_ids,
-            attachment_file_paths=normalized_attachment_file_paths,
+            recipient=recipient,
             room_id=resolved_room_id,
-            target=target,
             thread_id=thread_id,
-            ignore_mentions=ignore_mentions,
-            read_limit=self._read_limit(limit),
-            page_token=page_token,
-            room_timeline_sentinel=self._ROOM_TIMELINE_SENTINEL,
+            new_thread=new_thread,
+            event_id=event_id,
+            attachments=references,
+            message_extras=parsed_extras,
+            limit=limit,
         )
-        return self._operation_result_payload(result)
+        if idempotency_key is None:
+            return await dispatch(context)
+        try:
+            async with claim_matrix_message_send(context, resolved_room_id, idempotency_key) as claim:
+                return await dispatch(claim.context, send_claim=claim)
+        except (MatrixMessageIdempotencyError, OSError, ValueError) as exc:
+            return self._payload("error", action="send", room_id=resolved_room_id, message=str(exc))
+
+    async def _dispatch_action(
+        self,
+        context: ToolRuntimeContext,
+        *,
+        action: str,
+        message: str | None,
+        recipient: str | None,
+        room_id: str,
+        thread_id: str | None,
+        new_thread: bool,
+        event_id: str | None,
+        attachments: list[str],
+        message_extras: list[MessageExtraSection] | None,
+        limit: int | None,
+        send_claim: MatrixMessageSendClaim | None = None,
+    ) -> str:
+        stored_intent = send_claim.intent if send_claim is not None else None
+        if stored_intent is not None:
+            recipient = stored_intent.recipient
+            thread_id = stored_intent.thread_id
+            new_thread = stored_intent.starts_thread
+        if (rate_error := self._check_rate_limit(context, room_id, weight=1 + len(attachments))) is not None:
+            return self._payload("error", room_id=room_id, message=rate_error)
+        recipient_user_id = None
+        room_mode = (
+            context.config.get_entity_thread_mode(
+                context.agent_name,
+                context.runtime_paths,
+                room_id=room_id,
+            )
+            == "room"
+        )
+        if recipient is not None:
+            candidates = await available_room_agents(context, room_id)
+            selected = next((candidate for candidate in candidates if candidate.name == recipient), None)
+            if selected is None:
+                names = ", ".join(candidate.name for candidate in candidates) or "none"
+                return self._payload(
+                    "error",
+                    message=f"Recipient '{recipient}' is not available in this room. Available recipients: {names}.",
+                )
+            recipient_user_id = selected.matrix_user_id
+            if (
+                send_claim is not None
+                and send_claim.intent is not None
+                and recipient_user_id != send_claim.intent.recipient_user_id
+            ):
+                return self._payload("error", message="The original Matrix recipient is no longer available.")
+            if recipient_user_id == context.client.user_id and not is_human_requester_id(
+                context.requester_id,
+                context.config,
+                context.runtime_paths,
+            ):
+                return self._payload(
+                    "error",
+                    message="Self-messaging requires a human requester. Use run_subagent for a fresh self-run in this runtime.",
+                )
+            room_mode = selected.thread_mode == "room"
+            if room_mode and (stored_intent is None or stored_intent.event_id is None):
+                if new_thread or thread_id not in {None, "room"}:
+                    return self._payload(
+                        "error",
+                        message=f"Recipient '{recipient}' uses room conversations. Omit new_thread/thread_id or use thread_id=\"room\".",
+                    )
+                thread_id = "room"
+        effective_thread_id = resolve_context_thread_id(
+            context,
+            room_id=room_id,
+            thread_id=thread_id,
+            allow_context_fallback=not new_thread,
+            room_timeline_sentinel="room",
+        )
+        result = await self._operations.dispatch_action(
+            context,
+            action=action,
+            message=message,
+            attachments=attachments,
+            room_id=room_id,
+            event_id=event_id,
+            thread_id=effective_thread_id,
+            recipient_user_id=recipient_user_id,
+            room_mode=(room_mode or thread_id == "room") and not new_thread,
+            new_thread=new_thread or (recipient is not None and not room_mode and effective_thread_id is None),
+            message_extras=message_extras,
+            send_claim=send_claim,
+            recipient_name=recipient,
+            read_limit=max(1, min(limit if limit is not None else self._DEFAULT_READ_LIMIT, self._MAX_READ_LIMIT)),
+        )
+        return self._payload(result.status, **result.fields)

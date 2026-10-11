@@ -18,19 +18,19 @@ from backend.config import ALLOWED_ORIGINS, ENABLE_CLEANUP_SCHEDULER, ENVIRONMEN
 from backend.metrics import instrument_app
 from backend.deps import limiter
 from backend.middleware.audit_logging import AuditLoggingMiddleware
-from backend.tasks.cleanup import run_all_cleanup_tasks
+from backend.tasks.cleanup import run_cleanup_job
 from backend.routes import (
     accounts,
     admin,
     gdpr,
     health,
     instances,
+    matrix_oidc,
     pricing,
     provisioner,
     sso,
     stripe_routes,
     subscriptions,
-    usage,
     webhooks,
 )
 from fastapi import FastAPI, Request
@@ -39,22 +39,25 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from starlette.responses import Response as StarletteResponse
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
-def _run_cleanup_job() -> None:
-    """Execute periodic cleanup tasks with logging."""
-    try:
-        result = run_all_cleanup_tasks()
-        logger = logging.getLogger("mindroom.cleanup")
-        logger.info("Cleanup job completed", extra={"result": result})
-    except Exception:  # noqa: BLE001
-        logging.getLogger("mindroom.cleanup").exception("Scheduled cleanup job failed")
+async def _run_cleanup_job() -> None:
+    """Execute the nightly cleanup job with logging."""
+    logger = logging.getLogger("mindroom.cleanup")
+    run = await run_cleanup_job()
+    if run["ok"]:
+        logger.info("Cleanup job completed", extra={"result": run})
+    else:
+        logger.error("Cleanup job finished with errors", extra={"result": run})
 
 
 @asynccontextmanager
@@ -86,43 +89,72 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.cleanup_scheduler = None
 
 
+# Request size limit middleware (1 MiB default)
+MAX_REQUEST_BYTES = 1024 * 1024
+
+
+class RequestSizeLimitMiddleware:
+    """Return 413 once a request body exceeds MAX_REQUEST_BYTES, whether declared up front or streamed."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Pass through requests whose bodies stay within the limit."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            length = int(Headers(scope=scope).get("content-length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length > MAX_REQUEST_BYTES:
+            await JSONResponse({"detail": "Request too large"}, status_code=413)(scope, receive, send)
+            return
+        received = 0
+
+        async def bounded_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > MAX_REQUEST_BYTES:
+                    # Routes reading the body (including chunked bodies without Content-Length) answer 413.
+                    raise HTTPException(status_code=413, detail="Request too large")
+            return message
+
+        await self.app(scope, bounded_receive, send)
+
+
 # FastAPI app
-app = FastAPI(title="MindRoom Backend", lifespan=lifespan)
+production_docs_disabled = ENVIRONMENT == "production"
+app = FastAPI(
+    title="MindRoom Backend",
+    lifespan=lifespan,
+    docs_url=None if production_docs_disabled else "/docs",
+    redoc_url=None if production_docs_disabled else "/redoc",
+    openapi_url=None if production_docs_disabled else "/openapi.json",
+)
 
 instrument_app(app)
 
 # IMPORTANT: Middleware order is reversed in FastAPI!
 # The last middleware added runs first.
 # We want the execution order to be:
-# Request -> CORS -> TrustedHost -> SlowAPI -> Security -> AuditLogging -> Routes
+# Request -> CORS -> TrustedHost -> SlowAPI -> Security -> AuditLogging -> RequestSize -> Routes
 # So we add them in reverse order:
 
-# 1. Audit logging middleware (runs after security checks)
+# 1. Request size limit, with no BaseHTTPMiddleware below it, so an overflow raised from a body read answers 413
+app.add_middleware(RequestSizeLimitMiddleware)
+
+# 2. Audit logging middleware (runs after security checks)
 app.add_middleware(AuditLoggingMiddleware)
 
 # NOTE: The following middleware will be added later:
-# 2. Custom @app.middleware("http") decorators for security headers and request size
-# 3. SlowAPIMiddleware for rate limiting
-# 4. TrustedHostMiddleware for host validation
-# 5. CORSMiddleware (must be last to run first)
-
-
-# Request size limit middleware (1 MiB default)
-MAX_REQUEST_BYTES = 1024 * 1024
-
-
-@app.middleware("http")
-async def enforce_request_size(
-    request: Request, call_next: Callable[[Request], Awaitable[StarletteResponse]]
-) -> StarletteResponse:
-    """Return 413 if Content-Length exceeds MAX_REQUEST_BYTES."""
-    try:
-        length = int(request.headers.get("content-length", "0") or "0")
-    except ValueError:
-        length = 0
-    if length and length > MAX_REQUEST_BYTES:
-        return JSONResponse({"detail": "Request too large"}, status_code=413)
-    return await call_next(request)
+# 3. Custom @app.middleware("http") decorator for security headers
+# 4. SlowAPIMiddleware for rate limiting
+# 5. TrustedHostMiddleware for host validation
+# 6. CORSMiddleware (must be last to run first)
 
 
 # Basic security headers
@@ -180,6 +212,18 @@ def _service_allowed_hosts(*, environment: str) -> list[str]:
     return list(base_hosts | hosts_with_ports)
 
 
+def _host_name_from_header(host_header: str) -> str:
+    """Return a lower-case host name without an optional Host-header port."""
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        bracket_end = host.find("]")
+        if bracket_end != -1:
+            return host[1:bracket_end]
+    if host.count(":") == 1:
+        return host.rsplit(":", maxsplit=1)[0]
+    return host
+
+
 # Add remaining middleware BEFORE routers (but after custom middleware functions)
 # Remember: Last added = First to run
 
@@ -190,8 +234,23 @@ app.add_middleware(SlowAPIMiddleware)
 # Always allow loopback hosts so direct container health probes work in every environment.
 allowed_hosts = [f"*.{PLATFORM_DOMAIN}", PLATFORM_DOMAIN, "testserver", "localhost", "127.0.0.1"]
 
-allowed_hosts += _service_allowed_hosts(environment=ENVIRONMENT)
+service_allowed_hosts = _service_allowed_hosts(environment=ENVIRONMENT)
+metrics_allowed_hosts = frozenset(_host_name_from_header(host) for host in service_allowed_hosts)
+allowed_hosts += service_allowed_hosts
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+
+@app.middleware("http")
+async def restrict_public_metrics(
+    request: Request, call_next: Callable[[Request], Awaitable[StarletteResponse]]
+) -> StarletteResponse:
+    """Keep Prometheus samples on service hosts instead of public ingress hosts."""
+    if ENVIRONMENT == "production" and request.url.path == "/metrics":
+        host = _host_name_from_header(request.headers.get("host", ""))
+        if host not in metrics_allowed_hosts:
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+    return await call_next(request)
+
 
 # 5. Compute CORS origins: exclude localhost in production
 cors_origins = [o for o in ALLOWED_ORIGINS if not (ENVIRONMENT == "production" and o.startswith("http://localhost"))]
@@ -211,8 +270,8 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(accounts.router)
 app.include_router(subscriptions.router)
-app.include_router(usage.router)
 app.include_router(instances.router)
+app.include_router(matrix_oidc.router)
 app.include_router(provisioner.router)
 app.include_router(admin.router)
 app.include_router(pricing.router)
@@ -220,9 +279,6 @@ app.include_router(stripe_routes.router)
 app.include_router(sso.router)
 app.include_router(webhooks.router)
 app.include_router(gdpr.router)
-
-# Keep a reference list of primary endpoints for tooling/tests that grep this file
-EXPOSED_ENDPOINTS = ["/my/subscription", "/my/usage", "/my/account/admin-status", "/admin/stats"]
 
 
 if __name__ == "__main__":

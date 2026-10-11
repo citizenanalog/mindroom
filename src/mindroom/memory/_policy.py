@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from mindroom.memory_scope_ids import agent_name_from_scope_user_id, agent_scope_user_id
 from mindroom.runtime_resolution import resolve_agent_runtime
 
 from ._shared import FileMemoryResolution
@@ -12,61 +14,66 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.config.main import Config
+    from mindroom.config.memory import MemoryBackend
     from mindroom.constants import RuntimePaths
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
-def use_file_memory_backend(config: Config, *, agent_name: str | None = None) -> bool:
-    """Return whether the resolved backend is file-backed."""
-    if agent_name is None:
-        return config.memory.backend == "file"
-    return config.get_agent_memory_backend(agent_name) == "file"
+def _agent_uses_file_memory_backend(config: Config, agent_name: str) -> bool:
+    return config.resolve_entity(agent_name).memory_backend == "file"
 
 
-def use_disabled_memory_backend(config: Config, *, agent_name: str | None = None) -> bool:
-    """Return whether the resolved backend disables memory."""
-    if agent_name is None:
-        return config.memory.backend == "none"
-    return config.get_agent_memory_backend(agent_name) == "none"
+def _agent_uses_disabled_memory_backend(config: Config, agent_name: str) -> bool:
+    return config.resolve_entity(agent_name).memory_backend == "none"
 
 
 def caller_uses_file_memory_backend(config: Config, caller_context: str | list[str]) -> bool:
     """Return whether the caller context resolves to file-backed memory."""
     if isinstance(caller_context, str):
-        return use_file_memory_backend(config, agent_name=caller_context)
+        return _agent_uses_file_memory_backend(config, caller_context)
     return _team_uses_file_memory_backend(config, caller_context)
 
 
 def caller_uses_disabled_memory_backend(config: Config, caller_context: str | list[str]) -> bool:
     """Return whether the caller context resolves to disabled memory."""
     if isinstance(caller_context, str):
-        return use_disabled_memory_backend(config, agent_name=caller_context)
+        return _agent_uses_disabled_memory_backend(config, caller_context)
     return _team_uses_disabled_memory_backend(config, caller_context)
 
 
 def _team_uses_file_memory_backend(config: Config, agent_names: list[str]) -> bool:
     """Return whether all team members resolve to file-backed memory."""
     config.assert_team_agents_supported(agent_names)
-    return all(use_file_memory_backend(config, agent_name=agent_name) for agent_name in agent_names)
+    return all(_agent_uses_file_memory_backend(config, agent_name) for agent_name in agent_names)
 
 
 def _team_uses_disabled_memory_backend(config: Config, agent_names: list[str]) -> bool:
     """Return whether all team members resolve to disabled memory."""
     config.assert_team_agents_supported(agent_names)
-    return all(use_disabled_memory_backend(config, agent_name=agent_name) for agent_name in agent_names)
+    return all(_agent_uses_disabled_memory_backend(config, agent_name) for agent_name in agent_names)
 
 
-def team_members_by_memory_backend(config: Config, agent_names: list[str]) -> dict[str, list[str]]:
+@dataclass(frozen=True)
+class TeamMemoryBackendMembers:
+    """Team members grouped by their effective memory backend."""
+
+    file: list[str]
+    mem0: list[str]
+    none: list[str]
+
+    @property
+    def partitioned(self) -> bool:
+        """Return whether team memory must be split across member backends."""
+        return bool(self.none or (self.file and self.mem0))
+
+
+def team_members_by_memory_backend(config: Config, agent_names: list[str]) -> TeamMemoryBackendMembers:
     """Group team members by their effective memory backend."""
     config.assert_team_agents_supported(agent_names)
-    members_by_backend: dict[str, list[str]] = {"mem0": [], "file": [], "none": []}
-    for member_name in agent_names:
-        backend = config.get_agent_memory_backend(member_name)
-        if backend not in members_by_backend:
-            msg = f"Unsupported memory backend for team member {member_name}: {backend}"
-            raise ValueError(msg)
-        members_by_backend[backend].append(member_name)
-    return members_by_backend
+    members: dict[MemoryBackend, list[str]] = {"file": [], "mem0": [], "none": []}
+    for agent_name in agent_names:
+        members[config.resolve_entity(agent_name).memory_backend].append(agent_name)
+    return TeamMemoryBackendMembers(file=members["file"], mem0=members["mem0"], none=members["none"])
 
 
 def effective_storage_paths_for_context(
@@ -108,18 +115,6 @@ def build_team_user_id(agent_names: list[str]) -> str:
     return f"team_{'+'.join(sorted(agent_names))}"
 
 
-def agent_scope_user_id(agent_name: str) -> str:
-    """Return the scoped memory user ID for one agent."""
-    return f"agent_{agent_name}"
-
-
-def agent_name_from_scope_user_id(scope_user_id: str) -> str | None:
-    """Extract the agent name from an agent scope user ID."""
-    if scope_user_id.startswith("agent_"):
-        return scope_user_id[len("agent_") :]
-    return None
-
-
 def get_team_ids_for_agent(agent_name: str, config: Config) -> list[str]:
     """Get all team scope IDs that include the specified agent."""
     if not config.teams:
@@ -153,7 +148,10 @@ def storage_paths_for_scope_user_id(
     *,
     target_agent_names: list[str] | None = None,
 ) -> list[Path]:
-    """Return the canonical storage roots for one memory scope."""
+    """Return the canonical storage roots for one memory scope.
+
+    For a team scope, ``target_agent_names`` restricts the roots to those members.
+    """
     if (team_members := team_members_from_scope_user_id(scope_user_id, config)) is not None:
         storage_members = team_members
         if target_agent_names is not None:

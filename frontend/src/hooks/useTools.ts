@@ -7,13 +7,7 @@ export interface ToolFieldSchema {
   name: string;
   label: string;
   type:
-    | "boolean"
-    | "number"
-    | "password"
-    | "select"
-    | "string[]"
-    | "text"
-    | "url";
+    "boolean" | "number" | "password" | "select" | "string[]" | "text" | "url";
   required?: boolean;
   default?: unknown;
   placeholder?: string | null;
@@ -30,6 +24,7 @@ export interface ToolInfo {
   category: string;
   status: string;
   setup_type: string;
+  default_execution_target?: string | null;
   icon: string | null;
   icon_color: string | null;
   config_fields: ToolFieldSchema[] | null;
@@ -38,8 +33,14 @@ export interface ToolInfo {
   auth_provider?: string | null;
   docs_url?: string | null;
   helper_text?: string | null;
+  function_names?: string[] | null;
   dashboard_configuration_supported?: boolean;
   execution_scope_supported?: boolean;
+  /** Whether an agent's entry may set defer/initial; presets and control-plane tools may not. */
+  lazy_loading_supported?: boolean;
+  oauth_fallback_fields?: string[];
+  manual_auth_configured?: boolean;
+  environment_auth_configured?: boolean;
 }
 
 export interface ToolsResponse {
@@ -127,5 +128,8 @@ export function mapToolToIntegration(tool: ToolInfo) {
     dependencies: tool.dependencies,
     docs_url: tool.docs_url,
     helper_text: tool.helper_text,
+    oauth_fallback_fields: tool.oauth_fallback_fields,
+    manual_auth_configured: tool.manual_auth_configured,
+    environment_auth_configured: tool.environment_auth_configured,
   };
 }

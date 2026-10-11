@@ -64,11 +64,12 @@ locals {
     }
 
     apiKeys = {
-      openai     = var.openai_api_key
-      anthropic  = var.anthropic_api_key
-      openrouter = var.openrouter_api_key
-      google     = var.google_api_key
-      deepseek   = var.deepseek_api_key
+      openai                 = var.openai_api_key
+      anthropic              = var.anthropic_api_key
+      openrouter             = var.openrouter_api_key
+      openrouterProvisioning = var.openrouter_provisioning_api_key
+      google                 = var.google_api_key
+      deepseek               = var.deepseek_api_key
     }
 
     cleanupScheduler = {
@@ -76,7 +77,7 @@ locals {
     }
 
     monitoring = {
-      enabled     = var.deploy_monitoring
+      enabled      = var.deploy_monitoring
       releaseLabel = var.monitoring_release_name
     }
   }
@@ -160,6 +161,13 @@ resource "helm_release" "mindroom_platform" {
   values = [
     yamlencode(local.platform_values)
   ]
+
+  lifecycle {
+    precondition {
+      condition     = var.stripe_secret_key == "" || var.stripe_webhook_secret != ""
+      error_message = "stripe_webhook_secret is required when stripe_secret_key is set."
+    }
+  }
 }
 
 # ===========================================

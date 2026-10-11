@@ -1,3 +1,9 @@
+{{- $instanceSecretName := include "mindroom.instanceSecretName" .Values -}}
+{{- $instanceSecretHash := include "mindroom.instanceSecretHash" .Values -}}
+{{- $matrixOidc := .Values.matrixOidc | default (dict) -}}
+{{- /* Bump when a homeserver.yaml template change must restart running Synapse pods on upgrade. */ -}}
+{{- $synapseConfigRevision := "closed-registration" -}}
+{{- $synapseConfigHash := printf "%s|%s|%s|%s|%s|%s|%s" $synapseConfigRevision (.Values.customer | toString) (.Values.baseDomain | toString) ($matrixOidc.enabled | default "" | toString) ($matrixOidc.issuer | default "" | toString) ($matrixOidc.clientId | default "" | toString) (.Values.matrixAutoJoinRoomKeys | default (list) | toJson) | sha256sum -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,7 +23,12 @@ spec:
       labels:
         app: synapse
         customer: {{ .Values.customer | quote }}
+      annotations:
+        mindroom.ai/synapse-config-hash: {{ $synapseConfigHash | quote }}
+        mindroom.ai/instance-secret-hash: {{ $instanceSecretHash | quote }}
     spec:
+      # Synapse never calls the Kubernetes API.
+      automountServiceAccountToken: false
       containers:
       - name: synapse
         image: {{ .Values.synapse_image | default "matrixdotorg/synapse:latest" }}
@@ -43,13 +54,11 @@ spec:
         - name: synapse-config
           mountPath: /data/log.config
           subPath: log.config
+        - name: mindroom-secrets
+          mountPath: /etc/mindroom-secrets
+          readOnly: true
         resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "2Gi"
-            cpu: "1000m"
+          {{- toYaml (.Values.synapseResources | default (dict)) | nindent 10 }}
         readinessProbe:
           httpGet:
             path: /_matrix/client/versions
@@ -80,3 +89,6 @@ spec:
       - name: synapse-config
         configMap:
           name: synapse-config-{{ .Values.customer }}
+      - name: mindroom-secrets
+        secret:
+          secretName: {{ $instanceSecretName }}

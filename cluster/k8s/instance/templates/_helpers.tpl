@@ -1,64 +1,51 @@
-{{- define "mindroom.workerBackendEnv" -}}
-{{- $workerBackend := .workerBackend -}}
-{{- $instanceNamespace := .instanceNamespace -}}
-{{- $workerImage := .workerImage -}}
-{{- $workerImagePullPolicy := .workerImagePullPolicy -}}
-{{- $workerServiceAccountName := .workerServiceAccountName -}}
-{{- $controlPlaneNodeName := .controlPlaneNodeName -}}
-{{- $values := .values -}}
-{{- if eq $workerBackend "static_runner" }}
-- name: MINDROOM_SANDBOX_PROXY_URL
-  value: "http://localhost:8766"
-{{- else if eq $workerBackend "kubernetes" }}
-- name: MINDROOM_KUBERNETES_WORKER_NAMESPACE
-  value: {{ $instanceNamespace | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_IMAGE
-  value: {{ $workerImage | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_IMAGE_PULL_POLICY
-  value: {{ $workerImagePullPolicy | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_PORT
-  value: {{ $values.kubernetesWorkerPort | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_SERVICE_ACCOUNT_NAME
-  value: {{ $workerServiceAccountName | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_STORAGE_PVC_NAME
-  value: "mindroom-storage-{{ $values.customer }}"
-- name: MINDROOM_KUBERNETES_WORKER_STORAGE_MOUNT_PATH
-  value: {{ $values.storagePath | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_STORAGE_SUBPATH_PREFIX
-  value: {{ $values.kubernetesWorkerStorageSubpathPrefix | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_CONFIG_MAP_NAME
-  value: "mindroom-config-{{ $values.customer }}"
-- name: MINDROOM_KUBERNETES_WORKER_CONFIG_KEY
-  value: "config.yaml"
-- name: MINDROOM_KUBERNETES_WORKER_CONFIG_PATH
-  value: "/app/config.yaml"
-{{- if $controlPlaneNodeName }}
-- name: MINDROOM_KUBERNETES_WORKER_NODE_NAME
-  value: {{ $controlPlaneNodeName | quote }}
+{{- define "mindroom.instanceSecretName" -}}
+{{- $instanceSecrets := .instanceSecrets | default (dict) -}}
+{{- $instanceSecrets.name | default (printf "mindroom-api-keys-%s" (toString .customer)) -}}
 {{- end }}
-- name: MINDROOM_KUBERNETES_WORKER_IDLE_TIMEOUT_SECONDS
-  value: {{ $values.kubernetesWorkerIdleTimeoutSeconds | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_READY_TIMEOUT_SECONDS
-  value: {{ $values.kubernetesWorkerReadyTimeoutSeconds | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_NAME_PREFIX
-  value: {{ $values.kubernetesWorkerNamePrefix | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_ENABLE_SERVICE_LINKS
-  value: {{ $values.kubernetesWorkerEnableServiceLinks | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_AUTH_SECRET_NAME
-  value: "mindroom-worker-auth-{{ $values.customer }}"
-- name: MINDROOM_KUBERNETES_WORKER_LABELS_JSON
-  value: {{ dict "customer" $values.customer | toJson | quote }}
-- name: MINDROOM_KUBERNETES_WORKER_OWNER_DEPLOYMENT_NAME
-  value: "mindroom-{{ $values.customer }}"
+
+{{- define "mindroom.instanceSecretsCreate" -}}
+{{- $instanceSecrets := .instanceSecrets | default (dict) -}}
+{{- $create := true -}}
+{{- if hasKey $instanceSecrets "create" -}}
+{{- $createValue := lower (toString $instanceSecrets.create) -}}
+{{- $create = has $createValue (list "1" "true" "yes" "on") -}}
+{{- end -}}
+{{- $create -}}
 {{- end }}
+
+{{- define "mindroom.instanceSecretHash" -}}
+{{- $instanceSecrets := .instanceSecrets | default (dict) -}}
+{{- if $instanceSecrets.hash -}}
+{{- $instanceSecrets.hash -}}
+{{- else -}}
+{{- printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" (.openai_key | default "") (.anthropic_key | default "") (.openrouter_key | default "") (.google_key | default "") (.deepseek_key | default "") (.sandbox_proxy_token | default "") (.credentials_encryption_key | default "") (.matrixOidc.clientSecret | default "") (.matrixRegistrationSharedSecret | default .matrix_admin_password | default "") (.platformSsoSecret | default "") | sha256sum -}}
+{{- end -}}
+{{- end }}
+
+{{- define "mindroom.ingressControllerPeer" -}}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ required "ingressControllerNamespace is required" .Values.ingressControllerNamespace | quote }}
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: controller
+      app.kubernetes.io/name: ingress-nginx
 {{- end }}
 
 {{- define "mindroom.staticRunnerContainer" -}}
 {{- $values := .values -}}
+{{- /*
+The runner executes agent tool code, so it must not see the tenant credential store, Matrix state,
+the tenant config or its seed ConfigMap, or the credentials encryption key.
+It mounts only agent state from the PVC over its own private storage root,
+and saved tool settings reach it as per-call leases from the primary.
+Each request carries the allowlisted fields runners resolve from the primary's live config.
+Its config path matches the primary's only so config-relative snapshot paths resolve alike; nothing is mounted there.
+*/ -}}
 - name: sandbox-runner
   image: {{ $values.mindroom_image | default "ghcr.io/mindroom-ai/mindroom:latest" }}
   imagePullPolicy: {{ $values.mindroom_image_pull_policy | default "Always" }}
-  command: ["/app/run-sandbox-runner.sh"]
+  command: ["tini", "--", "/app/run-sandbox-runner.sh"]
   ports:
   - containerPort: 8766
   env:
@@ -67,37 +54,28 @@
   - name: MINDROOM_SANDBOX_PROXY_TOKEN
     valueFrom:
       secretKeyRef:
-        name: mindroom-api-keys-{{ $values.customer }}
+        name: {{ include "mindroom.instanceSecretName" $values }}
         key: sandbox_proxy_token
-  {{- if $values.credentials_encryption_key }}
-  - name: MINDROOM_CREDENTIALS_ENCRYPTION_KEY
-    valueFrom:
-      secretKeyRef:
-        name: mindroom-api-keys-{{ $values.customer }}
-        key: credentials_encryption_key
-  {{- end }}
   - name: MINDROOM_CONFIG_PATH
-    value: "/app/config.yaml"
+    value: "{{ $values.storagePath }}/config/config.yaml"
   - name: MINDROOM_STORAGE_PATH
     value: {{ $values.storagePath }}
   - name: HOME
     value: {{ $values.storagePath }}
   volumeMounts:
-  - name: config
-    mountPath: /app/config.yaml
-    subPath: config.yaml
-    readOnly: true
   - name: storage
     mountPath: {{ $values.storagePath }}
+    subPath: sandbox-runner
+  - name: storage
+    mountPath: {{ $values.storagePath }}/agents
+    subPath: agents
+  - name: storage
+    mountPath: {{ $values.storagePath }}/private_instances
+    subPath: private_instances
   - name: sandbox-workspace
     mountPath: /app/workspace
   resources:
-    requests:
-      memory: "256Mi"
-      cpu: "100m"
-    limits:
-      memory: "1Gi"
-      cpu: "500m"
+    {{- toYaml ($values.sandboxRunnerResources | default (dict)) | nindent 4 }}
   securityContext:
     allowPrivilegeEscalation: false
     capabilities:
@@ -107,5 +85,6 @@
 
 {{- define "mindroom.staticRunnerVolume" -}}
 - name: sandbox-workspace
-  emptyDir: {}
+  emptyDir:
+    sizeLimit: {{ required "sandboxRunnerWorkspaceSizeLimit is required" .Values.sandboxRunnerWorkspaceSizeLimit | quote }}
 {{- end }}

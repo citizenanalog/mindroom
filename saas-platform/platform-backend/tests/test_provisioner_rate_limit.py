@@ -6,14 +6,11 @@ without touching Kubernetes or the database by stubbing dependencies.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import backend.routes.provisioner as prov
+import backend.services.provisioner_service as prov_service
+import pytest
 from fastapi.testclient import TestClient
 from main import app
-
-if TYPE_CHECKING:  # pragma: no cover
-    import pytest
 
 
 def _setup_provisioner_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -28,19 +25,19 @@ def _setup_provisioner_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _exists(instance_id: int) -> bool:  # noqa: ARG001
         return True
 
-    monkeypatch.setattr(prov, "check_deployment_exists", _exists)
+    monkeypatch.setattr(prov_service, "check_deployment_exists", _exists)
 
     async def _fake_kubectl(args: list[str], namespace: str = "mindroom-instances") -> tuple[int, str, str]:  # noqa: ARG001
         return 0, "ok", ""
 
-    monkeypatch.setattr(prov, "run_kubectl", _fake_kubectl)
-    monkeypatch.setattr(prov, "update_instance_status", lambda instance_id, status: True)  # noqa: ARG005
+    monkeypatch.setattr(prov_service, "run_kubectl", _fake_kubectl)
+    monkeypatch.setattr(prov_service, "update_instance_status", lambda instance_id, status: True)  # noqa: ARG005
 
     # Also stub helm for uninstall route
     async def _fake_helm(args: list[str]) -> tuple[int, str, str]:  # noqa: ARG001
         return 0, "ok", ""
 
-    monkeypatch.setattr(prov, "run_helm", _fake_helm)
+    monkeypatch.setattr(prov_service, "run_helm", _fake_helm)
 
 
 def test_start_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -58,6 +55,7 @@ def test_start_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert statuses[10] == 429
 
 
+@pytest.mark.usefixtures("stub_uninstall_cleanup")
 def test_uninstall_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """2 requests allowed; 3rd returns 429."""
     _setup_provisioner_stubs(monkeypatch)

@@ -1,11 +1,16 @@
 """Comprehensive HTTP API tests for provisioner endpoints."""
 
 import base64
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+import inspect
+import json
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
+from backend.openrouter import CreatedOpenRouterKey, OpenRouterError
+from backend.services import provisioner_service
 from fastapi.testclient import TestClient
+
+from tests.fake_supabase import FakeSupabase
 
 
 def _helm_set_args(helm_args: list[str]) -> dict[str, str]:
@@ -28,10 +33,190 @@ def _helm_set_file_args(helm_args: list[str]) -> dict[str, str]:
     return set_file_args
 
 
+def _helm_set_string_args(helm_args: list[str]) -> dict[str, str]:
+    """Return Helm --set-string key/value pairs from a captured command."""
+    set_string_args = {}
+    for i, arg in enumerate(helm_args):
+        if arg == "--set-string":
+            key, value = helm_args[i + 1].split("=", 1)
+            set_string_args[key] = value
+    return set_string_args
+
+
+def _assert_helm_uses_external_instance_secret(helm_args: list[str]) -> None:
+    """Assert Helm only receives the external instance Secret reference."""
+    set_args = _helm_set_args(helm_args)
+    set_file_args = _helm_set_file_args(helm_args)
+    set_string_args = _helm_set_string_args(helm_args)
+
+    assert set_args["instanceSecrets.create"] == "false"
+    assert set_args["instanceSecrets.name"].startswith("mindroom-api-keys-")
+    assert "instanceSecrets.hash" in set_string_args
+    assert "credentials_encryption_key" not in set_args
+    assert "credentials_encryption_key" not in set_file_args
+
+
+_OWNER_ACCOUNT_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _mock_owner_account_tables(mock_supabase: MagicMock) -> MagicMock:
+    """Route Supabase tables to a new instance row and an owner account with an email; return the accounts table."""
+    instances_table = MagicMock()
+    instances_table.insert.return_value.execute.return_value = Mock(data=[{"instance_id": "123"}])
+    instances_table.update.return_value.eq.return_value.execute.return_value = Mock()
+    accounts_table = MagicMock()
+    accounts_table.select.return_value.eq.return_value.limit.return_value.execute.return_value = Mock(
+        data=[{"email": "Owner.User+Test@example.com"}]
+    )
+    mock_supabase.table.side_effect = lambda table: {"accounts": accounts_table, "instances": instances_table}[table]
+    return accounts_table
+
+
+def _applied_instance_secret_data(apply_secret: AsyncMock) -> dict[str, str]:
+    """Return the Secret payload passed to _apply_instance_secret."""
+    from backend.services.provisioner_service import _apply_instance_secret
+
+    apply_secret.assert_awaited()
+    bound = inspect.signature(_apply_instance_secret).bind(
+        *apply_secret.await_args.args, **apply_secret.await_args.kwargs
+    )
+    return bound.arguments["secret_data"]
+
+
+def test_owner_matrix_user_id_from_email_matches_synapse_oidc_template() -> None:
+    """Hosted owner MXIDs should match Synapse's OIDC email localpart mapping."""
+    from backend.services.provisioner_service import _owner_matrix_user_id_from_email
+
+    assert (
+        _owner_matrix_user_id_from_email("Owner.User+Test@Example.COM", instance_id="42", base_domain="mindroom.chat")
+        == "@owner.user+test:42.mindroom.chat"
+    )
+    assert (
+        _owner_matrix_user_id_from_email("_Owner=Test@example.com", instance_id="42", base_domain="mindroom.chat")
+        == "@=5fowner=3dtest:42.mindroom.chat"
+    )
+
+
+@pytest.mark.parametrize("stored_limit", ["not-a-number", object()])
+def test_matching_openrouter_metadata_treats_invalid_stored_limit_as_cache_miss(stored_limit: object) -> None:
+    """Malformed advisory OpenRouter metadata should not block fresh provisioning."""
+    from backend.services.provisioner_service import _matching_openrouter_metadata
+
+    assert (
+        _matching_openrouter_metadata(
+            {
+                "openrouter_key_hash": "hash_123",
+                "openrouter_key_limit_reset": "monthly",
+                "openrouter_key_limit_usd": stored_limit,
+            },
+            15,
+        )
+        is False
+    )
+
+
+def _stored_key_db(limit_usd: int) -> FakeSupabase:
+    """An instance whose stored key has a limit the hobby tier does not include as-is."""
+    return FakeSupabase(
+        {
+            "instances": [
+                {
+                    "instance_id": "123",
+                    "openrouter_key_hash": "old_hash",
+                    "openrouter_key_limit_usd": limit_usd,
+                    "openrouter_key_limit_reset": "monthly",
+                }
+            ]
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_limit", [10, 150])
+async def test_a_stored_key_limit_changes_without_replacing_the_key(old_limit: int) -> None:
+    from backend.services.provisioner_service import _provision_openrouter_key
+
+    db = _stored_key_db(old_limit)
+    with (
+        patch("backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY", "test-management"),
+        patch("backend.services.provisioner_service.set_openrouter_key_limit") as set_limit,
+        patch(
+            "backend.services.provisioner_service._existing_instance_secret_value", AsyncMock(return_value="same-key")
+        ),
+    ):
+        key, created = await _provision_openrouter_key(
+            sb=db,
+            account_id="acc_123",
+            instance_id="123",
+            tier="hobby",
+            existing_instance_row=db.row("instances", instance_id="123"),
+            namespace="test",
+        )
+    assert (key, created) == ("same-key", None)
+    set_limit.assert_called_once_with(management_api_key="test-management", key_hash="old_hash", limit_usd=15)
+    assert db.row("instances", instance_id="123")["openrouter_key_hash"] == "old_hash"
+    assert db.row("instances", instance_id="123")["openrouter_key_limit_usd"] == 15
+
+
+@pytest.mark.asyncio
+async def test_limit_update_repairs_a_missing_reset_schedule() -> None:
+    from backend.services.provisioner_service import openrouter_key_matches_plan, set_instance_openrouter_key_limit
+
+    db = _stored_key_db(15)
+    row = db.row("instances", instance_id="123")
+    row["openrouter_key_limit_reset"] = None
+    with (
+        patch("backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY", "test-management"),
+        patch("backend.openrouter._send_http_request", return_value=(200, b"{}")) as request,
+    ):
+        await set_instance_openrouter_key_limit(db, row, "hobby")
+
+    method, url, _, body = request.call_args.args
+    assert method == "PATCH"
+    assert url.endswith("/keys/old_hash")
+    assert json.loads(body) == {"limit": 15, "limit_reset": "monthly"}
+    assert row["openrouter_key_hash"] == "old_hash"
+    assert row["openrouter_key_limit_reset"] == "monthly"
+    assert openrouter_key_matches_plan(row, "hobby")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_limit_update_preserves_stored_key_metadata() -> None:
+    from backend.services.provisioner_service import _provision_openrouter_key
+
+    db = _stored_key_db(150)
+    with (
+        patch(
+            "backend.services.provisioner_service.set_openrouter_key_limit",
+            side_effect=OpenRouterError("update failed"),
+        ),
+        pytest.raises(OpenRouterError, match="update failed"),
+    ):
+        await _provision_openrouter_key(
+            sb=db,
+            account_id="acc_123",
+            instance_id="123",
+            tier="hobby",
+            existing_instance_row=db.row("instances", instance_id="123"),
+            namespace="test",
+        )
+    assert db.row("instances", instance_id="123")["openrouter_key_hash"] == "old_hash"
+    assert db.row("instances", instance_id="123")["openrouter_key_limit_usd"] == 150
+
+
+def _is_existing_secret_value_lookup(args: list[str]) -> bool:
+    """Return whether kubectl args read one existing instance Secret value."""
+    return args[:3] == ["get", "secret", "mindroom-api-keys-456"] and any(
+        arg.startswith("-o=jsonpath=") for arg in args
+    )
+
+
 async def _kubectl_without_credentials_encryption_secret(args: list[str], namespace: str | None = None):
     """Return an empty response for a missing existing instance API key Secret."""
     _ = namespace
-    if args[:3] == ["get", "secret", "mindroom-api-keys-456"]:
+    if args[:2] == ["get", "pvc"]:
+        return (0, '{"items":[]}', "")
+    if _is_existing_secret_value_lookup(args):
         assert "--ignore-not-found" in args
         return (0, "", "")
     return (0, "Success", "")
@@ -40,7 +225,9 @@ async def _kubectl_without_credentials_encryption_secret(args: list[str], namesp
 async def _kubectl_with_credentials_encryption_secret(args: list[str], namespace: str | None = None):
     """Return a non-empty existing credential encryption key for the instance API key Secret."""
     _ = namespace
-    if args[:3] == ["get", "secret", "mindroom-api-keys-456"]:
+    if args[:2] == ["get", "pvc"]:
+        return (0, '{"items":[]}', "")
+    if _is_existing_secret_value_lookup(args):
         assert "--ignore-not-found" in args
         existing_key = base64.urlsafe_b64encode(b"1" * 32).decode("ascii").rstrip("=")
         return (0, base64.b64encode(existing_key.encode("utf-8")).decode("ascii"), "")
@@ -50,7 +237,9 @@ async def _kubectl_with_credentials_encryption_secret(args: list[str], namespace
 async def _kubectl_credentials_encryption_secret_lookup_fails(args: list[str], namespace: str | None = None):
     """Return a real kubectl failure for the existing instance API key Secret lookup."""
     _ = namespace
-    if args[:3] == ["get", "secret", "mindroom-api-keys-456"]:
+    if args[:2] == ["get", "pvc"]:
+        return (0, '{"items":[]}', "")
+    if _is_existing_secret_value_lookup(args):
         assert "--ignore-not-found" in args
         return (1, "", "Forbidden")
     return (0, "Success", "")
@@ -71,62 +260,68 @@ class TestProvisionerEndpoints:
         """Mock Supabase client."""
         with patch("backend.routes.provisioner.ensure_supabase") as mock:
             sb = MagicMock()
+            # Instance lookups by id find no lifecycle hold unless a test says otherwise.
+            sb.table.return_value.select.return_value.eq.return_value.execute.return_value = Mock(
+                data=[{"lifecycle_stopped_at": None}]
+            )
             mock.return_value = sb
             yield sb
 
     @pytest.fixture
     def mock_kubectl(self):
         """Mock kubectl commands."""
-        with patch("backend.routes.provisioner.run_kubectl") as mock:
+        with patch("backend.services.provisioner_service.run_kubectl") as mock:
             mock.return_value = (0, "Success", "")  # Default success response
             yield mock
 
     @pytest.fixture
     def mock_helm(self):
         """Mock helm commands."""
-        with patch("backend.routes.provisioner.run_helm") as mock:
+        with patch("backend.services.provisioner_service.run_helm") as mock:
             mock.return_value = (0, "Success", "")  # Default success response
             yield mock
 
     @pytest.fixture
     def mock_check_deployment(self):
         """Mock deployment existence check."""
-        with patch("backend.routes.provisioner.check_deployment_exists") as mock:
+        with patch("backend.services.provisioner_service.check_deployment_exists") as mock:
             mock.return_value = True  # Default exists
             yield mock
 
     @pytest.fixture
     def mock_wait_for_deployment(self):
         """Mock deployment readiness check."""
-        with patch("backend.routes.provisioner.wait_for_deployment_ready") as mock:
+        with patch("backend.services.provisioner_service.wait_for_deployment_ready") as mock:
             mock.return_value = True  # Default ready
             yield mock
 
     @pytest.fixture
     def mock_update_status(self):
         """Mock update instance status."""
-        with patch("backend.routes.provisioner.update_instance_status") as mock:
+        with patch("backend.services.provisioner_service.update_instance_status") as mock:
             mock.return_value = True  # Default success
             yield mock
 
     @pytest.fixture
     def valid_auth_header(self):
         """Get valid authorization header."""
-        # Need to patch where it's used, not where it's defined
-        with patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-api-key"):
+        # Need to patch where it's used, not where it's defined: the route checks
+        # the bearer token and the service derives stable instance secrets from it.
+        with (
+            patch("backend.routes.provisioner.PROVISIONER_API_KEY", "test-api-key"),
+            patch("backend.services.provisioner_service.PROVISIONER_API_KEY", "test-api-key"),
+        ):
             yield {"Authorization": "Bearer test-api-key"}
 
     @pytest.fixture
     def mock_config(self):
         """Mock configuration values."""
         with patch.multiple(
-            "backend.routes.provisioner",
+            "backend.services.provisioner_service",
             INSTANCE_BASE_DOMAIN="mindroom.test",
             PLATFORM_DOMAIN="mindroom.test",
             SUPABASE_URL="https://supabase.test",
             SUPABASE_ANON_KEY="test-anon-key",
-            OPENROUTER_API_KEY="test-openrouter",
-            OPENAI_API_KEY="test-openai",
         ):
             yield
 
@@ -158,7 +353,7 @@ class TestProvisionerEndpoints:
         mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
         mock_supabase.table().update().eq().execute.return_value = Mock()
 
-        provision_data = {"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "starter"}
+        provision_data = {"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "byok"}
 
         # Make request
         response = client.post("/system/provision", json=provision_data, headers=valid_auth_header)
@@ -176,6 +371,441 @@ class TestProvisionerEndpoints:
         # Verify calls
         mock_kubectl.assert_called()
         mock_helm.assert_called()
+
+    def test_byok_provisioning_does_not_inject_platform_openrouter_key(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """BYOK instances should not receive a shared platform OpenRouter key."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+
+        with (
+            patch(
+                "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+            ) as apply_secret,
+            patch("backend.services.provisioner_service.create_openrouter_key", create=True) as create_key,
+        ):
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "byok"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        secret_data = _applied_instance_secret_data(apply_secret)
+        assert secret_data["openrouter_key"] == ""
+        create_key.assert_not_called()
+
+    def test_byok_provisioning_does_not_inject_shared_platform_provider_keys(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """BYOK tenants should not receive shared platform model-provider keys."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+
+        with patch(
+            "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+        ) as apply_secret:
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "byok"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        secret_data = _applied_instance_secret_data(apply_secret)
+        assert secret_data["openai_key"] == ""
+        assert secret_data["anthropic_key"] == ""
+        assert secret_data["google_key"] == ""
+        assert secret_data["deepseek_key"] == ""
+
+    def test_provisioning_secret_holds_only_instance_scoped_credentials(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """A tenant that reads its own Secret must not obtain the platform's Supabase service-role key."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+
+        with patch(
+            "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+        ) as apply_secret:
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "byok"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        secret_data = _applied_instance_secret_data(apply_secret)
+        # Review any new key for tenant scoping before extending this set.
+        assert set(secret_data) == {
+            "openai_key",
+            "anthropic_key",
+            "openrouter_key",
+            "google_key",
+            "deepseek_key",
+            "sandbox_proxy_token",
+            "credentials_encryption_key",
+            "matrix_oidc_client_secret",
+            "matrix_registration_shared_secret",
+            "platform_sso_secret",
+        }
+        assert len(bytes.fromhex(secret_data["sandbox_proxy_token"])) == 32
+
+    def test_hobby_provisioning_only_injects_limited_openrouter_provider_key(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Included-budget tenants should not receive shared direct provider keys."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+        created_key = CreatedOpenRouterKey(
+            key="sk-or-v1-hobby-customer",
+            hash="hobby_hash",
+            label="MindRoom hobby instance 123",
+            limit_usd=15,
+            limit_reset="monthly",
+        )
+
+        with (
+            patch(
+                "backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY",
+                "sk-or-v1-management",
+                create=True,
+            ),
+            patch("backend.services.provisioner_service.create_openrouter_key", return_value=created_key, create=True),
+            patch(
+                "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+            ) as apply_secret,
+        ):
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "hobby"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        secret_data = _applied_instance_secret_data(apply_secret)
+        assert secret_data["openrouter_key"] == "sk-or-v1-hobby-customer"
+        assert secret_data["openai_key"] == ""
+        assert secret_data["anthropic_key"] == ""
+        assert secret_data["google_key"] == ""
+        assert secret_data["deepseek_key"] == ""
+
+    def test_hobby_provisioning_creates_monthly_limited_openrouter_key(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Hobby instances should get a per-customer $15 monthly OpenRouter key."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+        created_key = CreatedOpenRouterKey(
+            key="sk-or-v1-hobby-customer",
+            hash="hobby_hash",
+            label="MindRoom hobby instance 123",
+            limit_usd=15,
+            limit_reset="monthly",
+        )
+
+        with (
+            patch(
+                "backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY",
+                "sk-or-v1-management",
+                create=True,
+            ),
+            patch(
+                "backend.services.provisioner_service.create_openrouter_key", return_value=created_key, create=True
+            ) as create_key,
+            patch(
+                "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+            ) as apply_secret,
+        ):
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "hobby"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        plan = create_key.call_args.kwargs["plan"]
+        assert plan.monthly_limit_usd == 15
+        assert plan.name == "MindRoom hobby account acc_test_123 instance 123"
+        secret_data = _applied_instance_secret_data(apply_secret)
+        assert secret_data["openrouter_key"] == "sk-or-v1-hobby-customer"
+        update_payloads = [call_.args[0] for call_ in mock_supabase.table().update.call_args_list if call_.args]
+        assert any(payload.get("openrouter_key_hash") == "hobby_hash" for payload in update_payloads)
+
+    def test_hobby_provisioning_deletes_a_key_whose_metadata_cannot_be_recorded(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """A created key the instance row does not record is deleted, because only recorded keys are ever disabled."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+        created_key = CreatedOpenRouterKey(
+            key="sk-or-v1-hobby-customer",
+            hash="hobby_hash",
+            label="MindRoom hobby instance 123",
+            limit_usd=15,
+            limit_reset="monthly",
+        )
+
+        with (
+            patch(
+                "backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY",
+                "sk-or-v1-management",
+                create=True,
+            ),
+            patch("backend.services.provisioner_service.create_openrouter_key", return_value=created_key, create=True),
+            patch("backend.services.provisioner_service.delete_openrouter_key") as delete_key,
+            patch(
+                "backend.services.provisioner_service._persist_openrouter_key_metadata",
+                side_effect=RuntimeError("supabase unavailable"),
+            ),
+            patch(
+                "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+            ) as apply_secret,
+        ):
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "hobby"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 500
+        delete_key.assert_called_once_with(management_api_key="sk-or-v1-management", key_hash="hobby_hash")
+        mock_helm.assert_not_called()
+
+    def test_hobby_provisioning_missing_openrouter_management_key_returns_operator_error(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Missing OpenRouter management configuration is a platform operator error."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+
+        with (
+            patch("backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY", "", create=True),
+            patch(
+                "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+            ) as apply_secret,
+        ):
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "hobby"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 500
+        assert "OPENROUTER_PROVISIONING_API_KEY" in response.json()["detail"]
+        apply_secret.assert_not_called()
+        update_payloads = [call_.args[0] for call_ in mock_supabase.table().update.call_args_list if call_.args]
+        assert any(payload.get("status") == "error" for payload in update_payloads)
+
+    def test_pro_provisioning_uses_larger_resource_profile_and_openrouter_limit(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Pro instances should get a $150 OpenRouter limit and larger Kubernetes resources."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+        created_key = CreatedOpenRouterKey(
+            key="sk-or-v1-pro-customer",
+            hash="pro_hash",
+            label="MindRoom pro instance 123",
+            limit_usd=150,
+            limit_reset="monthly",
+        )
+
+        with (
+            patch(
+                "backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY",
+                "sk-or-v1-management",
+                create=True,
+            ),
+            patch(
+                "backend.services.provisioner_service.create_openrouter_key", return_value=created_key, create=True
+            ) as create_key,
+            patch(
+                "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+            ) as apply_secret,
+        ):
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "pro"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        plan = create_key.call_args.kwargs["plan"]
+        assert plan.monthly_limit_usd == 150
+        secret_data = _applied_instance_secret_data(apply_secret)
+        assert secret_data["openrouter_key"] == "sk-or-v1-pro-customer"
+        set_args = _helm_set_args(mock_helm.call_args.args[0])
+        assert set_args["storage"] == "25Gi"
+        assert {key: value for key, value in set_args.items() if ".requests." in key} == {
+            "mindroomResources.requests.memory": "640Mi",
+            "mindroomResources.requests.cpu": "200m",
+            "mindroomResources.requests.ephemeral-storage": "64Mi",
+            "synapseResources.requests.memory": "384Mi",
+            "synapseResources.requests.cpu": "100m",
+            "synapseResources.requests.ephemeral-storage": "64Mi",
+            "sandboxRunnerResources.requests.memory": "256Mi",
+            "sandboxRunnerResources.requests.cpu": "50m",
+            "sandboxRunnerResources.requests.ephemeral-storage": "64Mi",
+        }
+        assert set_args["mindroomResources.limits.memory"] == "4Gi"
+        assert set_args["sandboxRunnerResources.limits.memory"] == "2Gi"
+
+    @pytest.mark.parametrize("namespace", ["", "nginx"])
+    def test_provision_forwards_the_configured_ingress_controller_namespace(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+        namespace: str,
+    ):
+        """Instance NetworkPolicies must admit the controller where the cluster actually runs it."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+
+        with patch("backend.services.provisioner_service.INSTANCE_INGRESS_CONTROLLER_NAMESPACE", namespace):
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "byok"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        set_args = _helm_set_args(mock_helm.call_args.args[0])
+        assert set_args.get("ingressControllerNamespace") == (namespace or None)
+
+    def test_provision_passes_owner_matrix_user_to_instance_chart(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Provisioning should authorize the platform owner inside the hosted Matrix tenant."""
+        _mock_owner_account_tables(mock_supabase)
+
+        with patch.multiple(
+            "backend.services.provisioner_service",
+            INSTANCE_MATRIX_OIDC_ENABLED="true",
+            INSTANCE_MATRIX_OIDC_ISSUER="https://api.mindroom.test/matrix-oidc",
+            INSTANCE_MATRIX_OIDC_CLIENT_ID="mindroom-synapse",
+        ):
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": _OWNER_ACCOUNT_ID, "tier": "byok"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        helm_args = mock_helm.call_args.args[0]
+        set_args = _helm_set_args(helm_args)
+        set_string_args = _helm_set_string_args(helm_args)
+        assert set_args["roomDefaults.joinPolicy"] == "public"
+        assert set_args["roomDefaults.listed"] == "false"
+        assert set_string_args["matrixAutoJoinRoomKeys[0]"] == "personal"
+        assert "matrixAutoJoinRoomKeys[1]" not in set_string_args
+        assert set_string_args["administrators[0]"] == "@owner.user+test:123.mindroom.test"
+        assert set_string_args["roomDefaults.inviteUsers[0]"] == "@owner.user+test:123.mindroom.test"
+        assert set_string_args["roomDefaults.admins[0]"] == "@owner.user+test:123.mindroom.test"
+        _assert_helm_uses_external_instance_secret(helm_args)
+
+    def test_provision_does_not_authorize_unbound_owner_matrix_user_without_oidc(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Without platform OIDC nothing binds the derived owner MXID to the account, so it gets no authority."""
+        accounts_table = _mock_owner_account_tables(mock_supabase)
+
+        with patch("backend.services.provisioner_service.INSTANCE_MATRIX_OIDC_ENABLED", ""):
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": _OWNER_ACCOUNT_ID, "tier": "byok"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        set_string_args = _helm_set_string_args(mock_helm.call_args.args[0])
+        assert "administrators[0]" not in set_string_args
+        assert "roomDefaults.inviteUsers[0]" not in set_string_args
+        assert "roomDefaults.admins[0]" not in set_string_args
+        accounts_table.select.assert_not_called()
 
     def test_provision_re_provision_existing(
         self,
@@ -195,7 +825,7 @@ class TestProvisionerEndpoints:
         provision_data = {
             "subscription_id": "sub_test_123",
             "account_id": "acc_test_123",
-            "tier": "professional",
+            "tier": "byok",
             "instance_id": "456",  # Existing instance
         }
 
@@ -208,9 +838,8 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert data["customer_id"] == "456"
         helm_args = mock_helm.call_args.args[0]
-        set_args = _helm_set_args(helm_args)
-        assert set_args["credentials_encryption_key"] == ""
-        assert "credentials_encryption_key" not in _helm_set_file_args(helm_args)
+        _assert_helm_uses_external_instance_secret(helm_args)
+        assert any(call_.args[0][:2] == ["apply", "-f"] for call_ in mock_kubectl.call_args_list)
 
     def test_provision_re_provision_existing_preserves_credentials_encryption(
         self,
@@ -231,7 +860,7 @@ class TestProvisionerEndpoints:
             json={
                 "subscription_id": "sub_test_123",
                 "account_id": "acc_test_123",
-                "tier": "professional",
+                "tier": "byok",
                 "instance_id": "456",
             },
             headers=valid_auth_header,
@@ -239,13 +868,10 @@ class TestProvisionerEndpoints:
 
         assert response.status_code == 200
         helm_args = mock_helm.call_args.args[0]
-        set_args = _helm_set_args(helm_args)
         expected_key = base64.urlsafe_b64encode(b"1" * 32).decode("ascii").rstrip("=")
-        assert "credentials_encryption_key" not in set_args
-        set_file_args = _helm_set_file_args(helm_args)
-        assert "credentials_encryption_key" in set_file_args
         assert expected_key not in " ".join(helm_args)
-        assert not Path(set_file_args["credentials_encryption_key"]).exists()
+        _assert_helm_uses_external_instance_secret(helm_args)
+        assert any(call_.args[0][:2] == ["apply", "-f"] for call_ in mock_kubectl.call_args_list)
 
     def test_provision_re_provision_existing_opt_in_preserves_existing_credentials_encryption_key(
         self,
@@ -266,7 +892,7 @@ class TestProvisionerEndpoints:
             json={
                 "subscription_id": "sub_test_123",
                 "account_id": "acc_test_123",
-                "tier": "professional",
+                "tier": "byok",
                 "instance_id": "456",
                 "enable_credentials_encryption": True,
             },
@@ -275,13 +901,10 @@ class TestProvisionerEndpoints:
 
         assert response.status_code == 200
         helm_args = mock_helm.call_args.args[0]
-        set_args = _helm_set_args(helm_args)
         expected_key = base64.urlsafe_b64encode(b"1" * 32).decode("ascii").rstrip("=")
-        assert "credentials_encryption_key" not in set_args
-        set_file_args = _helm_set_file_args(helm_args)
-        assert "credentials_encryption_key" in set_file_args
         assert expected_key not in " ".join(helm_args)
-        assert not Path(set_file_args["credentials_encryption_key"]).exists()
+        _assert_helm_uses_external_instance_secret(helm_args)
+        assert any(call_.args[0][:2] == ["apply", "-f"] for call_ in mock_kubectl.call_args_list)
 
     def test_provision_re_provision_existing_can_opt_into_credentials_encryption(
         self,
@@ -293,7 +916,7 @@ class TestProvisionerEndpoints:
         valid_auth_header: dict,
         mock_config,
     ):
-        """Existing instances should only enable credential encryption explicitly."""
+        """An existing keyless instance can opt into credential encryption explicitly."""
         mock_supabase.table().update().eq().execute.return_value = Mock(data=[{"instance_id": "456"}])
         mock_kubectl.side_effect = _kubectl_without_credentials_encryption_secret
 
@@ -302,7 +925,7 @@ class TestProvisionerEndpoints:
             json={
                 "subscription_id": "sub_test_123",
                 "account_id": "acc_test_123",
-                "tier": "professional",
+                "tier": "byok",
                 "instance_id": "456",
                 "enable_credentials_encryption": True,
             },
@@ -311,11 +934,55 @@ class TestProvisionerEndpoints:
 
         assert response.status_code == 200
         helm_args = mock_helm.call_args.args[0]
-        set_args = _helm_set_args(helm_args)
-        assert "credentials_encryption_key" not in set_args
-        set_file_args = _helm_set_file_args(helm_args)
-        assert "credentials_encryption_key" in set_file_args
-        assert not Path(set_file_args["credentials_encryption_key"]).exists()
+        _assert_helm_uses_external_instance_secret(helm_args)
+        assert any(call_.args[0][:2] == ["apply", "-f"] for call_ in mock_kubectl.call_args_list)
+
+    @pytest.mark.parametrize(
+        ("pvc_names", "keyless"),
+        [
+            pytest.param([], False, id="torn-down"),
+            pytest.param(["mindroom-storage-456", "synapse-storage-456"], True, id="existing-volume"),
+        ],
+    )
+    def test_reprovision_without_a_stored_key_keeps_plaintext_only_on_an_existing_volume(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+        pvc_names: list[str],
+        keyless: bool,  # noqa: FBT001
+    ):
+        """A torn-down instance rebuilt on new volumes gets its derived key; only an old volume may stay keyless."""
+        mock_supabase.table().update().eq().execute.return_value = Mock(data=[{"instance_id": "456"}])
+
+        async def kubectl(args: list[str], namespace: str | None = None) -> tuple[int, str, str]:
+            if args[:2] == ["get", "pvc"]:
+                return 0, json.dumps({"items": [{"metadata": {"name": name}, "spec": {}} for name in pvc_names]}), ""
+            return await _kubectl_without_credentials_encryption_secret(args, namespace)
+
+        mock_kubectl.side_effect = kubectl
+        with patch(
+            "backend.services.provisioner_service._apply_instance_secret", new_callable=AsyncMock
+        ) as apply_secret:
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={
+                    "subscription_id": "sub_test_123",
+                    "account_id": "acc_test_123",
+                    "tier": "byok",
+                    "instance_id": "456",
+                },
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        key = _applied_instance_secret_data(apply_secret)["credentials_encryption_key"]
+        assert key == ("" if keyless else provisioner_service._instance_credentials_encryption_key("456"))
 
     def test_provision_re_provision_existing_fails_when_existing_key_lookup_fails(
         self,
@@ -335,14 +1002,14 @@ class TestProvisionerEndpoints:
             json={
                 "subscription_id": "sub_test_123",
                 "account_id": "acc_test_123",
-                "tier": "professional",
+                "tier": "byok",
                 "instance_id": "456",
             },
             headers=valid_auth_header,
         )
 
         assert response.status_code == 500
-        assert "Failed to inspect existing credential encryption state" in response.json()["detail"]
+        assert "Failed to inspect existing Secret value credentials_encryption_key" in response.json()["detail"]
         mock_helm.assert_not_called()
 
     def test_provision_instance_not_found_for_reprovision(
@@ -445,10 +1112,14 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert "started successfully" in data["message"]
 
-        # Verify kubectl was called with scale command
-        mock_kubectl.assert_called_with(
-            ["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"
+        # Verify the full tenant stack was started in dependency order.
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["scale", "deployment/synapse-123", "--replicas=1"], namespace="mindroom-instances"),
+                call(["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"),
+            ]
         )
+        assert mock_kubectl.await_count == 2
         mock_update_status.assert_called_with(123, "running")
 
     def test_start_instance_not_found(
@@ -479,6 +1150,32 @@ class TestProvisionerEndpoints:
         assert response.status_code == 500
         assert "Failed to start instance" in response.json()["detail"]
 
+    def test_start_instance_requires_full_stack_scale_success(
+        self,
+        client: TestClient,
+        mock_kubectl: AsyncMock,
+        mock_check_deployment: AsyncMock,
+        mock_update_status: Mock,
+        valid_auth_header: dict,
+    ):
+        """Test start only marks running after Synapse and MindRoom are both scaled."""
+        # Setup
+        mock_kubectl.side_effect = [(0, "synapse scaled", ""), (1, "", "mindroom error")]
+
+        # Make request
+        response = client.post("/system/instances/123/start", headers=valid_auth_header)
+
+        # Verify
+        assert response.status_code == 500
+        assert "Failed to start instance" in response.json()["detail"]
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["scale", "deployment/synapse-123", "--replicas=1"], namespace="mindroom-instances"),
+                call(["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"),
+            ]
+        )
+        mock_update_status.assert_not_called()
+
     def test_stop_instance_success(
         self,
         client: TestClient,
@@ -497,10 +1194,14 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert "stopped successfully" in data["message"]
 
-        # Verify kubectl was called with scale command
-        mock_kubectl.assert_called_with(
-            ["scale", "deployment/mindroom-123", "--replicas=0"], namespace="mindroom-instances"
+        # Verify the app stops before the homeserver to avoid reconnect churn.
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["scale", "deployment/mindroom-123", "--replicas=0"], namespace="mindroom-instances"),
+                call(["scale", "deployment/synapse-123", "--replicas=0"], namespace="mindroom-instances"),
+            ]
         )
+        assert mock_kubectl.await_count == 2
         mock_update_status.assert_called_with(123, "stopped")
 
     def test_stop_instance_not_found(
@@ -530,10 +1231,14 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert "restarted successfully" in data["message"]
 
-        # Verify kubectl was called with rollout restart command
-        mock_kubectl.assert_called_with(
-            ["rollout", "restart", "deployment/mindroom-123"], namespace="mindroom-instances"
+        # Verify both tenant deployments were restarted.
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["rollout", "restart", "deployment/synapse-123"], namespace="mindroom-instances"),
+                call(["rollout", "restart", "deployment/mindroom-123"], namespace="mindroom-instances"),
+            ]
         )
+        assert mock_kubectl.await_count == 2
 
     def test_restart_instance_not_found(
         self, client: TestClient, mock_check_deployment: AsyncMock, valid_auth_header: dict
@@ -550,11 +1255,24 @@ class TestProvisionerEndpoints:
         assert "not found" in response.json()["detail"]
 
     def test_uninstall_instance_success(
-        self, client: TestClient, mock_helm: AsyncMock, mock_update_status: Mock, valid_auth_header: dict
+        self,
+        client: TestClient,
+        mock_helm: AsyncMock,
+        mock_kubectl: AsyncMock,
+        mock_update_status: Mock,
+        valid_auth_header: dict,
     ):
-        """Test uninstalling an instance successfully."""
-        # Make request
-        response = client.delete("/system/instances/123/uninstall", headers=valid_auth_header)
+        """Uninstall removes the release, volumes, out-of-release Secrets, and the OpenRouter key."""
+        with (
+            patch("backend.services.provisioner_service.ensure_supabase", return_value=MagicMock()),
+            patch(
+                "backend.services.provisioner_service.get_instance", return_value={"openrouter_key_hash": "hash_123"}
+            ),
+            patch("backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY", "sk-or-v1-management"),
+            patch("backend.services.provisioner_service.delete_openrouter_key") as delete_key,
+            patch("backend.services.provisioner_service.update_instance") as update_instance,
+        ):
+            response = client.delete("/system/instances/123/uninstall", headers=valid_auth_header)
 
         # Verify
         assert response.status_code == 200
@@ -565,10 +1283,43 @@ class TestProvisionerEndpoints:
 
         # Verify helm was called
         mock_helm.assert_called_with(["uninstall", "instance-123", "--namespace=mindroom-instances"])
+        mock_kubectl.assert_has_calls(
+            [
+                call(
+                    [
+                        "delete",
+                        "pvc",
+                        "mindroom-storage-123",
+                        "synapse-storage-123",
+                        "--ignore-not-found",
+                        "--wait=false",
+                    ],
+                    namespace="mindroom-instances",
+                ),
+                call(
+                    [
+                        "delete",
+                        "secret",
+                        "mindroom-api-keys-123",
+                        "mindroom-primary-api-key-123",
+                        "--ignore-not-found",
+                        "--wait=false",
+                    ],
+                    namespace="mindroom-instances",
+                ),
+            ]
+        )
+        delete_key.assert_called_once_with(management_api_key="sk-or-v1-management", key_hash="hash_123")
+        assert update_instance.call_args[0][2]["openrouter_key_hash"] is None
         mock_update_status.assert_called_with(123, "deprovisioned")
 
     def test_uninstall_instance_already_uninstalled(
-        self, client: TestClient, mock_helm: AsyncMock, mock_update_status: Mock, valid_auth_header: dict
+        self,
+        client: TestClient,
+        mock_helm: AsyncMock,
+        mock_update_status: Mock,
+        valid_auth_header: dict,
+        stub_uninstall_cleanup: AsyncMock,  # noqa: ARG002
     ):
         """Test uninstalling an already uninstalled instance."""
         # Setup
@@ -798,3 +1549,50 @@ class TestProvisionerEndpoints:
         data = response.json()
         assert data["success"] is True
         assert data["customer_id"] == "123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["remote_key", "secret_value"])
+async def test_provisioning_recovers_an_unusable_stored_key(missing: str) -> None:
+    from backend.services.provisioner_service import _provision_openrouter_key
+
+    db = _stored_key_db(150 if missing == "remote_key" else 15)
+    operations = []
+
+    def request(method, url, headers, body):
+        operations.append(method)
+        if method == "PATCH":
+            assert missing == "remote_key"
+            return 404, b"{}"
+        if method == "DELETE":
+            return (404, b"{}") if missing == "remote_key" else (200, b'{"deleted": true}')
+        assert method == "POST"
+        assert db.row("instances", instance_id="123")["openrouter_key_hash"] is None
+        return 201, json.dumps(
+            {
+                "key": "replacement",
+                "data": {
+                    "hash": "new_hash",
+                    "label": "replacement",
+                    "limit": 15,
+                    "limit_reset": "monthly",
+                },
+            }
+        ).encode()
+
+    with (
+        patch("backend.services.provisioner_service.OPENROUTER_PROVISIONING_API_KEY", "test-management"),
+        patch("backend.services.provisioner_service._existing_instance_secret_value", AsyncMock(return_value="")),
+        patch("backend.openrouter._send_http_request", side_effect=request),
+    ):
+        key, created = await _provision_openrouter_key(
+            sb=db,
+            account_id="acc_123",
+            instance_id="123",
+            tier="hobby",
+            existing_instance_row=db.row("instances", instance_id="123"),
+            namespace="test",
+        )
+    assert key == "replacement"
+    assert created.hash == "new_hash"
+    assert operations == (["PATCH", "DELETE", "POST"] if missing == "remote_key" else ["DELETE", "POST"])

@@ -10,6 +10,7 @@ from mindroom.dispatch_source import (
     is_automation_source_kind,
     is_voice_event,
 )
+from mindroom.turn_origin import SenderKind, TurnIntent, TurnOrigin, TurnTrust
 
 from .context import (
     AfterResponseContext,
@@ -31,6 +32,7 @@ from .context import (
     ResponseDraft,
     ResponseResult,
     RoomMemberJoinedContext,
+    RoomMemberLeftContext,
     ScheduleFiredContext,
     SessionHookContext,
     SystemEnrichContext,
@@ -38,11 +40,11 @@ from .context import (
     ToolBeforeCallContext,
 )
 from .decorators import get_hook_metadata, hook, iter_module_hooks
-from .enrichment import render_enrichment_block, render_system_enrichment_block
+from .enrichment import render_enrichment_block, render_system_enrichment_block, render_transient_context
 from .execution import emit, emit_collect, emit_final_response_transform, emit_gate, emit_transform
-from .ingress import HookIngressPolicy, hook_ingress_policy, should_handle_interactive_text_response
+from .ingress import HookIngressPolicy, hook_ingress_policy
 from .registry import HookRegistry, HookRegistryPlugin, HookRegistryState
-from .sender import build_hook_message_sender, send_and_track_message, send_hook_message
+from .sender import build_hook_message_sender, send_hook_message, send_matrix_message
 from .state import build_hook_room_state_putter, build_hook_room_state_querier
 from .types import (
     BUILTIN_EVENT_NAMES,
@@ -60,6 +62,7 @@ from .types import (
     EVENT_MESSAGE_RECEIVED,
     EVENT_REACTION_RECEIVED,
     EVENT_ROOM_MEMBER_JOINED,
+    EVENT_ROOM_MEMBER_LEFT,
     EVENT_SCHEDULE_FIRED,
     EVENT_SESSION_STARTED,
     EVENT_SYSTEM_ENRICH,
@@ -79,6 +82,7 @@ from .types import (
 if TYPE_CHECKING:
     import nio
 
+    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
 __all__ = [
@@ -98,6 +102,7 @@ __all__ = [
     "EVENT_MESSAGE_RECEIVED",
     "EVENT_REACTION_RECEIVED",
     "EVENT_ROOM_MEMBER_JOINED",
+    "EVENT_ROOM_MEMBER_LEFT",
     "EVENT_SCHEDULE_FIRED",
     "EVENT_SESSION_STARTED",
     "EVENT_SYSTEM_ENRICH",
@@ -134,11 +139,16 @@ __all__ = [
     "ResponseDraft",
     "ResponseResult",
     "RoomMemberJoinedContext",
+    "RoomMemberLeftContext",
     "ScheduleFiredContext",
+    "SenderKind",
     "SessionHookContext",
     "SystemEnrichContext",
     "ToolAfterCallContext",
     "ToolBeforeCallContext",
+    "TurnIntent",
+    "TurnOrigin",
+    "TurnTrust",
     "build_hook_matrix_admin",
     "build_hook_message_sender",
     "build_hook_room_state_putter",
@@ -157,9 +167,9 @@ __all__ = [
     "iter_module_hooks",
     "render_enrichment_block",
     "render_system_enrichment_block",
-    "send_and_track_message",
+    "render_transient_context",
     "send_hook_message",
-    "should_handle_interactive_text_response",
+    "send_matrix_message",
     "validate_event_name",
 ]
 
@@ -167,8 +177,10 @@ __all__ = [
 def build_hook_matrix_admin(
     client: nio.AsyncClient,
     runtime_paths: RuntimePaths,
+    *,
+    config: Config | None = None,
 ) -> HookMatrixAdmin:
     """Lazily import the concrete matrix admin builder to avoid package cycles."""
     from .matrix_admin import build_hook_matrix_admin  # noqa: PLC0415
 
-    return build_hook_matrix_admin(client, runtime_paths)
+    return build_hook_matrix_admin(client, runtime_paths, config=config)

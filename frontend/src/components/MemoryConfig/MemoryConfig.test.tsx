@@ -2,10 +2,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryConfig } from "./MemoryConfig";
 import { useConfigStore } from "@/store/configStore";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
 import { Config } from "@/types/config";
 
 // Mock the store
 vi.mock("@/store/configStore");
+vi.mock("@/hooks/useConfigSchema", () => ({
+  useConfigSchema: vi.fn(() => ({ schema: null, error: null, retry: vi.fn() })),
+}));
 
 describe("MemoryConfig", () => {
   const mockConfig: Partial<Config> = {
@@ -20,6 +24,7 @@ describe("MemoryConfig", () => {
   };
 
   const mockUpdateMemoryConfig = vi.fn();
+  const mockUpdateConfigValue = vi.fn();
   const mockSaveConfig = vi.fn();
 
   beforeEach(() => {
@@ -87,6 +92,63 @@ describe("MemoryConfig", () => {
 
     const hostInput = document.getElementById("host") as HTMLInputElement;
     expect(hostInput).toBeInTheDocument();
+  });
+
+  it("binds the OpenAI embedder to a named credential service", async () => {
+    render(<MemoryConfig />);
+
+    const credentialsServiceInput = document.getElementById(
+      "credentials-service",
+    ) as HTMLInputElement;
+    fireEvent.change(credentialsServiceInput, {
+      target: { value: "embedding-production" },
+    });
+
+    await waitFor(() => {
+      expect(mockUpdateMemoryConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          embedder: expect.objectContaining({
+            config: expect.objectContaining({
+              credentials_service: "embedding-production",
+            }),
+          }),
+        }),
+      );
+    });
+  });
+
+  it("removes a cleared credential service from saved config", async () => {
+    const configWithCredentialService: Partial<Config> = {
+      memory: {
+        embedder: {
+          provider: "openai",
+          config: {
+            model: "text-embedding-3-small",
+            credentials_service: "embedding-production",
+          },
+        },
+      },
+    };
+    (useConfigStore as any).mockReturnValue({
+      config: configWithCredentialService,
+      updateMemoryConfig: mockUpdateMemoryConfig,
+      saveConfig: mockSaveConfig,
+      isDirty: false,
+    });
+    render(<MemoryConfig />);
+
+    const credentialsServiceInput = document.getElementById(
+      "credentials-service",
+    ) as HTMLInputElement;
+    fireEvent.change(credentialsServiceInput, { target: { value: "" } });
+
+    await waitFor(() => {
+      const calls = mockUpdateMemoryConfig.mock.calls;
+      const nextConfig = calls[calls.length - 1]?.[0];
+      expect(nextConfig.embedder.config).not.toHaveProperty(
+        "credentials_service",
+      );
+    });
   });
 
   it("updates team reads member memory toggle", async () => {
@@ -253,13 +315,14 @@ describe("MemoryConfig", () => {
     });
   });
 
-  it("shows API key notice for OpenAI without custom base URL", () => {
+  it("offers credential binding without assuming OPENAI_API_KEY", () => {
     render(<MemoryConfig />);
 
-    expect(screen.getByText(/OPENAI_API_KEY/)).toBeInTheDocument();
+    expect(document.getElementById("credentials-service")).toBeInTheDocument();
+    expect(screen.queryByText(/OPENAI_API_KEY/)).not.toBeInTheDocument();
   });
 
-  it("hides API key notice when base URL is set", () => {
+  it("keeps credential binding available for a custom base URL", () => {
     const configWithHost: Partial<Config> = {
       memory: {
         embedder: {
@@ -281,7 +344,7 @@ describe("MemoryConfig", () => {
 
     render(<MemoryConfig />);
 
-    expect(screen.queryByText(/OPENAI_API_KEY/)).not.toBeInTheDocument();
+    expect(document.getElementById("credentials-service")).toBeInTheDocument();
   });
 
   it("allows typing custom model name", async () => {
@@ -325,6 +388,44 @@ describe("MemoryConfig", () => {
               host: "http://localhost:9292/v1",
             }),
           }),
+        }),
+      );
+    });
+  });
+
+  it("loads and updates the entrypoint token cap without touching other file settings", async () => {
+    (useConfigStore as any).mockReturnValue({
+      config: {
+        memory: {
+          backend: "file",
+          embedder: mockConfig.memory!.embedder,
+          file: {
+            path: "./memory_files",
+            max_entrypoint_lines: 120,
+            max_entrypoint_tokens: 30000,
+          },
+        },
+      },
+      updateMemoryConfig: mockUpdateMemoryConfig,
+      saveConfig: mockSaveConfig,
+      isDirty: false,
+    });
+    render(<MemoryConfig />);
+
+    const tokenInput = document.getElementById(
+      "entrypoint-max-tokens",
+    ) as HTMLInputElement;
+    expect(tokenInput.value).toBe("30000");
+    fireEvent.change(tokenInput, { target: { value: "20000" } });
+
+    await waitFor(() => {
+      expect(mockUpdateMemoryConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file: {
+            path: "./memory_files",
+            max_entrypoint_lines: 120,
+            max_entrypoint_tokens: 20000,
+          },
         }),
       );
     });
@@ -458,5 +559,107 @@ describe("MemoryConfig", () => {
     expect(providerSelect).toHaveTextContent("OpenAI");
     const modelInput = document.getElementById("model") as HTMLInputElement;
     expect(modelInput).toHaveValue("text-embedding-3-small");
+  });
+
+  it("edits memory settings the page does not render through More settings", () => {
+    (useConfigStore as any).mockReturnValue({
+      config: mockConfig,
+      agents: [],
+      rooms: [],
+      diagnostics: [],
+      updateMemoryConfig: mockUpdateMemoryConfig,
+      updateConfigValue: mockUpdateConfigValue,
+      saveConfig: mockSaveConfig,
+      isDirty: false,
+    });
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          MemoryConfig: {
+            type: "object",
+            properties: {
+              backend: { type: "string" },
+              llm: {
+                anyOf: [{ $ref: "#/$defs/_MemoryLLMConfig" }, { type: "null" }],
+                default: null,
+                description: "LLM used by Mem0 for memory extraction",
+              },
+            },
+          },
+          _MemoryLLMConfig: {
+            type: "object",
+            properties: {
+              provider: { type: "string", default: "ollama" },
+            },
+          },
+          EmbedderConfig: {
+            type: "object",
+            properties: { model: { type: "string" } },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<MemoryConfig />);
+    fireEvent.click(screen.getByRole("button", { name: /^More settings/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Configure LLM" }));
+
+    // Only the edited key is written; untouched memory defaults stay unset.
+    expect(mockUpdateConfigValue).toHaveBeenLastCalledWith(
+      ["memory", "llm"],
+      {},
+    );
+    expect(mockUpdateMemoryConfig).not.toHaveBeenCalled();
+  });
+
+  it("edits embedder options the page does not render through More embedder settings", () => {
+    (useConfigStore as any).mockReturnValue({
+      config: mockConfig,
+      agents: [],
+      rooms: [],
+      diagnostics: [],
+      updateMemoryConfig: mockUpdateMemoryConfig,
+      updateConfigValue: mockUpdateConfigValue,
+      saveConfig: mockSaveConfig,
+      isDirty: false,
+    });
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          MemoryConfig: { type: "object", properties: {} },
+          EmbedderConfig: {
+            type: "object",
+            properties: {
+              model: { type: "string" },
+              dimensions: {
+                anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }],
+                default: null,
+              },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<MemoryConfig />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /More embedder settings/ }),
+    );
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Dimensions" }), {
+      target: { value: "768" },
+    });
+
+    expect(mockUpdateConfigValue).toHaveBeenLastCalledWith(
+      ["memory", "embedder", "config", "dimensions"],
+      768,
+    );
   });
 });

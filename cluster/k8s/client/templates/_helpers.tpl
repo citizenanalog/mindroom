@@ -1,0 +1,367 @@
+{{/*
+Expand the chart name.
+*/}}
+{{- define "mindroom-client.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Create a default fully qualified app name.
+*/}}
+{{- define "mindroom-client.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "mindroom-client.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | quote }}
+app.kubernetes.io/name: {{ include "mindroom-client.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+{{- end -}}
+
+{{- define "mindroom-client.selectorLabels" -}}
+{{- if .Values.selectorLabels -}}
+{{- toYaml .Values.selectorLabels -}}
+{{- else -}}
+app.kubernetes.io/name: {{ include "mindroom-client.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/component: client
+{{- end -}}
+{{- end -}}
+
+{{- define "mindroom-client.image" -}}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s:%s@%s" .Values.image.repository $tag .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "mindroom-client.configMapName" -}}
+{{- if .Values.config.existingConfigMap -}}
+{{- .Values.config.existingConfigMap -}}
+{{- else -}}
+{{- printf "%s-config" (include "mindroom-client.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "mindroom-client.nginxConfigMapName" -}}
+{{- if .Values.nginx.existingConfigMap -}}
+{{- .Values.nginx.existingConfigMap -}}
+{{- else -}}
+{{- printf "%s-nginx" (include "mindroom-client.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Normalized base path: leading slash, no trailing slash, "/" for the origin root.
+*/}}
+{{- define "mindroom-client.basePath" -}}
+{{- $path := default "/" .Values.basePath | clean | trimSuffix "/" -}}
+{{- default "/" $path -}}
+{{- end -}}
+
+{{/*
+Path prefix prepended to client file locations; empty at the origin root.
+*/}}
+{{- define "mindroom-client.pathPrefix" -}}
+{{- $base := include "mindroom-client.basePath" . -}}
+{{- if ne $base "/" -}}{{- $base -}}{{- end -}}
+{{- end -}}
+
+{{- define "mindroom-client.probePath" -}}
+{{- printf "%s/config.json" (include "mindroom-client.pathPrefix" .) -}}
+{{- end -}}
+
+{{- define "mindroom-client.defaultClientConfig" -}}
+{{- $homeserver := default .Values.matrix.homeserverUrl .Values.matrix.defaultServerName -}}
+{
+  "defaultHomeserver": 0,
+  "homeserverList": [{{ $homeserver | quote }}],
+  "allowCustomHomeservers": {{ .Values.matrix.allowCustomHomeservers }},
+  "hashRouter": {
+    "enabled": false,
+    "basename": "/"
+  }
+}
+{{- end -}}
+
+{{/*
+Render every string inside a config.values entry with tpl, recursing into maps and lists.
+Arguments: list <root context> <value>.
+Returns JSON {"value": <rendered>} so scalars survive fromJson.
+*/}}
+{{- define "mindroom-client.tplConfigValue" -}}
+{{- $root := index . 0 -}}
+{{- $value := index . 1 -}}
+{{- if kindIs "string" $value -}}
+{{- $value = tpl $value $root -}}
+{{- else if kindIs "map" $value -}}
+{{- $rendered := dict -}}
+{{- range $key, $item := $value -}}
+{{- $_ := set $rendered $key (include "mindroom-client.tplConfigValue" (list $root $item) | fromJson).value -}}
+{{- end -}}
+{{- $value = $rendered -}}
+{{- else if kindIs "slice" $value -}}
+{{- $rendered := list -}}
+{{- range $item := $value -}}
+{{- $rendered = append $rendered (include "mindroom-client.tplConfigValue" (list $root $item) | fromJson).value -}}
+{{- end -}}
+{{- $value = $rendered -}}
+{{- end -}}
+{{- dict "value" $value | toJson -}}
+{{- end -}}
+
+{{- define "mindroom-client.matrixClientWellKnown" -}}
+{{- $wellKnown := dict "m.homeserver" (dict "base_url" .Values.matrix.homeserverUrl) -}}
+{{- if .Values.matrixRTC.enabled -}}
+{{- $focus := dict "type" "livekit" "livekit_service_url" .Values.matrixRTC.livekitServiceUrl -}}
+{{- $_ := set $wellKnown "org.matrix.msc4143.rtc_foci" (list $focus) -}}
+{{- end -}}
+{{- with .Values.bugReports.admins -}}
+{{- $_ := set $wellKnown "io.mindroom.bug_reports" (dict "admins" .) -}}
+{{- end -}}
+{{- $wellKnown | toJson -}}
+{{- end -}}
+
+{{/*
+The nginx server config serving the client under basePath.
+The image entrypoint normally writes runtime-config.js into the app directory,
+which an unprivileged read-only container forbids, so the chart serves
+runtime-config.js straight from nginx and the Deployment bypasses the entrypoint.
+*/}}
+{{- define "mindroom-client.defaultNginxConf" -}}
+{{- $base := include "mindroom-client.basePath" . -}}
+{{- $prefix := include "mindroom-client.pathPrefix" . -}}
+{{- $navigationFallbackExcludePaths := default (list) .Values.serviceWorker.navigationFallbackExcludePaths | toJson -}}
+{{- $runtimeConfig := printf "window.__APP_BASE_PATH__ = \"%s\"; window.__ENABLE_SERVICE_WORKER__ = %t; window.__SERVICE_WORKER_NAVIGATION_FALLBACK_EXCLUDE_PATHS__ = %s;" $base .Values.serviceWorker.enabled $navigationFallbackExcludePaths -}}
+{{- if .Values.authenticationRecovery.enabled -}}
+{{- $authenticationRecoveryConfig := dict "probeUrl" .Values.authenticationRecovery.probeUrl "navigationUrl" .Values.authenticationRecovery.navigationUrl "timeoutMs" (int .Values.authenticationRecovery.timeoutMs) | toJson -}}
+{{- $authenticationRecoveryLoader := "if (!window.__AUTHENTICATION_RECOVERY_READY__) { const script = document.createElement(\"script\"); script.src = new URL(\"authentication-recovery.js\", document.currentScript.src).href; script.async = false; window.__AUTHENTICATION_RECOVERY_READY__ = new Promise((resolve) => { script.onload = resolve; script.onerror = resolve; }); document.head.appendChild(script); }" -}}
+{{- $runtimeConfig = printf "%s window.__AUTHENTICATION_RECOVERY_CONFIG__ = %s; %s" $runtimeConfig $authenticationRecoveryConfig $authenticationRecoveryLoader -}}
+{{- end -}}
+server {
+  listen {{ .Values.nginx.port }};
+{{- if .Values.nginx.ipv6 }}
+  listen [::]:{{ .Values.nginx.port }};
+{{- end }}
+  absolute_redirect off;
+{{- if ne $base "/" }}
+
+  location = / {
+    return 308 {{ $base }}/;
+  }
+
+  location = {{ $base }} {
+    return 308 {{ $base }}/;
+  }
+{{- end }}
+
+  # index.html loads /runtime-config.js from the origin root regardless of basePath.
+  location = /runtime-config.js {
+    default_type application/javascript;
+    add_header Cache-Control "no-store, max-age=0" always;
+    return 200 {{ $runtimeConfig | quote }};
+  }
+{{- if .Values.authenticationRecovery.enabled }}
+
+  # The client image owns the recovery implementation. This chart only loads
+  # its native bootstrap and provides a same-origin reachability probe.
+  location = /authentication-recovery.js {
+    alias /usr/share/nginx/html/authentication-recovery.js;
+    default_type application/javascript;
+    add_header Cache-Control "no-store, max-age=0" always;
+  }
+
+  location = /authentication-recovery-probe {
+    add_header Cache-Control "no-store, max-age=0" always;
+    return 204;
+  }
+{{- end }}
+{{- if or .Values.matrixRTC.enabled .Values.bugReports.admins }}
+{{- if .Values.matrixRTC.enabled }}
+
+  # MatrixRTC backend discovery for Matrix voice and video calls.
+{{- end }}
+{{- if .Values.bugReports.admins }}
+
+  # Bug-report administrators for the client's Report a bug menu item.
+{{- end }}
+  location = /.well-known/matrix/client {
+    default_type application/json;
+    add_header Cache-Control "no-store, max-age=0" always;
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "X-Requested-With, Content-Type, Authorization" always;
+    return 200 '{{ include "mindroom-client.matrixClientWellKnown" . }}';
+  }
+{{- end }}
+{{- if .Values.matrixRTC.proxy.enabled }}
+
+  # MatrixRTC authorization service. The trailing proxy_pass slash strips the
+  # public /livekit/jwt/ prefix before forwarding the request.
+  location ^~ /livekit/jwt/ {
+    proxy_pass {{ .Values.matrixRTC.proxy.jwtServiceUpstream | trimSuffix "/" }}/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # LiveKit WebSocket signaling. WebRTC media uses the networking configured
+  # for the separately managed LiveKit service.
+  location ^~ /livekit/sfu/ {
+    proxy_pass {{ .Values.matrixRTC.proxy.sfuUpstream | trimSuffix "/" }}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+    proxy_buffering off;
+  }
+{{- end }}
+{{- with .Values.nginx.serverSnippet }}
+
+  # Additional server directives supplied through nginx.serverSnippet.
+{{ tpl . $ | indent 2 }}
+{{- end }}
+
+  location = {{ $prefix }}/config.json {
+    alias /usr/share/nginx/html/config.json;
+    default_type application/json;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+  }
+
+  # The client polls this manifest and reloads after a new build is published.
+  location = {{ $prefix }}/version.json {
+    alias /usr/share/nginx/html/version.json;
+    default_type application/json;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+  }
+
+  # The client service worker, scoped to basePath.
+  location = {{ $prefix }}/sw.js {
+    alias /usr/share/nginx/html/sw.js;
+    default_type application/javascript;
+    add_header Cache-Control "no-store, max-age=0" always;
+  }
+{{- if .Values.rootServiceWorkerCleanup.enabled }}
+
+  # A Matrix client that previously controlled the origin root can leave a
+  # root-scoped service worker that keeps serving the old app for every path on
+  # this origin. Serving this cleanup worker at the old /sw.js URL makes the
+  # stale worker replace itself with one that purges caches and unregisters.
+  location = /sw.js {
+    alias /usr/share/nginx/html/root-cleanup-sw.js;
+    default_type application/javascript;
+    add_header Cache-Control "no-store, max-age=0" always;
+  }
+{{- end }}
+{{- if ne $base "/" }}
+
+  location = {{ $prefix }}/manifest.json {
+    alias /usr/share/nginx/html/manifest.json;
+    add_header Cache-Control "no-store, max-age=0" always;
+  }
+
+  location = {{ $prefix }}/pdf.worker.min.js {
+    alias /usr/share/nginx/html/pdf.worker.min.js;
+  }
+{{- end }}
+
+  # The bundled Element Call ships its own assets/ directory, so strip only the
+  # route prefix before public/element-call/. Its hashed assets never change.
+  # Without "always", add_header skips 404s, so a missing build file never gets
+  # the immutable header.
+  location ~ ^/(?:.+/)?(public/element-call/assets/.+)$ {
+    root /usr/share/nginx/html;
+    try_files /$1 =404;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+  }
+
+  # Stable Element Call names such as index.html must revalidate so a client
+  # upgrade cannot leave them pointing at removed hashed assets.
+  location ~ ^/(?:.+/)?(public/element-call/.+)$ {
+    root /usr/share/nginx/html;
+    try_files /$1 =404;
+    add_header Cache-Control "no-cache";
+  }
+
+  # Hashed build assets are referenced relative to the current route, so strip
+  # any route prefix before the assets/ or public/ segment.
+  location ~ ^/(?:.+/)?(assets|public)/(.+)$ {
+    root /usr/share/nginx/html;
+    try_files /$1/$2 =404;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+  }
+{{- if eq $base "/" }}
+
+  location / {
+    root /usr/share/nginx/html;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+    add_header Content-Security-Policy "frame-ancestors 'self'" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    try_files $uri $uri/ /index.html;
+  }
+{{- else }}
+
+  # Everything else under basePath is an app route served by index.html.
+  location {{ $base }}/ {
+    root /usr/share/nginx/html;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+    add_header Content-Security-Policy "frame-ancestors 'self'" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    try_files /index.html =404;
+  }
+{{- end }}
+}
+{{- end -}}
+
+{{/*
+Service worker served at the origin-root /sw.js to replace a stale root-scoped
+worker: it purges client caches, releases controlled pages into basePath, and
+unregisters itself.
+*/}}
+{{- define "mindroom-client.rootCleanupServiceWorker" -}}
+{{- $target := printf "%s/" (include "mindroom-client.pathPrefix" .) -}}
+self.addEventListener("install", () => {
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      if ("caches" in self) {
+        const names = await self.caches.keys();
+        await Promise.all(
+          names
+            .filter((name) => name.includes("mindroom") || name.includes("workbox"))
+            .map((name) => self.caches.delete(name))
+        );
+      }
+      await self.clients.claim();
+      const clients = await self.clients.matchAll({
+        includeUncontrolled: true,
+        type: "window",
+      });
+      await Promise.all(clients.map((client) => client.navigate("{{ $target }}")));
+      await self.registration.unregister();
+    })()
+  );
+});
+{{- end -}}

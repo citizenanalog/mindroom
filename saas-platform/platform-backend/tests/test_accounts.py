@@ -1,10 +1,60 @@
 """Comprehensive HTTP API tests for accounts endpoints."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from backend.deps import verify_user, verify_user_allow_deleted
+from backend.routes.admin import ACCOUNT_STATUSES
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from main import app
+
+
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "supabase/migrations"
+BASELINE_MIGRATION_SQL = MIGRATIONS_DIR / "000_consolidated_complete_schema.sql"
+ACCOUNT_GRANTS_MIGRATION_SQL = MIGRATIONS_DIR / "002_restrict_account_grants.sql"
+ACCOUNT_STATUS_MIGRATION_SQL = MIGRATIONS_DIR / "006_require_account_status.sql"
+ACCOUNT_STATUS_CHECK = "CHECK (status IN ({}))".format(", ".join(f"'{status}'" for status in ACCOUNT_STATUSES))
+
+
+def assert_account_grants_restricted(sql: str) -> None:
+    assert "GRANT SELECT, INSERT, UPDATE ON TABLE accounts TO authenticated;" not in sql
+    assert "REVOKE INSERT, UPDATE ON TABLE accounts FROM authenticated;" in sql
+    assert (
+        "GRANT UPDATE (full_name, company_name, consent_marketing, consent_analytics, consent_updated_at) "
+        "ON TABLE accounts TO authenticated;"
+    ) in sql
+    for privileged_column in ("tier", "is_admin", "status", "stripe_customer_id", "deleted_at"):
+        assert f"GRANT UPDATE ({privileged_column}) ON TABLE accounts TO authenticated;" not in sql
+
+
+def test_accounts_baseline_migration_restricts_authenticated_updates_to_profile_columns() -> None:
+    """Fresh databases restrict authenticated writes to profile fields."""
+    assert_account_grants_restricted(BASELINE_MIGRATION_SQL.read_text(encoding="utf-8"))
+
+
+def test_accounts_incremental_migration_restricts_existing_authenticated_grants() -> None:
+    """Existing databases receive the same account grant restriction."""
+    assert_account_grants_restricted(ACCOUNT_GRANTS_MIGRATION_SQL.read_text(encoding="utf-8"))
+
+
+def test_accounts_baseline_migration_requires_a_known_status() -> None:
+    """Fresh databases refuse a missing or unknown account status, matching the statuses admins may set."""
+    sql = BASELINE_MIGRATION_SQL.read_text(encoding="utf-8")
+
+    assert f"status TEXT NOT NULL DEFAULT 'active' {ACCOUNT_STATUS_CHECK}," in sql
+
+
+def test_accounts_incremental_migration_requires_a_known_status() -> None:
+    """Existing databases backfill missing statuses as active before requiring a known status."""
+    sql = ACCOUNT_STATUS_MIGRATION_SQL.read_text(encoding="utf-8")
+
+    backfill = sql.index("UPDATE accounts SET status = 'active' WHERE status IS NULL;")
+    assert backfill < sql.index("ALTER TABLE accounts ALTER COLUMN status SET NOT NULL;")
+    assert f"ADD CONSTRAINT accounts_status_check\n    {ACCOUNT_STATUS_CHECK};" in sql
+    assert sql.index("BEGIN;") < backfill < sql.index("COMMIT;")
 
 
 class TestAccountsEndpoints:
@@ -13,8 +63,6 @@ class TestAccountsEndpoints:
     @pytest.fixture
     def client(self) -> TestClient:
         """Create test client."""
-        from main import app  # noqa: PLC0415
-
         return TestClient(app)
 
     @pytest.fixture
@@ -28,13 +76,12 @@ class TestAccountsEndpoints:
     @pytest.fixture
     def mock_verify_user(self):
         """Mock user verification."""
-        from main import app  # noqa: PLC0415
-        from backend.deps import verify_user
 
         def override_verify_user():
             return {"account_id": "acc_test_123", "email": "test@example.com"}
 
         app.dependency_overrides[verify_user] = override_verify_user
+        app.dependency_overrides[verify_user_allow_deleted] = override_verify_user
         yield
         app.dependency_overrides.clear()
 
@@ -52,7 +99,7 @@ class TestAccountsEndpoints:
                 {
                     "id": "sub_123",
                     "account_id": "acc_test_123",
-                    "tier": "professional",
+                    "tier": "pro",
                     "status": "active",
                     "instances": [{"id": "inst_123", "instance_id": "123", "status": "running"}],
                 }
@@ -69,7 +116,7 @@ class TestAccountsEndpoints:
         assert data["id"] == "acc_test_123"
         assert data["email"] == "test@example.com"
         assert len(data["subscriptions"]) == 1
-        assert data["subscriptions"][0]["tier"] == "professional"
+        assert data["subscriptions"][0]["tier"] == "pro"
 
     def test_get_current_account_not_found(self, client: TestClient, mock_supabase: MagicMock, mock_verify_user: Mock):
         """Test getting account when it doesn't exist."""
@@ -85,14 +132,11 @@ class TestAccountsEndpoints:
 
     def test_get_current_account_unauthorized(self, client: TestClient):
         """Test getting account without authentication."""
-        from main import app  # noqa: PLC0415
-        from backend.deps import verify_user
-        from fastapi import HTTPException
 
         def override_verify_user():
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-        app.dependency_overrides[verify_user] = override_verify_user
+        app.dependency_overrides[verify_user_allow_deleted] = override_verify_user
         try:
             response = client.get("/my/account")
             assert response.status_code == 401
@@ -141,7 +185,7 @@ class TestAccountsEndpoints:
         assert data["is_admin"] is False
 
     def test_setup_account_new_user(self, client: TestClient, mock_supabase: MagicMock, mock_verify_user: Mock):
-        """Test setting up free tier account for new user."""
+        """Test setting up an account without a plan for a new user."""
         # Setup
         # No existing subscription
         mock_supabase.table().select().eq().execute.return_value = Mock(data=[])
@@ -152,9 +196,6 @@ class TestAccountsEndpoints:
             "account_id": "acc_test_123",
             "tier": "free",
             "status": "active",
-            "max_agents": 1,
-            "max_messages_per_day": 100,
-            "max_storage_gb": 10,
             "created_at": datetime.now(UTC).isoformat(),
         }
         mock_supabase.table().insert().execute.return_value = Mock(data=[new_subscription])
@@ -165,9 +206,33 @@ class TestAccountsEndpoints:
         # Verify
         assert response.status_code == 200
         data = response.json()
-        assert "Free tier account created" in data["message"]
+        assert data["message"] == "Account created"
         assert data["account_id"] == "acc_test_123"
         assert data["subscription"]["tier"] == "free"
+
+    def test_setup_account_returns_the_new_subscription_without_a_plan(
+        self, mock_supabase: MagicMock, mock_verify_user: Mock
+    ):
+        """Account setup stores only the no-plan state and returns it with the computed entitlement fields."""
+        mock_supabase.table().select().eq().execute.return_value = Mock(data=[])
+        new_subscription = {
+            "id": "sub_new_123",
+            "account_id": "acc_test_123",
+            "tier": "free",
+            "status": "active",
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        mock_supabase.table().insert().execute.return_value = Mock(data=[new_subscription])
+
+        with TestClient(app, raise_server_exceptions=False) as non_raising_client:
+            response = non_raising_client.post("/my/account/setup")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["subscription"]["can_run_instances"] is False
+        assert data["subscription"]["stripe_subscription_ended"] is True
+        inserted_subscription = mock_supabase.table().insert.call_args.args[0]
+        assert set(inserted_subscription) == {"account_id", "tier", "status", "created_at"}
 
     def test_setup_account_existing_user(self, client: TestClient, mock_supabase: MagicMock, mock_verify_user: Mock):
         """Test setting up account when user already has subscription."""
@@ -194,9 +259,6 @@ class TestAccountsEndpoints:
                     "account_id": "acc_test_123",
                     "tier": "free",
                     "status": "active",
-                    "max_agents": 1,
-                    "max_messages_per_day": 100,
-                    "max_storage_gb": 10,
                 }
             ]
         )
@@ -250,17 +312,11 @@ class TestAccountsEndpoints:
             "created_at": datetime.now(UTC).isoformat(),
             "updated_at": datetime.now(UTC).isoformat(),
             "subscriptions": [
-                {
-                    "id": "sub_1",
-                    "account_id": "acc_test_123",
-                    "tier": "starter",
-                    "status": "cancelled",
-                    "instances": [],
-                },
+                {"id": "sub_1", "account_id": "acc_test_123", "tier": "byok", "status": "cancelled", "instances": []},
                 {
                     "id": "sub_2",
                     "account_id": "acc_test_123",
-                    "tier": "professional",
+                    "tier": "pro",
                     "status": "active",
                     "instances": [
                         {"id": "inst_1", "instance_id": "1", "status": "running"},

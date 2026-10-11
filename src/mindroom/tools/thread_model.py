@@ -1,0 +1,33 @@
+"""Thread model switching tool configuration."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
+
+if TYPE_CHECKING:
+    from mindroom.custom_tools.thread_model import ThreadModelTools
+
+
+@register_tool_with_metadata(
+    name="thread_model",
+    file_access=ToolFileAccess.NONE,
+    display_name="Thread Model",
+    description="Choose which AI model responds in the current conversation thread",
+    category=ToolCategory.PRODUCTIVITY,
+    status=ToolStatus.AVAILABLE,
+    setup_type=SetupType.NONE,
+    requires_room_context=True,
+    icon="Cpu",
+    icon_color="text-purple-500",
+    dependencies=["agno"],
+    docs_url="https://github.com/mindroom-ai/mindroom",
+    function_names=("list_models", "get_thread_model", "switch_thread_model", "reset_thread_model"),
+)
+def thread_model_tools() -> type[ThreadModelTools]:
+    """Return per-thread model switching tools."""
+    from mindroom.custom_tools.thread_model import ThreadModelTools
+
+    return ThreadModelTools

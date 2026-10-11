@@ -1,4 +1,4 @@
-"""Model-facing knowledge-search tool descriptions for agents."""
+"""Model-facing knowledge-search tool descriptions and governance of functions Agno generates for agents."""
 
 from __future__ import annotations
 
@@ -6,16 +6,21 @@ from typing import TYPE_CHECKING, Any
 
 from agno.agent import Agent
 from agno.tools.function import Function
+from agno.tools.toolkit import Toolkit
 
-from mindroom.knowledge_source_descriptions import KnowledgeSourceDescription, KnowledgeWithSourceDescriptions
+from mindroom.knowledge.source_descriptions import KnowledgeSourceDescription, KnowledgeWithSourceDescriptions
+from mindroom.tool_system.tool_hooks import prepend_function_tool_hook
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from agno.knowledge.knowledge import Knowledge
     from agno.run import RunContext
     from agno.run.agent import RunOutput
     from agno.session import AgentSession
 
-_KNOWLEDGE_SEARCH_TOOL_NAME = "search_knowledge_base"
+KNOWLEDGE_SEARCH_TOOL_NAME = "search_knowledge_base"
+_MEMORY_SEARCH_TOOL_NAME = "search_memories"
 
 
 def _normalize_description(value: str) -> str:
@@ -38,7 +43,11 @@ def knowledge_source_descriptions(knowledge: Knowledge) -> tuple[KnowledgeSource
     )
 
 
-def _knowledge_search_tool_description(sources: tuple[KnowledgeSourceDescription, ...]) -> str:
+def _knowledge_search_tool_description(
+    sources: tuple[KnowledgeSourceDescription, ...],
+    *,
+    memory_search_available: bool,
+) -> str:
     """Build the description shown to the model for the knowledge-search tool."""
     if not sources:
         return "Search this agent's configured knowledge bases for information about a query."
@@ -50,22 +59,66 @@ def _knowledge_search_tool_description(sources: tuple[KnowledgeSourceDescription
     for source in sources:
         description = source.description or "No description configured."
         lines.append(f"- {source.base_id}: {description}")
-    lines.append("Use this when the answer may depend on these sources.")
+    lines.append("This list only describes sources available through search_knowledge_base.")
+    if memory_search_available:
+        lines.append("For resilient memory search, team-visible memory, and memory IDs, use search_memories.")
     return "\n".join(lines)
 
 
-def _annotate_knowledge_search_tool(tools: list[Any], sources: tuple[KnowledgeSourceDescription, ...]) -> None:
-    """Attach MindRoom source descriptions to Agno's generated knowledge-search tool."""
-    description = _knowledge_search_tool_description(sources)
+def _tool_function_available(tools: list[Any], function_name: str, *, async_mode: bool) -> bool:
     for tool in tools:
-        if isinstance(tool, Function) and tool.name == _KNOWLEDGE_SEARCH_TOOL_NAME:
+        if isinstance(tool, Function) and tool.name == function_name:
+            return True
+        if isinstance(tool, Toolkit):
+            functions = tool.get_async_functions() if async_mode else tool.get_functions()
+            if function_name in functions:
+                return True
+    return False
+
+
+def _annotate_knowledge_search_tool(
+    tools: list[Any],
+    sources: tuple[KnowledgeSourceDescription, ...],
+    *,
+    async_mode: bool,
+) -> None:
+    """Attach MindRoom source descriptions to Agno's generated knowledge-search tool."""
+    description = _knowledge_search_tool_description(
+        sources,
+        memory_search_available=_tool_function_available(tools, _MEMORY_SEARCH_TOOL_NAME, async_mode=async_mode),
+    )
+    for tool in tools:
+        if isinstance(tool, Function) and tool.name == KNOWLEDGE_SEARCH_TOOL_NAME:
             tool.description = description
 
 
+def _govern_generated_functions(
+    tools: list[Any],
+    predicate: Callable[[Function], bool] | None,
+    tool_hook_bridge: Callable[..., Any] | None,
+) -> list[Any]:
+    """Apply the function policy and plugin tool hooks to functions Agno adds after agent construction."""
+    governed: list[Any] = []
+    for tool in tools:
+        function = tool if isinstance(tool, Function) else Function.from_callable(tool) if callable(tool) else None
+        if function is None:
+            governed.append(tool)
+        elif predicate is None or predicate(function):
+            if tool_hook_bridge is not None:
+                prepend_function_tool_hook(function, tool_hook_bridge)
+            governed.append(function)
+    return governed
+
+
 class KnowledgeToolDescribingAgent(Agent):
-    """Agent subclass that owns MindRoom's model-facing knowledge-search metadata."""
+    """Agent subclass that owns knowledge-search metadata and governs functions Agno generates.
+
+    Generated functions get the approval function policy and the plugin tool hook bridge.
+    """
 
     knowledge_sources: tuple[KnowledgeSourceDescription, ...] = ()
+    tool_function_filter: Callable[[Function], bool] | None = None
+    tool_hook_bridge: Callable[..., Any] | None = None
 
     def get_tools(
         self,
@@ -75,8 +128,12 @@ class KnowledgeToolDescribingAgent(Agent):
         user_id: str | None = None,
     ) -> list[Any]:
         """Return Agno tools with MindRoom knowledge-source metadata attached."""
-        tools = super().get_tools(run_response, run_context, session, user_id=user_id)
-        _annotate_knowledge_search_tool(tools, self.knowledge_sources)
+        tools = _govern_generated_functions(
+            super().get_tools(run_response, run_context, session, user_id=user_id),
+            self.tool_function_filter,
+            self.tool_hook_bridge,
+        )
+        _annotate_knowledge_search_tool(tools, self.knowledge_sources, async_mode=False)
         return tools
 
     async def aget_tools(
@@ -88,12 +145,16 @@ class KnowledgeToolDescribingAgent(Agent):
         check_mcp_tools: bool = True,
     ) -> list[Any]:
         """Return async Agno tools with MindRoom knowledge-source metadata attached."""
-        tools = await super().aget_tools(
-            run_response,
-            run_context,
-            session,
-            user_id=user_id,
-            check_mcp_tools=check_mcp_tools,
+        tools = _govern_generated_functions(
+            await super().aget_tools(
+                run_response,
+                run_context,
+                session,
+                user_id=user_id,
+                check_mcp_tools=check_mcp_tools,
+            ),
+            self.tool_function_filter,
+            self.tool_hook_bridge,
         )
-        _annotate_knowledge_search_tool(tools, self.knowledge_sources)
+        _annotate_knowledge_search_tool(tools, self.knowledge_sources, async_mode=True)
         return tools

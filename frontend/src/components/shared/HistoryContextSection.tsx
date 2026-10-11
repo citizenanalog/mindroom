@@ -3,6 +3,8 @@ import { Controller, type Control, type Path, useWatch } from "react-hook-form";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { SchemaSection } from "@/components/SchemaForm";
+import { setObjectKey } from "@/lib/configSchema";
 import { FieldGroup } from "./FieldGroup";
 import {
   resolveEffectiveCompactionEnabled,
@@ -10,10 +12,18 @@ import {
   type Config,
 } from "@/types/config";
 
+// Compaction keys this section renders by hand; More compaction settings shows the rest.
+const COMPACTION_EDITOR_FIELDS = [
+  "enabled",
+  "threshold_tokens",
+  "threshold_percent",
+  "replay_window_tokens",
+  "reserve_tokens",
+  "model",
+] as const;
+
 type HistoryFieldName =
-  | "num_history_runs"
-  | "num_history_messages"
-  | "max_tool_calls_from_history";
+  "num_history_runs" | "num_history_messages" | "max_tool_calls_from_history";
 
 type HistoryContextFormValues = {
   num_history_runs?: number | null;
@@ -26,6 +36,8 @@ type HistoryContextFormValues = {
 interface HistoryContextSectionProps<T extends HistoryContextFormValues> {
   control: Control<T>;
   resetKey: string | null | undefined;
+  /** Where this entity's compaction lives in config.yaml, for validation errors. */
+  compactionPath: Array<string | number>;
   defaults?: Config["defaults"];
   onFieldChange: (
     fieldName: HistoryFieldName,
@@ -86,6 +98,7 @@ function parseOptionalUnitFloat(raw: string): number | null {
 export function HistoryContextSection<T extends HistoryContextFormValues>({
   control,
   resetKey,
+  compactionPath,
   defaults,
   onFieldChange,
   updateCompaction,
@@ -333,7 +346,7 @@ export function HistoryContextSection<T extends HistoryContextFormValues>({
                   placeholder={
                     defaultCompaction?.threshold_tokens != null
                       ? `Default: ${defaultCompaction.threshold_tokens}`
-                      : "Default: derived from context window"
+                      : "Default: derived from replay window"
                   }
                   onChange={(e) => {
                     const value = parseOptionalInt(e.target.value, 1);
@@ -351,7 +364,7 @@ export function HistoryContextSection<T extends HistoryContextFormValues>({
 
               <FieldGroup
                 label="Threshold Percent"
-                helperText="Soft replay budget as a fraction of the context window. Crossing it records planning metadata; destructive compaction waits for the hard budget."
+                helperText="Soft replay budget as a fraction of the effective replay window. Crossing it records planning metadata; text compaction waits for the hard budget."
                 htmlFor="compaction_threshold_percent"
               >
                 <Input
@@ -401,6 +414,31 @@ export function HistoryContextSection<T extends HistoryContextFormValues>({
               </FieldGroup>
 
               <FieldGroup
+                label="Replay Window Tokens"
+                helperText="Optional persisted-replay and compaction-planning cap. This does not lower the model provider's request limit."
+                htmlFor="compaction_replay_window_tokens"
+              >
+                <Input
+                  id="compaction_replay_window_tokens"
+                  type="number"
+                  min={1}
+                  value={compactionConfig?.replay_window_tokens ?? ""}
+                  placeholder={
+                    defaultCompaction?.replay_window_tokens != null
+                      ? `Default: ${defaultCompaction.replay_window_tokens}`
+                      : "Default: model context window"
+                  }
+                  onChange={(e) => {
+                    const value = parseOptionalInt(e.target.value, 1);
+                    mutateCompaction((current) => ({
+                      ...(current ?? {}),
+                      replay_window_tokens: value ?? undefined,
+                    }));
+                  }}
+                />
+              </FieldGroup>
+
+              <FieldGroup
                 label="Reserve Tokens"
                 helperText="Headroom reserved for the current prompt, tools, and model output."
                 htmlFor="compaction_reserve_tokens"
@@ -440,6 +478,17 @@ export function HistoryContextSection<T extends HistoryContextFormValues>({
                 />
               </FieldGroup>
             </div>
+
+            <SchemaSection
+              title="More compaction settings"
+              definition="CompactionOverrideConfig"
+              value={compactionConfig}
+              path={compactionPath}
+              exclude={COMPACTION_EDITOR_FIELDS}
+              onFieldChange={(key, next) =>
+                mutateCompaction((current) => setObjectKey(current, key, next))
+              }
+            />
           </div>
         </FieldGroup>
       </div>

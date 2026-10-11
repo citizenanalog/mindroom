@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import nio
 import pytest
@@ -11,12 +11,13 @@ import yaml
 
 from mindroom import constants
 from mindroom.config.main import Config
-from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.constants import ROUTER_AGENT_NAME, resolve_avatar_path
 from mindroom.entity_resolution import mindroom_user_id
 from mindroom.matrix import client as matrix_client
 from mindroom.matrix import rooms as matrix_rooms
+from mindroom.matrix.client_room_admin import RoomJoinOutcome
 from mindroom.matrix.state import MatrixState
-from mindroom.matrix_identifiers import managed_room_key_from_alias_localpart, managed_space_alias_localpart
+from mindroom.matrix_identifiers import managed_space_alias_localpart, room_alias_identifier_candidates
 from mindroom.orchestrator import _MultiAgentOrchestrator
 from tests.conftest import (
     TEST_PASSWORD,
@@ -34,6 +35,22 @@ def _config_with_runtime_paths(tmp_path, **config_data: object) -> Config:  # no
     return bind_runtime_paths(
         Config(**config_data),
         orchestrator_runtime_paths(tmp_path, config_path=tmp_path / "config.yaml"),
+    )
+
+
+def _router_created_space_state(config: Config) -> nio.RoomGetStateResponse:
+    alias = f"#{managed_space_alias_localpart(runtime_paths_for(config))}:localhost"
+    return nio.RoomGetStateResponse(
+        [
+            {"type": "m.room.create", "state_key": "", "sender": "@router:localhost", "content": {}},
+            {
+                "type": "m.room.canonical_alias",
+                "state_key": "",
+                "sender": "@router:localhost",
+                "content": {"alias": alias},
+            },
+        ],
+        "!space:localhost",
     )
 
 
@@ -78,9 +95,11 @@ def test_matrix_state_load_is_backward_compatible_without_space_room_id(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("already_joined", [False, True])
 async def test_ensure_user_in_rooms_uses_managed_login_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    already_joined: bool,
 ) -> None:
     """The internal user room-join path should share managed Matrix session persistence."""
     runtime_paths = orchestrator_runtime_paths(tmp_path, config_path=tmp_path / "config.yaml")
@@ -118,9 +137,16 @@ async def test_ensure_user_in_rooms_uses_managed_login_boundary(
         updated_state.save(runtime_paths=login_runtime_paths)
         return client
 
-    join_room = AsyncMock(return_value=True)
+    join_room = AsyncMock(return_value=RoomJoinOutcome.JOINED)
     monkeypatch.setattr(matrix_rooms, "login_agent_user", _login_user)
     monkeypatch.setattr(matrix_rooms, "join_room", join_room)
+    monkeypatch.setattr(
+        matrix_rooms,
+        "get_joined_rooms",
+        AsyncMock(
+            return_value=["!lobby:localhost"] if already_joined else None,
+        ),
+    )
 
     await matrix_rooms.ensure_user_in_rooms(
         "http://localhost:8008",
@@ -132,7 +158,10 @@ async def test_ensure_user_in_rooms_uses_managed_login_boundary(
     assert login_calls[0].user_id == "@requested_internal:localhost"
     assert login_calls[0].device_id == "old_device"
     assert login_calls[0].access_token == TEST_PASSWORD
-    join_room.assert_awaited_once_with(client, "!lobby:localhost")
+    if already_joined:
+        join_room.assert_not_awaited()
+    else:
+        join_room.assert_awaited_once_with(client, "!lobby:localhost")
     client.close.assert_awaited_once()
 
     persisted = MatrixState.load(runtime_paths=runtime_paths).get_account("agent_user")
@@ -145,7 +174,7 @@ def test_config_rejects_room_key_that_conflicts_with_root_space_alias() -> None:
     """Managed room keys must not map to the reserved root Space alias."""
     runtime_paths = constants.resolve_runtime_paths()
     reserved_alias = managed_space_alias_localpart(runtime_paths)
-    colliding_room_key = managed_room_key_from_alias_localpart(reserved_alias, runtime_paths) or reserved_alias
+    colliding_room_key = room_alias_identifier_candidates(f"#{reserved_alias}:example.com", runtime_paths)[-1]
 
     with pytest.raises(ValueError, match="reserved root Space alias"):
         Config.model_validate(
@@ -161,7 +190,7 @@ def test_config_allows_colliding_room_key_when_space_disabled() -> None:
     """Colliding room keys should be accepted when the space feature is disabled."""
     runtime_paths = constants.resolve_runtime_paths()
     reserved_alias = managed_space_alias_localpart(runtime_paths)
-    colliding_room_key = managed_room_key_from_alias_localpart(reserved_alias, runtime_paths) or reserved_alias
+    colliding_room_key = room_alias_identifier_candidates(f"#{reserved_alias}:example.com", runtime_paths)[-1]
 
     config = Config.model_validate(
         {
@@ -263,10 +292,130 @@ async def test_add_room_to_space_falls_back_to_state_event_when_child_missing_fr
 
 
 @pytest.mark.asyncio
+async def test_ensure_room_admin_power_levels_promotes_missing_and_underpowered_users() -> None:
+    """Root Space admins should receive PL100 without disturbing existing higher levels."""
+    client = AsyncMock()
+    client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+        content={
+            "users": {
+                "@router:example.com": 100,
+                "@existing:example.com": 150,
+                "@underpowered:example.com": 50,
+            },
+            "state_default": 50,
+        },
+        event_type="m.room.power_levels",
+        state_key="",
+        room_id="!space:example.com",
+    )
+    client.room_put_state.return_value = nio.RoomPutStateResponse.from_dict(
+        {"event_id": "$power"},
+        room_id="!space:example.com",
+    )
+
+    result = await matrix_client.ensure_room_admin_power_levels(
+        client,
+        "!space:example.com",
+        {
+            "@existing:example.com",
+            "@underpowered:example.com",
+            "@owner:example.com",
+        },
+    )
+
+    assert result is True
+    client.room_put_state.assert_awaited_once_with(
+        room_id="!space:example.com",
+        event_type="m.room.power_levels",
+        content={
+            "users": {
+                "@router:example.com": 100,
+                "@existing:example.com": 150,
+                "@underpowered:example.com": 100,
+                "@owner:example.com": 100,
+            },
+            "state_default": 50,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_room_admin_power_levels_is_idempotent_when_admins_already_powered() -> None:
+    """No power-level write should happen when every target user is already an admin."""
+    client = AsyncMock()
+    client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+        content={"users": {"@owner:example.com": 100}},
+        event_type="m.room.power_levels",
+        state_key="",
+        room_id="!space:example.com",
+    )
+
+    result = await matrix_client.ensure_room_admin_power_levels(
+        client,
+        "!space:example.com",
+        {"@owner:example.com"},
+    )
+
+    assert result is True
+    client.room_put_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_room_admin_power_levels_returns_false_when_power_levels_read_fails() -> None:
+    """Power-level read failures should fail closed and avoid overwriting state."""
+    client = AsyncMock()
+    client.room_get_state_event.return_value = nio.RoomGetStateEventError(
+        "forbidden",
+        status_code="M_FORBIDDEN",
+        room_id="!space:example.com",
+    )
+
+    result = await matrix_client.ensure_room_admin_power_levels(
+        client,
+        "!space:example.com",
+        {"@owner:example.com"},
+    )
+
+    assert result is False
+    client.room_put_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_room_admin_power_levels_returns_false_when_power_level_write_fails() -> None:
+    """Power-level write failures should report reconciliation failure."""
+    client = AsyncMock()
+    client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
+        content={"users": {}},
+        event_type="m.room.power_levels",
+        state_key="",
+        room_id="!space:example.com",
+    )
+    client.room_put_state.return_value = nio.RoomPutStateError(
+        "forbidden",
+        status_code="M_FORBIDDEN",
+        room_id="!space:example.com",
+    )
+
+    result = await matrix_client.ensure_room_admin_power_levels(
+        client,
+        "!space:example.com",
+        {"@owner:example.com"},
+    )
+
+    assert result is False
+    client.room_put_state.assert_awaited_once_with(
+        room_id="!space:example.com",
+        event_type="m.room.power_levels",
+        content={"users": {"@owner:example.com": 100}},
+    )
+
+
+@pytest.mark.asyncio
 async def test_ensure_root_space_creates_space_links_rooms_and_persists_state(tmp_path) -> None:  # noqa: ANN001
     """Enabled root Space support should create the Space, persist it, and link rooms."""
     client = AsyncMock()
     client.homeserver = "http://localhost:8008"
+    client.room_get_state.return_value = nio.RoomGetStateResponse([], "!space:localhost")
     client.rooms = {}
     client.room_resolve_alias.return_value = nio.RoomResolveAliasError("not found", status_code="M_NOT_FOUND")
     state = MatrixState()
@@ -282,32 +431,35 @@ async def test_ensure_root_space_creates_space_links_rooms_and_persists_state(tm
         patch("mindroom.matrix.rooms.get_joined_rooms", new=AsyncMock(return_value=[])),
         patch("mindroom.matrix.rooms.create_space", new=AsyncMock(return_value="!space:localhost")) as mock_create,
         patch("mindroom.matrix.rooms.ensure_room_name", new=AsyncMock(return_value=True)) as mock_name,
+        patch("mindroom.matrix.rooms.ensure_room_admin_power_levels", new=AsyncMock(return_value=True)) as mock_admins,
         patch("mindroom.matrix.rooms.add_room_to_space", new=AsyncMock(return_value=True)) as mock_add,
-        patch("mindroom.matrix.rooms._set_room_avatar_if_available", new=AsyncMock()) as mock_avatar,
+        patch("mindroom.matrix.rooms._set_room_avatar", new=AsyncMock()) as mock_avatar,
     ):
         space_id = await matrix_rooms.ensure_root_space(
             client,
             config,
             runtime_paths_for(config),
             {"lobby": "!lobby:localhost", "dev": "!dev:localhost"},
+            admin_user_ids={"@owner:localhost"},
         )
 
     assert space_id == "!space:localhost"
     assert state.space_room_id == "!space:localhost"
     mock_save.assert_called_once_with(state, runtime_paths=runtime_paths_for(config))
     mock_create.assert_awaited_once()
-    mock_name.assert_awaited_once_with(client, "!space:localhost", "MindRoom")
+    mock_name.assert_awaited_once_with(client, "!space:localhost", "MindRoom", snapshot=ANY)
+    mock_admins.assert_awaited_once_with(client, "!space:localhost", {"@owner:localhost"}, snapshot=ANY)
     assert mock_add.await_args_list == [
-        call(client, "!space:localhost", "!lobby:localhost", "localhost"),
-        call(client, "!space:localhost", "!dev:localhost", "localhost"),
+        call(client, "!space:localhost", "!lobby:localhost", "localhost", snapshot=ANY),
+        call(client, "!space:localhost", "!dev:localhost", "localhost", snapshot=ANY),
     ]
-    mock_avatar.assert_awaited_once_with(
-        client,
-        "!space:localhost",
-        avatar_category="spaces",
-        avatar_name="root_space",
-        context="root_space",
-        runtime_paths=runtime_paths_for(config),
+    mock_avatar.assert_awaited_once()
+    assert mock_avatar.await_args.args == (client, "!space:localhost")
+    assert mock_avatar.await_args.kwargs["context"] == "root_space"
+    assert await mock_avatar.await_args.kwargs["resolve_avatar"]() == resolve_avatar_path(
+        "spaces",
+        "root_space",
+        runtime_paths_for(config),
     )
 
 
@@ -328,22 +480,29 @@ async def test_ensure_root_space_resolves_existing_alias_without_recreating(tmp_
         agents={"general": {"display_name": "General", "rooms": ["lobby"]}},
         matrix_space={"enabled": True, "name": "Workspace"},
     )
+    client.user_id = "@router:localhost"
+    client.room_get_state.return_value = _router_created_space_state(config)
 
     with (
         patch("mindroom.matrix.rooms.MatrixState.load", return_value=state),
         patch.object(MatrixState, "save", autospec=True) as mock_save,
         patch("mindroom.matrix.rooms.get_joined_rooms", new=AsyncMock(return_value=[])),
-        patch("mindroom.matrix.rooms.join_room", new=AsyncMock(return_value=True)) as mock_join,
+        patch(
+            "mindroom.matrix.rooms.join_room",
+            new=AsyncMock(return_value=RoomJoinOutcome.JOINED),
+        ) as mock_join,
         patch("mindroom.matrix.rooms.create_space", new=AsyncMock()) as mock_create,
         patch("mindroom.matrix.rooms.ensure_room_name", new=AsyncMock(return_value=True)) as mock_name,
+        patch("mindroom.matrix.rooms.ensure_room_admin_power_levels", new=AsyncMock(return_value=True)) as mock_admins,
         patch("mindroom.matrix.rooms.add_room_to_space", new=AsyncMock(return_value=True)) as mock_add,
-        patch("mindroom.matrix.rooms._set_room_avatar_if_available", new=AsyncMock()) as mock_avatar,
+        patch("mindroom.matrix.rooms._set_room_avatar", new=AsyncMock()) as mock_avatar,
     ):
         space_id = await matrix_rooms.ensure_root_space(
             client,
             config,
             runtime_paths_for(config),
             {"lobby": "!lobby:localhost"},
+            admin_user_ids={"@owner:localhost"},
         )
 
     assert space_id == "!space:localhost"
@@ -351,15 +510,16 @@ async def test_ensure_root_space_resolves_existing_alias_without_recreating(tmp_
     mock_save.assert_called_once_with(state, runtime_paths=runtime_paths_for(config))
     mock_join.assert_awaited_once_with(client, "!space:localhost")
     mock_create.assert_not_awaited()
-    mock_name.assert_awaited_once_with(client, "!space:localhost", "Workspace")
-    mock_add.assert_awaited_once_with(client, "!space:localhost", "!lobby:localhost", "localhost")
-    mock_avatar.assert_awaited_once_with(
-        client,
-        "!space:localhost",
-        avatar_category="spaces",
-        avatar_name="root_space",
-        context="root_space",
-        runtime_paths=runtime_paths_for(config),
+    mock_name.assert_awaited_once_with(client, "!space:localhost", "Workspace", snapshot=ANY)
+    mock_admins.assert_awaited_once_with(client, "!space:localhost", {"@owner:localhost"}, snapshot=ANY)
+    mock_add.assert_awaited_once_with(client, "!space:localhost", "!lobby:localhost", "localhost", snapshot=ANY)
+    mock_avatar.assert_awaited_once()
+    assert mock_avatar.await_args.args == (client, "!space:localhost")
+    assert mock_avatar.await_args.kwargs["context"] == "root_space"
+    assert await mock_avatar.await_args.kwargs["resolve_avatar"]() == resolve_avatar_path(
+        "spaces",
+        "root_space",
+        runtime_paths_for(config),
     )
 
 
@@ -380,16 +540,21 @@ async def test_ensure_root_space_skips_existing_alias_when_router_cannot_join(tm
         agents={"general": {"display_name": "General", "rooms": ["lobby"]}},
         matrix_space={"enabled": True, "name": "Workspace"},
     )
+    client.user_id = "@router:localhost"
+    client.room_get_state.return_value = _router_created_space_state(config)
 
     with (
         patch("mindroom.matrix.rooms.MatrixState.load", return_value=state),
         patch.object(MatrixState, "save", autospec=True) as mock_save,
         patch("mindroom.matrix.rooms.get_joined_rooms", new=AsyncMock(return_value=[])),
-        patch("mindroom.matrix.rooms.join_room", new=AsyncMock(return_value=False)) as mock_join,
+        patch(
+            "mindroom.matrix.rooms.join_room",
+            new=AsyncMock(return_value=RoomJoinOutcome.RETRYABLE_FAILURE),
+        ) as mock_join,
         patch("mindroom.matrix.rooms.create_space", new=AsyncMock()) as mock_create,
         patch("mindroom.matrix.rooms.ensure_room_name", new=AsyncMock(return_value=True)) as mock_name,
         patch("mindroom.matrix.rooms.add_room_to_space", new=AsyncMock(return_value=True)) as mock_add,
-        patch("mindroom.matrix.rooms._set_room_avatar_if_available", new=AsyncMock()) as mock_avatar,
+        patch("mindroom.matrix.rooms._set_room_avatar", new=AsyncMock()) as mock_avatar,
     ):
         space_id = await matrix_rooms.ensure_root_space(
             client,
@@ -413,6 +578,7 @@ async def test_ensure_root_space_returns_none_when_name_write_fails(tmp_path) ->
     """If the router lacks permission to set the space name, reconciliation should bail out."""
     client = AsyncMock()
     client.homeserver = "http://localhost:8008"
+    client.room_get_state.return_value = nio.RoomGetStateResponse([], "!space:localhost")
     client.rooms = {"!space:localhost": MagicMock()}
     state = MatrixState(space_room_id="!space:localhost")
     config = _config_with_runtime_paths(
@@ -426,7 +592,7 @@ async def test_ensure_root_space_returns_none_when_name_write_fails(tmp_path) ->
         patch("mindroom.matrix.rooms.get_joined_rooms", new=AsyncMock(return_value=["!space:localhost"])),
         patch("mindroom.matrix.rooms.ensure_room_name", new=AsyncMock(return_value=False)),
         patch("mindroom.matrix.rooms.add_room_to_space", new=AsyncMock(return_value=True)) as mock_add,
-        patch("mindroom.matrix.rooms._set_room_avatar_if_available", new=AsyncMock()) as mock_avatar,
+        patch("mindroom.matrix.rooms._set_room_avatar", new=AsyncMock()) as mock_avatar,
     ):
         space_id = await matrix_rooms.ensure_root_space(
             client,
@@ -441,10 +607,47 @@ async def test_ensure_root_space_returns_none_when_name_write_fails(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_ensure_root_space_returns_none_when_admin_power_reconciliation_fails(tmp_path) -> None:  # noqa: ANN001
+    """If root Space admin promotion fails, reconciliation should skip child linking."""
+    client = AsyncMock()
+    client.homeserver = "http://localhost:8008"
+    client.room_get_state.return_value = nio.RoomGetStateResponse([], "!space:localhost")
+    client.rooms = {"!space:localhost": MagicMock()}
+    state = MatrixState(space_room_id="!space:localhost")
+    config = _config_with_runtime_paths(
+        tmp_path,
+        agents={"general": {"display_name": "General", "rooms": ["lobby"]}},
+        matrix_space={"enabled": True},
+    )
+
+    with (
+        patch("mindroom.matrix.rooms.MatrixState.load", return_value=state),
+        patch("mindroom.matrix.rooms.get_joined_rooms", new=AsyncMock(return_value=["!space:localhost"])),
+        patch("mindroom.matrix.rooms.ensure_room_name", new=AsyncMock(return_value=True)),
+        patch("mindroom.matrix.rooms.ensure_room_admin_power_levels", new=AsyncMock(return_value=False)) as mock_admins,
+        patch("mindroom.matrix.rooms.add_room_to_space", new=AsyncMock(return_value=True)) as mock_add,
+        patch("mindroom.matrix.rooms._set_room_avatar", new=AsyncMock()) as mock_avatar,
+    ):
+        space_id = await matrix_rooms.ensure_root_space(
+            client,
+            config,
+            runtime_paths_for(config),
+            {"lobby": "!lobby:localhost"},
+            admin_user_ids={"@owner:localhost"},
+        )
+
+    assert space_id is None
+    mock_admins.assert_awaited_once_with(client, "!space:localhost", {"@owner:localhost"}, snapshot=ANY)
+    mock_add.assert_not_awaited()
+    mock_avatar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_ensure_root_space_returns_none_when_child_link_fails(tmp_path) -> None:  # noqa: ANN001
     """If the router cannot add child links, reconciliation should fail."""
     client = AsyncMock()
     client.homeserver = "http://localhost:8008"
+    client.room_get_state.return_value = nio.RoomGetStateResponse([], "!space:localhost")
     client.rooms = {"!space:localhost": MagicMock()}
     state = MatrixState(space_room_id="!space:localhost")
     config = _config_with_runtime_paths(
@@ -458,7 +661,7 @@ async def test_ensure_root_space_returns_none_when_child_link_fails(tmp_path) ->
         patch("mindroom.matrix.rooms.get_joined_rooms", new=AsyncMock(return_value=["!space:localhost"])),
         patch("mindroom.matrix.rooms.ensure_room_name", new=AsyncMock(return_value=True)),
         patch("mindroom.matrix.rooms.add_room_to_space", new=AsyncMock(return_value=False)) as mock_add,
-        patch("mindroom.matrix.rooms._set_room_avatar_if_available", new=AsyncMock()) as mock_avatar,
+        patch("mindroom.matrix.rooms._set_room_avatar", new=AsyncMock()) as mock_avatar,
     ):
         space_id = await matrix_rooms.ensure_root_space(
             client,
@@ -468,22 +671,22 @@ async def test_ensure_root_space_returns_none_when_child_link_fails(tmp_path) ->
         )
 
     assert space_id is None
-    mock_add.assert_awaited_once_with(client, "!space:localhost", "!lobby:localhost", "localhost")
+    mock_add.assert_awaited_once_with(client, "!space:localhost", "!lobby:localhost", "localhost", snapshot=ANY)
     mock_avatar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_ensure_root_space_invites_internal_and_authorized_users(tmp_path) -> None:  # noqa: ANN001
-    """The orchestrator should invite both the internal user and authorized users to the root Space."""
+async def test_orchestrator_ensure_root_space_uses_effective_room_invite_users(tmp_path) -> None:  # noqa: ANN001
+    """The root Space should use effective room invitations without implicit users."""
     orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path))
     orchestrator.config = _config_with_runtime_paths(
         tmp_path,
         agents={"general": {"display_name": "General", "rooms": ["lobby"]}},
         matrix_space={"enabled": True},
         mindroom_user={"username": "mindroom_user", "display_name": "MindRoomUser"},
-        authorization={
-            "global_users": ["@owner:example.com"],
-            "room_permissions": {"lobby": ["@collaborator:example.com"]},
+        room_defaults={"invite_users": ["@owner:example.com"]},
+        rooms={
+            "lobby": {"invite_users": ["@collaborator:example.com"]},
         },
     )
     router_bot = MagicMock()
@@ -502,12 +705,10 @@ async def test_orchestrator_ensure_root_space_invites_internal_and_authorized_us
         orchestrator.config,
         orchestrator.runtime_paths,
         {"lobby": "!lobby:localhost"},
+        admin_user_ids=set(),
     )
-    # Should have invited both the internal user and the authorized owner
     invited_user_ids = {c.args[2] for c in mock_invite.await_args_list}
-    assert mindroom_user_id(orchestrator.config, orchestrator.runtime_paths) in invited_user_ids
-    assert "@owner:example.com" in invited_user_ids
-    assert "@collaborator:example.com" not in invited_user_ids
+    assert invited_user_ids == {"@collaborator:example.com"}
 
 
 @pytest.mark.asyncio
@@ -517,19 +718,26 @@ async def test_orchestrator_ensure_root_space_invites_authorized_user_without_in
     orchestrator.config = Config(
         agents={"general": {"display_name": "General", "rooms": ["lobby"]}},
         matrix_space={"enabled": True},
-        authorization={"global_users": ["@owner:example.com"]},
+        room_defaults={"invite_users": ["@owner:example.com"]},
     )
     router_bot = MagicMock()
     router_bot.client = AsyncMock()
     orchestrator.agent_bots[ROUTER_AGENT_NAME] = router_bot
 
     with (
-        patch("mindroom.orchestrator.ensure_root_space", new=AsyncMock(return_value="!space:localhost")),
+        patch("mindroom.orchestrator.ensure_root_space", new=AsyncMock(return_value="!space:localhost")) as mock_space,
         patch("mindroom.orchestrator.get_room_members", new=AsyncMock(return_value={"@mindroom_router:localhost"})),
         patch("mindroom.orchestrator.invite_to_room", new=AsyncMock(return_value=True)) as mock_invite,
     ):
         await orchestrator._ensure_root_space({"lobby": "!lobby:localhost"})
 
+    mock_space.assert_awaited_once_with(
+        router_bot.client,
+        orchestrator.config,
+        orchestrator.runtime_paths,
+        {"lobby": "!lobby:localhost"},
+        admin_user_ids=set(),
+    )
     mock_invite.assert_awaited_once_with(
         router_bot.client,
         "!space:localhost",
@@ -546,7 +754,7 @@ async def test_orchestrator_ensure_root_space_skips_existing_members(tmp_path) -
         agents={"general": {"display_name": "General", "rooms": ["lobby"]}},
         matrix_space={"enabled": True},
         mindroom_user={"username": "mindroom_user", "display_name": "MindRoomUser"},
-        authorization={"global_users": ["@owner:example.com"]},
+        room_defaults={"invite_users": ["@owner:example.com"]},
     )
     router_bot = MagicMock()
     router_bot.client = AsyncMock()
@@ -564,7 +772,7 @@ async def test_orchestrator_ensure_root_space_skips_existing_members(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_setup_rooms_and_memberships_runs_root_space_after_each_room_reconciliation(tmp_path) -> None:  # noqa: ANN001
+async def test_setup_rooms_and_memberships_reconciles_root_space_once(tmp_path) -> None:  # noqa: ANN001
     """Space reconciliation should happen as a post-room phase during startup."""
     orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path))
     orchestrator.config = Config(
@@ -599,7 +807,6 @@ async def test_setup_rooms_and_memberships_runs_root_space_after_each_room_recon
 
     assert mock_root_space.await_args_list == [
         call({"lobby": "!room1:localhost"}),
-        call({"lobby": "!room1:localhost"}),
     ]
 
 
@@ -627,11 +834,13 @@ async def test_update_config_matrix_space_change_reconciles_without_room_members
     router_bot = MagicMock()
     router_bot.config = initial_config
     router_bot.enable_streaming = True
+    router_bot.running = True
     router_bot._set_presence_with_model_info = AsyncMock()
+    router_bot.recover_pending_turn_journal_events = AsyncMock()
     orchestrator.agent_bots[ROUTER_AGENT_NAME] = router_bot
 
     with (
-        patch("mindroom.orchestrator.load_config", return_value=updated_config),
+        patch("mindroom.orchestration.config_lifecycle.load_config", return_value=updated_config),
         patch("mindroom.orchestration.config_updates._identify_entities_to_restart", return_value=set()),
         patch.object(orchestrator, "_setup_rooms_and_memberships", new=AsyncMock()) as mock_setup,
         patch.object(
@@ -640,10 +849,9 @@ async def test_update_config_matrix_space_change_reconciles_without_room_members
             new=AsyncMock(return_value={"lobby": "!room1:localhost"}),
         ) as mock_rooms,
         patch.object(orchestrator, "_ensure_root_space", new=AsyncMock()) as mock_root_space,
-        patch.object(orchestrator, "_sync_event_cache_service", new=AsyncMock()),
         patch.object(orchestrator, "_sync_runtime_support_services", new=AsyncMock()),
     ):
-        updated = await orchestrator.update_config()
+        updated = await orchestrator.config_reload._update_config()
 
     assert updated is True
     assert general_bot.config == updated_config

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Mic, Settings, Volume2, Info } from "lucide-react";
+import { Mic, Settings, Volume2, Info, PhoneCall } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -21,8 +21,16 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
 import { showSaveFailureToastIfNeeded } from "@/components/shared";
-import { useConfigStore } from "@/store/configStore";
+import { readConfigRoot, useConfigStore } from "@/store/configStore";
+import {
+  SchemaFields,
+  SchemaSection,
+  SchemaUnavailable,
+} from "@/components/SchemaForm";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
 import { VoiceConfig as VoiceConfigType } from "@/types/config";
+
+const STT_EDITOR_FIELDS = ["provider", "model", "api_key", "host"] as const;
 
 const OPENAI_TRANSCRIPTION_ENDPOINT =
   "https://api.openai.com/v1/audio/transcriptions";
@@ -32,7 +40,7 @@ const DEFAULT_VOICE_CONFIG: VoiceConfigType = {
   visible_router_echo: true,
   stt: {
     provider: "openai",
-    model: "whisper-1",
+    model: "gpt-transcribe",
     api_key: "",
     host: "",
   },
@@ -48,7 +56,6 @@ function mergeVoiceConfig(config?: Partial<VoiceConfigType>): VoiceConfigType {
     stt: {
       ...DEFAULT_VOICE_CONFIG.stt,
       ...(config?.stt || {}),
-      provider: "openai",
     },
     intelligence: {
       ...DEFAULT_VOICE_CONFIG.intelligence,
@@ -62,8 +69,34 @@ function normalizeHost(host?: string): string {
   return host.trim().replace(/\/+$/, "");
 }
 
+function speechBaseUrl(host?: string): string {
+  const normalized = normalizeHost(host);
+  if (!normalized) return "";
+  return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
+}
+
+function normalizeSTTConfig(
+  stt: VoiceConfigType["stt"],
+): VoiceConfigType["stt"] {
+  const normalized = { ...stt };
+  const apiKey = stt.api_key?.trim();
+  const host = normalizeHost(stt.host);
+  if (apiKey) normalized.api_key = apiKey;
+  else delete normalized.api_key;
+  if (host) normalized.host = host;
+  else delete normalized.host;
+  return normalized;
+}
+
 export function VoiceConfig() {
-  const { config, isLoading, saveConfig, updateVoiceConfig } = useConfigStore();
+  const { config, isLoading, saveConfig, updateConfigValue } = useConfigStore();
+  const {
+    schema: schemaRoot,
+    error: schemaError,
+    retry: retrySchema,
+  } = useConfigSchema();
+  const callsConfig =
+    config == null ? undefined : readConfigRoot(config, "calls");
   const { toast } = useToast();
 
   // Initialize local state with default values if voice config doesn't exist
@@ -80,12 +113,12 @@ export function VoiceConfig() {
     const newConfig = { ...voiceConfig, ...updates };
     setVoiceConfig(newConfig);
 
-    updateVoiceConfig(newConfig);
+    updateConfigValue(["voice"], newConfig);
   };
 
   const handleSTTChange = (updates: Partial<VoiceConfigType["stt"]>) => {
     handleVoiceConfigChange({
-      stt: { ...voiceConfig.stt, ...updates, provider: "openai" },
+      stt: { ...voiceConfig.stt, ...updates },
     });
   };
 
@@ -99,24 +132,28 @@ export function VoiceConfig() {
 
   // Get available models from config
   const availableModels = config?.models ? Object.keys(config.models) : [];
-  const normalizedHost = normalizeHost(voiceConfig.stt.host);
-  const effectiveEndpoint = normalizedHost
-    ? `${normalizedHost}/v1/audio/transcriptions`
-    : OPENAI_TRANSCRIPTION_ENDPOINT;
-  const effectiveMode = normalizedHost ? "OpenAI-compatible API" : "OpenAI API";
+  const isCompatibleProvider = voiceConfig.stt.provider === "openai_compatible";
+  const normalizedBaseUrl = speechBaseUrl(voiceConfig.stt.host);
+  const effectiveEndpoint = normalizedBaseUrl
+    ? `${normalizedBaseUrl}/audio/transcriptions`
+    : isCompatibleProvider
+      ? "Base URL required"
+      : OPENAI_TRANSCRIPTION_ENDPOINT;
+  const effectiveMode =
+    normalizedBaseUrl || isCompatibleProvider
+      ? "OpenAI-compatible API"
+      : "OpenAI API";
   const keySource = voiceConfig.stt.api_key?.trim()
     ? "Stored in voice settings"
-    : "OPENAI_API_KEY environment variable";
-  const providerLabel = "OpenAI";
+    : isCompatibleProvider
+      ? "Non-secret compatibility placeholder"
+      : "OPENAI_API_KEY environment variable";
+  const providerLabel = isCompatibleProvider ? "OpenAI-compatible" : "OpenAI";
 
   const handleSave = async () => {
-    updateVoiceConfig({
+    updateConfigValue(["voice"], {
       ...voiceConfig,
-      stt: {
-        ...voiceConfig.stt,
-        provider: "openai",
-        host: normalizeHost(voiceConfig.stt.host),
-      },
+      stt: normalizeSTTConfig(voiceConfig.stt),
     });
     const result = await saveConfig();
     if (
@@ -130,6 +167,23 @@ export function VoiceConfig() {
     toast({
       title: "Voice Configuration Saved",
       description: "Your voice settings have been updated successfully.",
+    });
+  };
+
+  // Saves the draft as is; unlike handleSave it must not write voice defaults.
+  const handleSaveCalls = async () => {
+    const result = await saveConfig();
+    if (
+      showSaveFailureToastIfNeeded(result, {
+        staleMessage: "Save was superseded by newer call configuration edits.",
+        fallbackMessage: "Failed to save call configuration.",
+      })
+    ) {
+      return;
+    }
+    toast({
+      title: "Call Settings Saved",
+      description: "Your voice call settings have been updated successfully.",
     });
   };
 
@@ -210,7 +264,7 @@ export function VoiceConfig() {
                 </span>
               </div>
               <div className="flex items-start justify-between gap-4">
-                <span className="text-muted-foreground">Command Model:</span>
+                <span className="text-muted-foreground">Transcript Model:</span>
                 <span className="font-mono text-right text-foreground">
                   {voiceConfig.intelligence.model}
                 </span>
@@ -265,12 +319,32 @@ export function VoiceConfig() {
 
             <div className="grid gap-4">
               <div className="space-y-2">
+                <Label htmlFor="stt-provider">Provider</Label>
+                <Select
+                  value={voiceConfig.stt.provider}
+                  onValueChange={(
+                    provider: VoiceConfigType["stt"]["provider"],
+                  ) => handleSTTChange({ provider })}
+                >
+                  <SelectTrigger id="stt-provider">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="openai">OpenAI</SelectItem>
+                    <SelectItem value="openai_compatible">
+                      OpenAI-compatible
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2">
                 <Label htmlFor="stt-model">Model</Label>
                 <Input
                   id="stt-model"
                   value={voiceConfig.stt.model}
                   onChange={(e) => handleSTTChange({ model: e.target.value })}
-                  placeholder="whisper-1"
+                  placeholder="gpt-transcribe"
                 />
               </div>
 
@@ -281,15 +355,23 @@ export function VoiceConfig() {
                   type="password"
                   value={voiceConfig.stt.api_key || ""}
                   onChange={(e) => handleSTTChange({ api_key: e.target.value })}
-                  placeholder="Uses OPENAI_API_KEY env var if not set"
+                  placeholder={
+                    isCompatibleProvider
+                      ? "Optional for local-compatible services"
+                      : "Uses OPENAI_API_KEY env var if not set"
+                  }
                 />
                 <p className="text-xs text-muted-foreground">
-                  Leave empty to use the OPENAI_API_KEY environment variable
+                  {isCompatibleProvider
+                    ? "Leave empty to send a non-secret compatibility placeholder"
+                    : "Leave empty to use the OPENAI_API_KEY environment variable"}
                 </p>
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="stt-base-url">Base URL (Optional)</Label>
+                <Label htmlFor="stt-base-url">
+                  Base URL {isCompatibleProvider ? "(Required)" : "(Optional)"}
+                </Label>
                 <Input
                   id="stt-base-url"
                   value={voiceConfig.stt.host || ""}
@@ -298,19 +380,19 @@ export function VoiceConfig() {
                 />
                 <p className="text-xs text-muted-foreground">
                   Leave empty to use the default OpenAI endpoint. For
-                  self-hosted OpenAI-compatible services, provide the base host
-                  URL without <code>/v1</code>.
+                  self-hosted OpenAI-compatible services, provide either the
+                  service root or its <code>/v1</code> base URL.
                 </p>
               </div>
             </div>
           </div>
 
-          {/* Command Intelligence Model */}
+          {/* Transcript Intelligence Model */}
           <div className="space-y-4">
             <div className="flex items-center gap-2">
               <Settings className="h-4 w-4" />
               <Label className="text-base font-semibold">
-                Command Intelligence
+                Transcript Intelligence
               </Label>
             </div>
 
@@ -340,11 +422,21 @@ export function VoiceConfig() {
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Model used to process transcriptions into commands and agent
-                mentions
+                Model used for mention normalization and light ASR cleanup
               </p>
             </div>
           </div>
+
+          <SchemaSection
+            title="More speech-to-text settings"
+            definition="VoiceSTTConfig"
+            value={config?.voice?.stt}
+            path={["voice", "stt"]}
+            exclude={STT_EDITOR_FIELDS}
+            onFieldChange={(key, next) =>
+              updateConfigValue(["voice", "stt", key], next)
+            }
+          />
 
           {/* Save Button */}
           <div className="flex justify-end">
@@ -352,6 +444,52 @@ export function VoiceConfig() {
               Save Voice Configuration
             </Button>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <PhoneCall className="h-5 w-5 text-primary" />
+            Voice Calls
+          </CardTitle>
+          <CardDescription>
+            Let agents join Element Call (MatrixRTC) voice calls with named call
+            profiles.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {schemaError != null && (
+            <SchemaUnavailable
+              subject="Call settings"
+              error={schemaError}
+              onRetry={retrySchema}
+            />
+          )}
+          {schemaRoot == null && schemaError == null && (
+            <p className="text-sm text-muted-foreground">
+              Loading call settings...
+            </p>
+          )}
+          {schemaRoot?.properties?.calls != null && (
+            <>
+              <SchemaFields
+                schema={schemaRoot.properties.calls}
+                root={schemaRoot}
+                value={callsConfig}
+                path={["calls"]}
+                showOwnError
+                onFieldChange={(key, next) =>
+                  updateConfigValue(["calls", key], next)
+                }
+              />
+              <div className="flex justify-end">
+                <Button onClick={handleSaveCalls} disabled={isLoading}>
+                  Save Call Settings
+                </Button>
+              </div>
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -375,9 +513,8 @@ export function VoiceConfig() {
             <li className="flex items-start gap-2">
               <span className="text-primary mt-0.5">🤖</span>
               <span>
-                {
-                  'Smart command recognition (e.g., "schedule a meeting" -> "!schedule meeting")'
-                }
+                Transcript cleanup without converting natural language into chat
+                commands
               </span>
             </li>
             <li className="flex items-start gap-2">

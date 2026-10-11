@@ -12,7 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Plus, X, Bot, Settings } from "lucide-react";
+import { Plus, X, Bot } from "lucide-react";
 import {
   EditorPanel,
   EditorPanelEmptyState,
@@ -33,13 +33,65 @@ import {
 } from "@/types/config";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { useTools } from "@/hooks/useTools";
+import { useTools, type ToolInfo } from "@/hooks/useTools";
 import { useSkills } from "@/hooks/useSkills";
 import { useScopedConfigValidation } from "@/hooks/useScopedConfigValidation";
-import { ToolConfigPanel } from "./ToolConfigPanel";
+import { ToolConfigPanel } from "@/components/ToolConfig/ToolConfigPanel";
+import { ToolSelectionRow } from "./ToolSelectionRow";
+import { SchemaSection } from "@/components/SchemaForm";
+import { setObjectKey } from "@/lib/configSchema";
+
+/** AgentConfig keys this editor renders by hand; More settings shows the rest. */
+const AGENT_EDITOR_FIELDS = [
+  "display_name",
+  "role",
+  "tools",
+  "include_default_tools",
+  "skills",
+  "instructions",
+  "rooms",
+  "markdown",
+  "learning",
+  "learning_mode",
+  "model",
+  "memory_backend",
+  "compaction",
+  "private",
+  "knowledge_bases",
+  "context_files",
+  "thread_mode",
+  "num_history_runs",
+  "num_history_messages",
+  "compress_tool_results",
+  "max_tool_calls_from_history",
+  "show_tool_calls",
+  "worker_tools",
+  "allow_self_config",
+  "delegate_to",
+] as const;
+
+// Private agents derive their execution scope from private.per.
+const PRIVATE_AGENT_EDITOR_FIELDS = [...AGENT_EDITOR_FIELDS, "worker_scope"];
+
+const PRIVATE_KNOWLEDGE_EDITOR_FIELDS = [
+  "enabled",
+  "description",
+  "path",
+  "watch",
+] as const;
 
 const TOOL_VALIDATION_UNAVAILABLE_MESSAGE =
   "Tool availability preview is unavailable while agent policy preview is unavailable. Save or refresh to validate tool assignments.";
+
+/** Whether a checked tool's row opens settings: fields, overrides, or lazy loading. */
+function toolHasSettings(tool: ToolInfo, hasOverrides: boolean): boolean {
+  return (
+    hasOverrides ||
+    tool.lazy_loading_supported === true ||
+    (tool.agent_override_fields?.length ?? 0) > 0 ||
+    (tool.config_fields?.length ?? 0) > 0
+  );
+}
 
 export function AgentEditor() {
   const {
@@ -60,12 +112,12 @@ export function AgentEditor() {
 
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const selectedAgent = agents.find((a) => a.id === selectedAgentId);
-  const defaultLearning = config?.defaults.learning ?? true;
-  const defaultLearningMode = config?.defaults.learning_mode ?? "always";
-  const defaultShowToolCalls = config?.defaults.show_tool_calls ?? true;
-  const defaultMarkdown = config?.defaults.markdown ?? true;
+  const defaultLearning = config?.defaults?.learning ?? true;
+  const defaultLearningMode = config?.defaults?.learning_mode ?? "always";
+  const defaultShowToolCalls = config?.defaults?.show_tool_calls ?? true;
+  const defaultMarkdown = config?.defaults?.markdown ?? true;
   const defaultCompressToolResults =
-    config?.defaults.compress_tool_results ?? false;
+    config?.defaults?.compress_tool_results ?? false;
   const globalMemoryBackend = config?.memory?.backend ?? "mem0";
   const knowledgeBaseNames = useMemo(
     () => Object.keys(config?.knowledge_bases || {}).sort(),
@@ -287,16 +339,17 @@ export function AgentEditor() {
     [knowledgeBaseNames],
   );
 
-  // Prepare checkbox items for delegation targets (all agents except current)
+  // Include this agent so fresh self subagents can be explicitly allowed.
   const delegateItems: CheckboxListItem[] = useMemo(
     () =>
-      agents
-        .filter((a) => a.id !== selectedAgentId)
-        .map((a) => ({
-          value: a.id,
-          label: a.display_name,
-          description: a.role,
-        })),
+      agents.map((a) => ({
+        value: a.id,
+        label:
+          a.id === selectedAgentId
+            ? `${a.display_name} (this agent)`
+            : a.display_name,
+        description: a.role,
+      })),
     [agents, selectedAgentId],
   );
 
@@ -563,6 +616,7 @@ export function AgentEditor() {
       icon={Bot}
       title="Agent Details"
       isDirty={isDirty}
+      isBusy={toolsLoading || skillsLoading}
       onSave={handleSave}
       onDelete={handleDelete}
       disableSave={isLoading}
@@ -735,10 +789,10 @@ export function AgentEditor() {
         />
       </FieldGroup>
 
-      {/* Delegate To */}
+      {/* Allowed subagents */}
       <FieldGroup
-        label="Delegate To"
-        helperText="Allow this agent to delegate tasks to other agents via tool calls"
+        label="Allowed subagents"
+        helperText="Run these agents with fresh context and wait for their results. Select this agent to allow fresh copies of itself."
       >
         <CheckboxListField
           name="delegate_to"
@@ -747,7 +801,7 @@ export function AgentEditor() {
           fieldName="delegate_to"
           onFieldChange={handleFieldChange}
           idPrefix="delegate"
-          emptyMessage="No other agents available to delegate to."
+          emptyMessage="No agents available."
           className="space-y-2 max-h-48 overflow-y-auto border rounded-lg p-2"
         />
       </FieldGroup>
@@ -813,7 +867,7 @@ export function AgentEditor() {
 
         <FieldGroup
           label="Requester-Private State"
-          helperText="Enable requester-local state for one shared agent definition. Private agents cannot participate in teams yet, including through delegation from shared team members."
+          helperText="Enable requester-local state for one shared agent definition. Private agents cannot join configured teams or transitive delegation, but explicitly tagged ad hoc teams can include them for that requester."
           htmlFor="private_enabled"
         >
           <div className="flex items-center gap-2">
@@ -1009,6 +1063,19 @@ export function AgentEditor() {
                     </label>
                   </div>
                 </FieldGroup>
+
+                <SchemaSection
+                  title="More private knowledge settings"
+                  definition="AgentPrivateKnowledgeConfig"
+                  value={privateKnowledge}
+                  path={["agents", selectedAgent.id, "private", "knowledge"]}
+                  exclude={PRIVATE_KNOWLEDGE_EDITOR_FIELDS}
+                  onFieldChange={(key, next) =>
+                    mutatePrivateKnowledge((current) =>
+                      setObjectKey(current, key, next),
+                    )
+                  }
+                />
               </>
             )}
           </>
@@ -1174,89 +1241,44 @@ export function AgentEditor() {
                           const isChecked = field.value.includes(tool.name);
                           const hasOverrides = toolHasOverrides(tool.name);
                           const isActive = activeToolName === tool.name;
-                          const hasSettings =
-                            (tool.agent_override_fields?.length ?? 0) > 0 ||
-                            (tool.config_fields?.length ?? 0) > 0;
-                          const showSettings = hasSettings || hasOverrides;
+                          const showSettings = toolHasSettings(
+                            tool,
+                            hasOverrides,
+                          );
 
                           return (
                             <>
-                              <div
-                                className={`flex items-center justify-between rounded-lg p-2 transition-colors ${
-                                  isActive && showSettings
-                                    ? "bg-blue-50 dark:bg-blue-500/10"
-                                    : "hover:bg-gray-50 dark:hover:bg-white/5"
-                                }`}
-                              >
-                                <div className="flex items-center space-x-3 sm:space-x-2">
-                                  <Checkbox
-                                    id={`configured-${tool.name}`}
-                                    checked={isChecked}
-                                    aria-label={
-                                      isChecked ? tool.display_name : undefined
-                                    }
-                                    onCheckedChange={(checked) => {
-                                      field.onChange(
-                                        updateSelectedTools(
-                                          field.value,
-                                          tool.name,
-                                          checked === true,
-                                        ),
-                                      );
-                                    }}
-                                    className="h-5 w-5 sm:h-4 sm:w-4"
-                                  />
-                                  {isChecked && showSettings ? (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setActiveToolName((prev) =>
-                                          prev === tool.name ? null : tool.name,
-                                        )
-                                      }
-                                      className="text-sm font-medium leading-none text-left"
-                                    >
-                                      {tool.display_name}
-                                    </button>
-                                  ) : (
-                                    <label
-                                      htmlFor={`configured-${tool.name}`}
-                                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer select-none"
-                                    >
-                                      {tool.display_name}
-                                    </label>
-                                  )}
-                                  {hasOverrides && (
-                                    <Badge
-                                      variant="secondary"
-                                      className="text-[10px] uppercase tracking-wide"
-                                    >
-                                      Customized
-                                    </Badge>
-                                  )}
-                                </div>
-                                {isChecked && showSettings && (
-                                  <Button
-                                    type="button"
-                                    variant={isActive ? "secondary" : "ghost"}
-                                    size="sm"
-                                    onClick={() =>
-                                      setActiveToolName((prev) =>
-                                        prev === tool.name ? null : tool.name,
-                                      )
-                                    }
-                                    className="h-8 px-2"
-                                  >
-                                    <Settings className="h-4 w-4 sm:mr-1" />
-                                    <span className="hidden sm:inline">
-                                      {hasOverrides ? "Edit" : "Settings"}
-                                    </span>
-                                  </Button>
-                                )}
-                              </div>
+                              <ToolSelectionRow
+                                tool={tool}
+                                sectionKind="configured"
+                                checkboxId={`configured-${tool.name}`}
+                                isChecked={isChecked}
+                                isActive={isActive}
+                                hasOverrides={hasOverrides}
+                                showSettings={showSettings}
+                                onCheckedChange={(checked) => {
+                                  field.onChange(
+                                    updateSelectedTools(
+                                      field.value,
+                                      tool.name,
+                                      checked,
+                                    ),
+                                  );
+                                }}
+                                onToggleSettings={() =>
+                                  setActiveToolName((prev) =>
+                                    prev === tool.name ? null : tool.name,
+                                  )
+                                }
+                              />
                               {isChecked && isActive && showSettings && (
                                 <ToolConfigPanel
-                                  agentId={selectedAgent.id}
+                                  target={{
+                                    kind: "agent",
+                                    agentId: selectedAgent.id,
+                                    lazyLoading:
+                                      tool.lazy_loading_supported === true,
+                                  }}
                                   toolName={tool.name}
                                   toolDisplayName={tool.display_name}
                                   overrideFields={
@@ -1304,89 +1326,44 @@ export function AgentEditor() {
                           const isChecked = field.value.includes(tool.name);
                           const hasOverrides = toolHasOverrides(tool.name);
                           const isActive = activeToolName === tool.name;
-                          const hasSettings =
-                            (tool.agent_override_fields?.length ?? 0) > 0 ||
-                            (tool.config_fields?.length ?? 0) > 0;
-                          const showSettings = hasSettings || hasOverrides;
+                          const showSettings = toolHasSettings(
+                            tool,
+                            hasOverrides,
+                          );
 
                           return (
                             <>
-                              <div
-                                className={`flex items-center justify-between rounded-lg p-2 transition-colors ${
-                                  isActive && showSettings
-                                    ? "bg-blue-50 dark:bg-blue-500/10"
-                                    : "hover:bg-gray-50 dark:hover:bg-white/5"
-                                }`}
-                              >
-                                <div className="flex items-center space-x-3 sm:space-x-2">
-                                  <Checkbox
-                                    id={`default-${tool.name}`}
-                                    checked={isChecked}
-                                    aria-label={
-                                      isChecked ? tool.display_name : undefined
-                                    }
-                                    onCheckedChange={(checked) => {
-                                      field.onChange(
-                                        updateSelectedTools(
-                                          field.value,
-                                          tool.name,
-                                          checked === true,
-                                        ),
-                                      );
-                                    }}
-                                    className="h-5 w-5 sm:h-4 sm:w-4"
-                                  />
-                                  {isChecked && showSettings ? (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setActiveToolName((prev) =>
-                                          prev === tool.name ? null : tool.name,
-                                        )
-                                      }
-                                      className="text-sm font-medium leading-none text-left"
-                                    >
-                                      {tool.display_name}
-                                    </button>
-                                  ) : (
-                                    <label
-                                      htmlFor={`default-${tool.name}`}
-                                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer select-none"
-                                    >
-                                      {tool.display_name}
-                                    </label>
-                                  )}
-                                  {hasOverrides && (
-                                    <Badge
-                                      variant="secondary"
-                                      className="text-[10px] uppercase tracking-wide"
-                                    >
-                                      Customized
-                                    </Badge>
-                                  )}
-                                </div>
-                                {isChecked && showSettings && (
-                                  <Button
-                                    type="button"
-                                    variant={isActive ? "secondary" : "ghost"}
-                                    size="sm"
-                                    onClick={() =>
-                                      setActiveToolName((prev) =>
-                                        prev === tool.name ? null : tool.name,
-                                      )
-                                    }
-                                    className="h-8 px-2"
-                                  >
-                                    <Settings className="h-4 w-4 sm:mr-1" />
-                                    <span className="hidden sm:inline">
-                                      {hasOverrides ? "Edit" : "Settings"}
-                                    </span>
-                                  </Button>
-                                )}
-                              </div>
+                              <ToolSelectionRow
+                                tool={tool}
+                                sectionKind="default"
+                                checkboxId={`default-${tool.name}`}
+                                isChecked={isChecked}
+                                isActive={isActive}
+                                hasOverrides={hasOverrides}
+                                showSettings={showSettings}
+                                onCheckedChange={(checked) => {
+                                  field.onChange(
+                                    updateSelectedTools(
+                                      field.value,
+                                      tool.name,
+                                      checked,
+                                    ),
+                                  );
+                                }}
+                                onToggleSettings={() =>
+                                  setActiveToolName((prev) =>
+                                    prev === tool.name ? null : tool.name,
+                                  )
+                                }
+                              />
                               {isChecked && isActive && showSettings && (
                                 <ToolConfigPanel
-                                  agentId={selectedAgent.id}
+                                  target={{
+                                    kind: "agent",
+                                    agentId: selectedAgent.id,
+                                    lazyLoading:
+                                      tool.lazy_loading_supported === true,
+                                  }}
                                   toolName={tool.name}
                                   toolDisplayName={tool.display_name}
                                   overrideFields={
@@ -1436,114 +1413,45 @@ export function AgentEditor() {
                             tool.dashboard_configuration_supported === false;
                           const hasOverrides = toolHasOverrides(tool.name);
                           const isActive = activeToolName === tool.name;
-                          const hasSettings =
-                            (tool.agent_override_fields?.length ?? 0) > 0 ||
-                            (tool.config_fields?.length ?? 0) > 0;
-                          const showSettings = hasSettings || hasOverrides;
+                          const showSettings = toolHasSettings(
+                            tool,
+                            hasOverrides,
+                          );
 
                           return (
                             <>
-                              <div
-                                className={`rounded-lg p-2 transition-colors ${
-                                  isActive && showSettings
-                                    ? "bg-blue-50 dark:bg-blue-500/10"
-                                    : "hover:bg-gray-50 dark:hover:bg-white/5"
-                                }`}
-                              >
-                                <div className="flex items-center justify-between">
-                                  <div className="flex items-center space-x-3 sm:space-x-2">
-                                    <Checkbox
-                                      id={`setup-${tool.name}`}
-                                      checked={isChecked}
-                                      aria-label={
-                                        isChecked
-                                          ? tool.display_name
-                                          : undefined
-                                      }
-                                      onCheckedChange={(checked) => {
-                                        field.onChange(
-                                          updateSelectedTools(
-                                            field.value,
-                                            tool.name,
-                                            checked === true,
-                                          ),
-                                        );
-                                      }}
-                                      className="h-5 w-5 sm:h-4 sm:w-4"
-                                    />
-                                    {isChecked && showSettings ? (
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          setActiveToolName((prev) =>
-                                            prev === tool.name
-                                              ? null
-                                              : tool.name,
-                                          )
-                                        }
-                                        className="text-sm font-medium leading-none text-left"
-                                      >
-                                        {tool.display_name}
-                                      </button>
-                                    ) : (
-                                      <label
-                                        htmlFor={`setup-${tool.name}`}
-                                        className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer select-none"
-                                      >
-                                        {tool.display_name}
-                                      </label>
-                                    )}
-                                    {hasOverrides && (
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-[10px] uppercase tracking-wide"
-                                      >
-                                        Customized
-                                      </Badge>
-                                    )}
-                                  </div>
-                                  <div className="flex items-center gap-2">
-                                    <Badge
-                                      variant="secondary"
-                                      className="text-xs"
-                                    >
-                                      Setup required
-                                    </Badge>
-                                    {isChecked && showSettings && (
-                                      <Button
-                                        type="button"
-                                        variant={
-                                          isActive ? "secondary" : "ghost"
-                                        }
-                                        size="sm"
-                                        onClick={() =>
-                                          setActiveToolName((prev) =>
-                                            prev === tool.name
-                                              ? null
-                                              : tool.name,
-                                          )
-                                        }
-                                        className="h-8 px-2"
-                                      >
-                                        <Settings className="h-4 w-4 sm:mr-1" />
-                                        <span className="hidden sm:inline">
-                                          {hasOverrides ? "Edit" : "Settings"}
-                                        </span>
-                                      </Button>
-                                    )}
-                                  </div>
-                                </div>
-                                {setupBlocked && (
-                                  <p className="pl-8 pt-1 text-xs text-muted-foreground">
-                                    This scope can use runtime env credentials,
-                                    but dashboard credential setup is only
-                                    supported for shared deployment credentials.
-                                  </p>
-                                )}
-                              </div>
+                              <ToolSelectionRow
+                                tool={tool}
+                                sectionKind="setupRequired"
+                                checkboxId={`setup-${tool.name}`}
+                                isChecked={isChecked}
+                                isActive={isActive}
+                                hasOverrides={hasOverrides}
+                                showSettings={showSettings}
+                                setupBlocked={setupBlocked}
+                                onCheckedChange={(checked) => {
+                                  field.onChange(
+                                    updateSelectedTools(
+                                      field.value,
+                                      tool.name,
+                                      checked,
+                                    ),
+                                  );
+                                }}
+                                onToggleSettings={() =>
+                                  setActiveToolName((prev) =>
+                                    prev === tool.name ? null : tool.name,
+                                  )
+                                }
+                              />
                               {isChecked && isActive && showSettings && (
                                 <ToolConfigPanel
-                                  agentId={selectedAgent.id}
+                                  target={{
+                                    kind: "agent",
+                                    agentId: selectedAgent.id,
+                                    lazyLoading:
+                                      tool.lazy_loading_supported === true,
+                                  }}
                                   toolName={tool.name}
                                   toolDisplayName={tool.display_name}
                                   overrideFields={
@@ -1783,7 +1691,7 @@ export function AgentEditor() {
         <FieldGroup
           label="Worker Tools"
           helperText={`Select which of this agent's tools to route through worker-scoped execution via the sandbox proxy${
-            config?.defaults.worker_tools != null
+            config?.defaults?.worker_tools != null
               ? ` (default: ${
                   config.defaults.worker_tools.length > 0
                     ? config.defaults.worker_tools.join(", ")
@@ -1799,15 +1707,15 @@ export function AgentEditor() {
               <div className="space-y-1 max-h-48 overflow-y-auto border rounded-lg p-2">
                 {effectiveTools.map((toolName) => {
                   const effective =
-                    field.value ?? config?.defaults.worker_tools ?? [];
+                    field.value ?? config?.defaults?.worker_tools ?? [];
                   const isChecked = effective.includes(toolName);
                   const isInherited =
                     field.value == null &&
-                    config?.defaults.worker_tools != null;
+                    config?.defaults?.worker_tools != null;
                   const toggle = () => {
                     // On first interaction when inheriting, seed from defaults
                     const current =
-                      field.value ?? config?.defaults.worker_tools ?? [];
+                      field.value ?? config?.defaults?.worker_tools ?? [];
                     const updated = isChecked
                       ? current.filter((t) => t !== toolName)
                       : [...current, toolName];
@@ -1860,7 +1768,7 @@ export function AgentEditor() {
               <Checkbox
                 id="allow_self_config"
                 checked={
-                  field.value ?? config?.defaults.allow_self_config ?? false
+                  field.value ?? config?.defaults?.allow_self_config ?? false
                 }
                 onCheckedChange={(checked) => {
                   const value = checked === true;
@@ -1882,6 +1790,7 @@ export function AgentEditor() {
       <HistoryContextSection
         control={control}
         resetKey={selectedAgentId}
+        compactionPath={["agents", selectedAgent.id, "compaction"]}
         defaults={config?.defaults}
         onFieldChange={(fieldName, value) =>
           handleFieldChange(
@@ -1892,24 +1801,24 @@ export function AgentEditor() {
         updateCompaction={updateCompaction}
         mutateCompaction={mutateCompaction}
         historyRunsHelperText={`Number of prior conversation runs to include as history context. Leave empty to use default${
-          config?.defaults.num_history_runs != null
+          config?.defaults?.num_history_runs != null
             ? ` (${config.defaults.num_history_runs})`
             : " (all)"
         }.`}
         historyMessagesHelperText={`Max messages from history (mutually exclusive with History Runs). Leave empty to use default${
-          config?.defaults.num_history_messages != null
+          config?.defaults?.num_history_messages != null
             ? ` (${config.defaults.num_history_messages})`
             : " (all)"
         }.`}
         maxToolCallsHelperText={`Max tool call messages replayed from history. Leave empty to use default${
-          config?.defaults.max_tool_calls_from_history != null
+          config?.defaults?.max_tool_calls_from_history != null
             ? ` (${config.defaults.max_tool_calls_from_history})`
             : " (no limit)"
         }.`}
         autoCompactionHelperText="Automatically compact older session history before a run when raw replay exceeds the hard context budget."
-        thresholdTokensHelperText="Soft replay budget in tokens. Crossing it records planning metadata; destructive compaction waits for the hard budget."
+        thresholdTokensHelperText="Soft replay budget in tokens. Crossing it records planning metadata; text compaction waits for the hard budget."
         compactionModelPlaceholder={
-          config?.defaults.compaction?.model ?? "Default: agent model"
+          config?.defaults?.compaction?.model ?? "Default: agent model"
         }
         numHistoryRunsError={numHistoryRunsError}
         numHistoryMessagesError={numHistoryMessagesError}
@@ -1923,6 +1832,21 @@ export function AgentEditor() {
           onChange: (value) =>
             handleFieldChange("compress_tool_results", value),
         }}
+      />
+
+      <SchemaSection
+        title="More settings"
+        definition="AgentConfig"
+        value={selectedAgent}
+        path={["agents", selectedAgent.id]}
+        exclude={
+          selectedAgent.private != null
+            ? PRIVATE_AGENT_EDITOR_FIELDS
+            : AGENT_EDITOR_FIELDS
+        }
+        onFieldChange={(key, next) =>
+          updateAgent(selectedAgent.id, { [key]: next } as Partial<Agent>)
+        }
       />
     </EditorPanel>
   );

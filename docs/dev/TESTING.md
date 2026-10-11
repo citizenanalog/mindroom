@@ -15,15 +15,20 @@ The frontend uses Vitest as the test runner with React Testing Library for compo
 - `src/components/AgentList/AgentList.test.tsx` - Tests for the AgentList component
 - `src/components/AgentEditor/AgentEditor.test.tsx` - Tests for the AgentEditor component
 - `src/components/ModelConfig/ModelConfig.test.tsx` - Tests for the ModelConfig component
-- `src/components/ToolConfig/ToolConfigDialog.test.tsx` - Tests for the ToolConfigDialog component
+- `src/components/SchemaForm/SchemaForm.test.tsx` - Tests for the schema-driven config form widgets
+- `src/components/Settings/Settings.test.tsx` - Tests for the Settings page
 - `src/components/Credentials/Credentials.test.tsx` - Tests for the Credentials component
 - `src/components/Knowledge/Knowledge.test.tsx` - Tests for the Knowledge component
 - `src/components/TeamEditor/TeamEditor.test.tsx` - Tests for the TeamEditor component
 - `src/components/VoiceConfig/VoiceConfig.test.tsx` - Tests for the VoiceConfig component
 - `src/components/Integrations/Integrations.test.tsx` - Tests for the Integrations component
-- `src/types/toolConfig.test.ts` - Tests for tool configuration types
+- `src/lib/configSchema.test.ts` - Tests for configuration JSON schema classification
+- `src/components/SchemaForm/realSchema.test.tsx` - Renders every schema-driven form from `src/test/fixtures/config-schema.json`, a snapshot of the backend configuration schema
 
-There are 28 frontend test files covering components, hooks, and utilities.
+The frontend test count changes frequently; use `rg --files frontend/src | rg '\.test\.tsx?$'` for the current inventory.
+
+The `generate-config-schema` pre-commit hook regenerates the schema snapshot whenever backend Python changes, and `tests/test_config_schema.py` fails if it is stale.
+Run `.venv/bin/python .github/scripts/generate_config_schema.py` to regenerate it by hand.
 
 ### Running Frontend Tests
 
@@ -31,7 +36,7 @@ There are 28 frontend test files covering components, hooks, and utilities.
 cd frontend
 
 # Run tests in watch mode (default vitest behavior)
-bun test
+bun run test
 
 # Run all tests once (no watch)
 bun run test:unit
@@ -42,9 +47,9 @@ bun run test:ui
 # Run tests with coverage
 bun run test:coverage
 
-# Run e2e tests
-bun run test:e2e
 ```
+
+The package currently has no tracked Gmail OAuth E2E test, so the stale `test:e2e` package script is not part of the supported workflow.
 
 ### Writing Frontend Tests
 
@@ -84,22 +89,20 @@ There are 145+ backend test files covering agents, authorization, commands, conf
 
 ```bash
 # From project root
-source .venv/bin/activate
-
-# Install test dependencies (if not already installed)
+# Install all dependencies in a fresh checkout or worktree
 uv sync --all-extras
 
 # Run all API tests
-python -m pytest tests/api/
+uv run --all-extras pytest tests/api/
 
 # Run with verbose output
-python -m pytest tests/api/ -v
+uv run --all-extras pytest tests/api/ -v
 
 # Run specific test file
-python -m pytest tests/api/test_api.py
+uv run --all-extras pytest tests/api/test_api.py
 
 # Run with coverage
-python -m pytest tests/api/ --cov=mindroom.api
+uv run --all-extras pytest tests/api/ --cov=mindroom.api
 ```
 
 ### Writing Backend Tests
@@ -132,21 +135,30 @@ In strict mode, async test functions require an explicit `@pytest.mark.asyncio` 
 ### Parallel Execution
 
 Tests run in parallel by default via `pytest-xdist` (`-n auto` in `addopts`).
-To run serially for debugging, pass `-n0`: `python -m pytest tests/ -n0`.
+To run serially for debugging, pass `-n0`: `uv run --all-extras pytest tests/ -n0`.
+
+### Temporary Files
+
+On Linux, the [pytest-shm](https://github.com/basnijholt/pytest-shm) plugin points the suite's temp root at the `/dev/shm` tmpfs when no temp root is exported and `/dev/shm` allows executables and has at least 4 GiB free (`shm_min_free_gib` in `pyproject.toml`).
+Most test time on a real disk is fsync from SQLite journals and atomic JSON stores, and tmpfs makes it free.
+Tests' own `tempfile` output then lands under pytest's base directory with their `tmp_path` directories, which peak at about 3 GiB during a full run.
+Each xdist worker deletes its base directory when its tests pass, so only failing workers' files stay in memory for inspection.
+Pass `-v` to see in the report header whether the plugin is active, and why not when it is off.
+Export `TMPDIR` or pass `-p no:shm` to run against a real disk instead.
 
 ### Timeouts and Durations
 
 Each test has a 60-second timeout (`--timeout 60` in `addopts`).
 The 20 slowest tests are reported at the end of every run (`--durations 20`).
 
-### Automatic Coverage
+### Coverage
 
-Coverage runs automatically with every test invocation (`--cov=mindroom` in `addopts`).
-Reports are generated in three formats: terminal summary, HTML (`htmlcov/`), and XML (`coverage.xml`).
+Normal test runs skip coverage instrumentation so the fast feedback path stays fast.
+Run `just test-backend-coverage` for core backend coverage or `just test-saas-backend-coverage` for SaaS backend coverage.
 
-## Running All Tests
+## Running Standard Test Suites
 
-Use the convenience script to run both frontend and backend tests:
+Use `just test-standard` or the convenience script to run the core Python, core frontend, SaaS backend, SaaS frontend, and SaaS frontend API-command suites:
 
 ```bash
 ./run-tests.sh

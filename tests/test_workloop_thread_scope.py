@@ -21,7 +21,13 @@ from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.constants import ROUTER_AGENT_NAME
-from mindroom.delivery_gateway import DeliveryGateway, DeliveryGatewayDeps, FinalDeliveryRequest, ResponseHookService
+from mindroom.delivery_gateway import (
+    DeliveryGateway,
+    DeliveryGatewayDeps,
+    FinalDeliveryRequest,
+    ResponseHookService,
+    ResponseIdentity,
+)
 from mindroom.hooks import (
     EVENT_MESSAGE_AFTER_RESPONSE,
     EVENT_MESSAGE_CANCELLED,
@@ -43,15 +49,23 @@ from mindroom.hooks.execution import emit, emit_collect
 from mindroom.hooks.registry import HookRegistryState
 from mindroom.logging_config import get_logger
 from mindroom.message_target import MessageTarget
-from mindroom.scheduling import ScheduledWorkflow
+from mindroom.response_sources import ResponseSources
+from mindroom.scheduling.tasks import ScheduledWorkflow
+from mindroom.session_ids import create_session_id
 from mindroom.tool_system.metadata import TOOL_METADATA, TOOL_REGISTRY, get_tool_by_name
 from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
 from tests.conftest import (
     bind_runtime_paths,
-    make_conversation_cache_mock,
-    make_event_cache_mock,
+    ignore_final_delivery_handoff,
+    make_conversation_reader_mock,
+    make_outbox_mock,
+    make_relation_lookup,
+    message_origin,
     runtime_paths_for,
     test_runtime_paths,
 )
@@ -92,6 +106,7 @@ def _plugin(name: str, callbacks: list[object]) -> object:
         {
             "name": name,
             "discovered_hooks": tuple(callbacks),
+            "discovered_automations": (),
             "entry_config": PluginEntryConfig(path=f"./plugins/{name}"),
             "plugin_order": 0,
         },
@@ -209,19 +224,22 @@ def _tool_context(
     thread_id: str | None = None,
     resolved_thread_id: str | None = "$thread_root",
 ) -> ToolRuntimeContext:
-    return ToolRuntimeContext(
+    return make_test_tool_runtime_context(
         agent_name="code",
-        room_id=room_id,
-        thread_id=thread_id,
-        resolved_thread_id=resolved_thread_id,
+        target=MessageTarget(
+            room_id=room_id,
+            source_thread_id=thread_id,
+            resolved_thread_id=resolved_thread_id,
+            reply_to_event_id=None,
+            session_id=create_session_id(room_id, resolved_thread_id),
+        ),
         requester_id="@user:localhost",
         client=AsyncMock(),
         config=loaded.config,
         runtime_paths=loaded.runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=make_conversation_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         room=MagicMock(),
-        reply_to_event_id=None,
         storage_path=None,
     )
 
@@ -246,15 +264,12 @@ def _message_envelope(
         target = target.with_thread_root(resolved_thread_id)
     return MessageEnvelope(
         source_event_id="$event",
-        room_id=room_id,
         target=target,
-        requester_id="@user:localhost",
-        sender_id="@user:localhost",
         body=body,
         attachment_ids=(),
         mentioned_agents=(),
         agent_name=agent_name,
-        source_kind="message",
+        origin=message_origin(sender_id="@user:localhost", requester_id="@user:localhost", source_kind="message"),
     )
 
 
@@ -745,13 +760,14 @@ async def test_late_after_response_cancellation_still_runs_workloop_cleanup(
             redact_message_event=AsyncMock(return_value=True),
             resolver=MagicMock(),
             response_hooks=ResponseHookService(hook_context=hook_context),
+            outbox=make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
     parsed = MagicMock()
     parsed.formatted_text = "visible response"
-    parsed.option_map = None
-    parsed.options_list = None
+    parsed.interactive_metadata = None
 
     delivery_result = None
 
@@ -762,9 +778,12 @@ async def test_late_after_response_cancellation_still_runs_workloop_cleanup(
                 target=response_envelope.target,
                 existing_event_id=None,
                 response_text="visible response",
-                response_kind="ai",
-                response_envelope=response_envelope,
-                correlation_id="corr-late-workloop-cleanup",
+                identity=ResponseIdentity(
+                    response_kind="ai",
+                    response_envelope=response_envelope,
+                    correlation_id="corr-late-workloop-cleanup",
+                    sources=ResponseSources((response_envelope.source_event_id,), (response_envelope.source_event_id,)),
+                ),
                 tool_trace=None,
                 extra_content=None,
             ),

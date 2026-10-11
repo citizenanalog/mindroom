@@ -77,7 +77,7 @@ def test_issue_opaque_oauth_state_keeps_concurrent_process_writes(tmp_path: Path
     try:
         results: list[tuple[int | None, str, str]] = []
         for process in processes:
-            stdout, stderr = process.communicate(timeout=10)
+            stdout, stderr = process.communicate(timeout=30)
             results.append((process.returncode, stdout, stderr))
 
         assert {returncode for returncode, _stdout, _stderr in results} == {0}, results
@@ -99,6 +99,22 @@ def test_issue_opaque_oauth_state_keeps_concurrent_process_writes(tmp_path: Path
 
     stored = json.loads(_state_file(storage_root).read_text(encoding="utf-8"))
     assert tokens <= set(stored["states"])
+
+
+def test_issue_opaque_oauth_state_propagates_directory_fsync_failure(tmp_path: Path) -> None:
+    """A reconnect token cannot be returned before its directory entry is durable."""
+    runtime_paths = resolve_primary_runtime_paths(storage_path=tmp_path / "storage", process_env={})
+
+    with (
+        patch("mindroom.durable_write.fsync_directory_durable", side_effect=OSError("fsync failed")),
+        pytest.raises(OSError, match="fsync failed"),
+    ):
+        issue_opaque_oauth_state(
+            runtime_paths,
+            kind="test_state",
+            ttl_seconds=60,
+            data={"value": "stored"},
+        )
 
 
 def test_corrupt_state_file_logs_warning_and_does_not_overwrite(tmp_path: Path) -> None:

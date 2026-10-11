@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -66,6 +67,7 @@ export function HomeAssistantIntegration({
   const [instanceUrl, setInstanceUrl] = useState("");
   const [clientId, setClientId] = useState("");
   const [longLivedToken, setLongLivedToken] = useState("");
+  const [allowPrivateUrl, setAllowPrivateUrl] = useState(false);
   const [activeTab, setActiveTab] = useState("oauth");
   const { toast } = useToast();
   const callbackUrl = getHomeAssistantCallbackUrl();
@@ -128,6 +130,7 @@ export function HomeAssistantIntegration({
           body: JSON.stringify({
             instance_url: instanceUrl,
             client_id: clientId,
+            allow_private_url: allowPrivateUrl,
           }),
         },
       );
@@ -227,6 +230,7 @@ export function HomeAssistantIntegration({
           body: JSON.stringify({
             instance_url: instanceUrl,
             long_lived_token: longLivedToken,
+            allow_private_url: allowPrivateUrl,
           }),
         },
       );
@@ -246,6 +250,7 @@ export function HomeAssistantIntegration({
       // Clear form
       setInstanceUrl("");
       setLongLivedToken("");
+      setAllowPrivateUrl(false);
 
       // Notify parent component of success
       if (onSuccess) {
@@ -433,7 +438,7 @@ export function HomeAssistantIntegration({
             <CardHeader>
               <CardTitle>OAuth Authentication</CardTitle>
               <CardDescription>
-                Secure authentication using Home Assistant's OAuth flow
+                Secure authentication using Home Assistant&apos;s OAuth flow
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -443,16 +448,13 @@ export function HomeAssistantIntegration({
                   <strong>Prerequisites:</strong>
                   <ol className="mt-2 ml-4 list-decimal space-y-1 text-sm">
                     <li>
-                      Create an OAuth application in Home Assistant:
-                      <br />
-                      Go to Profile → Security → Long-Lived Access Tokens → Add
-                      OAuth Application
+                      Home Assistant needs no OAuth application registration.
                     </li>
                     <li>
-                      Set the redirect URI to:{" "}
+                      Enter this dashboard&apos;s URL as the Client ID; it must
+                      use the same host and port as the redirect URI:{" "}
                       <code className="text-xs">{callbackUrl}</code>
                     </li>
-                    <li>Copy the Client ID from the created application</li>
                   </ol>
                 </AlertDescription>
               </Alert>
@@ -472,6 +474,25 @@ export function HomeAssistantIntegration({
                 </p>
               </div>
 
+              <div className="flex items-start gap-3 rounded-md border p-3">
+                <Checkbox
+                  id="allow-private-url-oauth"
+                  checked={allowPrivateUrl}
+                  onCheckedChange={(checked) =>
+                    setAllowPrivateUrl(checked === true)
+                  }
+                />
+                <div className="space-y-1">
+                  <Label htmlFor="allow-private-url-oauth">
+                    Allow private or local URL
+                  </Label>
+                  <p className="text-xs text-gray-500">
+                    Enable only for a trusted self-hosted Home Assistant
+                    instance.
+                  </p>
+                </div>
+              </div>
+
               <div className="space-y-2">
                 <Label htmlFor="client-id">OAuth Client ID</Label>
                 <Input
@@ -482,7 +503,8 @@ export function HomeAssistantIntegration({
                   onChange={(e) => setClientId(e.target.value)}
                 />
                 <p className="text-xs text-gray-500">
-                  The Client ID from your Home Assistant OAuth application
+                  This dashboard&apos;s URL, such as
+                  https://mindroom.example.com
                 </p>
               </div>
 
@@ -520,9 +542,9 @@ export function HomeAssistantIntegration({
                       Go to your Home Assistant profile (click your username at
                       the bottom left)
                     </li>
-                    <li>Scroll down to "Long-Lived Access Tokens"</li>
-                    <li>Click "Create Token"</li>
-                    <li>Give it a name (e.g., "MindRoom")</li>
+                    <li>Scroll down to &quot;Long-Lived Access Tokens&quot;</li>
+                    <li>Click &quot;Create Token&quot;</li>
+                    <li>Give it a name (e.g., &quot;MindRoom&quot;)</li>
                     <li>Copy the generated token</li>
                   </ol>
                 </AlertDescription>
@@ -541,6 +563,25 @@ export function HomeAssistantIntegration({
                   The URL of your Home Assistant instance (including port if
                   needed)
                 </p>
+              </div>
+
+              <div className="flex items-start gap-3 rounded-md border p-3">
+                <Checkbox
+                  id="allow-private-url-token"
+                  checked={allowPrivateUrl}
+                  onCheckedChange={(checked) =>
+                    setAllowPrivateUrl(checked === true)
+                  }
+                />
+                <div className="space-y-1">
+                  <Label htmlFor="allow-private-url-token">
+                    Allow private or local URL
+                  </Label>
+                  <p className="text-xs text-gray-500">
+                    Enable only for a trusted self-hosted Home Assistant
+                    instance.
+                  </p>
+                </div>
               </div>
 
               <div className="space-y-2">

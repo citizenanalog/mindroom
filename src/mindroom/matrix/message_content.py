@@ -1,36 +1,64 @@
-"""Centralized message content extraction for Matrix sidecar-backed messages."""
+"""Centralized message content extraction for Matrix sidecar-backed messages.
+
+A message too large for one Matrix event carries a truncated preview in its
+content and its real text in an attached file. This module resolves that file.
+
+It keeps no durable memory of what it resolved, and must not acquire one. The
+resolved text belongs to the visible revision it is the body of, and that is
+stored once, in ``visible_messages.content_json``: an edit, a redaction, or a
+membership epoch advance all replace or remove the row, so the resolution is
+invalidated by the projection already working. A second durable copy keyed by
+MXC reference -- which is what this module used to keep in the event cache --
+needs its own invalidation and its own redaction cleanup to stay honest, and a
+plaintext store that misses a redaction serves deleted content.
+"""
 
 from __future__ import annotations
 
 import json
-import time
-from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 import nio
-from nio import crypto
 
 from mindroom.logging_config import get_logger
+from mindroom.matrix.media import decrypt_media_bytes, download_mxc_bytes
+from mindroom.matrix.sidecar_content import sidecar_content_to_resolve, sidecar_mxc_url
 from mindroom.matrix.visible_body import has_trusted_stream_body_metadata, visible_body_from_content
 
 if TYPE_CHECKING:
     from collections.abc import Collection
 
-    from mindroom.matrix.cache import ConversationEventCache
-
 logger = get_logger(__name__)
 
-# MXC download cache - stores (content, timestamp) tuples keyed by MXC URL.
-_mxc_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
-_cache_ttl = 3600.0  # 1 hour TTL
-_mxc_cache_max_entries = 500
+# Every `m.room.message` nio could type, which is exactly every one carrying a
+# `body`. `RoomMessageFormatted`, `RoomMessageMedia`, and `RoomEncryptedMedia`
+# are the three direct children of `nio.RoomMessage` that declare one, and
+# `RoomMessageUnknown` is the fourth and declares none.
+#
+# Written as a union only because nio gives encrypted and unencrypted media two
+# sibling bases instead of one, so no single class spans them. The rule that
+# decides membership at runtime is deliberately not this list:
+# `client_visible_messages.is_visible_room_message` asks the base class and
+# names the one exclusion, because four separate curated lists of `RoomMessage`
+# children have now each dropped a msgtype after shipping.
+type VisibleRoomMessage = nio.RoomMessageFormatted | nio.RoomMessageMedia | nio.RoomEncryptedMedia
+
+_MXC_TEXT_MAX_BYTES = 2 * 1024 * 1024
+_MAX_SIDECAR_HOPS = 8
 
 
 def _extract_large_message_v2_content(payload_json: str) -> dict[str, Any] | None:
     """Extract canonical content dict from a v2 large-message sidecar JSON payload."""
     try:
         payload = json.loads(payload_json)
-    except json.JSONDecodeError:
+        # A ``\ud800`` escape parses into an unpaired surrogate, which no model request can encode.
+        json.dumps(payload, ensure_ascii=False).encode()
+    except (RecursionError, ValueError):
+        # Whoever posted the message chose these bytes. Besides malformed JSON
+        # (a ``ValueError``), well-formed JSON nested past the recursion limit,
+        # holding an integer over the digit limit, or holding an unpaired
+        # surrogate (a ``UnicodeEncodeError``) raises too, and must leave the
+        # sidecar unresolved rather than fail the read.
         return None
     if not isinstance(payload, dict):
         return None
@@ -50,118 +78,84 @@ def is_v2_sidecar_text_preview(event_source: dict[str, Any]) -> bool:
     if content.get("msgtype") != "m.file":
         return False
 
-    long_text_meta = content.get("io.mindroom.long_text")
-    if not isinstance(long_text_meta, dict):
-        return False
-    if long_text_meta.get("version") != 2 or long_text_meta.get("encoding") != "matrix_event_content_json":
-        return False
-    return _sidecar_mxc_url(content) is not None
+    return sidecar_mxc_url(content) is not None
 
 
-def _sidecar_content_for_resolution(content: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the content dict that owns the long-text sidecar metadata."""
-    if "io.mindroom.long_text" in content:
-        return content
+def _with_event_relation(
+    resolved_content: dict[str, Any],
+    event_content: dict[str, Any],
+) -> dict[str, Any]:
+    """Return hydrated content that still sits where the event sits.
 
-    new_content = content.get("m.new_content")
-    if isinstance(new_content, dict) and "io.mindroom.long_text" in new_content:
-        return new_content
+    A sidecar carries the text that did not fit in the event, and nothing else.
+    ``m.relates_to`` is the whole of an event's position in the relation graph --
+    thread, edit, reply, reaction and reference are all read out of it -- and
+    that position is a property of the event the server stored, not of a file
+    the event points at. Letting a downloaded payload restate it would hand
+    whoever uploaded the file the choice of which conversation the message
+    joins, and would leave the journal, which records the event's relation, at
+    odds with the turn, which reads the payload's.
 
-    return None
+    So the event's relation is restored over whatever the payload named,
+    including when the event has none. On the honest path the two already agree,
+    because a large message uploads its own outer content.
+    """
+    relation = event_content.get("m.relates_to")
+    if relation is None:
+        resolved_content.pop("m.relates_to", None)
+    else:
+        resolved_content["m.relates_to"] = relation
+    return resolved_content
 
 
-def _sidecar_mxc_url(content: dict[str, Any]) -> str | None:
-    """Return the MXC URL referenced by one sidecar-backed content dict."""
-    url = content.get("url")
-    if isinstance(url, str):
-        return url
-
-    file_info = content.get("file")
-    if not isinstance(file_info, dict):
-        return None
-
-    file_url = file_info.get("url")
-    return file_url if isinstance(file_url, str) else None
+async def _resolve_event_content(
+    event_source: dict[str, Any],
+    client: nio.AsyncClient | None,
+) -> tuple[dict[str, Any], bool]:
+    """Return one event's canonical content plus whether resolving it changed anything."""
+    preview_content = _normalized_content_dict(event_source.get("content", {}))
+    resolved_content = await _resolve_canonical_content(preview_content, client)
+    if resolved_content is preview_content:
+        return preview_content, False
+    return _with_event_relation(resolved_content, preview_content), True
 
 
-async def _download_mxc_text(  # noqa: PLR0911, PLR0912, PLR0915, C901
+async def _download_mxc_text(
     client: nio.AsyncClient,
     mxc_url: str,
     file_info: dict[str, Any] | None = None,
-    *,
-    event_cache: ConversationEventCache | None = None,
-    room_id: str | None = None,
 ) -> str | None:
-    """Download text content from an MXC URL with caching.
+    """Download the text content behind one MXC reference.
 
     Args:
         client: Matrix client
         mxc_url: The MXC URL to download from
         file_info: Optional encryption info for E2EE rooms
-        event_cache: Optional durable event cache used for restart-safe MXC text reuse
-        room_id: Room scope for event-cache locking when a durable MXC cache is available
+
     Returns:
         The downloaded text content, or None if download failed
 
     """
-    # Check cache first
-    current_time = time.time()
-    if mxc_url in _mxc_cache:
-        content, timestamp = _mxc_cache[mxc_url]
-        if current_time - timestamp < _cache_ttl:
-            _mxc_cache.move_to_end(mxc_url)
-            logger.debug("mxc_cache_hit", mxc_url=mxc_url)
-            return content
-        # Expired, remove from cache
-        del _mxc_cache[mxc_url]
-
-    if event_cache is not None and room_id is not None:
-        try:
-            cached_text = await event_cache.get_mxc_text(room_id, mxc_url)
-        except Exception:
-            logger.exception("Failed to read durable MXC text cache")
-        else:
-            if cached_text is not None:
-                _mxc_cache[mxc_url] = (cached_text, current_time)
-                _mxc_cache.move_to_end(mxc_url)
-                _clean_expired_cache()
-                logger.debug("mxc_text_cache_hit", mxc_url=mxc_url, room_id=room_id)
-                return cached_text
-
     try:
-        # Parse MXC URL
-        if not mxc_url.startswith("mxc://"):
-            logger.error("invalid_mxc_url", mxc_url=mxc_url)
-            return None
-
-        # Validate the MXC URL structure before issuing the download.
-        parts = mxc_url[6:].split("/", 1)
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            logger.error("invalid_mxc_url_format", mxc_url=mxc_url)
-            return None
-
-        response = await client.download(mxc=mxc_url)
-
-        if not isinstance(response, nio.DownloadResponse):
-            logger.error("mxc_download_failed", mxc_url=mxc_url, error=str(response))
+        body = await download_mxc_bytes(client, mxc_url, max_bytes=_MXC_TEXT_MAX_BYTES)
+        if body is None:
             return None
 
         # Handle encryption if needed
         if file_info and "key" in file_info:
             # Decrypt the content
             try:
-                decrypted = crypto.attachments.decrypt_attachment(
-                    response.body,
-                    file_info["key"],
-                    file_info["hashes"]["sha256"],
-                    file_info["iv"],
+                text_bytes = decrypt_media_bytes(
+                    body,
+                    key=file_info["key"]["k"],
+                    sha256=file_info["hashes"]["sha256"],
+                    iv=file_info["iv"],
                 )
-                text_bytes = decrypted
             except Exception:
                 logger.exception("Failed to decrypt attachment")
                 return None
         else:
-            text_bytes = response.body
+            text_bytes = body
 
         # Decode to text
         try:
@@ -169,19 +163,6 @@ async def _download_mxc_text(  # noqa: PLR0911, PLR0912, PLR0915, C901
         except UnicodeDecodeError:
             logger.exception("Downloaded content is not valid UTF-8 text")
             return None
-        # Cache the result
-        _mxc_cache[mxc_url] = (decoded_text, time.time())
-        _mxc_cache.move_to_end(mxc_url)
-        logger.debug("mxc_content_cached", mxc_url=mxc_url)
-        if event_cache is not None and room_id is not None:
-            try:
-                await event_cache.store_mxc_text(room_id, mxc_url, decoded_text)
-            except Exception:
-                logger.exception("Failed to persist durable MXC text cache")
-
-        if len(_mxc_cache) > _mxc_cache_max_entries:
-            _clean_expired_cache()
-
     except Exception:
         logger.exception("Error downloading MXC content")
         return None
@@ -190,11 +171,9 @@ async def _download_mxc_text(  # noqa: PLR0911, PLR0912, PLR0915, C901
 
 
 async def extract_and_resolve_message(
-    event: nio.RoomMessageText | nio.RoomMessageNotice,
+    event: VisibleRoomMessage,
     client: nio.AsyncClient | None = None,
     *,
-    event_cache: ConversationEventCache | None = None,
-    room_id: str | None = None,
     trusted_sender_ids: Collection[str] = (),
 ) -> dict[str, Any]:
     """Extract message data and resolve large message content if needed.
@@ -205,8 +184,6 @@ async def extract_and_resolve_message(
     Args:
         event: The Matrix event to extract data from
         client: Optional Matrix client for downloading attachments
-        event_cache: Optional durable event cache used for restart-safe sidecar reuse
-        room_id: Room scope for durable sidecar cache reads and writes
         trusted_sender_ids: Exact trusted internal sender IDs allowed to override visible body
 
     Returns:
@@ -215,14 +192,7 @@ async def extract_and_resolve_message(
         the full text from the attachment.
 
     """
-    # Extract basic message data
-    preview_content = _normalized_content_dict(event.source.get("content", {}))
-    resolved_content = await _resolve_canonical_content(
-        preview_content,
-        client,
-        event_cache=event_cache,
-        room_id=room_id,
-    )
+    resolved_content, _ = await _resolve_event_content(event.source, client)
     resolved_body = visible_body_from_content(
         resolved_content,
         event.body,
@@ -256,18 +226,10 @@ async def extract_edit_body(
     event_source: dict[str, Any],
     client: nio.AsyncClient | None = None,
     *,
-    event_cache: ConversationEventCache | None = None,
-    room_id: str | None = None,
     trusted_sender_ids: Collection[str] = (),
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Extract body/content from an edit event's ``m.new_content`` payload."""
-    content = _normalized_content_dict(event_source.get("content", {}))
-    resolved_content = await _resolve_canonical_content(
-        content,
-        client,
-        event_cache=event_cache,
-        room_id=room_id,
-    )
+    resolved_content, _ = await _resolve_event_content(event_source, client)
     new_content = _normalized_content_dict(resolved_content.get("m.new_content"))
     body = visible_body_from_content(
         new_content,
@@ -285,19 +247,10 @@ async def extract_edit_body(
 async def resolve_event_source_content(
     event_source: dict[str, Any],
     client: nio.AsyncClient | None = None,
-    *,
-    event_cache: ConversationEventCache | None = None,
-    room_id: str | None = None,
 ) -> dict[str, Any]:
     """Return an event source with canonical v2 sidecar content hydrated when available."""
-    preview_content = _normalized_content_dict(event_source.get("content", {}))
-    resolved_content = await _resolve_canonical_content(
-        preview_content,
-        client,
-        event_cache=event_cache,
-        room_id=room_id,
-    )
-    if resolved_content is preview_content:
+    resolved_content, content_changed = await _resolve_event_content(event_source, client)
+    if not content_changed:
         return event_source
 
     resolved_event_source = {key: value for key, value in event_source.items() if isinstance(key, str)}
@@ -308,52 +261,29 @@ async def resolve_event_source_content(
 async def _resolve_canonical_content(
     content: dict[str, Any],
     client: nio.AsyncClient | None,
-    *,
-    event_cache: ConversationEventCache | None,
-    room_id: str | None,
 ) -> dict[str, Any]:
-    """Hydrate canonical event content from a v2 JSON sidecar when available."""
-    sidecar_content = _sidecar_content_for_resolution(content)
-    if client is None or sidecar_content is None:
+    """Follow bounded v2 sidecar chains, retaining unresolved content on failure."""
+    if client is None:
         return content
-
-    long_text_meta = sidecar_content.get("io.mindroom.long_text")
-    long_text_version = long_text_meta.get("version") if isinstance(long_text_meta, dict) else None
-    mxc_url = _sidecar_mxc_url(sidecar_content) if long_text_version == 2 else None
-    if mxc_url is None:
-        return content
-
-    full_text = await _download_mxc_text(
-        client,
-        mxc_url,
-        sidecar_content.get("file") if isinstance(sidecar_content.get("file"), dict) else None,
-        event_cache=event_cache,
-        room_id=room_id,
-    )
-    if full_text is None:
-        return content
-
-    resolved_content = _extract_large_message_v2_content(full_text)
-    if resolved_content is None:
-        logger.warning("Invalid large-message v2 payload JSON, returning preview content")
-        return content
-
-    return resolved_content
-
-
-def _clean_expired_cache() -> None:
-    """Remove expired entries, then evict oldest live entries until within the LRU bound."""
-    current_time = time.time()
-    expired_keys = [key for key, (_, timestamp) in _mxc_cache.items() if current_time - timestamp >= _cache_ttl]
-    for key in expired_keys:
-        del _mxc_cache[key]
-    evicted_entries = 0
-    while len(_mxc_cache) > _mxc_cache_max_entries:
-        _mxc_cache.popitem(last=False)
-        evicted_entries += 1
-    if expired_keys or evicted_entries:
-        logger.debug(
-            "mxc_cache_cleaned",
-            expired_entries=len(expired_keys),
-            evicted_entries=evicted_entries,
+    visited: set[str] = set()
+    for _ in range(_MAX_SIDECAR_HOPS):
+        sidecar_content = sidecar_content_to_resolve(content)
+        if sidecar_content is None:
+            break
+        mxc_url = sidecar_mxc_url(sidecar_content)
+        if mxc_url is None or mxc_url in visited:
+            break
+        visited.add(mxc_url)
+        full_text = await _download_mxc_text(
+            client,
+            mxc_url,
+            sidecar_content.get("file") if isinstance(sidecar_content.get("file"), dict) else None,
         )
+        if full_text is None:
+            break
+        resolved_content = _extract_large_message_v2_content(full_text)
+        if resolved_content is None:
+            logger.warning("Invalid large-message v2 payload JSON, returning preview content")
+            break
+        content = resolved_content
+    return content

@@ -6,19 +6,21 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 
 from mindroom.logging_config import get_logger
-from mindroom.tool_system.dependencies import install_command_for_current_python
-from mindroom.tool_system.metadata import (
+from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolStatus,
-    register_tool_with_metadata,
 )
+from mindroom.tool_system.dependencies import install_command_for_current_python
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     import logging
     from collections.abc import Callable
+    from pathlib import Path
 
     from agno.tools.python import PythonTools
 
@@ -64,9 +66,12 @@ def _python_tools_runtime() -> tuple[Any, Any, Any, Any]:
     display_name="Python Tools",
     description="Execute Python code, manage files, and install packages",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.UNCONFINED,
+    executes_code=True,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.WORKER,
+    consumes_workspace_paths=True,
     icon="SiPython",
     icon_color="text-blue-500",
     config_fields=[
@@ -92,13 +97,6 @@ def _python_tools_runtime() -> tuple[Any, Any, Any, Any]:
             required=False,
             default=None,
         ),
-        ConfigField(
-            name="restrict_to_base_dir",
-            label="Restrict To Base Dir",
-            type="boolean",
-            required=False,
-            default=True,
-        ),
     ],
     dependencies=["agno"],
     docs_url="https://docs.agno.com/tools/toolkits/local/python",
@@ -118,6 +116,22 @@ def python_tools() -> type[PythonTools]:
 
     class MindRoomPythonTools(python_tools_class):
         """MindRoom wrapper around Agno's Python tool implementation."""
+
+        def __init__(
+            self,
+            base_dir: Path | None = None,
+            safe_globals: dict | None = None,
+            safe_locals: dict | None = None,
+            **kwargs: object,
+        ) -> None:
+            # Arbitrary code execution cannot be confined in-process, so the file helpers are not either.
+            super().__init__(
+                base_dir=base_dir,
+                safe_globals=safe_globals,
+                safe_locals=safe_locals,
+                restrict_to_base_dir=False,
+                **kwargs,
+            )
 
         def pip_install_package(self, package_name: str) -> str:
             """Install a package into the current interpreter environment."""

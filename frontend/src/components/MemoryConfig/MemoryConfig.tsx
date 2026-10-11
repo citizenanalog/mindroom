@@ -13,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useConfigStore } from "@/store/configStore";
+import { SchemaSection } from "@/components/SchemaForm";
 
 const EMBEDDER_PROVIDERS = [
   { value: "openai", label: "OpenAI" },
@@ -46,6 +47,22 @@ const MODEL_PLACEHOLDERS: Record<string, string> = {
 
 type MemorySettings = MindRoomConfig["memory"];
 
+/** MemoryConfig keys this page renders by hand; More settings shows the rest. */
+const MEMORY_EDITOR_FIELDS = [
+  "backend",
+  "team_reads_member_memory",
+  "embedder",
+  "file",
+  "search",
+  "auto_flush",
+] as const;
+
+const EMBEDDER_EDITOR_FIELDS = [
+  "model",
+  "credentials_service",
+  "host",
+] as const;
+
 const DEFAULT_MEMORY_SETTINGS: MemorySettings = {
   backend: "mem0",
   team_reads_member_memory: false,
@@ -59,6 +76,12 @@ const DEFAULT_MEMORY_SETTINGS: MemorySettings = {
   file: {
     path: "",
     max_entrypoint_lines: 200,
+    max_entrypoint_tokens: 50000,
+  },
+  search: {
+    mode: "keyword",
+    include: ["memory/**/*.md"],
+    include_entrypoint: false,
   },
   auto_flush: {
     enabled: false,
@@ -104,6 +127,10 @@ function normalizeMemorySettings(
       ...DEFAULT_MEMORY_SETTINGS.file,
       ...(memory?.file || {}),
     },
+    search: {
+      ...DEFAULT_MEMORY_SETTINGS.search,
+      ...(memory?.search || {}),
+    },
     auto_flush: {
       ...DEFAULT_MEMORY_SETTINGS.auto_flush,
       ...(memory?.auto_flush || {}),
@@ -138,6 +165,13 @@ function parseBoolean(value: string): boolean {
   return value === "true";
 }
 
+function parseIncludePatterns(value: string): string[] {
+  return value
+    .split(",")
+    .map((pattern) => pattern.trim())
+    .filter((pattern) => pattern.length > 0);
+}
+
 function providerHelperText(provider: string): string {
   if (provider === "ollama") {
     return "Local embeddings using Ollama";
@@ -165,8 +199,14 @@ function defaultEmbedderConfig(
 }
 
 export function MemoryConfig() {
-  const { config, updateMemoryConfig, saveConfig, isDirty, isLoading } =
-    useConfigStore();
+  const {
+    config,
+    updateMemoryConfig,
+    updateConfigValue,
+    saveConfig,
+    isDirty,
+    isLoading,
+  } = useConfigStore();
   const [localConfig, setLocalConfig] = useState<MemorySettings>(() =>
     normalizeMemorySettings(config?.memory),
   );
@@ -221,12 +261,59 @@ export function MemoryConfig() {
     });
   };
 
+  const handleCredentialsServiceChange = (credentialsService: string) => {
+    const config = { ...localConfig.embedder.config };
+    const normalizedService = credentialsService.trim();
+    if (normalizedService) {
+      config.credentials_service = normalizedService;
+    } else {
+      delete config.credentials_service;
+    }
+    applyMemoryConfig({
+      ...localConfig,
+      embedder: {
+        ...localConfig.embedder,
+        config,
+      },
+    });
+  };
+
   const handleFilePathChange = (path: string) => {
     applyMemoryConfig({
       ...localConfig,
       file: {
         ...localConfig.file,
         path,
+      },
+    });
+  };
+
+  const handleSearchModeChange = (mode: "keyword" | "semantic") => {
+    applyMemoryConfig({
+      ...localConfig,
+      search: {
+        ...localConfig.search,
+        mode,
+      },
+    });
+  };
+
+  const handleSearchIncludeChange = (value: string) => {
+    applyMemoryConfig({
+      ...localConfig,
+      search: {
+        ...localConfig.search,
+        include: parseIncludePatterns(value),
+      },
+    });
+  };
+
+  const handleIncludeEntrypointChange = (include_entrypoint: boolean) => {
+    applyMemoryConfig({
+      ...localConfig,
+      search: {
+        ...localConfig.search,
+        include_entrypoint,
       },
     });
   };
@@ -421,6 +508,23 @@ export function MemoryConfig() {
             />
           </FieldGroup>
 
+          {localConfig.embedder.provider === "openai" && (
+            <FieldGroup
+              label="Credential Service"
+              helperText="Bind this embedder to a credential service. Leave empty for the legacy embedder-to-openai fallback."
+              htmlFor="credentials-service"
+            >
+              <Input
+                id="credentials-service"
+                type="text"
+                value={localConfig.embedder.config.credentials_service || ""}
+                onChange={(e) => handleCredentialsServiceChange(e.target.value)}
+                placeholder="embedder"
+                className="transition-colors hover:border-ring focus:border-ring"
+              />
+            </FieldGroup>
+          )}
+
           {shouldShowHostField(localConfig.embedder.provider) && (
             <FieldGroup
               label={
@@ -450,6 +554,18 @@ export function MemoryConfig() {
               />
             </FieldGroup>
           )}
+
+          <SchemaSection
+            title="More embedder settings"
+            definition="EmbedderConfig"
+            value={config?.memory?.embedder?.config}
+            path={["memory", "embedder", "config"]}
+            exclude={EMBEDDER_EDITOR_FIELDS}
+            // Edit the authored config directly so untouched defaults stay unwritten.
+            onFieldChange={(key, next) =>
+              updateConfigValue(["memory", "embedder", "config", key], next)
+            }
+          />
 
           {localConfig.backend === "file" && (
             <>
@@ -489,6 +605,97 @@ export function MemoryConfig() {
                   }
                   className="transition-colors hover:border-ring focus:border-ring"
                 />
+              </FieldGroup>
+
+              <FieldGroup
+                label="Entrypoint Max Tokens"
+                helperText="Maximum estimated tokens (characters / 4) of whole lines preloaded from the entrypoint file."
+                htmlFor="entrypoint-max-tokens"
+              >
+                <Input
+                  id="entrypoint-max-tokens"
+                  type="number"
+                  min={1}
+                  value={localConfig.file?.max_entrypoint_tokens ?? 50000}
+                  onChange={(e) =>
+                    applyMemoryConfig({
+                      ...localConfig,
+                      file: {
+                        ...localConfig.file,
+                        max_entrypoint_tokens: parseInteger(
+                          e.target.value,
+                          50000,
+                        ),
+                      },
+                    })
+                  }
+                  className="transition-colors hover:border-ring focus:border-ring"
+                />
+              </FieldGroup>
+
+              <FieldGroup
+                label="Search Mode"
+                helperText="Keyword search is exact text matching; semantic search uses the memory embedder."
+                htmlFor="memory-search-mode"
+              >
+                <Select
+                  value={localConfig.search?.mode ?? "keyword"}
+                  onValueChange={(value) =>
+                    handleSearchModeChange(value as "keyword" | "semantic")
+                  }
+                >
+                  <SelectTrigger
+                    id="memory-search-mode"
+                    className="transition-colors hover:border-ring"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="keyword">Keyword</SelectItem>
+                    <SelectItem value="semantic">Semantic</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FieldGroup>
+
+              <FieldGroup
+                label="Search Include"
+                helperText="Comma-separated root-relative globs for file-memory search."
+                htmlFor="memory-search-include"
+              >
+                <Input
+                  id="memory-search-include"
+                  type="text"
+                  value={(localConfig.search?.include || []).join(", ")}
+                  onChange={(e) => handleSearchIncludeChange(e.target.value)}
+                  placeholder="memory/**/*.md"
+                  className="transition-colors hover:border-ring focus:border-ring"
+                />
+              </FieldGroup>
+
+              <FieldGroup
+                label="Include Entrypoint"
+                helperText="Include MEMORY.md in search results in addition to preloaded context."
+                htmlFor="memory-search-entrypoint"
+              >
+                <Select
+                  value={String(
+                    localConfig.search?.include_entrypoint ?? false,
+                  )}
+                  onValueChange={(value) =>
+                    handleIncludeEntrypointChange(parseBoolean(value))
+                  }
+                >
+                  <SelectTrigger
+                    id="memory-search-entrypoint"
+                    className="transition-colors hover:border-ring"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="true">Enabled</SelectItem>
+                    <SelectItem value="false">Disabled</SelectItem>
+                  </SelectContent>
+                </Select>
               </FieldGroup>
 
               <FieldGroup
@@ -839,18 +1046,18 @@ export function MemoryConfig() {
               </FieldGroup>
             </>
           )}
-        </div>
 
-        {localConfig.backend !== "file" &&
-          localConfig.embedder.provider === "openai" &&
-          !localConfig.embedder.config.host && (
-            <div className="p-4 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800/30 rounded-lg shadow-sm">
-              <p className="text-sm text-yellow-800 dark:text-yellow-300">
-                <strong>Note:</strong> You&apos;ll need to set the
-                OPENAI_API_KEY environment variable for this provider to work.
-              </p>
-            </div>
-          )}
+          <SchemaSection
+            title="More settings"
+            definition="MemoryConfig"
+            value={config?.memory}
+            path={["memory"]}
+            exclude={MEMORY_EDITOR_FIELDS}
+            onFieldChange={(key, next) =>
+              updateConfigValue(["memory", key], next)
+            }
+          />
+        </div>
 
         <div className="p-4 bg-muted/50 rounded-lg shadow-sm border border-border">
           <h3 className="text-sm font-medium mb-3">Current Configuration</h3>
@@ -861,6 +1068,16 @@ export function MemoryConfig() {
                 {localConfig.backend || "mem0"}
               </span>
             </div>
+            {localConfig.embedder.config.credentials_service && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">
+                  Credential Service:
+                </span>
+                <span className="font-mono text-foreground">
+                  {localConfig.embedder.config.credentials_service}
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span className="text-muted-foreground">Provider:</span>
               <span className="font-mono text-foreground">

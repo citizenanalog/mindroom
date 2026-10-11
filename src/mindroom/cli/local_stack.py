@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
     from mindroom.constants import RuntimePaths
 
-_CINNY_DEFAULT_IMAGE = "ghcr.io/mindroom-ai/mindroom-cinny:latest"
+_CINNY_DEFAULT_IMAGE = "ghcr.io/mindroom-ai/mindroom-chat:latest"
 _CINNY_DEFAULT_CONTAINER = "mindroom-cinny-local"
 
 
@@ -40,12 +40,12 @@ def local_stack_setup(
     synapse_dir: Path = typer.Option(  # noqa: B008
         Path("local/matrix"),
         "--synapse-dir",
-        help="Directory containing Synapse docker-compose.yml (from mindroom-stack settings).",
+        help="Directory containing Synapse docker-compose.yml (core MindRoom repo: local/matrix).",
     ),
     homeserver_url: str = typer.Option(
         "http://localhost:8008",
         "--homeserver-url",
-        help="Homeserver URL that Cinny and MindRoom should use.",
+        help="Homeserver URL that MindRoom Chat and MindRoom should use.",
     ),
     server_name: str | None = typer.Option(
         None,
@@ -57,17 +57,17 @@ def local_stack_setup(
         "--cinny-port",
         min=1,
         max=65535,
-        help="Local host port for the MindRoom Cinny container.",
+        help="Local host port for the MindRoom Chat container.",
     ),
     cinny_image: str = typer.Option(
         _CINNY_DEFAULT_IMAGE,
         "--cinny-image",
-        help="Docker image for MindRoom Cinny.",
+        help="Docker image for MindRoom Chat.",
     ),
     cinny_container_name: str = typer.Option(
         _CINNY_DEFAULT_CONTAINER,
         "--cinny-container-name",
-        help="Container name for MindRoom Cinny.",
+        help="Container name for MindRoom Chat (legacy default retained for compatibility).",
     ),
     skip_synapse: bool = typer.Option(
         False,
@@ -80,7 +80,7 @@ def local_stack_setup(
         help="Persist Matrix local dev settings to .env next to config.yaml.",
     ),
 ) -> None:
-    """Start local Synapse + MindRoom Cinny using Docker only."""
+    """Start local Synapse + MindRoom Chat using Docker only."""
     runtime_paths = activate_cli_runtime()
     _require_supported_platform()
     _require_binary("docker", "Docker is required but was not found in PATH.")
@@ -97,7 +97,7 @@ def local_stack_setup(
         inferred_server_name,
         runtime_paths,
     )
-    console.print(f"Cinny config written: [dim]{cinny_config_path}[/dim]")
+    console.print(f"MindRoom Chat config written: [dim]{cinny_config_path}[/dim]")
 
     cinny_url = f"http://localhost:{cinny_port}"
     _start_cinny_container(
@@ -106,7 +106,7 @@ def local_stack_setup(
         cinny_config_path=cinny_config_path,
         cinny_image=cinny_image,
     )
-    _wait_for_service(f"{cinny_url}/config.json", "Cinny")
+    _wait_for_service(f"{cinny_url}/config.json", "MindRoom Chat")
 
     _print_local_stack_summary(
         homeserver_url=homeserver_url,
@@ -134,7 +134,7 @@ def _write_local_cinny_config(
     server_name: str,
     runtime_paths: RuntimePaths,
 ) -> Path:
-    """Write a minimal Cinny config for local MindRoom development."""
+    """Write a minimal MindRoom Chat config for local development."""
     config = {
         "defaultHomeserver": 0,
         "homeserverList": [homeserver_url],
@@ -155,6 +155,14 @@ def _write_local_cinny_config(
     return target
 
 
+def _needs_ssl_verify_override(homeserver_url: str) -> bool:
+    """Return whether the local homeserver needs MATRIX_SSL_VERIFY=false for its self-signed certificate.
+
+    Plain HTTP needs no certificate override, and a persisted one would stop verifying a hosted homeserver set later.
+    """
+    return urlparse(homeserver_url).scheme == "https"
+
+
 def _persist_local_matrix_env(
     homeserver_url: str,
     server_name: str,
@@ -162,14 +170,10 @@ def _persist_local_matrix_env(
     config_path: Path,
 ) -> Path:
     """Write local Matrix settings to .env next to the active config file."""
-    return upsert_env_values(
-        env_path_for_config(config_path),
-        {
-            "MATRIX_HOMESERVER": homeserver_url,
-            "MATRIX_SSL_VERIFY": "false",
-            "MATRIX_SERVER_NAME": server_name,
-        },
-    )
+    values = {"MATRIX_HOMESERVER": homeserver_url, "MATRIX_SERVER_NAME": server_name}
+    if _needs_ssl_verify_override(homeserver_url):
+        values["MATRIX_SSL_VERIFY"] = "false"
+    return upsert_env_values(env_path_for_config(config_path), values)
 
 
 def _require_supported_platform() -> None:
@@ -209,7 +213,7 @@ def _start_cinny_container(
     cinny_config_path: Path,
     cinny_image: str,
 ) -> None:
-    """Start (or replace) the local MindRoom Cinny container."""
+    """Start (or replace) the local MindRoom Chat container."""
     _run_command(["docker", "rm", "-f", cinny_container_name], check=False)
 
     run_cmd = [
@@ -228,7 +232,7 @@ def _start_cinny_container(
     ]
     result = _run_command(run_cmd, check=False)
     if result.returncode != 0:
-        _print_command_failure(result, "Failed to start MindRoom Cinny container")
+        _print_command_failure(result, "Failed to start MindRoom Chat container")
         raise typer.Exit(1)
 
 
@@ -270,7 +274,7 @@ def _print_local_stack_summary(
     """Print final setup instructions."""
     console.print("\n[green]Local stack is ready.[/green]")
     console.print(f"  Synapse: {homeserver_url}")
-    console.print(f"  Cinny:   {cinny_url}")
+    console.print(f"  MindRoom Chat: {cinny_url}")
     console.print(f"  Server:  {server_name}")
     if persist_env:
         env_path = _persist_local_matrix_env(
@@ -282,8 +286,9 @@ def _print_local_stack_summary(
         console.print("\nRun MindRoom backend:")
         console.print("  uv run mindroom run")
     else:
+        ssl_override = " MATRIX_SSL_VERIFY=false" if _needs_ssl_verify_override(homeserver_url) else ""
         console.print("\nRun MindRoom backend against this stack:")
-        console.print(f"  MATRIX_HOMESERVER={homeserver_url} MATRIX_SSL_VERIFY=false uv run mindroom run")
+        console.print(f"  MATRIX_HOMESERVER={homeserver_url}{ssl_override} uv run mindroom run")
     console.print("\nStop commands:")
     console.print(f"  docker rm -f {cinny_container_name}")
     if not skip_synapse:

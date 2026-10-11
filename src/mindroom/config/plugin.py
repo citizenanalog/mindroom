@@ -6,29 +6,35 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from mindroom.config.schema_hints import dashboard_hint
+from mindroom.config.validation import non_empty_stripped
+
 
 class HookOverrideConfig(BaseModel):
     """Per-hook deployer override configuration."""
 
-    enabled: bool = True
-    priority: int | None = None
-    timeout_ms: int | None = None
+    enabled: bool = Field(default=True, description="Run this hook; false disables it without removing the plugin")
+    priority: int | None = Field(default=None, description="Override the hook's default execution priority")
+    timeout_ms: int | None = Field(default=None, description="Override the hook's default timeout in milliseconds")
 
 
 class PluginEntryConfig(BaseModel):
     """Normalized plugin entry from the root config."""
 
-    path: str
-    enabled: bool = True
-    settings: dict[str, Any] = Field(default_factory=dict)
-    hooks: dict[str, HookOverrideConfig] = Field(default_factory=dict)
+    path: str = Field(description="Plugin directory, config-relative path, or Python package spec")
+    enabled: bool = Field(default=True, description="Load the plugin; false disables it without removing the entry")
+    settings: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Free-form settings passed to the plugin at load time; may include credentials",
+        json_schema_extra=dashboard_hint(secret=True),
+    )
+    hooks: dict[str, HookOverrideConfig] = Field(
+        default_factory=dict,
+        description="Per-hook overrides keyed by hook function name",
+    )
 
     @field_validator("path")
     @classmethod
     def validate_path(cls, value: str) -> str:
         """Reject empty plugin paths after trimming whitespace."""
-        normalized = value.strip()
-        if not normalized:
-            msg = "Plugin path must not be empty"
-            raise ValueError(msg)
-        return normalized
+        return non_empty_stripped(value, field_name="Plugin path")

@@ -1,9 +1,10 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import path from "path";
+import { svgzPlugin } from "./svgz.config";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), svgzPlugin],
   test: {
     environment: "jsdom",
     globals: true,
@@ -17,12 +18,7 @@ export default defineConfig({
       "**/tests/e2e/**", // Exclude E2E tests which are Playwright tests
     ],
     pool: "threads",
-    poolOptions: {
-      threads: {
-        maxThreads: 12,
-        minThreads: 1,
-      },
-    },
+    maxWorkers: 12,
   },
   resolve: {
     alias: {

@@ -1,12 +1,39 @@
-import { ExternalLink, CheckCircle, AlertCircle, Loader2, XCircle, Rocket, Copy } from 'lucide-react'
+import { ExternalLink, CheckCircle, AlertCircle, Loader2, XCircle, Rocket, Copy, MessageCircle } from 'lucide-react'
 import Link from 'next/link'
 import { useState } from 'react'
 import type { Instance } from '@/hooks/useInstance'
+import type { Subscription } from '@/hooks/useSubscription'
 import { provisionInstance } from '@/lib/api'
+import { buildCinnyLoginUrl } from '@/lib/cinny'
 import { Card, CardHeader } from '@/components/ui/Card'
 import { logger } from '@/lib/logger'
+import { planAction, planState } from '@/lib/plan-state'
 
-export function InstanceCard({ instance }: { instance: Instance | null }) {
+function formatDate(dateStr: string) {
+  return new Date(dateStr).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
+}
+
+function subscriptionAccessMessage(subscription: Subscription | null | undefined) {
+  if (!subscription) return null
+  if (subscription.status === 'trialing' && subscription.trial_days_remaining !== null) {
+    const days = subscription.trial_days_remaining
+    return `Trial: ${days} ${days === 1 ? 'day' : 'days'} remaining`
+  }
+  if (subscription.status === 'paused' && subscription.trial_days_remaining === 0) {
+    return 'Trial expired. Add billing to start or restore your hosted instance.'
+  }
+  return null
+}
+
+export function InstanceCard({
+  instance,
+  subscription,
+  subscriptionLoading = false,
+}: {
+  instance: Instance | null
+  subscription?: Subscription | null
+  subscriptionLoading?: boolean
+}) {
   const [isProvisioning, setIsProvisioning] = useState(false)
   const copyToClipboard = async (text: string) => {
     try {
@@ -26,7 +53,7 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
     }
   }
 
-  const formatRelativeTime = (dateStr?: string) => {
+  const formatRelativeTime = (dateStr?: string | null) => {
     if (!dateStr) return '—'
     const date = new Date(dateStr)
     const diff = Date.now() - date.getTime()
@@ -74,36 +101,72 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
     }
   }
 
-  // Token passing handled by shared SSO cookie; open via plain link
+  // Tenant access is handled by the configured instance auth layer; open via plain link.
 
   // No instance yet - show provision card
+  if (!instance && subscriptionLoading && !subscription) {
+    return (
+      <Card>
+        <CardHeader>MindRoom Instance</CardHeader>
+        <div className="flex justify-center py-8">
+          <Loader2 className="w-8 h-8 animate-spin text-orange-500" aria-label="Loading subscription" />
+        </div>
+      </Card>
+    )
+  }
+
   if (!instance) {
+    const state = planState(subscription)
+    const nextStep = state === 'active' ? null : planAction(state)
+    const accessMessage = subscriptionAccessMessage(subscription)
+
     return (
       <Card>
         <CardHeader>MindRoom Instance</CardHeader>
         <div className="text-center py-8">
           <Rocket className="w-16 h-16 text-gray-400 dark:text-gray-500 mx-auto mb-4" />
-          <p className="text-gray-600 dark:text-gray-400 mb-6">
-            No instance provisioned yet. Click below to create your MindRoom instance.
-          </p>
-          <button
-            onClick={handleProvision}
-            disabled={isProvisioning}
-            className="px-6 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all disabled:bg-gray-400 disabled:cursor-not-allowed"
-          >
-            {isProvisioning ? (
-              <>
-                <Loader2 className="inline-block w-5 h-5 mr-2 animate-spin" />
-                Provisioning...
-              </>
-            ) : (
-              'Provision Instance'
-            )}
-          </button>
+          {accessMessage && (
+            <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">{accessMessage}</p>
+          )}
+          {!nextStep ? (
+            <>
+              <p className="text-gray-600 dark:text-gray-400 mb-6">
+                No instance provisioned yet. Click below to create your MindRoom instance.
+              </p>
+              <button
+                onClick={handleProvision}
+                disabled={isProvisioning}
+                className="px-6 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all disabled:bg-gray-400 disabled:cursor-not-allowed"
+              >
+                {isProvisioning ? (
+                  <>
+                    <Loader2 className="inline-block w-5 h-5 mr-2 animate-spin" />
+                    Provisioning...
+                  </>
+                ) : (
+                  'Provision Instance'
+                )}
+              </button>
+            </>
+          ) : (
+            <>
+              {!accessMessage && (
+                <p className="text-gray-600 dark:text-gray-400 mb-6">{nextStep.step} to run a hosted instance.</p>
+              )}
+              <Link
+                href={nextStep.href}
+                className="inline-flex items-center justify-center px-6 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all"
+              >
+                {nextStep.label}
+              </Link>
+            </>
+          )}
         </div>
       </Card>
     )
   }
+
+  const noPlan = !instance.tier || instance.tier === 'free'
 
   const getStatusIcon = () => {
     switch (instance.status) {
@@ -155,7 +218,9 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
 
   const frontendHost = getHostname(instance.frontend_url)
   const backendHost = getHostname(instance.backend_url)
-  const matrixHost = getHostname(instance.matrix_server_url)
+  const chatInterfaceUrl = instance.matrix_server_url
+    ? buildCinnyLoginUrl(instance.matrix_server_url)
+    : null
   const lastSynced = instance.kubernetes_synced_at
     ? formatRelativeTime(instance.kubernetes_synced_at)
     : null
@@ -175,6 +240,21 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
           <span className="text-sm font-medium">{getStatusText()}</span>
         </div>
       </div>
+
+      {instance.status === 'stopped' && instance.teardown_after && (
+        <div
+          role="alert"
+          className="mb-4 rounded-xl border border-yellow-200 bg-yellow-50 p-4 text-sm text-yellow-800 dark:border-yellow-800/50 dark:bg-yellow-900/20 dark:text-yellow-200"
+        >
+          <p>
+            Your instance is paused because your subscription is no longer active.
+            Its data will be deleted on <strong>{formatDate(instance.teardown_after)}</strong> unless you resubscribe.
+          </p>
+          <Link href="/dashboard/billing" className="mt-2 inline-block font-semibold underline">
+            Go to billing
+          </Link>
+        </div>
+      )}
 
       {(statusHint || lastSynced) && (
         <div className="mb-3 space-y-1">
@@ -260,25 +340,25 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
         {/* Tier */}
         <div className="flex items-center justify-between">
           <span className="text-gray-600 dark:text-gray-400">Tier</span>
-          <span className="font-medium capitalize dark:text-gray-200">{instance.tier || 'Free'}</span>
+          <span className={`font-medium dark:text-gray-200 ${noPlan ? '' : 'capitalize'}`}>{noPlan ? 'No plan' : instance.tier}</span>
         </div>
 
-        {/* Matrix Server */}
-        {instance.matrix_server_url && (
+        {/* Chat Interface */}
+        {chatInterfaceUrl && (
           <div className="flex items-center justify-between">
-            <span className="text-gray-600 dark:text-gray-400">Matrix Server</span>
+            <span className="text-gray-600 dark:text-gray-400">Chat Interface</span>
             <div className="flex items-center gap-2">
               <Link
-                href={instance.matrix_server_url}
+                href={chatInterfaceUrl}
                 target="_blank"
                 className="flex items-center gap-1 text-purple-600 hover:text-purple-700 dark:text-purple-400 dark:hover:text-purple-300 font-medium"
               >
-                {matrixHost || 'Connect'}
+                Open chat
                 <ExternalLink className="w-3 h-3" />
               </Link>
               <button
                 onClick={() => copyToClipboard(instance.matrix_server_url!)}
-                title="Copy Matrix URL"
+                title="Copy chat server URL"
                 className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
               >
                 <Copy className="w-4 h-4" />
@@ -291,7 +371,7 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
         <div className="flex items-center justify-between">
           <span className="text-gray-600 dark:text-gray-400">Last Updated</span>
           <span className="text-sm text-gray-500 dark:text-gray-400">
-            {formatRelativeTime(instance.updated_at)} · {new Date(instance.updated_at).toLocaleString()}
+            {formatRelativeTime(instance.updated_at)} · {instance.updated_at ? new Date(instance.updated_at).toLocaleString() : '—'}
           </span>
         </div>
 
@@ -305,15 +385,28 @@ export function InstanceCard({ instance }: { instance: Instance | null }) {
       {/* Action Buttons */}
       {instance.status === 'running' && instance.frontend_url && (
         <div className="mt-6 pt-6 border-t dark:border-gray-700">
-          <Link
-            href={instance.frontend_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="w-full inline-flex items-center justify-center gap-2 px-6 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all"
-          >
-            <ExternalLink className="w-4 h-4" />
-            Open MindRoom
-          </Link>
+          <div className={`grid gap-3 ${chatInterfaceUrl ? 'sm:grid-cols-2' : ''}`}>
+            <Link
+              href={instance.frontend_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full inline-flex items-center justify-center gap-2 px-6 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all"
+            >
+              <ExternalLink className="w-4 h-4" />
+              Open MindRoom
+            </Link>
+            {chatInterfaceUrl && (
+              <Link
+                href={chatInterfaceUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full inline-flex items-center justify-center gap-2 px-6 py-3 border border-purple-200 bg-purple-50 text-purple-700 rounded-xl font-semibold hover:bg-purple-100 dark:border-purple-800/50 dark:bg-purple-900/20 dark:text-purple-200 dark:hover:bg-purple-900/30 transition-colors"
+              >
+                <MessageCircle className="w-4 h-4" />
+                Open Chat Interface
+              </Link>
+            )}
+          </div>
         </div>
       )}
     </Card>

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from mindroom.custom_tools.thread_summary import ThreadSummaryTools
@@ -12,11 +13,13 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="thread_summary",
+    file_access=ToolFileAccess.NONE,
     display_name="Thread Summary",
-    description="Set or update Matrix thread summaries with room/thread context defaults",
+    description="Write or update a summary of a conversation thread",
     category=ToolCategory.COMMUNICATION,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
+    requires_room_context=True,
     icon="MessageCircleMore",
     icon_color="text-cyan-500",
     dependencies=["agno"],

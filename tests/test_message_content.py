@@ -1,12 +1,12 @@
 """Tests for centralized message content extraction with large message support."""
 
 import json
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 import pytest
+from nio import crypto
 
 import mindroom.matrix.message_content as message_content_module
 from mindroom.config.agent import AgentConfig
@@ -19,24 +19,32 @@ from mindroom.matrix.client_visible_messages import (
     resolve_visible_event_source,
     thread_root_body_preview,
 )
+from mindroom.matrix.event_info import EventInfo
 from mindroom.matrix.message_content import (
     _download_mxc_text,
     extract_and_resolve_message,
     extract_edit_body,
     resolve_event_source_content,
 )
+from mindroom.matrix.sidecar_content import holds_unresolved_sidecar, sidecar_mxc_url
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.visible_body import (
     strip_matrix_rich_reply_fallback,
     visible_body_from_event_source,
     visible_content_from_content,
 )
-from tests.conftest import bind_runtime_paths, make_matrix_client_mock, runtime_paths_for, test_runtime_paths
+from tests.conftest import (
+    FakeMediaResponse,
+    bind_runtime_paths,
+    make_matrix_client_mock,
+    runtime_paths_for,
+    test_runtime_paths,
+)
 from tests.identity_helpers import persist_entity_accounts
 
 
 def _trusted_entity_sender_ids(config: Config, runtime_paths: RuntimePaths) -> frozenset[str]:
-    return entity_identity_registry(config, runtime_paths).internal_sender_ids
+    return entity_identity_registry(config, runtime_paths)._internal_sender_ids
 
 
 def _make_message_event(
@@ -69,12 +77,102 @@ def _make_client() -> AsyncMock:
     return make_matrix_client_mock(user_id="@mindroom_general:localhost")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "cycle", "missing", "invalid"])
+async def test_sidecar_chain_preserves_full_content_and_event_relation(ending: str) -> None:
+    """Nested historical sidecars resolve fully or retain explicit unreadability."""
+    metadata = {"version": 2, "encoding": "matrix_event_content_json"}
+    first = {"msgtype": "m.file", "body": "preview", "url": "mxc://server/first", "io.mindroom.long_text": metadata}
+    second = {**first, "url": "mxc://server/second"}
+    relation = {"rel_type": "m.replace", "event_id": "$actual"}
+    source = {"content": {**first, "m.relates_to": relation}}
+    terminal = {
+        "msgtype": "m.text",
+        "body": "complete body",
+        "io.mindroom.tool_trace": {"full": "tool output"},
+        "m.relates_to": {"rel_type": "m.thread", "event_id": "$forged"},
+    }
+    client = _make_client()
+    final_response = nio.DownloadResponse(
+        json.dumps(terminal if ending == "complete" else first).encode(),
+        "application/json",
+        None,
+    )
+    if ending == "missing":
+        final_response = nio.DownloadError("M_NOT_FOUND")
+    elif ending == "invalid":
+        final_response = nio.DownloadResponse(b"not JSON", "application/json", None)
+    client.download.side_effect = [
+        nio.DownloadResponse(json.dumps({"m.new_content": second}).encode(), "application/json", None),
+        final_response,
+    ]
+
+    resolved = await resolve_event_source_content(source, client)
+
+    assert client.download.await_count == 2
+    assert resolved["content"]["m.relates_to"] == relation
+    if ending == "complete":
+        assert resolved["content"] == {**terminal, "m.relates_to": relation}
+    else:
+        assert holds_unresolved_sidecar(resolved["content"])
+
+
+@pytest.mark.asyncio
+async def test_sidecar_chain_has_a_bounded_download_budget() -> None:
+    """Unique sidecar URLs cannot cause an unbounded walk."""
+
+    def preview(index: int) -> dict:
+        return {
+            "body": "preview",
+            "url": f"mxc://server/{index}",
+            "io.mindroom.long_text": {"version": 2, "encoding": "matrix_event_content_json"},
+        }
+
+    client = _make_client()
+    client.download.side_effect = [
+        nio.DownloadResponse(json.dumps(preview(index)).encode(), "application/json", None) for index in range(1, 10)
+    ]
+    resolved = await resolve_event_source_content({"content": preview(0)}, client)
+    assert client.download.await_count == 8
+    assert holds_unresolved_sidecar(resolved["content"])
+
+
 class TestResolvedMessageExtraction:
     """Tests for coherent visible message extraction."""
 
-    def setup_method(self) -> None:
-        """Clear cache before each test."""
-        message_content_module._mxc_cache.clear()
+    def test_sidecar_url_validation_prefers_the_encrypted_file_url(self) -> None:
+        """Hydration must pick the MXC URL, not the plain HTTP one beside it."""
+        content = {
+            "body": "Preview body",
+            "msgtype": "m.file",
+            "io.mindroom.long_text": {
+                "version": 2,
+                "encoding": "matrix_event_content_json",
+            },
+            "url": "https://example.test/not-mxc",
+            "file": {"url": "mxc://server/encrypted-sidecar"},
+        }
+
+        assert sidecar_mxc_url(content) == "mxc://server/encrypted-sidecar"
+
+    @pytest.mark.parametrize("malformed_url", ["mxc://", "mxc://server"])
+    def test_sidecar_url_validation_rejects_incomplete_mxc_uris(self, malformed_url: str) -> None:
+        """Incomplete content URIs must not enter hydration."""
+        metadata = {
+            "version": 2,
+            "encoding": "matrix_event_content_json",
+        }
+        direct_content = {
+            "io.mindroom.long_text": metadata,
+            "url": malformed_url,
+        }
+        encrypted_content = {
+            "io.mindroom.long_text": metadata,
+            "file": {"url": malformed_url},
+        }
+
+        assert sidecar_mxc_url(direct_content) is None
+        assert sidecar_mxc_url(encrypted_content) is None
 
     @pytest.mark.asyncio
     async def test_extract_and_resolve_message_hydrates_v2_sidecar_content(self) -> None:
@@ -104,7 +202,6 @@ class TestResolvedMessageExtraction:
                 body=json.dumps(original_content).encode("utf-8"),
             ),
         )
-
         resolved = await extract_and_resolve_message(event, client)
 
         assert resolved["body"] == "Full response body"
@@ -305,6 +402,93 @@ class TestResolvedMessageExtraction:
         )
 
         assert event_source["content"] == canonical_content
+
+    @pytest.mark.asyncio
+    async def test_hydration_keeps_the_relation_the_event_carries(self) -> None:
+        """A sidecar payload supplies text, never the event's place in the relation graph.
+
+        The metadata naming the sidecar sits inside ``m.new_content``, so a payload that restated
+        ``m.relates_to`` would erase the ``m.replace`` and hand whoever uploaded the file the choice
+        of which conversation the message joins - a thread nothing about the event agrees with.
+        """
+        client = _make_client()
+        client.download = AsyncMock(
+            return_value=MagicMock(
+                spec=nio.DownloadResponse,
+                body=json.dumps(
+                    {
+                        "msgtype": "m.text",
+                        "body": "Full text",
+                        "m.relates_to": {"rel_type": "m.thread", "event_id": "$claimed"},
+                    },
+                ).encode("utf-8"),
+            ),
+        )
+
+        event_source = await resolve_event_source_content(
+            {
+                "type": "m.room.message",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* Preview edit",
+                    "m.new_content": {
+                        "msgtype": "m.file",
+                        "body": "Preview edit",
+                        "io.mindroom.long_text": {
+                            "version": 2,
+                            "encoding": "matrix_event_content_json",
+                        },
+                        "url": "mxc://server/crafted-edit-sidecar",
+                    },
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+                },
+            },
+            client,
+        )
+
+        # The text is hydrated, so this pins preservation rather than a skipped download.
+        assert event_source["content"]["body"] == "Full text"
+        event_info = EventInfo.from_event(event_source)
+        assert event_info.is_edit is True
+        assert event_info.original_event_id == "$original"
+        assert event_info.thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_hydration_cannot_give_a_relation_free_event_a_relation(self) -> None:
+        """An event that relates to nothing still relates to nothing once its text arrives."""
+        client = _make_client()
+        client.download = AsyncMock(
+            return_value=MagicMock(
+                spec=nio.DownloadResponse,
+                body=json.dumps(
+                    {
+                        "msgtype": "m.text",
+                        "body": "Full text",
+                        "m.relates_to": {"rel_type": "m.thread", "event_id": "$claimed"},
+                    },
+                ).encode("utf-8"),
+            ),
+        )
+
+        event_source = await resolve_event_source_content(
+            {
+                "type": "m.room.message",
+                "content": {
+                    "msgtype": "m.file",
+                    "body": "Preview",
+                    "io.mindroom.long_text": {
+                        "version": 2,
+                        "encoding": "matrix_event_content_json",
+                    },
+                    "url": "mxc://server/crafted-plain-sidecar",
+                },
+            },
+            client,
+        )
+
+        assert event_source["content"]["body"] == "Full text"
+        assert "m.relates_to" not in event_source["content"]
+        assert EventInfo.from_event(event_source).thread_id is None
 
     def test_visible_body_from_event_source_prefers_visible_edit_content(self) -> None:
         """Visible-body extraction should use m.new_content when present."""
@@ -709,8 +893,6 @@ class TestResolvedMessageExtraction:
             client=client,
             config=config,
             runtime_paths=runtime_paths,
-            event_cache=None,
-            room_id=None,
             trusted_sender_ids=trusted_sender_ids,
         )
         mock_resolve.assert_awaited_once_with(
@@ -719,8 +901,6 @@ class TestResolvedMessageExtraction:
             fallback_body="Original root",
             config=config,
             runtime_paths=runtime_paths,
-            event_cache=None,
-            room_id=None,
             trusted_sender_ids=trusted_sender_ids,
         )
 
@@ -732,28 +912,25 @@ class TestResolvedMessageExtraction:
 class TestDownloadMxcText:
     """Tests for _download_mxc_text function."""
 
-    def setup_method(self) -> None:
-        """Clear cache before each test."""
-        message_content_module._mxc_cache.clear()
-
     @pytest.mark.asyncio
     async def test_invalid_mxc_url(self) -> None:
         """Test handling of invalid MXC URL."""
-        client = AsyncMock()
+        client = _make_client()
         result = await _download_mxc_text(client, "http://not-mxc-url")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_malformed_mxc_url(self) -> None:
         """Test handling of malformed MXC URL."""
-        client = AsyncMock()
+        client = _make_client()
         result = await _download_mxc_text(client, "mxc://no-media-id")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_successful_download(self) -> None:
         """Test successful text download."""
-        client = AsyncMock()
+        client = _make_client()
+        client.user_id = "@alice:localhost"
         response = MagicMock(spec=nio.DownloadResponse)
         response.body = b"Downloaded text content"
         client.download.return_value = response
@@ -761,47 +938,108 @@ class TestDownloadMxcText:
         result = await _download_mxc_text(client, "mxc://server/media123")
         assert result == "Downloaded text content"
         client.download.assert_called_once_with(mxc="mxc://server/media123")
+        assert await _download_mxc_text(client, "mxc://server/media123") == "Downloaded text content"
+        assert client.download.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_successful_encrypted_download(self) -> None:
+        """Encrypted sidecars should use the JWK key value emitted by nio."""
+        plaintext = b"Downloaded encrypted text content"
+        encrypted, file_info = crypto.attachments.encrypt_attachment(plaintext)
+        client = _make_client()
+        response = MagicMock(spec=nio.DownloadResponse)
+        response.body = encrypted
+        client.download.return_value = response
+
+        assert await _download_mxc_text(client, "mxc://server/encrypted", file_info) == plaintext.decode()
+
+    @pytest.mark.asyncio
+    async def test_hydration_does_not_reuse_plaintext_across_calls(self) -> None:
+        """Sidecar resolution keeps no durable memory of what it resolved.
+
+        The resolved text belongs to the visible revision it is the body of,
+        and the projection stores it there. A second copy here would need its
+        own invalidation, and one that missed a redaction would serve deleted
+        content.
+        """
+        client = _make_client()
+        client.user_id = "@alice:localhost"
+        first_response = MagicMock(spec=nio.DownloadResponse)
+        first_response.body = b"first"
+        second_response = MagicMock(spec=nio.DownloadResponse)
+        second_response.body = b"second"
+        client.download.side_effect = [first_response, second_response]
+
+        assert await _download_mxc_text(client, "mxc://server/incomplete") == "first"
+        assert await _download_mxc_text(client, "mxc://server/incomplete") == "second"
+        assert client.download.await_count == 2
 
     @pytest.mark.asyncio
     async def test_download_failure(self) -> None:
         """Test handling of download failure."""
-        client = AsyncMock()
+        client = _make_client()
         client.download.return_value = MagicMock(spec=nio.DownloadError)
 
         result = await _download_mxc_text(client, "mxc://server/media123")
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_mxc_cache_uses_lru_eviction(self) -> None:
-        """A cache hit should refresh recency so the oldest untouched entry is evicted first."""
-        client = AsyncMock()
-        now = time.time()
-        for index in range(message_content_module._mxc_cache_max_entries):
-            message_content_module._mxc_cache[f"mxc://server/{index}"] = (str(index), now)
+    async def test_download_rejects_plaintext_over_byte_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Oversized sidecar bytes should not be decoded."""
+        monkeypatch.setattr(message_content_module, "_MXC_TEXT_MAX_BYTES", 5)
+        client = _make_client()
+        response = MagicMock(spec=nio.DownloadResponse)
+        response.body = b"123456"
+        client.download.return_value = response
 
-        assert await _download_mxc_text(client, "mxc://server/0") == "0"
-        client.download.assert_not_called()
+        assert await _download_mxc_text(client, "mxc://server/oversized") is None
 
-        overflow_response = MagicMock(spec=nio.DownloadResponse)
-        overflow_response.body = b"overflow"
-        client.download.return_value = overflow_response
+    @pytest.mark.asyncio
+    async def test_download_stops_reading_an_oversized_sidecar_at_the_byte_limit(self) -> None:
+        """An oversized sidecar is abandoned once the cap is crossed, never held whole.
 
-        assert await _download_mxc_text(client, "mxc://server/overflow") == "overflow"
-        assert "mxc://server/0" in message_content_module._mxc_cache
-        assert "mxc://server/1" not in message_content_module._mxc_cache
+        nio's ``download`` reads the entire body into memory before anything can
+        measure it, so any room member could point a sidecar at a file as large
+        as the homeserver accepts and have every agent buffer all of it.
+        """
+        limit = message_content_module._MXC_TEXT_MAX_BYTES
+        response = FakeMediaResponse(b"x" * (5 * limit))
+        client = _make_client()
+        client.send = AsyncMock(return_value=response)
+
+        assert await _download_mxc_text(client, "mxc://server/huge") is None
+
+        client.download.assert_not_awaited()
+        assert response.streamed_bytes <= limit + 64 * 1024
+        assert response.released
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_encrypted_sidecar_over_byte_limit_before_decrypt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Oversized encrypted sidecars should be rejected before decryption allocates plaintext."""
+        monkeypatch.setattr(message_content_module, "_MXC_TEXT_MAX_BYTES", 5)
+        client = _make_client()
+        response = MagicMock(spec=nio.DownloadResponse)
+        response.body = b"123456"
+        client.download.return_value = response
+        file_info = {"key": {"k": "key"}, "hashes": {"sha256": "hash"}, "iv": "iv"}
+
+        with patch("mindroom.matrix.message_content.decrypt_media_bytes") as mock_decrypt:
+            result = await _download_mxc_text(client, "mxc://server/encrypted-oversized", file_info)
+
+        assert result is None
+        mock_decrypt.assert_not_called()
 
 
 class TestCanonicalContentResolution:
     """Tests for sidecar-backed canonical content extraction."""
 
-    def setup_method(self) -> None:
-        """Clear cache before each test."""
-        message_content_module._mxc_cache.clear()
-
     @pytest.mark.asyncio
     async def test_extract_and_resolve_message_hydrates_v2_content_metadata(self) -> None:
         """Large-message v2 previews should resolve canonical content keys from the sidecar."""
-        client = AsyncMock()
+        client = _make_client()
         response = MagicMock(spec=nio.DownloadResponse)
         response.body = b'{"body":"Full body","msgtype":"m.text","io.mindroom.tool_trace":{"version":1,"events":[{"tool":"shell"}]}}'
         client.download.return_value = response
@@ -832,7 +1070,7 @@ class TestCanonicalContentResolution:
     @pytest.mark.asyncio
     async def test_extract_edit_body_hydrates_v2_sidecar_new_content(self) -> None:
         """Edit extraction should use canonical m.new_content from a v2 sidecar payload."""
-        client = AsyncMock()
+        client = _make_client()
         response = MagicMock(spec=nio.DownloadResponse)
         response.body = (
             b'{"msgtype":"m.text","body":"* Full edit wrapper","m.new_content":{"body":"Full edit body","msgtype":"m.text",'

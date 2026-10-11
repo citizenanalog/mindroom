@@ -3,7 +3,8 @@ name: docs-review
 description: Review documentation for accuracy, completeness, and consistency against the actual codebase.
 ---
 
-Review documentation for accuracy, completeness, and consistency. Focus on things that require judgment—automated checks handle the rest.
+Review documentation for accuracy, completeness, relevance, and consistency. Focus on things that require judgment—automated checks handle the rest.
+The Documentation Policy in `AGENTS.md` defines who reads `docs/` and what belongs there.
 
 ## What's Already Automated
 
@@ -17,10 +18,13 @@ Don't waste time on these—CI and pre-commit hooks handle them:
 Focus on things that require judgment:
 
 1. **Accuracy**: Does the documentation match what the code actually does?
-2. **Completeness**: Are there undocumented features, options, or behaviors?
-3. **Clarity**: Would a new user understand this? Are examples realistic?
-4. **Consistency**: Do different docs contradict each other?
-5. **Freshness**: Has the code changed in ways the docs don't reflect?
+2. **Completeness**: Are there undocumented features, config options, user-visible behaviors, or operator procedures?
+   In user docs, internal limits, hardening, and failure or recovery paths are gaps only when a user would plausibly ask about them; `docs/architecture/` pages keep their inventories complete.
+3. **Relevance**: Does every sentence in user docs pass the Documentation Policy, or does it describe implementation mechanics or change history?
+   `docs/architecture/` pages and pages outside the nav may explain mechanisms.
+4. **Clarity**: Would a MindRoom agent answering a user question find and apply this? Are examples realistic?
+5. **Consistency**: Do different docs contradict each other or repeat the same fact?
+6. **Freshness**: Has the code changed in ways the docs don't reflect?
 
 ## Review Process
 
@@ -38,19 +42,22 @@ Look for new features, changed defaults, renamed options, or removed functionali
 
 ### 2. Verify Configuration Docs Against Code
 
-Compare docs under `docs/configuration/` against the Pydantic models in `src/mindroom/config.py`. Don't rely on a fixed list of files — discover what exists in both locations and check they match.
+Compare docs under `docs/configuration/` against the Pydantic models in the `src/mindroom/config/` package, whose root model is in `src/mindroom/config/main.py`.
+Do not rely on a fixed list of files; discover what exists in both locations and check they match.
 
 ```bash
-# Find all config models
-grep -r "class.*BaseModel" src/mindroom/config.py -A 15
+# Find every config class declaration, including indirect Pydantic subclasses
+rg -n "^class " src/mindroom/config
 
 # Find all config doc files
 ls docs/configuration/
 ```
 
+Trace inheritance for every discovered class instead of assuming each Pydantic model directly subclasses `BaseModel`.
+
 Check:
-- All config keys documented, types and defaults match code
-- No models exist without corresponding docs (or vice versa)
+- Every public config field has one owning reference with accurate type, default, constraints, inheritance, and prerequisites
+- Internal models need no docs just because they exist
 - Example YAML would actually work
 
 ### 3. Verify Architecture Docs Against Source
@@ -60,10 +67,9 @@ Check:
 git ls-files "src/mindroom/**/*.py"
 ```
 
-Check `docs/architecture/` and the Architecture section of `CLAUDE.md`:
+Check `docs/architecture/`, including the module rows in `docs/architecture/code-map.md`:
 - Listed modules exist and descriptions match what the code does
-- No source modules are missing from the listings
-- Both locations can drift independently — check both
+- No important source modules are missing from the code map; the other `docs/architecture/` pages cover components and data flow, not every module
 
 ### 4. Verify Feature Docs Against Implementation
 
@@ -87,9 +93,9 @@ For examples in any doc:
 
 ### 6. Cross-Reference Consistency
 
-The same info appears in multiple places. Check for conflicts between README.md, `docs/`, and `CLAUDE.md`.
+The same info appears in multiple places. Check for conflicts between README.md, `docs/`, and `AGENTS.md`.
 
-Also verify that script paths and file references in CLAUDE.md and `docs/deployment/` match the actual filesystem layout.
+Also verify that script paths and file references in AGENTS.md and `docs/deployment/` match the actual filesystem layout.
 
 ### 6b. Verify Deployment Docs
 
@@ -111,9 +117,10 @@ Categorize findings:
 1. **Critical**: Wrong info that would break user workflows
 2. **Inaccuracy**: Technical errors (wrong defaults, paths, types)
 3. **Missing**: Undocumented features or options
-4. **Outdated**: Was true, no longer is
-5. **Inconsistency**: Docs contradict each other
-6. **Minor**: Typos, unclear wording
+4. **Irrelevant**: Implementation mechanics, change history, or repeated facts to remove
+5. **Outdated**: Was true, no longer is
+6. **Inconsistency**: Docs contradict each other
+7. **Minor**: Typos, unclear wording
 
 For each issue, provide a ready-to-apply fix:
 

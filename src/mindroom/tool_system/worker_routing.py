@@ -9,34 +9,32 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
+from urllib.parse import quote
 
 from mindroom.tool_system.context_bound_streams import context_bound_async_stream
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 
+    from mindroom.agent_policy import ResolvedAgentPolicy
     from mindroom.constants import RuntimePaths
 
 WorkerScope = Literal["shared", "user", "user_agent"]
 ResolvedWorkerKeyScope = Literal["shared", "user", "user_agent", "unscoped"]
-_ExecutionChannel = Literal["matrix", "openai_compat"]
+_ExecutionChannel = Literal["matrix", "openai_compat", "mcp"]
 
 _WORKER_DIRNAME_MAX_PREFIX_LENGTH = 80
+_DEFAULT_WORKER_NAME_PREFIX = "mindroom-worker"
+_DNS_LABEL_MAX_LENGTH = 63
+_WORKER_ID_DIGEST_LENGTH = 24
+_DESCRIPTIVE_WORKER_ID_DIGEST_LENGTH = 10
 _AGENT_WORKSPACE_DIRNAME = "workspace"
 _PRIVATE_INSTANCE_ROOT_DIRNAME = "private_instances"
+WORKER_CREDENTIALS_DIRNAME = "credentials"
+WORKER_SHARED_CREDENTIALS_DIRNAME = ".shared_credentials"
 _SHARED_ONLY_INTEGRATION_NAMES = frozenset(
     {
         "spotify",
-        "homeassistant",
-    },
-)
-_LOCAL_ONLY_SHARED_INTEGRATION_TOOL_NAMES = frozenset(
-    {
-        "attachments",
-        "gmail",
-        "google_calendar",
-        "google_drive",
-        "google_sheets",
         "homeassistant",
     },
 )
@@ -97,10 +95,10 @@ def parse_tool_execution_identity_payload(
 
     raw_payload = cast("dict[str, object]", payload)
     channel = raw_payload.get("channel")
-    if channel not in ("matrix", "openai_compat"):
+    if channel not in ("matrix", "openai_compat", "mcp"):
         return _invalid_tool_execution_identity_payload(
             strict,
-            f"{error_prefix}.channel must be matrix or openai_compat",
+            f"{error_prefix}.channel must be matrix, openai_compat, or mcp",
         )
 
     agent_name = raw_payload.get("agent_name")
@@ -218,14 +216,71 @@ def stream_with_tool_execution_identity[ChunkT](
     )
 
 
-def _normalize_worker_key_part(value: str) -> str:
+def normalize_worker_key_part(value: str) -> str:
+    """Return one normalized worker-key component."""
     normalized = re.sub(r"[^a-zA-Z0-9._@+-]+", "_", value.strip()).strip("_")
     return normalized or "default"
 
 
-def _normalize_worker_requester_part(value: str) -> str:
-    normalized = re.sub(r"[^a-zA-Z0-9._:@+-]+", "_", value.strip()).strip("_")
-    return normalized or "default"
+def _digest_and_safe_prefix(worker_key: str, prefix: str, *, digest_length: int) -> tuple[str, str]:
+    """Return the worker-key digest and a prefix normalized to a DNS-label-safe slug beside it."""
+    digest = hashlib.sha256(worker_key.encode("utf-8")).hexdigest()[:digest_length]
+    normalized_prefix = re.sub(r"[^a-z0-9-]+", "-", prefix.lower()).strip("-") or _DEFAULT_WORKER_NAME_PREFIX
+    max_prefix_length = _DNS_LABEL_MAX_LENGTH - len(digest) - 1
+    safe_prefix = normalized_prefix[:max_prefix_length].rstrip("-")
+    if not safe_prefix:
+        safe_prefix = _DEFAULT_WORKER_NAME_PREFIX[:max_prefix_length].rstrip("-") or "worker"
+    return digest, safe_prefix
+
+
+def worker_id_for_key(worker_key: str, *, prefix: str) -> str:
+    """Return a DNS-safe resource name for one worker key (63-char label limit)."""
+    digest, safe_prefix = _digest_and_safe_prefix(worker_key, prefix, digest_length=_WORKER_ID_DIGEST_LENGTH)
+    return f"{safe_prefix}-{digest}"
+
+
+def descriptive_worker_id_for_key(worker_key: str, *, prefix: str) -> str:
+    """Return a DNS-safe resource name that keeps the worker key's scope readable.
+
+    Embeds the key's tenant/scope/requester/agent parts as a lowercase slug
+    (dropping the `v1` version tag and the `default` tenant, and reducing
+    Matrix requesters to their localpart) so listings stay human-readable,
+    with a short digest for uniqueness after truncation.
+    """
+    digest, safe_prefix = _digest_and_safe_prefix(
+        worker_key,
+        prefix,
+        digest_length=_DESCRIPTIVE_WORKER_ID_DIGEST_LENGTH,
+    )
+    max_slug_length = max(0, _DNS_LABEL_MAX_LENGTH - len(safe_prefix) - len(digest) - 2)
+    slug = _worker_key_slug(worker_key, max_length=max_slug_length)
+    if not slug:
+        return f"{safe_prefix}-{digest}"
+    return f"{safe_prefix}-{slug}-{digest}"
+
+
+def _worker_key_slug(worker_key: str, *, max_length: int) -> str:
+    parts = worker_key.split(":")
+    if len(parts) >= 4 and parts[0] == "v1":
+        tenant, scope, rest = parts[1], parts[2], parts[3:]
+        if scope == "user":
+            rest = [_requester_localpart(":".join(rest))]
+        elif scope == "user_agent" and len(rest) >= 2:
+            rest = [_requester_localpart(":".join(rest[:-1])), rest[-1]]
+        parts = ([] if tenant == "default" else [tenant]) + [scope, *rest]
+    slug = re.sub(r"[^a-z0-9]+", "-", ":".join(parts).lower()).strip("-")
+    return slug[:max_length].rstrip("-")
+
+
+def _requester_localpart(requester: str) -> str:
+    """Return the localpart of a Matrix-style requester; other requesters pass through."""
+    if requester.startswith("@"):
+        return requester[1:].split(":", 1)[0]
+    return requester
+
+
+def _encode_worker_requester_part(value: str) -> str:
+    return "~" + quote(value, safe="._:@+-")
 
 
 def _normalize_worker_dir_part(value: str) -> str:
@@ -235,7 +290,7 @@ def _normalize_worker_dir_part(value: str) -> str:
 
 def _identity_requester_key(identity: ToolExecutionIdentity) -> str | None:
     if identity.requester_id:
-        return _normalize_worker_requester_part(identity.requester_id)
+        return _encode_worker_requester_part(identity.requester_id)
     return None
 
 
@@ -362,27 +417,45 @@ def build_worker_target_from_runtime_env(
     )
 
 
+def build_agent_toolkit_worker_target(
+    worker_scope: WorkerScope | None,
+    agent_name: str,
+    *,
+    is_private: bool,
+    execution_identity: ToolExecutionIdentity | None,
+    runtime_paths: RuntimePaths,
+) -> ResolvedWorkerTarget:
+    """Build the worker target used when constructing one agent's registered toolkits.
+
+    Single source of truth for the `private_agent_names` derivation shared by
+    agent toolkit construction and dispatch-time tool composition.
+    """
+    if worker_scope == "user_agent":
+        private_agent_names = frozenset({agent_name}) if is_private else frozenset()
+    else:
+        private_agent_names = None
+    return build_worker_target_from_runtime_env(
+        worker_scope,
+        agent_name,
+        execution_identity=execution_identity,
+        runtime_paths=runtime_paths,
+        private_agent_names=private_agent_names,
+    )
+
+
 def worker_scope_allows_shared_only_integrations(worker_scope: WorkerScope | None) -> bool:
     """Return whether a worker scope can use shared-only dashboard integrations."""
     return worker_scope in (None, "shared")
 
 
-def _requires_shared_only_integration_scope(
-    name: str,
-    *,
-    configured_mcp_server_ids: Collection[str] | None = None,
-) -> bool:
-    """Return whether a tool or dashboard integration is restricted to shared scope."""
-    if name in _SHARED_ONLY_INTEGRATION_NAMES:
-        return True
+def _requires_shared_only_integration_scope(name: str) -> bool:
+    """Return whether a tool or dashboard integration is restricted to shared scope.
 
-    from mindroom.mcp.registry import mcp_server_id_from_tool_name, mcp_tool_name  # noqa: PLC0415
-
-    if mcp_server_id_from_tool_name(name) is not None:
-        return True
-    if configured_mcp_server_ids is None:
-        return False
-    return any(name == mcp_tool_name(server_id) for server_id in configured_mcp_server_ids)
+    MCP registry tools are supported on every scope: OAuth-backed servers follow
+    the configured worker scope, and non-OAuth servers always execute through
+    the shared server session without requester credentials.
+    """
+    return name in _SHARED_ONLY_INTEGRATION_NAMES
 
 
 def supports_tool_name_for_worker_scope(name: str, worker_scope: WorkerScope | None) -> bool:
@@ -395,25 +468,11 @@ def supports_tool_name_for_worker_scope(name: str, worker_scope: WorkerScope | N
 def unsupported_shared_only_integration_names(
     names: list[str],
     worker_scope: WorkerScope | None,
-    *,
-    configured_mcp_server_ids: Collection[str] | None = None,
 ) -> list[str]:
     """Return shared-only integration names that are invalid for the effective execution scope."""
     if worker_scope_allows_shared_only_integrations(worker_scope):
         return []
-    return [
-        name
-        for name in names
-        if _requires_shared_only_integration_scope(
-            name,
-            configured_mcp_server_ids=configured_mcp_server_ids,
-        )
-    ]
-
-
-def tool_stays_local(name: str) -> bool:
-    """Return whether one integration tool always stays in the primary runtime."""
-    return name in _LOCAL_ONLY_SHARED_INTEGRATION_TOOL_NAMES
+    return [name for name in names if _requires_shared_only_integration_scope(name)]
 
 
 def unsupported_shared_only_integration_message(
@@ -442,8 +501,8 @@ def resolve_worker_key(
     agent_name: str | None = None,
 ) -> str | None:
     """Derive a stable worker key from scope and execution identity."""
-    tenant_key = _normalize_worker_key_part(identity.tenant_id or identity.account_id or "default")
-    effective_agent_name = _normalize_worker_key_part(agent_name or identity.agent_name)
+    tenant_key = normalize_worker_key_part(identity.tenant_id or identity.account_id or "default")
+    effective_agent_name = normalize_worker_key_part(agent_name or identity.agent_name)
     worker_key: str | None
 
     if worker_scope == "shared":
@@ -474,14 +533,14 @@ def resolve_unscoped_worker_key(
 ) -> str:
     """Derive a stable backend worker key for unscoped sandbox execution."""
     identity = execution_identity
-    tenant_key = _normalize_worker_key_part(
+    tenant_key = normalize_worker_key_part(
         tenant_id
         or (identity.tenant_id if identity is not None and identity.tenant_id is not None else None)
         or account_id
         or (identity.account_id if identity is not None and identity.account_id is not None else None)
         or "default",
     )
-    effective_agent_name = _normalize_worker_key_part(agent_name)
+    effective_agent_name = normalize_worker_key_part(agent_name)
     return f"v1:{tenant_key}:unscoped:{effective_agent_name}"
 
 
@@ -523,7 +582,7 @@ def requires_explicit_private_agent_visibility(worker_key: str) -> bool:
     return resolved_worker_key_scope(worker_key) == "user_agent"
 
 
-def _worker_key_agent_name(worker_key: str) -> str | None:
+def worker_key_agent_name(worker_key: str) -> str | None:
     """Return the encoded agent name for one resolved worker key, when present."""
     scope = resolved_worker_key_scope(worker_key)
     if scope is None or scope == "user":
@@ -617,22 +676,17 @@ def agent_state_root_path(base_storage_path: Path, agent_name: str) -> Path:
     return resolved_base_path / "agents" / _normalize_worker_dir_part(agent_name)
 
 
+def private_instances_root_path(base_storage_path: Path) -> Path:
+    """Return the directory that holds every worker-scoped private-instance namespace."""
+    return shared_storage_root(base_storage_path) / _PRIVATE_INSTANCE_ROOT_DIRNAME
+
+
 def private_instance_scope_root_path(base_storage_path: Path, worker_key: str) -> Path:
     """Return the canonical shared root for one worker-scoped private-instance namespace."""
     resolved_base_path = shared_storage_root(base_storage_path)
     if _is_resolved_private_instance_scope_root(resolved_base_path, worker_key):
         return resolved_base_path
     return resolved_base_path / _PRIVATE_INSTANCE_ROOT_DIRNAME / worker_dir_name(worker_key)
-
-
-def _private_instance_state_root_path(
-    base_storage_path: Path,
-    *,
-    worker_key: str,
-    agent_name: str,
-) -> Path:
-    """Return the canonical durable state root for one private agent instance."""
-    return private_instance_scope_root_path(base_storage_path, worker_key) / _normalize_worker_dir_part(agent_name)
 
 
 def _is_resolved_agent_state_root(path: Path, agent_name: str) -> bool:
@@ -652,42 +706,55 @@ def _is_resolved_worker_root(path: Path, worker_key: str) -> bool:
     return resolved_path.parent.name == "workers" and resolved_path.name == worker_dir_name(worker_key)
 
 
-def visible_state_roots_for_worker_key(
+def written_by_other_workers(relative_path: Path, worker_roots: Path = Path("workers")) -> bool:
+    """Return whether sandbox workers can write below this storage-relative path."""
+    parts = relative_path.parts
+    return (
+        relative_path.is_relative_to(worker_roots)
+        or parts[:1] == (_PRIVATE_INSTANCE_ROOT_DIRNAME,)
+        or (parts[:1] == ("agents",) and parts[2:3] == (_AGENT_WORKSPACE_DIRNAME,))
+    )
+
+
+def private_root_name(agent_name: str, authored_root: str | None) -> str:
+    """Return the private workspace path below one private state root."""
+    return authored_root or f"{agent_name}_data"
+
+
+def visible_workspace_roots(
     base_storage_path: Path,
     worker_key: str,
+    policies: Mapping[str, ResolvedAgentPolicy],
     *,
-    private_agent_names: frozenset[str] = frozenset(),
+    private_agent_names: frozenset[str],
 ) -> tuple[Path, ...]:
-    """Return the canonical durable state roots a worker key is allowed to see by default.
+    """Return the canonical workspaces one worker key may mount and work in.
 
-    Shared agent roots remain canonical for normal agents.
-    Private-instance roots live under a separate shared-storage namespace keyed by
-    worker scope so they are durable without becoming worker-owned state.
-    `user` intentionally sees the shared `agents/` tree plus its own
-    private-instance namespace because it acts as a per-requester multi-agent
-    workstation.
+    Workers see only workspaces, never the state roots or private scopes around them.
+    A ``user`` key is a per-requester workstation that sees every ``worker_scope: user``
+    agent's workspace, private ones below its own scope. A ``user_agent`` key of an
+    agent in ``private_agent_names`` sees only that private workspace, so a stale
+    policy never widens it to the shared one.
     """
     scope = resolved_worker_key_scope(worker_key)
-    if scope is None:
-        return ()
     if scope == "user":
-        return (
-            shared_storage_root(base_storage_path) / "agents",
-            private_instance_scope_root_path(base_storage_path, worker_key),
+        return tuple(
+            private_instance_scope_root_path(base_storage_path, worker_key)
+            / agent_name
+            / private_root_name(agent_name, policy.private_root)
+            if policy.is_private
+            else agent_workspace_root_path(base_storage_path, agent_name)
+            for agent_name, policy in sorted(policies.items())
+            if policy.effective_execution_scope == "user"
         )
-
-    agent_name = _worker_key_agent_name(worker_key)
+    agent_name = worker_key_agent_name(worker_key) if scope is not None else None
     if agent_name is None:
         return ()
     if scope == "user_agent" and agent_name in private_agent_names:
-        return (
-            _private_instance_state_root_path(
-                base_storage_path,
-                worker_key=worker_key,
-                agent_name=agent_name,
-            ),
-        )
-    return (agent_state_root_path(base_storage_path, agent_name),)
+        policy = policies.get(agent_name)
+        root = private_root_name(agent_name, policy.private_root if policy is not None else None)
+        return (private_instance_scope_root_path(base_storage_path, worker_key) / agent_name / root,)
+    return (agent_workspace_root_path(base_storage_path, agent_name),)
 
 
 def agent_workspace_root_path(base_storage_path: Path, agent_name: str) -> Path:
@@ -741,7 +808,12 @@ def resolve_agent_owned_path(
     files are authoritative.
     """
     relative_target = agent_workspace_relative_path(path_text)
-    agent_workspace_root = agent_workspace_root_path(base_storage_path, agent_name).resolve()
+    lexical_workspace_root = agent_workspace_root_path(base_storage_path, agent_name)
+    agent_workspace_root = lexical_workspace_root.resolve()
+    if agent_workspace_root != lexical_workspace_root:
+        # Workers of older releases could replace the workspace; the mount planner refuses such links too.
+        msg = f"Agent workspace must not be reached through a link: {lexical_workspace_root}"
+        raise ValueError(msg)
     return _resolve_agent_workspace_target(relative_target, agent_root=agent_workspace_root)
 
 

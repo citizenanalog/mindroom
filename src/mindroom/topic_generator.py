@@ -8,11 +8,13 @@ import nio
 from agno.agent import Agent
 from pydantic import BaseModel, Field
 
-from mindroom import model_loading
 from mindroom.ai_runtime import cached_agent_run
 from mindroom.entity_resolution import configured_routable_entity_names_for_room
+from mindroom.helper_usage import record_system_usage
 from mindroom.logging_config import get_logger
 from mindroom.matrix import state as matrix_state
+from mindroom.matrix.room_reconciliation import RoomStateSnapshot, read_state_event
+from mindroom.providers import model_loading
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
@@ -117,6 +119,7 @@ Generate the topic:"""
     except Exception:
         logger.exception("room_topic_generation_failed", room_key=room_key, session_id=session_id)
         return None
+    await record_system_usage(response, runtime_paths=runtime_paths, kind="room_topic")
     content = response.content
     if not isinstance(content, _RoomTopic):
         logger.warning(
@@ -135,6 +138,8 @@ async def ensure_room_has_topic(
     room_name: str,
     config: Config,
     runtime_paths: RuntimePaths,
+    *,
+    snapshot: RoomStateSnapshot | None = None,
 ) -> bool:
     """Ensure a room has a topic set, generating one if needed.
 
@@ -145,12 +150,13 @@ async def ensure_room_has_topic(
         room_name: Display name for the room
         config: Configuration with agent settings
         runtime_paths: Explicit runtime context for topic generation
+        snapshot: Complete pass-local room state, if already read by reconciliation
 
     Returns:
         True if topic was set or already exists, False on error
 
     """
-    response = await client.room_get_state_event(room_id, "m.room.topic")
+    response = await read_state_event(client, room_id, "m.room.topic", snapshot=snapshot)
     if isinstance(response, nio.RoomGetStateEventResponse) and response.content.get("topic"):
         logger.debug(
             "room_topic_already_present",
@@ -167,6 +173,15 @@ async def ensure_room_has_topic(
         logger.warning("generate_room_topic_failed", room_id=room_id, room_key=room_key)
         return False
 
+    # Generation can take seconds; a human topic added meanwhile must win.
+    response = await read_state_event(client, room_id, "m.room.topic")
+    if isinstance(response, nio.RoomGetStateEventResponse):
+        if response.content.get("topic"):
+            return True
+    elif response.status_code != "M_NOT_FOUND":
+        logger.warning("room_topic_recheck_failed", room_id=room_id, error=str(response))
+        return False
+
     # Set the topic
     response = await client.room_put_state(
         room_id=room_id,
@@ -178,5 +193,5 @@ async def ensure_room_has_topic(
         logger.info("room_topic_set", room_id=room_id, room_key=room_key, topic=topic)
         return True
 
-    logger.warning("set_room_topic_failed", room_id=room_id, room_key=room_key, error=response)
+    logger.warning("set_room_topic_failed", room_id=room_id, room_key=room_key, error=str(response))
     return False

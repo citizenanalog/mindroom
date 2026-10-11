@@ -2,11 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { VoiceConfig } from "./VoiceConfig";
 import { useConfigStore } from "@/store/configStore";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
 import type { ConfigDiagnostic } from "@/lib/configValidation";
-import { Config } from "@/types/config";
+import { Agent, Config, Room } from "@/types/config";
 import type { SaveConfigResult } from "@/store/configStore";
 
 vi.mock("@/store/configStore");
+vi.mock("@/hooks/useConfigSchema", () => ({
+  useConfigSchema: vi.fn(() => ({ schema: null, error: null, retry: vi.fn() })),
+}));
 
 const { mockToast, mockToaster } = vi.hoisted(() => ({
   mockToast: vi.fn(),
@@ -21,15 +25,17 @@ vi.mock("@/components/ui/toaster", () => ({
 
 describe("VoiceConfig", () => {
   const mockSaveConfig = vi.fn();
-  const mockUpdateVoiceConfig = vi.fn();
+  const mockUpdateConfigValue = vi.fn();
   type MockStoreState = {
     config: Config;
+    agents: Agent[];
+    rooms: Room[];
     diagnostics: ConfigDiagnostic[];
     syncStatus: "synced" | "syncing" | "error" | "disconnected";
     isDirty: boolean;
     isLoading: boolean;
     saveConfig: () => Promise<SaveConfigResult>;
-    updateVoiceConfig: typeof mockUpdateVoiceConfig;
+    updateConfigValue: typeof mockUpdateConfigValue;
   };
   type MockedStoreHook = {
     (): MockStoreState;
@@ -41,14 +47,14 @@ describe("VoiceConfig", () => {
 
   const createConfig = (): Partial<Config> => ({
     models: {
-      default: { provider: "openai", id: "gpt-4o-mini" },
-      fast: { provider: "openai", id: "gpt-4.1-mini" },
+      default: { provider: "openai", id: "gpt-5.6-luna" },
+      fast: { provider: "openai", id: "gpt-5.6-terra" },
     },
     voice: {
       enabled: true,
       visible_router_echo: true,
       stt: {
-        provider: "custom",
+        provider: "openai_compatible",
         model: "whisper-1",
         host: "http://localhost:8080",
         api_key: "",
@@ -62,12 +68,14 @@ describe("VoiceConfig", () => {
   const setMockStore = (config: Partial<Config>) => {
     mockStoreState = {
       config: config as Config,
+      agents: [],
+      rooms: [],
       diagnostics: [],
       syncStatus: "synced",
       isDirty: false,
       isLoading: false,
       saveConfig: mockSaveConfig,
-      updateVoiceConfig: mockUpdateVoiceConfig,
+      updateConfigValue: mockUpdateConfigValue,
     };
     mockedUseConfigStore.mockReturnValue(mockStoreState);
     mockedUseConfigStore.getState = vi.fn(() => mockStoreState);
@@ -88,12 +96,12 @@ describe("VoiceConfig", () => {
 
     expect(screen.getByText("Current Effective Settings")).toBeInTheDocument();
     expect(screen.getByText("OpenAI-compatible API")).toBeInTheDocument();
-    expect(screen.getByText("OpenAI")).toBeInTheDocument();
+    expect(screen.getAllByText("OpenAI-compatible")).not.toHaveLength(0);
     expect(
       screen.getByText("http://localhost:8080/v1/audio/transcriptions"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("OPENAI_API_KEY environment variable"),
+      screen.getByText("Non-secret compatibility placeholder"),
     ).toBeInTheDocument();
   });
 
@@ -114,6 +122,11 @@ describe("VoiceConfig", () => {
   });
 
   it("uses default openai endpoint when base url is cleared", async () => {
+    const config = createConfig();
+    if (!config.voice) throw new Error("Expected voice config");
+    config.voice.stt.provider = "openai";
+    setMockStore(config);
+
     render(<VoiceConfig />);
 
     const hostInput = document.getElementById(
@@ -122,7 +135,7 @@ describe("VoiceConfig", () => {
     fireEvent.change(hostInput, { target: { value: "" } });
 
     await waitFor(() => {
-      expect(mockUpdateVoiceConfig).toHaveBeenCalledWith({
+      expect(mockUpdateConfigValue).toHaveBeenCalledWith(["voice"], {
         enabled: true,
         visible_router_echo: true,
         stt: {
@@ -141,7 +154,7 @@ describe("VoiceConfig", () => {
     });
   });
 
-  it("normalizes and saves voice settings as openai provider", async () => {
+  it("normalizes and saves voice settings without rewriting the provider", async () => {
     const config = createConfig();
     if (!config.voice) throw new Error("Expected voice config");
     config.voice.stt.host = "http://localhost:8080/";
@@ -156,14 +169,13 @@ describe("VoiceConfig", () => {
 
     await waitFor(() => {
       expect(mockSaveConfig).toHaveBeenCalled();
-      expect(mockUpdateVoiceConfig).toHaveBeenLastCalledWith({
+      expect(mockUpdateConfigValue).toHaveBeenLastCalledWith(["voice"], {
         enabled: true,
         visible_router_echo: true,
         stt: {
-          provider: "openai",
+          provider: "openai_compatible",
           model: "whisper-1",
           host: "http://localhost:8080",
-          api_key: "",
         },
         intelligence: {
           model: "default",
@@ -174,6 +186,29 @@ describe("VoiceConfig", () => {
         description: "Your voice settings have been updated successfully.",
       });
     });
+  });
+
+  it("does not append a duplicate v1 path", () => {
+    const config = createConfig();
+    if (!config.voice) throw new Error("Expected voice config");
+    config.voice.stt.host = "http://localhost:8080/v1/";
+    setMockStore(config);
+
+    render(<VoiceConfig />);
+
+    expect(
+      screen.getByText("http://localhost:8080/v1/audio/transcriptions"),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the current transcription model for new voice config", () => {
+    const config = createConfig();
+    delete config.voice;
+    setMockStore(config);
+
+    render(<VoiceConfig />);
+
+    expect(document.getElementById("stt-model")).toHaveValue("gpt-transcribe");
   });
 
   it("shows an error toast when saving fails", async () => {
@@ -263,11 +298,11 @@ describe("VoiceConfig", () => {
     fireEvent.click(visibleRouterEchoToggle);
 
     await waitFor(() => {
-      expect(mockUpdateVoiceConfig).toHaveBeenCalledWith({
+      expect(mockUpdateConfigValue).toHaveBeenCalledWith(["voice"], {
         enabled: true,
         visible_router_echo: true,
         stt: {
-          provider: "openai",
+          provider: "openai_compatible",
           model: "whisper-1",
           host: "http://localhost:8080",
           api_key: "",
@@ -291,5 +326,94 @@ describe("VoiceConfig", () => {
     expect(
       screen.getByRole("button", { name: "Save Voice Configuration" }),
     ).toBeDisabled();
+  });
+
+  it("shows a loading message on the Voice Calls card until the schema arrives", () => {
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: null,
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<VoiceConfig />);
+    expect(screen.getByText("Loading call settings...")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Save Call Settings" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("enables voice calls from the Voice Calls card", async () => {
+    mockStoreState.diagnostics = [];
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: { calls: { $ref: "#/$defs/CallsConfig" } },
+        $defs: {
+          CallsConfig: {
+            type: "object",
+            properties: {
+              enabled: {
+                type: "boolean",
+                default: false,
+                description: "Enable agents joining Element Call voice calls",
+              },
+            },
+          },
+          VoiceSTTConfig: { type: "object", properties: {} },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<VoiceConfig />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Enabled" }));
+
+    expect(mockUpdateConfigValue).toHaveBeenCalledWith(
+      ["calls", "enabled"],
+      true,
+    );
+
+    mockUpdateConfigValue.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Save Call Settings" }));
+    await waitFor(() => expect(mockSaveConfig).toHaveBeenCalled());
+    // Saving calls must not write the voice form's defaults.
+    expect(mockUpdateConfigValue).not.toHaveBeenCalled();
+  });
+
+  it("edits speech-to-text options through More speech-to-text settings", () => {
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          VoiceSTTConfig: {
+            type: "object",
+            properties: {
+              model: { type: "string" },
+              credentials_service: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+                description: "Named speech credential service",
+              },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<VoiceConfig />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /More speech-to-text settings/ }),
+    );
+    fireEvent.change(screen.getByLabelText("Credentials service"), {
+      target: { value: "speech" },
+    });
+
+    expect(mockUpdateConfigValue).toHaveBeenLastCalledWith(
+      ["voice", "stt", "credentials_service"],
+      "speech",
+    );
   });
 });

@@ -18,6 +18,8 @@ import {
   updateConsent
 } from '../api'
 import { createClient } from '../supabase/client'
+import { getCachedInstance, loadInstance } from '../instance-resource'
+import { instanceCache } from '../cache'
 
 // Mock the Supabase client
 jest.mock('../supabase/client', () => ({
@@ -60,7 +62,7 @@ describe('API Client', () => {
 
     // Setup fetch mock
     mockFetch = global.fetch as jest.MockedFunction<typeof fetch>
-    mockFetch.mockClear()
+    mockFetch.mockReset()
   })
 
   describe('apiCall', () => {
@@ -208,6 +210,21 @@ describe('API Client', () => {
 
   describe('Instance Management', () => {
     describe('listInstances', () => {
+      it.each([
+        null,
+        { access_token: 'other-token', user: { id: 'other-user' } },
+      ])('rejects an obsolete account load before another session can populate its cache: %j', async (session) => {
+        instanceCache.clear()
+        mockSupabase.auth.getSession.mockResolvedValue({ data: { session } })
+        mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+          instances: [{ id: 'other-instance', instance_id: 2, status: 'running', tier: 'byok' }],
+        }), { status: 200 }))
+
+        await expect(loadInstance('user-123')).rejects.toThrow('Authenticated account changed')
+        expect(mockFetch).not.toHaveBeenCalled()
+        expect(getCachedInstance('user-123')).toBeNull()
+      })
+
       it('should list instances successfully', async () => {
         const instances = [
           { id: 1, status: 'running' },
@@ -217,7 +234,7 @@ describe('API Client', () => {
           new Response(JSON.stringify(instances), { status: 200 })
         )
 
-        const result = await listInstances()
+        const result = await listInstances('user-123')
 
         expect(mockFetch).toHaveBeenCalledWith(
           'http://localhost:8000/my/instances',
@@ -343,7 +360,7 @@ describe('API Client', () => {
           new Response(JSON.stringify(sessionData), { status: 200 })
         )
 
-        const result = await createCheckoutSession('pro', 'yearly', 3)
+        const result = await createCheckoutSession('pro', 'yearly')
 
         expect(mockFetch).toHaveBeenCalledWith(
           'http://localhost:8000/stripe/checkout',
@@ -351,8 +368,7 @@ describe('API Client', () => {
             method: 'POST',
             body: JSON.stringify({
               tier: 'pro',
-              billing_cycle: 'yearly',
-              quantity: 3
+              billing_cycle: 'yearly'
             })
           })
         )
@@ -371,8 +387,7 @@ describe('API Client', () => {
           expect.objectContaining({
             body: JSON.stringify({
               tier: 'basic',
-              billing_cycle: 'monthly',
-              quantity: 1
+              billing_cycle: 'monthly'
             })
           })
         )

@@ -9,15 +9,22 @@ from unittest.mock import AsyncMock, Mock, patch
 import nio
 import pytest
 
-from mindroom.bot import AgentBot, create_bot_for_entity
+from mindroom.bot import AgentBot
 from mindroom.config.main import Config
 from mindroom.matrix.presence import is_user_online, should_use_streaming
 from mindroom.matrix.users import AgentMatrixUser
+from mindroom.response_runner import ResponseRequest
+from mindroom.response_sources import ResponseSources
+from tests.access_schema_support import with_current_room_member_access
+from tests.authorization_helpers import (
+    make_test_bot_for_entity,
+)
 from tests.conftest import (
     bind_runtime_paths,
     delivered_matrix_event,
-    install_runtime_cache_support,
+    install_runtime_journal_support,
     make_matrix_client_mock,
+    request_envelope,
     runtime_paths_for,
     test_runtime_paths,
 )
@@ -272,14 +279,16 @@ class TestBotIntegration:
         from mindroom.config.agent import AgentConfig  # noqa: PLC0415
 
         config = bind_runtime_paths(
-            Config(
-                agents={
-                    "test_agent": AgentConfig(
-                        display_name="Test Agent",
-                        model="gpt-4",
-                        rooms=["#test:localhost"],
-                    ),
-                },
+            with_current_room_member_access(
+                Config(
+                    agents={
+                        "test_agent": AgentConfig(
+                            display_name="Test Agent",
+                            model="gpt-6-astra",
+                            rooms=["#test:localhost"],
+                        ),
+                    },
+                ),
             ),
             test_runtime_paths(tmp_path),
         )
@@ -292,21 +301,19 @@ class TestBotIntegration:
             access_token="test_token",  # noqa: S106
         )
 
-        bot = create_bot_for_entity("test_agent", agent_user, config, runtime_paths_for(config), tmp_path)
+        bot = make_test_bot_for_entity("test_agent", agent_user, config, runtime_paths_for(config), tmp_path)
         assert isinstance(bot, AgentBot)
         bot.client = _mock_client()
         bot.client.user_id = "@mindroom_test_agent:localhost"
         bot.client.room_send = AsyncMock()
         bot.client.room_put_state = AsyncMock()
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
         expected_config = config
 
         async def mock_send_message_result(
             _client: object,
             _room_id: str,
             content: dict,
-            *,
-            config: Config,
         ) -> object:
             assert config is expected_config
             return delivered_matrix_event("$stream", content)
@@ -317,8 +324,6 @@ class TestBotIntegration:
             _event_id: str,
             content: dict,
             _display_text: str,
-            *,
-            config: Config,
         ) -> object:
             assert config is expected_config
             return delivered_matrix_event("$edit", content)
@@ -328,13 +333,24 @@ class TestBotIntegration:
             patch("mindroom.streaming.send_message_result", side_effect=mock_send_message_result),
             patch("mindroom.streaming.edit_message_result", side_effect=mock_edit_message_result),
         ):
-            await bot._generate_response(
-                room_id="!test:localhost",
-                prompt="Hello bot",
-                reply_to_event_id="$msg123",
-                thread_id="$thread123",
-                thread_history=[],
-                user_id="@user:localhost",
+            await bot._response_runner.generate_response(
+                ResponseRequest(
+                    sources=ResponseSources(
+                        pending_event_ids=("$msg123",),
+                        logical_source_event_ids=("$msg123",),
+                    ),
+                    prompt="Hello bot",
+                    thread_history=[],
+                    user_id="@user:localhost",
+                    response_envelope=request_envelope(
+                        room_id="!test:localhost",
+                        reply_to_event_id="$msg123",
+                        thread_id="$thread123",
+                        prompt="Hello bot",
+                        user_id="@user:localhost",
+                        agent_name="test_agent",
+                    ),
+                ),
             )
 
         # Should have used streaming since user is online
@@ -361,14 +377,16 @@ class TestBotIntegration:
         from mindroom.config.agent import AgentConfig  # noqa: PLC0415
 
         config = bind_runtime_paths(
-            Config(
-                agents={
-                    "test_agent": AgentConfig(
-                        display_name="Test Agent",
-                        model="gpt-4",
-                        rooms=["#test:localhost"],
-                    ),
-                },
+            with_current_room_member_access(
+                Config(
+                    agents={
+                        "test_agent": AgentConfig(
+                            display_name="Test Agent",
+                            model="gpt-6-astra",
+                            rooms=["#test:localhost"],
+                        ),
+                    },
+                ),
             ),
             test_runtime_paths(tmp_path),
         )
@@ -381,22 +399,33 @@ class TestBotIntegration:
             access_token="test_token",  # noqa: S106
         )
 
-        bot = create_bot_for_entity("test_agent", agent_user, config, runtime_paths_for(config), tmp_path)
+        bot = make_test_bot_for_entity("test_agent", agent_user, config, runtime_paths_for(config), tmp_path)
         assert isinstance(bot, AgentBot)
         bot.client = _mock_client()
         bot.client.user_id = "@mindroom_test_agent:localhost"
         bot.client.room_send = AsyncMock()
         bot.client.room_put_state = AsyncMock()
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
 
         # Simulate a message from a user
-        await bot._generate_response(
-            room_id="!test:localhost",
-            prompt="Hello bot",
-            reply_to_event_id="$msg123",
-            thread_id="$thread123",
-            thread_history=[],
-            user_id="@user:localhost",
+        await bot._response_runner.generate_response(
+            ResponseRequest(
+                sources=ResponseSources(
+                    pending_event_ids=("$msg123",),
+                    logical_source_event_ids=("$msg123",),
+                ),
+                prompt="Hello bot",
+                thread_history=[],
+                user_id="@user:localhost",
+                response_envelope=request_envelope(
+                    room_id="!test:localhost",
+                    reply_to_event_id="$msg123",
+                    thread_id="$thread123",
+                    prompt="Hello bot",
+                    user_id="@user:localhost",
+                    agent_name="test_agent",
+                ),
+            ),
         )
 
         # Should have used non-streaming since user is offline

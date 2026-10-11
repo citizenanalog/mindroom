@@ -1,0 +1,1070 @@
+"""Direct unit tests for the debounced config-reload lifecycle."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+import mindroom.orchestration.config_lifecycle as lifecycle_module
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config, load_config
+from mindroom.config.reload_status import ConfigReloadStatus
+from mindroom.orchestration.config_lifecycle import ConfigReloadLifecycle, _ReplacementDrainState
+from mindroom.orchestration.config_updates import ConfigUpdatePlan
+from mindroom.orchestration.runtime import create_logged_task
+from mindroom.response_admission import ResponseAdmissionGate
+from tests.conftest import bind_runtime_paths, test_runtime_paths
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from pathlib import Path
+
+    from mindroom.bot import AgentBot, TeamBot
+
+
+def _make_lifecycle(
+    tmp_path: Path,
+    *,
+    running: bool = True,
+    current_config: Config | None = None,
+    agent_bots: Mapping[str, AgentBot | TeamBot] | None = None,
+    response_admission_gate: ResponseAdmissionGate | None = None,
+) -> ConfigReloadLifecycle:
+    """Return a lifecycle wired to stub dependencies."""
+    gate = response_admission_gate or ResponseAdmissionGate()
+    return ConfigReloadLifecycle(
+        runtime_paths=test_runtime_paths(tmp_path),
+        is_running=lambda: running,
+        current_config=lambda: current_config,
+        agent_bots=lambda: agent_bots if agent_bots is not None else {},
+        load_initial_config=AsyncMock(return_value=False),
+        apply_update_plan=AsyncMock(return_value=True),
+        response_admission_gate=gate,
+        before_runtime_replacement=AsyncMock(),
+    )
+
+
+def test_replacement_drain_state_tracks_wait_warning_and_force() -> None:
+    """Replacement-drain helpers should model wait, warning, and force transitions."""
+    state = _ReplacementDrainState()
+
+    assert state.waiting_for_idle is False
+
+    state.begin_wait(now=10.0)
+
+    assert state.waiting_for_idle is True
+    assert (
+        state.should_warn(
+            now=10.5,
+            warning_after_seconds=1.0,
+            warning_interval_seconds=10.0,
+        )
+        is False
+    )
+    assert (
+        state.should_warn(
+            now=11.0,
+            warning_after_seconds=1.0,
+            warning_interval_seconds=10.0,
+        )
+        is True
+    )
+
+    state.mark_warning(11.0)
+
+    assert (
+        state.should_warn(
+            now=15.0,
+            warning_after_seconds=1.0,
+            warning_interval_seconds=10.0,
+        )
+        is False
+    )
+    assert (
+        state.should_warn(
+            now=21.0,
+            warning_after_seconds=1.0,
+            warning_interval_seconds=10.0,
+        )
+        is True
+    )
+    assert state.should_force_apply(now=11.9, force_after_seconds=2.0) is False
+    assert state.should_force_apply(now=12.0, force_after_seconds=2.0) is True
+
+
+@pytest.mark.asyncio
+async def test_request_reload_is_ignored_until_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reload requests before startup finishes should be dropped."""
+    logger_mock = MagicMock()
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.logger", logger_mock)
+    lifecycle = _make_lifecycle(tmp_path, running=False)
+
+    lifecycle.request_reload()
+
+    assert lifecycle._requested_at is None
+    assert lifecycle._reload_task is None
+    assert any(
+        call.args and call.args[0] == "Ignoring config change while startup is still in progress"
+        for call in logger_mock.info.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_rapid_requests_coalesce_into_one_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Multiple quick reload requests should extend the debounce and apply once."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    lifecycle = _make_lifecycle(tmp_path)
+    lifecycle._update_config = AsyncMock(return_value=True)
+
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+
+    await asyncio.sleep(0.02)
+    lifecycle.request_reload()
+
+    assert lifecycle._reload_task is task
+    await asyncio.wait_for(task, timeout=1)
+    lifecycle._update_config.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reload_drains_active_responses_before_applying(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queued reload should wait until in-flight responses finish."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    gate = ResponseAdmissionGate()
+    assert gate.admit()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    load_config_mock = MagicMock(return_value=new_config)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.load_config", load_config_mock)
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=gate,
+    )
+
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+
+    await asyncio.sleep(0.05)
+    load_config_mock.assert_called_once()
+    lifecycle.apply_update_plan.assert_not_awaited()
+
+    gate.release()
+    await asyncio.wait_for(task, timeout=1)
+    lifecycle.apply_update_plan.assert_awaited_once()
+    assert gate.closed is False
+
+
+_AGENT1_YAML = "agents:\n  agent1:\n    display_name: Agent 1\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("new_yaml", "waits_for_idle"),
+    [
+        pytest.param(_AGENT1_YAML + "defaults:\n  enable_streaming: false\n", False, id="restarts-nothing"),
+        pytest.param(_AGENT1_YAML + "    role: Changed\n", False, id="live-agent-edit"),
+        pytest.param(_AGENT1_YAML.replace("Agent 1", "Agent One"), True, id="restarts-agent"),
+        pytest.param(_AGENT1_YAML + "administrators:\n  - '@admin:localhost'\n", True, id="reply-authorization"),
+    ],
+)
+async def test_busy_reload_waits_only_for_restarts_or_reply_authorization_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    new_yaml: str,
+    waits_for_idle: bool,
+) -> None:
+    """A reload that restarts nothing applies during replies and still reports its fingerprint applied."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    runtime_paths = test_runtime_paths(tmp_path)
+    runtime_paths.config_path.write_text(_AGENT1_YAML, encoding="utf-8")
+    gate = ResponseAdmissionGate()
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=load_config(runtime_paths),
+        agent_bots={"router": MagicMock(), "agent1": MagicMock()},
+        response_admission_gate=gate,
+    )
+    runtime_paths.config_path.write_text(new_yaml, encoding="utf-8")
+    observed_gate_states: list[tuple[bool, int]] = []
+
+    async def apply_plan(*_args: object) -> bool:
+        observed_gate_states.append((gate.closed, gate.in_flight_response_count))
+        return True
+
+    lifecycle.apply_update_plan = AsyncMock(side_effect=apply_plan)
+
+    assert gate.admit()
+    update_task = asyncio.create_task(lifecycle._update_config())
+    try:
+        done, _pending = await asyncio.wait({update_task}, timeout=0.5)
+        assert bool(done) is not waits_for_idle
+    finally:
+        gate.release()
+    assert await asyncio.wait_for(update_task, timeout=1) is True
+
+    # Admission is closed for the swap itself, over the busy response only when nothing restarts.
+    assert observed_gate_states == [(True, 0 if waits_for_idle else 1)]
+    # A swap that replaces no runtime must not cancel running exports through the replacement hook.
+    assert lifecycle.before_runtime_replacement.await_count == (1 if waits_for_idle else 0)
+    assert gate.closed is False
+    assert lifecycle.status == ConfigReloadStatus(
+        status="applied",
+        fingerprint=load_config(runtime_paths).source_fingerprint,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reload_does_not_hold_config_lock_while_draining_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Response drain must not block unrelated config-lock owners."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    gate = ResponseAdmissionGate()
+    assert gate.admit()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    load_started = threading.Event()
+
+    def observed_load_config(*_args: object, **_kwargs: object) -> Config:
+        load_started.set()
+        return new_config
+
+    load_config_mock = MagicMock(side_effect=observed_load_config)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.load_config", load_config_mock)
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=gate,
+    )
+
+    update_task = asyncio.create_task(lifecycle._update_config())
+    assert await asyncio.to_thread(load_started.wait, 1)
+    await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(lifecycle.config_update_lock.acquire(), timeout=0.1)
+    lifecycle.config_update_lock.release()
+    lifecycle.apply_update_plan.assert_not_awaited()
+
+    gate.release()
+    assert await asyncio.wait_for(update_task, timeout=1) is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_noop_reload_does_not_wait_for_active_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A comment-only or formatting-only save must not close response admission."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0)
+    gate = ResponseAdmissionGate()
+    assert gate.admit()
+    current_config = Config()
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: Config(),
+    )
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=gate,
+    )
+
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+    finally:
+        gate.release()
+        await asyncio.gather(task, return_exceptions=True)
+
+    lifecycle.apply_update_plan.assert_not_awaited()
+    assert gate.closed is False
+
+
+@pytest.mark.asyncio
+async def test_semantic_noop_reload_records_new_include_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Equivalent config moved into an include must make that include watchable."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    runtime_paths.config_path.write_text("defaults:\n  enable_streaming: true\n", encoding="utf-8")
+    current_config = load_config(runtime_paths)
+    included_defaults = tmp_path / "defaults.yaml"
+    included_defaults.write_text("enable_streaming: true\n", encoding="utf-8")
+    runtime_paths.config_path.write_text("defaults: !include defaults.yaml\n", encoding="utf-8")
+    reloaded_config = load_config(runtime_paths)
+    assert current_config.authored_model_dump() == reloaded_config.authored_model_dump()
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: reloaded_config,
+    )
+    lifecycle = _make_lifecycle(tmp_path, current_config=current_config)
+
+    assert await lifecycle._update_config() is False
+
+    assert lifecycle.loaded_source_files == reloaded_config.source_files
+    assert included_defaults.resolve() in lifecycle.loaded_source_files
+    lifecycle.apply_update_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_replacement_admission_serializes_config_and_mcp_owners(tmp_path: Path) -> None:
+    """Concurrent replacement flows must never share or prematurely reopen gate ownership."""
+    gate = ResponseAdmissionGate()
+    lifecycle = _make_lifecycle(tmp_path, response_admission_gate=gate)
+    mcp_started = asyncio.Event()
+    config_started = asyncio.Event()
+
+    async def apply_mcp_restart() -> None:
+        mcp_started.set()
+        await asyncio.Future()
+
+    async def apply_config_reload() -> None:
+        config_started.set()
+        await asyncio.Future()
+
+    mcp_task = asyncio.create_task(
+        lifecycle.apply_with_response_admission(
+            apply_mcp_restart,
+            operation_name="MCP catalog restart",
+            request_is_current=lambda: True,
+        ),
+    )
+    await mcp_started.wait()
+    config_task = asyncio.create_task(
+        lifecycle.apply_with_response_admission(
+            apply_config_reload,
+            operation_name="configuration reload",
+            request_is_current=lambda: True,
+        ),
+    )
+    await asyncio.sleep(0)
+    assert gate.closed
+    assert not config_started.is_set()
+    mcp_task.cancel()
+    await asyncio.gather(mcp_task, return_exceptions=True)
+    await asyncio.wait_for(config_started.wait(), timeout=1)
+    assert gate.closed
+    config_task.cancel()
+    await asyncio.gather(config_task, return_exceptions=True)
+    assert gate.closed is False
+
+
+@pytest.mark.asyncio
+async def test_stuck_drain_warns_then_stops_deferring(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A wedged drain should warn, keep waiting, and only stop deferring at the bound."""
+    warning_after_seconds = 0.5
+    force_after_seconds = 1_000.0
+    wait_started_at = 10.0
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0)
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_WARNING_AFTER_SECONDS",
+        warning_after_seconds,
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_WARNING_INTERVAL_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_FORCE_AFTER_SECONDS",
+        force_after_seconds,
+    )
+    logger_mock = MagicMock()
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.logger", logger_mock)
+    lifecycle = _make_lifecycle(tmp_path)
+    drain_state = _ReplacementDrainState()
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    loop.time.side_effect = [wait_started_at, wait_started_at + 1.0, wait_started_at + force_after_seconds]
+
+    should_defer = await lifecycle._should_defer_replacement_for_active_responses(
+        drain_state=drain_state,
+        active_response_count=1,
+        loop=loop,
+        operation_name="configuration reload",
+    )
+    assert should_defer is True
+    logger_mock.info.assert_any_call(
+        "Deferring replacement until active responses finish",
+        operation="configuration reload",
+        active_response_count=1,
+    )
+
+    # Past the warning threshold but still inside the bound: warn and keep waiting.
+    should_defer = await lifecycle._should_defer_replacement_for_active_responses(
+        drain_state=drain_state,
+        active_response_count=1,
+        loop=loop,
+        operation_name="configuration reload",
+    )
+    assert should_defer is True
+    assert any(
+        call.args
+        and call.args[0] == "Replacement still waiting for active responses to finish"
+        and call.kwargs["operation"] == "configuration reload"
+        for call in logger_mock.warning.call_args_list
+    )
+    logger_mock.error.assert_not_called()
+
+    # At the bound: stop deferring so the change cannot be starved forever.
+    should_defer = await lifecycle._should_defer_replacement_for_active_responses(
+        drain_state=drain_state,
+        active_response_count=1,
+        loop=loop,
+        operation_name="configuration reload",
+    )
+    assert should_defer is False
+    assert any(
+        call.args
+        and call.args[0] == "Applying replacement while responses are still active"
+        and call.kwargs["operation"] == "configuration reload"
+        for call in logger_mock.error.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_request_during_drain_keeps_waiting_for_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A newer config change should not make an active response reload early."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.005)
+    logger_mock = MagicMock()
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.logger", logger_mock)
+    gate = ResponseAdmissionGate()
+    assert gate.admit()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    load_config_mock = MagicMock(return_value=new_config)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.load_config", load_config_mock)
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=gate,
+    )
+
+    lifecycle.request_reload()
+    await asyncio.sleep(0.06)
+    lifecycle.request_reload()
+    await asyncio.sleep(0.06)
+
+    task = lifecycle._reload_task
+    assert task is not None
+    assert load_config_mock.call_count == 2
+    lifecycle.apply_update_plan.assert_not_awaited()
+
+    gate.release()
+    await asyncio.wait_for(task, timeout=1)
+
+    lifecycle.apply_update_plan.assert_awaited_once()
+    logger_mock.info.assert_any_call("Configuration reload superseded before publication; skipping")
+
+
+@pytest.mark.asyncio
+async def test_failed_update_does_not_strand_queued_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed update must not prevent a subsequently queued reload from running."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    lifecycle = _make_lifecycle(tmp_path)
+
+    call_count = 0
+
+    async def failing_then_succeeding_update() -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call fails; queue a new reload during the failure
+            lifecycle.request_reload()
+            msg = "Simulated config update failure"
+            raise RuntimeError(msg)
+        return True
+
+    lifecycle._update_config = AsyncMock(side_effect=failing_then_succeeding_update)
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+
+    await asyncio.wait_for(task, timeout=2)
+
+    assert lifecycle._update_config.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_config_change_during_update_triggers_second_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A config change arriving while an update runs should cause a second reload."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    lifecycle = _make_lifecycle(tmp_path)
+
+    call_count = 0
+
+    async def update_config_with_second_change() -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            lifecycle.request_reload()
+        return True
+
+    lifecycle._update_config = AsyncMock(side_effect=update_config_with_second_change)
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+
+    await asyncio.wait_for(task, timeout=2)
+
+    assert lifecycle._update_config.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_logs_exception_instead_of_suppressing_silently(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reload-task cancellation should log unexpected failures and keep shutdown moving."""
+    logger_mock = MagicMock()
+    monkeypatch.setattr("mindroom.orchestration.runtime.logger", logger_mock)
+    lifecycle = _make_lifecycle(tmp_path)
+    started = asyncio.Event()
+
+    async def fail_during_cancel() -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as err:
+            msg = "boom"
+            raise RuntimeError(msg) from err
+
+    lifecycle._reload_task = create_logged_task(
+        fail_during_cancel(),
+        name="config_reload",
+        failure_message="config_reload failed",
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await lifecycle.cancel()
+
+    assert lifecycle._reload_task is None
+    assert any(
+        call.args
+        and call.args[0] == "Detached task failed while being cancelled"
+        and call.kwargs.get("task_name") == "config_reload"
+        for call in logger_mock.debug.call_args_list
+    )
+    logger_mock.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_queued_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cancelling should stop the queued reload before it applies."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0.01)
+    busy_gate = ResponseAdmissionGate()
+    assert busy_gate.admit()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    load_config_mock = MagicMock(return_value=new_config)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.load_config", load_config_mock)
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=busy_gate,
+    )
+
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+    await asyncio.sleep(0.05)
+
+    await lifecycle.cancel()
+
+    assert lifecycle._reload_task is None
+    assert lifecycle._requested_at is None
+    assert task.done()
+    load_config_mock.assert_called_once()
+    lifecycle.apply_update_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_config_load_stays_open_then_apply_waits_for_active_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Loading and planning stay live, while publication still drains active responses."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0)
+    load_started = threading.Event()
+    release_load = threading.Event()
+    observed_apply_counts: list[int] = []
+    gate = ResponseAdmissionGate()
+    assert gate.admit()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+
+    def blocked_load(*_args: object, **_kwargs: object) -> Config:
+        load_started.set()
+        assert release_load.wait(timeout=2)
+        return new_config
+
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.load_config", blocked_load)
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=gate,
+    )
+
+    async def apply_plan(*_args: object) -> bool:
+        observed_apply_counts.append(gate.in_flight_response_count)
+        return True
+
+    lifecycle.apply_update_plan = AsyncMock(side_effect=apply_plan)
+
+    lifecycle.request_reload()
+    reload_task = lifecycle._reload_task
+    assert reload_task is not None
+
+    try:
+        assert await asyncio.to_thread(load_started.wait, 1)
+        # Loading and validation do not publish anything, so responses may keep
+        # entering on the current config snapshot.
+        assert gate.admit() is True
+        gate.release()
+
+        release_load.set()
+        await asyncio.sleep(0.05)
+        lifecycle.apply_update_plan.assert_not_awaited()
+
+        gate.release()
+        await asyncio.wait_for(reload_task, timeout=1)
+
+        lifecycle.apply_update_plan.assert_awaited_once()
+        assert observed_apply_counts == [0]
+        # The gate reopens once the apply completes.
+        assert gate.admit() is True
+        gate.release()
+    finally:
+        release_load.set()
+        while gate.in_flight_response_count:
+            gate.release()
+        await asyncio.gather(reload_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_apply_does_not_block_response_drain_started_by_the_apply(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Applying a plan must not stall the response drain that stopping bots performs.
+
+    Stopping a bot drains its detached responses. If the applier held the
+    admission gate, a response parked at admission could not finish, so the
+    drain would burn its whole timeout and then cancel live work.
+    """
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0)
+    gate = ResponseAdmissionGate()
+    lifecycle = _make_lifecycle(tmp_path, current_config=Config(), response_admission_gate=gate)
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_a, **_k: Config(defaults={"enable_streaming": False}),
+    )
+
+    async def response_lifecycle() -> str:
+        if not gate.admit():
+            return "refused"
+        gate.release()
+        return "admitted"
+
+    async def apply_plan(*_args: object) -> bool:
+        # Stand in for stop_entities -> prepare_for_sync_shutdown -> drain_inbox_responses.
+        task = asyncio.create_task(response_lifecycle())
+        _done, pending = await asyncio.wait([task], timeout=1)
+        assert not pending, "drain stalled: response could not settle during apply"
+        assert task.result() == "refused"
+        return True
+
+    lifecycle.apply_update_plan = AsyncMock(side_effect=apply_plan)
+
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2)
+
+    lifecycle.apply_update_plan.assert_awaited_once()
+    assert gate.closed is False
+
+
+@pytest.mark.asyncio
+async def test_drain_applies_reload_after_force_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A never-idle install must still get its config change applied eventually."""
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._CONFIG_RELOAD_DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_IDLE_POLL_SECONDS", 0)
+    monkeypatch.setattr("mindroom.orchestration.config_lifecycle._REPLACEMENT_DRAIN_FORCE_AFTER_SECONDS", 0.05)
+    gate = ResponseAdmissionGate()
+    # A response that never finishes, so the gate is never idle.
+    assert gate.admit()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: new_config,
+    )
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        response_admission_gate=gate,
+    )
+
+    lifecycle.request_reload()
+    task = lifecycle._reload_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2)
+
+    lifecycle.apply_update_plan.assert_awaited_once()
+    # Admission reopens even though the forced apply ran over a live response.
+    assert gate.closed is False
+
+
+@pytest.mark.asyncio
+async def test_update_config_delegates_initial_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without an active config, update_config should hand off to the initial loader."""
+    new_config = Config()
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: new_config,
+    )
+    lifecycle = _make_lifecycle(tmp_path, current_config=None)
+
+    assert await lifecycle._update_config() is False
+
+    lifecycle.load_initial_config.assert_awaited_once_with(new_config)
+    lifecycle.apply_update_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_config_builds_plan_and_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With an active config, update_config should diff configs and dispatch the plan."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    current_config = bind_runtime_paths(Config(agents={"agent1": AgentConfig(display_name="Agent 1")}), runtime_paths)
+    new_config = bind_runtime_paths(
+        Config(agents={"agent1": AgentConfig(display_name="Agent One")}),
+        runtime_paths,
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: new_config,
+    )
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        agent_bots={"router": MagicMock(), "agent1": MagicMock()},
+    )
+
+    assert await lifecycle._update_config() is True
+
+    lifecycle.load_initial_config.assert_not_awaited()
+    lifecycle.apply_update_plan.assert_awaited_once()
+    dispatched_config, plan, plugin_changes = lifecycle.apply_update_plan.await_args.args
+    assert dispatched_config is current_config
+    assert plan.new_config is new_config
+    assert "agent1" in plan.entities_to_restart
+    assert plugin_changes == ()
+
+
+@pytest.mark.asyncio
+async def test_failed_partial_publication_retries_from_last_successful_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A partially published config must not make its retry look unchanged."""
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    live_config = current_config
+    applied_steps: list[tuple[Config, Config]] = []
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: new_config,
+    )
+    lifecycle = _make_lifecycle(tmp_path, current_config=current_config)
+    lifecycle.current_config = lambda: live_config
+
+    async def apply_plan(
+        applied_config: Config,
+        plan: ConfigUpdatePlan,
+        _plugin_changes: tuple[str, ...],
+    ) -> bool:
+        nonlocal live_config
+        applied_steps.append((applied_config, plan.new_config))
+        live_config = plan.new_config
+        if len(applied_steps) == 1:
+            msg = "failed after config publication"
+            raise RuntimeError(msg)
+        return True
+
+    lifecycle.apply_update_plan = AsyncMock(side_effect=apply_plan)
+
+    with pytest.raises(RuntimeError, match="failed after config publication"):
+        await lifecycle._update_config()
+
+    assert await lifecycle._update_config() is True
+    assert applied_steps == [
+        (current_config, new_config),
+        (new_config, current_config),
+        (current_config, new_config),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_partial_publication_allows_rollback_to_last_successful_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Restoring the last-good file must repair a partially published runtime."""
+    current_config = Config()
+    failed_config = Config(defaults={"enable_streaming": False})
+    loaded_config = failed_config
+    live_config = current_config
+    applied_from: list[Config] = []
+    applied_configs: list[Config] = []
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: loaded_config,
+    )
+    lifecycle = _make_lifecycle(tmp_path, current_config=current_config)
+    lifecycle.current_config = lambda: live_config
+
+    async def apply_plan(
+        applied_config: Config,
+        plan: ConfigUpdatePlan,
+        _plugin_changes: tuple[str, ...],
+    ) -> bool:
+        nonlocal live_config
+        applied_from.append(applied_config)
+        applied_configs.append(plan.new_config)
+        live_config = plan.new_config
+        if len(applied_configs) <= 2:
+            msg = (
+                "failed after config publication"
+                if len(applied_configs) == 1
+                else "failed during partial-publication repair"
+            )
+            raise RuntimeError(msg)
+        return True
+
+    lifecycle.apply_update_plan = AsyncMock(side_effect=apply_plan)
+
+    with pytest.raises(RuntimeError, match="failed after config publication"):
+        await lifecycle._update_config()
+
+    loaded_config = current_config
+    with pytest.raises(RuntimeError, match="failed during partial-publication repair"):
+        await lifecycle._update_config()
+
+    assert await lifecycle._update_config() is True
+    assert applied_from == [current_config, failed_config, failed_config]
+    assert applied_configs == [failed_config, current_config, current_config]
+
+
+@pytest.mark.asyncio
+async def test_failed_partial_publication_repairs_before_applying_corrected_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A corrected third snapshot must apply only after restoring the last-good state."""
+    current_config = Config(agents={"agent1": AgentConfig(display_name="Agent 1", rooms=["lobby"])})
+    failed_config = Config(agents={"agent1": AgentConfig(display_name="Agent 1", rooms=["project"])})
+    corrected_config = Config(
+        agents={"agent1": AgentConfig(display_name="Agent 1", rooms=["lobby"])},
+        defaults={"enable_streaming": False},
+    )
+    loaded_config = failed_config
+    live_config = current_config
+    applied_steps: list[tuple[Config, Config]] = []
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: loaded_config,
+    )
+    lifecycle = _make_lifecycle(tmp_path, current_config=current_config)
+    lifecycle.current_config = lambda: live_config
+
+    async def apply_plan(
+        applied_config: Config,
+        plan: ConfigUpdatePlan,
+        _plugin_changes: tuple[str, ...],
+    ) -> bool:
+        nonlocal live_config
+        applied_steps.append((applied_config, plan.new_config))
+        live_config = plan.new_config
+        if len(applied_steps) == 1:
+            msg = "failed after config publication"
+            raise RuntimeError(msg)
+        return True
+
+    lifecycle.apply_update_plan = AsyncMock(side_effect=apply_plan)
+
+    with pytest.raises(RuntimeError, match="failed after config publication"):
+        await lifecycle._update_config()
+
+    loaded_config = corrected_config
+    assert await lifecycle._update_config() is True
+    assert applied_steps == [
+        (current_config, failed_config),
+        (failed_config, current_config),
+        (current_config, corrected_config),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_config_plugin_changes_restart_all_bots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Plugin entry changes should expand the plan to restart every managed bot."""
+    current_config = Config()
+    new_config = Config(plugins=["plugins/demo"])
+    plan = ConfigUpdatePlan(
+        new_config=new_config,
+        changed_mcp_servers=set(),
+        configured_entities={"router"},
+        entities_to_restart={"agent1"},
+        new_entities=set(),
+        removed_entities=set(),
+        mindroom_user_changed=False,
+        room_access_changed=False,
+        matrix_space_changed=False,
+        authorization_changed=False,
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.load_config",
+        lambda *_args, **_kwargs: new_config,
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.plugin_change_paths",
+        lambda *_args: ("plugins/demo",),
+    )
+    monkeypatch.setattr(
+        "mindroom.orchestration.config_lifecycle.build_config_update_plan",
+        lambda **_kwargs: plan,
+    )
+    lifecycle = _make_lifecycle(
+        tmp_path,
+        current_config=current_config,
+        agent_bots={"router": MagicMock(), "agent1": MagicMock(), "agent2": MagicMock()},
+    )
+
+    assert await lifecycle._update_config() is True
+
+    _, dispatched_plan, plugin_changes = lifecycle.apply_update_plan.await_args.args
+    assert dispatched_plan.entities_to_restart == {"router", "agent1", "agent2"}
+    assert plugin_changes == ("plugins/demo",)
+
+
+@pytest.mark.asyncio
+async def test_update_config_loads_config_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """update_config must keep slow config loading off the loop so heartbeats keep ticking."""
+    gate = threading.Event()
+    load_started = threading.Event()
+    loaded_config = Config(agents={"general": AgentConfig(display_name="General")})
+
+    def slow_load_config(*_args: object, **_kwargs: object) -> Config:
+        load_started.set()
+        gate.wait()
+        return loaded_config
+
+    monkeypatch.setattr(lifecycle_module, "load_config", slow_load_config)
+    lifecycle = _make_lifecycle(tmp_path)
+    lifecycle.load_initial_config = AsyncMock(return_value=True)
+
+    update_task = asyncio.get_running_loop().create_task(lifecycle._update_config())
+    await asyncio.to_thread(load_started.wait, 5.0)
+
+    # The loader thread is parked on the gate; the loop must stay live.
+    heartbeats = 0
+    while heartbeats < 50:
+        await asyncio.sleep(0)
+        heartbeats += 1
+    assert not update_task.done()
+
+    gate.set()
+    assert await update_task is True
+    lifecycle.load_initial_config.assert_awaited_once_with(loaded_config)
+
+
+@pytest.mark.asyncio
+async def test_update_config_waits_for_shared_lock_before_plugin_aware_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config loading must not overlap another plugin/config publication owner."""
+    lock = asyncio.Lock()
+    current_config = Config()
+    new_config = Config(defaults={"enable_streaming": False})
+    to_thread_started = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def observed_to_thread(*args: object, **kwargs: object) -> object:
+        to_thread_started.set()
+        return await real_to_thread(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle_module.asyncio, "to_thread", observed_to_thread)
+    load_config_mock = MagicMock(return_value=new_config)
+    monkeypatch.setattr(lifecycle_module, "load_config", load_config_mock)
+    lifecycle = _make_lifecycle(tmp_path, current_config=current_config)
+    lifecycle.config_update_lock = lock
+
+    await lock.acquire()
+    update_task = asyncio.create_task(lifecycle._update_config())
+    await asyncio.sleep(0)
+    try:
+        assert not to_thread_started.is_set()
+        assert not update_task.done()
+        lifecycle.apply_update_plan.assert_not_awaited()
+    finally:
+        lock.release()
+    assert await update_task is True
+    load_config_mock.assert_called_once()
+    lifecycle.apply_update_plan.assert_awaited_once()

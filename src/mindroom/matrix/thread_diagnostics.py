@@ -1,4 +1,13 @@
-"""Shared Matrix thread-read diagnostic keys."""
+"""Shared Matrix thread-read diagnostic keys.
+
+A leaf module so the reader that produces ``ThreadHistoryResult`` diagnostics and
+``thread_membership``, which consumes them for root proofs, need not import each other.
+
+``thread_read_source`` has one value left: ``degraded``, the empty fail-open result of a read
+that could not complete. It is separate from ``thread_read_degraded`` because a caller can flag
+a read degraded while still returning its content, and only the source says the content is
+absent -- which is the distinction the two predicates below turn on.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 THREAD_HISTORY_SOURCE_DIAGNOSTIC = "thread_read_source"
-THREAD_HISTORY_SOURCE_CACHE = "cache"
-THREAD_HISTORY_SOURCE_HOMESERVER = "homeserver"
-THREAD_HISTORY_SOURCE_STALE_CACHE = "stale_cache"
 THREAD_HISTORY_SOURCE_DEGRADED = "degraded"
-THREAD_HISTORY_CACHE_REJECT_REASON_DIAGNOSTIC = "cache_reject_reason"
-THREAD_HISTORY_ERROR_DIAGNOSTIC = "thread_read_error"
 THREAD_HISTORY_DEGRADED_DIAGNOSTIC = "thread_read_degraded"
 
 
@@ -21,8 +25,8 @@ THREAD_HISTORY_DEGRADED_DIAGNOSTIC = "thread_read_degraded"
 class _SupportsThreadDiagnostics(Protocol):
     """Minimal boundary-safe shape for thread histories that expose read diagnostics.
 
-    Keep this structural to avoid importing ThreadHistoryResult here and creating a cache
-    package dependency cycle.
+    Keep this structural to avoid importing ThreadHistoryResult here and creating a
+    dependency cycle.
     """
 
     diagnostics: Mapping[str, object]

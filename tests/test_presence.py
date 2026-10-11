@@ -9,6 +9,7 @@ import nio
 import pytest
 
 from mindroom.config.agent import AgentConfig, TeamConfig
+from mindroom.config.calls import CallsConfig, RealtimeCallProfile
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import ROUTER_AGENT_NAME
@@ -52,13 +53,13 @@ class TestBuildAgentStatusMessage:
     def test_router_agent_status(self) -> None:
         """Test building status message for router agent."""
         config = Config(
-            router={"model": "gpt-4"},
-            models={"gpt-4": ModelConfig(provider="openai", id="gpt-4-turbo")},
+            router={"model": "gpt-6-astra"},
+            models={"gpt-6-astra": ModelConfig(provider="openai", id="gpt-6-astra")},
         )
 
         status = build_agent_status_message(ROUTER_AGENT_NAME, config)
 
-        assert "🤖 Model: openai/gpt-4-turbo" in status
+        assert "🤖 Model: openai/gpt-6-astra" in status
         assert "📍 Routes messages to appropriate agents or teams" in status
 
     def test_regular_agent_status_with_tools(self) -> None:
@@ -72,13 +73,13 @@ class TestBuildAgentStatusMessage:
                     model="claude",
                 ),
             },
-            models={"claude": ModelConfig(provider="anthropic", id="claude-3-opus")},
+            models={"claude": ModelConfig(provider="anthropic", id="claude-opus-5")},
             defaults={"tools": []},
         )
 
         status = build_agent_status_message("researcher", config)
 
-        assert "🤖 Model: anthropic/claude-3-opus" in status
+        assert "🤖 Model: anthropic/claude-opus-5" in status
         assert "💼 Research specialist focused on finding information" in status
         assert "🔧 4 tools available" in status
 
@@ -102,6 +103,35 @@ class TestBuildAgentStatusMessage:
         assert "💼 General purpose assistant" in status
         assert "🔧" not in status  # No tools section
 
+    def test_only_runtime_ready_calls_agents_advertise_voice_calls(self) -> None:
+        """Presence gives clients an exact runtime-ready voice-call capability signal."""
+        config = Config(
+            agents={
+                "voice": AgentConfig(display_name="Voice"),
+                "text": AgentConfig(display_name="Text"),
+            },
+            calls=CallsConfig(
+                enabled=True,
+                profiles={
+                    "voice": RealtimeCallProfile(
+                        backend="realtime",
+                        model="gpt-realtime",
+                        credentials_service="openai",
+                        voice="marin",
+                    ),
+                },
+                agents={"voice": "voice"},
+            ),
+        )
+
+        assert "📞 Voice calls" in build_agent_status_message(
+            "voice",
+            config,
+            voice_calls_available=True,
+        ).split(" | ")
+        assert "📞 Voice calls" not in build_agent_status_message("voice", config).split(" | ")
+        assert "📞 Voice calls" not in build_agent_status_message("text", config).split(" | ")
+
     def test_team_agent_status(self) -> None:
         """Test building status message for team agent."""
         config = Config(
@@ -118,15 +148,15 @@ class TestBuildAgentStatusMessage:
                     display_name="Research Team",
                     role="Collaborative research team",
                     agents=["researcher", "analyst", "writer", "reviewer", "editor", "fact_checker"],
-                    model="gpt-4",
+                    model="gpt-6-astra",
                 ),
             },
-            models={"gpt-4": ModelConfig(provider="openai", id="gpt-4")},
+            models={"gpt-6-astra": ModelConfig(provider="openai", id="gpt-6-astra")},
         )
 
         status = build_agent_status_message("research_team", config)
 
-        assert "🤖 Model: openai/gpt-4" in status
+        assert "🤖 Model: openai/gpt-6-astra" in status
         assert "👥 Collaborative research team" in status
         assert "🤝 Team: researcher, analyst, writer, reviewer, editor" in status  # First 5 only
         assert "fact_checker" not in status  # 6th agent not shown

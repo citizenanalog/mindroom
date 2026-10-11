@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.exa import ExaTools
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="exa",
+    file_access=ToolFileAccess.NONE,
     display_name="Exa",
     description="Advanced AI-powered web search engine for research and content discovery",
     category=ToolCategory.RESEARCH,
@@ -149,14 +151,14 @@ if TYPE_CHECKING:
         ConfigField(
             name="include_domains",
             label="Include Domains",
-            type="text",
+            type="string[]",
             required=False,
             default=None,
         ),
         ConfigField(
             name="exclude_domains",
             label="Exclude Domains",
-            type="text",
+            type="string[]",
             required=False,
             default=None,
         ),

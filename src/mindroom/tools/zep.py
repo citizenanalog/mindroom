@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.metadata import ConfigField, SetupType, ToolCategory, ToolStatus, register_tool_with_metadata
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
     from agno.tools.zep import ZepTools
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="zep",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
     display_name="Zep Memory",
     description="Memory system for storing, retrieving, and searching conversational data",
     category=ToolCategory.PRODUCTIVITY,
@@ -93,7 +96,7 @@ if TYPE_CHECKING:
     ],
     dependencies=["zep-cloud"],
     docs_url="https://docs.agno.com/tools/toolkits/database/zep",
-    function_names=("add_zep_message", "get_zep_memory", "initialize", "search_zep_memory"),
+    function_names=("add_zep_message", "get_zep_memory", "search_zep_memory"),
 )
 def zep_tools() -> type[ZepTools]:
     """Return Zep memory tools for storing and retrieving conversational data."""

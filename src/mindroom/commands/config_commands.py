@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from typing import TYPE_CHECKING, Any
 
 import yaml
 from pydantic import ValidationError
 
+from mindroom import yaml_io
 from mindroom.api import config_lifecycle
 from mindroom.config.main import (
     Config,
     ConfigRuntimeValidationError,
     format_invalid_config_message,
     load_config_or_user_error,
+    redact_authored_config,
 )
+from mindroom.config.schema_hints import redaction_marker_location
+from mindroom.event_journal.opening import describe_event_journal, pending_event_journal_restart
 from mindroom.logging_config import get_logger
+from mindroom.redaction import MAX_CANONICAL_JSON_INTEGER, REDACTED
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
@@ -133,13 +139,24 @@ def _parse_value(value_str: str) -> Any:  # noqa: ANN401
     #   {key: value}            -> {'key': 'value'}
     #   {"key": "value"}        -> {'key': 'value'}
     try:
-        return yaml.safe_load(value_str)
+        return yaml_io.safe_load(value_str)
     except yaml.YAMLError:
         pass
 
     # If YAML parsing fails, return as string
     # This handles cases where the string itself contains special YAML characters
     return value_str
+
+
+def _fits_room_state(value: Any) -> bool:  # noqa: ANN401
+    """Return whether Matrix canonical JSON, which rejects floats and very large integers, can carry a value."""
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _fits_room_state(item) for key, item in value.items())
+    if isinstance(value, list):
+        return all(_fits_room_state(item) for item in value)
+    if isinstance(value, int):
+        return abs(value) <= MAX_CANONICAL_JSON_INTEGER
+    return value is None or isinstance(value, str)
 
 
 def _format_value(value: Any) -> str:  # noqa: ANN401
@@ -177,11 +194,12 @@ async def handle_config_command(  # noqa: C901, PLR0911, PLR0912
 
     """
     operation, args = _parse_config_args(args_text)
-    path = runtime_paths.config_path
     load_error_footer = _CONFIG_CHANGE_REJECTED_MESSAGE if operation == "set" else None
 
-    # Load current config
-    config, load_error = load_config_or_user_error(
+    # Config loading and validation execute plugin modules and walk the
+    # filesystem; keep them off the event loop (#1260).
+    config, load_error = await asyncio.to_thread(
+        load_config_or_user_error,
         runtime_paths,
         footer=load_error_footer,
         tolerate_plugin_load_errors=True,
@@ -190,10 +208,11 @@ async def handle_config_command(  # noqa: C901, PLR0911, PLR0912
         return load_error, None
     assert config is not None
     config_dict = config.authored_model_dump()
+    redacted_config_dict = config.redacted_authored_model_dump()
 
     if operation == "show":
         # Show entire config
-        yaml_str = yaml.dump(config_dict, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        yaml_str = yaml.dump(redacted_config_dict, default_flow_style=False, sort_keys=False, allow_unicode=True)
         return f"**Current Configuration:**\n```yaml\n{yaml_str}```", None
 
     if operation == "get":
@@ -205,12 +224,11 @@ async def handle_config_command(  # noqa: C901, PLR0911, PLR0912
 
         config_path_str = args[0]
         try:
-            value = _get_nested_value(config_dict, config_path_str)
-        except (KeyError, IndexError) as e:
+            value = _get_nested_value(redacted_config_dict, config_path_str)
+        except (KeyError, IndexError, TypeError) as e:
             return f"❌ Configuration path not found: `{config_path_str}`\nError: {e}", None
         else:
-            formatted = _format_value(value)
-            return f"**Configuration value for `{config_path_str}`:**\n```yaml\n{formatted}\n```", None
+            return f"**Configuration value for `{config_path_str}`:**\n```yaml\n{_format_value(value)}\n```", None
 
     elif operation == "set":
         if len(args) < 2:
@@ -225,11 +243,20 @@ async def handle_config_command(  # noqa: C901, PLR0911, PLR0912
 
         # Parse the value - YAML parsing handles both quoted and unquoted formats
         value = _parse_value(value_str)
+        marker_location = redaction_marker_location(value)
+        if marker_location is not None:
+            field_path = ".".join((config_path_str, *marker_location))
+            return (
+                f"❌ `{field_path}` contains the redaction marker `{REDACTED}` or a masked URL password, which "
+                "`!config show` and `!config get` print in place of a hidden value. "
+                "Set that field to its real value instead."
+                f"\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
+            ), None
 
         # Get the current value for comparison
         try:
-            old_value = _get_nested_value(config_dict, config_path_str)
-        except (KeyError, IndexError):
+            old_value = _get_nested_value(redacted_config_dict, config_path_str)
+        except (KeyError, IndexError, TypeError):
             old_value = None  # Path doesn't exist yet
 
         # Create a copy to test the change
@@ -238,17 +265,18 @@ async def handle_config_command(  # noqa: C901, PLR0911, PLR0912
         try:
             # Verify the path exists or can be created
             _set_nested_value(test_config_dict, config_path_str, value)
-
-            # Validate the modified config
-            Config.validate_with_runtime(test_config_dict, runtime_paths)
-        except (KeyError, IndexError) as e:
+        except (KeyError, IndexError, TypeError) as e:
             return f"❌ Configuration path error: `{config_path_str}`\nError: {e}", None
+
+        try:
+            await asyncio.to_thread(Config.validate_with_runtime, test_config_dict, runtime_paths)
         except (ValidationError, ConfigRuntimeValidationError) as e:
             return format_invalid_config_message(e, footer=_CONFIG_CHANGE_REJECTED_MESSAGE), None
         else:
-            # Format the preview message
-            formatted_old = _format_value(old_value) if old_value is not None else "Not set"
-            formatted_new = _format_value(value)
+            # Redact the exact payload that confirmation applies, not a normalized model of it.
+            redacted_value = _get_nested_value(redact_authored_config(test_config_dict), config_path_str)
+            formatted_old = "Not set" if old_value is None else _format_value(old_value)
+            formatted_new = _format_value(redacted_value)
 
             preview_msg = (
                 f"**Configuration Change Preview**\n\n"
@@ -261,9 +289,10 @@ async def handle_config_command(  # noqa: C901, PLR0911, PLR0912
             # Return the preview and the change info for confirmation
             change_info = {
                 "config_path": config_path_str,
-                "old_value": old_value,
                 "new_value": value,
-                "path": str(path),
+                # The pending change is stored in room state that every member can read,
+                # so a value that redaction masks stays out of it, as does one room state cannot carry.
+                "new_value_withheld": redacted_value != value or not _fits_room_state(value),
             }
 
             return preview_msg, change_info
@@ -309,8 +338,9 @@ async def apply_config_change(
     path = runtime_paths.config_path
 
     try:
-        # Load the current configuration
-        config, load_error = load_config_or_user_error(
+        # Load the current configuration off the event loop (#1260).
+        config, load_error = await asyncio.to_thread(
+            load_config_or_user_error,
             runtime_paths,
             footer=_CONFIG_CHANGE_REJECTED_MESSAGE,
             tolerate_plugin_load_errors=True,
@@ -318,16 +348,31 @@ async def apply_config_change(
         if load_error:
             return load_error
         assert config is not None
-        config_dict = config.model_dump()
+        config_dict = config.authored_model_dump()
 
         # Apply the specific change
         _set_nested_value(config_dict, config_path_str, new_value)
 
         try:
-            config_lifecycle.validate_and_persist_config_payload(config_dict, runtime_paths)
+            saved = await asyncio.to_thread(
+                config_lifecycle.validate_and_persist_config_payload,
+                config_dict,
+                runtime_paths,
+            )
         except (ValidationError, ConfigRuntimeValidationError) as ve:
             return format_invalid_config_message(ve, footer=_CONFIG_CHANGE_REJECTED_MESSAGE)
 
+        # The event journal is opened once, at startup, and every bot shares
+        # that one store; saying the change affects new interactions would be
+        # untrue for this one field.
+        if pending_event_journal_restart(saved, runtime_paths):
+            return (
+                f"✅ **Configuration updated successfully!**\n\n"
+                f"Changes saved to {path}.\n\n"
+                f"⚠️ The event journal in force is still "
+                f"{describe_event_journal(config.event_journal, runtime_paths)}; the new value applies "
+                f"after MindRoom restarts."
+            )
         return (  # noqa: TRY300
             f"✅ **Configuration updated successfully!**\n\n"
             f"Changes saved to {path} and will affect new agent interactions."

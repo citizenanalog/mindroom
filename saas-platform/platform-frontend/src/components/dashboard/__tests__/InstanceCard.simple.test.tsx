@@ -5,20 +5,25 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { InstanceCard } from '../InstanceCard'
 import { provisionInstance } from '@/lib/api'
+import type { Instance } from '@/hooks/useInstance'
+import type { Subscription } from '@/hooks/useSubscription'
 
-// Define the Instance type
-type Instance = {
-  instance_id: number
-  account_id: string
-  status: 'running' | 'provisioning' | 'stopped' | 'error' | 'failed'
-  frontend_url: string | null
-  backend_url: string | null
-  matrix_server_url: string | null
-  tier: string | null
-  created_at: string
-  updated_at: string
-  kubernetes_synced_at?: string | null
-  status_hint?: string | null
+const activeSubscription: Subscription = {
+  id: 'sub-active',
+  account_id: 'acc-123',
+  tier: 'hobby',
+  status: 'active',
+  stripe_subscription_id: null,
+  stripe_customer_id: null,
+  current_period_start: null,
+  current_period_end: null,
+  trial_ends_at: null,
+  cancelled_at: null,
+  can_run_instances: true,
+  stripe_subscription_ended: true,
+  trial_days_remaining: null,
+  created_at: '2026-10-01T00:00:00Z',
+  updated_at: '2026-10-01T00:00:00Z',
 }
 
 // Mock the API
@@ -42,7 +47,7 @@ describe('InstanceCard - Simplified Tests', () => {
 
   describe('When no instance exists', () => {
     it('should display provision button and message', () => {
-      render(<InstanceCard instance={null} />)
+      render(<InstanceCard instance={null} subscription={activeSubscription} />)
 
       expect(screen.getByText(/No instance provisioned yet/)).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /Provision Instance/i })).toBeInTheDocument()
@@ -52,7 +57,7 @@ describe('InstanceCard - Simplified Tests', () => {
       mockProvisionInstance.mockResolvedValue({ instance_id: 1 })
       const user = userEvent.setup()
 
-      render(<InstanceCard instance={null} />)
+      render(<InstanceCard instance={null} subscription={activeSubscription} />)
       const button = screen.getByRole('button', { name: /Provision Instance/i })
 
       await user.click(button)
@@ -68,7 +73,7 @@ describe('InstanceCard - Simplified Tests', () => {
       )
       const user = userEvent.setup()
 
-      render(<InstanceCard instance={null} />)
+      render(<InstanceCard instance={null} subscription={activeSubscription} />)
       const button = screen.getByRole('button', { name: /Provision Instance/i })
 
       await user.click(button)
@@ -80,8 +85,9 @@ describe('InstanceCard - Simplified Tests', () => {
 
   describe('When instance exists', () => {
     const mockInstance: Instance = {
+      id: 'inst-1',
       instance_id: 1,
-      account_id: 'acc-123',
+      subscription_id: 'sub-123',
       status: 'running',
       frontend_url: 'https://customer.mindroom.chat',
       backend_url: 'https://customer.api.mindroom.chat',
@@ -103,7 +109,8 @@ describe('InstanceCard - Simplified Tests', () => {
       // Check URLs are displayed (use getAllByText since domain appears multiple times)
       expect(screen.getAllByText('customer.mindroom.chat')).toHaveLength(2) // Domain and Frontend
       expect(screen.getByText('customer.api.mindroom.chat')).toBeInTheDocument()
-      expect(screen.getByText('customer.matrix.mindroom.chat')).toBeInTheDocument()
+      expect(screen.getByText('Chat Interface')).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: /^Open chat$/i })).toBeInTheDocument()
 
       // Check tier (it's showing as 'pro' not 'Pro' due to capitalize class)
       expect(screen.getByText(/pro/i)).toBeInTheDocument()
@@ -126,7 +133,7 @@ describe('InstanceCard - Simplified Tests', () => {
           <InstanceCard instance={{ ...mockInstance, status }} />
         )
         expect(screen.getByText(expectedText)).toBeInTheDocument()
-        rerender(<InstanceCard instance={null} />)
+        rerender(<InstanceCard instance={null} subscription={activeSubscription} />)
       })
     })
 
@@ -136,6 +143,17 @@ describe('InstanceCard - Simplified Tests', () => {
       const openButton = screen.getByRole('link', { name: /Open MindRoom/i })
       expect(openButton).toBeInTheDocument()
       expect(openButton).toHaveAttribute('href', 'https://customer.mindroom.chat')
+    })
+
+    it('should display Open Chat Interface button for running instances', () => {
+      render(<InstanceCard instance={mockInstance} />)
+
+      const openButton = screen.getByRole('link', { name: /Open Chat Interface/i })
+      expect(openButton).toBeInTheDocument()
+      expect(openButton).toHaveAttribute(
+        'href',
+        'https://chat.mindroom.chat/login/https%3A%2F%2Fcustomer.matrix.mindroom.chat/'
+      )
     })
 
     it('should not display Open MindRoom button for stopped instances', () => {
@@ -163,20 +181,22 @@ describe('InstanceCard - Simplified Tests', () => {
       expect(screen.queryByText('Domain')).not.toBeInTheDocument()
       expect(screen.queryByText('Frontend')).not.toBeInTheDocument()
       expect(screen.queryByText('API')).not.toBeInTheDocument()
+      expect(screen.queryByText('Chat Interface')).not.toBeInTheDocument()
     })
 
     it('should show default tier when not specified', () => {
       const noTierInstance = { ...mockInstance, tier: null }
       render(<InstanceCard instance={noTierInstance} />)
 
-      expect(screen.getByText('Free')).toBeInTheDocument()
+      expect(screen.getByText('No plan')).toBeInTheDocument()
     })
   })
 
   describe('Relative time formatting', () => {
     const mockInstance: Instance = {
+      id: 'inst-1',
       instance_id: 1,
-      account_id: 'acc-123',
+      subscription_id: 'sub-123',
       status: 'running',
       frontend_url: null,
       backend_url: null,
