@@ -1,0 +1,342 @@
+"""PostgreSQL backend implementing the same contract as SQLite.
+
+The same SQL, the same transactions, the same operations. There is no second
+application protocol here: if the two backends could diverge in behavior, the
+parity tests would have nothing meaningful to compare.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, LiteralString, cast
+
+import psycopg
+from psycopg.rows import dict_row
+
+from .legacy_response_attempts import upgrade_continuation_identity
+from .legacy_schema import (
+    upgrade_legacy_journal,
+    upgrade_outbox_reply_rows,
+)
+from .offloading import ThreadOffload, settled
+from .schema import OUTBOX_TABLE, POSTGRES_DIALECT, render, schema_statements
+from .write_queue import CLOSED_MESSAGE, WriteOutcome, WriteQueue
+
+# An arbitrary constant that only this schema setup uses, so the lock it
+# takes cannot collide with an application advisory lock.
+_SCHEMA_LOCK_KEY = 7_403_118_615_233_901
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .backend import Operation, Row
+
+
+_POOL_SIZE = 4
+# The journal lock's session. A runtime that vanishes without closing it (a
+# lost node, a partition) holds the lock until the server notices: within about
+# a minute with these, instead of the default two hours. A holder cut off from
+# the server fails its probe within a minute too, and shuts down.
+_HOLD_SERVER_KEEPALIVES: tuple[LiteralString, ...] = (
+    "SET tcp_keepalives_idle = 30",
+    "SET tcp_keepalives_interval = 10",
+    "SET tcp_keepalives_count = 3",
+)
+_HOLD_CLIENT_KEEPALIVES: dict[str, Any] = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 60_000,
+}
+
+
+def _statement(sql: str) -> LiteralString:
+    """Return one rendered statement as the literal it actually is.
+
+    Every statement originates in a module constant and is transformed only by
+    swapping the parameter marker, so no caller-supplied text can reach it.
+    The type checker cannot see through that transformation, and building the
+    SQL any other way would mean giving up parameter binding.
+    """
+    return cast("LiteralString", render(sql, POSTGRES_DIALECT))
+
+
+@dataclass(frozen=True, slots=True)
+class _PostgresTransaction:
+    """Statement execution against one open PostgreSQL connection."""
+
+    cursor: psycopg.Cursor[dict[str, Any]]
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        """Run one statement."""
+        self.cursor.execute(_statement(sql), tuple(params))
+
+    def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Row | None:
+        """Run one query and return its first row, if any."""
+        self.cursor.execute(_statement(sql), tuple(params))
+        return None if self.cursor.rowcount == 0 else self.cursor.fetchone()
+
+    def fetchall(self, sql: str, params: Sequence[Any] = ()) -> tuple[Row, ...]:
+        """Run one query and return every row."""
+        self.cursor.execute(_statement(sql), tuple(params))
+        return tuple(self.cursor.fetchall())
+
+
+@dataclass
+class PostgresBackend:
+    """A PostgreSQL store with a serialized writer and pooled readers."""
+
+    # Kept out of the repr because a DSN carries a password, and a dataclass
+    # repr reaches logs and tracebacks without anyone choosing to print it.
+    database_url: str = field(repr=False)
+    _writer: psycopg.Connection[tuple[Any, ...]] = field(init=False, repr=False)
+    _recovery_reader: psycopg.Connection[tuple[Any, ...]] = field(init=False, repr=False)
+    _writes: WriteQueue = field(init=False, repr=False)
+    _readers: asyncio.Queue[psycopg.Connection[tuple[Any, ...]]] | None = field(default=None, init=False, repr=False)
+    _pool: list[psycopg.Connection[tuple[Any, ...]]] = field(default_factory=list, init=False, repr=False)
+    _close_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    # The session whose advisory lock claims this journal for one runtime;
+    # the server releases the lock when the session ends.
+    _hold: psycopg.Connection[tuple[Any, ...]] | None = field(default=None, init=False, repr=False)
+    _offload: ThreadOffload = field(default_factory=ThreadOffload, init=False, repr=False)
+    _recovery_offload: ThreadOffload = field(
+        default_factory=lambda: ThreadOffload.serial(
+            thread_name_prefix="mindroom-event-journal-recovery",
+        ),
+        init=False,
+        repr=False,
+    )
+
+    @classmethod
+    def open(cls, database_url: str) -> PostgresBackend:
+        """Create the schema and open the connections.
+
+        Synchronous for the same reason as the SQLite backend: a bot builds
+        its collaborators before it has an event loop.
+        """
+        backend = cls(database_url=database_url)
+        backend._writer = backend._connect()
+        try:
+            backend._create_schema()
+        except BaseException:
+            backend._writer.close()
+            raise
+        backend._pool = [backend._connect() for _ in range(_POOL_SIZE)]
+        backend._recovery_reader = backend._connect()
+        backend._writes = WriteQueue(
+            apply=backend._apply_write,
+            offload=backend._offload,
+            task_name="event_journal_postgres_writer",
+        )
+        return backend
+
+    def _readers_queue(self) -> asyncio.Queue[psycopg.Connection[tuple[Any, ...]]]:
+        """Bind the reader pool to the loop that first reads."""
+        if self._readers is None:
+            self._readers = asyncio.Queue()
+            for connection in self._pool:
+                self._readers.put_nowait(connection)
+        return self._readers
+
+    def _connect(self) -> psycopg.Connection[tuple[Any, ...]]:
+        # The row factory is chosen per cursor rather than per connection: it
+        # is the only place both psycopg and the type checker agree on the
+        # resulting row type.
+        return psycopg.connect(self.database_url, autocommit=False)
+
+    def _create_schema(self) -> None:
+        with self._writer.cursor(row_factory=dict_row) as cursor:
+            # `IF NOT EXISTS` is not itself race-free: two processes creating
+            # the same table or index at once can still collide in the system
+            # catalogue, and PostgreSQL resolves that by failing one of them.
+            # Serializing the whole of schema setup on a transaction-scoped
+            # advisory lock costs nothing at steady state, because the
+            # statements are all no-ops once the schema exists.
+            cursor.execute(cast("LiteralString", f"SELECT pg_advisory_xact_lock({_SCHEMA_LOCK_KEY})"))
+            cursor.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()",
+            )
+            existing_tables = frozenset(str(row["table_name"]) for row in cursor.fetchall())
+            upgrade_legacy_journal(_PostgresTransaction(cursor), existing_tables)
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'matrix_delivery_outbox'",
+            )
+            outbox_columns = frozenset(str(row["column_name"]) for row in cursor.fetchall())
+            upgrade_outbox_reply_rows(
+                _PostgresTransaction(cursor),
+                outbox_columns,
+                outbox_table_ddl=OUTBOX_TABLE,
+                sqlite=False,
+            )
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'approval_continuations'",
+            )
+            continuation_columns = frozenset(str(row["column_name"]) for row in cursor.fetchall())
+            upgrade_continuation_identity(_PostgresTransaction(cursor), existing_tables, continuation_columns)
+            for statement in schema_statements(POSTGRES_DIALECT):
+                cursor.execute(cast("LiteralString", statement))
+        self._writer.commit()
+
+    async def write[T](self, operation: Operation[T]) -> T:
+        """Queue one operation for the writer task and await its commit."""
+        return await self._writes.write(operation)
+
+    def _apply_write(self, operations: list[Operation[Any]]) -> list[WriteOutcome]:
+        """Commit queued writes in one transaction, each in a savepoint so one that fails rolls back alone."""
+        try:
+            with self._writer.cursor(row_factory=dict_row) as cursor:
+                outcomes = [self._apply_one(cursor, operation) for operation in operations]
+        except BaseException:
+            self._writer.rollback()
+            raise
+        self._writer.commit()
+        return outcomes
+
+    def _apply_one(self, cursor: psycopg.Cursor[dict[str, Any]], operation: Operation[Any]) -> WriteOutcome:
+        cursor.execute("SAVEPOINT journal_write")
+        try:
+            result = operation(_PostgresTransaction(cursor))
+        except Exception as error:
+            if self._writer.broken:
+                # The error took the connection, and the batch with it.
+                raise
+            cursor.execute("ROLLBACK TO SAVEPOINT journal_write")
+            cursor.execute("RELEASE SAVEPOINT journal_write")
+            return WriteOutcome(error=error)
+        cursor.execute("RELEASE SAVEPOINT journal_write")
+        return WriteOutcome(result=result)
+
+    async def read[T](self, operation: Operation[T]) -> T:
+        """Run one operation on a pooled reader.
+
+        The connection goes back to the pool only once its statement has
+        stopped. Returning it while a cancelled read's thread was still using
+        it handed a live connection to the next reader.
+        """
+        if self._writes.closed:
+            raise RuntimeError(CLOSED_MESSAGE)
+        connection = await self._readers_queue().get()
+
+        def apply() -> T:
+            return self._apply_read(connection, operation)
+
+        try:
+            # An exhausted pool makes the line above a suspension, so the store
+            # may have been closed while this read waited for a connection.
+            if self._writes.closed:
+                raise RuntimeError(CLOSED_MESSAGE)
+            return await self._offload.run(apply)
+        finally:
+            self._readers_queue().put_nowait(connection)
+
+    async def recovery_read[T](self, operation: Operation[T]) -> T:
+        """Run a committed-state handoff proof on its reserved reader."""
+        if self._writes.closed:
+            raise RuntimeError(CLOSED_MESSAGE)
+
+        def apply() -> T:
+            try:
+                with self._recovery_reader.cursor(row_factory=dict_row) as cursor:
+                    cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    return operation(_PostgresTransaction(cursor))
+            finally:
+                self._recovery_reader.rollback()
+
+        return await self._recovery_offload.run(apply)
+
+    @staticmethod
+    def _apply_read[T](
+        connection: psycopg.Connection[tuple[Any, ...]],
+        operation: Operation[T],
+    ) -> T:
+        try:
+            with connection.cursor(row_factory=dict_row) as cursor:
+                return operation(_PostgresTransaction(cursor))
+        finally:
+            connection.rollback()
+
+    async def close(self) -> None:
+        """Close admission once and await the one owned connection teardown.
+
+        Closing admission first stops any further statement from starting;
+        stopping the writer and draining then wait for the ones already on
+        worker threads, because closing a connection under a running statement
+        is how psycopg reports someone else's cancellation as this caller's
+        broken connection.
+        """
+        close_task = self._close_task
+        if close_task is None:
+            self._writes.close()
+            close_task = asyncio.create_task(
+                self._finish_close(),
+                name="event_journal_postgres_close",
+            )
+            self._close_task = close_task
+        await settled(close_task)
+
+    async def hold_exclusively(self, identity: str) -> bool:
+        """Claim the journal named ``identity`` with a session advisory lock held until close.
+
+        Every storage root bound to this database shares its identity, so a
+        second runtime against it is refused here. The lock needs a session of
+        its own, which a direct or session-pooled connection provides.
+        """
+        if self._hold is not None:
+            return True
+        key = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big", signed=True)
+
+        def take() -> psycopg.Connection[tuple[Any, ...]] | None:
+            session = psycopg.connect(self.database_url, autocommit=True, **_HOLD_CLIENT_KEEPALIVES)
+            try:
+                for statement in _HOLD_SERVER_KEEPALIVES:
+                    session.execute(statement)
+                row = session.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()
+            except BaseException:
+                session.close()
+                raise
+            if row is None or row[0] is not True:
+                session.close()
+                return None
+            return session
+
+        self._hold = await asyncio.to_thread(take)
+        return self._hold is not None
+
+    async def still_held(self) -> bool:
+        """Return whether the session holding the journal's lock is still alive."""
+        session = self._hold
+        if session is None:
+            return False
+
+        def probe() -> bool:
+            try:
+                session.execute("SELECT 1")
+            except psycopg.Error:
+                return False
+            return True
+
+        return await asyncio.to_thread(probe)
+
+    async def _finish_close(self) -> None:
+        """Finish the teardown every close waiter shares; the hold goes last, once nothing can write."""
+        await self._writes.stop()
+        try:
+            await asyncio.gather(
+                self._offload.drain(),
+                self._recovery_offload.drain(),
+            )
+            for connection in (self._writer, *self._pool):
+                await self._offload.run(connection.close)
+            await self._recovery_offload.run(self._recovery_reader.close)
+            self._pool.clear()
+        finally:
+            self._offload.shutdown()
+            self._recovery_offload.shutdown()
+            hold, self._hold = self._hold, None
+            if hold is not None:
+                await asyncio.to_thread(hold.close)

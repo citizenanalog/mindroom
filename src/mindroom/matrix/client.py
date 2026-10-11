@@ -6,8 +6,10 @@ from mindroom.matrix.client_delivery import (
     DeliveredMatrixEvent,
     cached_room,  # noqa: F401
     edit_message_result,
+    resolve_room_encryption_for_delivery,
     send_file_message,
     send_message_result,
+    send_room_event_result,
 )
 from mindroom.matrix.client_room_admin import (
     add_room_to_space,
@@ -24,6 +26,7 @@ from mindroom.matrix.client_room_admin import (
     invite_to_room,
     join_room,
     leave_room,
+    room_admin_power_user,
 )
 from mindroom.matrix.client_session import (
     PermanentMatrixStartupError,
@@ -32,8 +35,8 @@ from mindroom.matrix.client_session import (
     matrix_startup_error,
     restore_login,
 )
-from mindroom.matrix.client_thread_history import RoomThreadsPageError, get_room_threads_page
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage, replace_visible_message
+from mindroom.matrix.room_history_reads import RoomThreadsPageError, get_room_threads_page
 
 __all__ = [
     "DeliveredMatrixEvent",
@@ -56,7 +59,10 @@ __all__ = [
     "matrix_client",
     "matrix_startup_error",
     "replace_visible_message",
+    "resolve_room_encryption_for_delivery",
     "restore_login",
+    "room_admin_power_user",
     "send_file_message",
     "send_message_result",
+    "send_room_event_result",
 ]

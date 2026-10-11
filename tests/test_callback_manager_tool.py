@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import re
 import stat
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,6 +21,10 @@ from mindroom.external_triggers.store import ExternalTriggerStore
 from mindroom.message_target import MessageTarget
 from mindroom.runtime_state import reset_runtime_state, set_api_server_address
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import make_conversation_reader_mock, make_relation_lookup
 
 
 class _Client:
@@ -32,16 +39,21 @@ def _runtime_paths(tmp_path: Path, process_env: dict[str, str] | None = None) ->
     )
 
 
-def _config() -> Config:
+def _config(*, enabled: bool = True) -> Config:
     return Config.model_validate(
         {
-            "models": {"default": {"provider": "openai", "id": "gpt-5.6"}},
-            "agents": {"coder": {"display_name": "Coder", "model": "default", "rooms": ["lobby"]}},
-            "rooms": {"lobby": {"display_name": "Lobby"}},
-            "authorization": {
-                "global_users": ["@owner:example.org"],
-                "agent_reply_permissions": {"*": ["@owner:example.org"]},
+            "models": {"default": {"provider": "openai", "id": "gpt-6-astra"}},
+            "agents": {
+                "coder": {
+                    "display_name": "Coder",
+                    "model": "default",
+                    "rooms": ["lobby"],
+                    "access": {"users": ["@owner:example.org"]},
+                },
             },
+            "rooms": {"lobby": {"display_name": "Lobby"}},
+            "external_trigger_policy": {"enabled": enabled},
+            "administrators": ["@owner:example.org"],
         },
     )
 
@@ -52,15 +64,15 @@ def _context(
     requester_id: str = "@owner:example.org",
     process_env: dict[str, str] | None = None,
 ) -> ToolRuntimeContext:
-    return ToolRuntimeContext(
+    return make_test_tool_runtime_context(
         agent_name="coder",
         target=MessageTarget.resolve(room_id="lobby", thread_id="$thread", reply_to_event_id=None),
         requester_id=requester_id,
         client=cast("Any", _Client()),
         config=_config(),
         runtime_paths=_runtime_paths(tmp_path, process_env),
-        event_cache=cast("Any", object()),
-        conversation_cache=cast("Any", object()),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
     )
 
 
@@ -98,6 +110,37 @@ def test_mint_callback_writes_one_bound_script(tmp_path: Path) -> None:
     assert f"CALLBACK_URL=http://127.0.0.1:8765/api/triggers/{callback_id}" in script_text
     assert "CALLBACK_TOKEN=mrt_" in script_text
     assert "mrt_" not in store.store_path.read_text(encoding="utf-8")
+
+
+def test_mint_callback_needs_no_hard_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Workspaces on SMB, gcsfuse, and similar mounts lack hard links, so publication never needs one."""
+
+    def no_hard_links(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", no_hard_links)
+    with tool_runtime_context(_context(tmp_path)):
+        payload = _payload(CallbackManagerTools().mint_callback("issue-042 implementer"))
+
+    assert payload["status"] == "ok"
+    assert stat.S_IMODE(Path(payload["script_path"]).stat().st_mode) == 0o700
+
+
+def test_mint_callback_uses_current_trigger_policy(tmp_path: Path) -> None:
+    """A long-lived tool context must honor a current trigger disablement."""
+    context = replace(
+        _context(tmp_path),
+        config_provider=lambda: _config(enabled=False),
+    )
+
+    with tool_runtime_context(context):
+        payload = _payload(CallbackManagerTools().mint_callback("revoked callback"))
+
+    assert payload == {
+        "message": "Callback manager requires external triggers to be enabled.",
+        "status": "error",
+        "tool": "callback_manager",
+    }
 
 
 def test_mint_callback_targets_bound_api_server_port(tmp_path: Path) -> None:
@@ -158,8 +201,10 @@ def test_generated_script_posts_summary_and_deletes_itself(tmp_path: Path) -> No
         payload = _payload(CallbackManagerTools().mint_callback("quote-safe callback"))
     script_path = Path(payload["script_path"])
     script_text = script_path.read_text(encoding="utf-8")
-    assert "python3" not in script_text
-    assert "jq" not in script_text
+    # Whole words only. The script embeds a minted callback token, and a random
+    # token containing the letters "jq" is not the script reaching for `jq`.
+    assert not re.search(r"\bpython3\b", script_text)
+    assert not re.search(r"\bjq\b", script_text)
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -228,3 +273,44 @@ def test_manager_requires_live_human_requester(tmp_path: Path) -> None:
     assert "live Matrix tool context" in no_context["message"]
     assert bot_requester["status"] == "error"
     assert "human Matrix requester" in bot_requester["message"]
+
+
+def _workspace(tmp_path: Path) -> Path:
+    return _runtime_paths(tmp_path).storage_root / "agents" / "coder" / "workspace"
+
+
+@pytest.mark.parametrize("replaced", ["workspace", "callbacks_dir"])
+def test_mint_callback_refuses_a_linked_workspace_directory(tmp_path: Path, replaced: str) -> None:
+    """A workspace or callbacks directory swapped for a link never receives the capability script."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    workspace = _workspace(tmp_path)
+    if replaced == "workspace":
+        workspace.parent.mkdir(parents=True)
+        workspace.symlink_to(elsewhere, target_is_directory=True)
+    else:
+        (workspace / ".mindroom").mkdir(parents=True)
+        (workspace / ".mindroom" / "callbacks").symlink_to(elsewhere, target_is_directory=True)
+
+    with tool_runtime_context(_context(tmp_path)):
+        payload = _payload(CallbackManagerTools().mint_callback("issue-042 implementer"))
+
+    assert payload["status"] == "error"
+    assert not list(elsewhere.iterdir())
+    assert ExternalTriggerStore(_runtime_paths(tmp_path)).list_records() == []
+
+
+def test_mint_callback_does_not_write_through_a_planted_gitignore_link(tmp_path: Path) -> None:
+    """A link planted as the callbacks .gitignore is left alone instead of truncating or creating its target."""
+    callbacks_dir = _workspace(tmp_path) / ".mindroom" / "callbacks"
+    callbacks_dir.mkdir(parents=True)
+    existing_target = tmp_path / "primary-file.json"
+    existing_target.write_text('{"secret": "kept"}', encoding="utf-8")
+    (callbacks_dir / ".gitignore").symlink_to(existing_target)
+
+    with tool_runtime_context(_context(tmp_path)):
+        payload = _payload(CallbackManagerTools().mint_callback("issue-042 implementer"))
+
+    assert payload["status"] == "ok"
+    assert existing_target.read_text(encoding="utf-8") == '{"secret": "kept"}'
+    assert stat.S_IMODE(Path(payload["script_path"]).stat().st_mode) == 0o700

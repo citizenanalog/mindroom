@@ -17,10 +17,12 @@ from mindroom.tool_system.events import (
     _format_tool_started,
     build_tool_trace_content,
     complete_pending_tool_block,
+    deserialize_tool_trace,
     ensure_visible_tool_marker_spacing,
     extract_tool_completed_info,
     format_tool_combined,
     format_tool_completed_event,
+    serialize_tool_trace,
 )
 
 TEST_CURSOR = "cursor_1234567890"
@@ -35,12 +37,12 @@ def _room_threads_result(
 ) -> tuple[str, list[str]]:
     thread_ids = [f"$thread_{i}_{'X' * 40}:localhost" for i in range(thread_count)]
     payload = {
-        "action": "room-threads",
+        "action": "threads",
         "count": thread_count,
         "has_more": has_more,
         "next_token": next_token,
         "status": "ok",
-        "tool": "matrix_message",
+        "tool": "matrix_room",
         "threads": [
             {
                 "body_preview": "body " + ("y" * body_len),
@@ -187,7 +189,7 @@ def test_format_tool_combined_truncates_structured_room_threads_by_entry() -> No
     """Structured room-thread previews should drop whole entries and preserve metadata."""
     result, thread_ids = _room_threads_result(thread_count=4, body_len=400)
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview is not None
     assert len(trace.result_preview) <= _MAX_TOOL_RESULT_DISPLAY_CHARS
@@ -213,7 +215,7 @@ def test_format_tool_combined_truncates_body_preview_without_dropping_only_entry
         next_token=None,
     )
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview is not None
     assert len(trace.result_preview) <= _MAX_TOOL_RESULT_DISPLAY_CHARS
@@ -246,18 +248,18 @@ def test_format_tool_combined_falls_back_for_empty_threads_list_over_limit() -> 
     """Empty thread lists should use plain truncation instead of smart structured truncation."""
     result = json.dumps(
         {
-            "action": "room-threads",
+            "action": "threads",
             "count": 0,
             "has_more": True,
             "next_token": "N" * 600,
             "status": "ok",
             "threads": [],
-            "tool": "matrix_message",
+            "tool": "matrix_room",
         },
         sort_keys=True,
     )
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview is not None
     assert trace.result_preview == f"{result[: _MAX_TOOL_RESULT_DISPLAY_CHARS - 1]}…"
@@ -269,7 +271,7 @@ def test_format_tool_combined_preserves_exact_limit_structured_result() -> None:
     """Exact-at-limit thread payloads should not be marked truncated."""
     result, thread_ids = _exact_limit_room_threads_result()
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview == result
     assert trace.truncated is False
@@ -411,6 +413,33 @@ def test_streaming_tool_tracker_prefers_call_id_over_newest_same_named_tool() ->
     _tool_name, _result, matched_pending_tool, _completed_trace = completed
     assert matched_pending_tool == first_pending_tool
     assert [pending.tool_call_id for pending in tracker.pending_tools] == ["second"]
+
+
+def test_streaming_tool_tracker_scopes_reused_call_ids_to_team_members() -> None:
+    """Independent member runs may reuse one provider call ID without sharing state."""
+    tracker = StreamingToolTracker()
+    tracker.start(
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "first"}),
+        scope_key="agent:first",
+        tool_index=1,
+    )
+    tracker.start(
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "second"}),
+        scope_key="agent:second",
+        tool_index=2,
+    )
+
+    completed = tracker.complete(
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", result="first done"),
+        scope_key="agent:first",
+    )
+
+    assert completed is not None
+    assert completed[2] is not None
+    assert completed[2].scope_key == "agent:first"
+    assert [(pending.scope_key, pending.tool_call_id) for pending in tracker.pending_tools] == [
+        ("agent:second", "call-1"),
+    ]
 
 
 def test_streaming_tool_tracker_updates_visible_trace_slot() -> None:
@@ -630,6 +659,16 @@ def test_format_tool_started_redacts_top_level_key_value_secret_args() -> None:
     assert "value=***redacted***" in trace.args_preview
 
 
+def test_format_tool_started_survives_structured_redaction_failure() -> None:
+    """A failed argument redaction must not abort tool event formatting."""
+    _text, trace = _format_tool_started(
+        "run_shell",
+        {"command": "password=\n  hunter2"},
+    )
+
+    assert trace.args_preview == "command=[redaction failed]"
+
+
 def test_complete_pending_tool_block_roundtrip_with_marker_id() -> None:
     """Pending marker produced by format_tool_started should be completed in-place by id."""
     pending_text, _ = _format_tool_started(
@@ -712,6 +751,93 @@ def test_format_tool_completed_event_formats_combined_block() -> None:
     assert trace.tool_name == "run_shell"
     assert trace.args_preview == "cmd=pwd"
     assert trace.result_preview == "/app"
+
+
+def test_durable_tool_trace_round_trip_keeps_internal_identity_private() -> None:
+    """Restart state keeps exact call/scope identity without exposing it to Matrix clients."""
+    trace = ToolTraceEntry(
+        type="tool_call_started",
+        tool_name="inspect",
+        args_preview="path=report.txt",
+        tool_call_id="call-1",
+        scope_key="member:GeneralAgent",
+    )
+
+    durable = serialize_tool_trace([trace], include_internal=True)
+    public = build_tool_trace_content([trace])
+    restored = deserialize_tool_trace(durable)
+
+    assert durable == (
+        {
+            "type": "tool_call_started",
+            "tool_name": "inspect",
+            "args_preview": "path=report.txt",
+            "tool_call_id": "call-1",
+            "scope_key": "member:GeneralAgent",
+        },
+    )
+    assert public is not None
+    public_event = public[_TOOL_TRACE_KEY]["events"][0]
+    assert "tool_call_id" not in public_event
+    assert "scope_key" not in public_event
+    assert restored[0].tool_call_id == "call-1"
+    assert restored[0].scope_key == "member:GeneralAgent"
+
+
+def test_durable_tool_trace_round_trip_keeps_mcp_apps() -> None:
+    """Replies rebuilt from stored state keep the MCP App their tool calls produced."""
+    trace = ToolTraceEntry(
+        type="tool_call_completed",
+        tool_name="show_chart",
+        result_preview="chart ready",
+        mcp_app_resources=[
+            MCPAppResource(
+                uri="ui://demo/chart",
+                mime_type="text/html;profile=mcp-app",
+                html="<html><body>chart</body></html>",
+                meta={"ui": {"prefersBorder": True}},
+            ),
+        ],
+        mcp_app_tool_input={"arguments": {"chart": "sales"}},
+        mcp_app_tool_result={"content": [{"type": "text", "text": "chart ready"}], "isError": False},
+    )
+
+    restored = deserialize_tool_trace(serialize_tool_trace([trace], include_internal=True))
+
+    assert restored == [trace]
+
+
+@pytest.mark.parametrize(
+    "mcp_apps",
+    [
+        ["ui://demo/chart"],
+        [{"uri": "ui://demo/chart", "mime_type": "text/html;profile=mcp-app"}],
+        [{"uri": "ui://demo/chart", "mime_type": "text/html;profile=mcp-app", "html": "<html></html>", "meta": []}],
+    ],
+)
+def test_durable_tool_trace_rejects_malformed_mcp_app_resources(mcp_apps: list[object]) -> None:
+    """Corrupt stored MCP App resources must fail closed like other malformed trace slots."""
+    with pytest.raises(RuntimeError, match="malformed MCP App resource"):
+        deserialize_tool_trace([{"type": "tool_call_completed", "tool_name": "show_chart", "mcp_apps": mcp_apps}])
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"type": "unknown", "tool_name": "inspect"},
+        {"type": "tool_call_started", "tool_name": 7},
+        {"type": "tool_call_started", "tool_name": "inspect", "tool_call_id": 7},
+        {"type": "tool_call_started", "tool_name": "inspect", "scope_key": []},
+        {"type": "tool_call_completed", "tool_name": "inspect", "truncated": "yes"},
+        {"type": "tool_call_completed", "tool_name": "inspect", "mcp_apps": {}},
+        {"type": "tool_call_completed", "tool_name": "inspect", "mcp_tool_input": "chart=sales"},
+        {"type": "tool_call_completed", "tool_name": "inspect", "mcp_tool_result": []},
+    ],
+)
+def test_durable_tool_trace_rejects_malformed_events(malformed: dict[str, object]) -> None:
+    """Corrupt continuation metadata must fail closed instead of dropping an ordered slot."""
+    with pytest.raises(RuntimeError, match="malformed event"):
+        deserialize_tool_trace([malformed])
 
 
 # --- markdown_to_html: v2 plain markers + unsupported tag escaping ---

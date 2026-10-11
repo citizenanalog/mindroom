@@ -12,15 +12,16 @@ from unittest.mock import AsyncMock, MagicMock
 import nio
 import pytest
 
-from mindroom.bot import TeamBot
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import RouterConfig
+from mindroom.matrix.client_room_admin import RoomJoinOutcome
 from mindroom.matrix.users import AgentMatrixUser
+from tests.bot_helpers import make_test_team_bot
 from tests.conftest import (
     TEST_PASSWORD,
     bind_runtime_paths,
-    install_runtime_cache_support,
+    install_runtime_journal_support,
     runtime_paths_for,
     test_runtime_paths,
 )
@@ -68,17 +69,15 @@ class TestTeamRoomMembership:
 
         # Create the team bot with configured rooms
         config = _bind_runtime_paths(Config(router=RouterConfig(model="default")), tmp_path)
-        bot = TeamBot(
+        bot = make_test_team_bot(
             agent_user=team_user,
             storage_path=tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
             rooms=["!test_room:localhost"],
-            team_mode="round_robin",
-            team_model=None,
             enable_streaming=False,
         )
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
 
         # Mock the client
         mock_client = AsyncMock()
@@ -87,11 +86,12 @@ class TestTeamRoomMembership:
         # Track which rooms were joined
         joined_rooms = []
 
-        async def mock_join_room(_client: object, room_id: str) -> bool:
+        async def mock_join_room(_client: object, room_id: str) -> RoomJoinOutcome:
             joined_rooms.append(room_id)
-            return True
+            return RoomJoinOutcome.JOINED
 
-        monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", mock_join_room)
+        monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
+        monkeypatch.setattr("mindroom.bot_room_lifecycle.get_joined_rooms", AsyncMock(return_value=[]))
 
         # Mock restore_scheduled_tasks
         async def mock_restore_scheduled_tasks(
@@ -99,7 +99,7 @@ class TestTeamRoomMembership:
             _room_id: str,
             _config: Config,
             _runtime_paths: object,
-            _event_cache: object,
+            _conversation_reader: object,
         ) -> int:
             return 0
 
@@ -125,17 +125,15 @@ class TestTeamRoomMembership:
 
         # Create the team bot with no configured rooms
         config = _bind_runtime_paths(Config(router=RouterConfig(model="default")), tmp_path)
-        bot = TeamBot(
+        bot = make_test_team_bot(
             agent_user=team_user,
             storage_path=tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
             rooms=[],  # No configured rooms
-            team_mode="round_robin",
-            team_model=None,
             enable_streaming=False,
         )
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
 
         # Mock the client
         mock_client = AsyncMock()
@@ -197,26 +195,25 @@ class TestTeamRoomMembership:
             ),
             tmp_path,
         )
-        bot = TeamBot(
+        bot = make_test_team_bot(
             agent_user=team_user,
             storage_path=tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
-            team_mode="round_robin",
-            team_model=None,
             enable_streaming=False,
         )
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
         bot.client = AsyncMock()
 
-        join_room = AsyncMock(return_value=True)
-        monkeypatch.setattr("mindroom.bot_room_lifecycle.is_authorized_sender", lambda *_args, **_kwargs: True)
-        monkeypatch.setattr("mindroom.bot_room_lifecycle.join_room", join_room)
+        join_room = AsyncMock(return_value=RoomJoinOutcome.JOINED)
+        monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", join_room)
 
-        room = MagicMock(room_id="!team-room:localhost")
-        room.canonical_alias = None
+        room = nio.MatrixInvitedRoom("!team-room:localhost", team_user.user_id)
         event = MagicMock(sender="@user:localhost")
+        room.inviter = event.sender
+        bot.client.invited_rooms = {room.room_id: room}
 
-        await bot._on_invite(room, event)
+        await bot._room_lifecycle.record_pending_room_invite(room.room_id, event.sender)
+        await bot._room_lifecycle.handle_recorded_invite(room, event.sender)
 
         join_room.assert_awaited_once_with(bot.client, "!team-room:localhost")

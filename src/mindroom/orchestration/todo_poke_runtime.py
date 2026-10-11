@@ -7,18 +7,36 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from mindroom.constants import ORIGINAL_SENDER_KEY, ROUTER_AGENT_NAME
-from mindroom.custom_tools.todo_poke import TodoPokeDeps, TodoPokeWorker, todo_poke_policy
+from mindroom.authorization import ReplyMembershipPendingError, is_sender_allowed_for_responder
+from mindroom.constants import ORIGINAL_SENDER_KEY
+from mindroom.custom_tools.todo_poke import (
+    TodoPokeDeliveryUnavailableError,
+    TodoPokeDeps,
+    TodoPokeRequesterKind,
+    TodoPokeWorker,
+    todo_poke_policy,
+)
 from mindroom.custom_tools.todo_state import state_root as todo_state_root
-from mindroom.entity_resolution import mindroom_user_id
-from mindroom.scheduling import get_pending_schedule_thread_ids_for_room
+from mindroom.entity_resolution import (
+    MissingManagedEntityAccountError,
+    current_internal_sender_ids,
+    mindroom_user_id,
+)
+from mindroom.logging_config import get_logger
+from mindroom.matrix.client_room_admin import get_joined_rooms
+from mindroom.requester_identity import is_human_requester_id
+from mindroom.scheduling.tasks import get_pending_schedule_thread_ids_for_room
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.bot import AgentBot, TeamBot
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -28,6 +46,7 @@ class TodoPokeRuntimeCoordinator:
     runtime_paths: RuntimePaths
     config_provider: Callable[[], Config | None]
     bot_provider: Callable[[str], AgentBot | TeamBot | None]
+    agent_reply_memberships: AgentReplyMembershipIndex
     _worker: TodoPokeWorker | None = field(default=None, init=False)
     _task: asyncio.Task | None = field(default=None, init=False)
 
@@ -48,6 +67,7 @@ class TodoPokeRuntimeCoordinator:
                 schedule_query=self._schedule_query,
                 idle_check=self._agent_is_idle,
                 sender=self._send_poke,
+                requester_kind=self._requester_kind,
                 clock=lambda: datetime.now(UTC),
             ),
         )
@@ -84,38 +104,105 @@ class TodoPokeRuntimeCoordinator:
                 return False
         return True
 
-    def _router(self) -> AgentBot | TeamBot | None:
-        """Return the running router bot when todo poke I/O is ready."""
-        router_bot = self.bot_provider(ROUTER_AGENT_NAME)
-        if router_bot is None or not router_bot.running or router_bot.client is None:
+    def _agent_bot(self, agent_name: str) -> AgentBot | TeamBot | None:
+        """Return the assigned agent bot when todo poke I/O is ready."""
+        agent_bot = self.bot_provider(agent_name)
+        if agent_bot is None or not agent_bot.running or agent_bot.client is None:
             return None
-        return router_bot
+        return agent_bot
 
-    async def _schedule_query(self, room_id: str) -> frozenset[str | None] | None:
-        """Return pending schedule scopes, or None while router I/O is unavailable."""
-        router_bot = self._router()
-        if router_bot is None:
+    async def _joined_agent_bot(
+        self,
+        room_id: str,
+        agent_names: tuple[str, ...],
+    ) -> AgentBot | TeamBot | None:
+        """Return the first ready candidate with authoritative membership in the target room."""
+        for agent_name in agent_names:
+            agent_bot = self._agent_bot(agent_name)
+            if agent_bot is None:
+                continue
+            client = agent_bot.client
+            if client is None:
+                continue
+            try:
+                joined_room_ids = await get_joined_rooms(client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "todo_poke_membership_query_failed",
+                    assigned_agent=agent_name,
+                    room_id=room_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                continue
+            if joined_room_ids is not None and room_id in joined_room_ids:
+                return agent_bot
+        return None
+
+    async def _schedule_query(
+        self,
+        room_id: str,
+        agent_names: tuple[str, ...],
+    ) -> frozenset[str | None] | None:
+        """Return pending schedule scopes through one assigned agent joined to the room."""
+        agent_bot = await self._joined_agent_bot(room_id, agent_names)
+        if agent_bot is None or agent_bot.client is None:
             return None
-        client = router_bot.client
-        if client is None:
-            return None
-        return await get_pending_schedule_thread_ids_for_room(client, room_id)
+        return await get_pending_schedule_thread_ids_for_room(agent_bot.client, room_id, self.runtime_paths)
+
+    def _requester_kind(self, requester_id: str, agent_name: str, room_id: str) -> TodoPokeRequesterKind:
+        """Classify a recorded todo requester for one assignee and room under the current config."""
+        config = self.config_provider()
+        if config is None:
+            raise TodoPokeDeliveryUnavailableError
+        try:
+            internal_sender_ids = current_internal_sender_ids(config, self.runtime_paths)
+        except MissingManagedEntityAccountError as exc:
+            raise TodoPokeDeliveryUnavailableError from exc
+        # Access policies never restrict internal senders, so their work runs as the assignee's own turn.
+        if requester_id in internal_sender_ids:
+            return TodoPokeRequesterKind.INTERNAL
+        # Ingress promotes only a human or configured bot-account original sender to requester; any other sender would run with the assignee's authority.
+        # Pokes act only for humans, and ingress refuses a human the assignee may not reply to, so such work would only take poke slots.
+        if not is_human_requester_id(requester_id, config, self.runtime_paths) or agent_name not in config.agents:
+            return TodoPokeRequesterKind.REFUSED
+        try:
+            allowed = is_sender_allowed_for_responder(
+                requester_id,
+                agent_name,
+                room_id,
+                config,
+                self.runtime_paths,
+                self.agent_reply_memberships,
+                require_resolved_membership=True,
+            )
+        except ReplyMembershipPendingError as exc:
+            # Unresolved membership is no refusal, so skip the scan without pruning this requester's dedup state.
+            raise TodoPokeDeliveryUnavailableError from exc
+        return TodoPokeRequesterKind.HUMAN if allowed else TodoPokeRequesterKind.REFUSED
 
     async def _send_poke(
         self,
+        agent_name: str,
         room_id: str,
         body: str,
         thread_id: str | None,
+        requester_id: str | None,
     ) -> str | None:
-        """Send one router-originated todo poke that enters normal dispatch."""
-        router_bot = self._router()
+        """Send one assigned-agent todo poke that enters normal dispatch as its human requester or internally."""
         config = self.config_provider()
-        if router_bot is None or config is None:
-            return None
+        if config is None:
+            raise TodoPokeDeliveryUnavailableError
+        agent_bot = await self._joined_agent_bot(room_id, (agent_name,))
+        if agent_bot is None or agent_bot.client is None:
+            raise TodoPokeDeliveryUnavailableError
 
-        original_sender = mindroom_user_id(config, self.runtime_paths)
+        # A human original sender makes the assignee apply its access policy and tool authorization to that human.
+        original_sender = requester_id if requester_id is not None else mindroom_user_id(config, self.runtime_paths)
         extra_content = {ORIGINAL_SENDER_KEY: original_sender} if original_sender is not None else None
-        return await router_bot._hook_send_message(
+        return await agent_bot._hook_send_message(
             room_id,
             body,
             thread_id,

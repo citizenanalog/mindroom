@@ -15,10 +15,19 @@ from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.custom_tools.thread_summary import ThreadSummaryTools
 from mindroom.message_target import MessageTarget
-from mindroom.thread_summary import THREAD_SUMMARY_MAX_LENGTH, ThreadSummaryWriteError, _ThreadSummaryWriteResult
+from mindroom.thread_summary import _THREAD_SUMMARY_MAX_LENGTH, ThreadSummaryWriteError, _ThreadSummaryWriteResult
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from tests.conftest import bind_runtime_paths, make_event_cache_mock, runtime_paths_for, test_runtime_paths
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import (
+    bind_runtime_paths,
+    make_conversation_reader_mock,
+    make_relation_lookup,
+    runtime_paths_for,
+    test_runtime_paths,
+)
 
 
 def _make_context(
@@ -32,7 +41,7 @@ def _make_context(
         Config(agents={"general": AgentConfig(display_name="General Agent")}),
         test_runtime_paths(runtime_root),
     )
-    return ToolRuntimeContext(
+    return make_test_tool_runtime_context(
         agent_name="general",
         target=MessageTarget.resolve(
             room_id=room_id,
@@ -43,8 +52,8 @@ def _make_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths_for(config),
-        conversation_cache=AsyncMock(),
-        event_cache=make_event_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         room=None,
         storage_path=None,
     )
@@ -127,7 +136,7 @@ async def test_set_thread_summary_defaults_to_context_room_and_thread() -> None:
         context.client,
         context.room_id,
         "$ctx-thread:localhost",
-        conversation_cache=context.conversation_cache,
+        relations=context.relations,
     )
     mock_set.assert_awaited_once_with(
         context.client,
@@ -136,7 +145,9 @@ async def test_set_thread_summary_defaults_to_context_room_and_thread() -> None:
         "  🧵 Ready\nfor\t review  ",
         config=context.config,
         runtime_paths=context.runtime_paths,
-        conversation_cache=context.conversation_cache,
+        conversation_reader=context.conversation_reader,
+        entity_name=context.agent_name,
+        membership_index=context.require_agent_reply_memberships(),
         pin=True,
     )
 
@@ -169,7 +180,9 @@ async def test_set_thread_summary_returns_helper_summary() -> None:
         "# **Fix** [ISSUE-116](http://example.com)",
         config=context.config,
         runtime_paths=context.runtime_paths,
-        conversation_cache=context.conversation_cache,
+        conversation_reader=context.conversation_reader,
+        entity_name=context.agent_name,
+        membership_index=context.require_agent_reply_memberships(),
         pin=True,
     )
 
@@ -213,7 +226,7 @@ async def test_set_thread_summary_normalizes_explicit_thread_id() -> None:
         context.client,
         context.room_id,
         "$reply-event:localhost",
-        conversation_cache=context.conversation_cache,
+        relations=context.relations,
     )
     mock_set.assert_awaited_once_with(
         context.client,
@@ -222,7 +235,9 @@ async def test_set_thread_summary_normalizes_explicit_thread_id() -> None:
         "done",
         config=context.config,
         runtime_paths=context.runtime_paths,
-        conversation_cache=context.conversation_cache,
+        conversation_reader=context.conversation_reader,
+        entity_name=context.agent_name,
+        membership_index=context.require_agent_reply_memberships(),
         pin=True,
     )
 
@@ -245,6 +260,7 @@ async def test_set_thread_summary_requires_explicit_thread_context_for_room_repl
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
 async def test_set_thread_summary_cross_room_requires_authorization() -> None:
     """Explicit room targeting should enforce the same room access checks as other Matrix tools."""
     tool = ThreadSummaryTools()
@@ -323,19 +339,19 @@ async def test_set_thread_summary_rejects_overlong_summary() -> None:
             "mindroom.custom_tools.thread_summary.set_manual_thread_summary",
             new=AsyncMock(
                 side_effect=ThreadSummaryWriteError(
-                    f"summary must be {THREAD_SUMMARY_MAX_LENGTH} characters or fewer after whitespace normalization.",
+                    f"summary must be {_THREAD_SUMMARY_MAX_LENGTH} characters or fewer after whitespace normalization.",
                 ),
             ),
         ),
         tool_runtime_context(context),
     ):
-        payload = json.loads(await tool.set_thread_summary("x" * (THREAD_SUMMARY_MAX_LENGTH + 1)))
+        payload = json.loads(await tool.set_thread_summary("x" * (_THREAD_SUMMARY_MAX_LENGTH + 1)))
 
     assert payload["status"] == "error"
     assert payload["room_id"] == context.room_id
     assert (
         payload["message"]
-        == f"summary must be {THREAD_SUMMARY_MAX_LENGTH} characters or fewer after whitespace normalization."
+        == f"summary must be {_THREAD_SUMMARY_MAX_LENGTH} characters or fewer after whitespace normalization."
     )
 
 

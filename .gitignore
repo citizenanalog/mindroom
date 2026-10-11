@@ -33,6 +33,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!macos/MindRoomDesktopHelper.spec
 
 # Installer logs
 pip-log.txt
@@ -260,6 +261,7 @@ mindroom-test-storage/
 .claude/reports/
 REVIEW-*.md
 .codex-worktrees/
+docs/superpowers/
 
 # Swift Package Manager build artifacts (macOS menubar app)
 macos/MindRoom/.build/

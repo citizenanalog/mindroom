@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
+from mindroom.config.schema_hints import dashboard_hint
 from mindroom.path_globs import validate_safe_relative_pattern
 
 KnowledgeBaseMode = Literal["semantic", "files"]
@@ -20,7 +21,10 @@ class KnowledgeGitConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    repo_url: str = Field(description="Git repository URL used as the knowledge source")
+    repo_url: str = Field(
+        description="Git repository URL used as the knowledge source; may embed HTTPS credentials",
+        json_schema_extra=dashboard_hint(secret=True),
+    )
     branch: str = Field(default="main", description="Git branch to track")
     poll_interval_seconds: int = Field(
         default=300,
@@ -78,6 +82,10 @@ class KnowledgeBaseConfig(BaseModel):
     watch: bool = Field(
         default=True,
         description="When true, shared local folders watch filesystem changes and schedule background published-index refresh without blocking reads; when false, direct external file edits require explicit reindex or dashboard/API mutations",
+    )
+    require_content_before_publish: bool = Field(
+        default=False,
+        description="Keep a cold semantic index initializing until at least one managed source file exists",
     )
     chunk_size: int = Field(
         default=5000,

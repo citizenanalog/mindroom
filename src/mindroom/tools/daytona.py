@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
+from mindroom.tools.string_mapping import parse_string_mapping
 
 if TYPE_CHECKING:
     from agno.tools.daytona import DaytonaTools
@@ -13,6 +14,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="daytona",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
     display_name="Daytona",
     description="Execute code in secure, remote sandbox environments",
     category=ToolCategory.DEVELOPMENT,  # others/ maps to DEVELOPMENT
@@ -52,9 +55,9 @@ if TYPE_CHECKING:
             label="Sandbox Language",
             type="text",
             required=False,
-            default="PYTHON",
-            placeholder="PYTHON",
-            description="Primary language for the sandbox (PYTHON, JAVASCRIPT, TYPESCRIPT)",
+            default="python",
+            placeholder="python",
+            description="Primary language for the sandbox (python, javascript, typescript)",
         ),
         ConfigField(
             name="sandbox_target",
@@ -91,7 +94,7 @@ if TYPE_CHECKING:
         ConfigField(
             name="sandbox_env_vars",
             label="Sandbox Environment Variables",
-            type="text",
+            type="password",
             required=False,
             placeholder='{"ENV_VAR": "value"}',
             description="Environment variables for the sandbox (JSON format)",
@@ -128,14 +131,14 @@ if TYPE_CHECKING:
             type="boolean",
             required=False,
             default=True,
-            description="Automatically create sandbox if none exists",
+            description="Create a fallback sandbox after a sandbox-management error",
         ),
         ConfigField(
             name="verify_ssl",
             label="Verify SSL",
             type="boolean",
             required=False,
-            default=False,
+            default=True,
             description="Whether to verify SSL certificates",
         ),
         ConfigField(
@@ -144,7 +147,7 @@ if TYPE_CHECKING:
             type="boolean",
             required=False,
             default=True,
-            description="Whether to reuse the same sandbox across agent sessions",
+            description="Whether to reuse the same sandbox within the current agent session",
         ),
         ConfigField(
             name="sandbox_public",
@@ -186,5 +189,67 @@ if TYPE_CHECKING:
 def daytona_tools() -> type[DaytonaTools]:
     """Return Daytona tools for secure code execution in remote sandbox environments."""
     from agno.tools.daytona import DaytonaTools
+    from daytona import CodeLanguage
 
-    return DaytonaTools
+    class MindRoomDaytonaTools(DaytonaTools):
+        """Daytona toolkit that normalizes dashboard-authored values."""
+
+        def __init__(
+            self,
+            api_key: str | None = None,
+            api_url: str | None = None,
+            sandbox_id: str | None = None,
+            sandbox_language: CodeLanguage | str | None = None,
+            sandbox_target: str | None = None,
+            sandbox_os: str | None = None,
+            auto_stop_interval: int | None = 60,
+            sandbox_os_user: str | None = None,
+            sandbox_env_vars: dict[str, str] | str | None = None,
+            sandbox_labels: dict[str, str] | str | None = None,
+            sandbox_public: bool | None = None,
+            organization_id: str | None = None,
+            timeout: int = 300,
+            auto_create_sandbox: bool = True,
+            verify_ssl: bool | None = True,
+            persistent: bool = True,
+            instructions: str | None = None,
+            add_instructions: bool = False,
+            **kwargs: object,
+        ) -> None:
+            normalized_language = sandbox_language.strip() if isinstance(sandbox_language, str) else sandbox_language
+            if isinstance(normalized_language, str):
+                resolved_language = CodeLanguage(normalized_language.lower()) if normalized_language else None
+            else:
+                resolved_language = normalized_language
+            super().__init__(
+                api_key=api_key,
+                api_url=api_url,
+                sandbox_id=sandbox_id,
+                sandbox_language=resolved_language,
+                sandbox_target=sandbox_target,
+                sandbox_os=sandbox_os,
+                auto_stop_interval=auto_stop_interval,
+                sandbox_os_user=sandbox_os_user,
+                sandbox_env_vars=parse_string_mapping(sandbox_env_vars, field_name="sandbox_env_vars"),
+                sandbox_labels=parse_string_mapping(sandbox_labels, field_name="sandbox_labels"),
+                sandbox_public=sandbox_public,
+                organization_id=organization_id,
+                timeout=timeout,
+                auto_create_sandbox=auto_create_sandbox,
+                # AGNO_COMPAT: Daytona disables TLS verification process-wide for any falsy verify_ssl.
+                # Reason: Agno 3.0.9 treats None like False and then patches daytona_api_client.Configuration.__init__
+                # for the whole process until it restarts, so one such toolkit disables checks for every Daytona client.
+                # Upstream issue: Tracking gap; no matching issue has been verified for either behavior.
+                # Upstream PR: No matching fix identified.
+                # Remove when: Agno disables verification only for an explicit False and scopes it to its own client
+                # configuration; keep MindRoom's true default for unset and null values.
+                # Coverage: tests/test_tool_config_sync.py::test_daytona_verifies_tls_certificates_unless_explicitly_disabled.
+                verify_ssl=verify_ssl is not False,
+                persistent=persistent,
+                instructions=instructions,
+                add_instructions=add_instructions,
+                **kwargs,
+            )
+
+    MindRoomDaytonaTools.__init__.__annotations__["sandbox_language"] = CodeLanguage | str | None
+    return MindRoomDaytonaTools

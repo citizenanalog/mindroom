@@ -17,11 +17,12 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from mindroom.file_locks import async_exclusive_file_lock
+from mindroom.file_locks import async_exclusive_file_lock, expose_inherited_file_lock
 from mindroom.knowledge.registry import resolve_refresh_target
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from typing import Literal, TextIO
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -35,6 +36,7 @@ _refresh_locks_guard = Lock()
 # evicting a live one would report an in-flight refresh as idle and mask the leak a
 # crashed refresh means.
 _active_refresh_counts: dict[KnowledgeRefreshTarget, int] = {}
+_scheduled_refresh_targets: set[KnowledgeRefreshTarget] = set()
 _active_refresh_counts_guard = Lock()
 _MAX_REFRESH_LOCKS = 512
 _REFRESH_FILE_LOCK_POLL_SECONDS = 0.1
@@ -104,10 +106,14 @@ def _refresh_file_lock_path(key: KnowledgeSourceRoot) -> Path:
 
 
 @asynccontextmanager
-async def _acquire_refresh_file_lock(key: KnowledgeSourceRoot) -> AsyncIterator[None]:
+async def _acquire_refresh_file_lock(key: KnowledgeSourceRoot) -> AsyncIterator[TextIO]:
     """Serialize source-root refresh and mutation work across processes."""
-    async with async_exclusive_file_lock(_refresh_file_lock_path(key), poll_seconds=_REFRESH_FILE_LOCK_POLL_SECONDS):
-        yield
+    async with async_exclusive_file_lock(
+        _refresh_file_lock_path(key),
+        poll_seconds=_REFRESH_FILE_LOCK_POLL_SECONDS,
+        retain_for_inherited_fds=True,
+    ) as lock_file:
+        yield lock_file
 
 
 @asynccontextmanager
@@ -128,24 +134,52 @@ async def refresh_source_root_lock(key: KnowledgeSourceRoot) -> AsyncIterator[No
     order rather than queueing, and the borrow counts that keep the lock table from
     evicting a live entry would never be recorded.
     """
-    async with _acquire_refresh_lock(key), _acquire_refresh_file_lock(key):
-        yield
+    async with _acquire_refresh_lock(key), _acquire_refresh_file_lock(key) as lock_file:
+        with expose_inherited_file_lock(lock_file, scope=Path(key.knowledge_path)):
+            yield
 
 
 def mark_refresh_active(key: KnowledgeRefreshTarget) -> None:
-    """Record scheduler-level refresh activity before a task reaches the runner."""
+    """Record direct refresh activity for one physical target."""
     with _active_refresh_counts_guard:
         _active_refresh_counts[key] = _active_refresh_counts.get(key, 0) + 1
 
 
-def mark_refresh_inactive(key: KnowledgeRefreshTarget) -> None:
-    """Clear scheduler-level refresh activity after a scheduled task finishes."""
+def claim_scheduled_refresh(
+    key: KnowledgeRefreshTarget,
+) -> Literal["claimed", "scheduled_refresh_active", "direct_refresh_active"]:
+    """Atomically claim scheduler ownership or identify the existing owner."""
     with _active_refresh_counts_guard:
-        count = _active_refresh_counts.get(key, 0)
-        if count <= 1:
-            _active_refresh_counts.pop(key, None)
-        else:
-            _active_refresh_counts[key] = count - 1
+        if key in _scheduled_refresh_targets:
+            return "scheduled_refresh_active"
+        if _active_refresh_counts.get(key, 0) > 0:
+            return "direct_refresh_active"
+        _active_refresh_counts[key] = 1
+        _scheduled_refresh_targets.add(key)
+        return "claimed"
+
+
+def mark_scheduled_refresh_inactive(key: KnowledgeRefreshTarget) -> None:
+    """Release one scheduler-owned refresh claim."""
+    with _active_refresh_counts_guard:
+        if key not in _scheduled_refresh_targets:
+            return
+        _scheduled_refresh_targets.remove(key)
+        _mark_refresh_inactive_locked(key)
+
+
+def mark_refresh_inactive(key: KnowledgeRefreshTarget) -> None:
+    """Release one direct refresh activity record."""
+    with _active_refresh_counts_guard:
+        _mark_refresh_inactive_locked(key)
+
+
+def _mark_refresh_inactive_locked(key: KnowledgeRefreshTarget) -> None:
+    count = _active_refresh_counts.get(key, 0)
+    if count <= 1:
+        _active_refresh_counts.pop(key, None)
+    else:
+        _active_refresh_counts[key] = count - 1
 
 
 def is_refresh_active(key: KnowledgeRefreshTarget) -> bool:

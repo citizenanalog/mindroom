@@ -8,32 +8,27 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import nio
 
-from mindroom.approval_manager import (
-    PendingApproval,
-    SentApprovalEvent,
-    _ApprovalManager,
-    initialize_approval_store,
-)
 from mindroom.attachments import AttachmentRecord, register_local_attachment
 from mindroom.config.agent import AgentConfig, TeamConfig
-from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.constants import (
+    ROUTER_AGENT_NAME,
     VOICE_RAW_AUDIO_FALLBACK_KEY,
     RuntimePaths,
     resolve_runtime_paths,
 )
-from mindroom.dispatch_handoff import PreparedTextEvent
+from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_source import (
     MESSAGE_SOURCE_KIND,
     VOICE_SOURCE_KIND,
 )
+from mindroom.event_journal import EventClass, EventKind
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.handled_turns import TurnRecord
 from mindroom.history.types import HistoryScope
@@ -43,23 +38,20 @@ from mindroom.hooks import (
 )
 from mindroom.knowledge.indexing_config import IndexingSettings
 from mindroom.knowledge.utils import _KnowledgeResolution
-from mindroom.matrix.cache import ThreadHistoryResult
 from mindroom.matrix.client import ResolvedVisibleMessage
+from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
-from mindroom.orchestration.config_updates import ConfigUpdatePlan
 from mindroom.response_runner import (
     ResponseRequest,
 )
-from mindroom.runtime_support import StartupThreadPrewarmRegistry
-from mindroom.tool_approval import _shutdown_approval_store
+from mindroom.response_sources import ResponseSources
 from mindroom.turn_policy import PreparedDispatch, TurnPolicy
+from tests.access_schema_support import with_current_room_member_access
 from tests.conftest import (
     TEST_PASSWORD,
     bind_runtime_paths,
     drain_coalescing,
-    make_event_cache_mock,
-    make_event_cache_write_coordinator_mock,
     make_matrix_client_mock,
     message_origin,
     replace_turn_controller_deps,
@@ -70,6 +62,7 @@ from tests.conftest import (
 )
 from tests.conftest import replace_turn_policy_deps as shared_replace_turn_policy_deps
 from tests.identity_helpers import entity_ids, persist_entity_accounts
+from tests.journal_helpers import admit_dispatch_event
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
@@ -77,7 +70,7 @@ if TYPE_CHECKING:
     from agno.knowledge.document import Document
 
     from mindroom.bot import AgentBot, TeamBot
-    from mindroom.coalescing import ReadyPendingEvent
+    from mindroom.coalescing.gate import ReadyPendingEvent
     from mindroom.config.knowledge import KnowledgeBaseConfig
     from mindroom.conversation_resolver import MessageContext
     from mindroom.inbound_turn_normalizer import DispatchPayload
@@ -86,6 +79,28 @@ if TYPE_CHECKING:
         _MultiAgentOrchestrator,
     )
     from mindroom.turn_store import TurnStore
+
+
+def make_test_agent_bot(*args: Any, **kwargs: Any) -> AgentBot:  # noqa: ANN401
+    """Build a standalone test bot with an explicit real membership index."""
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex  # noqa: PLC0415
+    from mindroom.bot import AgentBot as RuntimeAgentBot  # noqa: PLC0415
+
+    if "agent_reply_memberships" not in kwargs:
+        membership_sync = kwargs.get("agent_reply_membership_sync")
+        kwargs["agent_reply_memberships"] = (
+            membership_sync.memberships if membership_sync is not None else AgentReplyMembershipIndex()
+        )
+    return RuntimeAgentBot(*args, **kwargs)
+
+
+def make_test_team_bot(*args: Any, **kwargs: Any) -> TeamBot:  # noqa: ANN401
+    """Build a standalone test team bot with an explicit real membership index."""
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex  # noqa: PLC0415
+    from mindroom.bot import TeamBot as RuntimeTeamBot  # noqa: PLC0415
+
+    kwargs.setdefault("agent_reply_memberships", AgentReplyMembershipIndex())
+    return RuntimeTeamBot(*args, **kwargs)
 
 
 def _stream_outcome(
@@ -153,6 +168,27 @@ def _visible_response_event_id(outcome: FinalDeliveryOutcome | str | None) -> st
     return outcome.final_visible_event_id
 
 
+async def dispatch_reaction_durably(
+    bot: AgentBot,
+    room: nio.MatrixRoom,
+    event: nio.ReactionEvent,
+) -> None:
+    """Exercise one reaction through its durable production entrypoint."""
+    source = dict(event.source)
+    source.setdefault("event_id", event.event_id)
+    source.setdefault("sender", event.sender)
+    source.setdefault("origin_server_ts", 1)
+    source.setdefault("type", "m.reaction")
+    source["content"] = {
+        **source.get("content", {}),
+        "m.relates_to": {"rel_type": "m.annotation", "event_id": event.reacts_to, "key": event.key},
+    }
+    event.source = source
+    event.decrypted = False
+    await admit_dispatch_event(bot._journal_dispatcher, room, event, EventKind.REACTION, EventClass.ACTIONABLE)
+    await bot._journal_dispatcher.drain_once()
+
+
 def _handled_response_event_id(outcome: FinalDeliveryOutcome | str | None) -> str | None:
     if isinstance(outcome, str) or outcome is None:
         return outcome
@@ -161,8 +197,8 @@ def _handled_response_event_id(outcome: FinalDeliveryOutcome | str | None) -> st
 
 def _assert_ready_voice_text_fallback(ready_event: ReadyPendingEvent | None) -> None:
     assert ready_event is not None
-    assert ready_event.pending_event.source_kind == VOICE_SOURCE_KIND
-    assert isinstance(ready_event.pending_event.event, PreparedTextEvent)
+    assert ready_event.pending_event.event.source_kind == VOICE_SOURCE_KIND
+    assert isinstance(ready_event.pending_event.event, PreparedIngress)
     assert ready_event.pending_event.event.body == "🎤 [Attached voice message]"
     assert ready_event.pending_event.event.source["content"][VOICE_RAW_AUDIO_FALLBACK_KEY] is True
 
@@ -180,6 +216,14 @@ async def _run_orchestrator_start_until_ready(
 
     with patch("mindroom.orchestrator.set_runtime_ready", side_effect=mark_ready):
         runtime_task = asyncio.create_task(orchestrator.start())
+
+        async def publish_router_membership_readiness() -> None:
+            while ROUTER_AGENT_NAME not in orchestrator._sync_tasks and not runtime_task.done():  # noqa: ASYNC110
+                await asyncio.sleep(0)
+            if not runtime_task.done():
+                orchestrator._router_reply_memberships_live_sync_ready.set()
+
+        router_ready_task = asyncio.create_task(publish_router_membership_readiness())
         try:
             await asyncio.wait_for(ready.wait(), timeout=1.0)
             if wait_for_startup_maintenance:
@@ -189,6 +233,10 @@ async def _run_orchestrator_start_until_ready(
             await orchestrator.stop()
             await asyncio.wait_for(runtime_task, timeout=1.0)
         finally:
+            if not router_ready_task.done():
+                router_ready_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await router_ready_task
             if not runtime_task.done():
                 runtime_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -198,6 +246,14 @@ async def _run_orchestrator_start_until_ready(
 def _make_matrix_client_mock() -> AsyncMock:
     """Return one Matrix client mock with safe thread-history defaults."""
     return make_matrix_client_mock()
+
+
+def owned_matrix_login(client: object, session: object | None = None) -> SimpleNamespace:
+    """Wrap a test client in Bot's private owned-login carrier shape."""
+    return SimpleNamespace(
+        client=client,
+        session=AsyncMock() if session is None else session,
+    )
 
 
 def _wrap_extracted_collaborators(bot: AgentBot) -> AgentBot:
@@ -213,13 +269,6 @@ def _wrap_extracted_collaborators(bot: AgentBot) -> AgentBot:
         state_writer=wrapped_bot._conversation_state_writer,
     )
     return wrapped_bot
-
-
-def _install_runtime_cache_support(bot: AgentBot | TeamBot) -> None:
-    """Attach the full injected runtime-support bundle to a bot test instance."""
-    bot.event_cache = make_event_cache_mock()
-    bot.event_cache_write_coordinator = make_event_cache_write_coordinator_mock()
-    bot.startup_thread_prewarm_registry = StartupThreadPrewarmRegistry()
 
 
 def _empty_full_thread_history() -> ThreadHistoryResult:
@@ -241,14 +290,14 @@ def _set_turn_store_tracker(bot: AgentBot | TeamBot, tracker: MagicMock) -> Magi
     """Swap the private handled-turn ledger behind one turn store for test assertions."""
     stored_records: dict[str, TurnRecord] = {}
     tracker.get_turn_record.return_value = None
+    # Records written through the tracker read back unless a test pins the read.
+    tracker.get_turn_record.side_effect = lambda event_id: stored_records.get(event_id, DEFAULT)
+    tracker.has_responded.return_value = False
 
-    def update_handled_turn(
+    async def update_handled_turn(
         lookup_event_ids: Sequence[str],
         update: Callable[[Mapping[str, TurnRecord]], TurnRecord],
-        *,
-        wait_for_persist: bool = False,
     ) -> TurnRecord:
-        del wait_for_persist  # The fake applies updates synchronously.
         existing_records = {
             source_event_id: turn_record
             for source_event_id in lookup_event_ids
@@ -275,10 +324,10 @@ def _set_turn_store_tracker(bot: AgentBot | TeamBot, tracker: MagicMock) -> Magi
 def _set_knowledge_for_agent(bot: AgentBot, knowledge_for_agent: MagicMock) -> MagicMock:
     """Replace the captured knowledge resolver on the real response coordinator."""
     bot._knowledge_access_support.for_agent = knowledge_for_agent
-    resolve_for_agent = MagicMock(
+    resolve_for_agent = AsyncMock(
         return_value=_KnowledgeResolution(knowledge=knowledge_for_agent.return_value),
     )
-    bot._knowledge_access_support.resolve_for_agent = resolve_for_agent
+    bot._knowledge_access_support.resolve_for_agent_async = resolve_for_agent
     return resolve_for_agent
 
 
@@ -287,6 +336,16 @@ def _room_send_response(event_id: str) -> MagicMock:
     response = MagicMock(spec=nio.RoomSendResponse, event_id=event_id)
     response.__class__ = nio.RoomSendResponse
     return response
+
+
+def unique_room_send_responses(client: MagicMock, *, prefix: str = "$sent") -> None:
+    """Answer every send with its own event ID, as a homeserver does.
+
+    A reply is bound to the event it created, so two replies cannot share one;
+    a fixed mocked response would make every send look like the same event.
+    """
+    counter = iter(range(1, 1_000_000))
+    client.room_send.side_effect = lambda *_args, **_kwargs: _room_send_response(f"{prefix}{next(counter)}")
 
 
 def _matrix_room(
@@ -344,10 +403,9 @@ def _agent_response_handled_turn(
     agent_name: str,
     room_id: str,
     event_id: str,
-    response_event_id: str,
+    response_event_id: str | None = None,
     thread_id: str | None = None,
     requester_id: str | None = None,
-    correlation_id: str | None = None,
     source_event_prompts: dict[str, str] | None = None,
 ) -> TurnRecord:
     """Return the handled-turn state persisted for one direct agent response."""
@@ -356,7 +414,6 @@ def _agent_response_handled_turn(
             [event_id],
             response_event_id=response_event_id,
             requester_id=requester_id,
-            correlation_id=correlation_id,
             source_event_prompts=source_event_prompts,
         ),
         response_owner=agent_name,
@@ -378,7 +435,6 @@ def _response_request(
     prompt: str = "Hello",
     model_prompt: str | None = None,
     existing_event_id: str | None = None,
-    existing_event_is_placeholder: bool = False,
     user_id: str | None = "@user:localhost",
     media: MediaInputs | None = None,
     attachment_ids: Sequence[str] | None = None,
@@ -398,11 +454,14 @@ def _response_request(
         msg = "Test response envelope target does not match the source response coordinates"
         raise ValueError(msg)
     return ResponseRequest(
+        sources=ResponseSources(
+            pending_event_ids=(response_envelope.source_event_id,),
+            logical_source_event_ids=(response_envelope.source_event_id,),
+        ),
         thread_history=thread_history,
         prompt=prompt,
         model_prompt=model_prompt,
         existing_event_id=existing_event_id,
-        existing_event_is_placeholder=existing_event_is_placeholder,
         user_id=user_id,
         media=media,
         attachment_ids=tuple(attachment_ids) if attachment_ids is not None else None,
@@ -452,21 +511,22 @@ def _fake_indexing_settings(base_id: str) -> IndexingSettings:
 def _configured_team_test_config(runtime_root: Path) -> Config:
     """Return a runtime-bound config with one configured team for TeamBot tests."""
     return _runtime_bound_config(
-        Config(
-            agents={
-                "calculator": AgentConfig(display_name="CalculatorAgent", rooms=["!test:localhost"]),
-                "general": AgentConfig(display_name="GeneralAgent", rooms=["!test:localhost"]),
-            },
-            teams={
-                "support_team": TeamConfig(
-                    display_name="Support Team",
-                    role="Coordinate test responses",
-                    agents=["general"],
-                    rooms=["!test:localhost"],
-                ),
-            },
-            models={"default": ModelConfig(provider="test", id="test-model")},
-            authorization=AuthorizationConfig(default_room_access=True),
+        with_current_room_member_access(
+            Config(
+                agents={
+                    "calculator": AgentConfig(display_name="CalculatorAgent", rooms=["!test:localhost"]),
+                    "general": AgentConfig(display_name="GeneralAgent", rooms=["!test:localhost"]),
+                },
+                teams={
+                    "support_team": TeamConfig(
+                        display_name="Support Team",
+                        role="Coordinate test responses",
+                        agents=["general"],
+                        rooms=["!test:localhost"],
+                    ),
+                },
+                models={"default": ModelConfig(provider="test", id="test-model")},
+            ),
         ),
         runtime_root,
     )
@@ -490,9 +550,8 @@ def _mock_managed_bot(config: Config) -> MagicMock:
     bot = MagicMock()
     bot.config = config
     bot.enable_streaming = config.defaults.enable_streaming
-    bot.event_cache = None
-    bot.event_cache_write_coordinator = None
     bot._set_presence_with_model_info = AsyncMock()
+    bot.recover_pending_turn_journal_events = AsyncMock()
     return bot
 
 
@@ -522,115 +581,6 @@ def _approval_reload_config(tmp_path: Path, *, include_code: bool) -> Config:
     )
 
 
-def _mock_approval_reload_bot(
-    config: Config,
-    *,
-    agent_name: str,
-    user_id: str,
-    room_send: AsyncMock,
-) -> MagicMock:
-    """Return one managed-bot double with a live Matrix client for approval reload tests."""
-    bot = _mock_managed_bot(config)
-    bot.agent_name = agent_name
-    bot.running = True
-    bot.client = make_matrix_client_mock(user_id=user_id)
-    bot.client.room_send = room_send
-    bot.client.rooms["!room:localhost"].add_member(user_id, agent_name.capitalize(), None)
-    latest_thread_event_id = "$latest-thread-event" if agent_name == "code" else None
-    bot.latest_thread_event_id_if_needed = AsyncMock(return_value=latest_thread_event_id)
-    bot.cleanup = AsyncMock()
-    return bot
-
-
-async def _wait_for_live_pending(
-    store: _ApprovalManager,
-    sender: AsyncMock,
-    *,
-    room_id: str = "!test:localhost",
-) -> PendingApproval:
-    async with asyncio.timeout(15):
-        while True:
-            if sender.await_args is not None:
-                approval_id = sender.await_args.args[2]["approval_id"]
-                card_event_id = store._live_card_event_id_for_approval(approval_id)
-                if card_event_id is not None:
-                    pending = await store._pending_approval_for_card(room_id=room_id, card_event_id=card_event_id)
-                    if pending is not None:
-                        return pending
-            await asyncio.sleep(0)
-
-
-async def _live_pending_approval(
-    store: _ApprovalManager,
-    *,
-    room_id: str,
-    approval_id: str,
-) -> PendingApproval | None:
-    card_event_id = store._live_card_event_id_for_approval(approval_id)
-    if card_event_id is None:
-        return None
-    return await store._pending_approval_for_card(room_id=room_id, card_event_id=card_event_id)
-
-
-async def _wait_for_pending_approval_id(store: _ApprovalManager, approval_ids: list[str]) -> str:
-    async with asyncio.timeout(1):
-        while True:
-            if (
-                approval_ids
-                and await _live_pending_approval(store, room_id="!room:localhost", approval_id=approval_ids[0])
-                is not None
-            ):
-                return approval_ids[0]
-            await asyncio.sleep(0)
-
-
-async def _start_live_approval(
-    runtime_paths: RuntimePaths,
-    *,
-    approver_user_id: str = "@user:localhost",
-    editor: AsyncMock | None = None,
-    arguments: dict[str, Any] | None = None,
-) -> tuple[_ApprovalManager, PendingApproval, asyncio.Task[Any], AsyncMock]:
-    sender = AsyncMock(return_value=SentApprovalEvent("$approval"))
-    approval_editor = editor or AsyncMock(return_value=True)
-    store = initialize_approval_store(runtime_paths, sender=sender, editor=approval_editor)
-    task = asyncio.create_task(
-        store.request_approval(
-            tool_name="read_file",
-            arguments=arguments or {"path": "notes.txt"},
-            room_id="!test:localhost",
-            requester_id="@user:localhost",
-            approver_user_id=approver_user_id,
-            timeout_seconds=30,
-        ),
-    )
-    try:
-        pending = await _wait_for_live_pending(store, sender)
-    except Exception:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-        await _shutdown_approval_store()
-        raise
-    return store, pending, task, approval_editor
-
-
-def _approval_removal_plan(new_config: Config) -> ConfigUpdatePlan:
-    """Return one config-update plan that removes the code bot without restarting others."""
-    return ConfigUpdatePlan(
-        new_config=new_config,
-        changed_mcp_servers=set(),
-        configured_entities=set(),
-        entities_to_restart=set(),
-        new_entities=set(),
-        removed_entities={"code"},
-        mindroom_user_changed=False,
-        matrix_room_access_changed=False,
-        matrix_space_changed=False,
-        authorization_changed=False,
-    )
-
-
 def _cleanup_recorder(event_order: list[str]) -> Callable[[], Awaitable[None]]:
     """Return one async cleanup side effect that records teardown ordering."""
 
@@ -645,6 +595,7 @@ def _hook_plugin(name: str, callbacks: list[object]) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
         discovered_hooks=tuple(callbacks),
+        discovered_automations=(),
         entry_config=PluginEntryConfig(path=f"./plugins/{name}"),
         plugin_order=0,
     )
@@ -951,14 +902,15 @@ class AgentBotTestBase:
     def create_mock_config(runtime_root: Path) -> Config:
         """Create a typed config for tests that do not need a runtime-bound YAML load."""
         return _runtime_bound_config(
-            Config(
-                agents={
-                    "calculator": AgentConfig(display_name="CalculatorAgent", rooms=["!test:localhost"]),
-                    "general": AgentConfig(display_name="GeneralAgent", rooms=["!test:localhost"]),
-                },
-                teams={},
-                models={"default": ModelConfig(provider="test", id="test-model")},
-                authorization=AuthorizationConfig(default_room_access=True),
+            with_current_room_member_access(
+                Config(
+                    agents={
+                        "calculator": AgentConfig(display_name="CalculatorAgent", rooms=["!test:localhost"]),
+                        "general": AgentConfig(display_name="GeneralAgent", rooms=["!test:localhost"]),
+                    },
+                    teams={},
+                    models={"default": ModelConfig(provider="test", id="test-model")},
+                ),
             ),
             runtime_root,
         )
@@ -993,6 +945,7 @@ class AgentBotTestBase:
             event = MagicMock(spec=nio.ReactionEvent)
             event.key = "👍"
             event.reacts_to = "$question"
+            event.server_timestamp = 1234567890
             event.source = {"content": {}}
         else:  # pragma: no cover - defensive guard for test helper misuse
             msg = f"Unsupported handler: {handler_name}"
@@ -1017,7 +970,7 @@ class AgentBotTestBase:
             await bot._on_media_message(room, event)
             await drain_coalescing(bot)
         elif handler_name == "reaction":
-            await bot._on_reaction(room, event)
+            await dispatch_reaction_durably(bot, room, event)
         else:  # pragma: no cover - defensive guard for test helper misuse
             msg = f"Unsupported handler: {handler_name}"
             raise ValueError(msg)

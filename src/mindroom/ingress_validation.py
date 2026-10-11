@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-import nio
-
-from mindroom.authorization import get_effective_sender_id_for_reply_permissions, is_authorized_sender
 from mindroom.commands.parsing import command_parser
-from mindroom.constants import ORIGINAL_SENDER_KEY, ROUTER_AGENT_NAME
-from mindroom.dispatch_handoff import PreparedTextEvent
+from mindroom.constants import (
+    ACTING_REQUESTER_KEY,
+    ORIGINAL_SENDER_KEY,
+    ROUTER_AGENT_NAME,
+    STREAM_STATUS_COMPLETED,
+    STREAM_STATUS_KEY,
+)
+from mindroom.dispatch_handoff import PreparedIngress, is_text_dispatch_event
 from mindroom.dispatch_source import (
     IMAGE_SOURCE_KIND,
     MEDIA_SOURCE_KIND,
+    MESSAGE_SOURCE_KIND,
     TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
     VOICE_SOURCE_KIND,
-    is_auto_resume_relay_body,
     is_visible_router_voice_echo_content,
     is_voice_event,
     source_kind_allows_self_authored_ingress,
@@ -26,11 +30,18 @@ from mindroom.dispatch_source import (
 )
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.handled_turns import TurnRecord
-from mindroom.matrix.event_info import reply_to_event_id_from_content
+from mindroom.matrix.event_info import EventInfo, reply_to_event_id_from_content
 from mindroom.matrix.media import is_audio_message_event
+from mindroom.requester_identity import (
+    is_access_checked_requester_id,
+    is_human_requester_id,
+    resolve_human_requester_alias,
+)
 from mindroom.turn_origin import requester_id_from_trusted_original_sender
 
 if TYPE_CHECKING:
+    import nio
+
     from mindroom.bot_runtime_view import BotRuntimeView
     from mindroom.commands.parsing import Command
     from mindroom.constants import RuntimePaths
@@ -38,7 +49,6 @@ if TYPE_CHECKING:
         DispatchEvent,
         DispatchIngressMetadata,
         DispatchPayloadMetadata,
-        TextDispatchEvent,
     )
     from mindroom.matrix.identity import MatrixID
     from mindroom.matrix.media import MatrixMediaEvent
@@ -48,8 +58,14 @@ if TYPE_CHECKING:
 class _SenderReplyPolicy(Protocol):
     """Minimal reply-permission surface needed at the ingress boundary."""
 
-    def can_reply_to_sender(self, sender_id: str) -> bool:
-        """Return whether this agent may reply to one effective requester."""
+    def can_reply_to_sender_in_room(
+        self,
+        sender_id: str,
+        room_id: str,
+        *,
+        observed_room: nio.MatrixRoom | None = None,
+    ) -> bool:
+        """Return whether this agent may reply to one requester in a room."""
         ...
 
 
@@ -79,34 +95,82 @@ class IngressValidator:
         """Return the effective requester for reply-permission checks."""
         source_dict = cast("dict[str, Any] | None", source if isinstance(source, dict) else None)
         content = source_dict.get("content") if source_dict is not None else None
+        requester_id = sender
         if isinstance(content, dict):
             original_sender = content.get(ORIGINAL_SENDER_KEY)
-            if not isinstance(original_sender, str):
-                return get_effective_sender_id_for_reply_permissions(
-                    sender,
-                    source_dict,
-                    self.deps.runtime.config,
-                    self.deps.runtime_paths,
-                )
-            source_kind = source_kind_from_content(content)
-            trusted_requester = requester_id_from_trusted_original_sender(
-                original_sender=original_sender,
-                original_sender_entity_name=self.managed_entity_name_for_sender(original_sender),
-                source_kind=source_kind,
-                sender_trusts_original_sender=self.should_trust_original_sender_metadata(
-                    sender=sender,
+            if isinstance(original_sender, str):
+                source_kind = source_kind_from_content(content)
+                trusted_requester = requester_id_from_trusted_original_sender(
+                    original_sender=original_sender,
+                    original_sender_entity_name=self.managed_entity_name_for_sender(original_sender),
+                    original_sender_is_access_checked=is_access_checked_requester_id(
+                        original_sender,
+                        self.deps.runtime.config,
+                        self.deps.runtime_paths,
+                    ),
                     source_kind=source_kind,
-                ),
-            )
-            if trusted_requester is not None:
-                return trusted_requester
-            return sender
-        return get_effective_sender_id_for_reply_permissions(
-            sender,
-            source_dict,
+                    sender_trusts_original_sender=self._should_trust_original_sender_metadata(
+                        sender=sender,
+                        source_kind=source_kind,
+                    ),
+                )
+                if trusted_requester is not None:
+                    requester_id = trusted_requester
+        return resolve_human_requester_alias(
+            requester_id,
             self.deps.runtime.config,
             self.deps.runtime_paths,
         )
+
+    def acting_requester_for_event(self, event: DispatchEvent | MatrixMediaEvent) -> str | None:
+        """Return the human or bot-account requester an agent's or team's own reply was written for, when trusted.
+
+        Entities that this reply mentions act for that requester: they apply their
+        access policy to it and run with it as requester, while the sender stays
+        the message's author for every sender-based mechanic.
+        """
+        content = event.source.get("content") if isinstance(event.source, dict) else None
+        if not isinstance(content, dict):
+            return None
+        acting_requester = content.get(ACTING_REQUESTER_KEY)
+        if (
+            not isinstance(acting_requester, str)
+            or self.managed_entity_name_for_sender(event.sender) in {None, ROUTER_AGENT_NAME}
+            or source_kind_from_content(content) not in {None, MESSAGE_SOURCE_KIND}
+            or not is_access_checked_requester_id(acting_requester, self.deps.runtime.config, self.deps.runtime_paths)
+        ):
+            return None
+        return resolve_human_requester_alias(acting_requester, self.deps.runtime.config, self.deps.runtime_paths)
+
+    def entity_final_reply_original_event_id(self, event: DispatchEvent | MatrixMediaEvent) -> str | None:
+        """Return the reply a managed entity's completed edit finalizes, or None for any other event."""
+        content = event.source.get("content") if isinstance(event.source, dict) else None
+        if (
+            not isinstance(content, dict)
+            or content.get(STREAM_STATUS_KEY) != STREAM_STATUS_COMPLETED
+            or self.managed_entity_name_for_sender(event.sender) in {None, ROUTER_AGENT_NAME}
+        ):
+            return None
+        return EventInfo.from_event(event.source).original_event_id
+
+    def entity_final_reply(self, event: nio.RoomMessageFormatted) -> nio.RoomMessageFormatted | None:
+        """Return a managed entity's completed edit as the reply message it finalizes.
+
+        An entity posts a placeholder and delivers its final text as an edit of it, so other
+        entities read the replacement content; the edit keeps its own event ID and relation.
+        """
+        content = event.source.get("content") if isinstance(event.source, dict) else None
+        if not isinstance(content, dict) or not isinstance(new_content := content.get("m.new_content"), dict):
+            return None
+        reply = copy(event)
+        reply.source = {**event.source, "content": {**new_content, "m.relates_to": content.get("m.relates_to")}}
+        body = new_content.get("body")
+        reply.body = body if isinstance(body, str) else event.body
+        return reply if self.entity_final_reply_original_event_id(reply) is not None else None
+
+    def discovery_event_id(self, event: DispatchEvent) -> str | None:
+        """Return the earlier event a turn for this event also owns: a routed human message or a finalized reply."""
+        return self.router_relay_original_event_id(event) or self.entity_final_reply_original_event_id(event)
 
     def sender_is_trusted_for_ingress_metadata(self, sender_id: str) -> bool:
         """Return whether one sender may supply trusted ingress metadata overrides."""
@@ -117,7 +181,7 @@ class IngressValidator:
         registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
         return registry.current_entity_name_for_user_id(sender_id, include_router=include_router)
 
-    def should_trust_original_sender_metadata(
+    def _should_trust_original_sender_metadata(
         self,
         *,
         sender: str,
@@ -133,12 +197,12 @@ class IngressValidator:
     @staticmethod
     def event_source_kind(event: DispatchEvent, content: dict[str, Any]) -> str | None:
         """Return canonical source-kind metadata for one dispatch event."""
-        source_kind = event.source_kind_override if isinstance(event, PreparedTextEvent) else None
+        source_kind = event.source_kind_override if isinstance(event, PreparedIngress) else None
         return source_kind if source_kind is not None else source_kind_from_content(content)
 
     def trusted_human_original_sender_for_event(self, event: DispatchEvent) -> str | None:
         """Return trusted human original-sender metadata from one dispatch event."""
-        if not isinstance(event, nio.RoomMessageText | PreparedTextEvent):
+        if not is_text_dispatch_event(event):
             return None
         if not self.sender_is_trusted_for_ingress_metadata(event.sender):
             return None
@@ -146,26 +210,37 @@ class IngressValidator:
         if not isinstance(content, dict):
             return None
         source_kind = self.event_source_kind(event, content)
-        return self.trusted_human_original_sender(
+        original_sender = self._trusted_original_sender(
             sender=event.sender,
             content=content,
             source_kind=source_kind,
         )
+        if original_sender is None or not is_human_requester_id(
+            original_sender,
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+        ):
+            return None
+        return original_sender
 
-    def trusted_human_original_sender(
+    def _trusted_original_sender(
         self,
         *,
         sender: str,
         content: dict[str, Any],
         source_kind: str | None,
     ) -> str | None:
-        """Return trusted original-sender metadata only when it names a human requester."""
+        """Return trusted original-sender metadata only when it names a human or configured bot-account requester."""
         original_sender = content.get(ORIGINAL_SENDER_KEY)
         if not isinstance(original_sender, str) or not original_sender:
             return None
-        if self.managed_entity_name_for_sender(original_sender) is not None:
+        if not is_access_checked_requester_id(
+            original_sender,
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+        ):
             return None
-        if not self.should_trust_original_sender_metadata(
+        if not self._should_trust_original_sender_metadata(
             sender=sender,
             source_kind=source_kind,
         ):
@@ -178,7 +253,7 @@ class IngressValidator:
 
     def is_trusted_internal_relay_event(self, event: DispatchEvent) -> bool:
         """Return whether one agent-authored relay should bypass user-turn coalescing."""
-        if not isinstance(event, nio.RoomMessageText | PreparedTextEvent):
+        if not is_text_dispatch_event(event):
             return False
         content = event.source.get("content") if isinstance(event.source, dict) else None
         if not isinstance(content, dict):
@@ -187,7 +262,7 @@ class IngressValidator:
             return False
         return self.trusted_human_original_sender_for_event(event) is not None
 
-    def is_trusted_router_relay_event(self, event: DispatchEvent) -> bool:
+    def _is_trusted_router_relay_event(self, event: DispatchEvent) -> bool:
         """Return whether one trusted internal relay originated from the router."""
         if not self.is_trusted_internal_relay_event(event):
             return False
@@ -196,12 +271,10 @@ class IngressValidator:
 
     def router_relay_original_event_id(self, event: DispatchEvent) -> str | None:
         """Return the routed human event one trusted router relay explicitly replies to."""
-        if not self.is_trusted_router_relay_event(event):
+        if not self._is_trusted_router_relay_event(event):
             return None
         content = event.source.get("content") if isinstance(event.source, dict) else None
         if not isinstance(content, dict):
-            return None
-        if is_auto_resume_relay_body(content.get("body")):
             return None
         relates_to = content.get("m.relates_to")
         if isinstance(relates_to, dict) and relates_to.get("is_falling_back") is True:
@@ -209,14 +282,14 @@ class IngressValidator:
         return reply_to_event_id_from_content(content)
 
     def is_trusted_router_visible_voice_echo_content(self, sender: str, content: object) -> bool:
-        """Return whether replay history content is a display-only router voice echo."""
+        """Return whether content is the router's display-only transcript of human or bot-account audio."""
         if self.managed_entity_name_for_sender(sender) != ROUTER_AGENT_NAME:
             return False
         if not is_visible_router_voice_echo_content(content) or not isinstance(content, dict):
             return False
         content_dict = cast("dict[str, Any]", content)
         return (
-            self.trusted_human_original_sender(
+            self._trusted_original_sender(
                 sender=sender,
                 content=content_dict,
                 source_kind=source_kind_from_content(content_dict),
@@ -227,7 +300,12 @@ class IngressValidator:
     def is_display_only_router_voice_echo(self, event: DispatchEvent) -> bool:
         """Return whether one ingress event is the router's display-only voice transcript echo."""
         content = event.source.get("content") if isinstance(event.source, dict) else None
-        return is_visible_router_voice_echo_content(content) and self.is_trusted_router_relay_event(event)
+        return (
+            is_text_dispatch_event(event)
+            and isinstance(content, dict)
+            and self.event_source_kind(event, content) == TRUSTED_INTERNAL_RELAY_SOURCE_KIND
+            and self.is_trusted_router_visible_voice_echo_content(event.sender, content)
+        )
 
     def should_use_trusted_router_relay_context(
         self,
@@ -238,7 +316,7 @@ class IngressValidator:
     ) -> bool:
         """Return whether dispatch context should use trusted router relay semantics."""
         if ingress_metadata is None:
-            return self.is_trusted_router_relay_event(event)
+            return self._is_trusted_router_relay_event(event)
         if ingress_metadata.source_kind != TRUSTED_INTERNAL_RELAY_SOURCE_KIND:
             return False
         sender_agent_name = self.managed_entity_name_for_sender(event.sender)
@@ -249,11 +327,15 @@ class IngressValidator:
             return (
                 original_sender is not None
                 and original_sender != ""
-                and self.managed_entity_name_for_sender(original_sender) is None
+                and is_human_requester_id(
+                    original_sender,
+                    self.deps.runtime.config,
+                    self.deps.runtime_paths,
+                )
             )
         return self.is_trusted_internal_relay_event(event)
 
-    def precheck_event(
+    async def precheck_event(
         self,
         room: nio.MatrixRoom,
         event: DispatchEvent | MatrixMediaEvent,
@@ -276,22 +358,15 @@ class IngressValidator:
         if not is_edit and self.deps.turn_store.is_handled(event.event_id):
             return None
 
-        if not is_authorized_sender(
-            requester_user_id,
-            self.deps.runtime.config,
-            room.room_id,
-            self.deps.runtime_paths,
-        ):
-            self.deps.turn_store.record_turn(TurnRecord.create([event.event_id]))
-            return None
-
-        if not self.deps.turn_policy.can_reply_to_sender(requester_user_id):
-            self.deps.turn_store.record_turn(TurnRecord.create([event.event_id]))
+        # The first gate is where a newcomer's first message meets a router that has not seen the join yet.
+        access_requester = self.acting_requester_for_event(event) or requester_user_id
+        if not self.deps.turn_policy.can_reply_to_sender_in_room(access_requester, room.room_id, observed_room=room):
+            await self.deps.turn_store.record_turn(TurnRecord.create([event.event_id]))
             return None
 
         return requester_user_id
 
-    def command_control_input(self, event: TextDispatchEvent, *, source_kind: str) -> Command | None:
+    def command_control_input(self, event: PreparedIngress, *, source_kind: str) -> Command | None:
         """Return the parsed command when one text event is a control input, not conversation."""
         if source_kind_bypasses_coalescing(source_kind):
             return None

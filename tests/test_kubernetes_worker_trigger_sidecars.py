@@ -59,9 +59,6 @@ def _worker_config(
         storage_pvc_name="mindroom-storage",
         storage_mount_path="/app/worker",
         storage_subpath_prefix="workers",
-        config_map_name="mindroom-config",
-        config_key="config.yaml",
-        config_path="/app/config.yaml",
         idle_timeout_seconds=60.0,
         ready_timeout_seconds=5.0,
         name_prefix="mindroom-worker",
@@ -94,6 +91,7 @@ def _pod_template(
         auth_token=_TEST_AUTH_TOKEN,
         storage_root=tmp_path / "storage",
         tool_validation_snapshot={},
+        config_snapshot={},
         worker_grantable_credentials=frozenset(),
     )
     return manager._pod_template(
