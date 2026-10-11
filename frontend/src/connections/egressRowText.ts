@@ -15,10 +15,7 @@ export interface RowAgent {
   displayName: string;
   /** A shared or unscoped agent: everyone using it shares its keys and accounts. */
   shared: boolean;
-  /**
-   * The credential managers' Matrix IDs, when the response names them. Where
-   * the page says who manages a shared agent, the rows leave it out.
-   */
+  /** The credential managers' Matrix IDs; the dashboard, whose operator manages every service, leaves them out. */
   managers?: string[];
   /** Every service of the agent: disconnecting a provider names the ones that use it. */
   services: EgressCredentialService[];

@@ -18382,7 +18382,7 @@ The same editor opens in limit mode for a [`restrict_only` service](#limiting-in
 
 It has no preset, website, send, key, or **More options** fields: a limit never has a key, and **Save limit** never sends one.
 Saving writes `{display_name, description, rules, restrict_to_rules: true, restrict_only: true}` with rules that carry no `auth`, and the labels "GitHub ({repos})" and "Limited to {repos}" follow the list unless you wrote your own.
-Changing a limit reads the repositories and the GraphQL choice back from its rules. When the stored rules are not exactly what the helper writes, the editor warns "Some rules of this limit are not repositories from the list. Changing the list replaces them.", and saving without changing anything writes the stored rules back untouched. An older limit that the helper wrote without `uploads.github.com` rules gets them on its next save.
+Changing a limit reads the repositories and the GraphQL choice back from its rules. When the stored rules are not exactly what the helper writes, the editor warns "Some rules of this limit are not repositories from the list. Changing the list replaces them.", and saving without changing anything writes the stored rules back untouched.
 **Remove limit** asks first and says what it gives back, by scope: "This removes the limit. {who} can then reach every repository the key or connected account allows." Here `{who}` is "Your {agent}" for `user_agent`, "All your agents that share your personal workspace ({agents})" for `user`, "Everyone using {agent}" for a shared agent, and "Every agent without a scope" for an unscoped one.
 
 On the personal page's rows:

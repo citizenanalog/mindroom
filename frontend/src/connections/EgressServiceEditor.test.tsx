@@ -373,6 +373,7 @@ describe("the editor form", () => {
     await renderEditor({
       loadPresets: vi.fn(async () => ({
         presets,
+        oauth_providers: providers,
         validation: {
           ...validation,
           placeholder: {
@@ -397,9 +398,11 @@ describe("the editor form", () => {
     expect(hint).not.toHaveTextContent("SSH_");
   });
 
-  it("gives a short hint without the lists when the server sends no rules", async () => {
+  it("gives a short hint without the lists when the presets could not be loaded", async () => {
     await renderEditor({
-      loadPresets: vi.fn(async () => ({ presets })),
+      loadPresets: vi.fn(async () => {
+        throw new Error("nope");
+      }),
     });
     openMoreOptions();
     const hint = screen.getByText(/The server checks the rest when you save/);
@@ -457,10 +460,12 @@ describe("the editor form", () => {
     expect(screen.queryByText(/must be TOKEN, KEY/)).toBeNull();
   });
 
-  it("gives the operator a short hint without the prefixes when the server sends no rules", async () => {
+  it("gives the operator a short hint without the prefixes when the presets could not be loaded", async () => {
     await renderEditor({
       context: "operator",
-      loadPresets: vi.fn(async () => ({ presets })),
+      loadPresets: vi.fn(async () => {
+        throw new Error("nope");
+      }),
     });
     openMoreOptions();
     expect(
@@ -922,6 +927,8 @@ describe("loading the presets", () => {
             placeholder_env: {},
           },
         ],
+        oauth_providers: providers,
+        validation,
       })),
     });
     expect(
@@ -950,7 +957,7 @@ describe("loading the presets", () => {
     render(<EgressServiceEditor {...baseProps()} loadPresets={loadPresets} />);
     expect(screen.getByLabelText("Preset")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Save service" })).toBeDisabled();
-    resolve({ presets });
+    resolve({ presets, oauth_providers: providers, validation });
     await waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
     expect(screen.getByRole("button", { name: "Save service" })).toBeEnabled();
     expect(loadPresets).toHaveBeenCalledTimes(1);
@@ -985,7 +992,11 @@ describe("loading the presets", () => {
     await renderEditor({
       name: "old",
       service: { preset: "retired" },
-      loadPresets: vi.fn(async () => ({ presets: [] })),
+      loadPresets: vi.fn(async () => ({
+        presets: [],
+        oauth_providers: providers,
+        validation,
+      })),
     });
     expect(screen.getByLabelText("Preset")).toHaveValue("retired");
   });
@@ -1006,6 +1017,7 @@ describe("the rule cap from the server", () => {
   it("stops adding rules at the most the server takes", async () => {
     await editWith({
       presets,
+      oauth_providers: providers,
       validation: { ...validation, max_rules_per_service: 2 },
     });
     expect(addRule()).toBeDisabled();
@@ -1014,6 +1026,7 @@ describe("the rule cap from the server", () => {
   it("keeps adding rules below it, up to it", async () => {
     await editWith({
       presets,
+      oauth_providers: providers,
       validation: { ...validation, max_rules_per_service: 3 },
     });
     expect(addRule()).toBeEnabled();
@@ -1021,8 +1034,14 @@ describe("the rule cap from the server", () => {
     expect(addRule()).toBeDisabled();
   });
 
-  it("leaves the count to the server when it sends no validation", async () => {
-    await editWith({ presets });
+  it("leaves the count to the server when the presets could not be loaded", async () => {
+    await renderEditor({
+      name: "svc",
+      service: twoRules,
+      loadPresets: vi.fn(async () => {
+        throw new Error("nope");
+      }),
+    });
     expect(addRule()).toBeEnabled();
   });
 });
@@ -1504,7 +1523,11 @@ describe("the account login field", () => {
         rules: [{ host: "a.example.com", auth: { type: "bearer" } }],
         oauth_provider: "retired_login",
       },
-      loadPresets: vi.fn(async () => ({ presets })),
+      loadPresets: vi.fn(async () => ({
+        presets,
+        oauth_providers: [],
+        validation,
+      })),
     });
     const login = screen.getByLabelText("Account login (optional)");
     expect(login).toHaveValue("retired_login");
@@ -2809,22 +2832,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("github-limited", stored);
-  });
-
-  it("adds uploads.github.com rules to an older limit without them when it is saved", async () => {
-    const older = storedLimit("a/b", {
-      rules: limitRules("a/b").filter(
-        (rule) => rule.host !== "uploads.github.com",
-      ),
-    });
-    const { onSave } = await renderEditor({
-      name: "github-limited",
-      service: older,
-    });
-    expect(screen.queryByText(/Changing the list replaces them/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
-    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    expect(onSave).toHaveBeenCalledWith("github-limited", storedLimit("a/b"));
   });
 
   it("warns that changing the list replaces rules it cannot show, and keeps them until then", async () => {

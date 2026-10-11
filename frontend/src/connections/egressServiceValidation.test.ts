@@ -688,20 +688,6 @@ describe("the validation the server sends", () => {
       ]);
   });
 
-  it("says no length when the server sends none", () => {
-    const options = optionsWith(
-      {},
-      { value_pattern: "[a-z]+", value_max_length: undefined },
-    );
-    expect(
-      errorsFor(
-        { preset: "github" },
-        withPlaceholder("MY_API_KEY", "A"),
-        options,
-      ),
-    ).toEqual(["The value of MY_API_KEY must be letters, digits, or . _ : -"]);
-  });
-
   it("leaves a value pattern it cannot read to the server", () => {
     const options = optionsWith({}, { value_pattern: "(" });
     expect(
@@ -713,7 +699,7 @@ describe("the validation the server sends", () => {
     ).toEqual([]);
   });
 
-  describe("from an older server that sends none", () => {
+  describe("without the server's validation, when the presets could not be loaded", () => {
     it("skips the caps on rules and size", () => {
       const rules = Array.from({ length: 51 }, validRule);
       expect(errorsFor(null, { rules }, withoutValidation)).toEqual([]);

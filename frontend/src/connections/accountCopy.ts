@@ -55,23 +55,15 @@ export function personalScopeLine(scope: EgressScope): string | null {
   return null;
 }
 
-/**
- * Why a personal account is no use on a shared agent, and what to do instead.
- * `managers` is undefined where the response does not name them.
- */
+/** Why a personal account is no use on a shared agent, and what to do instead. */
 export function personalAccountRefusal(
   provider: string,
   canManage: boolean,
-  managers: readonly string[] | undefined,
+  managers: readonly string[],
 ): string {
   const why = `Personal ${provider} accounts can't be used by shared agents.`;
   if (canManage) return `${why} Add a team API key instead.`;
-  const who =
-    managers === undefined
-      ? "its credential managers"
-      : managers.length > 0
-        ? formatList(managers)
-        : "an administrator";
+  const who = managers.length > 0 ? formatList(managers) : "an administrator";
   return `${why} Ask ${who} to add a team API key.`;
 }
 

@@ -332,7 +332,6 @@ describe("egress service rows", () => {
     );
     expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.getByText("Managed by credential managers")).toBeVisible();
   });
 
   it("warns that a shared key affects everyone who relies on it", async () => {
@@ -449,7 +448,7 @@ describe("connected accounts", () => {
         origin: authorization.completion_origin,
         source: popup as unknown as Window,
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider,
           status: "connected",
         },
@@ -523,7 +522,8 @@ describe("connected accounts", () => {
 
     finishAuthorization();
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
-    expect(popup.close).toHaveBeenCalled();
+    // The page that answered closes itself.
+    expect(popup.close).not.toHaveBeenCalled();
     expect(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
@@ -710,9 +710,6 @@ describe("connected accounts", () => {
     expect(
       screen.queryByRole("button", { name: /^(Set|Replace|Remove) key for / }),
     ).toBeNull();
-    expect(
-      screen.getByText("API key managed by credential managers"),
-    ).toBeVisible();
   });
 
   it("offers no actions to a user who can neither connect nor manage", () => {
@@ -734,7 +731,6 @@ describe("connected accounts", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.getByText("Managed by credential managers")).toBeVisible();
   });
 
   it("shows the connected account with Disconnect", () => {
@@ -1609,31 +1605,6 @@ describe("rows with an agent's wording", () => {
           name: /^(Set|Replace|Remove) key for /,
         }),
       ).toBeNull();
-    });
-
-    it("still says it where the managers are not known", () => {
-      renderRows(
-        [readOnly],
-        agent({ managers: undefined, services: [readOnly] }),
-      );
-      expect(screen.getByText("Managed by credential managers")).toBeVisible();
-    });
-
-    it("does not repeat it beside a refused personal account that says whom to ask", () => {
-      const refused = withAccount(
-        { can_connect: false, unavailable_reason: "shared_sandbox" },
-        { is_shared: true, can_manage: false },
-      );
-      renderRows(
-        [refused],
-        agent({ managers: undefined, services: [refused] }),
-      );
-      expect(
-        within(row("GitHub")).getByText(
-          /Ask its credential managers to add a team API key\.$/,
-        ),
-      ).toBeVisible();
-      expect(screen.queryByText("Managed by credential managers")).toBeNull();
     });
   });
 

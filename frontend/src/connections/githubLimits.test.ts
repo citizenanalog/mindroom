@@ -79,13 +79,11 @@ describe("the choices behind a limit's rules", () => {
   it("reads back repositories, owners, and the options the helper wrote", () => {
     expect(parseGithubLimit(summarized("a/b\nc/d", true, true))).toEqual({
       repositories: ["a/b", "c/d"],
-      uploads: true,
       graphql: true,
       exact: true,
     });
     expect(parseGithubLimit(summarized("octo/*\na/b"))).toEqual({
       repositories: ["octo/*", "a/b"],
-      uploads: false,
       graphql: false,
       exact: true,
     });
@@ -112,7 +110,6 @@ describe("the choices behind a limit's rules", () => {
   it("has nothing to read in rules that name no repository", () => {
     expect(parseGithubLimit([rule("api.github.com", "/")])).toEqual({
       repositories: [],
-      uploads: false,
       graphql: false,
       exact: false,
     });

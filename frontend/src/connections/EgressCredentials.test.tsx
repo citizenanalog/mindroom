@@ -49,6 +49,7 @@ const agents: EgressCredentialAgent[] = [
     scope: "user_agent",
     scope_agents: [],
     managers: [],
+    inactive_services: [],
     can_manage: true,
     services: [service],
   },
@@ -59,6 +60,7 @@ const agents: EgressCredentialAgent[] = [
     scope: "shared",
     scope_agents: [],
     managers: [],
+    inactive_services: [],
     can_manage: false,
     services: [{ ...service, is_shared: true, can_manage: false }],
   },
@@ -69,6 +71,7 @@ const agents: EgressCredentialAgent[] = [
     scope: "user_agent",
     scope_agents: [],
     managers: [],
+    inactive_services: [],
     can_manage: true,
     services: [],
   },
@@ -232,7 +235,7 @@ describe("egress credentials page", () => {
         origin: "https://portal.example.com",
         source: popup as unknown as Window,
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "github",
           status: "connected",
         },
@@ -302,6 +305,7 @@ describe("egress services on the personal page", () => {
         scope: "user_agent",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: true,
         services: [configService, userService],
       },
@@ -686,6 +690,7 @@ describe("egress services on the personal page", () => {
         scope: "shared",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: false,
         services: [{ ...configService, is_shared: true, can_manage: false }],
       },
@@ -696,6 +701,7 @@ describe("egress services on the personal page", () => {
         scope: "shared",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: false,
         services: [],
       },
@@ -706,6 +712,7 @@ describe("egress services on the personal page", () => {
         scope: "shared",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: true,
         services: [{ ...userService, is_shared: true, can_manage: true }],
       },
@@ -716,6 +723,7 @@ describe("egress services on the personal page", () => {
         scope: "user_agent",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: true,
         services: [],
       },
@@ -759,6 +767,7 @@ describe("egress services on the personal page", () => {
         scope: "shared",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: true,
         services: [{ ...userService, is_shared: true, can_manage: true }],
       },
@@ -1029,6 +1038,7 @@ describe("presets and unsaved edits on the personal page", () => {
         scope: "user_agent",
         scope_agents: [],
         managers: [],
+        inactive_services: [],
         can_manage: true,
         services: [
           { ...userService, name: "one", display_name: "One" },
@@ -1238,6 +1248,7 @@ describe("what deleting a service says about its scope", () => {
               managers: [],
               can_manage: true,
               services: [userService],
+              inactive_services: [],
               ...agent,
             },
           ],
@@ -1359,20 +1370,10 @@ describe("inactive services on the personal page", () => {
     ).toBeTruthy();
   });
 
-  it("shows nothing for an agent without inactive entries, or from an older server", async () => {
+  it("shows nothing for an agent without inactive entries", async () => {
     listing[0].inactive_services = [];
-    listing.push({
-      agent_name: "other",
-      agent_display_name: "Other Mind",
-      shared: false,
-      scope: "user_agent",
-      scope_agents: [],
-      managers: [],
-      can_manage: true,
-      services: [],
-    });
     render(<EgressCredentials />);
-    await screen.findByRole("region", { name: "Other Mind" });
+    await screen.findByRole("region", { name: "Personal Mind" });
     expect(
       screen.queryByRole("region", { name: "Inactive services" }),
     ).toBeNull();
@@ -1520,23 +1521,6 @@ describe("inactive services on the personal page", () => {
       expect(
         screen.getByRole("button", { name: "Delete inactive service taken" }),
       ).toBeEnabled(),
-    );
-  });
-
-  it("reads a reason it does not know in general terms", async () => {
-    listing[0].inactive_services = [
-      { name: "future", reason: "retired" as "invalid" },
-    ];
-    render(<EgressCredentials />);
-    const row = (await section()).getByLabelText("Inactive service future");
-    expect(row).toHaveTextContent("Not in use: the broker ignores this entry.");
-    fireEvent.click(
-      within(row).getByRole("button", {
-        name: "Delete inactive service future",
-      }),
-    );
-    expect(await screen.findByRole("dialog")).toHaveTextContent(
-      "This removes the entry.",
     );
   });
 });

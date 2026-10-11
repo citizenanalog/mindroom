@@ -2,12 +2,8 @@ export interface ConnectionService {
   provider: string;
   is_shared: boolean;
   can_manage: boolean;
-  /**
-   * Whether the account is connected, as the viewer's status would show it,
-   * read without refreshing the token. Absent in responses from before the
-   * server sent it.
-   */
-  connected?: boolean;
+  /** Whether the account is connected, as the viewer's status would show it, read without refreshing the token. */
+  connected: boolean;
   display_name: string;
   description: string;
   icon: string | null;
@@ -22,9 +18,8 @@ export interface AgentConnections {
   /**
    * A shared or unscoped agent's credential managers (Matrix IDs); empty for any
    * other agent, and for an agent with none only administrators manage it.
-   * Absent in responses from before the server sent it.
    */
-  managers?: string[];
+  managers: string[];
   mcp_available: boolean;
   services: ConnectionService[];
   tools: ConnectionTool[];
@@ -122,8 +117,7 @@ export interface EgressCredentialService {
    * The names of the variables the service sets in the sandbox, a preset's
    * included, so a service of one's own that sets the same one can be warned
    * about those of an administrator's. Sent for every service in the personal
-   * listing; absent on the dashboard and in responses from before the server
-   * sent it.
+   * listing; absent on the dashboard.
    */
   placeholder_names?: string[];
   /** `null` when the caller cannot tell whether the key is shared. */
@@ -169,8 +163,7 @@ export interface EgressCredentialAgent {
   /** The caller may add, change, and delete services of this agent, even when it has none yet. */
   can_manage: boolean;
   services: EgressCredentialService[];
-  /** Absent in responses from before the server listed them. */
-  inactive_services?: EgressInactiveService[];
+  inactive_services: EgressInactiveService[];
 }
 
 export interface EgressCredentialList {
@@ -243,8 +236,8 @@ export interface EgressPlaceholderValidation {
   reserved_prefixes: string[];
   /** The values a personal service may set, as a regular expression source that must match the whole value. */
   value_pattern: string;
-  /** The longest value `value_pattern` accepts; absent from servers before it was served. */
-  value_max_length?: number;
+  /** The longest value `value_pattern` accepts. */
+  value_max_length: number;
 }
 
 /** What the server checks when a service is saved; the editor checks the same before it asks. */
@@ -258,10 +251,9 @@ export interface EgressValidation {
 /** What the presets endpoints return. */
 export interface EgressPresetCatalog {
   presets: EgressPreset[];
-  /** The providers a service can sign in with. Absent in responses from before the server sent it. */
-  oauth_providers?: EgressOAuthProviderOption[];
-  /** Absent in responses from before the server sent it; the editor then leaves these checks to the server. */
-  validation?: EgressValidation;
+  /** The providers a service can sign in with. */
+  oauth_providers: EgressOAuthProviderOption[];
+  validation: EgressValidation;
 }
 
 /** One row of the request log. */

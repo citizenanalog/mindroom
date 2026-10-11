@@ -37,7 +37,7 @@ export function PlaceholderRows({
   disabled: boolean;
   context: EditorContext;
   preset: EgressPreset | undefined;
-  /** The server's placeholder rules the hint spells out; `null` until they load or when the server sends none. */
+  /** The server's placeholder rules the hint spells out; `null` until they load or when they could not be loaded. */
   validation: EgressPlaceholderValidation | null;
   /** Variable name to the display name of the administrator's service that sets it. */
   configPlaceholders: Readonly<Record<string, string>>;

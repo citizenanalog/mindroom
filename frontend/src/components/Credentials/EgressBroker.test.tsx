@@ -787,7 +787,7 @@ describe("egress broker connected accounts", () => {
         origin: authorization.completion_origin,
         source: popup as unknown as Window,
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "github",
           status: "connected",
         },

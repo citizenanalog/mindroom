@@ -94,7 +94,7 @@ describe("Generic OAuth integration provider", () => {
     window.dispatchEvent(
       new MessageEvent("message", {
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "google_drive",
           status: "connected",
         },
@@ -107,7 +107,7 @@ describe("Generic OAuth integration provider", () => {
     window.dispatchEvent(
       new MessageEvent("message", {
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "google_drive",
           status: "connected",
         },
@@ -195,7 +195,7 @@ describe("Generic OAuth integration provider", () => {
     window.dispatchEvent(
       new MessageEvent("message", {
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "google_drive",
           status: "connected",
         },
@@ -235,7 +235,7 @@ describe("Generic OAuth integration provider", () => {
     window.dispatchEvent(
       new MessageEvent("message", {
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "google_drive",
           status: "connected",
         },

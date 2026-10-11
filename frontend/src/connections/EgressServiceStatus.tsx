@@ -25,9 +25,6 @@ export function ServiceStatus({
   // Once a key is saved there is nothing left to ask for, so the hint goes.
   const refusalShown =
     oauth?.unavailable_reason === "shared_sandbox" && !service.key_configured;
-  // The page names a shared agent's managers once, and a refused personal
-  // account row says whom to ask itself, so the row only does without it.
-  const managersNamed = agent.managers !== undefined || refusalShown;
   return (
     <>
       <Badge
@@ -58,7 +55,7 @@ export function ServiceStatus({
             ? personalAccountRefusal(
                 oauth.display_name,
                 service.can_manage,
-                agent.managers,
+                agent.managers ?? [],
               )
             : personalSandboxRefusal(oauth.display_name)}
         </span>
@@ -67,13 +64,6 @@ export function ServiceStatus({
         <span className="text-xs text-amber-600 dark:text-amber-400">
           Everyone using this agent can act with the connected account until its
           access expires
-        </span>
-      )}
-      {!service.can_manage && !managersNamed && (
-        <span className="text-xs text-muted-foreground">
-          {oauth?.can_connect
-            ? "API key managed by credential managers"
-            : "Managed by credential managers"}
         </span>
       )}
     </>

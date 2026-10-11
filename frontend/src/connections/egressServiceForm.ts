@@ -25,8 +25,8 @@ export interface EditorOptions {
   presets: readonly EgressPreset[] | null;
   /**
    * What the server checks when a service is saved, from the presets
-   * response; `null` while it loads and when the server does not send it, in
-   * which case the checks that need it are left to the server.
+   * response; `null` while it loads and when the presets could not be loaded,
+   * in which case the checks that need it are left to the server.
    */
   validation: EgressValidation | null;
 }

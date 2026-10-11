@@ -72,9 +72,6 @@ describe("account copy", () => {
     expect(personalAccountRefusal("GitHub", false, [])).toBe(
       "Personal GitHub accounts can't be used by shared agents. Ask an administrator to add a team API key.",
     );
-    expect(personalAccountRefusal("GitHub", false, undefined)).toBe(
-      "Personal GitHub accounts can't be used by shared agents. Ask its credential managers to add a team API key.",
-    );
   });
 
   it("tells a personal agent's user the sandbox is shared, not the agent", () => {

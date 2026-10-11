@@ -40,10 +40,6 @@ export const EMPTY_HELPER_INPUT: HelperInput = {
  * the choices change. When the helper cannot write the rules back, changing
  * the repositories replaces rules the list does not show. Labels the person
  * wrote themselves are not the helper's, so they stay.
- *
- * A limit always covers uploads.github.com (`githubLimitRules`). An older one
- * the helper wrote without it has nothing the list does not show, so its next
- * save writes it anew with those rules.
  */
 export function restoredHelperInput(service: AuthoredEgressService | null): {
   input: HelperInput;
@@ -71,12 +67,10 @@ export function restoredHelperInput(service: AuthoredEgressService | null): {
     uploads: true,
     graphql: limit.graphql,
   };
-  const rewrite = limit.exact && !limit.uploads;
   return {
     input,
     exact: limit.exact,
-    applied:
-      input.repositories === "" || rewrite ? null : helperSignature(input),
+    applied: input.repositories === "" ? null : helperSignature(input),
     labels: {
       displayName:
         service.display_name === written.displayName ? written.displayName : "",

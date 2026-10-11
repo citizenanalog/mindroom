@@ -43,14 +43,10 @@ function orList(words: readonly string[]): string {
 
 /** What a value may look like, `1 to 256 letters, digits, or . _ : -`, with the length the server serves. */
 function valueDescription(validation: EgressPlaceholderValidation): string {
-  const length =
-    validation.value_max_length === undefined
-      ? ""
-      : `1 to ${validation.value_max_length} `;
-  return `${length}letters, digits, or . _ : -`;
+  return `1 to ${validation.value_max_length} letters, digits, or . _ : -`;
 }
 
-/** The hint under the placeholder rows of a personal service; a short one without the rules when the server did not send them. */
+/** The hint under the placeholder rows of a personal service; a short one without the rules when the presets could not be loaded. */
 export function personalPlaceholderHint(
   validation: EgressPlaceholderValidation | null,
 ): string {
@@ -63,7 +59,7 @@ export function personalPlaceholderHint(
   return `Names use capital letters, digits, and underscores, and one word between underscores must be ${orList(validation.credential_words)} (for example MY_API_KEY). No word may be ${orList(validation.refused_words)}, and names cannot start with ${prefixes}. PATH, HOME, and proxy and CA variables are reserved. Values are ${valueDescription(validation)}`;
 }
 
-/** The hint under the placeholder rows of the administrator's service; a short one without the prefixes when the server did not send them. */
+/** The hint under the placeholder rows of the administrator's service; a short one without the prefixes when the presets could not be loaded. */
 export function operatorPlaceholderHint(
   validation: EgressPlaceholderValidation | null,
 ): string {

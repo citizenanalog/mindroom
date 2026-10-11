@@ -560,7 +560,7 @@ function AgentSection({
         </p>
       )}
       <InactiveServices
-        services={agent.inactive_services ?? []}
+        services={agent.inactive_services}
         disabled={saving}
         onDelete={agent.can_manage ? remove : undefined}
       />

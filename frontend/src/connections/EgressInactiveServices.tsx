@@ -10,22 +10,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { EgressInactiveService } from "./types";
+import type { EgressInactiveReason, EgressInactiveService } from "./types";
 
-// A reason this page does not know, from a newer server, still reads sensibly.
-const REASON_TEXT: Record<string, string> = {
+const REASON_TEXT: Record<EgressInactiveReason, string> = {
   shadowed:
     "Not in use: your administrator provides a service with this name, and theirs takes precedence.",
   invalid: "Not in use: this entry is no longer valid, so it is ignored.",
 };
-const REASON_FALLBACK = "Not in use: the broker ignores this entry.";
 
-const DELETE_TEXT: Record<string, string> = {
+const DELETE_TEXT: Record<EgressInactiveReason, string> = {
   shadowed:
     "This removes your own entry. The administrator's service with this name stays, and so does the key saved for it.",
   invalid: "This removes the invalid entry and any key saved under its name.",
 };
-const DELETE_FALLBACK = "This removes the entry.";
 
 function InactiveServiceRow({
   service,
@@ -67,7 +64,7 @@ function InactiveServiceRow({
         <div className="min-w-0 space-y-0.5">
           <span className="font-mono text-sm">{service.name}</span>
           <p className="text-xs text-muted-foreground">
-            {REASON_TEXT[service.reason] ?? REASON_FALLBACK}
+            {REASON_TEXT[service.reason]}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -101,7 +98,7 @@ function InactiveServiceRow({
             <DialogHeader>
               <DialogTitle>Delete inactive {service.name}?</DialogTitle>
               <DialogDescription>
-                {DELETE_TEXT[service.reason] ?? DELETE_FALLBACK}
+                {DELETE_TEXT[service.reason]}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

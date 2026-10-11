@@ -38,7 +38,7 @@ describe("connection popup", () => {
         origin: authorization.completion_origin,
         source: popup as unknown as Window,
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "mail",
           status: "connected",
         },
@@ -58,7 +58,7 @@ describe("connection popup", () => {
     complete({ source: window });
     complete({
       data: {
-        type: "mindroom:oauth-complete",
+        type: "mindroom-oauth",
         provider: "other",
         status: "connected",
       },
@@ -67,7 +67,7 @@ describe("connection popup", () => {
       null,
       "connected",
       { type: "other", provider: "mail", status: "connected" },
-      { type: "mindroom:oauth-complete", provider: "mail", status: "pending" },
+      { type: "mindroom-oauth", provider: "mail", status: "pending" },
     ]) {
       complete({ data });
     }
@@ -75,7 +75,8 @@ describe("connection popup", () => {
     expect(popup.location.href).toBe(authorization.auth_url);
     complete();
     await expect(operation).resolves.toBeUndefined();
-    expect(popup.close).toHaveBeenCalledOnce();
+    // The page that answered closes itself.
+    expect(popup.close).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -265,7 +266,7 @@ describe("connection popup", () => {
       expect(popup.location.href).toBe(authUrl);
       complete({ origin: completionOrigin });
       await expect(operation).resolves.toBeUndefined();
-      expect(popup.close).toHaveBeenCalledOnce();
+      expect(popup.close).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
     },
   );
@@ -346,13 +347,6 @@ describe("connection popup", () => {
       expect(popup.location.href).toBe(authorization.auth_url);
       say("connected");
       await expect(operation).resolves.toBeUndefined();
-    });
-
-    it("still closes the popup itself for the older page that only says it is complete", async () => {
-      const { operation } = await open();
-      complete();
-      await expect(operation).resolves.toBeUndefined();
-      expect(popup.close).toHaveBeenCalledOnce();
     });
   });
 

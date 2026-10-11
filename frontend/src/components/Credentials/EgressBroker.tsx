@@ -76,8 +76,8 @@ interface BrokerService {
   description: string;
   source: EgressServiceSource;
   rules: EgressRuleSummary[];
-  /** The service only limits paths: it has no key or account. Absent from older servers. */
-  restrict_only?: boolean;
+  /** The service only limits paths: it has no key or account. */
+  restrict_only: boolean;
   configured: boolean;
   active_source: "key" | "oauth" | null;
   key_configured: boolean;

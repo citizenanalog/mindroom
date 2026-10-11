@@ -45,7 +45,7 @@ function accountCounts(agent: AgentTableRow) {
   const connectedServices = agent.services.filter(
     (service) =>
       agent.accounts[accountKey(agent.agent_name, service.provider)] ??
-      service.connected === true,
+      service.connected,
   );
   return {
     set:
@@ -208,7 +208,7 @@ function AgentEgress({
           {viewOnly ? "View services" : "Manage services"}
         </a>
       </div>
-      {shared && agent.managers !== undefined && (
+      {shared && (
         <p className="px-5 pt-2 text-xs text-muted-foreground">
           {sharedAgentNote(
             services.some((service) => service.can_manage),

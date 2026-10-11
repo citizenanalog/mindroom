@@ -16,6 +16,7 @@ const service: ConnectionService = {
   provider: "mail",
   is_shared: false,
   can_manage: true,
+  connected: false,
   display_name: "Mail",
   description: "Read your email.",
   tools: ["mail"],
@@ -36,6 +37,7 @@ const catalog = (services: (typeof service)[]) => ({
       agent_name: "personal",
       agent_display_name: "Personal assistant",
       is_shared: false,
+      managers: [],
       can_use: true,
       mcp_available: true,
       services,
@@ -451,7 +453,7 @@ describe("brokered API keys on agent cards", () => {
         origin: "https://portal.example.com",
         source: popup as unknown as Window,
         data: {
-          type: "mindroom:oauth-complete",
+          type: "mindroom-oauth",
           provider: "github",
           status: "connected",
         },
@@ -806,7 +808,7 @@ describe("connections", () => {
             origin: window.location.origin,
             source: popup as unknown as Window,
             data: {
-              type: "mindroom:oauth-complete",
+              type: "mindroom-oauth",
               provider: "mail",
               status: "connected",
             },
@@ -976,6 +978,7 @@ describe("shared agent connections", () => {
               agent_name: "research",
               agent_display_name: "Research Team",
               is_shared: true,
+              managers: [],
               tools: catalog([service]).agents[0].tools,
               services: [service],
             },
@@ -1027,6 +1030,7 @@ describe("shared agent connections", () => {
               agent_name: "research",
               agent_display_name: "Research Team",
               is_shared: true,
+              managers: [],
               tools: catalog([service]).agents[0].tools,
               services: [service],
             },
@@ -1055,6 +1059,7 @@ describe("shared agent connections", () => {
               agent_name: "research",
               agent_display_name: "Research Team",
               is_shared: true,
+              managers: [],
               tools: catalog([service]).agents[0].tools,
               services: [{ ...service, is_shared: true }],
             },
@@ -1115,6 +1120,7 @@ it("does not call a requester-only connection on a shared agent shared", async (
             agent_name: "research",
             agent_display_name: "Research Team",
             is_shared: true,
+            managers: [],
             tools: catalog([service]).agents[0].tools,
             services: [service],
           },
@@ -1165,6 +1171,7 @@ describe("MCP agent selection", () => {
         agent_name: "shared",
         agent_display_name: "Research Team",
         is_shared: true,
+        managers: [],
         can_use: true,
         mcp_available: true,
         services: [],
@@ -1430,6 +1437,7 @@ describe("shared accounts on agent cards", () => {
         agent_name: "research",
         agent_display_name: "Research Team",
         is_shared: true,
+        managers: [],
         can_use: true,
         services: [{ ...service, is_shared: true }],
         tools: catalog([service]).agents[0].tools,
@@ -1634,16 +1642,6 @@ describe("shared accounts on agent cards", () => {
           )
         ).length,
       ).toBeGreaterThan(0);
-    });
-
-    it("keeps the unnamed wording for a server that does not send the managers", async () => {
-      await open(catalogWith({ managers: undefined }, { can_manage: false }));
-      expect(
-        (await screen.findAllByText("Managed by credential managers")).length,
-      ).toBeGreaterThan(0);
-      expect(
-        screen.queryByText(/can change keys for this shared agent/),
-      ).toBeNull();
     });
 
     it("names the managers when a personal account is refused on a shared agent", async () => {
@@ -1911,18 +1909,6 @@ describe("agent table summary, search, and order", () => {
       expect(agentRow("Personal assistant")).toHaveTextContent(
         "2 tools / 0 of 1 accounts and keys set",
       ),
-    );
-  });
-
-  it("counts an account as not connected when an older server sends no connected flag", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({ agents: [{ ...withCalculator(), egress_services: [] }] }),
-    });
-    render(<Connections />);
-    await screen.findByRole("button", { name: "Expand Personal assistant" });
-    expect(agentRow("Personal assistant")).toHaveTextContent(
-      "2 tools / 0 of 1 accounts and keys set",
     );
   });
 

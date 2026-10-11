@@ -189,7 +189,7 @@ export function EgressServiceEditor({
   const [presets, setPresets] = useState<EgressPreset[] | null>(null);
   const [providers, setProviders] = useState<EgressOAuthProviderOption[]>([]);
   const [presetsFailed, setPresetsFailed] = useState(false);
-  // What the server checks on save, sent with the presets; `null` until then, and when an older server does not send it.
+  // What the server checks on save, sent with the presets; `null` until then, and when they could not be loaded.
   const [validation, setValidation] = useState<EgressValidation | null>(null);
   const options: EditorOptions = {
     context,
@@ -295,8 +295,8 @@ export function EgressServiceEditor({
       .then((loaded) => {
         if (controller.signal.aborted) return;
         setPresets(loaded.presets);
-        setProviders(loaded.oauth_providers ?? []);
-        setValidation(loaded.validation ?? null);
+        setProviders(loaded.oauth_providers);
+        setValidation(loaded.validation);
       })
       .catch(() => {
         if (controller.signal.aborted) return;

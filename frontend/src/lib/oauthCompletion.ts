@@ -21,8 +21,6 @@ interface OAuthCompletionOptions {
 
 type Outcome = "connected" | "cancelled" | "error";
 
-// The older page only ever says `connected`, and closes the popup itself at once.
-const LEGACY_COMPLETE_TYPE = "mindroom:oauth-complete";
 // The pages of the OAuth popup answer `connected`, `cancelled`, or `error`.
 const OUTCOME_TYPE = "mindroom-oauth";
 const OUTCOMES: readonly unknown[] = ["connected", "cancelled", "error"];
@@ -44,8 +42,6 @@ function readOutcome(
     return null;
   const data = event.data as Record<string, unknown>;
   if (data.provider !== provider) return null;
-  if (data.type === LEGACY_COMPLETE_TYPE && data.status === "connected")
-    return { status: "connected", popupClosesItself: false };
   if (data.type === OUTCOME_TYPE && OUTCOMES.includes(data.status))
     return { status: data.status as Outcome, popupClosesItself: true };
   return null;

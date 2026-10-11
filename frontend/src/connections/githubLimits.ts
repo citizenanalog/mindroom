@@ -88,7 +88,6 @@ export function limitedTo(
 export interface GithubLimit {
   /** `owner/repo` or `owner/*`, in rule order, from every rule that names a repository. */
   repositories: string[];
-  uploads: boolean;
   graphql: boolean;
   /** The rules are exactly what the helper writes for these choices, so applying them again changes nothing. */
   exact: boolean;
@@ -130,7 +129,6 @@ export function parseGithubLimit(rules: Rules): GithubLimit {
   const actual = new Set(all.map(ruleKey));
   return {
     repositories,
-    uploads,
     graphql,
     exact:
       repositories.length > 0 &&

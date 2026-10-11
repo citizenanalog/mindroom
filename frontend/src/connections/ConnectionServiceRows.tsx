@@ -254,9 +254,7 @@ export function ConnectionServiceRows({
                 )}
                 {!loading && status && !service.can_manage && (
                   <span className="text-xs text-muted-foreground">
-                    {agent.managers === undefined
-                      ? "Managed by credential managers"
-                      : sharedAgentNote(false, agent.managers)}
+                    {sharedAgentNote(false, agent.managers)}
                   </span>
                 )}
                 {!loading && status && service.can_manage && (
