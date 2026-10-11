@@ -165,7 +165,7 @@ egress_broker:
 | `header` | Custom header; requires `name` and `template` fields; `name` must be a valid HTTP header name other than `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authorization`, `Proxy-Connection`, or `Keep-Alive`; template must contain `{secret}` exactly once |
 | `query` | Query parameter `<name>=<secret>`; requires a non-empty `name`; replaces any client value |
 
-Matching follows this order: exact host over wildcard, specific port over none, longest path prefix, then declaration order.
+Matching follows this order: exact host over wildcard, specific port over none, longest path prefix, then declaration order. A save from the dashboard keeps the order of `egress_broker.services` as written.
 
 Service names use up to 63 lowercase letters, digits, `_`, and `-`, start with a letter or digit, and must not end in `_oauth` or `_oauth_client`, because the stored `egress_<name>` credential would then read as an OAuth service.
 
@@ -207,7 +207,7 @@ The 403 body names the restricting service in `service` (the first restricting s
 
 What follows from this:
 
-- **A user's restriction also limits the administrator's services on that host.** With the administrator's `github` service open on all of `api.github.com`, a user service that lists one repository and sets `restrict_to_rules` makes every other `api.github.com` path refuse for the scope that holds that service. The editor says so: "This also limits services from your administrator on these hosts, for this agent only." Precisely, it is the scope that holds the service (see [User services](#user-services)), so a service on a `user` agent limits all of that user's `user` agents. Other requesters, and hosts the user service has no rule for, follow the administrator's services as before.
+- **A user's restriction also limits the administrator's services on that host.** With the administrator's `github` service open on all of `api.github.com`, a user service that lists one repository and sets `restrict_to_rules` makes every other `api.github.com` path refuse for the scope that holds that service. The scope is the one that holds the service (see [User services](#user-services)): one agent for `user_agent`, all of the user's `user` agents for `user` (they share one store), and everyone who uses the agent for a shared or unscoped one. The personal page's editor says so with the sentence that matches the scope: "This also limits services from your administrator on these hosts, for this agent only." (`user_agent`), "... for all your agents that share your personal workspace." (`user`), or "... for everyone using this agent." (shared or unscoped). The dashboard editor leaves the sentence out. Other requesters, and hosts the user service has no rule for, follow the administrator's services as before.
 - **A user's restriction cannot open a path the administrator refuses.** The administrator's check runs on its own, so a user service with a `/` rule on a host where a config service restricts still gets `path_not_allowed` for every path the config rules do not list.
 - **On a shared or unscoped agent only managers can narrow.** Administrators and the agent's `credential_managers` write its user services, so only they can add a restriction, and it then applies to everyone who uses the agent.
 
@@ -235,6 +235,7 @@ GitHub's GraphQL endpoint (`api.github.com` `/graphql`) is refused under `restri
 Listing it opens every repository the credential can reach, because a GraphQL query names its repositories in the request body, which the broker never reads.
 
 **GitHub "Limit to repositories" helper.** The [services editor](#services-editor) writes these rules for you.
+Its description reads: "One repository per line, as owner/repo, or owner/* for everything an owner has. Applying replaces the rules above with rules for just those repositories (API and git over HTTPS) and refuses every other path on api.github.com and github.com. Other API paths, such as /user or search, stop working. Matching is case sensitive, so write names as they appear in GitHub URLs."
 Enter one `owner/repo` or `owner/*` per line and **Use these repositories** replaces the service's rules and turns on `restrict_to_rules`:
 
 - `owner/repo` gives `api.github.com` `/repos/owner/repo` (bearer), plus `github.com` `/owner/repo` and `/owner/repo.git` (basic auth with username `x-access-token`, which git over HTTPS uses).
@@ -312,7 +313,10 @@ A proxy token minted for one user's call stays readable in a shared sandbox for 
 So in a shared sandbox the broker does not use requester-scoped accounts at all:
 
 - It injects no GitHub or Atlassian account and adds no placeholder variables for it, and a matched request without an API key gets a 403 `credential_not_configured` with `manage_url` and no `connect_url`.
-- The status API reports the account part with `unavailable_reason: "shared_sandbox"`, not connected and not connectable. The row reads "Personal {provider} accounts can't be used by shared agents." plus "Ask {managers} to add a team API key." for a user who cannot manage the agent ("Ask an administrator to add a team API key." when the agent has no `credential_managers`) or "Add a team API key instead." for one who can. That text shows on the personal page and in the "API keys and accounts" section of each agent on the Connections portal; the dashboard panel always reads "... Add a team API key instead.", because an administrator manages every key there. None of them offers **Connect** there.
+- The status API reports the account part with `unavailable_reason: "shared_sandbox"`, not connected and not connectable.
+- On a shared or unscoped agent the row reads "Personal {provider} accounts can't be used by shared agents." plus "Ask {managers} to add a team API key." for a user who cannot manage the agent ("Ask an administrator to add a team API key." when the agent has no `credential_managers`) or "Add a team API key instead." for one who can.
+- On a personal agent (`user` or `user_agent`) that runs on the static runner, the sandbox is shared but the agent is not, so team keys and managers do not apply. The row reads "Personal {provider} accounts can't be used in this sandbox, which other users' commands share. Add an API key instead."
+- Both texts show on the personal page and in the "API keys and accounts" section of each agent on the Connections portal. The dashboard panel only lists shared and unscoped agents, so it always reads "... Add a team API key instead.", because an administrator manages every key there. None of them offers **Connect** there.
 - The [`egress_credentials` tool](#agent-tool) reports such a service as not configured and not connectable.
 
 Give those agents an API key instead, or run the agents whose users need their own account with worker scope `user` or `user_agent` on the Docker or Kubernetes worker backend.
@@ -343,6 +347,7 @@ The dashboard panel edits it as **Agents without a scope**.
 Set secrets and connect accounts in the **Agent API keys and accounts** panel on the dashboard's Credentials page, or on the personal egress page at `/connections/egress` (linked as "API keys and accounts" from the Connections pages).
 The panel is the first card on the Credentials page. Below it sits the raw editor, **Raw credential payloads (advanced)**, whose button reads **Save payload**.
 The panel's **Keys for** selector lists the `shared` agents that can run commands first, in config order, and then **Agents without a scope**, only when such an agent exists; it defaults to the first entry, which is **Agents without a scope** when no shared agent exists.
+When no agent uses the panel's keys at all (every agent that can run commands is `user` or `user_agent`), the panel hides its key actions and says "No agent uses these keys."
 Under **Add service** the panel says "Services you add here are offered to every agent and user. Private agents are not listed: each user sets their own keys on the Connections page.", and "Connections page" links to `/connections`.
 Keys for `user` and `user_agent` agents belong to each requester, so the panel does not list them and each user sets them on the personal egress page.
 The status API returns, for each service and scope, whether a key is set and when it was last updated, and the state of the connected account; it never returns a secret or token.
@@ -380,25 +385,26 @@ The personal listing also adds `is_shared` and `can_manage` per service, and giv
 - `managers`, for a shared or unscoped agent, the Matrix IDs of its `credential_managers` (administrators can always manage it as well), and `[]` otherwise.
 - `inactive_services`, the entries stored in that agent's scope that the broker ignores, as `{"name": "...", "reason": "shadowed"}` (a config service has that name now) or `"invalid"` (the entry no longer validates); see [User services](#user-services).
 
-Agents come in config declaration order, whatever their state.
+Agents come in config declaration order, whatever their state. A dashboard save keeps that order in `config.yaml`.
 `display_name` can be `null` in the dashboard listing, while the personal listing falls back to the title-cased service name.
 `oauth` is `null` for a service without an account provider.
-`unavailable_reason` is `"shared_sandbox"` when the scope runs in a shared sandbox (a shared or unscoped agent, or any agent on the static runner) and the provider is GitHub or Atlassian without `oauth_on_shared_workers`; the account part is then not connected and not connectable.
+`unavailable_reason` is `"shared_sandbox"` when the scope runs in a shared sandbox (a shared or unscoped agent, or any agent on the static runner) and the provider is GitHub or Atlassian without `oauth_on_shared_workers`; the account part is then not connected and not connectable. Clients pick the refusal text by the agent's `shared` flag, not by this reason alone (see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes)).
 `shared_worker_opt_in` is `true` on such a scope when the service sets `oauth_on_shared_workers` (see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes)).
 The OAuth part comes from the same helper as the Connections portal's per-provider status, so the egress pages and the portal agree.
 
 ### Connecting an account
 
-On the personal egress page, the dashboard panel, and the Connections portal cards, a service with an account provider shows **Connect <Provider>** as its primary action.
+On the personal egress page and the dashboard panel, a service with an account provider shows **Connect <Provider>** as its primary action.
+On the Connections portal's cards the button reads just **Connect**, and the provider is in its accessible name ("Connect <Provider>").
 It opens the provider's login in a popup; a connected row then reads "Connected as <account>" (just "Connected" when the connection has no label) with a **Disconnect** button.
 That is the text of an egress row, on the personal page, the dashboard panel, and the "API keys and accounts" section of the Connections portal; the portal's account cards instead show "Connected" with the account on a separate line, and a shared service uses the "shared with everyone using" form below.
 A row whose saved connection cannot be read reads "Reset required" and offers only **Reset connection**; **Connect** returns once the reset is done.
 **Use an API key instead** keeps the key actions (**Set key**, **Replace key**, **Remove key**), and a row of a service with an account provider whose key is in use reads "Using API key".
 When a key and a connected account both exist, the row adds "Your connected {provider} account is kept for other services."
-In a shared sandbox (a shared or unscoped agent, or any agent on the static runner) a GitHub or Atlassian row offers no **Connect** and says personal accounts cannot be used there (see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes)), unless the service sets `oauth_on_shared_workers`, in which case the row warns that everyone using the agent can act with the connected account.
+In a shared sandbox (a shared or unscoped agent, or any agent on the static runner) a GitHub or Atlassian row offers no **Connect** and says personal accounts cannot be used there, in the shared-agent wording or, for a personal agent on the static runner, the sandbox wording (see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes)), unless the service sets `oauth_on_shared_workers`, in which case the row warns that everyone using the agent can act with the connected account.
 Where the status offers no **Connect** because the scope runs in a shared sandbox, the connect and disconnect routes agree and answer 409 with a message instead of starting a login.
 
-**GitHub account label.** After a GitHub connection finishes, MindRoom reads the account's login from the GitHub API (`https://api.github.com/user`, with the new token, a 5 second timeout, and no redirects) and shows it as the account label, so the row reads "Connected as octocat".
+**GitHub account label.** After a GitHub connection finishes, MindRoom reads the account's login from the GitHub API (`https://api.github.com/user`, with the new token, one overall 5 second deadline, and no redirects) and shows it as the account label, so the row reads "Connected as octocat".
 GitHub's token response names no account, so the lookup runs once per connection, never on refresh.
 If the lookup fails, the account still connects and shows no label, and the log records only the error type, never the token.
 Accounts connected before the lookup existed show no label until they are reconnected.
@@ -421,8 +427,8 @@ The Connections portal cards do not edit services: every agent the user may use 
 
 An agent can also send a user straight to the login: the 403 `credential_not_configured` and `oauth_connection_required` responses and the [`egress_credentials` tool](#agent-tool) point at where to connect, and the broker's responses carry a `connect_url`, a short-lived single-use link.
 The link carries only the connect target, not a login: the browser that opens it must be signed in to MindRoom as the requester the link was minted for.
-A link for a shared scope would skip that sign-in, and any process in the shared worker could read it from the response, so the broker never hands one out: on a shared agent the response has no `connect_url` and the user connects at `manage_url` instead.
-GitHub and Atlassian links are never for a shared scope, because those connections belong to the requester.
+A link for a connection that everyone using the agent shares would skip that sign-in, and any process in the shared worker could read it from the response, so the broker never hands one out for it: the response has no `connect_url` and the user connects at `manage_url` instead.
+GitHub and Atlassian connections belong to the requester, not to the shared scope. Where `oauth_on_shared_workers` lets a shared agent use them, the response carries a link for the calling requester's own account, and its message is the connectable text (see [Error responses](#error-responses)).
 The broker reuses one link per caller for 60 seconds, so a worker that retries in a loop does not mint a new one each time.
 
 Who may connect an account follows who may set a key, with one exception:
@@ -501,7 +507,7 @@ A service is stored per scope, in the same primary-only store as that scope's ke
 It follows the placement in the [scope table](#secret-management): per requester (and agent for `user_agent`), per agent for `shared`, and in the global store for unscoped agents, where every agent without a worker scope shares it.
 So a service saved on one of a user's `user` agents applies to all of that user's `user` agents, together with its key, while each `user_agent` agent has its own.
 The editor says which on a personal agent, from the listing's `scope` and `scope_agents`: for `user_agent`, "Only your {agent} uses this service and its key."; for `user`, "All your agents that share your personal workspace use this service and its key: {agents}." Shared, unscoped, and dashboard editors show no such note.
-The delete confirmation of a personal service also says that your other personal agents that share the scope lose the service.
+The delete confirmation of a service says who loses it, by scope: "Your {agent} loses access through it." (`user_agent`), "All your agents that share your personal workspace lose access through it: {agents}." (`user`), or "Everyone using {agent} loses access through it." (shared or unscoped).
 Workers never read that store.
 The broker merges the config services and the calling scope's own services per request, from a small per-scope cache that every save or delete clears, so a change applies to the next request without a restart.
 A user service routes only that scope's keys and accounts, so it cannot reach anyone else's credentials.
@@ -552,14 +558,14 @@ A stored entry that no longer passes these rules is skipped (or loses the offend
 One editor adds, edits, and deletes services in two places:
 
 - **Personal egress page** (`/connections/egress`): each agent has an **Add service** button where the caller may manage services (their own personal agents, and shared or unscoped agents they manage as an administrator or credential manager). A user's own services have **Edit service** and **Delete service**, and deleting also deletes the service's key. Services from `config.yaml` appear read-only under "From your administrator" and keep their key and account controls; a service that covers GitHub also offers **Limit to repositories** (see [Limiting paths and repositories](#limiting-paths-and-repositories)). [Inactive entries](#user-services) are listed under the agent with their reason, and can be deleted by anyone who may manage services there.
-- **Dashboard Credentials page**: the **Agent API keys and accounts** panel has **Add service**, and **Edit service** and **Delete service** on the services of `config.yaml`. Deleting one removes it from the configuration but keeps its saved keys, which apply again if a service with the same name is added back. A save writes `config.yaml` through the same config API as Settings and keeps the preset form you wrote (`{preset: github}` is not expanded), so later preset updates still reach the service; because a save writes the whole configuration draft, when the Settings draft holds other unsaved changes the panel says so and asks you to confirm before it saves or deletes. When the save fails with an error, the draft goes back to what it was before the write; when the configuration changed while saving (a stale save), the panel asks you to reload the page and check the service list instead. The selected scope's user services show read-only with a "User service" badge, since users edit them on their own page. The panel's editor has no key field (keys have their own actions on each row), and its restriction help leaves out the sentence about limiting the administrator's services, because the dashboard edits the administrator's own services.
+- **Dashboard Credentials page**: the **Agent API keys and accounts** panel has **Add service**, and **Edit service** and **Delete service** on the services of `config.yaml`. Deleting one removes it from the configuration but keeps its saved keys, which apply again if a service with the same name is added back. A save writes `config.yaml` through the same config API as Settings, keeps the preset form you wrote (`{preset: github}` is not expanded), so later preset updates still reach the service, and keeps your order of services and agents: the file is written in the order of the draft, never sorted, so the declaration order that breaks ties between services and orders the agents on the Connections pages survives every dashboard save; because a save writes the whole configuration draft, when the Settings draft holds other unsaved changes the panel says so and asks you to confirm before it saves or deletes. When the save fails with an error, the draft goes back to what it was before the write; when the configuration changed while saving (a stale save), the panel asks you to reload the page and check the service list instead. The selected scope's user services show read-only with a "User service" badge, since users edit them on their own page. The panel's editor has no key field (keys have their own actions on each row), and its restriction help leaves out the sentence about limiting the administrator's services, because the dashboard edits the administrator's own services.
 
 **Basic fields.** The editor opens with the fields most services need, and saves the service and its key in one step:
 
 - **Name**, fixed once saved. For a new service it follows the preset id, or the first label of the website (`httpbin.org` gives `httpbin`), until you type one, and it takes the first free `{name}-2` or `{name}-3` when the name is taken. An empty name says "Name is required".
 - **Preset**, or **Custom**.
 - **Website**, the host of the first rule.
-- **Send the key as**: Bearer token, Header, Basic, Query parameter, or Custom template (a header with a value template).
+- **Send the key as**: Bearer token, Header, Basic, Query parameter, or Custom template (a header with a value template). A Query parameter or Custom template adds a **Value template** field with the hint "Leave empty to send the key as is."
 - **Header name**, with the hint "For example X-Api-Key" (or **Username** for Basic, or **Parameter name** for a query parameter, with the hint "For example api_key").
 - **API key**, an optional password field with the hint "Paste the key now or later". It appears on the personal page only, where the caller may set the agent's keys.
 
@@ -569,9 +575,10 @@ If the key fails after the service saved, the editor says "The service was saved
 Errors show beside their field, and the first invalid field gets focus.
 
 **More options** holds everything else: display name, description, path prefix, port, extra rules, **Replace the preset's rules with my own**, **Refuse other paths on these hosts** (`restrict_to_rules`), the account login, and the placeholder variables.
-The account login (`oauth_provider`) is an "Account login (optional)" field only for a **Custom** service; with a preset that has a provider, a line of text says users can connect that account instead of using a key, and a preset without one shows nothing.
+The account login (`oauth_provider`) is an "Account login (optional)" field only for a **Custom** service; with a preset that has a provider, a line of text says "Users can connect an account ({provider}) instead of an API key.", and a preset without one shows nothing.
+For a shared or unscoped agent, which cannot use personal accounts in a user service (see [User services](#user-services)), the field is disabled and empty with the hint "Accounts cannot be connected on a shared agent. Use an API key.", and a preset's line reads "Accounts cannot be connected on a shared agent, so this service uses an API key."
 The **Limit to repositories** helper described in [Limiting paths and repositories](#limiting-paths-and-repositories) sits between the basic fields and **More options**, and shows only for a GitHub service.
-The restriction's help reads: "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key. This also limits services from your administrator on these hosts, for this agent only. The real boundary is the key itself, so scope it as narrowly as the website allows." On GitHub hosts it adds: "GraphQL (/graphql) is refused unless listed, and a listed GraphQL rule reaches every repository the key can reach. Use a fine-grained token or a GitHub App installed on selected repositories."
+The restriction's help reads: "Requests to these hosts whose path matches none of your rules are refused (path_not_allowed) instead of being sent without a key. This also limits services from your administrator on these hosts, {scope}. The real boundary is the key itself, so scope it as narrowly as the website allows." The {scope} part follows the scope that holds the service: "for this agent only" on a `user_agent` agent, "for all your agents that share your personal workspace" on a `user` agent, and "for everyone using this agent" on a shared or unscoped agent. The dashboard editor leaves the whole sentence out. On GitHub hosts it adds: "GraphQL (/graphql) is refused unless listed, and a listed GraphQL rule reaches every repository the key can reach. Use a fine-grained token or a GitHub App installed on selected repositories."
 
 Rules you write next to a preset replace the preset's rules as a whole, which the form says when you tick **Replace the preset's rules with my own**.
 The preset dropdown comes from the presets routes (`GET /api/connections/egress/presets` and `GET /api/egress-broker/presets`), so it always lists the presets this MindRoom version knows.
@@ -596,6 +603,7 @@ The example is abbreviated to one preset and one rule.
 Rules carry no auth settings, and `display_name` falls back to the preset id.
 The editor checks what it can before saving, and shows the server's message for the rest (a name that is taken, a limit, or a rule the server refuses).
 On the personal page the placeholder fields check the user-service rules from [User services](#user-services) (the name and value patterns and the refused words) after the first save attempt, and live from then on, and the hint under them lists those rules, so a placeholder the server would reject is flagged before saving.
+The hint also says "Placeholders are set only while this service has a key or a connected account.", matching [Placeholder environment](#custom-services).
 
 ## Connections pages
 
@@ -612,6 +620,9 @@ The caveat is real: the broker returns upstream responses to the worker, so a si
 
 **Grouping and wording.** Under each agent, rows are grouped as "From your administrator" (services from `config.yaml`) and "Added by you" (personal agents) or "Added by its credential managers" (shared agents); empty groups are left out.
 A row with a key reads "Key saved {date}" with **Replace key** and **Remove key** (**Set key** when none is saved), and a row's service actions are **Edit service** and **Delete service**.
+Every service row shows a host line under its description, "Sends to {hosts}": the unique hosts of its rules, comma-separated, with a port written as `host:port`.
+
+**Accessible names.** A button's accessible name starts with its visible text and names the service, so two rows for the same provider never share a name: "Set key for {service}", "Replace key for {service}", "Remove key for {service}", "Limit to repositories for {service}", "Edit service for {service}", "Delete service for {service}", "Disconnect for {service}", and "Reset connection for {service}", where {service} is the service's display name.
 
 **Shared agents.** Each shared or unscoped agent has a note under its name, from the listing's `managers`:
 
@@ -646,7 +657,7 @@ A 407 and a malformed request the broker rejects before it can route it write no
 
 On the personal egress page each agent has a collapsible **Recent requests** table with the time, method, host, path, service, and status of its latest requests, loaded when you open it, and the broker's error code under the status when there is one.
 Codes wrap after an underscore and never clip, on this table and on the dashboard's.
-A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host."
+A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path)."
 While the broker is off, the table shows the server's "Egress broker is not running" message.
 
 ## Agent tool
@@ -842,7 +853,7 @@ The broker returns these errors to worker code:
 | Path that fails a restriction (see [Limiting paths and repositories](#limiting-paths-and-repositories)) | 403 JSON `{"error": "path_not_allowed", "service": "<restricting service>", "manage_url": "<link>", "message": "..."}` |
 | Destination fails dial guard (private/metadata/link-local) | 403 JSON `{"error": "destination_blocked", "message": "..."}` |
 | Unmatched host under `deny` policy | 403 JSON `{"error": "host_not_allowed", "services": [...], "message": "..."}` with the operator's service names as a hint |
-| Matched service, no key and no connected account in scope | 403 JSON `{"error": "credential_not_configured", "service": "<name>", "manage_url": "<link>", "message": "..."}`, plus `"provider": "<id>"` and `"connect_url": "<link>"` when the service's account provider is connectable and the broker may hand out a link for the scope (never for a shared scope). The link still requires its opener to be allowed to connect that account |
+| Matched service, no key and no connected account in scope | 403 JSON `{"error": "credential_not_configured", "service": "<name>", "manage_url": "<link>", "message": "..."}`, plus `"provider": "<id>"` and `"connect_url": "<link>"` when the service's account provider is connectable and the broker may hand out a link (never for a connection that everyone using a shared agent shares; a requester's own GitHub or Atlassian account under `oauth_on_shared_workers` does get one). The link still requires its opener to be allowed to connect that account |
 | Connected account revoked, rejected by the provider, or unreadable | 403 JSON `{"error": "oauth_connection_required", "service": "<name>", "provider": "<id>", "connect_url": "<link>", "manage_url": "<link>", "message": "..."}`; `connect_url` is `null` for a shared scope, and an unreadable stored credential adds `"reset_required": true` and has a `null` `connect_url` until it is reset |
 | Provider outage, timeout, or network failure while refreshing the account's token | 503 JSON `{"error": "oauth_refresh_failed", "service": "<name>", "provider": "<id>", "manage_url": "<link>", "message": "..."}`; retry later, do not reconnect |
 | Unresolvable destination, or upstream connect or TLS failure | 502 JSON `{"error": "upstream_unreachable", "message": "..."}` |
@@ -859,7 +870,7 @@ The messages, with `{service}`, `{provider}`, `{host}`, `{path}`, and `{managers
 |---------|-----------|
 | `credential_not_configured`, connectable | "No {service} credential is set for this agent. Ask the user to connect it at connect_url or add a key at manage_url, then retry." |
 | `credential_not_configured`, key only | "No {service} key is set for this agent. Ask the user to add one at manage_url, then retry." |
-| `credential_not_configured`, shared or unscoped agent | "No {service} key is set for this shared agent. Only its credential managers ({managers}) can add one, at manage_url." With no managers: "No {service} key is set for this shared agent. Only an administrator can add one, at manage_url." |
+| `credential_not_configured`, shared or unscoped agent, no connect link | "No {service} key is set for this shared agent. Only its credential managers ({managers}) can add one, at manage_url." With no managers: "No {service} key is set for this shared agent. Only an administrator can add one, at manage_url." |
 | `oauth_connection_required` | "The {provider} account for {service} must be connected again. Ask the user to reconnect at connect_url or manage_url." |
 | `oauth_refresh_failed` | "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url." |
 | `path_not_allowed` | "{host}{path} is outside the paths {service} allows for this agent. Ask the user to add it at manage_url if the agent needs it." |
@@ -875,7 +886,7 @@ The messages, with `{service}`, `{provider}`, `{host}`, `{path}`, and `{managers
 | `broker_error` | "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator." |
 | `proxy_authentication_required` | "The sandbox's proxy credentials are missing or expired. Start a new tool call." |
 
-The shared text wins over the connectable one: a shared or unscoped agent is never offered a connect link, and its managers are read from the agent's `credential_managers` in the primary's current config.
+The connectable text wins over the shared one: when the response carries a `connect_url`, the message offers it, even on a shared or unscoped agent (a requester's own account that `oauth_on_shared_workers` allows there). The shared text is for a shared or unscoped agent whose response has no link, and its managers are read from the agent's `credential_managers` in the primary's current config.
 The managers' Matrix IDs appear in no other broker response.
 
 A 503 `oauth_refresh_failed` backs off per credential store: for 30 seconds after a failed refresh, further requests for that store get the same 503 without calling the provider again.

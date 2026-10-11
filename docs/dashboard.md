@@ -6,6 +6,7 @@ icon: lucide/layout-dashboard
 
 The web dashboard configures agents, teams, rooms, models, credentials, and integrations without editing YAML by hand.
 Each editor keeps a local draft and writes `config.yaml` when you save.
+A save writes entries in the order of the draft instead of sorting them, so the order of your agents and, for egress, of `egress_broker.services` survives it (declaration order lists agents on the Connections pages and breaks ties between equally specific egress rules).
 This page covers opening the dashboard, what each tab does, saving and conflict errors, and the dashboard REST API.
 
 ## Accessing the Dashboard
