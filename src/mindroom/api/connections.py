@@ -22,6 +22,7 @@ from mindroom.api.connection_agents import (
 from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
 from mindroom.authorization import is_platform_administrator
 from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.logging_config import get_logger
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
 from mindroom.matrix.users import create_agent_http_client
 from mindroom.oauth.credential_lifecycle import resolve_oauth_credential_context
@@ -35,14 +36,20 @@ if TYPE_CHECKING:
     from mindroom.tool_system.catalog import ToolMetadata
 
 router = APIRouter(prefix="/api/connections", tags=["connections"])
+logger = get_logger(__name__)
 
 
 class ConnectionService(BaseModel):
-    """One available account connection, without credential storage details."""
+    """One available account connection, without credential storage details.
+
+    `connected` is only filled in by the catalog route: it is what the status route would report to this viewer,
+    read without refreshing the token, so a page can count connected accounts before it loads each status.
+    """
 
     provider: str
     is_shared: bool
     can_manage: bool
+    connected: bool = False
     display_name: str
     description: str
     icon: str | None
@@ -65,12 +72,15 @@ class AgentConnections(BaseModel):
 
     `egress_services` is a list for an agent whose egress credentials the user may use, empty when it has no
     services, so the portal can link every such agent to the services page. It is null for any other agent.
+    `managers` is a shared or unscoped agent's credential managers as Matrix IDs, as the egress listing reports them;
+    it is empty for any other agent, and for an agent with none only administrators manage its credentials.
     """
 
     agent_name: str
     agent_display_name: str
     is_shared: bool
     can_use: bool
+    managers: list[str] = []
     services: list[ConnectionService]
     tools: list[ConnectionTool]
     egress_services: list[EgressCredentialService] | None = None
@@ -199,6 +209,7 @@ def _agent_connections(
         agent_display_name=agent.display_name,
         is_shared=agent.private is None,
         can_use=agent_name in user.agent_names,
+        managers=list(agent.credential_managers) if entity.execution_scope in {None, "shared"} else [],
         services=list(services.values()),
         tools=tools,
     )
@@ -227,6 +238,47 @@ def _require_same_origin(request: Request, context: _Connections) -> None:
     require_connections_same_origin(request, context.runtime_paths)
 
 
+async def _service_connected(
+    request: Request,
+    context: _Connections,
+    agent_name: str,
+    service: ConnectionService,
+) -> bool:
+    """Say whether the status route would report the service connected, without refreshing its token.
+
+    It reads state the way that route does, so a viewer sees the same answer in the catalog and in the expanded row.
+    Any failure reads as not connected: one unreadable service must not fail the catalog.
+    """
+    provider = context.providers[service.provider]
+    try:
+        if service.can_manage:
+            result = await oauth.authenticated_connection_status(
+                service.provider,
+                request,
+                agent_name=agent_name,
+                refresh=False,
+            )
+        else:
+            agent = resolve_connection_agent(context.user, agent_name)
+            credential_context = resolve_oauth_credential_context(
+                provider,
+                context.runtime_paths,
+                get_runtime_credentials_manager(context.runtime_paths),
+                agent.worker_target,
+                execution_identity=agent.execution_identity,
+                config=agent.config,
+            )
+            result = await oauth.connection_status(request, credential_context, refresh=False)
+    except Exception as exc:
+        logger.warning(
+            "connection_catalog_status_unavailable",
+            provider_id=service.provider,
+            error_type=type(exc).__name__,
+        )
+        return False
+    return oauth.personal_connection_view(result, can_manage=service.can_manage).connected
+
+
 @router.get("/me")
 async def me(request: Request, response: Response) -> ConnectionsIdentity:
     """Return the signed-in identity for the Connections pages' header.
@@ -251,7 +303,11 @@ async def me(request: Request, response: Response) -> ConnectionsIdentity:
 
 @router.get("")
 async def catalog(request: Request, context: _ConnectionsContext) -> ConnectionsCatalog:
-    """List allowed services; the status of their accounts is loaded per card, not here.
+    """List allowed services with whether each is connected; the full status of an account is loaded per card.
+
+    `connected` on a service is read like the status route reads it, without refreshing the token, so the portal
+    can count connected accounts before a card is opened; a service whose state cannot be read counts as not
+    connected.
 
     Egress rows follow the personal egress API's eligibility rule, only agents the user may use, and carry the
     stored OAuth state of their services. That state is read only here, so status, connect and disconnect of other
@@ -265,6 +321,12 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
     agents = [
         agent.model_copy(
             update={
+                "services": [
+                    service.model_copy(
+                        update={"connected": await _service_connected(request, context, agent.agent_name, service)},
+                    )
+                    for service in agent.services
+                ],
                 "egress_services": await egress_services_for_agent(
                     request,
                     agent.agent_name,

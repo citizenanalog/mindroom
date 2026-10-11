@@ -930,3 +930,92 @@ def test_catalog_reports_connection_sharing_by_provider_and_scope(
     assert personal["services"][0]["is_shared"] is False
     assert research["is_shared"] is True
     assert research["services"][0]["is_shared"] is expected_shared
+
+
+def _connect_account(portal: dict[str, Any], user: str, agent: str) -> None:
+    """Complete the OAuth flow for one user on one agent, as the browser popup does."""
+    client, headers = portal["client"], portal["headers"]
+    connect = client.post(f"/api/connections/agents/{agent}/google_drive/connect", headers=headers[user], json={})
+    assert connect.status_code == 200, connect.text
+    state = parse_qs(urlparse(connect.json()["auth_url"]).query)["state"][0]
+    callback = client.get(
+        "/api/oauth/google_drive/callback",
+        params={"code": "test-code", "state": state},
+        headers=headers[user],
+        follow_redirects=False,
+    )
+    assert callback.status_code in {302, 303, 307}, callback.text
+
+
+def _catalog_services(portal: dict[str, Any], user: str) -> dict[str, dict[str, Any]]:
+    response = portal["client"].get("/api/connections", headers=portal["headers"][user])
+    assert response.status_code == 200, response.text
+    return {agent["agent_name"]: agent["services"][0] for agent in response.json()["agents"]}
+
+
+def test_catalog_says_whether_each_service_is_connected_for_the_viewer(portal: dict[str, Any]) -> None:
+    """The catalog carries the connected flag the expanded row would show, without refreshing any token."""
+    refresh = AsyncMock(side_effect=AssertionError("The catalog must not refresh tokens"))
+    with patch.object(oauth, "refresh_oauth_credentials", refresh):
+        assert _catalog_services(portal, "alice")["personal"]["connected"] is False
+    _connect_account(portal, "alice", "personal")
+    with patch.object(oauth, "refresh_oauth_credentials", refresh):
+        assert _catalog_services(portal, "alice")["personal"]["connected"] is True
+        # A private agent's account belongs to the user who connected it.
+        assert _catalog_services(portal, "bob")["personal"]["connected"] is False
+    refresh.assert_not_called()
+    status = portal["client"].get(
+        "/api/connections/agents/personal/google_drive/status",
+        headers=portal["headers"]["alice"],
+    )
+    assert status.json()["connected"] is True
+
+
+def test_catalog_shows_a_shared_account_as_connected_to_managers_and_to_users(shared_portal: dict[str, Any]) -> None:
+    """Everyone who uses a shared agent sees its connection, whether or not they may change it."""
+    shared_portal["payload"]["agents"]["research"]["access"] = {"users": ["@bob:example.org"]}
+    _publish_config(main.app, shared_portal["paths"], shared_portal["payload"])
+    _use_runtime_auth_settings(main.app)
+    for user in ("alice", "bob"):
+        assert _catalog_services(shared_portal, user)["research"]["connected"] is False
+    _connect_account(shared_portal, "alice", "research")
+    alice, bob = _catalog_services(shared_portal, "alice"), _catalog_services(shared_portal, "bob")
+    assert (alice["research"]["can_manage"], alice["research"]["connected"]) == (True, True)
+    assert (bob["research"]["can_manage"], bob["research"]["connected"]) == (False, True)
+    # Another shared agent has its own connection.
+    assert alice["personal"]["connected"] is False
+
+
+def test_catalog_survives_a_service_whose_state_cannot_be_read(
+    portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unreadable connection shows as not connected and neither fails the catalog nor leaks the error."""
+    monkeypatch.setattr(
+        oauth,
+        "authenticated_connection_status",
+        AsyncMock(side_effect=HTTPException(503, "internal-client-secret")),
+    )
+    response = portal["client"].get("/api/connections", headers=portal["headers"]["alice"])
+    assert response.status_code == 200, response.text
+    assert response.json()["agents"][0]["services"][0]["connected"] is False
+    assert "internal-client-secret" not in response.text
+
+
+def test_catalog_names_the_credential_managers_of_shared_agents(shared_portal: dict[str, Any]) -> None:
+    """Shared and unscoped agents list their credential managers, as the egress listing does; private ones list none."""
+    shared_portal["payload"]["agents"]["support"]["worker_scope"] = "user"
+    _publish_config(main.app, shared_portal["paths"], shared_portal["payload"])
+    _use_runtime_auth_settings(main.app)
+    agents = {
+        agent["agent_name"]: agent["managers"]
+        for agent in shared_portal["client"]
+        .get("/api/connections", headers=shared_portal["headers"]["admin"])
+        .json()["agents"]
+    }
+    assert agents == {
+        "personal": [],
+        "research": ["@alice:example.org", "@mallory:example.org"],
+        # A shared agent that runs per user keeps its keys per requester, so nobody manages them together.
+        "support": [],
+    }
