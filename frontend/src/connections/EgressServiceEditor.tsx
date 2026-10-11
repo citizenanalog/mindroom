@@ -583,10 +583,11 @@ export function EgressServiceEditor({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
+        {/* The presets bring the limits a save is checked against, so saving waits until they have loaded or failed. */}
         <Button
           type="submit"
           size="sm"
-          disabled={busy !== null || (presets === null && !limiting)}
+          disabled={busy !== null || presets === null}
         >
           {busy === "save" ? (
             <>

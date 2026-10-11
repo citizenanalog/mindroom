@@ -1,5 +1,4 @@
 import {
-  act,
   cleanup,
   fireEvent,
   render,
@@ -2582,13 +2581,20 @@ describe("typed repositories after the preset changes", () => {
   });
 });
 
+/** Wait until the limit form can be saved: the presets, which bring the limits, have loaded or failed. */
+const limitSavable = () =>
+  waitFor(() =>
+    expect(screen.getByRole("button", { name: "Save limit" })).toBeEnabled(),
+  );
+
 describe("a limit: a service that only restricts GitHub repositories", () => {
-  /** The limit form has no preset, so there is nothing to wait for. */
+  /** The limit form has no preset, but it waits for the limits the presets bring. */
   const renderEditor = async (
     props: Partial<EgressServiceEditorProps> = {},
   ) => {
     const merged = { ...baseProps(), ...props };
     render(<EgressServiceEditor {...merged} />);
+    await limitSavable();
     return { onSave: merged.onSave, onCancel: merged.onCancel };
   };
   const enter = (value: string) =>
@@ -2670,7 +2676,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     expect(onSave).not.toHaveBeenCalled();
   });
 
-  it("does not wait for the presets", async () => {
+  it("waits for the presets, which bring the limits, before it can be saved", async () => {
     const loadPresets = vi.fn(() => new Promise<EgressPresetCatalog>(() => {}));
     render(
       <EgressServiceEditor
@@ -2680,7 +2686,20 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
         loadPresets={loadPresets}
       />,
     );
-    expect(screen.getByRole("button", { name: "Save limit" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Save limit" })).toBeDisabled();
+  });
+
+  it("can be saved once the presets fail to load", async () => {
+    const { onSave } = await renderEditor({
+      initialRestrictOnly: true,
+      initialName: "github-limited",
+      loadPresets: vi.fn(async () => {
+        throw new Error("offline");
+      }),
+    });
+    enter("octocat/Hello-World");
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
   });
 
   it("says for whom it also limits the administrator's services", async () => {
@@ -2794,9 +2813,10 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
 });
 
 describe("a limit: relabelling, rules without auth, and long lists", () => {
-  const renderLimit = (props: Partial<EgressServiceEditorProps> = {}) => {
+  const renderLimit = async (props: Partial<EgressServiceEditorProps> = {}) => {
     const merged = { ...baseProps(), ...props };
     render(<EgressServiceEditor {...merged} />);
+    await limitSavable();
     return { onSave: merged.onSave };
   };
   const noAuth = (rules: EgressRule[]): EgressRule[] =>
@@ -2819,7 +2839,10 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
       restrict_only: true,
     };
     expect(stored.rules?.every((rule) => rule.auth === undefined)).toBe(true);
-    const { onSave } = renderLimit({ name: "github-limited", service: stored });
+    const { onSave } = await renderLimit({
+      name: "github-limited",
+      service: stored,
+    });
     expect(screen.getByLabelText("GitHub repositories")).toHaveValue("a/b");
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
@@ -2834,7 +2857,7 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
       restrict_to_rules: true,
       restrict_only: true,
     });
-    const first = renderLimit({
+    const first = await renderLimit({
       name: "github-limited",
       service: written("a/b"),
     });
@@ -2849,7 +2872,7 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
       restrict_only: true,
     });
     cleanup();
-    const second = renderLimit({
+    const second = await renderLimit({
       name: "github-limited",
       service: {
         ...written("a/b"),
@@ -2870,12 +2893,10 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
   });
 
   it("tells a list that makes more than 50 rules in the alert, and does not save", async () => {
-    const { onSave } = renderLimit({
+    const { onSave } = await renderLimit({
       initialRestrictOnly: true,
       initialName: "github-limited",
     });
-    // The limit on rules comes with the presets, which a person types after.
-    await act(async () => undefined);
     enter(Array.from({ length: 17 }, (_, i) => `o/r${i}`).join("\n"));
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
