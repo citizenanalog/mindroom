@@ -12,7 +12,11 @@ from pydantic import BaseModel, ConfigDict
 
 from mindroom.api import config_lifecycle
 from mindroom.api.auth import require_connections_user
-from mindroom.api.connection_agents import CONNECTIONS_HEADERS, require_connections_same_origin
+from mindroom.api.connection_agents import (
+    CONNECTIONS_HEADERS,
+    require_connections_same_origin,
+    resolve_connection_user,
+)
 from mindroom.api.connections_sessions import CONNECTIONS_SESSION_COOKIE, CONNECTIONS_SESSION_SECONDS
 from mindroom.constants import RuntimePaths
 from mindroom.matrix_openid import (
@@ -89,7 +93,16 @@ async def sign_in(body: _SignIn, request: Request, response: Response, paths: _P
         matrix_user_id = await verify_matrix_openid(body.openid_token, paths)
     except MatrixOpenIDError as error:
         raise HTTPException(error.status_code, error.detail, headers=CONNECTIONS_HEADERS) from error
-    token = config_lifecycle.app_state(request.app).connections_sessions.create(matrix_user_id)
+    # Any homeserver user can obtain a valid token, so only users with portal access may take a session slot.
+    app_state = config_lifecycle.app_state(request.app)
+    user = resolve_connection_user(
+        config_lifecycle.bind_current_request_snapshot(request),
+        matrix_user_id,
+        membership_index=app_state.agent_reply_memberships,
+    )
+    if not user.visible_agent_names:
+        raise HTTPException(403, "No connections are available for this account", headers=CONNECTIONS_HEADERS)
+    token = app_state.connections_sessions.create(matrix_user_id)
     response.headers.update(CONNECTIONS_HEADERS)
     response.set_cookie(
         CONNECTIONS_SESSION_COOKIE,

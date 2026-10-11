@@ -50,7 +50,7 @@ def signin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce_turn_authori
     """Serve the real API in API-key mode with a fake Matrix OpenID verifier for users alice and bob."""
 
     async def verify(token: Any, _paths: Any) -> str:  # noqa: ANN401
-        if token.access_token in {"alice", "bob"}:
+        if token.access_token in {"alice", "bob", "mallory"}:
             return f"@{token.access_token}:example.org"
         raise MatrixOpenIDError(401, "Matrix OpenID verification failed.")
 
@@ -153,6 +153,16 @@ def test_sign_in_sets_portal_session_cookie(signin: dict[str, Any]) -> None:
     assert config_lifecycle.app_state(main.app).connections_sessions.resolve(token) == "@alice:example.org"
     assert signin["verifier"].await_args.args[0].access_token == "alice"  # noqa: S105
     assert signin["verifier"].await_args.args[1] == signin["paths"]
+
+
+def test_sign_in_refuses_user_without_visible_agents(signin: dict[str, Any]) -> None:
+    """Any homeserver user has a valid token, so one without portal access gets no session slot."""
+    store = config_lifecycle.app_state(main.app).connections_sessions
+    sessions_before = dict(store._sessions)
+    response = sign_in(signin["client"], "mallory")
+    assert response.status_code == 403, response.text
+    assert "set-cookie" not in response.headers
+    assert store._sessions == sessions_before
 
 
 def test_sign_in_rejects_client_origin_not_allowlisted(signin: dict[str, Any]) -> None:
