@@ -1249,7 +1249,7 @@ visibility = [
 
 [[modules]]
 path = "mindroom.approval_receipt"
-depends_on = ["mindroom.agno_compat_model_hooks", "mindroom.event_journal"]
+depends_on = ["mindroom.agno_compat_model_hooks", "mindroom.event_journal", "mindroom.history.legacy_summary_system_prompt"]
 visibility = [
     "mindroom.approval_execution",
     "mindroom.response_runner",
@@ -2400,6 +2400,7 @@ visibility = [
 path = "mindroom.history.legacy_summary_system_prompt"
 depends_on = []
 visibility = [
+    "mindroom.approval_receipt",
     "mindroom.history.agno_compat_message_builder",
     "mindroom.history.mid_turn_compaction",
 ]

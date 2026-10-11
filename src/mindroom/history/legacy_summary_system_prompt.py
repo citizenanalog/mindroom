@@ -25,9 +25,11 @@ _LEGACY_SUMMARY_BLOCK = re.compile(
 # Last legacy release: v2026.10.242; replacement: the next release renders the summary as the first history message.
 # Handling: Resuming such a run inserts no summary message, so its request keeps the single summary it was paused
 # with and the paused tool call's signed reasoning stays valid against an unchanged prefix. A mid-turn compaction
-# of that resumed request folds the paused tool call anyway, so it also removes the block from the system message.
+# of that resumed request folds the paused tool call anyway, so it also removes the block from the system message,
+# including the stored one behind an approval receipt's projected copy.
 # Coverage: tests/test_history_summary_message.py::test_resuming_a_pre_release_pause_keeps_its_single_summary;
-# tests/test_mid_turn_compaction.py::test_legacy_resume_then_mid_turn_compaction_leaves_one_summary.
+# tests/test_mid_turn_compaction.py::test_legacy_resume_then_mid_turn_compaction_leaves_one_summary;
+# tests/test_approval_receipt.py::test_publishing_keeps_a_legacy_summary_strip_made_on_the_outbound_copy.
 def system_message_embeds_summary(messages: Sequence[Message]) -> bool:
     """Return whether a leading system or developer message already carries Agno's summary block."""
     for message in messages:
