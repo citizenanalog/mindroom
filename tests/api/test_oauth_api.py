@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from httpx import HTTPError, HTTPStatusError, Request, Response
 from starlette.requests import Request as StarletteRequest
@@ -2405,6 +2405,28 @@ def test_oauth_browser_errors_are_html(tmp_path: Path, scenario: str) -> None:
     assert "no_such_provider" not in response.text
     # The foreign link stays redeemable for its owner: the page changes the presentation, never the decision.
     assert oauth_service.lookup_oauth_connect_token(provider, runtime_paths, connect_token) is not None
+
+
+def test_only_an_unknown_provider_gets_the_fixed_text_not_every_404(tmp_path: Path) -> None:
+    """The fixed "Unknown OAuth provider." text belongs to the provider lookup, so another 404 keeps its own message."""
+    runtime_paths = _runtime_paths(tmp_path)
+    api_app = _make_test_app(runtime_paths, _config_payload())
+    provider = _fake_provider()
+    elsewhere = HTTPException(status_code=404, detail="The agent for this connection no longer exists.")
+
+    with patch("mindroom.api.oauth.load_oauth_providers_for_snapshot", return_value={provider.id: provider}):
+        with TestClient(api_app) as client:
+            with (
+                patch("mindroom.api.oauth.pending_oauth_state_requires_browser_user", return_value=False),
+                patch("mindroom.api.oauth._complete_oauth_callback", side_effect=elsewhere),
+            ):
+                other = client.get(f"/api/oauth/{provider.id}/callback?code=test-code&state=any-state")
+            unknown = client.get("/api/oauth/no_such_provider/callback?code=test-code&state=any-state")
+
+    _expect_styled_oauth_page(other, status=404, message="The agent for this connection no longer exists.")
+    assert "Unknown OAuth provider." not in other.text
+    _expect_styled_oauth_page(unknown, status=404, message="Unknown OAuth provider.")
+    assert "no_such_provider" not in unknown.text
 
 
 def test_cancelled_authorization_page_says_so(tmp_path: Path) -> None:

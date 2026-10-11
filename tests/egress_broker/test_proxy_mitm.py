@@ -373,7 +373,7 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
     records = await audit_records(audit, 2)
     assert {record.path: (record.kind, record.status, record.service) for record in records} == {
         "/echo": ("request", 200, "svc"),
-        "/ok": ("denied", 403, None),
+        "/ok": ("denied", 403, "svc"),
     }
     assert {record.path: record.code for record in records} == {"/echo": None, "/ok": "path_not_allowed"}
 
@@ -416,9 +416,9 @@ async def test_user_restriction_refuses_operator_paths_in_tunnel(
     assert tls_upstream.hits == ["/echo"]
     assert broker.resolved == ["limited"]
     records = await audit_records(audit, 2)
-    assert {record.path: (record.kind, record.status, record.code) for record in records} == {
-        "/echo": ("request", 200, None),
-        "/ok": ("denied", 403, "path_not_allowed"),
+    assert {record.path: (record.kind, record.status, record.code, record.service) for record in records} == {
+        "/echo": ("request", 200, None, "limited"),
+        "/ok": ("denied", 403, "path_not_allowed", "limited"),
     }
 
 
@@ -561,6 +561,36 @@ async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
         "Only its credential managers (@alice:example.org) can add one, at manage_url.",
     }
     assert asked == [DEFAULT_CLAIMS]
+    assert tls_upstream.hits == []
+
+
+@pytest.mark.asyncio
+async def test_missing_secret_on_a_shared_agent_with_a_connect_link_offers_the_link(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+) -> None:
+    """When the lookup hands out a connect link, the shared agent's refusal offers it instead of naming managers."""
+    await broker(
+        _config(),
+        resolve_secret=lambda _claims, _service: SecretMissing(provider="github", connect_url=CONNECT_URL),
+        manage_url=lambda _claims: MANAGE_URL,
+        scope_info=lambda _claims: ScopeInfo(shared=True, managers=("@alice:example.org",)),
+    )
+    client = proxy_client(broker.token())
+
+    response = await client.get(tls_upstream.url("/echo"))
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": "credential_not_configured",
+        "service": "svc",
+        "manage_url": MANAGE_URL,
+        "provider": "github",
+        "connect_url": CONNECT_URL,
+        "message": "No svc credential is set for this agent. "
+        "Ask the user to connect it at connect_url or add a key at manage_url, then retry.",
+    }
     assert tls_upstream.hits == []
 
 

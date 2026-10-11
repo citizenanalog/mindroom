@@ -92,13 +92,12 @@ def test_each_refusal_code_has_its_spec_text(code: str, values: dict[str, object
     assert body["message"] == message
 
 
-def test_shared_agent_names_every_manager_and_wins_over_a_connect_link() -> None:
-    """A shared agent names its managers joined with ", ", even when a connect link would otherwise be offered."""
+def test_shared_agent_names_every_manager() -> None:
+    """A shared agent without a connect link names its managers, joined with ", "."""
     body = refusal_body(
         "credential_not_configured",
         service="openai",
         shared=True,
-        connectable=True,
         managers=("@alice:example.org", "@bob:example.org"),
     )
 
@@ -106,6 +105,24 @@ def test_shared_agent_names_every_manager_and_wins_over_a_connect_link() -> None
         "No openai key is set for this shared agent. "
         "Only its credential managers (@alice:example.org, @bob:example.org) can add one, at manage_url."
     )
+
+
+def test_shared_agent_with_a_connect_link_gets_the_connectable_text() -> None:
+    """A refusal that carries a connect link says so, even on a shared agent whose managers could be named."""
+    body = refusal_body(
+        "credential_not_configured",
+        service="github",
+        provider="github",
+        shared=True,
+        connectable=True,
+        managers=("@alice:example.org",),
+    )
+
+    assert body["message"] == (
+        "No github credential is set for this agent. "
+        "Ask the user to connect it at connect_url or add a key at manage_url, then retry."
+    )
+    assert "@alice:example.org" not in str(body)
 
 
 def test_shared_agent_without_managers_points_at_an_administrator() -> None:

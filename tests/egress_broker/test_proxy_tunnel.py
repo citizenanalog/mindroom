@@ -539,7 +539,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
     }
     assert http_upstream.hits == []
     [record] = await audit_records(audit, 1)
-    assert (record.kind, record.status, record.path, record.service) == ("denied", 403, "/echo", None)
+    assert (record.kind, record.status, record.path, record.service) == ("denied", 403, "/echo", "svc")
     assert record.code == "path_not_allowed"
 
 

@@ -922,6 +922,15 @@ def _is_connections_path(path: str) -> bool:
     return any(path == prefix or path.startswith(f"{prefix}/") for prefix in ("/connections", "/api/connections"))
 
 
+def is_administrator(matrix_user_id: object, snapshot: ApiSnapshot) -> bool:
+    """Return whether a signed Matrix user is a platform administrator in the snapshot's config."""
+    return (
+        isinstance(matrix_user_id, str)
+        and snapshot.runtime_config is not None
+        and is_platform_administrator(matrix_user_id, snapshot.runtime_config, snapshot.runtime_paths)
+    )
+
+
 def _require_connections_route_authorized(
     request: Request,
     auth_user: dict[str, Any],
@@ -937,12 +946,7 @@ def _require_connections_route_authorized(
     if len(parts) == 5 and parts[1:3] == ["api", "oauth"] and parts[3] and parts[4] in {"callback", "success", "reset"}:
         # These handlers independently validate their state or reset capability.
         return
-    matrix_user_id = auth_user.get("matrix_user_id")
-    if (
-        isinstance(matrix_user_id, str)
-        and snapshot.runtime_config is not None
-        and is_platform_administrator(matrix_user_id, snapshot.runtime_config, snapshot.runtime_paths)
-    ):
+    if is_administrator(auth_user.get("matrix_user_id"), snapshot):
         return
     if _is_browser_page_request(request):
         # A user who opens a dashboard page lands on their own page instead of a JSON refusal.

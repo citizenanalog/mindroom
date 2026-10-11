@@ -487,6 +487,29 @@ def test_oauth_and_connections_routes_are_untouched_by_the_html_redirect(
     assert "location" not in response.headers
 
 
+@pytest.mark.parametrize("portal_setting", [None, "", "   "])
+def test_html_get_without_the_portal_agent_keeps_dashboard_access(
+    portal_setting: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    connections_auth_client: Callable[..., TestClient],
+    signed_connections_headers: Callable[[str], dict[str, str]],
+) -> None:
+    """Without MINDROOM_CONNECTIONS_AGENT no route is restricted, so a signed user's page load is never redirected."""
+    (tmp_path / "index.html").write_text("administrator dashboard")
+    monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: tmp_path)
+    client = connections_auth_client(MINDROOM_CONNECTIONS_AGENT=portal_setting)
+    headers = {**signed_connections_headers("alice"), **_BROWSER_ACCEPT}
+
+    page = client.get("/", headers=headers, follow_redirects=False)
+    api = client.get("/api/config", headers=headers, follow_redirects=False)
+
+    assert (page.status_code, page.text) == (200, "administrator dashboard")
+    assert api.status_code == 200
+    assert "location" not in page.headers
+    assert "location" not in api.headers
+
+
 def test_administrator_and_connections_pages_are_not_redirected(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

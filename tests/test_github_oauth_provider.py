@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -57,7 +58,7 @@ def _answer_login_lookup(
     monkeypatch.setattr(
         github_oauth,
         "_login_lookup_client",
-        lambda: httpx.Client(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
     )
 
 
@@ -277,9 +278,73 @@ def _exchange(runtime_paths: RuntimePaths) -> object:
 def test_github_login_lookup_targets_the_user_api_with_a_five_second_timeout() -> None:
     assert GITHUB_USER_API_URL == "https://api.github.com/user"
     assert LOGIN_LOOKUP_TIMEOUT_SECONDS == 5.0
-    with _REAL_LOGIN_LOOKUP_CLIENT() as client:
+    client = _REAL_LOGIN_LOOKUP_CLIENT()
+    try:
+        assert isinstance(client, httpx.AsyncClient)
         assert client.timeout == httpx.Timeout(5.0)
         assert client.follow_redirects is False
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_github_login_lookup_gives_up_after_one_overall_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub that stays silent cannot stall the connection for longer than the deadline, each phase included."""
+    runtime_paths = _runtime_paths(tmp_path)
+    _save_client_config(runtime_paths)
+    monkeypatch.setattr(github_oauth, "LOGIN_LOOKUP_TIMEOUT_SECONDS", 0.2)
+
+    async def never_answers(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={"login": "octo"})
+
+    # Each phase timeout is far longer than the deadline, so only the overall deadline can end the lookup.
+    monkeypatch.setattr(
+        github_oauth,
+        "_login_lookup_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(never_answers), timeout=60),
+    )
+    started = time.monotonic()
+
+    result = _exchange(runtime_paths)
+
+    assert time.monotonic() - started < 5
+    assert result.token_data["token"] == "github-user-access"  # noqa: S105
+    assert result.claims == {}
+
+
+def test_a_claims_reader_that_raises_still_lets_the_account_connect(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reader is best effort by contract; one that raises anyway costs the label, never the connection."""
+    runtime_paths = _runtime_paths(tmp_path)
+    _save_client_config(runtime_paths)
+
+    def raises(token_data: object) -> dict[str, object]:
+        msg = f"secret {token_data}"
+        raise RuntimeError(msg)
+
+    provider = replace(_provider(), account_claims_reader=raises)
+    with patch(
+        "authlib.integrations.httpx_client.AsyncOAuth2Client.fetch_token",
+        new=AsyncMock(return_value=_TOKEN_RESPONSE),
+    ):
+        result = asyncio.run(
+            provider.exchange_code(
+                "authorization-code",
+                runtime_paths,
+                token_url=provider.token_url,
+                code_verifier="v" * 64,
+            ),
+        )
+
+    assert result.token_data["token"] == "github-user-access"  # noqa: S105
+    assert result.claims == {}
+    assert result.claims_verified is False
+    assert "github-user-access" not in caplog.text
 
 
 def test_github_exchange_reads_the_login_with_the_new_token(

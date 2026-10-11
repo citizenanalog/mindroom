@@ -17,9 +17,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from mindroom.api import config_lifecycle, main, oauth
+from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.matrix.state import MatrixState
 from mindroom.oauth import registry as oauth_registry
 from mindroom.oauth import service as oauth_service
+from mindroom.oauth.providers import OAuthProviderError
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from tests.api.test_api import (
     _trusted_upstream_jwks,
@@ -37,6 +39,9 @@ from tests.api.test_oauth_api import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from mindroom.constants import RuntimePaths
+    from mindroom.oauth.providers import OAuthProvider, OAuthRuntimeEndpoints
 
 
 @pytest.fixture
@@ -969,6 +974,29 @@ def test_catalog_says_whether_each_service_is_connected_for_the_viewer(portal: d
         headers=portal["headers"]["alice"],
     )
     assert status.json()["connected"] is True
+
+
+def test_catalog_never_bootstraps_an_oauth_client_to_read_connected_state(
+    portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reading connected state is a local read: a provider with no stored client reads as not connected, offline."""
+    bootstrapped: list[str] = []
+
+    async def failing_bootstrapper(provider: OAuthProvider, _runtime_paths: RuntimePaths) -> OAuthRuntimeEndpoints:
+        bootstrapped.append(provider.id)
+        msg = "bootstrap unavailable"
+        raise OAuthProviderError(msg)
+
+    provider = replace(portal["provider"], runtime_bootstrapper=failing_bootstrapper)
+    monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (provider,))
+    oauth_registry.clear_oauth_provider_cache()
+    get_runtime_credentials_manager(portal["paths"]).delete_credentials("test_drive_oauth_client")
+
+    for user in ("alice", "bob"):
+        assert _catalog_services(portal, user)["personal"]["connected"] is False
+
+    assert bootstrapped == []
 
 
 def test_catalog_shows_a_shared_account_as_connected_to_managers_and_to_users(shared_portal: dict[str, Any]) -> None:

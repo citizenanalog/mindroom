@@ -138,12 +138,16 @@ class OAuthStatusResponse(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
 
 
+class _UnknownOAuthProviderError(HTTPException):
+    """The provider in the URL is not registered; its detail repeats the URL text, which browser pages never show."""
+
+
 def _load_provider(request: Request, provider_id: str) -> tuple[OAuthProvider, RuntimePaths]:
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
     providers = load_oauth_providers_for_snapshot(snapshot)
     provider = providers.get(provider_id)
     if provider is None:
-        raise HTTPException(status_code=404, detail=f"Unknown OAuth provider: {provider_id}")
+        raise _UnknownOAuthProviderError(status_code=404, detail=f"Unknown OAuth provider: {provider_id}")
     return provider, snapshot.runtime_paths
 
 
@@ -652,10 +656,10 @@ def _oauth_browser_error_response(message: str, *, status_code: int, title: str 
 def _oauth_flow_error_response(exc: HTTPException) -> HTMLResponse:
     """Show a refusal of the browser's own OAuth step (authorize or callback) as a page for the popup.
 
-    A 404 means the provider in the URL is unknown, and the page never repeats text from the URL.
+    An unknown provider in the URL gets a fixed text, so the page never repeats text from the URL.
     """
     title = "OAuth connection changed" if exc.status_code == 409 else "Account connection failed"
-    message = "Unknown OAuth provider." if exc.status_code == 404 else str(exc.detail)
+    message = "Unknown OAuth provider." if isinstance(exc, _UnknownOAuthProviderError) else str(exc.detail)
     return _oauth_browser_error_response(message, status_code=exc.status_code, title=title)
 
 
@@ -1049,11 +1053,13 @@ async def authenticated_connection_status(
     *,
     agent_name: str | None,
     refresh: bool = True,
+    bootstrap_client: bool = True,
 ) -> OAuthStatusResponse:
     """Return scoped connection status for a request the caller has already authenticated.
 
     Callers that load several providers for one request authenticate once and call this per provider.
-    `refresh=False` skips the token refresh, as in `connection_status`.
+    `refresh=False` and `bootstrap_client=False` skip the token refresh and the OAuth client bootstrap, as in
+    `connection_status`.
     """
     provider, runtime_paths = _load_provider(request, provider_id)
     target = _resolve_oauth_credentials_target(
@@ -1062,7 +1068,7 @@ async def authenticated_connection_status(
         agent_name=agent_name,
     )
     context = _credential_context(provider, runtime_paths, target)
-    return await connection_status(request, context, refresh=refresh)
+    return await connection_status(request, context, refresh=refresh, bootstrap_client=bootstrap_client)
 
 
 @dataclass(frozen=True)
@@ -1097,10 +1103,13 @@ async def connection_status(
     context: OAuthCredentialContext,
     *,
     refresh: bool = True,
+    bootstrap_client: bool = True,
 ) -> OAuthStatusResponse:
     """Load connection state after the caller has authorized the credential target.
 
     `refresh=False` skips the token refresh, so a listing never waits on the provider's token endpoint.
+    `bootstrap_client=False` reads only the stored OAuth client and never bootstraps one over the network: `connected`
+    is the same (it uses the stored client either way), and `has_client_config` stays false until a client is stored.
     """
     provider, runtime_paths = context.provider, context.runtime_paths
     credential_status: OAuthCredentialsStatus = await load_oauth_credentials_status(context)
@@ -1108,7 +1117,7 @@ async def connection_status(
     has_service_account_config = oauth_provider_service_account_configured(provider, runtime_paths)
     client_config_resolution = (
         provider.client_config_resolution(runtime_paths)
-        if has_service_account_config
+        if has_service_account_config or not bootstrap_client
         else await _client_config_resolution_for_request(
             request,
             provider,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -23,34 +24,40 @@ LOGIN_LOOKUP_TIMEOUT_SECONDS = 5.0
 _GITHUB_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 
 
-def _login_lookup_client() -> httpx.Client:
+def _login_lookup_client() -> httpx.AsyncClient:
     """Build the client for the login lookup; it never follows a redirect, so the token goes to one URL only."""
-    return httpx.Client(timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS, follow_redirects=False)
+    return httpx.AsyncClient(timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS, follow_redirects=False)
+
+
+async def _fetch_login_payload(token: str) -> Any:  # noqa: ANN401
+    """Fetch the signed-in user's JSON, giving up when the whole exchange (not each phase) takes too long."""
+    async with asyncio.timeout(LOGIN_LOOKUP_TIMEOUT_SECONDS), _login_lookup_client() as client:
+        response = await client.get(
+            GITHUB_USER_API_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 def _github_account_claims(token_data: Mapping[str, Any]) -> dict[str, Any]:
     """Read the account login with the token a code exchange just returned, as `{"login": ...}`.
 
     GitHub's token response names no account, so the connection would show as just "Connected". The lookup is best
-    effort, with a short timeout: a failure logs only its type, never the token, and returns no claims, so the
-    account still connects and shows no label.
+    effort and has one overall deadline, `LOGIN_LOOKUP_TIMEOUT_SECONDS`, so a slow GitHub cannot stall the
+    callback: a failure logs only its type, never the token, and returns no claims, so the account still connects
+    and shows no label. It runs in a worker thread, which gives the lookup its own event loop.
     """
     token = token_data.get("token")
     if not isinstance(token, str) or not token:
         return {}
     try:
-        with _login_lookup_client() as client:
-            response = client.get(
-                GITHUB_USER_API_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-            )
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
+        payload = asyncio.run(_fetch_login_payload(token))
+    except (httpx.HTTPError, ValueError, TimeoutError) as exc:
         logger.warning("github_login_lookup_failed", error_type=type(exc).__name__)
         return {}
     login = payload.get("login") if isinstance(payload, dict) else None

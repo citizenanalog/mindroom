@@ -325,6 +325,15 @@ def test_restrict_to_rules_refuses_unmatched_paths() -> None:
     assert _route(config, "example.com", 443, "/user") == Route(host_has_rules=False)
 
 
+def test_a_path_not_allowed_route_must_name_its_restricting_service() -> None:
+    """Without `restricted_by` the refusal's message and audit row would lack the service, so such a route cannot exist."""
+    with pytest.raises(ValueError, match="names the service"):
+        Route(host_has_rules=True, refusal="path_not_allowed")
+    assert Route(host_has_rules=True, refusal="path_not_allowed", restricted_by="svc").refusal_status == 403
+    # Other routes need no restricting service.
+    assert Route(host_has_rules=True, refusal="bad_request").restricted_by is None
+
+
 def test_restrict_to_rules_refuses_graphql_unless_listed() -> None:
     """GraphQL can reach any repository the key can, so a restricted service refuses it unless a rule lists it."""
     assert _route(_github_repo_config(restrict=True), "api.github.com", 443, "/graphql").refusal == ("path_not_allowed")

@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict
 
 from mindroom.api import config_lifecycle, oauth
-from mindroom.api.auth import require_connections_user
+from mindroom.api.auth import is_administrator, require_connections_user
 from mindroom.api.connection_agents import (
     CONNECTIONS_HEADERS,
     ConnectionUserContext,
@@ -20,7 +20,6 @@ from mindroom.api.connection_agents import (
     resolve_connection_user,
 )
 from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
-from mindroom.authorization import is_platform_administrator
 from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.logging_config import get_logger
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
@@ -247,7 +246,9 @@ async def _service_connected(
     """Say whether the status route would report the service connected, without refreshing its token.
 
     It reads state the way that route does, so a viewer sees the same answer in the catalog and in the expanded row.
-    Any failure reads as not connected: one unreadable service must not fail the catalog.
+    It never bootstraps an OAuth client over the network, which every service of the catalog would otherwise attempt:
+    a provider with no stored client reads as not connected. Any failure also reads as not connected: one
+    unreadable service must not fail the catalog.
     """
     provider = context.providers[service.provider]
     try:
@@ -257,6 +258,7 @@ async def _service_connected(
                 request,
                 agent_name=agent_name,
                 refresh=False,
+                bootstrap_client=False,
             )
         else:
             agent = resolve_connection_agent(context.user, agent_name)
@@ -268,7 +270,12 @@ async def _service_connected(
                 execution_identity=agent.execution_identity,
                 config=agent.config,
             )
-            result = await oauth.connection_status(request, credential_context, refresh=False)
+            result = await oauth.connection_status(
+                request,
+                credential_context,
+                refresh=False,
+                bootstrap_client=False,
+            )
     except Exception as exc:
         logger.warning(
             "connection_catalog_status_unavailable",
@@ -296,8 +303,7 @@ async def me(request: Request, response: Response) -> ConnectionsIdentity:
     return ConnectionsIdentity(
         matrix_user_id=matrix_user_id,
         email=email if isinstance(email, str) and email else None,
-        is_administrator=snapshot.runtime_config is not None
-        and is_platform_administrator(matrix_user_id, snapshot.runtime_config, snapshot.runtime_paths),
+        is_administrator=is_administrator(matrix_user_id, snapshot),
     )
 
 
@@ -305,15 +311,15 @@ async def me(request: Request, response: Response) -> ConnectionsIdentity:
 async def catalog(request: Request, context: _ConnectionsContext) -> ConnectionsCatalog:
     """List allowed services with whether each is connected; the full status of an account is loaded per card.
 
-    `connected` on a service is read like the status route reads it, without refreshing the token, so the portal
-    can count connected accounts before a card is opened; a service whose state cannot be read counts as not
-    connected.
+    `connected` on a service is read like the status route reads it, without refreshing the token or bootstrapping an
+    OAuth client, so the portal can count connected accounts before a card is opened; a service whose state cannot be
+    read counts as not connected.
 
     Egress rows follow the personal egress API's eligibility rule, only agents the user may use, and carry the
     stored OAuth state of their services. That state is read only here, so status, connect and disconnect of other
     providers never depend on it, and one service whose state cannot be read is shown as not connectable. Reading it
-    skips the token refresh; resolving a provider's OAuth client can still bootstrap it over the network once when
-    none is stored.
+    skips the token refresh; resolving the OAuth client of an egress service's provider can still bootstrap it over
+    the network once when none is stored.
     """
     user = context.user
     memberships = config_lifecycle.app_state(request.app).agent_reply_memberships

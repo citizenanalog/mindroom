@@ -68,10 +68,10 @@ class ScopeInfo:
 
 
 def _template(code: str, *, path: str | None, managers: Sequence[str], shared: bool, connectable: bool) -> str:
-    if code == "credential_not_configured" and shared:
-        return _SHARED if managers else _SHARED_WITHOUT_MANAGERS
     if code == "credential_not_configured" and connectable:
         return _CONNECTABLE
+    if code == "credential_not_configured" and shared:
+        return _SHARED if managers else _SHARED_WITHOUT_MANAGERS
     if code == "bad_request" and path is None:
         return _MALFORMED
     try:
@@ -96,10 +96,10 @@ def refusal_body(
     """Return the JSON body for a refusal: its `error` code, `message`, `service` and `provider` when given, and `extra`.
 
     `host`, `path`, and `managers` only fill in the message; `path` is cut at its query, which could hold a secret.
-    For `credential_not_configured`, a `shared` scope names its `managers` (or an administrator when there are none),
-    and otherwise `connectable` offers connecting an account as well as adding a key. A `bad_request` with a `path` is
-    the ambiguous-path refusal; without one, the request itself was malformed. Raises ValueError for a code without a
-    text and KeyError when the text needs a value that was not given.
+    For `credential_not_configured`, `connectable` offers connecting an account as well as adding a key, and
+    otherwise a `shared` scope names its `managers` (or an administrator when there are none). A `bad_request` with
+    a `path` is the ambiguous-path refusal; without one, the request itself was malformed. Raises ValueError for a
+    code without a text and KeyError when the text needs a value that was not given.
     """
     template = _template(code, path=path, managers=managers or (), shared=shared, connectable=connectable)
     values = {

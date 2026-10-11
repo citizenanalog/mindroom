@@ -72,6 +72,12 @@ class Route:
     refusal: Literal["bad_request", "path_not_allowed"] | None = None
     restricted_by: str | None = None
 
+    def __post_init__(self) -> None:
+        """Refuse a `path_not_allowed` route that names no restricting service, which its message and audit row need."""
+        if self.refusal == "path_not_allowed" and self.restricted_by is None:
+            msg = "A path_not_allowed route names the service that restricts the host."
+            raise ValueError(msg)
+
     @property
     def refusal_status(self) -> int:
         """Return the HTTP status that goes with `refusal`; a route that is not refused has none."""

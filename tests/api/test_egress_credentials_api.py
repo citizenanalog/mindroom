@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,11 +15,12 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import jwt
 import pytest
+import yaml
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
-from mindroom.api import connections, egress_credentials, egress_status, main, oauth
+from mindroom.api import config_lifecycle, connections, egress_credentials, egress_status, main, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.main import Config
 from mindroom.credentials import get_runtime_credentials_manager
@@ -26,6 +28,7 @@ from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.oauth_source import Token, resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
+from mindroom.egress_broker.rules import EgressRules, route_request
 from mindroom.oauth import credential_store as oauth_credential_store
 from mindroom.oauth import github as github_oauth
 from mindroom.oauth import registry as oauth_registry
@@ -311,12 +314,55 @@ def test_agents_keep_config_order(egress_portal: dict[str, Any]) -> None:
     assert listed == ["shared_dev", "personal"]
     assert catalog == ["shared_dev", "personal"]
 
-    # Setting a key on the agent declared second, then on the first, never reorders either page.
-    for agent in ("personal", "shared_dev"):
-        put = client.put(f"/api/connections/egress/agents/{agent}/github", json={"secret": "k"}, headers=bob)
+    # Setting a key on the agent declared second, then on the first, never reorders either page. Alice sets her own
+    # personal key, so the key lands in the scope the pages read; Bob manages the shared agent.
+    for agent, setter in (("personal", alice), ("shared_dev", bob)):
+        put = client.put(f"/api/connections/egress/agents/{agent}/github", json={"secret": "k"}, headers=setter)
         assert put.status_code == 204, put.text
         assert _agent_rows(client.get("/api/connections/egress", headers=alice)) == listed
         assert _agent_rows(client.get("/api/connections", headers=alice)) == catalog
+    configured = {
+        agent["agent_name"]: next(service for service in agent["services"] if service["name"] == "github")["configured"]
+        for agent in client.get("/api/connections/egress", headers=alice).json()["agents"]
+    }
+    assert configured == {"shared_dev": True, "personal": True}
+
+
+def test_dashboard_config_save_keeps_the_authored_order(egress_portal: dict[str, Any]) -> None:
+    """Saving the config through the dashboard keeps agent and egress service order, which the pages and rules read."""
+    portal = egress_portal
+    client, paths = portal["client"], portal["paths"]
+    admin, alice = portal["headers"]["admin"], portal["headers"]["alice"]
+    payload = deepcopy(portal["payload"])
+    agents = payload["agents"]
+    payload["agents"] = {"shared_dev": agents["shared_dev"], **agents}
+    clashing_rule = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
+    # Declared against the alphabet, and both match the same request: the first declared must win.
+    payload["egress_broker"]["services"] = {
+        "zeta": clashing_rule,
+        "alpha": clashing_rule,
+        **payload["egress_broker"]["services"],
+    }
+    declared_services = list(payload["egress_broker"]["services"])
+
+    saved = client.put("/api/config/save", json=payload, headers=admin)
+    assert saved.status_code == 200, saved.text
+    # Read the file back, as a restart or reload does, so the order on disk is what the pages and rules see.
+    assert config_lifecycle.load_config_into_app(paths, main.app)
+
+    assert _agent_rows(client.get("/api/connections/egress", headers=alice)) == ["shared_dev", "personal"]
+    assert _agent_rows(client.get("/api/connections", headers=alice)) == ["shared_dev", "personal"]
+    on_disk = yaml.safe_load(paths.config_path.read_text(encoding="utf-8"))
+    assert list(on_disk["agents"]) == list(payload["agents"])
+    assert list(on_disk["egress_broker"]["services"]) == declared_services
+    route = route_request(
+        EgressRules.from_config(Config.validate_with_runtime(on_disk, paths).egress_broker),
+        "api.example.com",
+        443,
+        "/anything",
+    )
+    assert route.match is not None
+    assert route.match.service == "zeta"
 
 
 def test_requester_sets_own_user_agent_secret(egress_portal: dict[str, Any]) -> None:
@@ -815,7 +861,7 @@ def _use_real_github_provider(
     monkeypatch.setattr(
         github_oauth,
         "_login_lookup_client",
-        lambda: httpx.Client(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
     )
     return lookups
 

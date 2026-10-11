@@ -272,7 +272,11 @@ class Relay:
             return None
 
     async def refuse_route(self, client: Peer, entry: AuditEntry, route: Route) -> None:
-        """Answer and audit the refusal `route` decided for the entry's host and path; a failing link callback is a 502."""
+        """Answer and audit the refusal `route` decided for the entry's host and path; a failing link callback is a 502.
+
+        The audit row names the restricting service of a `path_not_allowed` refusal, as a matched rule's row does.
+        """
+        entry.service = route.restricted_by
         try:
             link = self.manage_url(entry.claims) if route.refusal == "path_not_allowed" else None
         except Exception as exc:
