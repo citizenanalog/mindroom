@@ -124,6 +124,21 @@ The rest require the primary runtime and cannot run in a worker (`claude_agent`,
 MindRoom logs a warning when an agent routes code-execution tools to a worker while primary-process tools stay unconfined, meaning unconfined tools or path tools under `file_access: unrestricted`, because those tools can then read runtime secrets the worker was meant to keep away.
 The model sees the effective file access and the unconfined tools in its tool execution environment description.
 
+## Connections portal sign-in
+
+This section holds the mechanics behind [Matrix sign-in from MindRoom Chat](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#matrix-sign-in-from-mindroom-chat).
+The portal asks the window that opened it for a Matrix OpenID token over `postMessage`, waiting up to 30 seconds.
+It then posts the token and the origin of Chat's message to `POST /api/connections/session`.
+MindRoom checks that origin against `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`.
+It verifies the token at the configured homeserver through `/_matrix/federation/v1/openid/userinfo` and accepts only users of that homeserver.
+When the homeserver advertises `io.mindroom.openid_audience`, MindRoom also sends the normalized origin of `MINDROOM_PUBLIC_URL`, and the homeserver accepts only a token that Chat requested for that origin.
+MindRoom then sets the `__Host-mindroom_connections_session` cookie.
+The cookie is `Secure`, `HttpOnly`, `SameSite=Lax`, and `Path=/`.
+The cookie is browser-wide, so a second sign-in in another tab replaces it.
+To keep a stale tab from acting as the new account, the portal sends the Matrix ID it rendered in the `X-MindRoom-Connections-User` header on every `/api/connections` request.
+MindRoom answers 401 when that header names a different account than the session.
+Requests without the header, such as OAuth popup navigations, still work.
+
 ## Known gaps
 
 These are tracked gaps, not intentional behaviors; fix them rather than documenting around them.

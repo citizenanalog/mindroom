@@ -150,15 +150,14 @@ MINDROOM_CONNECTIONS_ALLOWED_ORIGINS='["https://chat.example.org"]'
 
 Sign-in works as follows:
 
-1. Chat opens `/connections/` in a new window.
-2. The portal asks the window that opened it for a Matrix OpenID token over `postMessage`, waiting up to 30 seconds.
+1. In MindRoom Chat, the user opens **Connections** in Settings, General, which opens `/connections/` in a new window.
+2. The portal signs the user in with the account that Chat is signed in to, and shows `Signed in as <Matrix ID>`.
    It shows nothing until that succeeds and ignores any session the browser still holds, so the account signed in to Chat replaces another account's session in the same browser.
    When the portal is opened directly rather than from MindRoom Chat, as with trusted upstream sign-in, it uses the existing session or signed upstream identity, or asks the user to open Connections from Chat.
-3. The portal posts the token and the origin of Chat's message to `POST /api/connections/session`.
-4. MindRoom checks that origin against `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`, then verifies the token at the configured homeserver through `/_matrix/federation/v1/openid/userinfo`.
-   Only users of that homeserver are accepted.
-   When the homeserver advertises `io.mindroom.openid_audience` (MindRoom's Tuwunel fork), MindRoom also sends the normalized origin of `MINDROOM_PUBLIC_URL`, and the homeserver accepts only a token that Chat requested for that origin.
-5. MindRoom sets the `__Host-mindroom_connections_session` cookie, and the portal shows `Signed in as <Matrix ID>`.
+3. MindRoom accepts only users of its configured homeserver, and only from Chat origins in `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`.
+
+If two portal tabs are signed in as different accounts, the older tab refuses further requests and asks the user to reload.
+The request-by-request exchange is described in [Connections portal sign-in](https://docs.mindroom.chat/architecture/security-posture/#connections-portal-sign-in).
 
 With a binding homeserver, MindRoom requires `MINDROOM_PUBLIC_URL` and binds tokens to its normalized origin (lowercase scheme and host, no path, no default port).
 MindRoom never derives the audience from the request, because a replaying backend controls the `Host` header; without a valid `MINDROOM_PUBLIC_URL`, sign-in answers 503.
@@ -168,7 +167,7 @@ Roll out in this order: first MindRoom backends, then MindRoom Chat clients incl
 Older backends verify Computers tokens without an audience and would reject Chat's bound tokens with 401.
 Older Chat clients, including iOS app versions that are still in App Store review, send unbound tokens that a new backend rejects with 401 once the homeserver binds.
 
-The cookie is `Secure`, `HttpOnly`, `SameSite=Lax`, and `Path=/`, and the session lasts one hour.
+The session lasts one hour.
 Sessions live in MindRoom's memory, so a restart signs everyone out; opening Connections from Chat again signs the user in again.
 The portal shell at `/connections` is served without authentication while the portal is enabled, and every API route stays protected.
 
