@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 from mindroom.constants import resolve_runtime_paths
 from mindroom.egress_broker.env import (
@@ -14,7 +15,7 @@ from mindroom.egress_broker.env import (
 
 
 def test_broker_env_sets_proxy_with_token_userinfo(test_ca_pem: str) -> None:
-    """HTTPS_PROXY includes token as userinfo with empty password, git proxy entries present."""
+    """HTTPS_PROXY includes the token as userinfo with a fixed password, and the git proxy entries are present."""
     result = broker_execution_env(
         broker_url="http://host.docker.internal:8768",
         token="mrb1.eyJjbGFpbXMiOnsic2NvcGUiOiJ3b3JrZXItMSJ9LCJleHAiOjE3MDAwMDAwMDB9.abcdef",  # noqa: S106
@@ -23,9 +24,7 @@ def test_broker_env_sets_proxy_with_token_userinfo(test_ca_pem: str) -> None:
         extra_no_proxy_hosts=["example.com"],
     )
 
-    expected_proxy = (
-        "http://mrb1.eyJjbGFpbXMiOnsic2NvcGUiOiJ3b3JrZXItMSJ9LCJleHAiOjE3MDAwMDAwMDB9.abcdef:@host.docker.internal:8768"
-    )
+    expected_proxy = "http://mrb1.eyJjbGFpbXMiOnsic2NvcGUiOiJ3b3JrZXItMSJ9LCJleHAiOjE3MDAwMDAwMDB9.abcdef:mindroom@host.docker.internal:8768"
     assert result["HTTP_PROXY"] == expected_proxy
     assert result["HTTPS_PROXY"] == expected_proxy
     assert result["http_proxy"] == expected_proxy
@@ -37,6 +36,25 @@ def test_broker_env_sets_proxy_with_token_userinfo(test_ca_pem: str) -> None:
     git_config = {result[f"GIT_CONFIG_KEY_{i}"]: result[f"GIT_CONFIG_VALUE_{i}"] for i in range(git_count)}
     assert git_config["http.proxy"] == expected_proxy
     assert git_config["http.proxyAuthMethod"] == "basic"
+
+
+def test_proxy_url_carries_a_non_empty_password(test_ca_pem: str) -> None:
+    """The password is never empty: Python urllib and Node fetch send proxy credentials only when both parts are set.
+
+    The token stays the user name, percent-encoded, which is where the broker reads it.
+    """
+    token = "mrb1.e30.sig/+=:@"  # noqa: S105 - URL-significant characters must be quoted
+    result = broker_execution_env(
+        broker_url="http://broker:8768",
+        token=token,
+        ca_pem=test_ca_pem,
+        placeholder_env={},
+        extra_no_proxy_hosts=[],
+    )
+
+    assert result["HTTPS_PROXY"] == f"http://{quote(token, safe='')}:mindroom@broker:8768"
+    parts = urlsplit(result["HTTPS_PROXY"])
+    assert (unquote(parts.username or ""), parts.password) == (token, "mindroom")
 
 
 def test_no_proxy_includes_primary_callback_hosts(test_ca_pem: str) -> None:

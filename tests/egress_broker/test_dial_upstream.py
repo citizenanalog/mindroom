@@ -381,7 +381,7 @@ async def test_proxy_refusal_maps_to_502(broker: BrokerFactory, raw_proxy: RawPr
                 connect_request("example.com:443", authorization=proxy_authorization(broker.token())),
             )
     assert response.status == 502
-    assert response.json() == {"error": "upstream_unreachable"}
+    assert response.json() == {"error": "upstream_unreachable", "message": "example.com could not be reached."}
     assert operator.requests == [b"CONNECT 93.184.216.34:443 HTTP/1.1"]
 
 

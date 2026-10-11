@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import shutil
 import socket
 import time
+import urllib.request
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
+from mindroom.egress_broker.env import broker_execution_env
 from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.tokens import TokenSigner
 from tests.egress_broker.conftest import (
@@ -23,6 +28,7 @@ from tests.egress_broker.conftest import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+    from pathlib import Path
 
     import httpx
 
@@ -33,6 +39,30 @@ if TYPE_CHECKING:
 
     RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
     ProxyClient = Callable[..., httpx.AsyncClient]
+
+
+PROXY_AUTHENTICATION_REQUIRED = {
+    "error": "proxy_authentication_required",
+    "message": "The sandbox's proxy credentials are missing or expired. Start a new tool call.",
+}
+MALFORMED = {"error": "bad_request", "message": "The request is malformed and was refused."}
+BROKER_ERROR = {
+    "error": "broker_error",
+    "message": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
+}
+BODY_TOO_LARGE = {"error": "request_body_too_large", "message": "The request body is larger than the broker accepts."}
+LOCALHOST_BLOCKED = {
+    "error": "destination_blocked",
+    "message": "localhost resolves to a private or internal address, which agents may not reach.",
+}
+
+
+def _host_not_allowed(*services: str) -> dict[str, object]:
+    return {
+        "error": "host_not_allowed",
+        "services": list(services),
+        "message": "localhost is not allowed by the administrator's egress policy.",
+    }
 
 
 def _config(host: str, *, path_prefix: str = "/") -> EgressBrokerConfig:
@@ -59,6 +89,7 @@ async def test_missing_token_gets_407(broker: BrokerFactory, raw_proxy: RawProxy
     assert response.status == 407
     assert response.headers["proxy-authenticate"] == 'Basic realm="mindroom-egress-broker"'
     assert response.headers["connection"] == "close"
+    assert response.json() == PROXY_AUTHENTICATION_REQUIRED
 
 
 @pytest.mark.asyncio
@@ -81,6 +112,7 @@ async def test_bad_token_gets_407(broker: BrokerFactory, raw_proxy: RawProxy, cr
 
     assert response.status == 407
     assert "proxy-authenticate" in response.headers
+    assert response.json() == PROXY_AUTHENTICATION_REQUIRED
 
 
 @pytest.mark.asyncio
@@ -116,6 +148,65 @@ async def test_unmatched_host_is_blind_tunnel(
     assert "authorization" not in echoed["headers"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client", ["urllib", "curl"])
+async def test_python_urllib_and_curl_authenticate(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    upstream_ca: UpstreamCA,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client: str,
+) -> None:
+    """Clients configured only with the worker env's proxy URL reach a blind-tunnel host.
+
+    Python's urllib sends proxy credentials only when the URL has both a user name and a password, so it is the
+    client that fails if the broker env leaves the password empty.
+    """
+    started = await broker()
+    proxy_url = broker_execution_env(
+        broker_url=f"http://127.0.0.1:{started.port}",
+        token=broker.token(),
+        ca_pem=broker.ca.cert_pem,
+        placeholder_env={},
+        extra_no_proxy_hosts=[],
+    )["HTTPS_PROXY"]
+    url = tls_upstream.url("/echo")
+    if client == "urllib":
+        # urllib would skip the proxy for a host this process's own NO_PROXY lists.
+        for name in ("no_proxy", "NO_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"https": proxy_url}),
+            urllib.request.HTTPSHandler(context=upstream_ca.client_context()),
+        )
+
+        def fetch() -> bytes:
+            with opener.open(url, timeout=10) as response:
+                return response.read()
+
+        body = await asyncio.to_thread(fetch)
+    else:
+        if shutil.which("curl") is None:
+            pytest.skip("curl not installed")
+        ca_file = tmp_path / "upstream-ca.pem"
+        ca_file.write_text(upstream_ca.pem)
+        env = {name: value for name, value in os.environ.items() if not name.lower().endswith("_proxy")}
+        process = await asyncio.create_subprocess_exec(
+            *("curl", "-q", "-sS", "--fail", "--cacert", str(ca_file), url),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**env, "https_proxy": proxy_url},
+        )
+        async with asyncio.timeout(30):
+            body, stderr = await process.communicate()
+        assert process.returncode == 0, stderr.decode()
+
+    echoed = json.loads(body)
+    assert echoed["path"] == "/echo"
+    assert "proxy-authorization" not in echoed["headers"]
+
+
 def _with_user_services(operator: EgressBrokerConfig, **user: EgressService) -> EgressRules:
     """Return the operator's config merged with one scope's user services, as the broker builds them."""
     effective = operator.model_copy(update={"services": {**operator.services, **user}})
@@ -144,7 +235,7 @@ async def test_deny_ignores_user_rules_on_hosts_the_operator_does_not_name(
     )
     plain = await raw_proxy(started.port, _plain_get(http_upstream, "/echo", token))
 
-    denied = {"error": "host_not_allowed", "services": ["svc"]}
+    denied = _host_not_allowed("svc")
     assert (connect.status, connect.json()) == (403, denied)
     assert (plain.status, plain.json()) == (403, denied)
     assert broker.resolved == []
@@ -194,13 +285,23 @@ async def test_operator_restriction_refuses_paths_only_a_user_rule_lists(
     await broker(
         rules_provider=lambda _claims: _with_user_services(operator, mine=mine),
         secrets={"op": "operator-key", "mine": "user-key"},
+        manage_url=lambda _claims: "https://m.test/connections/egress",
     )
     client = proxy_client(broker.token())
 
     refused = await client.get(tls_upstream.url("/echo"))
     allowed = await client.get(tls_upstream.url("/ok"))
 
-    assert (refused.status_code, refused.json()) == (403, {"error": "path_not_allowed"})
+    assert (refused.status_code, refused.json()) == (
+        403,
+        {
+            "error": "path_not_allowed",
+            "service": "op",
+            "manage_url": "https://m.test/connections/egress",
+            "message": "localhost/echo is outside the paths op allows for this agent. "
+            "Ask the user to add it at manage_url if the agent needs it.",
+        },
+    )
     assert allowed.status_code == 200
     assert tls_upstream.hits == ["/ok"]
     assert broker.resolved == ["op"]
@@ -230,19 +331,23 @@ async def test_unmatched_host_denied_under_deny_policy(
     assert response.status == 403
     assert response.headers["content-type"] == "application/json"
     assert response.headers["connection"] == "close"
-    assert response.json() == {"error": "host_not_allowed", "services": ["github", "openai"]}
+    assert response.json() == _host_not_allowed("github", "openai")
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.host, record.method) == ("denied", 403, "localhost", "CONNECT")
     assert record.code == "host_not_allowed"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target", ["127.0.0.1:8766", "localhost:8766", "[::1]:8766"])
+@pytest.mark.parametrize(
+    ("target", "host"),
+    [("127.0.0.1:8766", "127.0.0.1"), ("localhost:8766", "localhost"), ("[::1]:8766", "::1")],
+)
 async def test_default_policy_blocks_loopback(
     broker_default_policy: EgressBroker,
     broker: BrokerFactory,
     raw_proxy: RawProxy,
     target: str,
+    host: str,
 ) -> None:
     """The dial guard refuses loopback tunnels, including bracketed IPv6 CONNECT targets."""
     response = await raw_proxy(
@@ -251,7 +356,10 @@ async def test_default_policy_blocks_loopback(
     )
 
     assert response.status == 403
-    assert response.json() == {"error": "destination_blocked"}
+    assert response.json() == {
+        "error": "destination_blocked",
+        "message": f"{host} resolves to a private or internal address, which agents may not reach.",
+    }
 
 
 @pytest.mark.asyncio
@@ -263,6 +371,7 @@ async def test_connect_without_valid_port_gets_400(broker: BrokerFactory, raw_pr
     response = await raw_proxy(started.port, connect_request(target, authorization=proxy_authorization(broker.token())))
 
     assert response.status == 400
+    assert response.json() == MALFORMED
 
 
 @pytest.mark.asyncio
@@ -282,7 +391,7 @@ async def test_unresolvable_connect_target_gets_502(broker: BrokerFactory, raw_p
         )
 
     assert response.status == 502
-    assert response.json() == {"error": "upstream_unreachable"}
+    assert response.json() == {"error": "upstream_unreachable", "message": "nonexistent.invalid could not be reached."}
 
 
 @pytest.mark.asyncio
@@ -316,7 +425,11 @@ async def test_plain_http_matched_rule_requires_tls(
     assert response.status_code == 403
     assert response.headers["content-type"] == "application/json"
     assert response.headers["connection"] == "close"
-    assert response.json() == {"error": "tls_required", "service": "svc"}
+    assert response.json() == {
+        "error": "tls_required",
+        "service": "svc",
+        "message": "Credentials are only added over HTTPS. Use https:// for localhost.",
+    }
     assert http_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.service, record.status, record.path) == ("denied", "svc", 403, "/echo")
@@ -366,7 +479,11 @@ async def test_plain_http_ambiguous_path_on_rule_host_gets_400(
     response = await raw_proxy(started.port, _plain_get(http_upstream, f"{target}?page=2", broker.token()))
 
     assert response.status == 400
-    assert response.json() == {"error": "bad_request"}
+    assert response.json() == {
+        "error": "bad_request",
+        "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) "
+        "and was refused. Use a plain path.",
+    }
     assert http_upstream.hits == []
     assert broker.resolved == []
     [record] = await audit_records(audit, 1)
@@ -404,13 +521,22 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
 ) -> None:
     """An unlisted path on a restricted host is refused over plain HTTP too, not forwarded without credentials."""
     rule = EgressRule(host="localhost", path_prefix="/private", auth=EgressAuth(type="bearer"))
-    await broker(EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}))
+    await broker(
+        EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}),
+        manage_url=lambda _claims: "https://m.test/connections/egress",
+    )
     client = proxy_client(broker.token())
 
     response = await client.get(http_upstream.url("/echo?page=2"))
 
     assert response.status_code == 403
-    assert response.json() == {"error": "path_not_allowed"}
+    assert response.json() == {
+        "error": "path_not_allowed",
+        "service": "svc",
+        "manage_url": "https://m.test/connections/egress",
+        "message": "localhost/echo is outside the paths svc allows for this agent. "
+        "Ask the user to add it at manage_url if the agent needs it.",
+    }
     assert http_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.path, record.service) == ("denied", 403, "/echo", None)
@@ -453,7 +579,7 @@ async def test_plain_http_denied_under_deny_policy(
     response = await client.get(http_upstream.url("/echo"))
 
     assert response.status_code == 403
-    assert response.json() == {"error": "host_not_allowed", "services": ["svc"]}
+    assert response.json() == _host_not_allowed("svc")
     assert http_upstream.hits == []
 
 
@@ -471,7 +597,7 @@ async def test_plain_http_blocked_destination(
     response = await client.get(http_upstream.url("/echo"))
 
     assert response.status_code == 403
-    assert response.json() == {"error": "destination_blocked"}
+    assert response.json() == LOCALHOST_BLOCKED
     assert http_upstream.hits == []
 
 
@@ -586,7 +712,7 @@ async def test_plain_http_streamed_body_over_limit_gets_413(
     response = await raw_proxy(started.port, request)
 
     assert response.status == 413
-    assert response.json() == {"error": "request_body_too_large"}
+    assert response.json() == BODY_TOO_LARGE
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status) == ("request", 413)
     assert record.code == "request_body_too_large"
@@ -620,8 +746,8 @@ async def test_rules_provider_failure_gets_502_and_listener_survives(
     first = await raw_proxy(started.port, request)
     second = await raw_proxy(started.port, request)
 
-    assert (first.status, first.json()) == (502, {"error": "broker_error"})
-    assert (second.status, second.json()) == (502, {"error": "broker_error"})
+    assert (first.status, first.json()) == (502, BROKER_ERROR)
+    assert (second.status, second.json()) == (502, BROKER_ERROR)
     records = await audit_records(audit, 2)
     assert {(record.kind, record.status) for record in records} == {
         ("tunnel" if transport == "connect" else "request", 502),
@@ -661,7 +787,7 @@ async def test_plain_http_body_over_limit_gets_413(
     response = await client.post(http_upstream.url("/upload"), content=b"x" * 2048)
 
     assert response.status_code == 413
-    assert response.json() == {"error": "request_body_too_large"}
+    assert response.json() == BODY_TOO_LARGE
     assert http_upstream.hits == []
 
 
@@ -681,7 +807,7 @@ async def test_plain_http_unreachable_upstream_gets_502(
     response = await client.get(f"http://localhost:{closed_port}/echo")
 
     assert response.status_code == 502
-    assert response.json() == {"error": "upstream_unreachable"}
+    assert response.json() == {"error": "upstream_unreachable", "message": "localhost could not be reached."}
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.path) == ("request", 502, "/echo")
     assert record.code == "upstream_unreachable"
@@ -724,7 +850,7 @@ async def test_malformed_request_does_not_break_listener(broker: BrokerFactory, 
     malformed = await raw_proxy(started.port, b"\x16\x03\x01 not http\r\n\r\n")
     following = await raw_proxy(started.port, connect_request("localhost:443"))
 
-    assert malformed.status == 400
+    assert (malformed.status, malformed.json()) == (400, MALFORMED)
     assert following.status == 407
 
 

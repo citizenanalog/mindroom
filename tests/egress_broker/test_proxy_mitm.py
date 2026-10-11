@@ -25,7 +25,9 @@ from structlog.testing import capture_logs
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.ca import materialize_ca_bundle
 from mindroom.egress_broker.dial import DialPolicy
+from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.mitm import _verifying_context
+from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretNeedsReconnect, SecretUnavailable
 from tests.egress_broker.conftest import (
     DEFAULT_CLAIMS,
@@ -51,6 +53,21 @@ MANAGE_URL = "https://m.test/connections/egress"
 CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
 SECRET = "s3cret"  # noqa: S105 - test credential the fake upstream expects
 _PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "git_askpass", "ssh_askpass"}
+MALFORMED = {"error": "bad_request", "message": "The request is malformed and was refused."}
+AMBIGUOUS_PATH = {
+    "error": "bad_request",
+    "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
+    "Use a plain path.",
+}
+BROKER_ERROR = {
+    "error": "broker_error",
+    "message": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
+}
+BODY_TOO_LARGE = {"error": "request_body_too_large", "message": "The request body is larger than the broker accepts."}
+LOCALHOST_UNREACHABLE = {"error": "upstream_unreachable", "message": "localhost could not be reached."}
+RECONNECT_MESSAGE = (
+    "The github account for svc must be connected again. Ask the user to reconnect at connect_url or manage_url."
+)
 
 
 def _config(
@@ -220,7 +237,10 @@ async def test_host_mismatch_is_refused(
 
     assert response.status_code == 403
     assert response.headers["connection"] == "close"
-    assert response.json() == {"error": "host_mismatch"}
+    assert response.json() == {
+        "error": "host_mismatch",
+        "message": "The Host header does not match the host this connection was opened for.",
+    }
     assert tls_upstream.hits == []
     assert broker.resolved == []
     [record] = await audit_records(audit, 1)
@@ -272,7 +292,7 @@ async def test_non_origin_form_target_is_refused(
         writer.transport.abort()
 
     assert response.status == 400
-    assert response.json() == {"error": "bad_request"}
+    assert response.json() == MALFORMED
     assert tls_upstream.hits == []
     assert broker.resolved == []
     [record] = await audit_records(audit, 1)
@@ -310,7 +330,7 @@ async def test_ambiguous_path_on_rule_host_is_refused(
 
     assert response.status == 400
     assert response.headers["connection"] == "close"
-    assert response.json() == {"error": "bad_request"}
+    assert response.json() == AMBIGUOUS_PATH
     assert tls_upstream.hits == []
     assert broker.resolved == []
     [record] = await audit_records(audit, 1)
@@ -330,6 +350,7 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
     await broker(
         EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}),
         secrets={"svc": SECRET},
+        manage_url=lambda _claims: MANAGE_URL,
     )
     client = proxy_client(broker.token())
 
@@ -340,7 +361,13 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
     assert allowed.json()["headers"]["authorization"] == [f"Bearer {SECRET}"]
     assert refused.status_code == 403
     assert refused.headers["connection"] == "close"
-    assert refused.json() == {"error": "path_not_allowed"}
+    assert refused.json() == {
+        "error": "path_not_allowed",
+        "service": "svc",
+        "manage_url": MANAGE_URL,
+        "message": "localhost/ok is outside the paths svc allows for this agent. "
+        "Ask the user to add it at manage_url if the agent needs it.",
+    }
     assert tls_upstream.hits == ["/echo"]
     assert broker.resolved == ["svc"]
     records = await audit_records(audit, 2)
@@ -349,6 +376,50 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
         "/ok": ("denied", 403, None),
     }
     assert {record.path: record.code for record in records} == {"/echo": None, "/ok": "path_not_allowed"}
+
+
+@pytest.mark.asyncio
+async def test_user_restriction_refuses_operator_paths_in_tunnel(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+    audit: AuditLog,
+) -> None:
+    """A user's limit also refuses paths the operator's broad service would cover, and says which service and where."""
+    operator = EgressBrokerConfig(
+        services={"op": EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])},
+    )
+    limited = EgressService(
+        restrict_to_rules=True,
+        rules=[EgressRule(host="localhost", path_prefix="/echo", auth=EgressAuth(type="bearer"))],
+    )
+    effective = operator.model_copy(update={"services": {**operator.services, "limited": limited}})
+    await broker(
+        rules_provider=lambda _claims: EgressRules(operator=operator, effective=effective),
+        secrets={"op": "operator-key", "limited": "user-key"},
+        manage_url=lambda _claims: MANAGE_URL,
+    )
+    client = proxy_client(broker.token())
+
+    allowed = await client.get(tls_upstream.url("/echo"))
+    refused = await client.get(tls_upstream.url("/ok?access_token=leaked"))
+
+    assert allowed.json()["headers"]["authorization"] == ["Bearer user-key"]
+    assert refused.status_code == 403
+    assert refused.json() == {
+        "error": "path_not_allowed",
+        "service": "limited",
+        "manage_url": MANAGE_URL,
+        "message": "localhost/ok is outside the paths limited allows for this agent. "
+        "Ask the user to add it at manage_url if the agent needs it.",
+    }
+    assert tls_upstream.hits == ["/echo"]
+    assert broker.resolved == ["limited"]
+    records = await audit_records(audit, 2)
+    assert {record.path: (record.kind, record.status, record.code) for record in records} == {
+        "/echo": ("request", 200, None),
+        "/ok": ("denied", 403, "path_not_allowed"),
+    }
 
 
 @pytest.mark.asyncio
@@ -417,7 +488,12 @@ async def test_missing_secret_returns_403_with_manage_url(
 
     assert response.status_code == 403
     assert response.headers["connection"] == "close"
-    assert response.json() == {"error": "credential_not_configured", "service": "svc", "manage_url": MANAGE_URL}
+    assert response.json() == {
+        "error": "credential_not_configured",
+        "service": "svc",
+        "manage_url": MANAGE_URL,
+        "message": "No svc key is set for this agent. Ask the user to add one at manage_url, then retry.",
+    }
     assert tls_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.service, record.path) == ("denied", 403, "svc", "/echo")
@@ -448,11 +524,44 @@ async def test_missing_secret_offers_oauth_connect_link(
         "manage_url": MANAGE_URL,
         "provider": "github",
         "connect_url": CONNECT_URL,
+        "message": "No svc credential is set for this agent. "
+        "Ask the user to connect it at connect_url or add a key at manage_url, then retry.",
     }
+    assert "one-time-token" not in str(response.json()["message"])
     assert tls_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.service) == ("denied", 403, "svc")
     assert record.code == "credential_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+) -> None:
+    """On a shared agent the refusal says that only its credential managers can add the key, and names them."""
+    asked: list[WorkerClaims] = []
+
+    def shared_scope(claims: WorkerClaims) -> ScopeInfo:
+        asked.append(claims)
+        return ScopeInfo(shared=True, managers=("@alice:example.org",))
+
+    await broker(_config(), manage_url=lambda _claims: MANAGE_URL, scope_info=shared_scope)
+    client = proxy_client(broker.token())
+
+    response = await client.get(tls_upstream.url("/echo?page=2"))
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": "credential_not_configured",
+        "service": "svc",
+        "manage_url": MANAGE_URL,
+        "message": "No svc key is set for this shared agent. "
+        "Only its credential managers (@alice:example.org) can add one, at manage_url.",
+    }
+    assert asked == [DEFAULT_CLAIMS]
+    assert tls_upstream.hits == []
 
 
 @pytest.mark.asyncio
@@ -461,7 +570,14 @@ async def test_missing_secret_offers_oauth_connect_link(
     [
         (
             SecretNeedsReconnect(provider="github", connect_url=CONNECT_URL),
-            {"error": "oauth_connection_required", "service": "svc", "provider": "github", "connect_url": CONNECT_URL},
+            {
+                "error": "oauth_connection_required",
+                "service": "svc",
+                "provider": "github",
+                "connect_url": CONNECT_URL,
+                "manage_url": MANAGE_URL,
+                "message": RECONNECT_MESSAGE,
+            },
         ),
         (
             SecretNeedsReconnect(provider="github", reset_required=True),
@@ -470,7 +586,9 @@ async def test_missing_secret_offers_oauth_connect_link(
                 "service": "svc",
                 "provider": "github",
                 "connect_url": None,
+                "manage_url": MANAGE_URL,
                 "reset_required": True,
+                "message": RECONNECT_MESSAGE,
             },
         ),
     ],
@@ -517,7 +635,14 @@ async def test_oauth_refresh_outage_gets_retryable_503(
     response = await client.get(tls_upstream.url("/echo"))
 
     assert response.status_code == 503
-    assert response.json() == {"error": "oauth_refresh_failed", "service": "svc", "provider": "github"}
+    assert response.json() == {
+        "error": "oauth_refresh_failed",
+        "service": "svc",
+        "provider": "github",
+        "manage_url": MANAGE_URL,
+        "message": "github did not refresh the account token. "
+        "Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url.",
+    }
     assert tls_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.service, record.path) == ("request", 503, "svc", "/echo")
@@ -548,7 +673,7 @@ async def test_resolve_secret_failure_gets_502_and_audit_row(
     response = await client.get(tls_upstream.url("/echo?page=2"))
     following = await client.get(tls_upstream.url("/echo"))
 
-    assert (response.status_code, response.json()) == (502, {"error": "broker_error"})
+    assert (response.status_code, response.json()) == (502, BROKER_ERROR)
     assert following.status_code == 502
     assert tls_upstream.hits == []
     records = await audit_records(audit, 2)
@@ -598,7 +723,7 @@ async def test_body_over_limit_gets_413(
     response = await client.post(tls_upstream.url("/upload"), content=b"x" * 2048)
 
     assert response.status_code == 413
-    assert response.json() == {"error": "request_body_too_large"}
+    assert response.json() == BODY_TOO_LARGE
     assert tls_upstream.hits == []
 
 
@@ -615,7 +740,7 @@ async def test_upstream_unreachable_gets_502(
     response = await client.get(f"https://localhost:{_closed_port()}/echo")
 
     assert response.status_code == 502
-    assert response.json() == {"error": "upstream_unreachable"}
+    assert response.json() == LOCALHOST_UNREACHABLE
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.path, record.service) == ("request", 502, "/echo", "svc")
     assert record.code == "upstream_unreachable"
@@ -641,7 +766,7 @@ async def test_untrusted_upstream_certificate_gets_502(broker: BrokerFactory, pr
         await upstream.wait_closed()
 
     assert response.status_code == 502
-    assert response.json() == {"error": "upstream_unreachable"}
+    assert response.json() == LOCALHOST_UNREACHABLE
     # The handshake failed before the upstream's handler ran, so not even a request head reached it.
     assert received == []
 
@@ -660,7 +785,10 @@ async def test_blocked_upstream_gets_403(
     response = await client.get(tls_upstream.url("/echo"))
 
     assert response.status_code == 403
-    assert response.json() == {"error": "destination_blocked"}
+    assert response.json() == {
+        "error": "destination_blocked",
+        "message": "localhost resolves to a private or internal address, which agents may not reach.",
+    }
     assert tls_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status) == ("denied", 403)
@@ -831,7 +959,11 @@ async def test_open_tunnel_follows_config_changes(
 
     assert first.json()["headers"]["authorization"] == [f"Bearer {SECRET}"]
     assert second.status_code == 403
-    assert second.json() == {"error": "host_not_allowed", "services": ["svc"]}
+    assert second.json() == {
+        "error": "host_not_allowed",
+        "services": ["svc"],
+        "message": "localhost is not allowed by the administrator's egress policy.",
+    }
     assert tls_upstream.hits == ["/echo"]
 
 
@@ -961,7 +1093,7 @@ async def test_bytes_sent_before_connect_answer_get_400(broker: BrokerFactory) -
         writer.transport.abort()
 
     assert response.status == 400
-    assert response.json() == {"error": "bad_request"}
+    assert response.json() == MALFORMED
     assert broker.resolved == []
 
 
@@ -1030,7 +1162,7 @@ async def test_secret_with_line_break_gets_502_without_leaking(
     with capture_logs() as logs:
         response = await client.get(tls_upstream.url("/echo"))
 
-    assert (response.status_code, response.json()) == (502, {"error": "broker_error"})
+    assert (response.status_code, response.json()) == (502, BROKER_ERROR)
     assert tls_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.service) == ("request", 502, "svc")
@@ -1127,6 +1259,10 @@ async def test_expired_token_stops_open_tunnel(
     assert second.status_code == 407
     assert second.headers["connection"] == "close"
     assert second.headers["proxy-authenticate"] == 'Basic realm="mindroom-egress-broker"'
+    assert second.json() == {
+        "error": "proxy_authentication_required",
+        "message": "The sandbox's proxy credentials are missing or expired. Start a new tool call.",
+    }
     assert tls_upstream.hits == ["/echo"]
     assert broker.resolved == ["svc"]
 
@@ -1170,7 +1306,7 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
         await upstream.wait_closed()
 
     assert response.status == 413
-    assert response.json() == {"error": "request_body_too_large"}
+    assert response.json() == BODY_TOO_LARGE
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.service) == ("request", 413, "svc")
 

@@ -23,6 +23,7 @@ from mindroom.egress_broker._relay import (
     upstream_request_headers,
 )
 from mindroom.egress_broker.dial import DialPolicy
+from mindroom.egress_broker.messages import ScopeInfo, refusal_body
 from mindroom.egress_broker.mitm import TlsInterceptor
 from mindroom.egress_broker.rules import host_not_allowed, route_request
 
@@ -35,13 +36,19 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.secrets import SecretResult
     from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 
-__all__ = ["EgressBroker", "ManageUrl", "RulesProvider", "SecretResolver"]
+__all__ = ["EgressBroker", "ManageUrl", "RulesProvider", "ScopeInfoProvider", "SecretResolver"]
 
 # Called in a thread with the verified requester's claims; returns the rules that requester's traffic matches.
 type RulesProvider = Callable[[WorkerClaims], EgressRules]
 # Awaited on the broker's loop: the resolver chooses which executor each blocking lookup runs on.
 type SecretResolver = Callable[[WorkerClaims, str], Awaitable[SecretResult]]
 type ManageUrl = Callable[[WorkerClaims], str | None]
+# Called on the broker's loop when a refusal says who can add a missing key.
+type ScopeInfoProvider = Callable[[WorkerClaims], ScopeInfo]
+
+
+def _personal_scope(_claims: WorkerClaims) -> ScopeInfo:
+    return ScopeInfo(shared=False, managers=())
 
 
 def _parse_port(text: str) -> int:
@@ -122,6 +129,7 @@ class EgressBroker:
         dial_policy: DialPolicy = DialPolicy(),  # noqa: B008 - frozen dataclass
         upstream_ssl_context: ssl.SSLContext | None = None,
         manage_url: ManageUrl = lambda _claims: None,
+        scope_info: ScopeInfoProvider = _personal_scope,
         max_body_bytes: int = 1 << 30,
         idle_timeout: float = 1800.0,
         head_timeout: float = 30.0,
@@ -131,6 +139,7 @@ class EgressBroker:
         self._relay = Relay(
             audit=audit,
             rules_provider=rules_provider,
+            manage_url=manage_url,
             dial_policy=dial_policy,
             max_body_bytes=max_body_bytes,
             idle_timeout=idle_timeout,
@@ -141,7 +150,7 @@ class EgressBroker:
             ca=ca,
             upstream_ssl_context=upstream_ssl_context,
             resolve_secret=resolve_secret,
-            manage_url=manage_url,
+            scope_info=scope_info,
         )
         self._server: asyncio.Server | None = None
         self._connections: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
@@ -211,10 +220,10 @@ class EgressBroker:
         try:
             host, port = _parse_connect_target(request.target)
         except ValueError:
-            await send_json(client, 400, {"error": "bad_request"})
+            await send_json(client, 400, refusal_body("bad_request"))
             return
         if not isinstance(await client.next_event(), h11.EndOfMessage):
-            await send_json(client, 400, {"error": "bad_request"})
+            await send_json(client, 400, refusal_body("bad_request"))
             return
         entry = AuditEntry(claims=claims, kind="tunnel", method="CONNECT", host=host, path="")
         rules = await self._relay.read_rules(client, entry)
@@ -224,7 +233,7 @@ class EgressBroker:
             await self._interceptor.intercept(client, token, claims, host, port)
             return
         if rules.unmatched_hosts == "deny":
-            await self._relay.deny(client, entry, host_not_allowed(rules))
+            await self._relay.deny(client, entry, host_not_allowed(rules, host))
             return
         await self._tunnel(client, entry, port)
 
@@ -251,7 +260,7 @@ class EgressBroker:
         try:
             host, port, authority, target = _parse_absolute_http(request.target)
         except ValueError:
-            await send_json(client, 400, {"error": "bad_request"})
+            await send_json(client, 400, refusal_body("bad_request"))
             return False
         path = target.split(b"?", 1)[0].decode("ascii")
         entry = AuditEntry(claims=claims, kind="request", method=request.method.decode("ascii"), host=host, path=path)
@@ -260,14 +269,14 @@ class EgressBroker:
             return False
         route = route_request(rules, host, port, path)
         if rules.unmatched_hosts == "deny" and not route.host_has_rules:
-            await self._relay.deny(client, entry, host_not_allowed(rules))
+            await self._relay.deny(client, entry, host_not_allowed(rules, host))
             return False
         if route.refusal is not None:
-            await self._relay.deny(client, entry, {"error": route.refusal}, status=route.refusal_status)
+            await self._relay.refuse_route(client, entry, route)
             return False
         if route.match is not None:
             entry.service = route.match.service
-            await self._relay.deny(client, entry, {"error": "tls_required", "service": route.match.service})
+            await self._relay.deny(client, entry, refusal_body("tls_required", host=host, service=route.match.service))
             return False
         headers = upstream_request_headers(list(request.headers), host=authority)
         upstream_request = h11.Request(method=request.method, target=target, headers=headers)

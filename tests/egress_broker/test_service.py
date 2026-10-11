@@ -73,6 +73,13 @@ _PUBLIC_URL = "https://chat.example.org"
 _OAUTH_REFRESH_TOKEN = "github-refresh"  # noqa: S105 - test credential
 # Provider ids a user service may name, as the API reads them from the registry.
 _PROVIDERS = frozenset({"github"})
+_NO_GITHUB_KEY = "No github key is set for this agent. Ask the user to add one at manage_url, then retry."
+_NO_SHARED_GITHUB_KEY = "No github key is set for this shared agent. Only an administrator can add one, at manage_url."
+_OPENAI_ONLY = {
+    "error": "host_not_allowed",
+    "services": ["openai"],
+    "message": "localhost is not allowed by the administrator's egress policy.",
+}
 
 
 @pytest.fixture
@@ -304,6 +311,7 @@ async def test_missing_secret_reports_manage_url(
         "error": "credential_not_configured",
         "service": "github",
         "manage_url": "https://chat.example.org/connections/egress",
+        "message": _NO_GITHUB_KEY,
     }
     assert tls_upstream.hits == []
 
@@ -361,7 +369,7 @@ async def test_last_good_config_survives_unreadable_config(
             state["mode"] = mode
             responses.append(await raw_proxy(port, connect))
     assert [(response.status, response.json()) for response in responses] == [
-        (403, {"error": "host_not_allowed", "services": ["openai"]}),
+        (403, _OPENAI_ONLY),
     ] * 3
     assert tls_upstream.hits == []
 
@@ -808,8 +816,63 @@ async def test_requester_scoped_oauth_is_not_used_where_requesters_share_a_worke
         "error": "credential_not_configured",
         "service": "github",
         "manage_url": f"{_PUBLIC_URL}/connections/egress",
+        "message": _NO_SHARED_GITHUB_KEY,
     }
     assert tls_upstream.hits == []
+
+
+@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
+@pytest.mark.parametrize(
+    ("scope", "managers", "message"),
+    [
+        (
+            "shared",
+            ["@alice:example.org", "@bob:example.org"],
+            "No github key is set for this shared agent. "
+            "Only its credential managers (@alice:example.org, @bob:example.org) can add one, at manage_url.",
+        ),
+        (
+            None,
+            [],
+            "No github key is set for this shared agent. Only an administrator can add one, at manage_url.",
+        ),
+        (
+            "user_agent",
+            ["@bob:example.org"],
+            "No github key is set for this agent. Ask the user to add one at manage_url, then retry.",
+        ),
+    ],
+    ids=["shared", "unscoped", "personal"],
+)
+@pytest.mark.asyncio
+async def test_missing_key_message_names_the_calling_agents_credential_managers(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    tls_upstream: Upstream,
+    tmp_path: Path,
+    scope: WorkerScope | None,
+    managers: list[str],
+    message: str,
+) -> None:
+    """The refusal reads the calling agent's credential managers from the config, and names them only when shared."""
+    runtime_paths = _oauth_runtime(tmp_runtime_paths)
+    config = Config(
+        agents={"code": {"display_name": "Code", "credential_managers": managers}},
+        egress_broker={"services": {"github": _GITHUB}},
+    )
+    target = _target(scope=scope)
+    if target.worker_key is None:
+        target = replace(target, worker_key="v1:local:unscoped:code")
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
+        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": "credential_not_configured",
+        "service": "github",
+        "manage_url": f"{_PUBLIC_URL}/connections/egress",
+        "message": message,
+    }
 
 
 @pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
@@ -859,6 +922,7 @@ async def test_requester_scoped_oauth_is_not_used_on_the_static_runner_without_t
         "error": "credential_not_configured",
         "service": "github",
         "manage_url": f"{_PUBLIC_URL}/connections/egress",
+        "message": _NO_GITHUB_KEY,
     }
     assert tls_upstream.hits == []
 
@@ -931,8 +995,12 @@ async def test_revoked_grant_returns_oauth_connection_required(
             response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
     body = response.json()
     assert response.status_code == 403
-    assert body.keys() == {"error", "service", "provider", "connect_url"}
+    assert body.keys() == {"error", "service", "provider", "connect_url", "manage_url", "message"}
     assert (body["error"], body["service"], body["provider"]) == ("oauth_connection_required", "github", "github")
+    assert body["manage_url"] == f"{_PUBLIC_URL}/connections/egress"
+    assert body["message"] == (
+        "The github account for github must be connected again. Ask the user to reconnect at connect_url or manage_url."
+    )
     assert body["connect_url"].startswith(f"{_PUBLIC_URL}/api/oauth/github/authorize?connect_token=")
     assert tls_upstream.hits == []
     for leaked in ("stale-oauth", _OAUTH_REFRESH_TOKEN):
@@ -958,8 +1026,12 @@ async def test_missing_connection_returns_connect_url(
         response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
     body = response.json()
     assert response.status_code == 403
-    assert body.keys() == {"error", "service", "manage_url", "provider", "connect_url"}
+    assert body.keys() == {"error", "service", "manage_url", "provider", "connect_url", "message"}
     assert (body["error"], body["service"], body["provider"]) == ("credential_not_configured", "github", "github")
+    assert body["message"] == (
+        "No github credential is set for this agent. "
+        "Ask the user to connect it at connect_url or add a key at manage_url, then retry."
+    )
     assert body["manage_url"] == f"{_PUBLIC_URL}/connections/egress"
     assert body["connect_url"].startswith(f"{_PUBLIC_URL}/api/oauth/github/authorize?connect_token=")
     assert tls_upstream.hits == []
@@ -1020,7 +1092,14 @@ async def test_provider_outage_is_a_retryable_503_off_the_shared_executor(
     assert keyed_response.json()["headers"]["authorization"] == ["Bearer s3cret"]
     for response in (*outage_responses, within_backoff):
         assert response.status_code == 503
-        assert response.json() == {"error": "oauth_refresh_failed", "service": "github", "provider": "github"}
+        assert response.json() == {
+            "error": "oauth_refresh_failed",
+            "service": "github",
+            "provider": "github",
+            "manage_url": f"{_PUBLIC_URL}/connections/egress",
+            "message": "github did not refresh the account token. "
+            "Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url.",
+        }
     assert presented == [_OAUTH_REFRESH_TOKEN]
     assert "/ok" not in tls_upstream.hits
     assert len(lookup_threads) == 3
@@ -1046,6 +1125,7 @@ async def test_unconnectable_provider_gives_the_plain_missing_credential_body(
         "error": "credential_not_configured",
         "service": "github",
         "manage_url": f"{_PUBLIC_URL}/connections/egress",
+        "message": _NO_GITHUB_KEY,
     }
 
 
@@ -1074,6 +1154,7 @@ async def test_shared_agent_scoped_provider_refusal_has_no_connect_link(
         "error": "credential_not_configured",
         "service": "drive",
         "manage_url": f"{_PUBLIC_URL}/connections/egress",
+        "message": "No drive key is set for this shared agent. Only an administrator can add one, at manage_url.",
     }
     assert private.status_code == 403
     assert private.json()["provider"] == drive.id
@@ -1223,7 +1304,7 @@ async def test_user_service_cannot_open_a_host_under_deny(
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         connect = connect_request(f"localhost:{tls_upstream.port}", authorization=proxy_authorization(_token(env)))
         response = await raw_proxy(port, connect)
-    assert (response.status, response.json()) == (403, {"error": "host_not_allowed", "services": ["openai"]})
+    assert (response.status, response.json()) == (403, _OPENAI_ONLY)
     assert tls_upstream.hits == []
 
 

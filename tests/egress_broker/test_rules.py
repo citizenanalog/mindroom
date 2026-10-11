@@ -318,7 +318,7 @@ def test_restrict_to_rules_refuses_unmatched_paths() -> None:
 
     for path in ["/repos/basnijholt/agent-cli-old", "/repos/basnijholt/other", "/user", "/"]:
         refused = _route(config, "api.github.com", 443, path)
-        assert refused == Route(host_has_rules=True, refusal="path_not_allowed")
+        assert refused == Route(host_has_rules=True, refusal="path_not_allowed", restricted_by="github")
         assert refused.refusal_status == 403
     allowed = _route(config, "api.github.com", 443, "/repos/basnijholt/agent-cli/issues")
     assert allowed.match is not None
@@ -434,19 +434,92 @@ def test_operator_restriction_is_decided_by_operator_rules_alone() -> None:
 
 
 def test_user_restriction_still_narrows_its_scope() -> None:
-    """A user service's own `restrict_to_rules` refuses unlisted paths on its host, even next to open operator rules."""
+    """A user service's own `restrict_to_rules` refuses unlisted paths on its host, operator rules' paths included."""
     rules = _merged(
         {"op": EgressService(rules=[_rule("api.example.com", "/op")])},
         {"mine": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/mine")])},
     )
 
-    assert route_request(rules, "api.example.com", 443, "/other").refusal == "path_not_allowed"
-    operator = route_request(rules, "api.example.com", 443, "/op/x")
+    for path in ["/other", "/op/x"]:
+        assert route_request(rules, "api.example.com", 443, path) == Route(
+            host_has_rules=True,
+            refusal="path_not_allowed",
+            restricted_by="mine",
+        )
+    mine = route_request(rules, "api.example.com", 443, "/mine/x")
+    assert mine.match is not None
+    assert mine.match.service == "mine"
+    operator_only = EgressRules.from_config(rules.operator)
+    assert route_request(operator_only, "api.example.com", 443, "/other") == Route(host_has_rules=True)
+    operator = route_request(operator_only, "api.example.com", 443, "/op/x")
     assert operator.match is not None
     assert operator.match.service == "op"
-    assert route_request(EgressRules.from_config(rules.operator), "api.example.com", 443, "/other") == Route(
-        host_has_rules=True,
+
+
+def test_user_restriction_narrows_operator_services_on_the_host() -> None:
+    """A user's repo limit also limits the operator's broad service on that host, for that requester only."""
+    operator = {"github": EgressService(rules=[_rule("api.github.com"), _rule("uploads.github.com")])}
+    limited = EgressService(restrict_to_rules=True, rules=[_rule("api.github.com", "/repos/o/a")])
+    rules = _merged(operator, {"github-limited": limited})
+
+    allowed = route_request(rules, "api.github.com", 443, "/repos/o/a/pulls")
+    assert allowed.match is not None
+    assert allowed.match.service == "github-limited"
+    for path in ["/repos/o/b", "/user", "/graphql"]:
+        assert route_request(rules, "api.github.com", 443, path) == Route(
+            host_has_rules=True,
+            refusal="path_not_allowed",
+            restricted_by="github-limited",
+        )
+    # Another requester on the same host has no user services: the operator's service still covers everything.
+    other = route_request(_merged(operator, {}), "api.github.com", 443, "/repos/o/b")
+    assert other.match is not None
+    assert other.match.service == "github"
+    assert other.refusal is None
+    # The limit holds on the hosts the user's rules name: the operator's other host is not limited.
+    elsewhere = route_request(rules, "uploads.github.com", 443, "/x")
+    assert elsewhere.match is not None
+    assert elsewhere.match.service == "github"
+
+
+def test_user_restriction_cannot_open_an_operator_restricted_path() -> None:
+    """Both restrictions apply: a user limit to `/` never opens what the operator's restriction leaves out."""
+    rules = _merged(
+        {"op": EgressService(restrict_to_rules=True, rules=[_rule("api.github.com", "/repos/o/")])},
+        {"mine": EgressService(restrict_to_rules=True, rules=[_rule("api.github.com")])},
     )
+
+    assert route_request(rules, "api.github.com", 443, "/user") == Route(
+        host_has_rules=True,
+        refusal="path_not_allowed",
+        restricted_by="op",
+    )
+    allowed = route_request(rules, "api.github.com", 443, "/repos/o/a")
+    assert allowed.match is not None
+    assert allowed.match.service == "op"
+
+
+def test_restricted_by_names_the_first_restricting_service_of_the_failing_party() -> None:
+    """The refusal names the first restricting service in declaration order whose party's check the path fails."""
+    rules = _merged(
+        {
+            "op-open": EgressService(rules=[_rule("api.example.com", "/op")]),
+            "op-first": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/a")]),
+            "op-second": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/b")]),
+        },
+        {
+            "mine-open": EgressService(rules=[_rule("api.example.com", "/a/open")]),
+            "mine-first": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/a/mine")]),
+        },
+    )
+
+    assert route_request(rules, "api.example.com", 443, "/c").restricted_by == "op-first"
+    assert route_request(rules, "api.example.com", 443, "/b").restricted_by == "mine-first"
+    assert route_request(rules, "api.example.com", 443, "/a/x").restricted_by == "mine-first"
+    for path, service in [("/a/open/x", "mine-open"), ("/a/mine/x", "mine-first")]:
+        route = route_request(rules, "api.example.com", 443, path)
+        assert route.match is not None
+        assert (route.match.service, route.restricted_by) == (service, None)
 
 
 @pytest.mark.parametrize(

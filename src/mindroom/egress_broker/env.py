@@ -18,6 +18,8 @@ __all__ = [
 ]
 
 BROKER_CA_PEM_ENV = "MINDROOM_EGRESS_BROKER_CA_PEM"
+# Not a secret: the broker ignores it. Clients that drop credentials with an empty password need a value here.
+_PROXY_PASSWORD = "mindroom"  # noqa: S105
 
 
 def broker_execution_env(
@@ -35,9 +37,12 @@ def broker_execution_env(
     NO_PROXY with callback hosts and extras, NODE_USE_ENV_PROXY=1, the broker
     CA PEM for runner-side materialization, and placeholder env vars.
 
-    The password is empty (token:@ userinfo format). `call_env` is the env the
-    call already carries: its Git config entries are kept and the broker's are
-    appended, so overlaying the result on it drops none of them.
+    The token is the user name and the password is the fixed `mindroom`
+    (`<token>:mindroom@`): Python urllib and Node fetch send proxy credentials
+    only when both parts are non-empty, and the broker reads only the user name.
+    `call_env` is the env the call already carries: its Git config entries are
+    kept and the broker's are appended, so overlaying the result on it drops
+    none of them.
     """
     # Import here to avoid circular dependency with constants
     from mindroom.constants import WORKER_EGRESS_NO_PROXY, compose_worker_proxy_env  # noqa: PLC0415
@@ -60,7 +65,7 @@ def broker_execution_env(
         call_env or {},
         proxy_url=broker_url,
         username=token,
-        password="",  # empty password
+        password=_PROXY_PASSWORD,
         ca_file=None,  # CA is handled separately via BROKER_CA_PEM_ENV
         no_proxy=no_proxy,
     )

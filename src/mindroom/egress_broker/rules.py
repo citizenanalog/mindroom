@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import re
+from collections.abc import Mapping  # noqa: TC003
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import quote, unquote, urlparse
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService  # noqa: TC001
+from mindroom.egress_broker.messages import refusal_body
 
 __all__ = [
     "EgressRules",
@@ -60,13 +62,15 @@ class Route:
 
     `match` names the rule whose service secret is injected. `refusal` is the error code when the request
     is refused instead: `bad_request` (400) for an ambiguous path, `path_not_allowed` (403) for a path that a
-    restricted host's rules do not list (see `route_request`). With neither, the request is forwarded without
-    credentials; when `host_has_rules` is false no applicable rule names the host, so `unmatched_hosts` decides.
+    restricted host's rules do not list (see `route_request`), and then `restricted_by` names the service whose
+    restriction refused it. With neither, the request is forwarded without credentials; when `host_has_rules` is
+    false no applicable rule names the host, so `unmatched_hosts` decides.
     """
 
     host_has_rules: bool
     match: RuleMatch | None = None
     refusal: Literal["bad_request", "path_not_allowed"] | None = None
+    restricted_by: str | None = None
 
     @property
     def refusal_status(self) -> int:
@@ -75,6 +79,15 @@ class Route:
             msg = "Route is not refused."
             raise ValueError(msg)
         return {"bad_request": 400, "path_not_allowed": 403}[self.refusal]
+
+    def refusal_body(self, *, host: str, path: str, manage_url: str | None) -> dict[str, object]:
+        """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it."""
+        if self.refusal is None:
+            msg = "Route is not refused."
+            raise ValueError(msg)
+        if self.refusal == "bad_request":
+            return refusal_body("bad_request", path=path)
+        return refusal_body("path_not_allowed", host=host, path=path, service=self.restricted_by, manage_url=manage_url)
 
 
 def _host_matches(rule_host: str, request_host: str) -> bool:
@@ -198,9 +211,9 @@ class EgressRules:
     """The rules one requester's traffic matches: the operator's config and its merge with the scope's own services.
 
     The scope's services can narrow operator policy, never widen it. Under `unmatched_hosts: deny` a user rule
-    applies only on hosts the operator's services name (`applicable`), and on a host where an operator service sets
-    `restrict_to_rules` only operator rules decide which paths are allowed (`route_request`). Top-level settings
-    come from the operator's config.
+    applies only on hosts the operator's services name (`applicable`). On a host where an operator service sets
+    `restrict_to_rules` a path must match an operator rule, and where one of the scope's services sets it the path
+    must also match one of the scope's rules (`route_request`). Top-level settings come from the operator's config.
     """
 
     operator: EgressBrokerConfig
@@ -239,10 +252,14 @@ def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> R
     3. Longest path_prefix wins
     4. Declaration order (across services and rules)
     """
-    host = host.lower()
+    return _best_match(config.services, host.lower(), port, path)
+
+
+def _best_match(services: Mapping[str, EgressService], host: str, port: int, path: str) -> RuleMatch | None:
+    """Return the most specific rule of `services` for a lowercase host, in `match_rule`'s priority order."""
     candidates: list[tuple[str, EgressRule, tuple[int, int, int]]] = [
         (service_name, rule, _rule_priority(rule, port))
-        for service_name, service in config.services.items()
+        for service_name, service in services.items()
         for rule in service.rules
         if _rule_applies(rule, host, port) and path_matches(rule.path_prefix, path)
     ]
@@ -258,44 +275,48 @@ def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> R
     return RuleMatch(service=service_name, rule=rule)
 
 
-def host_not_allowed(rules: EgressRules) -> dict[str, object]:
+def host_not_allowed(rules: EgressRules, host: str) -> dict[str, object]:
     """Return the 403 body for a host `deny` refuses; it lists the operator's services, whose hosts are reachable."""
-    return {"error": "host_not_allowed", "services": list(rules.operator.services)}
+    return refusal_body("host_not_allowed", host=host, services=list(rules.operator.services))
 
 
-def _services_on_host(config: EgressBrokerConfig, host: str, port: int) -> list[EgressService]:
-    return [
-        service
-        for service in config.services.values()
-        if any(_rule_applies(rule, host, port) for rule in service.rules)
-    ]
+def _restricting_service(services: Mapping[str, EgressService], host: str, port: int) -> str | None:
+    """Return the first service, in declaration order, that sets `restrict_to_rules` and has a rule for the host."""
+    return next(
+        (
+            name
+            for name, service in services.items()
+            if service.restrict_to_rules and any(_rule_applies(rule, host, port) for rule in service.rules)
+        ),
+        None,
+    )
 
 
 def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     """Decide how to handle a request for `path` (origin-form, query removed) on `host`:`port`.
 
     Hosts without applicable rules are left to `unmatched_hosts` whatever their path. On a host with rules,
-    an ambiguous path is refused before matching, so path tricks cannot select a different rule. Where an operator
-    service on the host sets `restrict_to_rules`, a path no operator rule lists is refused whatever user rules say.
-    Otherwise the most specific applicable rule, operator's or user's, picks the credential. A path no rule matches
-    is forwarded without credentials, unless any service with rules on the host restricts it, then it is refused.
+    an ambiguous path is refused before matching, so path tricks cannot select a different rule. Then the path must
+    pass each party's restriction: where an operator service on the host sets `restrict_to_rules` it must match an
+    operator rule, and where one of the requester's own services on the host sets it, it must match one of their
+    rules. So a user's limit narrows the operator's services on that host for that requester alone, and never opens
+    a path the operator's limit refuses. A refusal names the first restricting service of the party it failed.
+    A path that passes gets the most specific applicable rule, operator's or user's, or no credentials without one.
     """
     host = host.lower()
     config = rules.applicable(host, port)
-    services_on_host = _services_on_host(config, host, port)
-    if not services_on_host:
+    if not host_has_rules(config, host, port):
         return Route(host_has_rules=False)
     if is_ambiguous_path(path):
         return Route(host_has_rules=True, refusal="bad_request")
-    operator_restricts = any(service.restrict_to_rules for service in _services_on_host(rules.operator, host, port))
-    if operator_restricts and match_rule(rules.operator, host, port, path) is None:
-        return Route(host_has_rules=True, refusal="path_not_allowed")
-    match = match_rule(config, host, port, path)
-    if match is not None:
-        return Route(host_has_rules=True, match=match)
-    if any(service.restrict_to_rules for service in services_on_host):
-        return Route(host_has_rules=True, refusal="path_not_allowed")
-    return Route(host_has_rules=True)
+    operator = rules.operator.services
+    # A user service never takes an operator service's name, so the names tell the parties apart.
+    user = {name: service for name, service in config.services.items() if name not in operator}
+    for party in (operator, user):
+        restricted_by = _restricting_service(party, host, port)
+        if restricted_by is not None and _best_match(party, host, port, path) is None:
+            return Route(host_has_rules=True, refusal="path_not_allowed", restricted_by=restricted_by)
+    return Route(host_has_rules=True, match=_best_match(config.services, host, port, path))
 
 
 def _inject_query_param(target: bytes, param_name: str, template: str, secret: str) -> bytes:

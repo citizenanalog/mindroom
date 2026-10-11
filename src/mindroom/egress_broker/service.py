@@ -18,6 +18,7 @@ from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.ca import BrokerCA
 from mindroom.egress_broker.dial import DialPolicy
 from mindroom.egress_broker.env import broker_execution_env, primary_callback_hosts
+from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.oauth_source import (
     Missing,
     NeedsReconnect,
@@ -222,6 +223,16 @@ class _LastGoodConfig:
         effective = effective_config(operator, self._credentials_manager, claims.to_worker_target())
         return EgressRules(operator=operator, effective=effective)
 
+    def scope_info(self, claims: WorkerClaims) -> ScopeInfo:
+        """Return who can add a missing key for one requester: themselves, or a shared agent's credential managers.
+
+        `user` and `user_agent` scopes are personal; `shared` and unscoped agents are shared.
+        """
+        config = self.current()
+        agent = None if config is None else config.agents.get(claims.agent_name)
+        managers = () if agent is None else tuple(agent.credential_managers)
+        return ScopeInfo(shared=claims.worker_scope not in {"user", "user_agent"}, managers=managers)
+
 
 async def _resolve_secret(
     claims: WorkerClaims,
@@ -338,6 +349,7 @@ class _BrokerService:
             # None selects the broker's verifying context: system roots plus certifi.
             upstream_ssl_context=None,
             manage_url=lambda _claims: link,
+            scope_info=config.scope_info,
         )
         self._thread = threading.Thread(target=self._run, args=(broker,), name=_THREAD_NAME, daemon=True)
         self._thread.start()

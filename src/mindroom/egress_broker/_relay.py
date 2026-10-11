@@ -17,6 +17,7 @@ import h11
 
 from mindroom.egress_broker.audit import AuditRecord
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
+from mindroom.egress_broker.messages import refusal_body
 from mindroom.egress_broker.rules import strip_request_headers, strip_response_headers
 from mindroom.logging_config import get_logger
 
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from mindroom.egress_broker.audit import AuditLog
-    from mindroom.egress_broker.rules import EgressRules
+    from mindroom.egress_broker.rules import EgressRules, Route
     from mindroom.egress_broker.tokens import WorkerClaims
 
 __all__ = [
@@ -137,7 +138,7 @@ async def send_json(
 
 async def send_proxy_challenge(client: Peer) -> None:
     """Answer 407 with a Basic challenge: the proxy token is missing, invalid, or expired."""
-    await send_json(client, 407, {"error": "proxy_authentication_required"}, headers=(_PROXY_AUTHENTICATE,))
+    await send_json(client, 407, refusal_body("proxy_authentication_required"), headers=(_PROXY_AUTHENTICATE,))
 
 
 async def serve_peer(peer: Peer, serve_one: Callable[[Peer], Awaitable[bool]]) -> None:
@@ -147,7 +148,7 @@ async def serve_peer(peer: Peer, serve_one: Callable[[Peer], Awaitable[bool]]) -
             while await serve_one(peer):
                 peer.conn.start_next_cycle()
         except h11.RemoteProtocolError as exc:
-            await send_json(peer, exc.error_status_hint, {"error": "bad_request"})
+            await send_json(peer, exc.error_status_hint, refusal_body("bad_request"))
     except OSError as exc:
         # Peers disconnect and time out (TimeoutError is an OSError); exception text can echo header bytes.
         logger.debug("egress_broker_connection_failed", error_type=type(exc).__name__)
@@ -155,7 +156,7 @@ async def serve_peer(peer: Peer, serve_one: Callable[[Peer], Awaitable[bool]]) -
         # Anything else is a broker fault: it fails this connection only, never the listener.
         logger.warning("egress_broker_connection_error", error_type=type(exc).__name__)
         with contextlib.suppress(Exception):
-            await send_json(peer, 502, {"error": "broker_error"})
+            await send_json(peer, 502, refusal_body("broker_error"))
 
 
 async def close_stream(writer: asyncio.StreamWriter) -> None:
@@ -246,10 +247,14 @@ def _downstream_response_headers(
 
 @dataclass(frozen=True)
 class Relay:
-    """Per-request work both listener paths share: reading rules, dialing, streaming, answering, and auditing."""
+    """Per-request work both listener paths share: reading rules, dialing, streaming, answering, and auditing.
+
+    `manage_url` returns where the verified requester changes their egress keys and services, for refusal bodies.
+    """
 
     audit: AuditLog
     rules_provider: Callable[[WorkerClaims], EgressRules]
+    manage_url: Callable[[WorkerClaims], str | None]
     dial_policy: DialPolicy
     max_body_bytes: int
     idle_timeout: float
@@ -263,8 +268,19 @@ class Relay:
             return await asyncio.to_thread(self.rules_provider, entry.claims)
         except Exception as exc:
             logger.warning("egress_broker_config_unavailable", error_type=type(exc).__name__)
-            await self.reject(client, entry, 502, {"error": "broker_error"})
+            await self.reject(client, entry, 502, refusal_body("broker_error"))
             return None
+
+    async def refuse_route(self, client: Peer, entry: AuditEntry, route: Route) -> None:
+        """Answer and audit the refusal `route` decided for the entry's host and path; a failing link callback is a 502."""
+        try:
+            link = self.manage_url(entry.claims) if route.refusal == "path_not_allowed" else None
+        except Exception as exc:
+            logger.warning("egress_broker_manage_url_failed", error_type=type(exc).__name__)
+            await self.reject(client, entry, 502, refusal_body("broker_error"))
+            return
+        body = route.refusal_body(host=entry.host, path=entry.path, manage_url=link)
+        await self.deny(client, entry, body, status=route.refusal_status)
 
     async def open_upstream(
         self,
@@ -280,9 +296,9 @@ class Relay:
                 open_upstream(entry.host, port, policy=self.dial_policy, ssl_context=ssl_context),
             )
         except DestinationBlockedError:
-            await self.deny(client, entry, {"error": "destination_blocked"})
+            await self.deny(client, entry, refusal_body("destination_blocked", host=entry.host))
         except _RequestFailedError as exc:
-            await self.reject(client, entry, exc.status, {"error": exc.code})
+            await self.reject(client, entry, exc.status, refusal_body(exc.code, host=entry.host))
         else:
             return Peer(h11.Connection(h11.CLIENT), reader, writer, idle_timeout=self.idle_timeout)
         return None
@@ -292,7 +308,7 @@ class Relay:
         declared = next((int(value) for name, value in request.headers if name == b"content-length"), 0)
         if declared <= self.max_body_bytes:
             return False
-        await self.reject(client, entry, 413, {"error": "request_body_too_large"})
+        await self.reject(client, entry, 413, refusal_body("request_body_too_large"))
         return True
 
     async def deny(self, client: Peer, entry: AuditEntry, body: dict[str, object], *, status: int = 403) -> None:
@@ -385,7 +401,7 @@ class Relay:
             # A failure after the response head went out keeps that status; the client just sees the cut.
             entry.status = entry.status or exc.status
             entry.code = exc.code
-            await send_json(client, exc.status, {"error": exc.code})
+            await send_json(client, exc.status, refusal_body(exc.code, host=entry.host))
             return False
         finally:
             await self.record(entry)

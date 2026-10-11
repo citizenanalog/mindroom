@@ -21,6 +21,7 @@ from mindroom.egress_broker._relay import (
     serve_peer,
     upstream_request_headers,
 )
+from mindroom.egress_broker.messages import refusal_body
 from mindroom.egress_broker.rules import RuleMatch, host_not_allowed, inject_credentials, route_request
 from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretNeedsReconnect, SecretUnavailable
 from mindroom.logging_config import get_logger
@@ -28,7 +29,7 @@ from mindroom.logging_config import get_logger
 if TYPE_CHECKING:
     from mindroom.egress_broker._relay import Relay
     from mindroom.egress_broker.ca import BrokerCA
-    from mindroom.egress_broker.proxy import ManageUrl, SecretResolver
+    from mindroom.egress_broker.proxy import ScopeInfoProvider, SecretResolver
     from mindroom.egress_broker.rules import EgressRules, Route
     from mindroom.egress_broker.secrets import SecretResult
     from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
@@ -126,14 +127,14 @@ class TlsInterceptor:
         ca: BrokerCA,
         upstream_ssl_context: ssl.SSLContext | None,
         resolve_secret: SecretResolver,
-        manage_url: ManageUrl,
+        scope_info: ScopeInfoProvider,
     ) -> None:
         self._relay = relay
         self._signer = signer
         self._ca = ca
         self._upstream_ssl_context = upstream_ssl_context or _verifying_context()
         self._resolve_secret = resolve_secret
-        self._manage_url = manage_url
+        self._scope_info = scope_info
 
     async def intercept(self, client: Peer, token: str, claims: WorkerClaims, host: str, port: int) -> None:
         """Accept the CONNECT, complete TLS with a leaf for `host`, and serve requests until the tunnel closes."""
@@ -146,7 +147,7 @@ class TlsInterceptor:
         context = await asyncio.to_thread(self._ca.server_context, host)
         if client.conn.trailing_data[0]:
             # Bytes h11 already read past the CONNECT head cannot be handed to the TLS handshake.
-            await send_json(client, 400, {"error": "bad_request"})
+            await send_json(client, 400, refusal_body("bad_request"))
             return
         await client.send(h11.Response(status_code=200, reason=b"Connection Established", headers=[]))
         try:
@@ -219,11 +220,11 @@ class TlsInterceptor:
             return False
         if not origin_form:
             # Absolute, authority, and asterisk forms could name another destination; only the CONNECT target routes.
-            await self._relay.deny(client, entry, {"error": "bad_request"}, status=400)
+            await self._relay.deny(client, entry, refusal_body("bad_request"), status=400)
             return False
         if host_header is not None and _host_header_name(host_header) != tunnel.host:
             # Forwarding another Host to the same address is domain fronting: it could carry the secret elsewhere.
-            await self._relay.deny(client, entry, {"error": "host_mismatch"})
+            await self._relay.deny(client, entry, refusal_body("host_mismatch"))
             return False
         return True
 
@@ -240,10 +241,10 @@ class TlsInterceptor:
     ) -> h11.Request | None:
         """Return the request to send upstream, injected when a rule matches; otherwise answer, audit, and return None."""
         if not route.host_has_rules and rules.unmatched_hosts == "deny":
-            await self._relay.deny(client, entry, host_not_allowed(rules))
+            await self._relay.deny(client, entry, host_not_allowed(rules, tunnel.host))
             return None
         if route.refusal is not None:
-            await self._relay.deny(client, entry, {"error": route.refusal}, status=route.refusal_status)
+            await self._relay.refuse_route(client, entry, route)
             return None
         headers = upstream_request_headers(list(request.headers), host=host_header or tunnel.authority)
         if _is_websocket_upgrade(list(request.headers)):
@@ -258,7 +259,7 @@ class TlsInterceptor:
         injected = _injected_request(request, headers, match, secret)
         if injected is None:
             logger.warning("egress_broker_secret_unusable", service=match.service)
-            await self._relay.reject(client, entry, 502, {"error": "broker_error"})
+            await self._relay.reject(client, entry, 502, refusal_body("broker_error"))
         return injected
 
     async def _secret(self, client: Peer, entry: AuditEntry, service: str) -> str | None:
@@ -270,7 +271,7 @@ class TlsInterceptor:
             status, body = self._refusal(entry.claims, service, result)
         except Exception as exc:
             logger.warning("egress_broker_secret_lookup_failed", error_type=type(exc).__name__)
-            await self._relay.reject(client, entry, 502, {"error": "broker_error"})
+            await self._relay.reject(client, entry, 502, refusal_body("broker_error"))
             return None
         if status == 403:
             await self._relay.deny(client, entry, body)
@@ -279,28 +280,45 @@ class TlsInterceptor:
         return None
 
     def _refusal(self, claims: WorkerClaims, service: str, result: SecretResult) -> tuple[int, dict[str, object]]:
-        """Return the status and body for a lookup without a secret: retry later, reconnect, or set one."""
+        """Return the status and body for a lookup without a secret: retry later, reconnect, or set one.
+
+        Each body carries `manage_url`, which its message names, and a connect link only in `connect_url`.
+        """
+        manage_url = self._relay.manage_url(claims)
         if isinstance(result, SecretUnavailable):
             # The provider may recover, so this is a retryable failure, not a prompt to reconnect.
-            return 503, {"error": "oauth_refresh_failed", "service": service, "provider": result.provider}
+            return 503, refusal_body(
+                "oauth_refresh_failed",
+                service=service,
+                provider=result.provider,
+                manage_url=manage_url,
+            )
         if isinstance(result, SecretNeedsReconnect):
-            reconnect: dict[str, object] = {
-                "error": "oauth_connection_required",
-                "service": service,
-                "provider": result.provider,
-                "connect_url": result.connect_url,
-            }
+            reconnect = refusal_body(
+                "oauth_connection_required",
+                service=service,
+                provider=result.provider,
+                connect_url=result.connect_url,
+                manage_url=manage_url,
+            )
             if result.reset_required:
                 reconnect["reset_required"] = True
             return 403, reconnect
-        missing: dict[str, object] = {
-            "error": "credential_not_configured",
-            "service": service,
-            "manage_url": self._manage_url(claims),
-        }
-        if isinstance(result, SecretMissing) and result.provider is not None:
-            missing["provider"] = result.provider
-            missing["connect_url"] = result.connect_url
+        # No secret, or an empty one: the body also names the account the user can connect instead, if any.
+        provider = result.provider if isinstance(result, SecretMissing) else None
+        connect_url = result.connect_url if isinstance(result, SecretMissing) else None
+        scope = self._scope_info(claims)
+        missing = refusal_body(
+            "credential_not_configured",
+            service=service,
+            provider=provider,
+            managers=scope.managers,
+            shared=scope.shared,
+            connectable=provider is not None and connect_url is not None,
+            manage_url=manage_url,
+        )
+        if provider is not None:
+            missing["connect_url"] = connect_url
         return 403, missing
 
     async def _forward(

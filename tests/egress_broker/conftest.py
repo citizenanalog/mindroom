@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.egress_broker.audit import AuditRecord
+    from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.secrets import SecretResult
 
 DEFAULT_CLAIMS = WorkerClaims(
@@ -344,6 +345,7 @@ class BrokerFactory:
         resolve_secret: Callable[[WorkerClaims, str], SecretResult] | None = None,
         dial_policy: DialPolicy | None = None,
         manage_url: ManageUrl | None = None,
+        scope_info: Callable[[WorkerClaims], ScopeInfo] | None = None,
         max_body_bytes: int = 1 << 30,
         head_timeout: float = 30.0,
         rules_provider: Callable[[WorkerClaims], EgressBrokerConfig | EgressRules] | None = None,
@@ -353,6 +355,7 @@ class BrokerFactory:
         `resolve_secret` replaces the `secrets` lookup, and `rules_provider` replaces the fixed `config`,
         when a test needs a callback that changes, fails, or depends on the requester's claims. It returns a config,
         or `EgressRules` to add user services. Both are plain functions; the broker awaits the lookup.
+        Without `scope_info` the broker's default applies: a personal scope.
         """
         current = config or EgressBrokerConfig()
         provider = rules_provider or (lambda _claims: current)
@@ -381,6 +384,7 @@ class BrokerFactory:
             manage_url=manage_url or (lambda _claims: None),
             max_body_bytes=max_body_bytes,
             head_timeout=head_timeout,
+            **({} if scope_info is None else {"scope_info": scope_info}),
         )
         await broker.start("127.0.0.1", 0)
         self.brokers.append(broker)
