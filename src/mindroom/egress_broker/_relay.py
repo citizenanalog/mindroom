@@ -531,12 +531,39 @@ class Relay:
     ) -> bool:
         """Relay one request and its response, then audit it; return whether the client connection stays open.
 
-        After a protocol switch (101) the connection becomes a byte splice until either side closes.
+        Redirects are never followed. After a protocol switch (101) the connection becomes a byte splice until either
+        side closes.
         """
         try:
-            if await self._exchange(client, upstream, request, entry, strip_cookies=strip_cookies):
+            await _from_upstream(upstream.send(request))
+            if client.conn.they_are_waiting_for_100_continue:
+                await client.send(h11.InformationalResponse(status_code=100, headers=[]))
+            while isinstance(event := await client.next_event(), h11.Data):
+                entry.bytes_up += len(event.data)
+                if entry.bytes_up > self.max_body_bytes:
+                    raise _RequestFailedError(413, "request_body_too_large")  # noqa: TRY301 - answered below
+                await _from_upstream(upstream.send(event))
+            await _from_upstream(upstream.send(h11.EndOfMessage()))
+            response = await _from_upstream(_read_response(upstream))
+            entry.status = response.status_code
+            switched = isinstance(response, h11.InformationalResponse)
+            headers = _downstream_response_headers(
+                list(response.headers),
+                strip_cookies=strip_cookies,
+                keep_upgrade=switched,
+            )
+            if switched:
+                await client.send(h11.InformationalResponse(status_code=101, reason=response.reason, headers=headers))
                 await self.splice(client, upstream, entry)
                 return False
+            if client.close_after_response:
+                # h11 then ends the client connection after this response.
+                headers.append((b"connection", b"close"))
+            await client.send(h11.Response(status_code=response.status_code, reason=response.reason, headers=headers))
+            while isinstance(event := await _from_upstream(upstream.next_event()), h11.Data):
+                entry.bytes_down += len(event.data)
+                await client.send(event)
+            await client.send(h11.EndOfMessage())
         except _RequestFailedError as exc:
             # A failure after the response head went out keeps that status; the client just sees the cut.
             entry.status = entry.status or exc.status
@@ -546,43 +573,3 @@ class Relay:
         finally:
             await self.record(entry)
         return client.conn.our_state is h11.DONE and client.conn.their_state is h11.DONE
-
-    async def _exchange(
-        self,
-        client: Peer,
-        upstream: Peer,
-        request: h11.Request,
-        entry: AuditEntry,
-        *,
-        strip_cookies: bool,
-    ) -> bool:
-        """Send one request upstream and stream both bodies, never following redirects; return whether a 101 came back."""
-        await _from_upstream(upstream.send(request))
-        if client.conn.they_are_waiting_for_100_continue:
-            await client.send(h11.InformationalResponse(status_code=100, headers=[]))
-        while isinstance(event := await client.next_event(), h11.Data):
-            entry.bytes_up += len(event.data)
-            if entry.bytes_up > self.max_body_bytes:
-                raise _RequestFailedError(413, "request_body_too_large")
-            await _from_upstream(upstream.send(event))
-        await _from_upstream(upstream.send(h11.EndOfMessage()))
-        response = await _from_upstream(_read_response(upstream))
-        entry.status = response.status_code
-        switched = isinstance(response, h11.InformationalResponse)
-        headers = _downstream_response_headers(
-            list(response.headers),
-            strip_cookies=strip_cookies,
-            keep_upgrade=switched,
-        )
-        if switched:
-            await client.send(h11.InformationalResponse(status_code=101, reason=response.reason, headers=headers))
-            return True
-        if client.close_after_response:
-            # h11 then ends the client connection after this response.
-            headers.append((b"connection", b"close"))
-        await client.send(h11.Response(status_code=response.status_code, reason=response.reason, headers=headers))
-        while isinstance(event := await _from_upstream(upstream.next_event()), h11.Data):
-            entry.bytes_down += len(event.data)
-            await client.send(event)
-        await client.send(h11.EndOfMessage())
-        return False

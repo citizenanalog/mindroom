@@ -229,10 +229,7 @@ class EgressBroker:
         if rules.unmatched_hosts == "deny":
             await self._relay.deny(client, entry, host_not_allowed(rules, host))
             return
-        await self._tunnel(client, entry, port)
-
-    async def _tunnel(self, client: Peer, entry: AuditEntry, port: int) -> None:
-        """Relay raw bytes to an unmatched host without looking inside them."""
+        # A blind tunnel: raw bytes to an unmatched host, never looked inside.
         upstream = await self._relay.open_upstream(client, entry, port, ssl_context=None)
         if upstream is None:
             return
