@@ -1360,6 +1360,8 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
     mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
 
+    # The leading message is edited in place, so projections that track it by identity (approval receipts) still do.
+    assert messages[0] is legacy_system
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"
     assert [is_compaction_summary(message) for message in messages] == [False, True, False]
     assert messages[2] is prompt

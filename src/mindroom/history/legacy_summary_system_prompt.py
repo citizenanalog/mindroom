@@ -38,8 +38,7 @@ def system_message_embeds_summary(messages: Sequence[Message]) -> bool:
     return False
 
 
-def without_embedded_summary(message: Message) -> Message:
-    """Return a system or developer message with Agno's summary block removed."""
-    if not isinstance(message.content, str) or _LEGACY_SUMMARY_TAG not in message.content:
-        return message
-    return message.model_copy(update={"content": _LEGACY_SUMMARY_BLOCK.sub("", message.content)})
+def strip_embedded_summary(message: Message) -> None:
+    """Remove Agno's summary block from a system or developer message in place, keeping the message's identity."""
+    if isinstance(message.content, str) and _LEGACY_SUMMARY_TAG in message.content:
+        message.content = _LEGACY_SUMMARY_BLOCK.sub("", message.content)

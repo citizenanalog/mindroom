@@ -32,7 +32,7 @@ from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY
 from mindroom.helper_usage import get_helper_usage_owner
 from mindroom.history import archive
 from mindroom.history.agno_compat_message_builder import built_request_session
-from mindroom.history.legacy_summary_system_prompt import without_embedded_summary
+from mindroom.history.legacy_summary_system_prompt import strip_embedded_summary
 from mindroom.history.policy import context_budget_after_reserve
 from mindroom.history.replay import (
     HistorySummaryBudgetError,
@@ -675,7 +675,9 @@ def _summary_usage_recorder(
 
 def _rewrite(messages: list[Message], layout: _Layout, summary_message: Message) -> None:
     """Replace the folded history and the turn's exchanges with the summary, keeping the kept messages in order."""
-    leading = [without_embedded_summary(message) for message in messages[: layout.leading]]
+    leading = messages[: layout.leading]
+    for message in leading:
+        strip_embedded_summary(message)
     messages[:] = [*leading, summary_message, *layout.kept]
 
 
