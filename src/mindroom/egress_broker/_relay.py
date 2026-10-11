@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from mindroom.egress_broker.audit import AuditLog
+    from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.rules import EgressRules, Route
     from mindroom.egress_broker.tokens import WorkerClaims
 
@@ -271,12 +272,14 @@ def _downstream_response_headers(
 class Relay:
     """Per-request work both listener paths share: reading rules, dialing, streaming, answering, and auditing.
 
-    `manage_url` returns where the verified requester changes their egress keys and services, for refusal bodies.
+    `manage_url` returns where the verified requester changes their egress keys and services, and `scope_info` who
+    else can change them on a shared agent, for refusal bodies.
     """
 
     audit: AuditLog
     rules_provider: Callable[[WorkerClaims], EgressRules]
     manage_url: Callable[[WorkerClaims], str | None]
+    scope_info: Callable[[WorkerClaims], ScopeInfo]
     dial_policy: DialPolicy
     max_body_bytes: int
     idle_timeout: float
@@ -294,18 +297,19 @@ class Relay:
             return None
 
     async def refuse_route(self, client: Peer, entry: AuditEntry, route: Route) -> None:
-        """Answer and audit the refusal `route` decided for the entry's host and path; a failing link callback is a 502.
+        """Answer and audit the refusal `route` decided for the entry's host and path; a failing callback is a 502.
 
         The audit row names the restricting service of a `path_not_allowed` refusal, as a matched rule's row does.
         """
         entry.service = route.restricted_by
         try:
             link = self.manage_url(entry.claims) if route.refusal == "path_not_allowed" else None
+            scope = self.scope_info(entry.claims)
         except Exception as exc:
-            logger.warning("egress_broker_manage_url_failed", error_type=type(exc).__name__)
+            logger.warning("egress_broker_refusal_context_failed", error_type=type(exc).__name__)
             await self.reject(client, entry, 502, refusal_body("broker_error"))
             return
-        body = route.refusal_body(host=entry.host, path=entry.path, manage_url=link)
+        body = route.refusal_body(host=entry.host, path=entry.path, manage_url=link, scope=scope)
         await self.deny(client, entry, body, status=route.refusal_status)
 
     async def open_upstream(

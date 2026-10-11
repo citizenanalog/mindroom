@@ -423,6 +423,60 @@ async def test_user_restriction_refuses_operator_paths_in_tunnel(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("managers", "ending"),
+    [
+        (("@alice:example.org",), "Only its credential managers (@alice:example.org) can change this, at manage_url."),
+        ((), "Only an administrator can change this, at manage_url."),
+    ],
+)
+async def test_limit_in_place_on_a_shared_agent_keeps_the_operator_key_and_names_who_can_change_it(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+    audit: AuditLog,
+    managers: tuple[str, ...],
+    ending: str,
+) -> None:
+    """A restrict-only limit lets listed paths use the operator's key; others get a refusal naming its display name."""
+    operator = EgressBrokerConfig(
+        services={"op": EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])},
+    )
+    limited = EgressService(
+        restrict_only=True,
+        display_name="Local (echo)",
+        rules=[EgressRule(host="localhost", path_prefix="/echo")],
+    )
+    effective = operator.model_copy(update={"services": {**operator.services, "limited": limited}})
+    await broker(
+        rules_provider=lambda _claims: EgressRules(operator=operator, effective=effective),
+        secrets={"op": "operator-key", "limited": "never-sent"},
+        manage_url=lambda _claims: MANAGE_URL,
+        scope_info=lambda _claims: ScopeInfo(shared=True, managers=managers),
+    )
+    client = proxy_client(broker.token())
+
+    allowed = await client.get(tls_upstream.url("/echo"))
+    refused = await client.get(tls_upstream.url("/ok"))
+
+    assert allowed.json()["headers"]["authorization"] == ["Bearer operator-key"]
+    assert refused.status_code == 403
+    assert refused.json() == {
+        "error": "path_not_allowed",
+        "service": "limited",
+        "manage_url": MANAGE_URL,
+        "message": f"localhost/ok is outside the paths Local (echo) allows for this agent. {ending}",
+    }
+    assert tls_upstream.hits == ["/echo"]
+    assert broker.resolved == ["op"]
+    records = await audit_records(audit, 2)
+    assert {record.path: (record.kind, record.status, record.code, record.service) for record in records} == {
+        "/echo": ("request", 200, None, "op"),
+        "/ok": ("denied", 403, "path_not_allowed", "limited"),
+    }
+
+
+@pytest.mark.asyncio
 async def test_redirect_is_returned_not_followed(
     broker: BrokerFactory,
     tls_upstream: Upstream,

@@ -1661,13 +1661,20 @@
           "type": "string"
         },
         "auth": {
-          "$ref": "#/$defs/EgressAuth",
-          "description": "Authentication config for this rule"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EgressAuth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Authentication config for this rule; required unless the service is restrict_only, which ignores it"
         }
       },
       "required": [
-        "host",
-        "auth"
+        "host"
       ],
       "title": "EgressRule",
       "type": "object"
@@ -1750,6 +1757,12 @@
           "default": false,
           "description": "Refuse requests to this service's hosts whose path matches no rule of any service (403 path_not_allowed) instead of forwarding them without credentials. GraphQL (/graphql) is then refused unless a rule lists it; a listed GraphQL endpoint reaches everything the credential can. Presets never set this",
           "title": "Restrict To Rules",
+          "type": "boolean"
+        },
+        "restrict_only": {
+          "default": false,
+          "description": "Only limit paths: the rules take part in the path check like restrict_to_rules (which this implies), but never choose a credential, so an allowed path still uses the credential of the most specific other service on the host. Such a service has no key, OAuth login, or placeholders, its rules need no auth, and a preset contributes only its display_name, description, and rules. Presets never set this",
+          "title": "Restrict Only",
           "type": "boolean"
         }
       },

@@ -127,7 +127,10 @@ class EgressRule(BaseModel):
             "otherwise the exact path or that path followed by / (/repos/o/r never matches /repos/o/r-old)"
         ),
     )
-    auth: EgressAuth = Field(description="Authentication config for this rule")
+    auth: EgressAuth | None = Field(
+        default=None,
+        description="Authentication config for this rule; required unless the service is restrict_only, which ignores it",
+    )
 
     @field_validator("host")
     @classmethod
@@ -230,6 +233,20 @@ class EgressService(BaseModel):
             "Presets never set this"
         ),
     )
+    restrict_only: bool = Field(
+        default=False,
+        description=(
+            "Only limit paths: the rules take part in the path check like restrict_to_rules (which this implies), "
+            "but never choose a credential, so an allowed path still uses the credential of the most specific other "
+            "service on the host. Such a service has no key, OAuth login, or placeholders, its rules need no auth, "
+            "and a preset contributes only its display_name, description, and rules. Presets never set this"
+        ),
+    )
+
+    @property
+    def restricts_paths(self) -> bool:
+        """Return whether the service's party refuses paths none of its rules match on the service's hosts."""
+        return self.restrict_to_rules or self.restrict_only
 
     @model_validator(mode="wrap")
     @classmethod
@@ -240,32 +257,54 @@ class EgressService(BaseModel):
         so every existing validator runs on the resolved service.
         Afterwards only the authored fields stay in `model_fields_set`,
         so `Config.authored_model_dump()` keeps `{preset: github}` as written and later preset updates still apply.
+        A `restrict_only` service takes no login or placeholders from its preset, since it never sends a credential.
         """
         if not isinstance(data, dict):
-            return cls._require_rules(handler(data))
+            return cls._check_resolved(handler(data))
         authored = cast("dict[str, object]", data)
         name = authored.get("preset")
         if not isinstance(name, str):
-            return cls._require_rules(handler(data))
+            return cls._check_resolved(handler(data))
         preset = EGRESS_PRESETS.get(name)
         if preset is None:
             known = ", ".join(sorted(EGRESS_PRESETS))
             msg = f"unknown egress preset '{name}' (known presets: {known})"
             raise ValueError(msg)
         # Deep copy so validated models never alias the shared built-in table.
-        service = handler({**copy.deepcopy(preset), **authored})
+        defaults = copy.deepcopy(preset)
+        if authored.get("restrict_only") is True:
+            for credential_field in ("oauth_provider", "placeholder_env"):
+                defaults.pop(credential_field, None)
+        service = handler({**defaults, **authored})
         service.model_fields_set.difference_update(set(preset) - set(authored))
-        return cls._require_rules(service)
+        return cls._check_resolved(service)
 
     def authored_model_dump(self) -> dict[str, object]:
         """Serialize the service as authored: a preset stays `{preset: github}`, so later preset updates still apply."""
         return self.model_dump(mode="json", exclude_unset=True)
 
     @classmethod
-    def _require_rules(cls, service: EgressService) -> EgressService:
-        """Reject a service that resolves to no rules; the error path carries the service name."""
+    def _check_resolved(cls, service: EgressService) -> EgressService:
+        """Reject a resolved service without rules, or with credential settings that do not fit `restrict_only`.
+
+        A service that sends a credential needs `auth` on every rule. A `restrict_only` service never sends one, so it
+        may not set an OAuth login, placeholders, or `oauth_on_shared_workers`. The error path carries the service name.
+        """
         if not service.rules:
             msg = "service must define at least one rule (set `rules` or choose a `preset`)"
+            raise ValueError(msg)
+        if service.restrict_only:
+            if service.oauth_provider is not None:
+                msg = "a restrict_only service never sends a credential, so it cannot set oauth_provider"
+                raise ValueError(msg)
+            if service.placeholder_env:
+                msg = "a restrict_only service never sends a credential, so it cannot set placeholder_env"
+                raise ValueError(msg)
+            if service.oauth_on_shared_workers:
+                msg = "a restrict_only service never sends a credential, so it cannot set oauth_on_shared_workers"
+                raise ValueError(msg)
+        elif any(rule.auth is None for rule in service.rules):
+            msg = "every rule needs auth unless the service is restrict_only"
             raise ValueError(msg)
         return service
 

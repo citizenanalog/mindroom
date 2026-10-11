@@ -263,6 +263,28 @@ def test_lists_the_scopes_own_services_next_to_config_services(tmp_path: Path) -
     assert _statuses(bob) == {"github": False, "openai": False}
 
 
+def test_a_restrict_only_limit_is_not_listed_as_a_missing_credential(tmp_path: Path) -> None:
+    """A limit never takes a credential, so the agent is not told to ask for one; the service it limits stays listed."""
+    runtime_paths = _runtime_paths(tmp_path)
+    manager = get_runtime_credentials_manager(runtime_paths)
+    context = _context(runtime_paths)
+    limit = EgressService.model_validate(
+        {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}]},
+    )
+    save_user_service(
+        manager,
+        _target(),
+        "github-limited",
+        limit,
+        config_services=context.config.egress_broker.services,
+        oauth_providers=(),
+    )
+
+    payload = _list(EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()), context)
+
+    assert _statuses(payload) == {"github": False, "openai": False}
+
+
 def test_user_services_are_listed_without_config_services(tmp_path: Path) -> None:
     """With no operator services, the scope's own services are still listed instead of the no-services note."""
     runtime_paths = _runtime_paths(tmp_path)

@@ -18,6 +18,7 @@ from mindroom.api.connection_agents import (
     require_connections_same_origin,
 )
 from mindroom.api.egress_status import (
+    RESTRICT_ONLY_KEY_REFUSAL,
     AuditLogsResponse,
     EgressRuleSummary,
     EgressServiceSource,
@@ -77,7 +78,8 @@ class EgressCredentialService(EgressSourceStatus):
     scope through the services routes. `rules` says where the service applies (host, port, path prefix), so a client
     can tell which services overlap; it carries no auth settings. `placeholder_names` lists the variables the
     service sets in the sandbox (a preset's included), names only, so the editor can warn when a service of
-    one's own sets the same one.
+    one's own sets the same one. `restrict_only` marks a service that only limits the paths of the other services on
+    its hosts and never has a key or account of its own.
     """
 
     name: str
@@ -88,6 +90,7 @@ class EgressCredentialService(EgressSourceStatus):
     source: EgressServiceSource
     rules: list[EgressRuleSummary]
     placeholder_names: list[str]
+    restrict_only: bool
 
 
 class EgressInactiveService(BaseModel):
@@ -283,6 +286,7 @@ async def _build_service_for_agent(
         source=source,
         rules=rule_summaries(service),
         placeholder_names=list(service.placeholder_env),
+        restrict_only=service.restrict_only,
         **sources.model_dump(),
     )
 
@@ -563,16 +567,18 @@ def put_egress_secret(
     body: PutSecretRequest,
     requester_id: _EgressUser,
 ) -> None:
-    """Set or replace an egress service secret for one agent."""
+    """Set or replace an egress service secret for one agent; a `restrict_only` service takes no key (422)."""
     _require_same_origin(request)
 
-    agent, _service = _resolve_agent_and_service(
+    agent, egress_service = _resolve_agent_and_service(
         request,
         requester_id,
         agent_name,
         service,
         require_management=True,
     )
+    if egress_service.restrict_only:
+        raise _unprocessable(RESTRICT_ONLY_KEY_REFUSAL)
 
     manager = get_runtime_credentials_manager(agent.runtime_paths)
     try:

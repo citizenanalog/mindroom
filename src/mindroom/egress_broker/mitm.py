@@ -29,7 +29,7 @@ from mindroom.logging_config import get_logger
 if TYPE_CHECKING:
     from mindroom.egress_broker._relay import Relay
     from mindroom.egress_broker.ca import BrokerCA
-    from mindroom.egress_broker.proxy import ScopeInfoProvider, SecretResolver
+    from mindroom.egress_broker.proxy import SecretResolver
     from mindroom.egress_broker.rules import EgressRules, Route
     from mindroom.egress_broker.secrets import SecretResult
     from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
@@ -66,7 +66,7 @@ def _injected_request(
 ) -> h11.Request | None:
     """Build the upstream request with the secret injected; None when h11 refuses it, such as a secret with CR/LF."""
     try:
-        injected_headers, target = inject_credentials(headers, request.target, match.rule.auth, secret)
+        injected_headers, target = inject_credentials(headers, request.target, match.auth, secret)
         return h11.Request(method=request.method, target=target, headers=injected_headers)
     except h11.LocalProtocolError:
         # The error message can quote the offending header value, which may be the secret, so it is dropped here.
@@ -128,14 +128,12 @@ class TlsInterceptor:
         ca: BrokerCA,
         upstream_ssl_context: ssl.SSLContext | None,
         resolve_secret: SecretResolver,
-        scope_info: ScopeInfoProvider,
     ) -> None:
         self._relay = relay
         self._signer = signer
         self._ca = ca
         self._upstream_ssl_context = upstream_ssl_context or _verifying_context()
         self._resolve_secret = resolve_secret
-        self._scope_info = scope_info
 
     async def intercept(self, client: Peer, token: str, claims: WorkerClaims, host: str, port: int) -> None:
         """Accept the CONNECT, complete TLS with a leaf for `host`, and serve requests until the tunnel closes."""
@@ -308,7 +306,7 @@ class TlsInterceptor:
         # No secret, or an empty one: the body also names the account the user can connect instead, if any.
         provider = result.provider if isinstance(result, SecretMissing) else None
         connect_url = result.connect_url if isinstance(result, SecretMissing) else None
-        scope = self._scope_info(claims)
+        scope = self._relay.scope_info(claims)
         missing = refusal_body(
             "credential_not_configured",
             service=service,

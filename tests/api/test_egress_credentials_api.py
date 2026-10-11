@@ -29,6 +29,7 @@ from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.oauth_source import Token, resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import EgressRules, route_request
+from mindroom.egress_broker.user_services import effective_config
 from mindroom.oauth import credential_store as oauth_credential_store
 from mindroom.oauth import github as github_oauth
 from mindroom.oauth import registry as oauth_registry
@@ -1909,6 +1910,82 @@ def test_the_admin_panel_shows_a_shared_agents_user_services_read_only_and_keys_
     assert delete.status_code == 204, delete.text
     notes = next(s for s in _listed_services(portal, "alice", "shared_dev") if s["name"] == "notes")
     assert notes["key_configured"] is False
+
+
+def test_a_restrict_only_limit_is_saved_listed_and_never_takes_a_key(egress_portal: dict[str, Any]) -> None:
+    """A manager limits a shared agent's GitHub in place: the limit saves without auth or key and narrows the config row."""
+    portal = egress_portal
+    client, admin = portal["client"], portal["headers"]["admin"]
+    limit = {
+        "display_name": "GitHub (o/a)",
+        "restrict_only": True,
+        "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}],
+    }
+
+    saved = _put_service(portal, "bob", "shared_dev", "github-limited", limit)
+    assert saved.status_code == 204, saved.text
+    assert _get_service(portal, "bob", "shared_dev", "github-limited").json() == limit
+    rows = {service["name"]: service for service in _listed_services(portal, "alice", "shared_dev")}
+    assert rows["github-limited"]["restrict_only"] is True
+    assert rows["github-limited"]["configured"] is False
+    assert rows["github"]["restrict_only"] is False
+    panel = client.get("/api/egress-broker/services", params={"agent_name": "shared_dev"}, headers=admin)
+    assert {s["name"]: s["restrict_only"] for s in panel.json()["services"]} == {
+        "github": False,
+        "openai": False,
+        "github-limited": True,
+    }
+
+    # Neither page stores a key for it: the broker would never send one.
+    personal_put = portal["client"].put(
+        "/api/connections/egress/agents/shared_dev/github-limited",
+        json={"secret": "never-used"},
+        headers=portal["headers"]["bob"],
+    )
+    assert personal_put.status_code == 422
+    assert personal_put.json()["detail"] == egress_status.RESTRICT_ONLY_KEY_REFUSAL
+    admin_put = client.put(
+        "/api/egress-broker/services/github-limited/secret?agent_name=shared_dev",
+        json={"secret": "never-used"},
+        headers=admin,
+    )
+    assert admin_put.status_code == 422
+    assert admin_put.json()["detail"] == egress_status.RESTRICT_ONLY_KEY_REFUSAL
+    assert _stored_key(portal, "github-limited", "shared_dev") is None
+
+    # The scope's rules keep the config service's credential on the listed paths and refuse the rest.
+    manager = get_runtime_credentials_manager(portal["paths"])
+    config = Config.validate_with_runtime(portal["payload"], portal["paths"])
+    target = _scope_target(portal, "shared_dev")
+    rules = EgressRules(
+        operator=config.egress_broker,
+        effective=effective_config(config.egress_broker, manager, target),
+    )
+    allowed = route_request(rules, "api.github.com", 443, "/repos/o/a/pulls")
+    assert allowed.match is not None
+    assert allowed.match.service == "github"
+    assert route_request(rules, "api.github.com", 443, "/repos/o/b").restricted_by == "github-limited"
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({"oauth_provider": "github"}, "cannot set oauth_provider"),
+        ({"placeholder_env": {"GH_TOKEN": "mindroom-brokered"}}, "cannot set placeholder_env"),
+    ],
+)
+def test_a_restrict_only_service_with_credential_settings_is_422(
+    egress_portal: dict[str, Any],
+    extra: dict[str, Any],
+    message: str,
+) -> None:
+    """A login or placeholders on a limit are refused with the validator's message."""
+    body = {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}], **extra}
+
+    response = _put_service(egress_portal, "alice", "personal", "github-limited", body)
+
+    assert response.status_code == 422
+    assert message in response.json()["detail"]
 
 
 def test_user_services_are_loaded_off_the_event_loop(

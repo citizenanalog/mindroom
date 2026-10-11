@@ -7,11 +7,14 @@ import re
 import unicodedata
 from collections.abc import Mapping  # noqa: TC003
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote, unquote, urlparse
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService  # noqa: TC001
 from mindroom.egress_broker.messages import refusal_body
+
+if TYPE_CHECKING:
+    from mindroom.egress_broker.messages import ScopeInfo
 
 __all__ = [
     "EgressRules",
@@ -51,10 +54,18 @@ _SEGMENT_TAIL = re.compile(r"[;?#]")
 
 @dataclass(frozen=True)
 class RuleMatch:
-    """A matched rule with its service name."""
+    """A matched rule with its service name: the rule whose service's credential is injected."""
 
     service: str
     rule: EgressRule
+
+    @property
+    def auth(self) -> EgressAuth:
+        """Return how the credential is sent; a match never names a `restrict_only` rule, so its rule has auth."""
+        if self.rule.auth is None:
+            msg = f"Rule of service {self.service} has no auth to inject with."
+            raise ValueError(msg)
+        return self.rule.auth
 
 
 @dataclass(frozen=True)
@@ -64,14 +75,16 @@ class Route:
     `match` names the rule whose service secret is injected. `refusal` is the error code when the request
     is refused instead: `bad_request` (400) for an ambiguous path, `path_not_allowed` (403) for a path that a
     restricted host's rules do not list (see `route_request`), and then `restricted_by` names the service whose
-    restriction refused it. With neither, the request is forwarded without credentials; when `host_has_rules` is
-    false no applicable rule names the host, so `unmatched_hosts` decides.
+    restriction refused it and `restricted_by_label` its display name (its name without one), for the message.
+    With neither, the request is forwarded without credentials; when `host_has_rules` is false no applicable rule
+    names the host, so `unmatched_hosts` decides.
     """
 
     host_has_rules: bool
     match: RuleMatch | None = None
     refusal: Literal["bad_request", "path_not_allowed"] | None = None
     restricted_by: str | None = None
+    restricted_by_label: str | None = None
 
     def __post_init__(self) -> None:
         """Refuse a `path_not_allowed` route that names no restricting service, which its message and audit row need."""
@@ -87,14 +100,26 @@ class Route:
             raise ValueError(msg)
         return {"bad_request": 400, "path_not_allowed": 403}[self.refusal]
 
-    def refusal_body(self, *, host: str, path: str, manage_url: str | None) -> dict[str, object]:
-        """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it."""
+    def refusal_body(self, *, host: str, path: str, manage_url: str | None, scope: ScopeInfo) -> dict[str, object]:
+        """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it.
+
+        On a shared or unscoped agent (`scope`), its message names who can change the limit instead of the user.
+        """
         if self.refusal is None:
             msg = "Route is not refused."
             raise ValueError(msg)
         if self.refusal == "bad_request":
             return refusal_body("bad_request", path=path)
-        return refusal_body("path_not_allowed", host=host, path=path, service=self.restricted_by, manage_url=manage_url)
+        return refusal_body(
+            "path_not_allowed",
+            host=host,
+            path=path,
+            service=self.restricted_by,
+            service_label=self.restricted_by_label,
+            shared=scope.shared,
+            managers=scope.managers,
+            manage_url=manage_url,
+        )
 
 
 def _host_matches(rule_host: str, request_host: str) -> bool:
@@ -269,8 +294,15 @@ def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> R
     2. Port-specific rule beats no-port rule (different port never matches)
     3. Longest path_prefix wins
     4. Declaration order (across services and rules)
+
+    Rules of `restrict_only` services never match here: they only limit paths and have no credential.
     """
-    return _best_match(config.services, host.lower(), port, path)
+    return _best_match(_credential_services(config.services), host.lower(), port, path)
+
+
+def _credential_services(services: Mapping[str, EgressService]) -> dict[str, EgressService]:
+    """Return the services whose rules can choose a credential: every service but the `restrict_only` ones."""
+    return {name: service for name, service in services.items() if not service.restrict_only}
 
 
 def _best_match(services: Mapping[str, EgressService], host: str, port: int, path: str) -> RuleMatch | None:
@@ -299,12 +331,15 @@ def host_not_allowed(rules: EgressRules, host: str) -> dict[str, object]:
 
 
 def _restricting_service(services: Mapping[str, EgressService], host: str, port: int) -> str | None:
-    """Return the first service, in declaration order, that sets `restrict_to_rules` and has a rule for the host."""
+    """Return the first service, in declaration order, that restricts paths and has a rule for the host.
+
+    A service restricts paths with `restrict_to_rules` or `restrict_only`.
+    """
     return next(
         (
             name
             for name, service in services.items()
-            if service.restrict_to_rules and any(_rule_applies(rule, host, port) for rule in service.rules)
+            if service.restricts_paths and any(_rule_applies(rule, host, port) for rule in service.rules)
         ),
         None,
     )
@@ -320,6 +355,8 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     rules. So a user's limit narrows the operator's services on that host for that requester alone, and never opens
     a path the operator's limit refuses. A refusal names the first restricting service of the party it failed.
     A path that passes gets the most specific applicable rule, operator's or user's, or no credentials without one.
+    Rules of `restrict_only` services count in their party's check but never choose the credential, so a user's
+    limit in place keeps the operator's service, with the user's connection or key, for the paths it allows.
     """
     host = host.lower()
     config = rules.applicable(host, port)
@@ -333,8 +370,13 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     for party in (operator, user):
         restricted_by = _restricting_service(party, host, port)
         if restricted_by is not None and _best_match(party, host, port, path) is None:
-            return Route(host_has_rules=True, refusal="path_not_allowed", restricted_by=restricted_by)
-    return Route(host_has_rules=True, match=_best_match(config.services, host, port, path))
+            return Route(
+                host_has_rules=True,
+                refusal="path_not_allowed",
+                restricted_by=restricted_by,
+                restricted_by_label=party[restricted_by].display_name or restricted_by,
+            )
+    return Route(host_has_rules=True, match=_best_match(_credential_services(config.services), host, port, path))
 
 
 def _inject_query_param(target: bytes, param_name: str, template: str, secret: str) -> bytes:

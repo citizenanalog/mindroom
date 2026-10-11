@@ -17,6 +17,7 @@ from mindroom.api.credentials_target import (
     worker_target_for_credentials_target,
 )
 from mindroom.api.egress_status import (
+    RESTRICT_ONLY_KEY_REFUSAL,
     AuditLogsResponse,
     EgressRuleSummary,
     EgressServiceSource,
@@ -53,7 +54,8 @@ class _ServiceStatus(EgressSourceStatus):
     """Status of one egress service.
 
     `source` is `config` for the administrator's services and `user` for services the selected scope defines for
-    itself, which the panel shows read-only: they are edited on the personal egress page.
+    itself, which the panel shows read-only: they are edited on the personal egress page. `restrict_only` marks a
+    service that only limits the paths of the other services on its hosts and never has a key or account.
     """
 
     name: str
@@ -61,6 +63,7 @@ class _ServiceStatus(EgressSourceStatus):
     description: str
     source: EgressServiceSource
     rules: list[EgressRuleSummary]
+    restrict_only: bool
 
 
 class ServicesResponse(BaseModel):
@@ -164,6 +167,7 @@ async def _load_service_statuses_for_target(
                 description=service_config.description,
                 source=service_source(config, name),
                 rules=rule_summaries(service_config),
+                restrict_only=service_config.restrict_only,
                 **sources.model_dump(),
             ),
         )
@@ -175,8 +179,8 @@ def _resolve_scope_and_service(
     request: Request,
     name: str,
     agent_name: str | None,
-) -> tuple[RequestCredentialsTarget, ResolvedWorkerTarget | None]:
-    """Resolve the selected scope and check that the service is one it uses, a config service or its own."""
+) -> tuple[RequestCredentialsTarget, ResolvedWorkerTarget | None, EgressService]:
+    """Resolve the selected scope and the service, which must be one it uses: a config service or its own."""
     from mindroom.api import config_lifecycle  # noqa: PLC0415
 
     config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
@@ -188,9 +192,10 @@ def _resolve_scope_and_service(
         service_names=(),
     )
     worker_target = worker_target_for_credentials_target(target)
-    if name not in effective_services(config, target.base_manager, worker_target):
+    service = effective_services(config, target.base_manager, worker_target).get(name)
+    if service is None:
         raise HTTPException(status_code=404, detail=f"Service '{name}' is not configured")
-    return target, worker_target
+    return target, worker_target, service
 
 
 def _scope_worker_target(request: Request, agent_name: str | None) -> ResolvedWorkerTarget | None:
@@ -234,9 +239,11 @@ def put_service_secret(
     """Set an egress service secret.
 
     Raises 404 if the service is neither configured nor one of the selected scope's own services, 422 if the
-    secret is invalid.
+    secret is invalid or the service is `restrict_only`, which takes no key.
     """
-    target, worker_target = _resolve_scope_and_service(request, name, agent_name)
+    target, worker_target, service = _resolve_scope_and_service(request, name, agent_name)
+    if service.restrict_only:
+        raise HTTPException(status_code=422, detail=RESTRICT_ONLY_KEY_REFUSAL)
 
     try:
         save_secret(target.base_manager, worker_target, name, body.secret)
@@ -251,7 +258,7 @@ def delete_service_secret(
     agent_name: Annotated[str | None, Query()] = None,
 ) -> None:
     """Delete an egress service secret."""
-    target, worker_target = _resolve_scope_and_service(request, name, agent_name)
+    target, worker_target, _service = _resolve_scope_and_service(request, name, agent_name)
     delete_secret(target.base_manager, worker_target, name)
 
 

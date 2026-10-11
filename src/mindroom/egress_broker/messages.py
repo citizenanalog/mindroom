@@ -10,8 +10,9 @@ if TYPE_CHECKING:
 
 __all__ = ["ScopeInfo", "refusal_body"]
 
-# Texts from the design spec (section 12.5). They name only a service, provider, host, path without its query, or
-# manager IDs, never a secret, token, or connect link: the links travel in their own fields, which the texts name.
+# Texts from the design spec (sections 12.5 and 14). They name only a service, provider, host, path without its
+# query, or manager IDs, never a secret, token, or connect link: the links travel in their own fields, which the texts
+# name.
 _MESSAGES = {
     "credential_not_configured": "No {service} key is set for this agent. Ask the user to add one at manage_url, then retry.",
     "oauth_connection_required": (
@@ -51,6 +52,9 @@ _SHARED = (
 _SHARED_WITHOUT_MANAGERS = (
     "No {service} key is set for this shared agent. Only an administrator can add one, at manage_url."
 )
+_PATH_OUTSIDE = "{host}{path} is outside the paths {service} allows for this agent. "
+_PATH_SHARED = _PATH_OUTSIDE + "Only its credential managers ({managers}) can change this, at manage_url."
+_PATH_SHARED_WITHOUT_MANAGERS = _PATH_OUTSIDE + "Only an administrator can change this, at manage_url."
 # The spec words `bad_request` for the ambiguous-path refusal; a request the broker cannot read at all has no path.
 _MALFORMED = "The request is malformed and was refused."
 
@@ -72,6 +76,8 @@ def _template(code: str, *, path: str | None, managers: Sequence[str], shared: b
         return _CONNECTABLE
     if code == "credential_not_configured" and shared:
         return _SHARED if managers else _SHARED_WITHOUT_MANAGERS
+    if code == "path_not_allowed" and shared:
+        return _PATH_SHARED if managers else _PATH_SHARED_WITHOUT_MANAGERS
     if code == "bad_request" and path is None:
         return _MALFORMED
     try:
@@ -87,6 +93,7 @@ def refusal_body(
     host: str | None = None,
     path: str | None = None,
     service: str | None = None,
+    service_label: str | None = None,
     provider: str | None = None,
     managers: Sequence[str] | None = None,
     shared: bool = False,
@@ -95,17 +102,19 @@ def refusal_body(
 ) -> dict[str, object]:
     """Return the JSON body for a refusal: its `error` code, `message`, `service` and `provider` when given, and `extra`.
 
-    `host`, `path`, and `managers` only fill in the message; `path` is cut at its query, which could hold a secret.
+    `host`, `path`, `service_label`, and `managers` only fill in the message; `path` is cut at its query, which could
+    hold a secret, and `service_label` (a display name) names the service there instead of `service`.
     For `credential_not_configured`, `connectable` offers connecting an account as well as adding a key, and
-    otherwise a `shared` scope names its `managers` (or an administrator when there are none). A `bad_request` with
-    a `path` is the ambiguous-path refusal; without one, the request itself was malformed. Raises ValueError for a
-    code without a text and KeyError when the text needs a value that was not given.
+    otherwise a `shared` scope names its `managers` (or an administrator when there are none); a `shared`
+    `path_not_allowed` names them as the ones who can change the limit. A `bad_request` with a `path` is the
+    ambiguous-path refusal; without one, the request itself was malformed. Raises ValueError for a code without a
+    text and KeyError when the text needs a value that was not given.
     """
     template = _template(code, path=path, managers=managers or (), shared=shared, connectable=connectable)
     values = {
         "host": host,
         "path": None if path is None else path.split("?", 1)[0],
-        "service": service,
+        "service": service_label or service,
         "provider": provider,
         "managers": ", ".join(managers or ()),
     }

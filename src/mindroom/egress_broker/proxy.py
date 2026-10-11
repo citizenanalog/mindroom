@@ -43,7 +43,7 @@ type RulesProvider = Callable[[WorkerClaims], EgressRules]
 # Awaited on the broker's loop: the resolver chooses which executor each blocking lookup runs on.
 type SecretResolver = Callable[[WorkerClaims, str], Awaitable[SecretResult]]
 type ManageUrl = Callable[[WorkerClaims], str | None]
-# Called on the broker's loop when a refusal says who can add a missing key.
+# Called on the broker's loop when a refusal says who can add a missing key or change a path limit.
 type ScopeInfoProvider = Callable[[WorkerClaims], ScopeInfo]
 
 
@@ -140,6 +140,7 @@ class EgressBroker:
             audit=audit,
             rules_provider=rules_provider,
             manage_url=manage_url,
+            scope_info=scope_info,
             dial_policy=dial_policy,
             max_body_bytes=max_body_bytes,
             idle_timeout=idle_timeout,
@@ -150,7 +151,6 @@ class EgressBroker:
             ca=ca,
             upstream_ssl_context=upstream_ssl_context,
             resolve_secret=resolve_secret,
-            scope_info=scope_info,
         )
         self._server: asyncio.Server | None = None
         self._connections: dict[asyncio.Task[None], asyncio.StreamWriter] = {}

@@ -135,6 +135,30 @@ def test_shared_agent_without_managers_points_at_an_administrator() -> None:
         )
 
 
+def test_path_not_allowed_names_the_display_name_and_on_shared_agents_who_can_change_it() -> None:
+    """The limit's display name names it; a shared agent's refusal names its managers, or an administrator."""
+    values = {"host": "api.github.com", "path": "/repos/o/b", "service": "github-limited"}
+    outside = "api.github.com/repos/o/b is outside the paths GitHub (o/a) allows for this agent. "
+
+    personal = refusal_body("path_not_allowed", service_label="GitHub (o/a)", **values)
+    shared = refusal_body(
+        "path_not_allowed",
+        service_label="GitHub (o/a)",
+        shared=True,
+        managers=("@alice:example.org", "@bob:example.org"),
+        **values,
+    )
+    unmanaged = refusal_body("path_not_allowed", service_label="GitHub (o/a)", shared=True, **values)
+
+    assert personal["message"] == outside + "Ask the user to add it at manage_url if the agent needs it."
+    assert shared["message"] == (
+        outside + "Only its credential managers (@alice:example.org, @bob:example.org) can change this, at manage_url."
+    )
+    assert unmanaged["message"] == outside + "Only an administrator can change this, at manage_url."
+    # The machine-readable field keeps the service name.
+    assert {personal["service"], shared["service"], unmanaged["service"]} == {"github-limited"}
+
+
 def test_path_in_a_message_never_includes_the_query() -> None:
     """A query can hold a secret the client sent, so the message names the path without it."""
     body = refusal_body(

@@ -249,3 +249,70 @@ def test_restrict_to_rules_survives_the_authored_dump() -> None:
 
     assert dumped == {"services": {"github": {"preset": "github", "restrict_to_rules": True}}}
     assert Config(**config.authored_model_dump()).egress_broker.services["github"].restrict_to_rules is True
+
+
+def test_restrict_only_implies_restriction_and_needs_no_auth_on_its_rules() -> None:
+    """A restrict-only service limits paths like `restrict_to_rules` and has no credential, so its rules need no auth."""
+    service = EgressService.model_validate(
+        {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r"}]},
+    )
+
+    assert service.restricts_paths is True
+    assert service.restrict_to_rules is False
+    assert service.rules[0].auth is None
+    assert service.authored_model_dump() == {
+        "restrict_only": True,
+        "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r"}],
+    }
+    assert EgressService.model_validate({"preset": "github"}).restricts_paths is False
+    assert all("restrict_only" not in preset for preset in EGRESS_PRESETS.values())
+
+
+def test_a_service_that_sends_a_credential_needs_auth_on_every_rule() -> None:
+    """Only a restrict-only service may leave out a rule's auth: any other one would not know how to send its key."""
+    with pytest.raises(ValidationError, match="every rule needs auth unless the service is restrict_only"):
+        EgressService.model_validate(
+            {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}, {"host": "uploads.example.com"}]},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("oauth_provider", "github"),
+        ("placeholder_env", {"GH_TOKEN": "mindroom-brokered"}),
+        ("oauth_on_shared_workers", True),
+    ],
+)
+def test_restrict_only_refuses_credential_settings(field: str, value: object) -> None:
+    """A restrict-only service never sends a credential, so a login, placeholders, or the shared opt-in are refused."""
+    with pytest.raises(
+        ValidationError,
+        match=f"a restrict_only service never sends a credential, so it cannot set {field}",
+    ):
+        EgressService.model_validate(
+            {"restrict_only": True, "rules": [{"host": "api.github.com", "auth": {"type": "bearer"}}], field: value},
+        )
+
+
+def test_restrict_only_keeps_a_presets_rules_and_names_but_not_its_login_or_placeholders() -> None:
+    """With a preset, a restrict-only service takes its hosts and names; the login and placeholders stay with the preset."""
+    service = EgressService.model_validate(
+        {
+            "preset": "github",
+            "restrict_only": True,
+            "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r", "auth": {"type": "bearer"}}],
+        },
+    )
+
+    assert service.display_name == "GitHub"
+    assert service.oauth_provider is None
+    assert service.placeholder_env == {}
+    assert service.authored_model_dump() == {
+        "preset": "github",
+        "restrict_only": True,
+        "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r", "auth": {"type": "bearer"}}],
+    }
+    # An authored login is still refused: only the preset's own is dropped.
+    with pytest.raises(ValidationError, match="cannot set oauth_provider"):
+        EgressService.model_validate({"preset": "github", "restrict_only": True, "oauth_provider": "github"})

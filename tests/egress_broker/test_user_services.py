@@ -414,6 +414,34 @@ def test_restrict_to_rules_on_a_user_service_applies_only_to_its_scope(manager: 
     assert route_request(bob, "api.example.com", 443, "/repos/bob/y").host_has_rules is False
 
 
+def test_a_restrict_only_limit_is_saved_and_narrows_the_config_service_in_its_scope(
+    manager: CredentialsManager,
+) -> None:
+    """Saving a limit takes the usual limits; in its scope the config service keeps the credential for listed paths."""
+    limit = EgressService.model_validate(
+        {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/alice/x"}]},
+    )
+    _save(manager, _target(), "github-limited", limit)
+
+    alice = EgressRules(operator=_CONFIG, effective=effective_config(_CONFIG, manager, _target()))
+    bob = EgressRules(operator=_CONFIG, effective=effective_config(_CONFIG, manager, _target(_BOB)))
+
+    assert load_user_services(manager, _target())["github-limited"].restrict_only is True
+    allowed = route_request(alice, "api.github.com", 443, "/repos/alice/x/pulls")
+    assert allowed.match is not None
+    assert allowed.match.service == "github"
+    assert route_request(alice, "api.github.com", 443, "/repos/bob/y").restricted_by == "github-limited"
+    other = route_request(bob, "api.github.com", 443, "/repos/bob/y")
+    assert other.match is not None
+    assert other.match.service == "github"
+    # The usual per-service limits still apply.
+    too_many = EgressService.model_validate(
+        {"restrict_only": True, "rules": [{"host": "api.github.com"}] * (MAX_RULES_PER_SERVICE + 1)},
+    )
+    with pytest.raises(ValueError, match="at most 50 rules"):
+        _save(manager, _target(), "too-many", too_many)
+
+
 def test_hosts_outside_deny_are_reported_for_a_save_check() -> None:
     """Under deny the helper names each user host no config rule covers; under passthrough it names none."""
     service = EgressService.model_validate(

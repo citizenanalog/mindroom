@@ -80,7 +80,12 @@ class EgressCredentialsTools(Toolkit):
         config = context.current_config
         manager = get_runtime_credentials_manager(self._runtime_paths)
         # The config's services plus the ones the user defined in this agent's scope, as the broker matches them.
-        services = effective_config(config.egress_broker, manager, self._worker_target).services
+        # A restrict-only service only limits paths and never takes a credential, so it is not listed.
+        services = {
+            name: service
+            for name, service in effective_config(config.egress_broker, manager, self._worker_target).services.items()
+            if not service.restrict_only
+        }
         if not services:
             return self._payload([], link, _NO_SERVICES_NOTE)
         entries = [

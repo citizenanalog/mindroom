@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 type EgressServiceSource = ServiceSource
 
+RESTRICT_ONLY_KEY_REFUSAL = "This service only limits paths and never sends a key, so it cannot store one"
+
 
 def effective_services(
     config: Config,
