@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
+    from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 router = APIRouter(prefix="/api/connections/egress", tags=["egress-credentials"])
@@ -609,15 +610,15 @@ class _EmptyMutation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-@router.post("/agents/{agent_name}/{service}/connect")
-async def connect_egress_account(
+async def _account_provider(
     request: Request,
+    requester_id: str,
     agent_name: str,
     service: str,
-    requester_id: _EgressUser,
-    _body: _EmptyMutation,
-) -> oauth.OAuthConnectResponse:
-    """Start the OAuth flow of a service's provider for one agent's credential scope."""
+    *,
+    connecting: bool,
+) -> OAuthProvider:
+    """Run the connect and disconnect gates in order: same origin, agent and service access, then the provider."""
     _require_egress_same_origin(request)
     agent, egress_service = await asyncio.to_thread(
         _resolve_agent_and_service,
@@ -627,13 +628,25 @@ async def connect_egress_account(
         service,
         requester_owned_oauth=True,
     )
-    provider = oauth_provider_of_service(
+    return oauth_provider_of_service(
         request,
         egress_service,
         agent.target,
-        connecting=True,
+        connecting=connecting,
         headers=CONNECTIONS_HEADERS,
     )
+
+
+@router.post("/agents/{agent_name}/{service}/connect")
+async def connect_egress_account(
+    request: Request,
+    agent_name: str,
+    service: str,
+    requester_id: _EgressUser,
+    _body: _EmptyMutation,
+) -> oauth.OAuthConnectResponse:
+    """Start the OAuth flow of a service's provider for one agent's credential scope."""
+    provider = await _account_provider(request, requester_id, agent_name, service, connecting=True)
     try:
         return await oauth.connect(provider.id, request, agent_name=agent_name)
     except HTTPException as exc:
@@ -653,22 +666,7 @@ async def disconnect_egress_account(
     _body: _EmptyMutation,
 ) -> dict[str, str]:
     """Reset the OAuth connection of a service's provider for one agent's credential scope."""
-    _require_egress_same_origin(request)
-    agent, egress_service = await asyncio.to_thread(
-        _resolve_agent_and_service,
-        request,
-        requester_id,
-        agent_name,
-        service,
-        requester_owned_oauth=True,
-    )
-    provider = oauth_provider_of_service(
-        request,
-        egress_service,
-        agent.target,
-        connecting=False,
-        headers=CONNECTIONS_HEADERS,
-    )
+    provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
     try:
         return await oauth.disconnect(provider.id, request, agent_name=agent_name)
     except HTTPException as exc:
