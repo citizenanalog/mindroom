@@ -91,9 +91,10 @@ from mindroom.providers.tool_policy import provider_tools_disabled
 from mindroom.system_prompt import SESSION_CONTEXT_BOUNDARY
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from agno.models.anthropic import Claude as AnthropicClaude
+    from agno.models.message import Message
 
     from mindroom.providers.bedrock_claude import MindRoomBedrockClaude
 
@@ -345,6 +346,24 @@ def claude_deferred_tool_names(model: object) -> frozenset[str]:
     """Return the wire tool names registered for deferred loading on one model."""
     deferred_tool_names = vars(model).get(_DEFERRED_TOOL_NAMES_ATTR)
     return deferred_tool_names if isinstance(deferred_tool_names, frozenset) else frozenset()
+
+
+def claude_loaded_tool_names(messages: Sequence[Message]) -> frozenset[str]:
+    """Return the tool names whose definitions tool searches in these messages loaded into Claude's context."""
+    names: set[str] = set()
+    for message in messages:
+        blocks = message.provider_data.get("server_tool_blocks") if isinstance(message.provider_data, dict) else None
+        for block in blocks if isinstance(blocks, list) else ():
+            block_dict = as_dict(block)
+            content = as_dict(block_dict.get("content")) if block_dict is not None else None
+            if block_dict is None or block_dict.get("type") != TOOL_SEARCH_RESULT_BLOCK_TYPE or content is None:
+                continue
+            references = content.get("tool_references")
+            for reference in references if isinstance(references, list) else ():
+                reference_dict = as_dict(reference)
+                if reference_dict is not None and isinstance(name := reference_dict.get("tool_name"), str):
+                    names.add(name)
+    return frozenset(names)
 
 
 def _request_tool_names(request_kwargs: dict[str, Any]) -> frozenset[str]:

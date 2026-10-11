@@ -429,8 +429,45 @@ def test_request_sizing_leaves_out_deferred_tool_definitions(provider: str) -> N
         {"type": "function", "function": {"name": "lookup", "description": "Look up a value.", "parameters": {}}},
     ]
 
-    assert mid_turn_compaction._tool_tokens(model, tools) < 1_000
-    assert mid_turn_compaction._tool_tokens(model, tools) > 0
+    assert mid_turn_compaction._tool_tokens(model, tools, []) < 1_000
+    assert mid_turn_compaction._tool_tokens(model, tools, []) > 0
+
+
+@pytest.mark.parametrize("provider", ["openai", "claude"])
+def test_request_sizing_counts_deferred_tool_definitions_once_tool_search_loads_them(provider: str) -> None:
+    """A deferred definition enters the context when a tool search in the request returns it."""
+    big_tool = {"type": "function", "function": {"name": "big_tool", "description": "d" * 80_000, "parameters": {}}}
+    if provider == "openai":
+        model: Any = MindRoomOpenAIResponses(id="gpt-6-luna", store=False)
+        install_openai_deferred_tool_search(model, deferred_tool_names=frozenset({"big_tool"}))
+        provider_data: dict[str, Any] = {
+            "tool_search_items": [
+                {"type": "tool_search_call", "id": "ts_1", "execution": "server", "arguments": {"query": "big"}},
+                {"type": "tool_search_output", "id": "tso_1", "execution": "server", "tools": [big_tool["function"]]},
+            ],
+        }
+    else:
+        model = MindRoomAnthropicClaude(id="claude-sonnet-5-5", api_key="test")
+        install_claude_deferred_tool_search(model, deferred_tool_names=frozenset({"big_tool"}))
+        provider_data = {
+            "server_tool_blocks": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "tool_search_tool_regex", "input": {"query": "big"}},
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srv_1",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [{"type": "tool_reference", "tool_name": "big_tool"}],
+                    },
+                },
+            ],
+        }
+    searched = [
+        Message(role="user", content="Use the big tool"),
+        Message(role="assistant", provider_data=provider_data),
+    ]
+
+    assert mid_turn_compaction._tool_tokens(model, [big_tool], searched) > 15_000
 
 
 def test_aggregate_usage_of_retried_requests_never_anchors_sizing() -> None:

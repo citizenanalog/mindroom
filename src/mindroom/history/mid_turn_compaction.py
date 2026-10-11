@@ -54,8 +54,8 @@ from mindroom.history.types import HistoryScope
 from mindroom.logging_config import get_logger
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, checkpoint_items, native_replay_messages
-from mindroom.providers.claude_prompt_cache import claude_deferred_tool_names
-from mindroom.providers.openai_tool_search import model_deferred_tool_names
+from mindroom.providers.claude_prompt_cache import claude_deferred_tool_names, claude_loaded_tool_names
+from mindroom.providers.openai_tool_search import model_deferred_tool_names, openai_loaded_tool_names
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
 
@@ -423,6 +423,7 @@ def _request_tokens(
     estimate their projected request.
     """
     if policy.native_route is not None:
+        projected = native_replay_messages(messages, policy.native_route)
         return (
             estimate_request_messages_tokens(
                 messages,
@@ -431,13 +432,9 @@ def _request_tokens(
             )
             # Thinking before the latest checkpoint is part of that checkpoint, not of the request.
             + _thinking_tokens(
-                [
-                    message
-                    for message in native_replay_messages(messages, policy.native_route)
-                    if not checkpoint_items(message, policy.native_route)
-                ],
+                [message for message in projected if not checkpoint_items(message, policy.native_route)],
             )
-            + _tool_tokens(policy.model, tools)
+            + _tool_tokens(policy.model, tools, projected)
         )
     anchor = next(
         (
@@ -469,15 +466,17 @@ def _estimated_request_tokens(policy: _Policy, messages: list[Message], tools: l
     return (
         estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
         + _thinking_tokens(messages)
-        + _tool_tokens(policy.model, tools)
+        + _tool_tokens(policy.model, tools, messages)
     )
 
 
-def _tool_tokens(model: Model, tools: list[dict[str, Any]] | None) -> int:
-    """Estimate the tool definitions a request carries in full; tool search keeps deferred ones out until loaded."""
+def _tool_tokens(model: Model, tools: list[dict[str, Any]] | None, messages: Sequence[Message]) -> int:
+    """Estimate the tool definitions a request carries in full; tool search keeps deferred ones out until it loads them."""
     if not tools:
         return 0
     deferred = claude_deferred_tool_names(model) | model_deferred_tool_names(model)
+    if deferred:
+        deferred -= claude_loaded_tool_names(messages) | openai_loaded_tool_names(messages)
     sent = [tool for tool in tools if _tool_name(tool) not in deferred] if deferred else tools
     return estimate_text_tokens(stable_serialize(sent)) if sent else 0
 

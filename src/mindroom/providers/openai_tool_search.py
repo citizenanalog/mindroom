@@ -20,11 +20,17 @@ cached prefix stays byte-stable. Ordered output capture and replay live in
 from __future__ import annotations
 
 import re
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from mindroom.llm_request_logging import record_llm_request_tools
 from mindroom.model_defaults import OPENAI_TOOL_SEARCH_MIN_GPT_VERSION
+from mindroom.providers.agno_compat_openai_responses_items import TOOL_SEARCH_ITEMS_KEY
 from mindroom.providers.model_instance_checks import isinstance_of_loaded
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from agno.models.message import Message
 
 _OPENAI_RESPONSES_CLASS = ("agno.models.openai.responses", "OpenAIResponses")
 
@@ -81,6 +87,20 @@ def model_deferred_tool_names(model: object) -> frozenset[str]:
     """Return the wire tool names registered for deferred loading on one model."""
     deferred_tool_names = vars(model).get(_DEFERRED_TOOL_NAMES_ATTR)
     return deferred_tool_names if isinstance(deferred_tool_names, frozenset) else frozenset()
+
+
+def openai_loaded_tool_names(messages: Sequence[Message]) -> frozenset[str]:
+    """Return the tool names whose definitions tool searches in these messages loaded into the context."""
+    names: set[str] = set()
+    for message in messages:
+        items = message.provider_data.get(TOOL_SEARCH_ITEMS_KEY) if isinstance(message.provider_data, dict) else None
+        for item in items if isinstance(items, list) else ():
+            item_dict = _as_dict(item)
+            tools = item_dict.get("tools") if item_dict is not None else None
+            if item_dict is None or item_dict.get("type") != "tool_search_output" or not isinstance(tools, list):
+                continue
+            names.update(name for tool in tools if isinstance(name := (_as_dict(tool) or {}).get("name"), str))
+    return frozenset(names)
 
 
 def request_params_with_deferred_tool_search(
