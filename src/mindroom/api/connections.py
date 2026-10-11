@@ -65,6 +65,7 @@ class AgentConnections(BaseModel):
     agent_display_name: str
     is_shared: bool
     can_use: bool
+    mcp_available: bool
     services: list[ConnectionService]
     tools: list[ConnectionTool]
 
@@ -183,6 +184,7 @@ def _agent_connections(
         agent_display_name=agent.display_name,
         is_shared=agent.private is None,
         can_use=agent_name in user.agent_names,
+        mcp_available=agent_name in user.gateway_agent_names,
         services=list(services.values()),
         tools=tools,
     )

@@ -9,7 +9,7 @@ import secrets
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
-from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode
 
 import jwt
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
@@ -29,6 +29,7 @@ from mindroom.matrix.identity import (
     try_parse_historical_matrix_user_id,
     validate_email_to_matrix_mapping,
 )
+from mindroom.origins import normalized_origin
 from mindroom.tool_system.dependencies import auto_install_enabled, auto_install_optional_extra_for_import_retry
 
 if TYPE_CHECKING:
@@ -772,12 +773,7 @@ def _request_path_with_query(request: Request) -> str:
 
 def public_origin(public_url: str | None) -> str | None:
     """Extract a configured URL's origin for browser redirects, CORS, and mutation checks."""
-    if not public_url:
-        return None
-    parsed = urlsplit(public_url.strip())
-    if not parsed.scheme or not parsed.netloc:
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}"
+    return normalized_origin(public_url)
 
 
 def _platform_redirect_target(request: Request, auth_settings: _ApiAuthSettings, next_path: str | None) -> str:

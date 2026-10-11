@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from agno.run.team import TeamRunOutput
 
     from mindroom.agent_modes import AgentMode
+    from mindroom.delegation.state import SubagentPersona
     from mindroom.dispatch_source import ScheduledHistoryBudget
     from mindroom.history.session_context import ScopeSessionContext
     from mindroom.history.turn_recorder import TurnRecorder
@@ -80,6 +81,7 @@ __all__ = [
     "EmptyRunDiscard",
     "ExcludedAttempt",
     "HandledAttempt",
+    "PausedAnswer",
     "PausedAttempt",
     "ResponsePausedForApproval",
     "ResponseTurnContext",
@@ -313,6 +315,8 @@ class ResponseTurnContext:
     # prompt-owning event while capping this turn without changing authored config.
     scheduled_history_budget: ScheduledHistoryBudget | None = None
     agent_mode: AgentMode = "standard"
+    # Set only for authored subagents: their authored prompt and tool subset.
+    persona: SubagentPersona | None = None
     # Set only for responses that count toward skill learning, so the review can fork their final request.
     skill_review_capture: SkillReviewCapture | None = None
     # Which events this turn's history derives from are redacted, each with the source a legacy summary consumed
@@ -401,6 +405,16 @@ class ExcludedAttempt:
     session_id: str | None = None
     run_id: str | None = None
     metadata_content: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class PausedAnswer:
+    """The answer a paused run showed, as its reply's records keep it, which its resume continues."""
+
+    text: str = ""
+    tool_trace: tuple[ToolTraceEntry, ...] = ()
+    # A team's structured document, restored instead of re-parsing its rendered text.
+    team_state: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
