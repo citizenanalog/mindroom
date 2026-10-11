@@ -196,6 +196,7 @@ describe("egress service rows", () => {
     render(
       <EgressServiceRows
         secretPath={(name) => `/custom/${name}/secret`}
+        servicesPath="/custom/services"
         accountPath={(name, action) => `/custom/${name}/${action}`}
         services={[github]}
         onChanged={vi.fn()}
@@ -398,6 +399,7 @@ describe("egress service rows", () => {
     render(
       <EgressServiceRows
         secretPath={(name) => `/custom/${name}/secret`}
+        servicesPath="/custom/services"
         accountPath={(name, action) => `/custom/${name}/${action}`}
         errorMessages={{ forbidden: "No access.", notFound: "Gone." }}
         services={[openai]}
@@ -602,6 +604,7 @@ describe("connected accounts", () => {
     const { rerender } = render(
       <EgressServiceRows
         secretPath={(name) => `/custom/${name}/secret`}
+        servicesPath="/custom/services"
         accountPath={(name, action) => `/custom/${name}/${action}?agent_name=a`}
         services={[withAccount()]}
         onChanged={onChanged}
@@ -622,6 +625,7 @@ describe("connected accounts", () => {
     rerender(
       <EgressServiceRows
         secretPath={(name) => `/custom/${name}/secret`}
+        servicesPath="/custom/services"
         accountPath={(name, action) => `/custom/${name}/${action}?agent_name=a`}
         services={[connectedGithub]}
         onChanged={onChanged}
@@ -2436,16 +2440,34 @@ describe("a popup that closes without answering", () => {
     close: ReturnType<typeof vi.fn>;
     location: { href: string };
   };
+  const listingPath = "/api/connections/egress";
+  // The provider's status route is for tool rows; this agent has no tool for
+  // the provider, so the route answers 404 and is never the one asked.
   const answerWith = (connected: boolean | "fails") =>
     vi.mocked(fetch).mockImplementation(async (input) => {
       const path = String(input);
       if (path.endsWith("/connect")) return json(authorization);
-      if (path === "/api/connections/agents/personal/github/status") {
+      if (path === "/api/connections/agents/personal/github/status")
+        return json({ detail: "Not found" }, 404);
+      if (path === listingPath) {
         if (connected === "fails") return json({}, 500);
-        return json({ provider: "github", connected });
+        return json({
+          agents: [
+            {
+              agent_name: "other",
+              services: [withAccount({ connected: !connected })],
+            },
+            {
+              agent_name: "personal",
+              services: [withAccount({ connected })],
+            },
+          ],
+        });
       }
       return noContent();
     });
+  const reads = (path: string) =>
+    vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === path);
   const connectAndClose = async (onChanged = vi.fn()) => {
     render(
       <EgressServiceRows
@@ -2473,36 +2495,30 @@ describe("a popup that closes without answering", () => {
     vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
   });
 
-  it("counts a connection that completed before the answer was read, once its status says so", async () => {
+  it("counts a connection that completed before the answer was read, once the listing says so", async () => {
     answerWith(true);
     const onChanged = await connectAndClose();
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1), {
       timeout: 2000,
     });
     expect(screen.queryByRole("alert")).toBeNull();
-    const statusReads = vi
-      .mocked(fetch)
-      .mock.calls.filter(([input]) => String(input).endsWith("/github/status"));
-    expect(statusReads).toHaveLength(1);
+    expect(reads(listingPath)).toHaveLength(1);
+    expect(
+      reads("/api/connections/agents/personal/github/status"),
+    ).toHaveLength(0);
   });
 
-  it("says cancelled when the status shows nothing was connected, after one read", async () => {
+  it("says cancelled when the listing shows nothing was connected, after one read", async () => {
     answerWith(false);
     const onChanged = await connectAndClose();
     expect(
       await screen.findByRole("alert", {}, { timeout: 2000 }),
     ).toHaveTextContent("Authorization was cancelled.");
     expect(onChanged).not.toHaveBeenCalled();
-    expect(
-      vi
-        .mocked(fetch)
-        .mock.calls.filter(([input]) =>
-          String(input).endsWith("/github/status"),
-        ),
-    ).toHaveLength(1);
+    expect(reads(listingPath)).toHaveLength(1);
   });
 
-  it("says cancelled when the status cannot be read", async () => {
+  it("says cancelled when the listing cannot be read", async () => {
     answerWith("fails");
     const onChanged = await connectAndClose();
     expect(

@@ -459,6 +459,10 @@ function ServiceSection({
                 agentName,
               )
             }
+            servicesPath={withAgentName(
+              API_ENDPOINTS.egressBroker.services,
+              agentName,
+            )}
             services={services}
             onChanged={() => void load()}
             errorMessages={SECRET_ERROR_MESSAGES}

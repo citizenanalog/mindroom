@@ -29,7 +29,7 @@ import { coversGithub } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
-import type { EgressCredentialService } from "./types";
+import type { EgressCredentialList, EgressCredentialService } from "./types";
 
 export type { RowAgent, ServiceEditing } from "./egressRowStatus";
 
@@ -40,8 +40,8 @@ interface ServicePaths {
   secret: string;
   connect: string;
   disconnect: string;
-  /** Where the connection status of a provider is read, when the page has such a route. */
-  status?: (provider: string) => string;
+  /** Whether the service's account is connected now, read again from the listing the row came from. */
+  accountConnected: (signal: AbortSignal) => Promise<boolean>;
 }
 
 function EgressServiceRow({
@@ -210,7 +210,6 @@ function EgressServiceRow({
     if (!oauth || busy !== null) return;
     const controller = new AbortController();
     operation.current = controller;
-    const statusPath = paths.status?.(oauth.provider);
     setBusy("connect");
     setError(null);
     try {
@@ -226,15 +225,7 @@ function EgressServiceRow({
           ),
         controller.signal,
         // A popup that closed after connecting is a connection, not a cancel.
-        statusPath === undefined
-          ? undefined
-          : async () =>
-              (
-                await requestConnection<{ connected: boolean }>(
-                  statusPath,
-                  controller.signal,
-                )
-              ).connected,
+        () => paths.accountConnected(controller.signal),
       );
       if (!controller.signal.aborted) onChanged();
     } catch (cause) {
@@ -732,30 +723,65 @@ type ServiceTarget =
       agentName: string;
       secretPath?: undefined;
       accountPath?: undefined;
+      servicesPath?: undefined;
     }
   | {
       agentName?: undefined;
       secretPath: (serviceName: string) => string;
       accountPath: (serviceName: string, action: AccountAction) => string;
+      /** The listing these services came from, `{services: [...]}`, read again when a login popup closes without answering. */
+      servicesPath: string;
     };
 
+const EGRESS_LISTING_PATH = "/api/connections/egress";
+
+const accountConnectedIn = (
+  services: readonly EgressCredentialService[] | undefined,
+  serviceName: string,
+) =>
+  services?.find((service) => service.name === serviceName)?.oauth
+    ?.connected === true;
+
+// The egress listings say whether each service's account is connected, for any
+// agent and provider; a provider's own status route only knows the agent's tools.
 function servicePathsFor(
   target: ServiceTarget,
   serviceName: string,
 ): ServicePaths {
-  if (target.secretPath)
+  if (target.secretPath) {
+    const { servicesPath } = target;
     return {
       secret: target.secretPath(serviceName),
       connect: target.accountPath(serviceName, "connect"),
       disconnect: target.accountPath(serviceName, "disconnect"),
+      accountConnected: async (signal) =>
+        accountConnectedIn(
+          (
+            await requestConnection<{ services: EgressCredentialService[] }>(
+              servicesPath,
+              signal,
+            )
+          ).services,
+          serviceName,
+        ),
     };
-  const base = `/api/connections/egress/agents/${encodeURIComponent(target.agentName)}/${encodeURIComponent(serviceName)}`;
+  }
+  const { agentName } = target;
+  const base = `/api/connections/egress/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
   return {
     secret: base,
     connect: `${base}/connect`,
     disconnect: `${base}/disconnect`,
-    status: (provider) =>
-      `/api/connections/agents/${encodeURIComponent(target.agentName)}/${encodeURIComponent(provider)}/status`,
+    accountConnected: async (signal) =>
+      accountConnectedIn(
+        (
+          await requestConnection<EgressCredentialList>(
+            EGRESS_LISTING_PATH,
+            signal,
+          )
+        ).agents.find((agent) => agent.agent_name === agentName)?.services,
+        serviceName,
+      ),
   };
 }
 
@@ -763,8 +789,8 @@ function servicePathsFor(
  * Accounts and API keys the egress broker injects into outbound requests.
  *
  * Rows target one agent's personal connections API by default. Pass
- * `secretPath` and `accountPath` instead of `agentName` to use another
- * endpoint, such as the dashboard's.
+ * `secretPath`, `accountPath`, and `servicesPath` instead of `agentName` to
+ * use another endpoint, such as the dashboard's.
  */
 export function EgressServiceRows({
   services,

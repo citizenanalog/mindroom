@@ -803,6 +803,51 @@ describe("egress broker connected accounts", () => {
     expect(requests("/api/egress-broker/services")).toHaveLength(2);
   });
 
+  it("reads the selected agent's services again when the popup closes without answering", async () => {
+    mutationResponse = () => json(authorization);
+    sharedCoder();
+    render(<EgressBroker />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
+    const question = await screen.findByRole("dialog", {
+      name: "Connect a shared account?",
+    });
+    fireEvent.click(within(question).getByRole("button", { name: "Continue" }));
+    await waitFor(() =>
+      expect(popup.location.href).toBe(authorization.auth_url),
+    );
+
+    // The connection finished, but its message never arrived.
+    services = [
+      {
+        ...github,
+        configured: true,
+        active_source: "oauth",
+        oauth: { ...githubAccount, connected: true, account_label: "octocat" },
+      },
+      openai,
+    ];
+    popup.closed = true;
+
+    expect(
+      await screen.findByText(
+        "Connected as octocat · shared with everyone using Agent coder",
+        {},
+        { timeout: 2000 },
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Authorization was cancelled.")).toBeNull();
+    // The first load, the check after the popup closed, and the reload.
+    const listings = requests("/api/egress-broker/services");
+    expect(listings).toHaveLength(3);
+    expect(listings.map((url) => url.searchParams.get("agent_name"))).toEqual([
+      "coder",
+      "coder",
+      "coder",
+    ]);
+  });
+
   it("disconnects the global account without an agent_name", async () => {
     services = [
       {
