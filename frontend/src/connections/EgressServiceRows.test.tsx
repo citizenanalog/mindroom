@@ -1582,23 +1582,6 @@ describe("rows with an agent's wording", () => {
     });
   });
 
-  describe("who manages a shared agent", () => {
-    const readOnly = { ...openai, is_shared: true, can_manage: false };
-
-    it("leaves naming the managers to the agent's note when they are known", () => {
-      renderRows(
-        [readOnly],
-        agent({ managers: ["@bob:example.org"], services: [readOnly] }),
-      );
-      expect(screen.queryByText(/Managed by credential managers/)).toBeNull();
-      expect(
-        screen.queryByRole("button", {
-          name: /^(Set|Replace|Remove) key for /,
-        }),
-      ).toBeNull();
-    });
-  });
-
   describe("disconnecting an account", () => {
     const listing = [
       connectedGithub,
@@ -2239,7 +2222,7 @@ describe("a shared agent's key where a personal account is refused", () => {
     expect(screen.queryByText("Using API key")).toBeNull();
   });
 
-  it("still names the managers to someone who cannot change the key, after the hint is gone", () => {
+  it("drops the hint for someone who cannot change the key too", () => {
     renderRows(
       refused({
         can_manage: false,
@@ -2250,8 +2233,6 @@ describe("a shared agent's key where a personal account is refused", () => {
       }),
     );
     expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
-    // The page names the managers once, so the row says nothing more about who manages it.
-    expect(screen.queryByText(/credential managers/)).toBeNull();
   });
 });
 

@@ -30,7 +30,11 @@ export const sharedPersonal: EditorOptions = {
   sharedTarget: true,
 };
 export const operator: EditorOptions = { ...personal, context: "operator" };
-export const newService = { editing: false, takenNames: [] as string[] };
+export const newService = {
+  editing: false,
+  takenNames: [] as string[],
+  service: null,
+};
 
 export const bearerRule: EgressRule = {
   host: "api.example.com",
@@ -49,11 +53,10 @@ export const problemsFor = (
   options: EditorOptions = personal,
   settings: { editing: boolean; takenNames: string[] } = newService,
 ) =>
-  validateService(
-    { ...formFromService("svc", service), ...changes },
-    options,
-    settings,
-  );
+  validateService({ ...formFromService("svc", service), ...changes }, options, {
+    ...settings,
+    service,
+  });
 
 export const errorsFor = (
   service: AuthoredEgressService | null,

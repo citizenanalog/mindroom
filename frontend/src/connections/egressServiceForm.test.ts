@@ -668,6 +668,7 @@ describe("a service that only limits paths", () => {
       validateService(formFromService("github-limited", limit), personal, {
         editing: true,
         takenNames: ["github-limited"],
+        service: limit,
       }),
     ).toEqual([]);
   });

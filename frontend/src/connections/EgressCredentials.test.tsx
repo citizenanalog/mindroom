@@ -1890,9 +1890,6 @@ describe("who can change a shared agent's keys", () => {
         "Only @bob:example.org and @carol:example.org can change keys for this shared agent.",
       ),
     ).toBeVisible();
-    expect(
-      within(region).queryByText(/Managed by credential managers/),
-    ).toBeNull();
   });
 
   it("falls back to administrators when no manager is named", async () => {

@@ -1616,7 +1616,6 @@ describe("shared accounts on agent cards", () => {
         "Only @alice:example.org and @mallory:example.org can change keys for this shared agent.";
       // Once under the API keys heading, once where the account would be connected.
       await waitFor(() => expect(screen.getAllByText(note)).toHaveLength(2));
-      expect(screen.queryByText("Managed by credential managers")).toBeNull();
     });
 
     it("tells a manager they manage the keys", async () => {

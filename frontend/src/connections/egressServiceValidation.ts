@@ -193,8 +193,8 @@ export function validateService(
   settings: {
     editing: boolean;
     takenNames: readonly string[];
-    /** The service the form opened with, which the save serializes the form against. */
-    service?: AuthoredEgressService | null;
+    /** The service the form opened with, which the save serializes the form against; null for a new one. */
+    service: AuthoredEgressService | null;
   },
 ): ServiceProblem[] {
   const problems: ServiceProblem[] = [];
@@ -259,7 +259,7 @@ function tooManyRulesProblem(
 function sizeProblems(
   form: EgressServiceForm,
   options: EditorOptions,
-  service: AuthoredEgressService | null | undefined,
+  service: AuthoredEgressService | null,
   found: readonly ServiceProblem[],
 ): ServiceProblem[] {
   const max = options.validation?.max_service_bytes;
