@@ -670,6 +670,24 @@ def test_replayed_queued_notice_is_folded() -> None:
     assert old_notice in layout.history
 
 
+def test_tool_results_after_an_interleaved_receipt_fold_with_their_call() -> None:
+    prompt = Message(role="user", content="Do the task")
+    call = Message(
+        role="assistant",
+        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "probe", "arguments": "{}"}}],
+    )
+    # An approval receipt sits between a paused call and its approved result.
+    receipt = Message(role="system", content="Approved.", add_to_agent_memory=False)
+    result = Message(role="tool", tool_call_id="c1", content="r")
+    messages = [Message(role="system", content="Be precise."), prompt, call, receipt, result]
+    run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
+
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=False)
+
+    assert layout.exchanges == ((call, result),)
+    assert layout.kept == (prompt, receipt)
+
+
 @pytest.mark.asyncio
 async def test_parallel_tool_batch_is_folded_whole(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)

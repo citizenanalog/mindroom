@@ -519,13 +519,20 @@ def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput, *,
 
 
 def _exchanges(messages: Sequence[Message]) -> list[list[Message]]:
-    """Group each message with the tool results that answer it, so a tool batch is never split."""
+    """Group each message with the tool results that answer it, so a tool batch is never split.
+
+    A tool result joins the latest assistant tool call even when a projection, such as an approval receipt, sits
+    between them; that projection stays its own exchange.
+    """
     exchanges: list[list[Message]] = []
+    calls: list[Message] | None = None
     for message in messages:
-        if message.role == "tool" and exchanges:
-            exchanges[-1].append(message)
-        else:
-            exchanges.append([message])
+        if message.role == "tool" and calls is not None:
+            calls.append(message)
+            continue
+        exchanges.append([message])
+        if message.role == "assistant":
+            calls = exchanges[-1] if message.tool_calls else None
     return exchanges
 
 
