@@ -81,7 +81,7 @@ MAX_DOCUMENT_BYTES = 256 * 1024
 # such variables as programs or paths to run or load (RESTIC_PASSWORD_COMMAND, SOPS_AGE_KEY_CMD, SSH_AUTH_SOCK).
 PLACEHOLDER_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 # Tuples keep the order the error messages list the words in. The presets routes serve these constants, the name
-# pattern above, and the limits above as `limits`, so the editor checks the same rules before it saves.
+# pattern above, and the caps above as `validation`, so the editor checks the same rules before it saves.
 PLACEHOLDER_NAME_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL")
 PLACEHOLDER_REFUSED_WORDS = ("COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS")
 PLACEHOLDER_REFUSED_PREFIX = "SSH_"
@@ -146,7 +146,7 @@ def inactive_user_services(
     """List, by name, the scope's stored entries that `effective_config` leaves out, with the reason.
 
     An entry is `shadowed` when `config` has a service of that name, whether or not it would still validate, and
-    `invalid` when it no longer validates as a user service. Both still count toward the scope's limits, and
+    `invalid` when it no longer validates as a user service. Both still count toward the scope's caps, and
     `delete_user_service` removes either. This reads the store each time and logs nothing per entry, so a listing can
     call it.
     """
@@ -354,7 +354,7 @@ def _validated(name: str, authored: object) -> EgressService:
 
 
 def _check_user_service(service: EgressService) -> None:
-    """Apply the limits that user services have on top of the config model's validators."""
+    """Apply the caps that user services have on top of the config model's validators."""
     if service.oauth_on_shared_workers:
         msg = "oauth_on_shared_workers can only be set by an administrator in config.yaml"
         raise ValueError(msg)

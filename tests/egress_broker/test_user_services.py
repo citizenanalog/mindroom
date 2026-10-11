@@ -127,8 +127,8 @@ def test_oauth_on_shared_workers_stays_operator_only(manager: CredentialsManager
     assert load_user_services(manager, worker_target()) == {}
 
 
-def test_service_count_is_limited_per_scope(manager: CredentialsManager) -> None:
-    """A scope holds at most 50 services; replacing one of them still works at the limit."""
+def test_service_count_is_capped_per_scope(manager: CredentialsManager) -> None:
+    """A scope holds at most 50 services; replacing one of them still works at the cap."""
     for index in range(MAX_USER_SERVICES):
         _save(manager, worker_target(), f"svc-{index}", _service())
 
@@ -143,7 +143,7 @@ def test_service_count_is_limited_per_scope(manager: CredentialsManager) -> None
     _save(manager, worker_target(_BOB), "svc-0", _service())
 
 
-def test_rule_count_is_limited_per_service(manager: CredentialsManager) -> None:
+def test_rule_count_is_capped_per_service(manager: CredentialsManager) -> None:
     """A service has at most 50 rules."""
     rules = [
         {"host": f"h{index}.example.com", "auth": {"type": "bearer"}} for index in range(MAX_RULES_PER_SERVICE + 1)
@@ -402,7 +402,7 @@ def test_restrict_to_rules_on_a_user_service_applies_only_to_its_scope(manager: 
 def test_a_restrict_only_limit_is_saved_and_narrows_the_config_service_in_its_scope(
     manager: CredentialsManager,
 ) -> None:
-    """Saving a limit takes the usual limits; in its scope the config service keeps the credential for listed paths."""
+    """Saving a limit takes the usual caps; in its scope the config service keeps the credential for listed paths."""
     limit = EgressService.model_validate(
         {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/alice/x"}]},
     )
@@ -419,7 +419,7 @@ def test_a_restrict_only_limit_is_saved_and_narrows_the_config_service_in_its_sc
     other = route_request(bob, "api.github.com", 443, "/repos/bob/y")
     assert other.match is not None
     assert other.match.service == "github"
-    # The usual per-service limits still apply.
+    # The usual per-service caps still apply.
     too_many = EgressService.model_validate(
         {"restrict_only": True, "rules": [{"host": "api.github.com"}] * (MAX_RULES_PER_SERVICE + 1)},
     )
@@ -675,7 +675,7 @@ def test_stored_placeholders_users_may_not_set_are_dropped(
         assert value not in str(logs)
 
 
-def test_a_service_is_limited_to_16_kib(manager: CredentialsManager) -> None:
+def test_a_service_is_capped_at_16_kib(manager: CredentialsManager) -> None:
     """One service's authored JSON may take at most 16 KiB."""
     _save(manager, worker_target(), "fits", _service(description="x" * 16_000))
     with pytest.raises(ValueError, match="at most 16 KiB"):
@@ -684,8 +684,8 @@ def test_a_service_is_limited_to_16_kib(manager: CredentialsManager) -> None:
     assert list(load_user_services(manager, worker_target())) == ["fits"]
 
 
-def test_a_scope_document_is_limited_to_256_kib(manager: CredentialsManager) -> None:
-    """All of a scope's services together may take at most 256 KiB, well before the 50-service limit."""
+def test_a_scope_document_is_capped_at_256_kib(manager: CredentialsManager) -> None:
+    """All of a scope's services together may take at most 256 KiB, well before the 50-service cap."""
     for index in range(16):
         _save(manager, worker_target(), f"svc-{index}", _service(description="x" * 15_500))
 

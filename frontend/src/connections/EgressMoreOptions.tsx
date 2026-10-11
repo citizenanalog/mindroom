@@ -22,6 +22,7 @@ import type {
   EgressOAuthProviderOption,
   EgressPreset,
   EgressScope,
+  EgressValidation,
 } from "./types";
 
 // What "Refuse other paths" does, in the order spec 12.4 gives it. The second
@@ -68,7 +69,7 @@ export function MoreOptions({
   context,
   scope,
   sharedTarget,
-  maxRules,
+  validation,
   preset,
   providers,
   onGithub,
@@ -87,8 +88,8 @@ export function MoreOptions({
   scope: EgressScope | undefined;
   /** Shared and unscoped agents cannot use personal accounts. */
   sharedTarget: boolean;
-  /** The most rules a personal service can have, from the server; unknown until it says. */
-  maxRules: number | undefined;
+  /** What the server checks on save, for the most rules and the placeholder hint; `null` until it says. */
+  validation: EgressValidation | null;
   preset: EgressPreset | undefined;
   /** The account logins a custom service can use. */
   providers: readonly EgressOAuthProviderOption[];
@@ -236,8 +237,8 @@ export function MoreOptions({
             disabled={
               disabled ||
               (isPersonal &&
-                maxRules !== undefined &&
-                form.rules.length >= maxRules)
+                validation !== null &&
+                form.rules.length >= validation.max_rules_per_service)
             }
             onClick={() => set({ rules: [...form.rules, emptyRule()] })}
           >
@@ -271,6 +272,7 @@ export function MoreOptions({
         disabled={disabled}
         context={context}
         preset={preset}
+        validation={validation?.placeholder ?? null}
         configPlaceholders={configPlaceholders}
       />
     </div>

@@ -2,7 +2,7 @@ import { type RuleAuthChoice, hasCustomTemplate } from "./egressRuleAuth";
 import type {
   AuthoredEgressService,
   EgressAuth,
-  EgressLimits,
+  EgressValidation,
   EgressPreset,
   EgressRule,
 } from "./types";
@@ -28,7 +28,7 @@ export interface EditorOptions {
    * response; `null` while it loads and when the server does not send it, in
    * which case the checks that need it are left to the server.
    */
-  limits: EgressLimits | null;
+  validation: EgressValidation | null;
 }
 
 export const BROKERED_PLACEHOLDER = "mindroom-brokered";

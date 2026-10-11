@@ -1440,8 +1440,8 @@ def test_non_object_body_and_bad_names_are_422(egress_portal: dict[str, Any]) ->
         assert response.status_code == 422, (name, response.text)
 
 
-def test_user_service_limits_are_422(egress_portal: dict[str, Any]) -> None:
-    """At most 50 rules per service and 50 services per scope; replacing a service at the limit still works."""
+def test_user_service_caps_are_422(egress_portal: dict[str, Any]) -> None:
+    """At most 50 rules per service and 50 services per scope; replacing a service at the cap still works."""
     portal = egress_portal
     too_many_rules = {"rules": [{"host": f"h{i}.example.com", "auth": {"type": "bearer"}} for i in range(51)]}
     response = _put_service(portal, "alice", "personal", "wide", too_many_rules)
@@ -2253,12 +2253,12 @@ def test_presets_are_served_as_the_config_model_expands_them(egress_portal: dict
     assert all(set(provider) == {"id", "display_name"} for provider in providers)
 
 
-def test_presets_serve_the_user_service_limits_the_server_enforces(egress_portal: dict[str, Any]) -> None:
-    """The limits the editor validates against are the constants the server enforces, with no copy of them."""
+def test_presets_serve_the_user_service_validation_the_server_enforces(egress_portal: dict[str, Any]) -> None:
+    """The validation the editor applies is the constants the server enforces, with no copy of them."""
     response = egress_portal["client"].get("/api/connections/egress/presets", headers=egress_portal["headers"]["alice"])
 
     assert response.status_code == 200, response.text
-    assert response.json()["limits"] == {
+    assert response.json()["validation"] == {
         "max_services": MAX_USER_SERVICES,
         "max_rules_per_service": MAX_RULES_PER_SERVICE,
         "max_service_bytes": MAX_SERVICE_BYTES,
@@ -2278,7 +2278,7 @@ def test_presets_serve_the_user_service_limits_the_server_enforces(egress_portal
 
 def test_served_placeholder_rules_give_the_answers_of_the_server_checks() -> None:
     """Each served placeholder rule refuses what the server refuses, so an editor that checks them agrees with a save."""
-    placeholder = egress_status.presets_response({}).limits.placeholder
+    placeholder = egress_status.presets_response({}).validation.placeholder
 
     def refused_by_the_config_model(name: str) -> bool:
         try:
@@ -2310,7 +2310,7 @@ def test_frontend_preset_fixture_matches_the_served_presets() -> None:
     served = egress_status.presets_response({}).model_dump(mode="json")
 
     assert fixture["presets"] == served["presets"]
-    assert fixture["limits"] == served["limits"]
+    assert fixture["validation"] == served["validation"]
 
 
 def test_presets_need_a_signed_user_and_take_no_query(egress_portal: dict[str, Any]) -> None:
@@ -2558,7 +2558,7 @@ def test_inactive_entries_of_a_shared_agent_are_listed_for_its_users_and_deleted
     assert _listed_agent(portal, "alice", "shared_dev")["inactive_services"] == []
 
 
-def test_inactive_entries_count_toward_the_limit_until_deleted(egress_portal: dict[str, Any]) -> None:
+def test_inactive_entries_count_toward_the_cap_until_deleted(egress_portal: dict[str, Any]) -> None:
     """A scope full of ignored entries cannot take another service, so the user must be able to delete them."""
     portal = egress_portal
     _store_raw_entries(portal, {f"stale-{index}": {"rules": []} for index in range(50)})

@@ -150,7 +150,7 @@ function placeholderProblems(
 ): ServiceProblem[] {
   const problems: ServiceProblem[] = [];
   // Without the server's rules the checks that need them are left to the server.
-  const limits = options.limits?.placeholder ?? null;
+  const placeholderRules = options.validation?.placeholder ?? null;
   const seen = new Set<string>();
   placeholders.forEach((placeholder, index) => {
     const name = placeholder.name.trim();
@@ -162,12 +162,14 @@ function placeholderProblems(
       // A personal user hears what the server would say, not a pattern.
       const message =
         options.context === "personal"
-          ? limits && personalPlaceholderNameError(name, limits)
+          ? placeholderRules &&
+            personalPlaceholderNameError(name, placeholderRules)
           : operatorPlaceholderNameError(name);
       if (message) add("name", message);
       return;
     }
-    const reservedProblem = limits && reservedPlaceholderError(name, limits);
+    const reservedProblem =
+      placeholderRules && reservedPlaceholderError(name, placeholderRules);
     if (reservedProblem) {
       add("name", reservedProblem);
       return;
@@ -175,8 +177,8 @@ function placeholderProblems(
     if (seen.has(name)) add("name", `Placeholder ${name} is listed twice`);
     seen.add(name);
     const personalProblem =
-      options.context === "personal" && limits
-        ? personalPlaceholderError(name, placeholder.value, limits)
+      options.context === "personal" && placeholderRules
+        ? personalPlaceholderError(name, placeholder.value, placeholderRules)
         : null;
     if (personalProblem) add(personalProblem.part, personalProblem.message);
   });
@@ -197,7 +199,7 @@ export function validateService(
   if (form.restrictOnly) {
     // The repository helper writes the rules and tells when there are none,
     // and the server checks them again, but a long list can still pass the
-    // limits on a service's size. The form has no field for those, so they
+    // caps on a service's size. The form has no field for those, so they
     // are told in its alert.
     if (form.rules.length === 0)
       problems.push({
@@ -234,12 +236,12 @@ export function validateService(
   return problems;
 }
 
-/** What to say when a personal service has more rules than the server takes, or null; the dashboard has no such limit. */
+/** What to say when a personal service has more rules than the server takes, or null; the dashboard has no such cap. */
 function tooManyRulesProblem(
   form: EgressServiceForm,
   options: EditorOptions,
 ): string | null {
-  const max = options.limits?.max_rules_per_service;
+  const max = options.validation?.max_rules_per_service;
   return options.context === "personal" &&
     max !== undefined &&
     form.rules.length > max
@@ -253,7 +255,7 @@ function sizeProblems(
   options: EditorOptions,
   found: readonly ServiceProblem[],
 ): ServiceProblem[] {
-  const max = options.limits?.max_service_bytes;
+  const max = options.validation?.max_service_bytes;
   return options.context === "personal" &&
     max !== undefined &&
     found.length === 0 &&

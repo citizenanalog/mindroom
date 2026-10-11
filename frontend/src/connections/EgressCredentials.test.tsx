@@ -891,7 +891,7 @@ describe("egress services on the personal page", () => {
     expect(screen.getByLabelText("Name")).toHaveValue("gh");
   });
 
-  it("shows the size limit from the server", async () => {
+  it("shows the size cap from the server", async () => {
     mutation = () => json({ detail: "A service can take at most 16 KiB" }, 413);
     render(<EgressCredentials />);
     fireEvent.click(

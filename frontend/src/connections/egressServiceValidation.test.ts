@@ -11,7 +11,7 @@ import {
   newService,
   problemsFor,
   errorsFor,
-  limits,
+  validation,
   validRule,
 } from "@/test/egressServiceTestKit";
 import {
@@ -24,8 +24,8 @@ import {
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type {
   AuthoredEgressService,
-  EgressLimits,
-  EgressPlaceholderLimits,
+  EgressValidation,
+  EgressPlaceholderValidation,
 } from "./types";
 
 describe("validating a service", () => {
@@ -144,7 +144,7 @@ describe("validating a service", () => {
     ).toEqual(["Host is required"]);
   });
 
-  it("limits a personal service to 50 rules but not an operator service", () => {
+  it("caps a personal service at 50 rules but not an operator service", () => {
     const rules = Array.from({ length: 51 }, validRule);
     expect(errorsFor(null, { rules })).toEqual([
       "A service can have at most 50 rules",
@@ -152,7 +152,7 @@ describe("validating a service", () => {
     expect(errorsFor(null, { rules }, operator)).toEqual([]);
   });
 
-  it("limits a personal service to 16 KiB", () => {
+  it("caps a personal service at 16 KiB", () => {
     const description = "x".repeat(17 * 1024);
     expect(errorsFor(null, { rules: [validRule()], description })).toEqual([
       "A service can take at most 16 KiB",
@@ -539,28 +539,28 @@ describe("which problems the basic fields show", () => {
   });
 });
 
-describe("the limits the server sends", () => {
+describe("the validation the server sends", () => {
   const optionsWith = (
-    changes: Partial<EgressLimits> = {},
-    placeholder: Partial<EgressPlaceholderLimits> = {},
+    changes: Partial<EgressValidation> = {},
+    placeholder: Partial<EgressPlaceholderValidation> = {},
     base = personal,
   ): typeof personal => ({
     ...base,
-    limits: {
-      ...limits,
+    validation: {
+      ...validation,
       ...changes,
-      placeholder: { ...limits.placeholder, ...placeholder },
+      placeholder: { ...validation.placeholder, ...placeholder },
     },
   });
   const withPlaceholder = (name: string, value = "mindroom-brokered") => ({
     placeholders: [{ name, value }],
   });
-  const noLimits = { ...personal, limits: null };
+  const withoutValidation = { ...personal, validation: null };
 
   it("has name and value patterns from Python that read as JavaScript regular expressions", () => {
     for (const source of [
-      limits.placeholder.name_pattern,
-      limits.placeholder.value_pattern,
+      validation.placeholder.name_pattern,
+      validation.placeholder.value_pattern,
     ])
       expect(() => new RegExp(`^(?:${source})$`)).not.toThrow();
   });
@@ -681,8 +681,19 @@ describe("the limits the server sends", () => {
     expect(errors("abc")).toEqual([]);
     for (const value of ["abcd", "xabc", "abc1", "ab\n", ""])
       expect(errors(value)).toEqual([
-        "The value of MY_API_KEY must be 1 to 256 letters, digits, or . _ : -",
+        "The value of MY_API_KEY must be 1 to 3 letters, digits, or . _ : -",
       ]);
+  });
+
+  it("says no length for a value pattern that has none", () => {
+    const options = optionsWith({}, { value_pattern: "[a-z]+" });
+    expect(
+      errorsFor(
+        { preset: "github" },
+        withPlaceholder("MY_API_KEY", "A"),
+        options,
+      ),
+    ).toEqual(["The value of MY_API_KEY must be letters, digits, or . _ : -"]);
   });
 
   it("leaves a value pattern it cannot read to the server", () => {
@@ -697,25 +708,33 @@ describe("the limits the server sends", () => {
   });
 
   describe("from an older server that sends none", () => {
-    it("skips the limits on rules and size", () => {
+    it("skips the caps on rules and size", () => {
       const rules = Array.from({ length: 51 }, validRule);
-      expect(errorsFor(null, { rules }, noLimits)).toEqual([]);
+      expect(errorsFor(null, { rules }, withoutValidation)).toEqual([]);
       const description = "x".repeat(17 * 1024);
       expect(
-        errorsFor(null, { rules: [validRule()], description }, noLimits),
+        errorsFor(
+          null,
+          { rules: [validRule()], description },
+          withoutValidation,
+        ),
       ).toEqual([]);
       expect(
         errorsFor(
           null,
           { rules: Array.from({ length: 51 }, validRule), restrictOnly: true },
-          noLimits,
+          withoutValidation,
         ),
       ).toEqual([]);
     });
 
     it("skips the reserved names and the personal placeholder rules", () => {
       const errors = (name: string, value?: string) =>
-        errorsFor({ preset: "github" }, withPlaceholder(name, value), noLimits);
+        errorsFor(
+          { preset: "github" },
+          withPlaceholder(name, value),
+          withoutValidation,
+        );
       expect(errors("PATH")).toEqual([]);
       expect(errors("MINDROOM_TOKEN")).toEqual([]);
       expect(errors("LD_PRELOAD")).toEqual([]);
@@ -724,11 +743,11 @@ describe("the limits the server sends", () => {
       expect(errors("lowercase")).toEqual([]);
     });
 
-    it("still checks what needs no limits", () => {
+    it("still checks what needs no validation from the server", () => {
       expect(
         errorsFor({ preset: "github" }, withPlaceholder("lowercase"), {
           ...operator,
-          limits: null,
+          validation: null,
         }),
       ).toEqual(["Placeholder name lowercase must match ^[A-Z_][A-Z0-9_]*$"]);
       expect(
@@ -740,7 +759,7 @@ describe("the limits the server sends", () => {
               { name: "MY_API_KEY", value: "b" },
             ],
           },
-          noLimits,
+          withoutValidation,
         ),
       ).toEqual(["Placeholder MY_API_KEY is listed twice"]);
     });

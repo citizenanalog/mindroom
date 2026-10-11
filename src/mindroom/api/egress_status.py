@@ -137,7 +137,7 @@ class EgressOAuthProviderOption(BaseModel):
     display_name: str
 
 
-class PlaceholderLimits(BaseModel):
+class PlaceholderValidation(BaseModel):
     """The placeholder rules of a service a user defines, as the server checks them on save.
 
     A name must match `name_pattern` completely, needs one of the `credential_words` as an underscore-separated word
@@ -156,7 +156,7 @@ class PlaceholderLimits(BaseModel):
     value_pattern: str
 
 
-class EgressLimits(BaseModel):
+class EgressValidation(BaseModel):
     """What a service a user defines may hold, so the editor can refuse a service the server would refuse.
 
     `max_services` counts the services of one scope, `max_rules_per_service` the rules of one service,
@@ -167,25 +167,25 @@ class EgressLimits(BaseModel):
     max_rules_per_service: int
     max_service_bytes: int
     max_document_bytes: int
-    placeholder: PlaceholderLimits
+    placeholder: PlaceholderValidation
 
 
 class PresetsResponse(BaseModel):
-    """The built-in service presets, the OAuth providers an account login can name, and the limits of user services."""
+    """The built-in service presets, the OAuth providers an account login can name, and the user service validation."""
 
     presets: list[EgressPresetResponse]
     oauth_providers: list[EgressOAuthProviderOption]
-    limits: EgressLimits
+    validation: EgressValidation
 
 
-def _egress_limits() -> EgressLimits:
-    """Describe the limits of a user's service from the constants the broker and the config model enforce."""
-    return EgressLimits(
+def _egress_validation() -> EgressValidation:
+    """Describe how a user's service is validated, from the constants the broker and the config model enforce."""
+    return EgressValidation(
         max_services=MAX_USER_SERVICES,
         max_rules_per_service=MAX_RULES_PER_SERVICE,
         max_service_bytes=MAX_SERVICE_BYTES,
         max_document_bytes=MAX_DOCUMENT_BYTES,
-        placeholder=PlaceholderLimits(
+        placeholder=PlaceholderValidation(
             name_pattern=PLACEHOLDER_NAME.pattern,
             credential_words=list(PLACEHOLDER_NAME_WORDS),
             refused_words=list(PLACEHOLDER_REFUSED_WORDS),
@@ -201,7 +201,7 @@ def presets_response(oauth_providers: Mapping[str, OAuthProvider]) -> PresetsRes
     """List the presets as the config model expands them, so the editor shows what a `preset:` entry resolves to.
 
     `oauth_providers` is the registry (`oauth.registry`), the same one a saved service's `oauth_provider` is checked
-    against, listed in registry order. `limits` is the same for every caller.
+    against, listed in registry order. `validation` is the same for every caller.
     """
     presets = []
     for preset_id in EGRESS_PRESETS:
@@ -223,7 +223,7 @@ def presets_response(oauth_providers: Mapping[str, OAuthProvider]) -> PresetsRes
         EgressOAuthProviderOption(id=provider_id, display_name=provider.display_name)
         for provider_id, provider in oauth_providers.items()
     ]
-    return PresetsResponse(presets=presets, oauth_providers=providers, limits=_egress_limits())
+    return PresetsResponse(presets=presets, oauth_providers=providers, validation=_egress_validation())
 
 
 class AuditRecordResponse(BaseModel):

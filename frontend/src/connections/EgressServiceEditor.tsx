@@ -53,7 +53,7 @@ import { useServiceSubmit } from "./useServiceSubmit";
 import type {
   AuthoredEgressService,
   EgressCredentialService,
-  EgressLimits,
+  EgressValidation,
   EgressOAuthProviderOption,
   EgressPreset,
   EgressPresetCatalog,
@@ -132,7 +132,7 @@ export interface EgressServiceEditorProps {
 }
 
 /**
- * Form for one egress service: its preset or rules, placeholders, and limits.
+ * Form for one egress service: its preset or rules, and its placeholders.
  *
  * Used on the personal Connections page (the caller's own services) and on the
  * dashboard (services in config.yaml). It always hands back the authored form.
@@ -167,8 +167,13 @@ export function EgressServiceEditor({
   const [providers, setProviders] = useState<EgressOAuthProviderOption[]>([]);
   const [presetsFailed, setPresetsFailed] = useState(false);
   // What the server checks on save, sent with the presets; `null` until then, and when an older server does not send it.
-  const [limits, setLimits] = useState<EgressLimits | null>(null);
-  const options: EditorOptions = { context, sharedTarget, presets, limits };
+  const [validation, setValidation] = useState<EgressValidation | null>(null);
+  const options: EditorOptions = {
+    context,
+    sharedTarget,
+    presets,
+    validation,
+  };
   // Checked against the names the editor opened with: a save that is still
   // running may already have written this name into the page's own list.
   const [openedWithNames] = useState(takenNames);
@@ -282,7 +287,7 @@ export function EgressServiceEditor({
         if (controller.signal.aborted) return;
         setPresets(loaded.presets);
         setProviders(loaded.oauth_providers ?? []);
-        setLimits(loaded.limits ?? null);
+        setValidation(loaded.validation ?? null);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
@@ -548,7 +553,7 @@ export function EgressServiceEditor({
               context={context}
               scope={scope}
               sharedTarget={sharedTarget}
-              maxRules={limits?.max_rules_per_service}
+              validation={validation}
               preset={preset}
               providers={providers}
               onGithub={showGithubHelper}
@@ -583,7 +588,7 @@ export function EgressServiceEditor({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        {/* The presets bring the limits a save is checked against, so saving waits until they have loaded or failed. */}
+        {/* The presets bring the validation a save is checked against, so saving waits until they have loaded or failed. */}
         <Button
           type="submit"
           size="sm"

@@ -18055,7 +18055,7 @@ The routes that name an agent answer 404 for an unknown agent and for one the ca
 | `/api/connections/egress/agents/<agent>/<service>/connect` | POST | Start the OAuth login of the service's provider. Same checks as the key routes, with the requester-scoped exception above, then the provider's OAuth connect flow; 404 for a service without a known provider, 409 while a shared service account replaces personal accounts and 409, with a string detail, where the agent runs in a shared sandbox and the broker would not use the requester's own account there (see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes)) |
 | `/api/connections/egress/agents/<agent>/<service>/disconnect` | POST | Reset the connected account, with the same checks, the 404, and the shared-sandbox 409. It stays possible while a shared service account is configured, so an account connected earlier can be revoked |
 | `/api/connections/egress/agents/<agent>/services/<name>` | GET | 200 with one of the scope's own services as authored, so a preset stays `{"preset": "github"}` and a limit keeps `restrict_only`. 404 for a config service or a name only another scope has. Any user of the agent may read it, because a service holds no secret |
-| `/api/connections/egress/agents/<agent>/services/<name>` | PUT | Create or replace one of the scope's own services; the body has the fields of a [config service](#custom-services) except `oauth_on_shared_workers`. 204; 403 for a user who cannot manage services there; 409 when a config service has the name; 413 for a body over 16 KiB; 422 with a string detail for a body that is not a JSON object, an invalid service, or one of the limits and rules in [User services](#user-services) |
+| `/api/connections/egress/agents/<agent>/services/<name>` | PUT | Create or replace one of the scope's own services; the body has the fields of a [config service](#custom-services) except `oauth_on_shared_workers`. 204; 403 for a user who cannot manage services there; 409 when a config service has the name; 413 for a body over 16 KiB; 422 with a string detail for a body that is not a JSON object, an invalid service, or one of the caps and rules in [User services](#user-services) |
 | `/api/connections/egress/agents/<agent>/services/<name>` | DELETE | Delete one of the scope's own services together with its key, or an [inactive entry](#user-services) of either reason (a shadowed entry keeps the key, which the config service uses). 204; 403 as for PUT; 404 when the scope has no such entry; 409 for the name of a config service that has no entry of its own |
 
 **The Connections identity route.** `GET /api/connections/me` returns `{"matrix_user_id": "...", "email": "..." or null, "is_administrator": true or false}` for the signed-in user.
@@ -18096,10 +18096,10 @@ A user service routes only that scope's keys and accounts, so it cannot reach an
 **Inactive entries.**
 The broker ignores a stored entry that a config service now shadows (`shadowed`) and one that no longer validates, for example after an upgrade tightened a rule (`invalid`), but the entry stays in the scope's store.
 The personal listing reports each as `inactive_services` with its reason, and the personal page shows them under the agent as **Inactive** with the reason and a **Delete** button where the caller may manage services.
-Inactive entries count toward the limits below until they are deleted, so a scope full of them cannot take a new service.
+Inactive entries count toward the caps below until they are deleted, so a scope full of them cannot take a new service.
 Deleting a shadowed entry keeps the key, which the config service uses, and deleting an invalid entry removes its key.
 
-**Limits.** A scope can have at most 50 user services, a service at most 50 rules, a service at most 16 KiB (as stored, in its authored form), and all of a scope's services at most 256 KiB.
+**Caps.** A scope can have at most 50 user services, a service at most 50 rules, a service at most 16 KiB (as stored, in its authored form), and all of a scope's services at most 256 KiB.
 Going over one of these is a 422, except that a request body over 16 KiB is refused with 413 before its fields are checked.
 
 **User services narrow operator policy and never widen it:**
@@ -18177,7 +18177,7 @@ Both return the presets as the config model expands them:
     }
   ],
   "oauth_providers": [{"id": "github", "display_name": "GitHub"}],
-  "limits": {
+  "validation": {
     "max_services": 50,
     "max_rules_per_service": 50,
     "max_service_bytes": 16384,
@@ -18198,9 +18198,9 @@ Both return the presets as the config model expands them:
 The example is abbreviated to one preset, one rule, one provider, and a few of the `reserved_names`.
 Rules carry no auth settings, and `display_name` falls back to the preset id.
 `oauth_providers` lists the OAuth providers a service's account login can name, in registry order: the registry that a saved service's `oauth_provider` is checked against.
-`limits` is the one source of the [user service](#user-services) limits and placeholder rules the server enforces: the counts and sizes of a scope's services, and for placeholders the pattern a name must match completely, the credential words it needs, the words and prefix it may not have, the reserved names and prefixes, and the pattern a value must match completely.
+`validation` is the one source of the [user service](#user-services) caps and placeholder rules the server enforces: the counts and sizes of a scope's services, and for placeholders the pattern a name must match completely, the credential words it needs, the words and prefix it may not have, the reserved names and prefixes, and the pattern a value must match completely.
 The word lists keep the order the server's messages list them in, and the other lists are sorted, so an editor can show the server's own texts without a copy of the rules.
-The editor checks what it can before saving, and shows the server's message for the rest (a name that is taken, a limit, or a rule the server refuses).
+The editor checks what it can before saving, and shows the server's message for the rest (a name that is taken, a cap, or a rule the server refuses).
 On the personal page the placeholder fields check the user-service rules from [User services](#user-services) (the name and value patterns and the refused words) after the first save attempt, and live from then on, and the hint under them lists those rules, so a placeholder the server would reject is flagged before saving.
 The hint also says "Placeholders are set only while this service has a key or a connected account.", matching [Placeholder environment](#custom-services).
 
@@ -18209,7 +18209,7 @@ The hint also says "Placeholders are set only while this service has a key or a 
 The same editor opens in limit mode for a [`restrict_only` service](#limiting-in-place), from **Limit to repositories** (new) or **Change limit** (an existing limit). It is titled "Limit to repositories" or "Change limit", and has:
 
 - **Name**: `github-limited` (or the first free `github-limited-N`) for a new limit, fixed when changing one.
-- **Repositories**: the GitHub helper with its **GraphQL** choice, and no **Use these repositories** button, because **Save limit** applies the list. It has no **uploads.github.com** choice: a limit always limits that host to the same repositories. An empty list says "Enter at least one repository, such as owner/repo", and the usual limits on a service's rules (50) and size (16 KiB) apply, so a limit holds at most 12 `owner/repo` lines (4 rules each) or 16 `owner/*` lines (3 rules each).
+- **Repositories**: the GitHub helper with its **GraphQL** choice, and no **Use these repositories** button, because **Save limit** applies the list. It has no **uploads.github.com** choice: a limit always limits that host to the same repositories. An empty list says "Enter at least one repository, such as owner/repo", and the usual caps on a service's rules (50) and size (16 KiB) apply, so a limit holds at most 12 `owner/repo` lines (4 rules each) or 16 `owner/*` lines (3 rules each).
 - On a personal agent, the sentence that says whose services the limit also narrows: "This also limits services from your administrator on these hosts, {scope}."
 
 It has no preset, website, send, key, or **More options** fields: a limit never has a key, and **Save limit** never sends one.

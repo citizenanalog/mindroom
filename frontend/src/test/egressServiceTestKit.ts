@@ -8,7 +8,7 @@ import {
 import { validateService } from "@/connections/egressServiceValidation";
 import type {
   AuthoredEgressService,
-  EgressLimits,
+  EgressValidation,
   EgressPreset,
   EgressRule,
 } from "@/connections/types";
@@ -19,24 +19,24 @@ type Options = EditorOptions;
 
 export const presets = egressPresets.presets as EgressPreset[];
 // What the server sends with the presets; typing it checks the fixture has the shape the editor reads.
-export const limits: EgressLimits = egressPresets.limits;
+export const validation: EgressValidation = egressPresets.validation;
 export const personal: Options = {
   context: "personal",
   sharedTarget: false,
   presets,
-  limits,
+  validation,
 };
 export const sharedPersonal: Options = {
   context: "personal",
   sharedTarget: true,
   presets,
-  limits,
+  validation,
 };
 export const operator: Options = {
   context: "operator",
   sharedTarget: false,
   presets,
-  limits,
+  validation,
 };
 export const newService = { editing: false, takenNames: [] as string[] };
 

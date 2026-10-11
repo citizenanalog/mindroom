@@ -121,7 +121,7 @@ function InactiveServiceRow({
 
 /**
  * Entries in the agent's own store that the broker ignores, with why, so they
- * do not sit there unseen while still counting toward the limits.
+ * do not sit there unseen while still counting toward the caps.
  *
  * Without `onDelete` the entries are listed only: the viewer cannot manage them.
  */

@@ -7,10 +7,14 @@ import {
   type EgressServiceForm,
   type PlaceholderForm,
 } from "./egressServiceForm";
+import {
+  operatorPlaceholderHint,
+  personalPlaceholderHint,
+} from "./egressPlaceholderRules";
 import { configPlaceholderWarning } from "./egressServiceNotes";
 import { placeholderField } from "./egressServiceValidation";
 import { errorClass, warningClass } from "./EgressRuleFields";
-import type { EgressPreset } from "./types";
+import type { EgressPlaceholderValidation, EgressPreset } from "./types";
 
 /**
  * The placeholder variables of a service: what they are for, the rules for
@@ -24,6 +28,7 @@ export function PlaceholderRows({
   disabled,
   context,
   preset,
+  validation,
   configPlaceholders,
 }: {
   form: EgressServiceForm;
@@ -32,6 +37,8 @@ export function PlaceholderRows({
   disabled: boolean;
   context: EditorContext;
   preset: EgressPreset | undefined;
+  /** The server's placeholder rules the hint spells out; `null` until they load or when the server sends none. */
+  validation: EgressPlaceholderValidation | null;
   /** Variable name to the display name of the administrator's service that sets it. */
   configPlaceholders: Readonly<Record<string, string>>;
 }) {
@@ -60,8 +67,8 @@ export function PlaceholderRows({
         </p>
         <p className="text-xs text-muted-foreground">
           {context === "personal"
-            ? "Names use capital letters, digits, and underscores, and one word between underscores must be TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL (for example MY_API_KEY). No word may be COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS, and names cannot start with SSH_, MINDROOM_, or GIT_CONFIG_. PATH, HOME, and proxy and CA variables are reserved. Values are 1 to 256 letters, digits, or . _ : -"
-            : "Names use capital letters, digits, and underscores. PATH, HOME, proxy and CA variables, and names starting with MINDROOM_ or GIT_CONFIG_ are reserved."}
+            ? personalPlaceholderHint(validation)
+            : operatorPlaceholderHint(validation)}
         </p>
       </div>
       {form.placeholders.map((placeholder, index) => {

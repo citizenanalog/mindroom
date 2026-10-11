@@ -25,7 +25,7 @@ import type {
 // The JSON fixture types each placeholder_env by its own keys.
 const presets = egressPresets.presets as EgressPreset[];
 const providers = egressPresets.oauth_providers;
-const limits = egressPresets.limits;
+const validation = egressPresets.validation;
 
 const bearerRule: EgressRule = {
   host: "api.example.com",
@@ -38,7 +38,7 @@ const baseProps = () => ({
   loadPresets: vi.fn(async () => ({
     presets,
     oauth_providers: providers,
-    limits,
+    validation,
   })),
   onSave: vi.fn(async () => undefined),
   onCancel: vi.fn(),
@@ -345,11 +345,68 @@ describe("the editor form", () => {
       "No word may be COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS",
     );
     expect(hint).toHaveTextContent(
-      "names cannot start with SSH_, MINDROOM_, or GIT_CONFIG_",
+      "names cannot start with SSH_, GIT_CONFIG_, or MINDROOM_",
     );
     expect(hint).toHaveTextContent(
       "PATH, HOME, and proxy and CA variables are reserved",
     );
+  });
+
+  it("names every word, prefix, and value length the server sends in the hint", async () => {
+    await renderEditor();
+    openMoreOptions();
+    const hint = screen.getByText(/one word between underscores must be/);
+    const { placeholder } = validation;
+    for (const word of [
+      ...placeholder.credential_words,
+      ...placeholder.refused_words,
+      placeholder.refused_prefix,
+      ...placeholder.reserved_prefixes,
+    ])
+      expect(hint).toHaveTextContent(
+        new RegExp(`(?<![A-Z0-9_])${word}(?![A-Z0-9_])`),
+      );
+    expect(hint).toHaveTextContent("Values are 1 to 256 letters");
+  });
+
+  it("builds the hint from the rules the server sends, not from a copy", async () => {
+    await renderEditor({
+      loadPresets: vi.fn(async () => ({
+        presets,
+        validation: {
+          ...validation,
+          placeholder: {
+            ...validation.placeholder,
+            credential_words: ["SECRET", "TICKET"],
+            refused_words: ["SCRIPT"],
+            refused_prefix: "SUDO_",
+            reserved_prefixes: ["ACME_"],
+            value_pattern: "[a-z]{2,9}",
+          },
+        },
+      })),
+    });
+    openMoreOptions();
+    const hint = screen.getByText(/one word between underscores must be/);
+    expect(hint).toHaveTextContent("must be SECRET or TICKET");
+    expect(hint).toHaveTextContent("No word may be SCRIPT, and");
+    expect(hint).toHaveTextContent("names cannot start with SUDO_ or ACME_.");
+    expect(hint).toHaveTextContent("Values are 2 to 9 letters");
+    expect(hint).not.toHaveTextContent("TOKEN");
+    expect(hint).not.toHaveTextContent("SSH_");
+  });
+
+  it("gives a short hint without the lists when the server sends no rules", async () => {
+    await renderEditor({
+      loadPresets: vi.fn(async () => ({ presets })),
+    });
+    openMoreOptions();
+    const hint = screen.getByText(/The server checks the rest when you save/);
+    expect(hint).toHaveTextContent(
+      "Names use capital letters, digits, and underscores, and must name a credential, such as MY_API_KEY.",
+    );
+    expect(hint).not.toHaveTextContent("TOKEN");
+    expect(hint).not.toHaveTextContent("MINDROOM_");
   });
 
   it("refuses a placeholder the server would, and says why", async () => {
@@ -394,9 +451,21 @@ describe("the editor form", () => {
     await renderEditor({ context: "operator" });
     openMoreOptions();
     expect(
-      screen.getByText(/MINDROOM_ or GIT_CONFIG_ are reserved/),
+      screen.getByText(/GIT_CONFIG_ or MINDROOM_ are reserved/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/must be TOKEN, KEY/)).toBeNull();
+  });
+
+  it("gives the operator a short hint without the prefixes when the server sends no rules", async () => {
+    await renderEditor({
+      context: "operator",
+      loadPresets: vi.fn(async () => ({ presets })),
+    });
+    openMoreOptions();
+    expect(
+      screen.getByText(/Some names, such as PATH and HOME, are reserved/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/MINDROOM_/)).toBeNull();
   });
 
   it("adds a placeholder with the brokered value and saves it", async () => {
@@ -921,7 +990,7 @@ describe("loading the presets", () => {
   });
 });
 
-describe("the limit on rules from the server", () => {
+describe("the rule cap from the server", () => {
   const twoRules = {
     rules: [bearerRule, { ...bearerRule, host: "b.example.com" }],
   };
@@ -936,7 +1005,7 @@ describe("the limit on rules from the server", () => {
   it("stops adding rules at the most the server takes", async () => {
     await editWith({
       presets,
-      limits: { ...limits, max_rules_per_service: 2 },
+      validation: { ...validation, max_rules_per_service: 2 },
     });
     expect(addRule()).toBeDisabled();
   });
@@ -944,14 +1013,14 @@ describe("the limit on rules from the server", () => {
   it("keeps adding rules below it, up to it", async () => {
     await editWith({
       presets,
-      limits: { ...limits, max_rules_per_service: 3 },
+      validation: { ...validation, max_rules_per_service: 3 },
     });
     expect(addRule()).toBeEnabled();
     fireEvent.click(addRule());
     expect(addRule()).toBeDisabled();
   });
 
-  it("leaves the count to the server when it sends no limits", async () => {
+  it("leaves the count to the server when it sends no validation", async () => {
     await editWith({ presets });
     expect(addRule()).toBeEnabled();
   });
@@ -2581,14 +2650,14 @@ describe("typed repositories after the preset changes", () => {
   });
 });
 
-/** Wait until the limit form can be saved: the presets, which bring the limits, have loaded or failed. */
+/** Wait until the limit form can be saved: the presets, which bring the validation, have loaded or failed. */
 const limitSavable = () =>
   waitFor(() =>
     expect(screen.getByRole("button", { name: "Save limit" })).toBeEnabled(),
   );
 
 describe("a limit: a service that only restricts GitHub repositories", () => {
-  /** The limit form has no preset, but it waits for the limits the presets bring. */
+  /** The limit form has no preset, but it waits for the validation the presets bring. */
   const renderEditor = async (
     props: Partial<EgressServiceEditorProps> = {},
   ) => {
@@ -2676,7 +2745,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     expect(onSave).not.toHaveBeenCalled();
   });
 
-  it("waits for the presets, which bring the limits, before it can be saved", async () => {
+  it("waits for the presets, which bring the validation, before it can be saved", async () => {
     const loadPresets = vi.fn(() => new Promise<EgressPresetCatalog>(() => {}));
     render(
       <EgressServiceEditor
