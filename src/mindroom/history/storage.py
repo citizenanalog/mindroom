@@ -538,7 +538,8 @@ def _remove_redacted_event_from_compaction(
             session_id=session.session_id,
             scope_key=scope.key,
             hit=hit,
-            live_run_ids=live_run_ids,
+            # A snapshot of a removed run is undone with it; the live runs left are older ones compaction skipped.
+            live_run_ids=() if (archive.snapshot_origin(hit.run_id) or hit.run_id) in removed_run_ids else live_run_ids,
         )
     elif not removed_live_run:
         return False
@@ -574,13 +575,9 @@ def remove_runs_for_sources(
     hit = archive.earliest_archived_run(storage, session_id=session_id, scope_key=scope.key, run_ids=removed_run_ids)
     session = storage.get_session(session_id=session_id, session_type=session_type)
     if hit is not None and isinstance(session, (AgentSession, TeamSession)):
-        archive.roll_back_to(
-            storage,
-            session_id=session_id,
-            scope_key=scope.key,
-            hit=hit,
-            live_run_ids=[run.run_id for run in session.runs or [] if run.run_id],
-        )
+        # The removed runs were the newest, so the live runs left are older ones compaction skipped, such as a
+        # pending approval.
+        archive.roll_back_to(storage, session_id=session_id, scope_key=scope.key, hit=hit, live_run_ids=())
         _sync_after_history_removal(storage, session, scope)
     return True
 

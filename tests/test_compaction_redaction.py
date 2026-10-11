@@ -580,6 +580,35 @@ def test_redacting_a_turn_compacted_again_after_an_undone_compaction_keeps_runs_
     assert stored.summary is None
 
 
+@pytest.mark.parametrize("removal", ["edit", "redaction"])
+def test_removing_a_turn_that_compacted_mid_turn_keeps_an_older_paused_run(storage: SqliteDb, removal: str) -> None:
+    """A pending approval that compaction skipped survives undoing the compaction of a later turn."""
+    paused = _run("p")
+    paused.status = RunStatus.paused
+    live = _live_run_with(["$x"], reply="$reply")
+    session = seed_session(
+        storage,
+        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), paused, live]),
+    )
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="r1 and early x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[*(run for run in session.runs or [] if run.run_id == "r1"), _snapshot_of(live, ["$x"])],
+    )
+
+    if removal == "edit":
+        assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
+    else:
+        assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$reply") is True
+
+    stored = _stored(storage)
+    assert sorted(run.run_id or "" for run in stored.runs or []) == ["p", "r1"]
+    assert stored.summary is None
+
+
 def _team_run(run_id: str, *, parent_run_id: str | None = None) -> TeamRunOutput:
     return TeamRunOutput(
         run_id=run_id,
