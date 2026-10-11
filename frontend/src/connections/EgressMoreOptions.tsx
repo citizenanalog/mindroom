@@ -2,12 +2,20 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { administratorLimitNote } from "./accountCopy";
 import {
+  operatorPlaceholderHint,
+  personalPlaceholderHint,
+} from "./egressPlaceholderRules";
+import {
+  BROKERED_PLACEHOLDER,
   type EditorContext,
   type EgressServiceForm,
+  type PlaceholderForm,
   type RuleForm,
   emptyRule,
   usesOwnRules,
 } from "./egressServiceForm";
+import { configPlaceholderWarning } from "./egressServiceNotes";
+import { placeholderField } from "./egressServiceValidation";
 import {
   ExtraRule,
   Field,
@@ -16,8 +24,8 @@ import {
   errorClass,
   inputClass,
   selectClass,
+  warningClass,
 } from "./EgressRuleFields";
-import { PlaceholderRows } from "./EgressPlaceholderRows";
 import type {
   EgressOAuthProviderOption,
   EgressPreset,
@@ -95,6 +103,7 @@ export function MoreOptions({
   providers: readonly EgressOAuthProviderOption[];
   /** The service is on GitHub, so the help adds what GraphQL does. */
   onGithub: boolean;
+  /** Variable name to the display name of the administrator's service that sets it. */
   configPlaceholders: Readonly<Record<string, string>>;
   ruleEditing: (index: number, rule: RuleForm) => RuleEditing;
   /** The service is being added, so an empty display name is saved as its host; an edited one keeps none. */
@@ -109,6 +118,14 @@ export function MoreOptions({
       ? `Leave empty to use ${primaryHost}.`
       : undefined;
   const rulesProblem = problemAt("rules");
+  // The server's placeholder rules the hint spells out; `null` until they load or when they could not be loaded.
+  const placeholderRules = validation?.placeholder ?? null;
+  const setPlaceholder = (index: number, placeholder: PlaceholderForm) =>
+    set({
+      placeholders: form.placeholders.map((existing, i) =>
+        i === index ? placeholder : existing,
+      ),
+    });
   const loginField = preset?.oauth_provider ? (
     <p className="text-xs text-muted-foreground">
       {sharedTarget
@@ -265,16 +282,121 @@ export function MoreOptions({
 
       {loginField}
 
-      <PlaceholderRows
-        form={form}
-        set={set}
-        problemAt={problemAt}
-        disabled={disabled}
-        context={context}
-        preset={preset}
-        validation={validation?.placeholder ?? null}
-        configPlaceholders={configPlaceholders}
-      />
+      {/* The placeholder variables: what they are for, the rules for their names, one row each with its problem or warning. */}
+      <div className="space-y-3">
+        <div className="space-y-1">
+          <h4 className="text-sm font-medium">Placeholder variables</h4>
+          <p className="text-xs text-muted-foreground">
+            Environment variables set in the agent's sandbox so tools find a key
+            to send. Use a fixed value such as {BROKERED_PLACEHOLDER}; the
+            broker swaps in the real key. Placeholders are set only while this
+            service has a key or a connected account.
+            {preset
+              ? form.explicitlyEmpty.placeholders
+                ? ` This service sets none, which drops the placeholders of the ${preset.display_name} preset.`
+                : ` Leave the list empty to use the placeholders of the ${preset.display_name} preset.`
+              : ""}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {context === "personal"
+              ? personalPlaceholderHint(placeholderRules)
+              : operatorPlaceholderHint(placeholderRules)}
+          </p>
+        </div>
+        {form.placeholders.map((placeholder, index) => {
+          const nameError = problemAt(placeholderField(index, "name"));
+          const valueError = problemAt(placeholderField(index, "value"));
+          const warning = nameError
+            ? null
+            : configPlaceholderWarning(placeholder.name, configPlaceholders);
+          const nameNoteId = `${id}-placeholder-${index}-name-note`;
+          const valueNoteId = `${id}-placeholder-${index}-value-note`;
+          return (
+            <div key={index} className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  aria-label={`Placeholder ${index + 1} name`}
+                  aria-invalid={nameError ? true : undefined}
+                  aria-describedby={
+                    nameError || warning ? nameNoteId : undefined
+                  }
+                  placeholder="MY_API_KEY"
+                  className="h-9 w-56 font-mono text-xs aria-invalid:border-destructive"
+                  value={placeholder.name}
+                  disabled={disabled}
+                  onChange={(event) =>
+                    setPlaceholder(index, {
+                      ...placeholder,
+                      name: event.target.value,
+                    })
+                  }
+                />
+                <Input
+                  aria-label={`Placeholder ${index + 1} value`}
+                  aria-invalid={valueError ? true : undefined}
+                  aria-describedby={valueError ? valueNoteId : undefined}
+                  className="h-9 w-56 font-mono text-xs aria-invalid:border-destructive"
+                  value={placeholder.value}
+                  disabled={disabled}
+                  onChange={(event) =>
+                    setPlaceholder(index, {
+                      ...placeholder,
+                      value: event.target.value,
+                    })
+                  }
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  aria-label={`Remove placeholder ${index + 1}`}
+                  disabled={disabled}
+                  onClick={() =>
+                    set({
+                      placeholders: form.placeholders.filter(
+                        (_, i) => i !== index,
+                      ),
+                    })
+                  }
+                >
+                  Remove
+                </Button>
+              </div>
+              {nameError && (
+                <p id={nameNoteId} className={errorClass}>
+                  {nameError}
+                </p>
+              )}
+              {warning && (
+                <p id={nameNoteId} className={warningClass}>
+                  {warning}
+                </p>
+              )}
+              {valueError && (
+                <p id={valueNoteId} className={errorClass}>
+                  {valueError}
+                </p>
+              )}
+            </div>
+          );
+        })}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={disabled}
+          onClick={() =>
+            set({
+              placeholders: [
+                ...form.placeholders,
+                { name: "", value: BROKERED_PLACEHOLDER },
+              ],
+            })
+          }
+        >
+          Add placeholder
+        </Button>
+      </div>
     </div>
   );
 }
