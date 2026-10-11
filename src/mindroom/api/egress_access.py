@@ -58,7 +58,7 @@ def unprocessable(detail: str) -> HTTPException:
     return HTTPException(422, detail, headers=CONNECTIONS_HEADERS)
 
 
-def require_same_origin(request: Request) -> None:
+def require_egress_same_origin(request: Request) -> None:
     """Reject a mutation from another origin before any authorization lookup."""
     require_connections_same_origin(
         request,
@@ -101,6 +101,7 @@ def check_agent_eligibility(
     return is_shared, can_manage
 
 
+# Private although the resolvers below return it: callers only read its fields, so no other module imports the name.
 @dataclass(frozen=True)
 class _ResolvedAgent:
     """An agent the requester may use, with the worker target their credentials and services live under."""

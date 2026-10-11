@@ -1,4 +1,7 @@
-"""Personal egress API services: read, save, and delete the services an agent's scope defines for itself."""
+"""Personal egress API services: read, save, and delete the services an agent's scope defines for itself.
+
+`egress_credentials.py` mounts this router under `/api/connections/egress`, so its paths are relative to that.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ from pydantic import ValidationError
 from mindroom.api.connection_agents import CONNECTIONS_HEADERS
 from mindroom.api.egress_access import (
     EgressUser,
-    require_same_origin,
+    require_egress_same_origin,
     resolve_agent,
     resolve_service_editor,
     unprocessable,
@@ -109,7 +112,7 @@ def put_user_service(
     an invalid service, a limit (count or size), a placeholder user services may not set, an unknown OAuth provider
     or one on a shared or unscoped agent, or rules on hosts that `unmatched_hosts: deny` keeps closed.
     """
-    require_same_origin(request)
+    require_egress_same_origin(request)
     agent = resolve_service_editor(request, requester_id, agent_name)
     operator = agent.config.egress_broker
     if name in operator.services:
@@ -144,7 +147,7 @@ def delete_user_service_route(
     has since taken keeps the key, which the config service uses, and one that no longer validates takes its key
     with it.
     """
-    require_same_origin(request)
+    require_egress_same_origin(request)
     agent = resolve_service_editor(request, requester_id, agent_name)
     operator = agent.config.egress_broker
     manager = get_runtime_credentials_manager(agent.runtime_paths)

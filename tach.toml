@@ -1721,7 +1721,7 @@ depends_on = [
     "mindroom.api.egress_keys",
     "mindroom.api.egress_listing",
     "mindroom.api.egress_logs",
-    "mindroom.api.egress_services",
+    "mindroom.api.egress_user_services",
 ]
 
 [[modules]]
@@ -1748,7 +1748,6 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.egress_keys"
 depends_on = [
-    "mindroom.api.connection_agents",
     "mindroom.api.egress_access",
     "mindroom.api.egress_status",
     "mindroom.credentials.manager",
@@ -1778,7 +1777,7 @@ depends_on = [
 ]
 
 [[modules]]
-path = "mindroom.api.egress_services"
+path = "mindroom.api.egress_user_services"
 depends_on = [
     "mindroom.api.connection_agents",
     "mindroom.api.egress_access",

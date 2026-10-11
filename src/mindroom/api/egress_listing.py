@@ -1,4 +1,7 @@
-"""Personal egress API listing: every agent the user may use with its services, and the preset catalog."""
+"""Personal egress API listing: every agent the user may use with its services, and the preset catalog.
+
+`egress_credentials.py` mounts this router under `/api/connections/egress`, so its paths are relative to that.
+"""
 
 from __future__ import annotations
 
@@ -169,6 +172,7 @@ async def _personal_oauth_status(
             ),
         )
     except Exception as exc:
+        # OAuth provider code, plugin providers included, can raise anything.
         logger.warning(
             "egress_oauth_status_unavailable",
             service=service_name,

@@ -25,8 +25,8 @@ from mindroom.api import (
     connections,
     egress_listing,
     egress_logs,
-    egress_services,
     egress_status,
+    egress_user_services,
     main,
     oauth,
 )
@@ -1630,7 +1630,7 @@ def test_user_service_body_over_16_kib_is_413_before_validation(
 ) -> None:
     """An oversized body, such as a huge rules list, is refused before the service model validates any of it."""
     parsed: list[object] = []
-    monkeypatch.setattr(egress_services, "_parse_user_service", parsed.append)
+    monkeypatch.setattr(egress_user_services, "_parse_user_service", parsed.append)
     huge_rules = {"rules": [{"host": f"h{i}.example.com", "auth": {"type": "bearer"}} for i in range(2000)]}
     for body in (huge_rules, {**_NOTES, "description": "x" * 17_000}):
         response = _put_service(egress_portal, "alice", "personal", "notes", body)

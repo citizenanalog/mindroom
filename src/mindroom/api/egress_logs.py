@@ -1,4 +1,7 @@
-"""Personal egress API request log: the caller's own brokered requests."""
+"""Personal egress API request log: the caller's own brokered requests.
+
+`egress_credentials.py` mounts this router under `/api/connections/egress`, so its paths are relative to that.
+"""
 
 from __future__ import annotations
 
