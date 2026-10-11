@@ -102,24 +102,28 @@ class UpstreamCA:
         """Return a client context that trusts only this CA."""
         return ssl.create_default_context(cadata=self.pem)
 
-    def server_context(self, directory: Path) -> ssl.SSLContext:
-        """Issue a certificate for ``localhost`` and 127.0.0.1 and return a server context serving it."""
+    def server_context(
+        self,
+        directory: Path,
+        *,
+        name: str = "localhost",
+        with_loopback_ip: bool = True,
+    ) -> ssl.SSLContext:
+        """Issue a certificate for `name` (and 127.0.0.1 unless told not to) and return a server context serving it."""
         key = ec.generate_private_key(ec.SECP256R1())
         now = datetime.now(UTC)
+        names: list[x509.GeneralName] = [x509.DNSName(name)]
+        if with_loopback_ip:
+            names.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
         cert = (
             x509.CertificateBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
             .issuer_name(self.cert.subject)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - timedelta(hours=1))
             .not_valid_after(now + timedelta(days=1))
-            .add_extension(
-                x509.SubjectAlternativeName(
-                    [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))],
-                ),
-                critical=False,
-            )
+            .add_extension(x509.SubjectAlternativeName(names), critical=False)
             # Python 3.13 default contexts verify strictly and require the key identifiers.
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key()), critical=False)
             .sign(self.key, hashes.SHA256())
