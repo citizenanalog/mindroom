@@ -181,9 +181,8 @@ class TestEmptyDirectoryIncludes:
         assert before.uses_includes is False
         path.write_text(include_source, encoding="utf-8")
         monkeypatch.setattr(
-            ConfigManagerTools,
-            "_configuration_mutation_authorization_error",
-            staticmethod(lambda _config: None),
+            "mindroom.custom_tools.config_manager.platform_administrator_error",
+            lambda _config, _message: None,
         )
         manager = ConfigManagerTools(runtime_paths)
 
@@ -325,7 +324,7 @@ class TestEmptyDirectoryIncludes:
         """The dashboard receives the include warning when only the root was read."""
         main.initialize_api_app(main.app, empty_include_runtime_paths)
         assert config_lifecycle.load_config_into_app(empty_include_runtime_paths, main.app) is True
-        client = TestClient(main.app)
+        client = TestClient(main.app, base_url="http://localhost")
 
         response = client.post("/api/config/load")
 
@@ -1176,7 +1175,7 @@ class TestIncludeAwareSnapshots:
         """/api/config/load exposes the includes flag so clients can warn before a save."""
         main.initialize_api_app(main.app, split_runtime_paths)
         assert config_lifecycle.load_config_into_app(split_runtime_paths, main.app) is True
-        client = TestClient(main.app)
+        client = TestClient(main.app, base_url="http://localhost")
 
         response = client.post("/api/config/load")
 

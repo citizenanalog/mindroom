@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from agno.tools.function import ToolResult
 
-from mindroom.attachments import register_image_bytes_attachment
+from mindroom.attachments import register_bytes_attachment
 from mindroom.tool_system.runtime_context import append_tool_runtime_attachment_id, get_tool_runtime_context
 
 
@@ -31,9 +31,10 @@ def _retain_tool_media(result: object) -> object:  # noqa: PLR0911
         return result
     attachment_id = f"att_{uuid4().hex[:16]}"
     extension = ".png" if image.mime_type == "image/png" else ".jpg"
-    record = register_image_bytes_attachment(
+    record = register_bytes_attachment(
         context.storage_path,
         image.content,
+        kind="image",
         attachment_id=attachment_id,
         filename=f"viewed-image{extension}",
         mime_type=image.mime_type,
@@ -55,6 +56,6 @@ def finalize_tool_media(result: object) -> object:
     context = get_tool_runtime_context()
     if context is None:
         return result
-    from mindroom.provider_media_fallback import guard_tool_image_result  # noqa: PLC0415
+    from mindroom.providers.media_fallback import guard_tool_image_result  # noqa: PLC0415
 
     return guard_tool_image_result(_retain_tool_media(result), context=context)

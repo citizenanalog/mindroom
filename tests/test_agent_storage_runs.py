@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -497,6 +498,18 @@ def test_delete_runs_scrubs_legacy_blob_descendants_too(tmp_path: Path) -> None:
     assert [run["run_id"] for run in json.loads(blob)] == ["team2"]
 
 
+def test_runs_without_removes_every_descendant() -> None:
+    """Grandchildren leave with their root even when stored before it."""
+    runs = [
+        RunOutput(run_id="unrelated"),
+        RunOutput(run_id="child", parent_run_id="root"),
+        RunOutput(run_id="grandchild", parent_run_id="child"),
+        RunOutput(run_id="root"),
+    ]
+
+    assert [run.run_id for run in runs_without(runs, ["root"])] == ["unrelated"]
+
+
 def test_runs_without_drops_a_child_that_has_no_run_id() -> None:
     """A descendant is identified by its parent_run_id even when it never got a run_id of its own."""
     root = TeamRunOutput(run_id="root", team_id="eng", session_id="t1")
@@ -551,6 +564,9 @@ def test_cache_diagnostics_count_history_without_retaining_closed_adapters(
 
     from mindroom import agent_storage  # noqa: PLC0415
 
+    # Scope diagnostics to this test's adapters; other tests may retain an
+    # otherwise unreachable Agno adapter cycle until the next GC collection.
+    monkeypatch.setattr(agent_storage, "_CACHE_DIAGNOSTICS", weakref.WeakKeyDictionary())
     monkeypatch.setattr(agent_storage, "_CACHE_DIAGNOSTICS_NEXT_REPORT", 0.0, raising=False)
     first = _storage(tmp_path / "first")
     second = _storage(tmp_path / "second")

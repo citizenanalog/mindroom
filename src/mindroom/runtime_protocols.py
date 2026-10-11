@@ -9,7 +9,9 @@ if TYPE_CHECKING:
 
     import nio
 
+    from mindroom.agent_cli.session import TurnToolRegistry
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+    from mindroom.automations.runner import AutomationRunner
     from mindroom.bot import AgentBot, TeamBot
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
     from mindroom.hooks import HookMatrixAdmin, HookMessageSender, HookRoomStatePutter, HookRoomStateQuerier
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.response_admission import ResponseAdmissionGate
+    from mindroom.skill_learning.runner import SkillReviewRunner
     from mindroom.tool_system.plugins import PluginReloadResult
 
 __all__ = [
@@ -53,6 +56,15 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     def knowledge_refresh_scheduler(self) -> KnowledgeRefreshScheduler: ...  # noqa: D102
 
     @property
+    def agent_cli_registry(self) -> TurnToolRegistry: ...  # noqa: D102
+
+    @property
+    def skill_reviews(self) -> SkillReviewRunner: ...  # noqa: D102
+
+    @property
+    def automations(self) -> AutomationRunner: ...  # noqa: D102
+
+    @property
     def agent_reply_memberships(self) -> AgentReplyMembershipIndex: ...  # noqa: D102
 
     def hook_message_sender(self) -> HookMessageSender | None: ...  # noqa: D102
@@ -62,6 +74,10 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     def hook_room_state_putter(self) -> HookRoomStatePutter | None: ...  # noqa: D102
 
     def hook_matrix_admin(self) -> HookMatrixAdmin | None: ...  # noqa: D102
+
+    def running_entity_client(self, entity_name: str) -> nio.AsyncClient | None:
+        """Return the Matrix client of one running managed entity."""
+        ...
 
     def reload_plugins_now(self, *, source: str) -> Awaitable[PluginReloadResult]: ...  # noqa: D102
 
@@ -75,10 +91,6 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
 
     def desktop_controller_identity(self, entity_name: str) -> DesktopControllerIdentity:
         """Resolve the current running bot's already-owned Matrix device pin."""
-        ...
-
-    def request_interrupted_turn_recovery(self, entity_name: str, room_id: str) -> None:
-        """Notify existing fleet recovery that a settled interruption needs scanning."""
         ...
 
     def handle_bot_ready(self, bot: AgentBot | TeamBot) -> Awaitable[None]:

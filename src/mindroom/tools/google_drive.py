@@ -8,6 +8,7 @@ from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     display_name="Google Drive",
     description="Search, read, upload, and organize files in Google Drive",
     category=ToolCategory.PRODUCTIVITY,
+    file_access=ToolFileAccess.AGENT,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.OAUTH,
     requires_primary_runtime=True,
@@ -78,6 +80,14 @@ if TYPE_CHECKING:
             default=10485760,
             description="Maximum non-Google-Workspace file size to read in bytes.",
         ),
+        ConfigField(
+            name="max_download_size",
+            label="Max Download Size",
+            type="number",
+            required=False,
+            default=104857600,
+            description="Maximum file or export size to download into the agent workspace in bytes.",
+        ),
     ],
     managed_init_args=(
         ToolManagedInitArg.RUNTIME_PATHS,
@@ -85,6 +95,7 @@ if TYPE_CHECKING:
         ToolManagedInitArg.WORKER_TARGET,
         ToolManagedInitArg.RUNTIME_CONFIG,
         ToolManagedInitArg.TOOL_OUTPUT_WORKSPACE_ROOT,
+        ToolManagedInitArg.FILE_ACCESS,
     ),
     dependencies=[
         "google-api-python-client",

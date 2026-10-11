@@ -24,7 +24,7 @@ from agno.session.agent import AgentSession
 from agno.session.team import TeamSession
 from structlog.testing import capture_logs
 
-from mindroom import ai_runtime, model_loading
+from mindroom import ai_runtime
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.agent_storage import create_state_storage, get_agent_session
 from mindroom.ai import _PreparedAgentRun, ai_response, stream_agent_response
@@ -34,7 +34,7 @@ from mindroom.ai_runtime import (
     register_queued_notice_storage,
 )
 from mindroom.bot_runtime_view import BotRuntimeState
-from mindroom.coalescing_batch import (
+from mindroom.coalescing.batch import (
     CoalescingKey,
     RequesterCoalescingOwner,
     active_follow_up_coalescing_key,
@@ -77,6 +77,7 @@ from mindroom.post_response_effects import (
     apply_post_response_effects,
 )
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
+from mindroom.providers import model_loading
 from mindroom.response_lifecycle import ResponseLifecycleCoordinator, _QueuedMessageState
 from mindroom.response_payload_preparation import DispatchPayloadInputs, ResponsePayloadPreparation
 from mindroom.response_runner import (
@@ -483,6 +484,13 @@ class _FakeResponseModel:
         del messages
         yield ModelResponse(content="ok")
 
+    async def _aprocess_model_response(self, **_kwargs: object) -> None:
+        return
+
+    async def aprocess_response_stream(self, **_kwargs: object) -> AsyncIterator[ModelResponse]:
+        return
+        yield  # pragma: no cover - unreachable, keeps this an async generator
+
 
 class _FakeModel(_FakeResponseModel):
     def format_function_call_results(
@@ -551,7 +559,7 @@ def test_queued_message_state_tracks_source_event_ids_idempotently() -> None:
 
 
 def test_active_follow_up_batch_prompt_uses_queued_receive_order() -> None:
-    """Target-scoped active follow-up batches should preserve timeline order and senders."""
+    """Target-scoped active follow-up batches should preserve timeline order and per-message tags."""
     room = nio.MatrixRoom("!room:localhost", "@mindroom_general:localhost")
     pending_events = [
         make_pending_event(
@@ -569,21 +577,21 @@ def test_active_follow_up_batch_prompt_uses_queued_receive_order() -> None:
         ),
         make_pending_event(
             PreparedIngress(
-                sender="@bob:localhost",
-                event_id="$b1",
-                body="B <context> & more",
-                source={"content": {"body": "B <context> & more"}},
+                sender="@alice:localhost",
+                event_id="$a2",
+                body="A <context> & more",
+                source={"content": {"body": "A <context> & more"}},
                 server_timestamp=2,
             ),
             room,
-            requester_user_id="@bob:localhost",
+            requester_user_id="@alice:localhost",
             source_kind=MESSAGE_SOURCE_KIND,
             dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
         ),
         make_pending_event(
             PreparedIngress(
                 sender="@alice:localhost",
-                event_id="$a2",
+                event_id="$a3",
                 body="A follow-up",
                 source={"content": {"body": "A follow-up"}},
                 server_timestamp=3,
@@ -600,20 +608,20 @@ def test_active_follow_up_batch_prompt_uses_queued_receive_order() -> None:
         pending_events,
     )
 
-    assert batch.handled_turn.source_event_ids == ("$a1", "$b1", "$a2")
+    assert batch.handled_turn.source_event_ids == ("$a1", "$a2", "$a3")
     assert batch.requester_user_id == "@alice:localhost"
     assert batch.handled_turn.source_event_prompts == {
         "$a1": "A first",
-        "$b1": "B <context> & more",
-        "$a2": "A follow-up",
+        "$a2": "A <context> & more",
+        "$a3": "A follow-up",
     }
     assert batch.event.body == (
         "Messages arrived while the previous response was still running. "
         "They are in chat timeline order. Respond once to the combined context:\n\n"
         "<queued_messages>\n"
         '<msg event_id="$a1" from="@alice:localhost"><![CDATA[A first]]></msg>\n'
-        '<msg event_id="$b1" from="@bob:localhost"><![CDATA[B <context> & more]]></msg>\n'
-        '<msg event_id="$a2" from="@alice:localhost"><![CDATA[A follow-up]]></msg>\n'
+        '<msg event_id="$a2" from="@alice:localhost"><![CDATA[A <context> & more]]></msg>\n'
+        '<msg event_id="$a3" from="@alice:localhost"><![CDATA[A follow-up]]></msg>\n'
         "</queued_messages>"
     )
 
@@ -3639,7 +3647,7 @@ def test_create_team_instance_installs_notice_hook_on_team_model(tmp_path: Path)
             config=config,
             execution_identity=None,
         ) as scope_context,
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.teams.Team", side_effect=lambda **kwargs: SimpleNamespace(model=kwargs["model"])),
         queued_message_signal_context(_StaticQueuedState(pending=True)),
     ):

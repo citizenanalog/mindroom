@@ -9,14 +9,11 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
-from google.auth import exceptions as google_auth_exceptions
-from google.auth.transport.requests import Request as GoogleRequest
-from google.oauth2 import id_token as google_id_token
-from requests import exceptions as requests_exceptions
 
 from mindroom.background_tasks import run_blocking_until_complete
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.logging_config import get_logger
+from mindroom.matrix.provisioning_env import local_client_headers
 from mindroom.oauth.providers import (
     RUNTIME_BOOTSTRAPPED_CLIENT_CONFIG_KEY,
     OAuthClaimValidationError,
@@ -66,7 +63,7 @@ def _provisioning_client_credentials(runtime_paths: RuntimePaths) -> tuple[str, 
     if not provisioning_url or not client_id or not client_secret:
         msg = (
             "Google OAuth bootstrap requires MINDROOM_PROVISIONING_URL, MINDROOM_LOCAL_CLIENT_ID, "
-            "and MINDROOM_LOCAL_CLIENT_SECRET. Run `mindroom connect --pair-code ...` to restore pairing."
+            "and MINDROOM_LOCAL_CLIENT_SECRET. Run `mindroom connect` to restore pairing."
         )
         raise OAuthProviderError(msg)
     parsed_url = httpx.URL(provisioning_url)
@@ -126,16 +123,13 @@ async def _google_runtime_bootstrapper(
         if existing:
             return _google_runtime_endpoints()
         msg = (
-            "Google OAuth is not configured. Pair this local install with `mindroom connect --pair-code ...`, "
+            "Google OAuth is not configured. Pair this local install with `mindroom connect`, "
             "or save a custom Google OAuth client in the dashboard."
         )
         raise OAuthProviderError(msg)
 
     provisioning_url, local_client_id, local_client_secret = provisioning_credentials
-    headers = {
-        "X-Local-MindRoom-Client-Id": local_client_id,
-        "X-Local-MindRoom-Client-Secret": local_client_secret,
-    }
+    headers = local_client_headers(local_client_id, local_client_secret)
     try:
         client_id, client_secret = await _fetch_provisioned_google_client(provisioning_url, headers)
     except OAuthProviderError as exc:
@@ -172,7 +166,7 @@ async def _fetch_provisioned_google_client(
 
     if not response.is_success:
         if response.status_code in {401, 403}:
-            msg = "MindRoom pairing credentials are invalid or revoked. Run `mindroom connect --pair-code ...` again."
+            msg = "MindRoom pairing credentials are invalid or revoked. Run `mindroom connect` again."
         elif response.status_code == 503:
             msg = "The MindRoom provisioning service has not configured the Google OAuth client yet."
         else:
@@ -216,6 +210,12 @@ def _google_token_parser(
         msg = "Google did not return a verifiable identity token"
         raise OAuthClaimValidationError(msg)
     else:
+        # google-auth and requests load only when a Google sign-in completes.
+        from google.auth import exceptions as google_auth_exceptions  # noqa: PLC0415
+        from google.auth.transport.requests import Request as GoogleRequest  # noqa: PLC0415
+        from google.oauth2 import id_token as google_id_token  # noqa: PLC0415
+        from requests import exceptions as requests_exceptions  # noqa: PLC0415
+
         try:
             claims = google_id_token.verify_oauth2_token(
                 id_token,
@@ -236,7 +236,6 @@ def _google_token_parser(
 
     token_data: dict[str, Any] = {
         "token": access_token,
-        "token_uri": provider.token_url,
         "client_id": client_config.client_id,
         "_source": "oauth",
         "_oauth_provider": provider.id,
@@ -268,7 +267,7 @@ def _google_oauth_provider(
     display_name: str,
     scopes: tuple[str, ...],
     credential_service: str,
-    tool_config_service: str,
+    tool_config_service: str | None,
     client_config_services: tuple[str, ...],
     status_capabilities: tuple[str, ...],
     include_granted_scopes: bool = True,

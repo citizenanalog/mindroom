@@ -19,8 +19,10 @@ import { SyncStatus } from "@/components/SyncStatus/SyncStatus";
 import { Dashboard } from "@/components/Dashboard/Dashboard";
 import { Usage } from "@/components/Usage/Usage";
 import { Skills } from "@/components/Skills/Skills";
+import { Settings } from "@/components/Settings/Settings";
 import { Schedules } from "@/components/Schedules/Schedules";
 import { Credentials } from "@/components/Credentials/Credentials";
+import { ProviderSetupBanner } from "@/components/ProviderSetup/ProviderSetup";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Toaster } from "@/components/ui/toaster";
@@ -97,6 +99,7 @@ function AppContent() {
     diagnostics,
     configUsesIncludes,
     configJournalPendingRestart,
+    committedGeneration,
     isLoading,
     isDirty,
     selectedAgentId,
@@ -417,6 +420,14 @@ function AppContent() {
           </div>
         )}
 
+        {config != null && (
+          // Refetch on navigation and config commits so keys added on the
+          // Models or Credentials pages clear the banner.
+          <ProviderSetupBanner
+            refreshKey={`${committedGeneration ?? "none"}:${currentTab}`}
+          />
+        )}
+
         {visibleGlobalDiagnostics.map((diagnostic, index) => (
           <div
             key={`${diagnostic.kind}-${diagnostic.message}-${index}`}
@@ -640,6 +651,16 @@ function AppContent() {
               >
                 <div className="h-full overflow-hidden">
                   <Skills />
+                </div>
+              </RoutePanel>
+
+              <RoutePanel
+                active={currentTab === "settings"}
+                label="Settings"
+                className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
+              >
+                <div className="h-full overflow-hidden">
+                  <Settings />
                 </div>
               </RoutePanel>
             </div>

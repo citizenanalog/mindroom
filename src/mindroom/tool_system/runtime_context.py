@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import nio
+    from agno.run.requirement import RunRequirement
     from agno.tools.function import Function
     from structlog.stdlib import BoundLogger
 
@@ -52,8 +53,9 @@ if TYPE_CHECKING:
     from mindroom.matrix.relation_lookup import RelationLookup
     from mindroom.matrix.runtime_media import RuntimeEncryptedMediaAttachment
     from mindroom.message_target import MessageTarget
+    from mindroom.response_turn import PausedAttempt
     from mindroom.runtime_protocols import OrchestratorRuntime
-    from mindroom.scheduling import SchedulingRuntime
+    from mindroom.scheduling.tasks import SchedulingRuntime
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
     from mindroom.workers.models import WorkerReadyProgress
 
@@ -130,9 +132,12 @@ class ToolRuntimeContext:
     message_received_depth: int = 0
     orchestrator: OrchestratorRuntime | None = None
     tool_function_filter: Callable[[Function], bool] | None = None
+    # Tools of the authored subagent running this turn; copies it authors stay within them.
+    persona_tools: tuple[str, ...] | None = None
     membership: PrincipalStore | None = None
     membership_turn_id: str | None = None
     config_provider: Callable[[], Config] | None = None
+    cli_approval_handler: Callable[[PausedAttempt], Awaitable[tuple[RunRequirement, ...]]] | None = None
 
     @property
     def current_config(self) -> Config:
@@ -572,7 +577,7 @@ def runtime_context_from_dispatch_context(dispatch_context: ToolDispatchContext)
 
 def build_scheduling_runtime_from_tool_runtime_context(context: ToolRuntimeContext) -> SchedulingRuntime:
     """Build the canonical live scheduling runtime for one Matrix tool context."""
-    from mindroom.scheduling import SchedulingRuntime  # noqa: PLC0415
+    from mindroom.scheduling.tasks import SchedulingRuntime  # noqa: PLC0415
 
     if context.room is None:
         msg = "Scheduling runtime requires a cached Matrix room in tool runtime context"

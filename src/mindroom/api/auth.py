@@ -6,6 +6,7 @@ import html
 import importlib
 import json
 import secrets
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, unquote, urlencode, urlsplit
@@ -20,6 +21,7 @@ from mindroom.api import config_lifecycle
 from mindroom.api.config_lifecycle import ApiSnapshot
 from mindroom.api.config_lifecycle import request_snapshot as request_api_snapshot
 from mindroom.api.config_lifecycle import store_request_snapshot as store_request_api_snapshot
+from mindroom.api.open_access import open_access_rejection
 from mindroom.authorization import is_platform_administrator
 from mindroom.matrix.identity import (
     matrix_user_id_from_email,
@@ -46,7 +48,14 @@ def require_operator_key(request: Request, authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid credentials")
 
 
-_PLATFORM_AUTH_COOKIE_NAME = "mindroom_jwt"
+# Host-only by prefix, so sibling tenant subdomains can neither receive nor overwrite it.
+_PLATFORM_SESSION_COOKIE_NAME = "__Host-mindroom_platform_session"
+_PLATFORM_SESSION_TYPE = "mindroom_platform_session"
+_PLATFORM_SESSION_MAX_AGE_SECONDS = 3600
+_PLATFORM_SSO_TICKET_TYPE = "mindroom_platform_sso_ticket"
+_PLATFORM_SSO_CLOCK_SKEW_SECONDS = 10
+# Ticket IDs already exchanged by this runtime, mapped to their expiry.
+_used_platform_sso_ticket_ids: dict[str, int] = {}
 _STANDALONE_AUTH_COOKIE_NAME = "mindroom_api_key"
 _TRUSTED_UPSTREAM_JWKS_CACHE_SECONDS = 60
 _TRUSTED_UPSTREAM_JWKS_TIMEOUT_SECONDS = 5
@@ -96,12 +105,13 @@ class _TrustedUpstreamJwtIdentity:
 class _ApiAuthSettings:
     """Dashboard authentication settings for one runtime."""
 
-    platform_login_url: str | None
     supabase_url: str | None
     supabase_anon_key: str | None
     account_id: str | None
     mindroom_api_key: str | None
     public_url: str | None = None
+    platform_sso_url: str | None = None
+    platform_sso_secret: str | None = None
     trusted_upstream: TrustedUpstreamAuthSettings = field(default_factory=TrustedUpstreamAuthSettings)
 
 
@@ -118,13 +128,31 @@ class ApiAuthState:
 def _build_auth_settings(runtime_paths: RuntimePaths, *, account_id: str | None = None) -> _ApiAuthSettings:
     """Read dashboard auth settings from one explicit runtime context."""
     return _ApiAuthSettings(
-        platform_login_url=runtime_paths.env_value("MINDROOM_PLATFORM_LOGIN_URL"),
         supabase_url=runtime_paths.env_value("SUPABASE_URL"),
         supabase_anon_key=runtime_paths.env_value("SUPABASE_ANON_KEY"),
         account_id=account_id,
         mindroom_api_key=runtime_paths.env_value("MINDROOM_API_KEY"),
         public_url=runtime_paths.env_value("MINDROOM_PUBLIC_URL"),
+        platform_sso_url=env_text(runtime_paths, "MINDROOM_PLATFORM_SSO_URL"),
+        platform_sso_secret=env_text(runtime_paths, "MINDROOM_PLATFORM_SSO_SECRET"),
         trusted_upstream=trusted_upstream_auth_settings(runtime_paths),
+    )
+
+
+def _platform_auth_credentials(settings: _ApiAuthSettings) -> tuple[str, str] | None:
+    """Return the Supabase URL and anon key when platform authentication owns dashboard requests."""
+    if settings.supabase_url and settings.supabase_anon_key:
+        return settings.supabase_url, settings.supabase_anon_key
+    return None
+
+
+def dashboard_requires_credential(runtime_paths: RuntimePaths) -> bool:
+    """Return whether dashboard requests need a credential instead of being authorized by reachability alone."""
+    settings = _build_auth_settings(runtime_paths)
+    return (
+        settings.trusted_upstream.enabled
+        or _platform_auth_credentials(settings) is not None
+        or bool(settings.mindroom_api_key)
     )
 
 
@@ -155,11 +183,7 @@ def _app_auth_state(api_app: FastAPI) -> ApiAuthState:
         state = ApiAuthState(
             runtime_paths=snapshot.runtime_paths,
             settings=settings,
-            supabase_auth=_init_supabase_auth(
-                snapshot.runtime_paths,
-                settings.supabase_url,
-                settings.supabase_anon_key,
-            ),
+            supabase_auth=_init_supabase_auth(snapshot.runtime_paths, settings),
             trusted_upstream_jwt_client=_build_trusted_upstream_jwt_client(settings.trusted_upstream),
         )
         api_state.snapshot = replace(snapshot, auth_state=state)
@@ -168,11 +192,11 @@ def _app_auth_state(api_app: FastAPI) -> ApiAuthState:
 
 def _init_supabase_auth(
     runtime_paths: RuntimePaths,
-    supabase_url: str | None,
-    supabase_anon_key: str | None,
+    settings: _ApiAuthSettings,
 ) -> _SupabaseClientProtocol | None:
     """Initialize Supabase auth client when credentials are configured."""
-    if not supabase_url or not supabase_anon_key:
+    credentials = _platform_auth_credentials(settings)
+    if credentials is None:
         return None
 
     try:
@@ -189,7 +213,7 @@ def _init_supabase_auth(
             raise ImportError(msg) from None
         create_client = importlib.import_module("supabase").create_client
 
-    return cast("_SupabaseClientProtocol", create_client(supabase_url, supabase_anon_key))
+    return cast("_SupabaseClientProtocol", create_client(*credentials))
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:
@@ -203,25 +227,6 @@ def _extract_bearer_token(authorization: str | None) -> str | None:
 def _is_standalone_public_path(path: str) -> bool:
     """Return whether one unauthenticated standalone callback path may enter its handler."""
     return path in _STANDALONE_PUBLIC_PATHS
-
-
-def _get_request_token(
-    request: Request,
-    authorization: str | None,
-    *,
-    cookie_names: tuple[str, ...],
-) -> str | None:
-    """Return the request auth token from bearer auth or one of the allowed cookies."""
-    bearer_token = _extract_bearer_token(authorization)
-    if bearer_token:
-        return bearer_token
-
-    for cookie_name in cookie_names:
-        cookie_value = request.cookies.get(cookie_name)
-        if cookie_value:
-            return cookie_value
-
-    return None
 
 
 def _get_configured_header(request: Request, header_name: str | None) -> str | None:
@@ -529,6 +534,82 @@ def _validate_supabase_token(token: str, auth_state: ApiAuthState) -> _SupabaseU
     return response.user
 
 
+def _dashboard_origin(request: Request, settings: _ApiAuthSettings) -> str | None:
+    """Return this dashboard's public origin, which platform logins and browser mutations must name."""
+    return public_origin(settings.public_url or str(request.base_url))
+
+
+def _verified_platform_sso_claims(
+    request: Request,
+    settings: _ApiAuthSettings,
+    token: str,
+    *,
+    token_type: str,
+    required_claims: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Verify a platform login ticket or session signed with this instance's own SSO key."""
+    audience = _dashboard_origin(request, settings)
+    if settings.platform_sso_secret is None or audience is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid credentials")
+    try:
+        claims = jwt.decode(
+            token,
+            settings.platform_sso_secret,
+            algorithms=["HS256"],
+            audience=audience,
+            leeway=_PLATFORM_SSO_CLOCK_SKEW_SECONDS,
+            options={"require": ["typ", "aud", "sub", "iat", "exp", *required_claims]},
+        )
+    except PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid platform login") from exc
+    subject = claims["sub"]
+    email = claims.get("email")
+    if (
+        claims["typ"] != token_type
+        or not isinstance(subject, str)
+        or not subject
+        or (email is not None and not isinstance(email, str))
+    ):
+        raise HTTPException(status_code=401, detail="Invalid platform login")
+    return claims
+
+
+def _platform_user_identity(
+    request: Request,
+    authorization: str | None,
+    auth_state: ApiAuthState,
+) -> tuple[str, str | None]:
+    """Return the user from a Supabase bearer token or this instance's platform session cookie."""
+    bearer_token = _extract_bearer_token(authorization)
+    if bearer_token is not None:
+        user = _validate_supabase_token(bearer_token, auth_state)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user.id, user.email
+
+    session_token = request.cookies.get(_PLATFORM_SESSION_COOKIE_NAME)
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid credentials")
+    claims = _verified_platform_sso_claims(
+        request,
+        auth_state.settings,
+        session_token,
+        token_type=_PLATFORM_SESSION_TYPE,
+    )
+    return claims["sub"], claims.get("email")
+
+
+def _consume_platform_sso_ticket(ticket_id: object, expires_at: int) -> None:
+    """Accept each platform login ticket once while it can still verify."""
+    now = time.time()
+    for used_id, used_expires_at in list(_used_platform_sso_ticket_ids.items()):
+        if used_expires_at + _PLATFORM_SSO_CLOCK_SKEW_SECONDS < now:
+            del _used_platform_sso_ticket_ids[used_id]
+    if not isinstance(ticket_id, str) or not ticket_id or ticket_id in _used_platform_sso_ticket_ids:
+        raise HTTPException(status_code=401, detail="Invalid platform login")
+    _used_platform_sso_ticket_ids[ticket_id] = expires_at
+
+
 def _bind_authenticated_request_snapshot(request: Request) -> ApiSnapshot:
     """Bind one coherent auth/runtime/config snapshot to the request."""
     existing = request_api_snapshot(request)
@@ -550,11 +631,7 @@ def _bind_authenticated_request_snapshot(request: Request) -> ApiSnapshot:
             auth_state = ApiAuthState(
                 runtime_paths=current.runtime_paths,
                 settings=settings,
-                supabase_auth=_init_supabase_auth(
-                    current.runtime_paths,
-                    settings.supabase_url,
-                    settings.supabase_anon_key,
-                ),
+                supabase_auth=_init_supabase_auth(current.runtime_paths, settings),
                 trusted_upstream_jwt_client=_build_trusted_upstream_jwt_client(settings.trusted_upstream),
             )
             current = replace(current, auth_state=auth_state)
@@ -586,7 +663,8 @@ async def request_has_frontend_access(request: Request) -> bool:
     try:
         auth_user = await authenticate_user(request, authorization, allow_public_paths=False)
     except HTTPException as exc:
-        if exc.status_code >= 500:
+        # Only a missing or invalid credential falls through to the login page.
+        if exc.status_code not in {401, 403}:
             raise
         return False
     if auth_state.settings.trusted_upstream.enabled:
@@ -596,21 +674,31 @@ async def request_has_frontend_access(request: Request) -> bool:
 
 def sanitize_next_path(next_path: str | None) -> str:
     """Normalize redirect targets to an absolute in-app path."""
-    if not next_path or not next_path.startswith("/") or _is_protocol_relative_redirect(next_path):
+    if not next_path or not next_path.startswith("/") or _leaves_dashboard_origin(next_path):
         return "/"
     return next_path
 
 
-def _is_protocol_relative_redirect(next_path: str) -> bool:
-    """Return whether a browser may normalize one target to a protocol-relative URL."""
+def _leaves_dashboard_origin(next_path: str) -> bool:
+    """Return whether a browser may resolve one target outside the dashboard origin."""
     candidate = next_path
     for _ in range(_REDIRECT_TARGET_DECODE_PASSES):
-        if candidate.replace("\\", "/").startswith("//"):
+        if _is_offsite_candidate(candidate):
             return True
         decoded = unquote(candidate)
         if decoded == candidate:
             return False
         candidate = decoded
+    return _is_offsite_candidate(candidate)
+
+
+def _is_offsite_candidate(candidate: str) -> bool:
+    """Return whether one decoded target reads as protocol-relative to a browser's URL parser."""
+    # The WHATWG URL parser removes ASCII tab and newline before parsing, so "/\t/evil.com"
+    # resolves to the scheme-relative "//evil.com". Reject every C0 control character instead of
+    # replaying that removal, since no in-app path needs one.
+    if any(character < " " for character in candidate):
+        return True
     return candidate.replace("\\", "/").startswith("//")
 
 
@@ -643,9 +731,13 @@ def login_redirect_for_request(request: Request, *, next_path: str | None = None
     auth_settings = _request_auth_state(request).settings
     if auth_settings.trusted_upstream.enabled:
         return None
-    if auth_settings.supabase_url and auth_settings.supabase_anon_key and auth_settings.platform_login_url:
+    if (
+        _platform_auth_credentials(auth_settings) is not None
+        and auth_settings.platform_sso_url
+        and auth_settings.platform_sso_secret
+    ):
         redirect_to = quote(_platform_redirect_target(request, auth_settings, next_path), safe="")
-        return RedirectResponse(f"{auth_settings.platform_login_url}?redirect_to={redirect_to}")
+        return RedirectResponse(f"{auth_settings.platform_sso_url}?redirect_to={redirect_to}")
     if auth_settings.mindroom_api_key:
         login_target = sanitize_next_path(next_path or _request_path_with_query(request))
         return RedirectResponse(f"/login?{urlencode({'next': login_target})}")
@@ -754,7 +846,8 @@ def _render_standalone_login_page(
         body: JSON.stringify({{ api_key: input.value }}),
       }});
       if (response.ok) {{
-        window.location.assign(nextPath);
+        const target = new URL(nextPath, window.location.origin);
+        window.location.assign(target.origin === window.location.origin ? target.href : "/");
         return;
       }}
       error.textContent = "Invalid API key.";
@@ -881,7 +974,7 @@ def _require_browser_mutation_origin(
         or _extract_bearer_token(validated_authorization) is not None
     ):
         return
-    origin = public_origin(settings.public_url or str(request.base_url))
+    origin = _dashboard_origin(request, settings)
     if origin is None:
         raise HTTPException(403, "Browser changes require a valid public origin")
     require_same_origin(request, origin)
@@ -914,37 +1007,27 @@ async def authenticate_user(
             return auth_user
 
         if mindroom_api_key:
-            token = _get_request_token(
-                request,
-                authorization,
-                cookie_names=(_STANDALONE_AUTH_COOKIE_NAME,),
-            )
+            token = _extract_bearer_token(authorization) or request.cookies.get(_STANDALONE_AUTH_COOKIE_NAME) or None
             if token is None:
                 raise HTTPException(status_code=401, detail="Missing or invalid credentials")
             if not secrets.compare_digest(token, mindroom_api_key):
                 raise HTTPException(status_code=401, detail="Invalid API key")
             _require_browser_mutation_origin(request, auth_state.settings, authorization)
+        else:
+            # Without a credential, only where the request comes from authorizes it.
+            rejection = open_access_rejection(request.headers, request.method, snapshot.runtime_paths)
+            if rejection is not None:
+                raise HTTPException(rejection.status_code, rejection.detail)
         auth_user = {"user_id": "standalone", "email": None}
         request.scope["auth_user"] = auth_user
         return auth_user
 
-    token = _get_request_token(
-        request,
-        authorization,
-        cookie_names=(_PLATFORM_AUTH_COOKIE_NAME,),
-    )
-    if token is None:
-        raise HTTPException(status_code=401, detail="Missing or invalid credentials")
-
-    user = _validate_supabase_token(token, auth_state)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    if auth_state.settings.account_id and user.id != auth_state.settings.account_id:
+    user_id, email = _platform_user_identity(request, authorization, auth_state)
+    if auth_state.settings.account_id and user_id != auth_state.settings.account_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     _require_browser_mutation_origin(request, auth_state.settings, authorization)
-    auth_user = {"user_id": user.id, "email": user.email}
+    auth_user = {"user_id": user_id, "email": email}
     request.scope["auth_user"] = auth_user
     return auth_user
 
@@ -1003,6 +1086,51 @@ async def clear_auth_session(response: Response) -> dict[str, bool]:
     """Clear the standalone dashboard auth cookie."""
     response.delete_cookie(key=_STANDALONE_AUTH_COOKIE_NAME, path="/")
     return {"success": True}
+
+
+@router.get("/api/auth/platform-sso", include_in_schema=False)
+async def complete_platform_sso(request: Request, ticket: str, next: str = "/") -> RedirectResponse:  # noqa: A002
+    """Exchange a single-use platform login ticket for a host-only dashboard session."""
+    auth_state = cast("ApiAuthState", _bind_authenticated_request_snapshot(request).auth_state)
+    settings = auth_state.settings
+    if auth_state.supabase_auth is None or settings.trusted_upstream.enabled or settings.platform_sso_secret is None:
+        raise HTTPException(status_code=404, detail="Platform login is not enabled")
+
+    claims = _verified_platform_sso_claims(
+        request,
+        settings,
+        ticket,
+        token_type=_PLATFORM_SSO_TICKET_TYPE,
+        required_claims=("jti",),
+    )
+    _consume_platform_sso_ticket(claims["jti"], int(claims["exp"]))
+    if settings.account_id and claims["sub"] != settings.account_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    now = int(time.time())
+    session_token = jwt.encode(
+        {
+            "typ": _PLATFORM_SESSION_TYPE,
+            "aud": claims["aud"],
+            "sub": claims["sub"],
+            "email": claims.get("email"),
+            "iat": now,
+            "exp": now + _PLATFORM_SESSION_MAX_AGE_SECONDS,
+        },
+        settings.platform_sso_secret,
+        algorithm="HS256",
+    )
+    response = RedirectResponse(sanitize_next_path(next))
+    response.set_cookie(
+        key=_PLATFORM_SESSION_COOKIE_NAME,
+        value=session_token,
+        max_age=_PLATFORM_SESSION_MAX_AGE_SECONDS,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 @router.get("/login", include_in_schema=False)

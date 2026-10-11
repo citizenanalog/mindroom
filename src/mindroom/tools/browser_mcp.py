@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, ToolCategory, ToolExecutionTarget, ToolManagedInitArg
+from mindroom.tool_system.declarations import (
+    ConfigField,
+    ToolCategory,
+    ToolExecutionTarget,
+    ToolFileAccess,
+    ToolManagedInitArg,
+)
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.worker_computer.mcp_catalog import browser_mcp_catalog
 
@@ -14,8 +20,13 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="browser_mcp",
+    file_access=ToolFileAccess.NONE,
     display_name="Browser MCP",
-    description="Native Playwright browser tools in an isolated worker Computer",
+    description=(
+        "Native Playwright browser tools in an isolated worker Computer. "
+        "If you have chat_ui, your first call in a conversation already shows the user the Computer panel; "
+        "use chat_ui.open_panel(panel='computer') only to show it again."
+    ),
     category=ToolCategory.RESEARCH,
     default_execution_target=ToolExecutionTarget.WORKER,
     consumes_workspace_paths=True,

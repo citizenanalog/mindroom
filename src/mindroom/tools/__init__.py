@@ -12,6 +12,7 @@ from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
@@ -24,12 +25,14 @@ from mindroom.tools import (
     memory,  # noqa: F401
     report_publishing,  # noqa: F401
     self_config,  # noqa: F401
+    skill_manage,  # noqa: F401
 )
 from mindroom.tools.agentql import agentql_tools
 from mindroom.tools.airflow import airflow_tools
 from mindroom.tools.apify import apify_tools
 from mindroom.tools.approved_egress import approved_egress_tools
 from mindroom.tools.arxiv import arxiv_tools
+from mindroom.tools.atlassian import atlassian_tools
 from mindroom.tools.attachments import attachments_tools
 from mindroom.tools.aws_lambda import aws_lambda_tools
 from mindroom.tools.aws_ses import aws_ses_tools
@@ -81,6 +84,7 @@ from mindroom.tools.google_drive import google_drive_tools
 from mindroom.tools.google_maps import google_maps_tools
 from mindroom.tools.google_scholar import google_scholar_tools
 from mindroom.tools.google_sheets import google_sheets_tools
+from mindroom.tools.google_tasks import google_tasks_tools
 from mindroom.tools.googlesearch import googlesearch_tools
 from mindroom.tools.groq import groq_tools
 from mindroom.tools.hackernews import hackernews_tools
@@ -130,6 +134,7 @@ from mindroom.tools.sql import sql_tools
 from mindroom.tools.tavily import tavily_tools
 from mindroom.tools.telegram import telegram_tools
 from mindroom.tools.thread_model import thread_model_tools
+from mindroom.tools.thread_move import thread_move_tools
 from mindroom.tools.thread_resolution import thread_resolution_tools
 from mindroom.tools.thread_summary import register_thread_summary_tools
 from mindroom.tools.thread_tags import thread_tags_tools
@@ -164,6 +169,7 @@ __all__ = [
     "apify_tools",
     "approved_egress_tools",
     "arxiv_tools",
+    "atlassian_tools",
     "attachments_tools",
     "aws_lambda_tools",
     "aws_ses_tools",
@@ -215,6 +221,7 @@ __all__ = [
     "google_maps_tools",
     "google_scholar_tools",
     "google_sheets_tools",
+    "google_tasks_tools",
     "googlesearch_tools",
     "groq_tools",
     "hackernews_tools",
@@ -265,6 +272,7 @@ __all__ = [
     "tavily_tools",
     "telegram_tools",
     "thread_model_tools",
+    "thread_move_tools",
     "thread_resolution_tools",
     "thread_tags_tools",
     "todo_tools",
@@ -292,6 +300,7 @@ __all__ = [
 
 @register_tool_with_metadata(
     name="openclaw_compat",
+    file_access=ToolFileAccess.NONE,
     display_name="OpenClaw Compat",
     description="Convenience bundle that implies shell, coding, browser, and other common tools",
     category=ToolCategory.DEVELOPMENT,
@@ -308,6 +317,7 @@ def _openclaw_compat_tools() -> type[Toolkit]:
 
 @register_tool_with_metadata(
     name="homeassistant",
+    file_access=ToolFileAccess.NONE,
     display_name="Home Assistant",
     description="Control and monitor smart home devices",
     category=ToolCategory.SMART_HOME,
@@ -371,6 +381,7 @@ def _homeassistant_tools() -> type[Toolkit]:
 
 @register_tool_with_metadata(
     name="agent_vault_access",
+    file_access=ToolFileAccess.NONE,
     requires_primary_runtime=True,
     display_name="Agent Vault Access",
     description="Get a link to manage this agent's passwords and API keys in Agent Vault",

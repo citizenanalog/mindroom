@@ -6,6 +6,7 @@ import hashlib
 import re
 from collections import deque
 from dataclasses import dataclass
+from functools import cache
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -29,6 +30,7 @@ from mindroom.agent_policy import (
     get_agent_delegation_closure,
     get_unsupported_team_agents,
     resolve_agent_policy_from_data,
+    resolve_agent_policy_index,
     resolve_private_knowledge_base_agent,
     unsupported_team_agent_message,
 )
@@ -36,6 +38,7 @@ from mindroom.config.access import RoomDefaultsConfig, validate_concrete_matrix_
 from mindroom.config.agent import AgentConfig, RoomConfig, TeamConfig  # noqa: TC001
 from mindroom.config.approval import ToolApprovalConfig
 from mindroom.config.auth import AuthorizationConfig
+from mindroom.config.automations import Automation  # noqa: TC001
 from mindroom.config.calls import CallsConfig, CascadedCallProfile, LiveCallProfile
 from mindroom.config.entity_view import ResolvedEntityView
 from mindroom.config.external_trigger_policy import ExternalTriggerPolicyConfig
@@ -60,6 +63,7 @@ from mindroom.config.models import (
     DebugConfig,
     DefaultsConfig,
     EffectiveToolConfig,
+    FileAccess,
     ModelConfig,
     RouterConfig,
     ToolConfigEntry,
@@ -71,6 +75,7 @@ from mindroom.config.runtime_overlays import (
     apply_runtime_approved_egress_overlay,
     strip_runtime_approved_egress_overlay_from_dump,
 )
+from mindroom.config.schema_hints import DashboardJsonSchema, dashboard_hint, redact_config_for_display
 from mindroom.config.tool_entries import raw_tool_entry_name_and_lazy_flag_fields, raw_tools_entries
 from mindroom.config.voice import VoiceConfig
 from mindroom.config.yaml_includes import (
@@ -104,24 +109,25 @@ from mindroom.prompt_templates import render_prompt_template, validate_prompt_te
 from mindroom.prompts import PROMPT_DEFAULT_NAMES, PROMPT_DEFAULTS
 from mindroom.room_model_overrides import resolve_room_model_override
 from mindroom.room_thread_modes import resolve_room_thread_mode_override
-from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.thread_models import resolve_thread_model_override
 from mindroom.tool_system.plugin_imports import PluginValidationError
 from mindroom.tool_system.worker_routing import unsupported_shared_only_integration_names
 from mindroom.trusted_upstream_settings import matrix_identity_configuration_error, trusted_upstream_auth_settings
-from mindroom.workspaces import validate_workspace_template_dir
+from mindroom.workspaces import control_plane_owns_private_templates, validate_workspace_template_dir
 
 if TYPE_CHECKING:
     from collections.abc import Collection
 
+    from mindroom.agent_policy import ResolvedAgentPolicy
     from mindroom.tool_system.catalog import ToolValidationInfo
     from mindroom.tool_system.worker_routing import WorkerScope
 
 # Keep synchronized with todo_poke._SAFE_ASSIGNEE_PATTERN without importing runtime tools into config.
 _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
-_RESERVED_ENTITY_NAMES = frozenset({ROUTER_AGENT_NAME, "user"})
+# "_shared" is the requester-store directory part for `user` scope in CredentialsManager.for_primary_runtime_scope.
+_RESERVED_ENTITY_NAMES = frozenset({ROUTER_AGENT_NAME, "user", "_shared"})
 _DEFER_PROHIBITED_CONTROL_TOOLS = frozenset(
-    {"delegate", "dynamic_tools", "external_trigger_manager", "invite_router", "self_config"},
+    {"delegate", "dynamic_tools", "external_trigger_manager", "invite_router", "self_config", "skill_manage"},
 )
 _OPENCLAW_COMPAT_PRESET_TOOLS: tuple[str, ...] = (
     "shell",
@@ -386,15 +392,6 @@ def _template_contains_overlapping_subtree(template_dir: Path, target_path: Path
     )
 
 
-def _skip_private_template_dir_validation(runtime_paths: RuntimePaths | None) -> bool:
-    """Return whether runtime-local workers should skip control-plane template validation."""
-    if runtime_paths is None:
-        return False
-    return runtime_paths.env_flag(SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"]) and bool(
-        runtime_paths.env_value(SANDBOX_RUNTIME_ENV_BY_KEY["dedicated_worker_key"], default=""),
-    )
-
-
 def _tool_entry_has_lazy_flag_field(entry: ToolConfigEntry) -> bool:
     """Return whether one normalized tool entry authored a lazy-loading field."""
     return bool(entry.model_fields_set & {"defer", "initial"})
@@ -403,7 +400,8 @@ def _tool_entry_has_lazy_flag_field(entry: ToolConfigEntry) -> bool:
 class Config(BaseModel):
     """Complete configuration from YAML."""
 
-    model_config = ConfigDict(extra="forbid")
+    # Config carries API keys, so rendered validation errors must never echo input values.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     _source_files: frozenset[Path] = PrivateAttr(default=frozenset())
     _source_fingerprint: str | None = PrivateAttr(default=None)
     _uses_includes: bool = PrivateAttr(default=False)
@@ -433,16 +431,22 @@ class Config(BaseModel):
     agents: dict[str, AgentConfig] = Field(default_factory=dict, description="Agent configurations")
     teams: dict[str, TeamConfig] = Field(default_factory=dict, description="Team configurations")
     rooms: dict[str, RoomConfig] = Field(default_factory=dict, description="Managed Matrix room metadata")
-    room_models: dict[str, str] = Field(default_factory=dict, description="Room-specific model overrides")
+    room_models: dict[str, str] = Field(
+        default_factory=dict,
+        description="Room-specific model overrides",
+        json_schema_extra=dashboard_hint(key_reference="room", reference="model"),
+    )
     room_thread_summary_models: dict[str, str] = Field(
         default_factory=dict,
         description="Room-specific model overrides for automatic thread summaries",
+        json_schema_extra=dashboard_hint(key_reference="room", reference="model"),
     )
     plugins: list[PluginEntryConfig] = Field(default_factory=list, description="Plugin entries")
     debug: DebugConfig = Field(default_factory=DebugConfig, description="Debug and diagnostic settings")
     prompts: dict[str, str] = Field(
         default_factory=dict,
         description="Built-in prompt overrides keyed by the uppercase global name from mindroom.prompts",
+        json_schema_extra=dashboard_hint(multiline=True),
     )
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig, description="Default values")
     memory: MemoryConfig = Field(default_factory=MemoryConfig, description="Memory configuration")
@@ -528,6 +532,11 @@ class Config(BaseModel):
                 "defer/initial are only valid on runtime tools."
             )
         return None
+
+    @classmethod
+    def supports_lazy_loading(cls, tool_name: str) -> bool:
+        """Return whether a tool entry may set defer/initial; presets and control-plane tools may not."""
+        return cls._lazy_flag_prohibited_message(tool_name=tool_name, config_path=tool_name) is None
 
     @classmethod
     def _validate_raw_tool_lazy_flag_boundary(cls, entry: object, *, config_path: str) -> None:
@@ -1005,7 +1014,7 @@ class Config(BaseModel):
     def validate_private_template_dirs(self, info: ValidationInfo) -> Config:
         """Ensure private template directories exist when runtime path resolution is available."""
         runtime_paths = info.context.get("runtime_paths") if isinstance(info.context, dict) else None
-        if runtime_paths is None or _skip_private_template_dir_validation(runtime_paths):
+        if runtime_paths is None or control_plane_owns_private_templates(runtime_paths):
             return self
         for agent_name, agent_config in self.agents.items():
             private_config = agent_config.private
@@ -1174,6 +1183,10 @@ class Config(BaseModel):
         )
         return _strip_empty_root_sections(payload)
 
+    def redacted_authored_model_dump(self) -> dict[str, Any]:
+        """Serialize authored config for display, masking schema-marked secrets and credential-named keys."""
+        return redact_authored_config(self.authored_model_dump())
+
     def with_runtime_knowledge_base_overlay(
         self,
         base_id: str,
@@ -1227,15 +1240,22 @@ class Config(BaseModel):
             system_message_role="system",
         )
 
+    def _configured_entity(self, entity_name: str) -> AgentConfig | TeamConfig:
+        """Return the authored config for one configured agent or team."""
+        if entity_name in self.agents:
+            return self.get_agent(entity_name)
+        if entity_name in self.teams:
+            return self.teams[entity_name]
+        msg = f"Unknown entity: {entity_name}"
+        raise ValueError(msg)
+
+    def entity_display_name(self, entity_name: str) -> str:
+        """Return the configured display name for one agent or team."""
+        return self._configured_entity(entity_name).display_name
+
     def _entity_history_settings(self, entity_name: str) -> ResolvedHistorySettings:
         """Return effective replay settings for one configured agent or team."""
-        if entity_name in self.agents:
-            entity = self.get_agent(entity_name)
-        elif entity_name in self.teams:
-            entity = self.teams[entity_name]
-        else:
-            msg = f"Unknown entity: {entity_name}"
-            raise ValueError(msg)
+        entity = self._configured_entity(entity_name)
 
         num_history_runs = entity.num_history_runs
         num_history_messages = entity.num_history_messages
@@ -1257,28 +1277,34 @@ class Config(BaseModel):
             system_message_role="system",
         )
 
+    def _entity_max_tool_calls_per_turn(self, entity_name: str) -> int:
+        """Return the effective per-turn tool-call budget for one configured agent or team."""
+        override = self._configured_entity(entity_name).max_tool_calls_per_turn
+        return override if override is not None else self.defaults.max_tool_calls_per_turn
+
+    def _agent_file_access(self, entity_name: str) -> FileAccess:
+        """Return the effective file access for one agent; every non-agent scope inherits the default."""
+        agent_config = self.agents.get(entity_name)
+        if agent_config is None or agent_config.file_access is None:
+            return self.defaults.file_access
+        return agent_config.file_access
+
     def _default_compaction_config(self) -> CompactionConfig:
-        """Return the effective destructive compaction config for defaults-only scope."""
+        """Return the effective text compaction config for defaults-only scope."""
         base = self.defaults.compaction
         merged = base.model_dump() if base is not None else {}
         return CompactionConfig.model_validate(merged)
 
     def _has_authored_default_compaction_config(self) -> bool:
-        """Return whether defaults-only scope has authored destructive compaction config."""
+        """Return whether defaults-only scope has authored text compaction config."""
         return self.defaults.compaction is not None
 
     def _entity_compaction_config(self, entity_name: str) -> CompactionConfig:
-        """Return the effective destructive compaction config for one configured agent or team."""
+        """Return the effective text compaction config for one configured agent or team."""
         base = self.defaults.compaction
         defaults_enabled = base.enabled if base is not None else False
         merged = base.model_dump() if base is not None else {}
-        if entity_name in self.agents:
-            override = self.get_agent(entity_name).compaction
-        elif entity_name in self.teams:
-            override = self.teams[entity_name].compaction
-        else:
-            msg = f"Unknown entity: {entity_name}"
-            raise ValueError(msg)
+        override = self._configured_entity(entity_name).compaction
         if override is not None:
             authored_override = override.model_dump(exclude_unset=True)
             explicit_enabled = authored_override.pop(
@@ -1303,14 +1329,8 @@ class Config(BaseModel):
         return CompactionConfig.model_validate(merged)
 
     def _has_authored_entity_compaction_config(self, entity_name: str) -> bool:
-        """Return whether destructive compaction was explicitly configured for one configured entity."""
-        if entity_name in self.agents:
-            override = self.get_agent(entity_name).compaction
-        elif entity_name in self.teams:
-            override = self.teams[entity_name].compaction
-        else:
-            msg = f"Unknown entity: {entity_name}"
-            raise ValueError(msg)
+        """Return whether text compaction was explicitly configured for one configured entity."""
+        override = self._configured_entity(entity_name).compaction
         return self.defaults.compaction is not None or override is not None
 
     def resolve_entity(self, entity_name: str | None) -> ResolvedEntityView:
@@ -1351,12 +1371,27 @@ class Config(BaseModel):
             )
         }
 
+    def get_agent_worker_tools(self, agent_name: str) -> list[str] | None:
+        """Return one agent's configured worker-routed tools, or None for the built-in routing policy."""
+        configured = self.get_agent(agent_name).worker_tools
+        if configured is None:
+            configured = self.defaults.worker_tools
+        return None if configured is None else self.expand_tool_names(list(configured))
+
     def get_worker_grantable_credentials(self) -> frozenset[str]:
         """Return shared credential service names allowed inside isolated workers."""
         configured = self.defaults.worker_grantable_credentials
         if configured is None:
             return DEFAULT_WORKER_GRANTABLE_CREDENTIALS
         return frozenset(configured)
+
+    def get_agent_policies(self) -> dict[str, ResolvedAgentPolicy]:
+        """Return the canonical execution policy of every configured agent."""
+        seeds = build_agent_policy_seeds(self.agents, default_worker_scope=self.defaults.worker_scope)
+        return resolve_agent_policy_index(
+            seeds,
+            private_knowledge_base_id_prefix=self.PRIVATE_KNOWLEDGE_BASE_ID_PREFIX,
+        ).policies
 
     def _agent_execution_scope(self, agent_name: str) -> WorkerScope | None:
         """Return the internal derived execution scope for one agent.
@@ -1844,6 +1879,45 @@ class Config(BaseModel):
         # exclude_none keeps the "None inherits" tri-state; deep copy avoids aliasing memory.search.include.
         return self.memory.search.model_copy(update=override.model_dump(exclude_none=True), deep=True)
 
+    def _automation_block_reason(self, agent_name: str, automation: Automation) -> str | None:
+        """Return why an agent cannot run ``automation``, or None when it can.
+
+        Automations run unattended, so requester-private agents have no identity to run them as, and the
+        built-ins maintain file memory, which needs the file backend.
+        A plugin automation's own needs are checked when it fires, once its plugin is loaded.
+        """
+        if self.get_agent(agent_name).private is not None:
+            return "is private; automations run unattended and need a shared agent"
+        if automation.requires_file_memory and self._agent_memory_backend(agent_name) != "file":
+            return f"needs memory_backend: file for {automation.name}"
+        return None
+
+    def _agent_automations(self, agent_name: str) -> list[Automation]:
+        """Get one agent's automations: its own list, or the inherited defaults it can run."""
+        agent = self.get_agent(agent_name)
+        if agent.automations is not None:
+            return agent.automations
+        return [
+            entry for entry in self.defaults.automations if self._automation_block_reason(agent_name, entry) is None
+        ]
+
+    @model_validator(mode="after")
+    def validate_agent_automations(self) -> Config:
+        """Reject automations an agent lists but cannot run, or that name an unknown model."""
+        for automation in self.defaults.automations:
+            if automation.model is not None and automation.model not in self.models:
+                msg = f"defaults.automations {automation.name!r} uses unknown model {automation.model!r}"
+                raise ValueError(msg)
+        for agent_name, agent in self.agents.items():
+            for automation in agent.automations or []:
+                if (reason := self._automation_block_reason(agent_name, automation)) is not None:
+                    msg = f"Agent {agent_name!r} {reason}"
+                    raise ValueError(msg)
+                if automation.model is not None and automation.model not in self.models:
+                    msg = f"Agent {agent_name!r} automation {automation.name!r} uses unknown model {automation.model!r}"
+                    raise ValueError(msg)
+        return self
+
     def uses_file_memory(self) -> bool:
         """Return whether any configured agent uses file-backed memory."""
         if not self.agents:
@@ -1924,8 +1998,8 @@ class Config(BaseModel):
         return "thread"
 
     @model_validator(mode="after")
-    def validate_agent_judgments(self) -> Config:
-        """Validate dedicated judgment model aliases for opted-in agents."""
+    def validate_agent_helper_models(self) -> Config:
+        """Validate dedicated judgment and skill-review model aliases for opted-in agents."""
         for agent_name, agent in self.agents.items():
             for settings in (agent.participation, agent.mid_turn):
                 if settings is None:
@@ -1934,6 +2008,10 @@ class Config(BaseModel):
                 if isinstance(judgment, LLMJudgmentConfig) and judgment.model not in self.models:
                     msg = f"Unknown judgment model for agent {agent_name!r}: {judgment.model!r}"
                     raise ValueError(msg)
+            review_model = agent.skill_learning.model
+            if review_model is not None and review_model not in self.models:
+                msg = f"Unknown skill_learning model for agent {agent_name!r}: {review_model!r}"
+                raise ValueError(msg)
         return self
 
     def _entity_model_name(self, entity_name: str) -> str:
@@ -1981,21 +2059,18 @@ class Config(BaseModel):
     ) -> ResolvedRuntimeModel:
         """Resolve the active runtime model plus its configured context window.
 
-        Precedence: explicit `active_model_name`, persisted thread override,
-        persisted room override, configured room override, then authored entity model.
+        Precedence: explicit `active_model_name`, persisted thread override for
+        the entities its setter may address, persisted room override,
+        configured room override, then authored entity model.
         """
         resolved_model_name = active_model_name
         if resolved_model_name is None and thread_id is not None:
             if runtime_paths is None:
                 msg = "runtime_paths are required to resolve a thread-specific runtime model"
                 raise ValueError(msg)
-            thread_override = resolve_thread_model_override(
-                runtime_paths,
-                thread_id,
-                configured_models=self.models,
-            ).active
-            if thread_override is not None:
-                resolved_model_name = thread_override
+            thread_overrides = resolve_thread_model_override(runtime_paths, thread_id, config=self).active
+            if entity_name is not None:
+                resolved_model_name = thread_overrides.get(entity_name)
         if resolved_model_name is None:
             if entity_name is None:
                 resolved_model_name = default_model_name
@@ -2022,6 +2097,45 @@ class Config(BaseModel):
             resolved_context_window = self.get_model_context_window(resolved_model_name)
 
         return ResolvedRuntimeModel(model_name=resolved_model_name, context_window=resolved_context_window)
+
+
+def _tag_automation_unions(node: Any) -> None:  # noqa: ANN401 - a JSON schema node
+    """Mark each automation union as chosen by ``name``, which the built-ins pin and plugin automations leave free."""
+    if isinstance(node, dict):
+        branches = node.get("oneOf")
+        if isinstance(branches, list) and {"$ref": "#/$defs/PluginAutomation"} in branches:
+            node["discriminator"] = {"propertyName": "name"}
+        for value in node.values():
+            _tag_automation_unions(value)
+    elif isinstance(node, list):
+        for value in node:
+            _tag_automation_unions(value)
+
+
+def _describe_automation_union(schema: dict[str, Any]) -> None:
+    """Shape the automation union for the dashboard's form: a pinned name per built-in and a free one for plugins."""
+    defs = schema["$defs"]
+    for built_in in ("PromptCurationAutomation", "DreamingAutomation"):
+        # The form fills required fields when a variant is picked, and the name is what selects the variant.
+        defs[built_in]["required"] = ["name", *defs[built_in].get("required", [])]
+    plugin = defs["PluginAutomation"]
+    plugin["title"] = "Plugin automation"
+    # Validation errors for a plugin entry are reported under this tag, since its name is not fixed.
+    plugin.setdefault("x-mindroom", {})["union_tag"] = "plugin"
+    _tag_automation_unions(schema)
+
+
+@cache
+def dashboard_config_schema() -> dict[str, Any]:
+    """Return the Config JSON schema with dashboard hints and default-factory values."""
+    schema = Config.model_json_schema(schema_generator=DashboardJsonSchema)
+    _describe_automation_union(schema)
+    return schema
+
+
+def redact_authored_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Redact one authored config payload for display, letting the config schema decide for typed fields."""
+    return cast("dict[str, Any]", redact_config_for_display(payload, dashboard_config_schema()))
 
 
 def failed_config_source_fingerprint(exc: BaseException) -> str | None:

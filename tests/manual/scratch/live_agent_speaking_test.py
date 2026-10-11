@@ -69,7 +69,7 @@ from mindroom.config.memory import MemoryConfig  # noqa: E402
 from mindroom.config.models import ModelConfig  # noqa: E402
 from mindroom.config.voice import SpeechServiceConfig  # noqa: E402
 from mindroom.constants import resolve_runtime_paths  # noqa: E402
-from mindroom.credentials_sync import sync_env_to_credentials  # noqa: E402
+from mindroom.credentials.sync import sync_env_to_credentials  # noqa: E402
 from mindroom.matrix.state import MatrixState  # noqa: E402
 from mindroom.matrix_rtc import call_manager as cm  # noqa: E402
 from mindroom.matrix_rtc.events import (  # noqa: E402
@@ -626,8 +626,10 @@ async def main() -> int:  # noqa: C901, PLR0915
                 {"event_id": "$evt", "sender": caller.user_id, "origin_server_ts": 1},
                 CALL_MEMBER_EVENT_TYPE,
             )
-            await asyncio.wait_for(manager.on_room_event(room_obj, event), timeout=120)
-            log("  [bot] call join path completed (agent session started)")
+            await manager.on_room_event(room_obj, event)
+            # The manager joins in a background reconcile, so wait for the session it starts.
+            if await wait_for(lambda: room_id in manager._sessions, 120, "agent call session"):
+                log("  [bot] call join path completed (agent session started)")
 
             log("== leg 1: greeting audio from the agent ==")
             results["greeting_audio"] = await wait_for(lambda: meter.voiced >= 20, 45, "greeting audio")

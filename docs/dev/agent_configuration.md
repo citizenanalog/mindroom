@@ -44,7 +44,7 @@ models:
 
   anthropic:
     provider: "anthropic"
-    id: "claude-haiku-4-5"
+    id: "claude-haiku-5-5"
 
   ollama:
     provider: "ollama"
@@ -54,7 +54,7 @@ models:
 
   openrouter:
     provider: "openrouter"
-    id: "anthropic/claude-sonnet-5"
+    id: "anthropic/claude-sonnet-5.5"
 ```
 
 Each model entry supports these fields:
@@ -63,6 +63,7 @@ Each model entry supports these fields:
 - **host** - Optional host URL for Ollama.
 - **extra_kwargs** - Additional provider-specific parameters; set `extra_kwargs.base_url` for an OpenAI-compatible server.
 - **context_window** - Actual provider context window size in tokens; when set, MindRoom uses it for compaction summary input and as the default replay-planning window unless compaction config sets a smaller `replay_window_tokens`, and applies a final replay-fit step that may reduce or disable persisted replay for that run; on `vertexai_claude` models it additionally enables request-time fitting that trims replayed history when a request would exceed the window
+- **stream_idle_timeout_seconds** - Seconds a streamed request may go without a provider event before MindRoom treats it as stalled and retries once if nothing was streamed yet; unset means 300 for hosted providers on their built-in endpoint and no limit for `ollama`, `llama_cpp`, or a configured endpoint; `0` disables the limit
 
 ### Supported Providers
 
@@ -101,6 +102,7 @@ memory:
   llm: null  # Optional LLM for memory operations (provider + config dict)
   file:
     max_entrypoint_lines: 200  # Max lines preloaded from MEMORY.md
+    max_entrypoint_tokens: 50000  # Max estimated tokens (characters / 4) preloaded from MEMORY.md
   auto_flush:
     enabled: false  # Background file-memory auto-flush (see memory consolidation plan)
     flush_interval_seconds: 1800
@@ -165,7 +167,7 @@ agents:
 - **agent_name**: The configured identifier used for agent config and aliases; provisioning may propose a `mindroom_<agent_name>` username when an account is missing, but runtime identity always comes from persisted Matrix account state.
 - **display_name**: A friendly name shown in conversations
 - **role**: A brief description of the agent's purpose
-- **tools**: List of tools the agent can use — plain strings or single-key dicts with inline config overrides, including `script` controls such as `allowed_tools`, concurrency, call-rate, and runtime limits (see Available Tools below, [Per-Agent Tool Configuration](../configuration/agents.md#per-agent-tool-configuration), and [Background Python Scripts](../tools/background-scripts.md))
+- **tools**: List of tools the agent can use — plain strings or single-key dicts with inline config overrides, including `script` controls such as `allowed_tools`, concurrency, call-rate, and runtime limits (see Available Tools below, [Per-Agent Tool Configuration](../tools/index.md#per-agent-tool-configuration), and [Background Python Scripts](../tools/background-scripts.md))
 - **include_default_tools**: Whether to merge `defaults.tools` into this agent's `tools` (default: true)
 - **skills**: Skill names the agent can use
 - **instructions**: Specific guidelines for the agent's behavior
@@ -185,20 +187,21 @@ agents:
 - **num_history_messages**: Max messages from history (mutually exclusive with `num_history_runs`)
 - **compress_tool_results**: Compress tool results in history to save context (per-agent override, inherits a default of `false`, and can invalidate Anthropic/Vertex Claude prompt caches when enabled)
 - **compaction**: Optional per-agent required-compaction overrides (`enabled`, `threshold_tokens`, `threshold_percent`, `replay_window_tokens`, `reserve_tokens`, `model`, `fallback_model`, `timeout_seconds`); when the active runtime model has a known `context_window`, MindRoom always computes a replay plan for the current run and reduces or disables persisted replay when needed.
-Automatic destructive compaction is enabled by default through `defaults.compaction`, but it runs only when raw history exceeds the hard replay budget for the next reply.
+Automatic text compaction is enabled by default through `defaults.compaction`, but it runs only when raw history exceeds the hard replay budget for the next reply.
 `threshold_tokens` and `threshold_percent` set a soft trigger budget for planning metadata and compaction notices; crossing that soft trigger while still within the hard budget leaves the stored session unchanged and relies on replay fitting.
 `replay_window_tokens` can cap persisted replay and required-compaction planning below the model's real context window without lowering the provider request limit.
 If the active model window is unknown, an explicit `replay_window_tokens` still supplies the replay-planning window.
 Each compaction summary input chunk is sized independently from the selected compaction model's real `context_window`, after reserve, prompt overhead, and a safety margin.
 Each primary, retry, and fallback summary request uses `timeout_seconds`, which defaults to 600 seconds, while an explicitly shorter provider timeout remains the stricter cap.
-Destructive compaction requires the resolved summary input budget to exceed 2,000 tokens.
-With the default `reserve_tokens`, this makes destructive compaction unavailable when the compaction model's context window is roughly 10,000 tokens or smaller; lowering `reserve_tokens` restores availability for such small windows.
+Text compaction requires the resolved summary input budget to exceed 2,000 tokens.
+With the default `reserve_tokens`, this makes text compaction unavailable when the compaction model's context window is roughly 10,000 tokens or smaller; lowering `reserve_tokens` restores availability for such small windows.
 Set `enabled: false` in defaults or the agent override to disable automatic pre-reply compaction.
 Manual `compact_context` records a durable request that runs before the next reply in the same conversation scope.
 Manual `compact_context` remains available when a compaction model and context window are configured and the resolved summary input budget exceeds 2,000 tokens.
 Required compaction runs before the reply with a Matrix lifecycle notice that is edited in place; otherwise MindRoom leaves the session unchanged and relies on replay fitting for that reply.
-Compaction rewrites the live session so compacted history moves into `session.summary` while only recent raw runs remain in `session.runs`
+Compaction moves the oldest runs into the conversation's compaction archive and replays them through `session.summary`, while only recent raw runs remain in `session.runs`.
 - **max_tool_calls_from_history**: Max tool call messages replayed from history (per-agent override)
+- **max_tool_calls_per_turn**: Max tool calls one turn may execute (per-agent override of `defaults.max_tool_calls_per_turn`, 1000); later calls return a tool error, and the turn ends with its text so far after this many plus two model requests
 - **show_tool_calls**: Whether to show tool call details inline in responses (per-agent override). When disabled, routed tools may still show generic worker warmup copy, but it never includes tool identifiers or tool-trace metadata
 - **worker_tools**: Tool names to route through scoped workers (overrides defaults; `null` uses the built-in default routing policy)
 - **worker_scope**: Worker runtime reuse mode for routed tools: `shared`, `user`, or `user_agent`
@@ -229,6 +232,7 @@ teams:
     num_history_runs: 8  # Optional team-scoped replay policy
     num_history_messages: null  # Optional; mutually exclusive with num_history_runs
     max_tool_calls_from_history: 6  # Optional replay trimming for tool calls
+    max_tool_calls_per_turn: 200  # Optional coordinator tool-call budget per turn, delegations included
     compaction:  # Optional team-scoped required-compaction overrides
       # Soft thresholds do not compact by themselves while history still fits.
       enabled: true
@@ -244,6 +248,7 @@ teams:
 - **accept_invites**: Accept every direct Matrix room invite with `true`, none with `false` or `[]`, or exact and wildcard inviter Matrix user IDs from a list
 - **num_history_runs / num_history_messages**: Optional team-owned replay policy for named teams
 - **max_tool_calls_from_history**: Optional cap on replayed tool call messages for the shared team scope
+- **max_tool_calls_per_turn**: Optional cap on the coordinator's own tool calls per turn, delegations included; members keep their own budgets
 - **compaction**: Optional team-owned required-compaction overrides for the shared team scope
 
 Named teams use these explicit team settings for replay and compaction when provided.
@@ -379,12 +384,13 @@ defaults:
   # num_history_runs: null  # Default: all
   # num_history_messages: null  # Mutually exclusive with num_history_runs
   # max_tool_calls_from_history: null  # Default: no limit
+  # max_tool_calls_per_turn: 1000  # Default: 1000 tool calls per agent or team turn
   # worker_tools: null  # Default: use built-in routing policy
   # worker_scope: null  # Default: no worker scoping
 ```
 
 Automatic thread summaries use `defaults.thread_summary_temperature` when the selected provider supports runtime temperature overrides.
-MindRoom always uses provider temperature defaults for Vertex Claude, Claude Opus 5, Sonnet 5, Fable 5.1, and direct Google Gemini 3.8 Flash and Gemini 3.5 Flash-Lite thread summaries.
+MindRoom always uses provider temperature defaults for GPT-6 Astra, Sol, and Luna, Vertex Claude, Claude Opus 5.5, Sonnet 5.5, Opus 5, Sonnet 5, Fable 5.1, and direct Google Gemini 3.8 Flash and Gemini 3.5 Flash-Lite thread summaries.
 When a thread has no trusted prior summary, its first automatic summary call is summary-only so a useful thread title appears early.
 The next scheduled automatic summary refresh also returns one to three tags when the thread has no existing tags, whether the prior summary was automatic or manual.
 Initial tags therefore use the same summary model, room override, temperature, prompt, and background task as the refreshed summary.
@@ -469,6 +475,7 @@ Below is a representative selection:
 - **slack** - Slack messaging (requires bot token)
 - **discord** - Discord messaging (requires bot token)
 - **matrix_message** - Send messages to other Matrix rooms
+- **thread_move** - Move the current Matrix thread into another room with `move_thread`
 - **thread_summary** - Write or update a one-line Matrix thread summary with `set_thread_summary`
 - **thread_model** - Show, switch, or reset the model override for the current Matrix thread (applies from the next message)
 
@@ -485,6 +492,7 @@ Below is a representative selection:
 - **google_docs** - Google Docs creation, reading, and text editing (requires Google OAuth)
 - **google_drive** - Google Drive file reading and management (requires Google OAuth)
 - **google_sheets** - Spreadsheet operations (requires Google OAuth)
+- **google_tasks** - Google Tasks listing, creation, updates, and completion (requires Google OAuth)
 - **homeassistant** - Home Assistant device control (requires OAuth or long-lived access token)
 - **spotify** - Spotify playback and library (requires OAuth)
 - **todoist** - Task management (requires API key)
@@ -596,7 +604,7 @@ Some tools need additional setup:
 
 ### Tools requiring OAuth or credentials:
 - **github** - GitHub App user OAuth, with an explicit access token or `GITHUB_ACCESS_TOKEN` as a higher-precedence alternative
-- **gmail**, **google_calendar**, **google_docs**, **google_drive**, **google_sheets** - Google OAuth
+- **gmail**, **google_calendar**, **google_docs**, **google_drive**, **google_sheets**, **google_tasks** - Google OAuth
 - **homeassistant** - Home Assistant OAuth or long-lived access token
 - **spotify** - Manually supplied Spotify OAuth access token
 
@@ -635,7 +643,7 @@ models:
 
   smart:
     provider: "anthropic"
-    id: "claude-sonnet-5"
+    id: "claude-sonnet-5-5"
 
 # Agent configurations
 agents:

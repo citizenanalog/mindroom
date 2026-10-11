@@ -82,6 +82,7 @@ async def start_child_record(
             parent_delegation_id=parent_delegation_id,
             subagent_id=child.subagent_id,
             previous_delegation_id=child.previous_delegation_id,
+            persona=child.persona,
         ),
         caller_execution_identity=caller_execution_identity,
         child_execution_identity=child_identity,
@@ -269,7 +270,7 @@ async def _append_response_events(
                 data={"content": response.content},
             ),
         )
-    usage = response.metrics.to_dict() if response.metrics is not None else None
+    usage = child_response_usage(response)
     if usage:
         await owner.append_event(
             handle,
@@ -280,6 +281,11 @@ async def _append_response_events(
             ),
         )
     return usage, pending_approval
+
+
+def child_response_usage(response: RunOutput) -> dict[str, object] | None:
+    """Return the usage one child attempt reports."""
+    return response.metrics.to_dict() if response.metrics is not None else None
 
 
 async def finish_child_record(

@@ -18,9 +18,9 @@ from agno.tools.function import FunctionCall
 
 from mindroom.api import sandbox_runner
 from mindroom.constants import resolve_runtime_paths
-from mindroom.shell_execution import kill_all_records, run_command
-from mindroom.shell_output_capture import ShellOutputDestination
-from mindroom.shell_supervisor import SHELL_SUPERVISOR_SOCKET_ENV, _ShellSupervisorManager
+from mindroom.shell.execution import kill_all_records, run_command
+from mindroom.shell.output_capture import ShellOutputDestination
+from mindroom.shell.supervisor import SHELL_SUPERVISOR_SOCKET_ENV, _ShellSupervisorManager
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_toolkit_for_output_files
 from mindroom.tools import shell as shell_module
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
     from agno.tools.toolkit import Toolkit
 
-    from mindroom.shell_execution import ShellRunResult
+    from mindroom.shell.execution import ShellRunResult
 
 
 @pytest.fixture(params=[False, True], ids=["local", "supervisor"])
@@ -131,6 +131,23 @@ async def test_plain_shell_output_still_honors_tail(shell_toolkit: Toolkit) -> N
 
     assert result.status == "success"
     assert str(result.result).splitlines()[1:] == ["two", "three"]
+
+
+@pytest.mark.asyncio
+async def test_redirect_preserves_stdout_receipt_on_nonzero_exit(shell_toolkit: Toolkit, tmp_path: Path) -> None:
+    """Redirected nonterminal CLI output must use the same complete failure formatting."""
+    result = await FunctionCall(
+        function=shell_toolkit.async_functions["run_shell_command"],
+        arguments={
+            "args": 'printf \'{"status":"queued","call_id":"call-1"}\'; exit 3',
+            "mindroom_output_path": "receipt.txt",
+        },
+    ).aexecute()
+
+    assert result.status == "success"
+    assert (tmp_path / "receipt.txt").read_text().split("\n", 1)[-1] == (
+        'Error: {"status":"queued","call_id":"call-1"}'
+    )
 
 
 @pytest.mark.asyncio
@@ -290,12 +307,13 @@ async def test_spool_failure_settles_background_handle(tmp_path: Path, monkeypat
         streams.append(stream)
         return stream
 
-    monkeypatch.setattr("mindroom.shell_output_capture.tempfile.TemporaryFile", full_device)
+    monkeypatch.setattr("mindroom.shell.output_capture.tempfile.TemporaryFile", full_device)
     registry = {}
     result = await run_command(
         registry,
         namespace="disk-failure",
-        argv=["bash", "-c", "printf data"],
+        # Outlive spawn so timeout=0 always backgrounds; a command that already exited returns in the foreground.
+        argv=["bash", "-c", "printf data; sleep 0.5"],
         env={"PATH": os.environ["PATH"]},
         cwd=str(tmp_path),
         tail=100,
@@ -333,8 +351,8 @@ async def test_spawn_cancellation_closes_capture(tmp_path: Path, monkeypatch: py
         spawning.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr("mindroom.shell_output_capture.tempfile.TemporaryFile", observed_file)
-    monkeypatch.setattr("mindroom.shell_execution.asyncio.create_subprocess_exec", blocked_spawn)
+    monkeypatch.setattr("mindroom.shell.output_capture.tempfile.TemporaryFile", observed_file)
+    monkeypatch.setattr("mindroom.shell.execution.asyncio.create_subprocess_exec", blocked_spawn)
     task = asyncio.create_task(
         run_command(
             {},
@@ -469,7 +487,7 @@ async def test_spool_creation_failure_returns_shell_error(tmp_path: Path, monkey
         message = "Cannot create capture spool"
         raise OSError(message)
 
-    monkeypatch.setattr("mindroom.shell_output_capture.tempfile.TemporaryFile", fail_spool)
+    monkeypatch.setattr("mindroom.shell.output_capture.tempfile.TemporaryFile", fail_spool)
     result = await run_command(
         {},
         namespace="spool-create",

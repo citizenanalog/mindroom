@@ -153,6 +153,7 @@ def _plugin(*callbacks: object) -> object:
             "entry_config": PluginEntryConfig(path="test-plugin"),
             "plugin_order": 0,
             "discovered_hooks": tuple(callbacks),
+            "discovered_automations": (),
         },
     )()
 
@@ -596,6 +597,34 @@ def test_output_temp_name_does_not_limit_destination_basename(tmp_path: Path, na
     assert list(tmp_path.iterdir()) == [tmp_path / filename]
 
 
+@pytest.mark.parametrize("workspace_state", ["real", "home-relative", "replaced-by-link"])
+def test_output_write_opens_the_workspace_as_spelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_state: str,
+) -> None:
+    """Output lands in the workspace as spelled; a workspace replaced by a link is refused, not followed."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "agents" / "code" / "workspace"
+    workspace.mkdir(parents=True)
+    credentials = tmp_path / "credentials"
+    credentials.mkdir()
+    spelled = Path("~/agents/code/workspace") if workspace_state == "home-relative" else workspace
+    policy = _policy(spelled)
+    if workspace_state == "replaced-by-link":
+        workspace.rename(tmp_path / "moved-workspace")
+        workspace.symlink_to(credentials, target_is_directory=True)
+
+    result = write_bytes_to_output_path(policy, "reports/nested/out.bin", b"payload")
+
+    if workspace_state == "replaced-by-link":
+        assert result == "Failed to write redirected tool output."
+        assert list(credentials.iterdir()) == []
+    else:
+        assert not isinstance(result, str)
+        assert (workspace / "reports" / "nested" / "out.bin").read_bytes() == b"payload"
+
+
 @pytest.mark.parametrize(
     "bad_path",
     [
@@ -657,6 +686,50 @@ def test_existing_directory_rejected_without_calling_tool(tmp_path: Path) -> Non
 
     assert seen == []
     assert _receipt(result.result)["status"] == "error"
+
+
+@pytest.mark.parametrize("git_path", ["knowledge/docs/.git/config", "knowledge/docs/.git", "repo/.GIT/config"])
+def test_git_metadata_output_paths_rejected_without_calling_tool(tmp_path: Path, git_path: str) -> None:
+    """Redirected output must not author Git metadata that MindRoom later runs Git against."""
+    git_config = tmp_path / "knowledge" / "docs" / ".git" / "config"
+    git_config.parent.mkdir(parents=True)
+    git_config.write_text("[core]\n", encoding="utf-8")
+    seen: list[object] = []
+    toolkit = _EchoToolkit(seen, result="should not run")
+    wrap_toolkit_for_output_files(toolkit, _policy(tmp_path))
+
+    result = FunctionCall(
+        function=_first_function(toolkit),
+        arguments={"text": "hi", OUTPUT_PATH_ARGUMENT: git_path},
+        call_id="call-1",
+    ).execute()
+
+    assert seen == []
+    assert _receipt(result.result)["status"] == "error"
+    assert validate_output_path_syntax(git_path) == "mindroom_output_path must not target Git metadata ('.git')."
+    assert git_config.read_text(encoding="utf-8") == "[core]\n"
+    assert not (tmp_path / "repo").exists()
+
+
+def test_symlink_into_git_metadata_rejected_without_calling_tool(tmp_path: Path) -> None:
+    """A workspace-internal link to ``.git`` must not bypass the name check."""
+    git_config = tmp_path / "knowledge" / "docs" / ".git" / "config"
+    git_config.parent.mkdir(parents=True)
+    git_config.write_text("[core]\n", encoding="utf-8")
+    (tmp_path / "linked").symlink_to(git_config.parent, target_is_directory=True)
+    seen: list[object] = []
+    toolkit = _EchoToolkit(seen, result="should not run")
+    wrap_toolkit_for_output_files(toolkit, _policy(tmp_path))
+
+    result = FunctionCall(
+        function=_first_function(toolkit),
+        arguments={"text": "hi", OUTPUT_PATH_ARGUMENT: "linked/config"},
+        call_id="call-1",
+    ).execute()
+
+    assert seen == []
+    assert _receipt(result.result)["status"] == "error"
+    assert git_config.read_text(encoding="utf-8") == "[core]\n"
 
 
 def test_intermediate_symlink_escape_rejected_without_calling_tool(tmp_path: Path) -> None:

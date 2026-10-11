@@ -18,7 +18,7 @@ from mindroom.api.connection_agents import (
     resolve_connection_agent,
     resolve_connection_user,
 )
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
 from mindroom.matrix.users import create_agent_http_client
 from mindroom.oauth.credential_lifecycle import resolve_oauth_credential_context
@@ -64,6 +64,7 @@ class AgentConnections(BaseModel):
     agent_display_name: str
     is_shared: bool
     can_use: bool
+    mcp_available: bool
     services: list[ConnectionService]
     tools: list[ConnectionTool]
 
@@ -182,6 +183,7 @@ def _agent_connections(
         agent_display_name=agent.display_name,
         is_shared=agent.private is None,
         can_use=agent_name in user.agent_names,
+        mcp_available=agent_name in user.gateway_agent_names,
         services=list(services.values()),
         tools=tools,
     )

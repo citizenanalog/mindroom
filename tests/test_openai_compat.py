@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import re
+import tempfile
 from concurrent.futures import CancelledError as FutureCancelledError
 from contextlib import contextmanager
 from contextvars import Context
@@ -15,13 +16,16 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.conftest import seed_session
+from tests.conftest import FakeModel, seed_session
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
+    from mindroom.ai import ResponseTurnContext
+
 import pytest
 from agno.agent import Agent as AgnoAgent
+from agno.metrics import RunMetrics
 from agno.models.message import Message
 from agno.models.ollama import Ollama
 from agno.models.response import ModelResponse
@@ -37,7 +41,7 @@ from starlette.requests import ClientDisconnect
 
 from mindroom import constants
 from mindroom.agents import create_agent
-from mindroom.ai_run_metadata import build_prepared_history_metadata_content
+from mindroom.ai_run_metadata import build_ai_run_metadata_content, build_prepared_history_metadata_content
 from mindroom.api import config_lifecycle, openai_compat
 from mindroom.api.main import initialize_api_app
 from mindroom.api.openai_compat import (
@@ -47,15 +51,19 @@ from mindroom.api.openai_compat import (
     _is_error_response,
 )
 from mindroom.api.openai_request_parsing import _extract_content_text
+from mindroom.approval.tool_approval import shutdown_approval_runtime
+from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.judgment import TypeSafeJudgmentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig, ToolConfigEntry
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.execution_preparation import _PreparedExecutionContext
+from mindroom.helper_usage import HelperUsageOwner, get_helper_usage_owner
 from mindroom.history.session_context import ScopeSessionContext, open_bound_scope_session_context
 from mindroom.history.types import CompactionDecision, HistoryScope, PreparedHistoryState, ResolvedReplayPlan
-from mindroom.judgment.client import PINNED_MODEL, SystemOneClient
+from mindroom.judgment.client import JudgmentClient
+from mindroom.judgment.typesafe import _PINNED_MODEL
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.indexing_config import IndexingSettings
 from mindroom.knowledge.utils import KnowledgeAvailabilityDetail, _KnowledgeResolution
@@ -64,11 +72,10 @@ from mindroom.matrix.client import ResolvedVisibleMessage
 from mindroom.memory import MemoryPromptParts
 from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
-from mindroom.provider_media_fallback import install_provider_media_fallback
+from mindroom.providers.media_fallback import install_provider_media_fallback
 from mindroom.routing import ResponderSelection
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode
-from mindroom.tool_approval import shutdown_approval_runtime
 from mindroom.tool_system.tool_calls import record_tool_success
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
@@ -96,7 +103,11 @@ def _make_test_team(
 
 
 def _runtime_paths(process_env: dict[str, str] | None = None) -> RuntimePaths:
-    return resolve_runtime_paths(config_path=Path(__file__), process_env=process_env or {})
+    return resolve_runtime_paths(
+        config_path=Path(__file__),
+        storage_path=Path(tempfile.mkdtemp()),
+        process_env=process_env or {},
+    )
 
 
 def _runtime_paths_for_config(config: Config, process_env: dict[str, str] | None = None) -> RuntimePaths:
@@ -257,7 +268,7 @@ def app_client(test_config: Config) -> Iterator[TestClient]:
 
     with (
         patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-        TestClient(app) as client,
+        TestClient(app, base_url="http://localhost") as client,
     ):
         yield client
 
@@ -364,7 +375,7 @@ def test_list_models_uses_committed_snapshot_until_reload(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/v1/models")
 
     assert response.status_code == 200
@@ -387,13 +398,14 @@ def test_list_models_keeps_auth_runtime_bound_across_runtime_swap(test_config: C
     captured_runtime_paths: list[RuntimePaths | None] = []
 
     def _authenticate_and_swap(
+        _request: Request,
         authorization: str | None,
         runtime_paths: RuntimePaths,
-    ) -> JSONResponse | None:
+    ) -> openai_compat._AuthenticatedCaller:
         assert authorization == "Bearer old-key"
         assert runtime_paths == runtime_a
         initialize_api_app(app, runtime_b)
-        return None
+        return openai_compat._AuthenticatedCaller(session_namespace="old-key-namespace", requester_id=None)
 
     def _capture_load_config(
         _request: Request,
@@ -438,7 +450,7 @@ def test_openai_compatible_agent_hides_approval_gated_tools(test_config: Config,
         session_id="openai-session",
     )
 
-    with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
         agent = create_agent(
             "code",
             config=config,
@@ -483,7 +495,7 @@ def test_openai_compatible_agent_hides_context_bound_todo_tool(tmp_path: Path) -
         session_id="openai-session",
     )
 
-    with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
         agent = create_agent(
             "code",
             config=config,
@@ -540,7 +552,7 @@ def test_openai_compatible_dynamic_tools_hide_deferred_context_bound_todo(tmp_pa
         session_id="openai-session",
     )
 
-    with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
         agent = create_agent(
             "code",
             config=config,
@@ -594,7 +606,7 @@ def test_openai_compatible_agent_hides_script_gated_tools(test_config: Config, t
         session_id="openai-session",
     )
 
-    with patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")):
         agent = create_agent(
             "code",
             config=config,
@@ -647,13 +659,14 @@ def test_chat_completions_keeps_auth_runtime_bound_across_runtime_swap(tmp_path:
     captured_runtime_paths: list[RuntimePaths | None] = []
 
     def _authenticate_and_swap(
+        _request: Request,
         authorization: str | None,
         runtime_paths: RuntimePaths,
-    ) -> JSONResponse | None:
+    ) -> openai_compat._AuthenticatedCaller:
         assert authorization == "Bearer old-key"
         assert runtime_paths == runtime_a
         initialize_api_app(app, runtime_b)
-        return None
+        return openai_compat._AuthenticatedCaller(session_namespace="old-key-namespace", requester_id=None)
 
     real_load_config = openai_compat._load_config
 
@@ -713,7 +726,7 @@ def test_list_models_tolerate_missing_plugin_path(tmp_path: Path) -> None:
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is True
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/v1/models")
 
     assert response.status_code == 200
@@ -737,7 +750,7 @@ def test_list_models_returns_malformed_yaml_errors(tmp_path: Path) -> None:
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is False
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/v1/models")
 
     assert response.status_code == 422
@@ -776,7 +789,7 @@ def test_chat_completions_tolerate_missing_plugin_path_during_model_validation(t
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is True
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.post(
             "/v1/chat/completions",
             json={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
@@ -803,7 +816,7 @@ def test_chat_completions_returns_malformed_yaml_errors(tmp_path: Path) -> None:
     initialize_api_app(app, runtime_paths)
     assert openai_compat.config_lifecycle.load_config_into_app(runtime_paths, app) is False
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         response = client.post(
             "/v1/chat/completions",
             json={"model": "general", "messages": [{"role": "user", "content": "hi"}]},
@@ -892,7 +905,7 @@ class TestListModels:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
 
@@ -918,7 +931,7 @@ class TestListModels:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
 
@@ -944,7 +957,7 @@ class TestListModels:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
 
@@ -994,7 +1007,7 @@ class TestListModels:
         )
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(empty_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.get("/v1/models")
             assert response.status_code == 200
@@ -1028,6 +1041,65 @@ class TestChatCompletions:
         assert data["choices"][0]["message"]["content"] == "Hello! How can I help?"
         assert data["choices"][0]["finish_reason"] == "stop"
         assert data["usage"]["prompt_tokens"] == 0
+
+    def test_non_stream_completion_reports_run_token_usage(self, app_client: TestClient) -> None:
+        """Non-streaming usage comes from the run's own token metrics instead of zeros."""
+
+        async def respond(_ctx: object, **kwargs: object) -> str:
+            collector = kwargs.get("run_metadata_collector")
+            if isinstance(collector, dict):
+                collector[constants.AI_RUN_METADATA_KEY] = {
+                    "usage": {"input_tokens": 1200, "output_tokens": 34, "total_tokens": 1234},
+                }
+            return "Hello!"
+
+        with patch("mindroom.api.openai_compat.ai_response", side_effect=respond):
+            response = app_client.post(
+                "/v1/chat/completions",
+                json={"model": "general", "messages": [{"role": "user", "content": "Hello"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"prompt_tokens": 1200, "completion_tokens": 34, "total_tokens": 1234}
+
+    def test_non_stream_usage_counts_cached_prompt_tokens_for_anthropic(self, app_client: TestClient) -> None:
+        """Anthropic reports cache reads and writes outside input_tokens; prompt_tokens must include them."""
+
+        async def respond(_ctx: object, **kwargs: object) -> str:
+            collector = kwargs.get("run_metadata_collector")
+            if isinstance(collector, dict):
+                collector.update(
+                    build_ai_run_metadata_content(
+                        config=Config(
+                            agents={},
+                            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
+                            router=RouterConfig(model="default"),
+                        ),
+                        model_name="default",
+                        run_id="run-1",
+                        session_id="session-1",
+                        status="completed",
+                        model="claude-sonnet-5-5",
+                        model_provider="Anthropic",
+                        metrics=RunMetrics(
+                            input_tokens=40,
+                            output_tokens=200,
+                            total_tokens=240,
+                            cache_read_tokens=30000,
+                            cache_write_tokens=500,
+                        ),
+                    ),
+                )
+            return "Hello!"
+
+        with patch("mindroom.api.openai_compat.ai_response", side_effect=respond):
+            response = app_client.post(
+                "/v1/chat/completions",
+                json={"model": "general", "messages": [{"role": "user", "content": "Hello"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"prompt_tokens": 30540, "completion_tokens": 200, "total_tokens": 30740}
 
     def test_completion_lock_releases_when_request_is_cancelled(self, app_client: TestClient) -> None:
         """Cancellation after lock acquisition must not leave the OpenAI session locked."""
@@ -1193,13 +1265,13 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(config, runtime_paths)),
-            patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
             patch("mindroom.ai.build_memory_prompt_parts", new=AsyncMock(return_value=MemoryPromptParts())),
             patch(
                 "mindroom.ai._run_cached_agent_attempt",
                 new=AsyncMock(return_value=RunOutput(content="Agent reply")),
             ),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1268,7 +1340,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1306,7 +1378,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1338,7 +1410,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1370,7 +1442,7 @@ class TestChatCompletions:
 
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(test_config, runtime_paths)),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             response = client.post(
                 "/v1/chat/completions",
@@ -1720,7 +1792,6 @@ class TestStreamingCompletion:
                 test_config,
                 _runtime_paths(),
                 None,
-                None,
             )
 
         assert isinstance(response, openai_compat._OpenAIStreamingResponse)
@@ -1775,7 +1846,6 @@ class TestStreamingCompletion:
                 "session-123",
                 test_config,
                 runtime_paths,
-                None,
                 None,
                 None,
                 execution_identity=execution_identity,
@@ -2095,6 +2165,59 @@ class TestAuthentication:
             },
         )
         assert response.status_code == 401
+
+    def test_unauthenticated_api_refuses_rebound_hosts_and_other_sites(self, app_client: TestClient) -> None:
+        """Without a key a completion runs an agent for any caller, so no rebound or cross-site page may start one."""
+        body = json.dumps({"model": "general", "messages": [{"role": "user", "content": "Hello"}]})
+        # A text/plain POST is a simple request, which a browser sends cross-site without a preflight.
+        simple = {"Content-Type": "text/plain"}
+        with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
+            mock_ai.return_value = "Hello!"
+            rebound = app_client.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={**simple, "Host": "attacker.example"},
+            )
+            cross_origin = app_client.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={**simple, "Origin": "https://attacker.example"},
+            )
+            cross_site = app_client.post(
+                "/v1/chat/completions",
+                content=body,
+                headers={**simple, "Sec-Fetch-Site": "cross-site"},
+            )
+            rebound_models = app_client.get("/v1/models", headers={"Host": "attacker.example"})
+
+        statuses = [response.status_code for response in (rebound, cross_origin, cross_site, rebound_models)]
+        assert statuses == [400, 403, 403, 400]
+        assert "MINDROOM_DASHBOARD_ALLOWED_HOSTS" in rebound.json()["error"]["message"]
+        mock_ai.assert_not_awaited()
+
+    def test_unauthenticated_api_serves_local_callers(self, app_client: TestClient) -> None:
+        """API clients, the local UI, and callers on an address keep reaching an unauthenticated `/v1`."""
+        payload = {"model": "general", "messages": [{"role": "user", "content": "Hello"}]}
+        with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai:
+            mock_ai.return_value = "Hello!"
+            responses = [
+                app_client.post("/v1/chat/completions", json=payload, headers=headers)
+                for headers in ({}, {"Origin": "http://localhost"}, {"Host": "192.168.1.20:8765"})
+            ]
+
+        assert [response.status_code for response in responses] == [200, 200, 200]
+
+    def test_keyed_api_serves_any_host_and_origin(self, authed_client: TestClient) -> None:
+        """A key authorizes a `/v1` request, so the host and origin it names do not matter."""
+        response = authed_client.get(
+            "/v1/models",
+            headers={
+                "Authorization": "Bearer test-key-1",
+                "Host": "mindroom.internal",
+                "Origin": "https://ui.example.org",
+            },
+        )
+        assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -2472,6 +2595,44 @@ async def test_openai_error_response_releases_lock_when_send_fails() -> None:
     assert not completion_lock.locked()
 
 
+def _completion_session_ids(client: TestClient, authorization_headers: list[str]) -> list[str]:
+    """Post one completion per Authorization header with the same X-Session-Id and return the session IDs."""
+    session_ids: list[str] = []
+
+    async def capture(ctx: ResponseTurnContext, **_kwargs: object) -> str:
+        session_ids.append(ctx.session_id)
+        return "Response"
+
+    with patch("mindroom.api.openai_compat.ai_response", side_effect=capture):
+        for authorization in authorization_headers:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": authorization, "X-Session-Id": "shared"},
+                json={"model": "general", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+            assert response.status_code == 200
+    return session_ids
+
+
+def test_session_namespace_is_the_full_digest_of_the_validated_key(authed_client: TestClient) -> None:
+    """Accepted spellings of one key share its session; another key never does."""
+    first, padded, tabbed, other = _completion_session_ids(
+        authed_client,
+        ["Bearer test-key-1", "Bearer   test-key-1", "Bearer \ttest-key-1", "Bearer test-key-2"],
+    )
+
+    assert first == f"{hashlib.sha256(b'test-key-1').hexdigest()}:shared"
+    assert padded == tabbed == first
+    assert other == f"{hashlib.sha256(b'test-key-2').hexdigest()}:shared"
+
+
+def test_unauthenticated_session_namespace_ignores_the_authorization_header(app_client: TestClient) -> None:
+    """Without configured keys the header authenticates nothing, so it cannot select a session namespace."""
+    session_ids = _completion_session_ids(app_client, ["Bearer anything", "Bearer something-else"])
+
+    assert session_ids == ["noauth:shared", "noauth:shared"]
+
+
 class TestSessionIdDerivation:
     """Tests for _derive_session_id()."""
 
@@ -2484,30 +2645,24 @@ class TestSessionIdDerivation:
         return mock
 
     def test_explicit_session_id_header(self) -> None:
-        """X-Session-Id header takes highest priority (namespaced with key)."""
+        """X-Session-Id header takes highest priority (namespaced with the caller's key)."""
         request = self._mock_request({"X-Session-Id": "my-session"})
-        sid = _derive_session_id("general", request)
-        # Session ID is namespaced with API key hash prefix
-        assert sid.endswith(":my-session")
-        assert sid.startswith("noauth:")  # No auth header
+        sid = _derive_session_id("general", request, "noauth")
+        assert sid == "noauth:my-session"
 
     def test_explicit_session_id_namespaced_by_key(self) -> None:
-        """Different API keys produce different session namespaces."""
-        req1 = self._mock_request({"X-Session-Id": "sess", "Authorization": "Bearer key-1"})
-        req2 = self._mock_request({"X-Session-Id": "sess", "Authorization": "Bearer key-2"})
-        sid1 = _derive_session_id("general", req1)
-        sid2 = _derive_session_id("general", req2)
-        # Same session ID but different keys → different derived IDs
-        assert sid1 != sid2
-        assert sid1.endswith(":sess")
-        assert sid2.endswith(":sess")
+        """Different key namespaces produce different session IDs for one X-Session-Id."""
+        request = self._mock_request({"X-Session-Id": "sess"})
+        sid1 = _derive_session_id("general", request, "key-1-digest")
+        sid2 = _derive_session_id("general", request, "key-2-digest")
+        assert sid1 == "key-1-digest:sess"
+        assert sid2 == "key-2-digest:sess"
 
     def test_librechat_conversation_id(self) -> None:
         """X-LibreChat-Conversation-Id header is used when no X-Session-Id."""
         request = self._mock_request({"X-LibreChat-Conversation-Id": "conv-123"})
-        sid = _derive_session_id("general", request)
-        assert "conv-123" in sid
-        assert "general" in sid
+        sid = _derive_session_id("general", request, "noauth")
+        assert sid == "noauth:conv-123:general"
 
     def test_session_id_takes_priority_over_librechat(self) -> None:
         """X-Session-Id takes priority over X-LibreChat-Conversation-Id."""
@@ -2517,22 +2672,22 @@ class TestSessionIdDerivation:
                 "X-LibreChat-Conversation-Id": "libre",
             },
         )
-        sid = _derive_session_id("general", request)
+        sid = _derive_session_id("general", request, "noauth")
         assert "explicit" in sid
         assert "libre" not in sid
 
     def test_fallback_generates_ephemeral_session_id(self) -> None:
         """Fallback generates an ephemeral namespaced session ID."""
         request = self._mock_request()
-        sid1 = _derive_session_id("general", request)
+        sid1 = _derive_session_id("general", request, "noauth")
         assert sid1.startswith("noauth:ephemeral:")
         assert len(sid1) > len("noauth:ephemeral:")
 
     def test_fallback_is_not_deterministic(self) -> None:
         """Fallback IDs differ across requests to avoid cross-chat collisions."""
         request = self._mock_request()
-        sid1 = _derive_session_id("general", request)
-        sid2 = _derive_session_id("general", request)
+        sid1 = _derive_session_id("general", request, "noauth")
+        sid2 = _derive_session_id("general", request, "noauth")
         assert sid1 != sid2
 
     def test_fallback_ignores_user_message_content(self, app_client: TestClient) -> None:
@@ -2735,12 +2890,12 @@ class TestAutoRouting:
         def env_value(paths: RuntimePaths, key: str, *args: object, **kwargs: object) -> str | None:
             return "synthetic" if key == "TYPESAFE_API_KEY" else original_env_value(paths, key, *args, **kwargs)
 
-        async def post(_self: SystemOneClient, body: bytes) -> bytes:
+        async def post(_self: JudgmentClient, body: bytes) -> bytes:
             payload = json.loads(body)
             posted.append(payload)
             return json.dumps(
                 {
-                    "model": PINNED_MODEL,
+                    "model": _PINNED_MODEL,
                     "answers": {
                         "responder_selection": {
                             "type": "choice",
@@ -2757,7 +2912,7 @@ class TestAutoRouting:
             ).encode()
 
         monkeypatch.setattr(RuntimePaths, "env_value", env_value)
-        monkeypatch.setattr(SystemOneClient, "_post", post)
+        monkeypatch.setattr(JudgmentClient, "_post", post)
         with patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as response_agent:
             response = app_client.post(
                 "/v1/chat/completions",
@@ -2871,7 +3026,7 @@ class TestAutoRouting:
         with (
             patch("mindroom.api.openai_compat._load_config", return_value=(empty_config, runtime_paths)),
             patch("mindroom.api.openai_compat.suggest_responder", new_callable=AsyncMock) as mock_route,
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             mock_route.return_value = None
             response = client.post(
@@ -2979,9 +3134,122 @@ def team_app_client(team_config: Config) -> Iterator[TestClient]:
     initialize_api_app(app, runtime_paths)
     with (
         patch("mindroom.api.openai_compat._load_config", return_value=(team_config, runtime_paths)),
-        TestClient(app) as client,
+        TestClient(app, base_url="http://localhost") as client,
     ):
         yield client
+
+
+def _post_team_completion_capturing_run_user(
+    client: TestClient,
+    *,
+    stream: bool,
+    headers: dict[str, str] | None = None,
+) -> MagicMock:
+    """Post one team completion carrying a spoofed body ``user`` and return the captured ``team.arun``."""
+    mock_team = _make_test_team()
+
+    async def stream_events() -> AsyncIterator[object]:
+        yield TeamContentEvent(content="Team answer")
+
+    async def run() -> TeamRunOutput:
+        return TeamRunOutput(content="Team answer")
+
+    mock_team.arun = MagicMock(side_effect=lambda *_args, **kwargs: stream_events() if kwargs.get("stream") else run())
+    with (
+        patch(
+            "mindroom.api.openai_compat._build_team",
+            return_value=([_make_test_agent("GeneralAgent")], mock_team, TeamMode.COORDINATE),
+        ),
+        patch(
+            "mindroom.api.openai_compat._prepare_openai_team_prompt",
+            new=AsyncMock(return_value=openai_compat._PreparedOpenAITeamPrompt("Build it", None)),
+        ),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers or {},
+            json={
+                "model": "team/super_team",
+                "messages": [{"role": "user", "content": "Build it"}],
+                "stream": stream,
+                "user": "@victim:localhost",
+            },
+        )
+    assert response.status_code == 200
+    assert "Team answer" in response.text
+    return mock_team.arun
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_team_run_ignores_request_body_user_without_requester(team_app_client: TestClient, stream: bool) -> None:
+    """The request body ``user`` must not choose the Agno user scope of a team run."""
+    arun = _post_team_completion_capturing_run_user(team_app_client, stream=stream)
+
+    assert arun.call_args.kwargs["user_id"] is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_team_run_uses_mapped_requester_instead_of_request_body_user(team_config: Config, stream: bool) -> None:
+    """A mapped key's canonical requester, never the body ``user``, owns the team run's Agno user scope."""
+    team_config.teams["super_team"].access = ResponderAccessConfig(users=["@alice:localhost"])
+    runtime_paths = _runtime_paths(
+        {
+            "OPENAI_COMPAT_API_KEYS": "alice-key",
+            "OPENAI_COMPAT_API_KEY_REQUESTERS": json.dumps({"alice-key": "@alice:localhost"}),
+        },
+    )
+    persist_entity_accounts(team_config, runtime_paths)
+    app = FastAPI()
+    app.include_router(openai_compat.router)
+    initialize_api_app(app, runtime_paths)
+    with (
+        patch("mindroom.api.openai_compat._load_config", return_value=(team_config, runtime_paths)),
+        TestClient(app, base_url="http://localhost") as client,
+    ):
+        arun = _post_team_completion_capturing_run_user(
+            client,
+            stream=stream,
+            headers={"Authorization": "Bearer alice-key"},
+        )
+
+    assert arun.call_args.kwargs["user_id"] == "@alice:localhost"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_team_run_records_helper_usage_in_its_conversation(team_app_client: TestClient, stream: bool) -> None:
+    """Helper work during an API team run, such as a member's Claude Code session, belongs to the team conversation."""
+    owners: list[HelperUsageOwner | None] = []
+    mock_team = _make_test_team()
+
+    async def stream_events() -> AsyncIterator[object]:
+        owners.append(get_helper_usage_owner())
+        yield TeamContentEvent(content="Team answer")
+
+    async def run() -> TeamRunOutput:
+        owners.append(get_helper_usage_owner())
+        return TeamRunOutput(content="Team answer")
+
+    mock_team.arun = MagicMock(side_effect=lambda *_args, **kwargs: stream_events() if kwargs.get("stream") else run())
+    with (
+        patch(
+            "mindroom.api.openai_compat._build_team",
+            return_value=([_make_test_agent("GeneralAgent")], mock_team, TeamMode.COORDINATE),
+        ),
+        patch(
+            "mindroom.api.openai_compat._prepare_openai_team_prompt",
+            new=AsyncMock(return_value=openai_compat._PreparedOpenAITeamPrompt("Build it", None)),
+        ),
+    ):
+        response = team_app_client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "team-session"},
+            json={"model": "team/super_team", "messages": [{"role": "user", "content": "Build it"}], "stream": stream},
+        )
+
+    assert response.status_code == 200
+    assert len(owners) == 1
+    assert owners[0] is not None
+    assert owners[0].session_id == mock_team.arun.call_args.kwargs["session_id"]
 
 
 class TestTeamCompletion:
@@ -3117,6 +3385,52 @@ class TestTeamCompletion:
         assert run_input == "Build a feature"
         metadata = mock_team.arun.call_args.kwargs["metadata"]
         assert metadata[constants.AI_RUN_METADATA_KEY]["prepared_context"]["tokens"] == 321
+
+    def test_team_non_streaming_reports_leader_and_member_token_usage(self, team_app_client: TestClient) -> None:
+        """Team usage sums every run's prompt tokens, each normalized for its own provider's cache accounting."""
+        mock_team = _make_test_team()
+        mock_team.arun = AsyncMock(
+            return_value=TeamRunOutput(
+                content="Team consensus result",
+                model="claude-sonnet-5-5",
+                model_provider="Anthropic",
+                metrics=RunMetrics(
+                    input_tokens=100,
+                    output_tokens=20,
+                    total_tokens=120,
+                    cache_read_tokens=1000,
+                    cache_write_tokens=200,
+                ),
+                member_responses=[
+                    RunOutput(
+                        content="Member view",
+                        model="gpt-6-astra",
+                        model_provider="OpenAI",
+                        metrics=RunMetrics(input_tokens=50, output_tokens=10, total_tokens=60, cache_read_tokens=30),
+                    ),
+                ],
+            ),
+        )
+        mock_agents = [_make_test_agent("GeneralAgent"), _make_test_agent("CodeAgent")]
+
+        with (
+            patch(
+                "mindroom.api.openai_compat._build_team",
+                return_value=(mock_agents, mock_team, TeamMode.COORDINATE),
+            ),
+            patch(
+                "mindroom.api.openai_compat.prepare_materialized_team_execution",
+                new_callable=AsyncMock,
+            ) as mock_prepare,
+        ):
+            mock_prepare.return_value = _prepared_team_execution_context(final_prompt="Build a feature")
+            response = team_app_client.post(
+                "/v1/chat/completions",
+                json={"model": "team/super_team", "messages": [{"role": "user", "content": "Build a feature"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"prompt_tokens": 1350, "completion_tokens": 30, "total_tokens": 1380}
 
     def test_team_non_streaming_unready_kb_emits_system_hint(self, team_app_client: TestClient) -> None:
         """Non-streaming team completions should prepend the degraded knowledge notice."""
@@ -3266,7 +3580,6 @@ class TestTeamCompletion:
                 team_config,
                 runtime_paths,
                 None,
-                "@api-user:localhost",
                 execution_identity=execution_identity,
             )
 
@@ -3529,7 +3842,6 @@ class TestTeamCompletion:
                 team_config,
                 runtime_paths,
                 None,
-                "@api-user:localhost",
                 execution_identity=execution_identity,
             )
 
@@ -4001,7 +4313,6 @@ class TestTeamCompletion:
                 team_config,
                 runtime_paths,
                 None,
-                None,
                 execution_identity=execution_identity,
             )
 
@@ -4237,7 +4548,7 @@ class TestTeamCompletion:
     def test_team_member_materialization_failure_returns_generic_500(self, team_app_client: TestClient) -> None:
         """Configured team build failures should not expose internal exception details."""
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=MagicMock()),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=MagicMock()),
             patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
             patch(
                 "mindroom.teams.create_agent",
@@ -4812,7 +5123,7 @@ class TestTeamCompletion:
         )
         with (
             patch("mindroom.teams.create_agent") as mock_create,
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("agno.team.Team.__init__", return_value=None) as mock_team_init,
         ):
             mock_create.return_value = MagicMock(name="GeneralAgent")
@@ -4844,7 +5155,7 @@ class TestTeamCompletion:
         """Coordinate mode sets delegate_to_all_members=False on Team."""
         with (
             patch("mindroom.teams.create_agent") as mock_create,
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("agno.team.Team.__init__", return_value=None) as mock_team_init,
         ):
             mock_create.return_value = MagicMock(name="GeneralAgent")
@@ -4907,7 +5218,7 @@ class TestTeamCompletion:
 
         with (
             patch("mindroom.teams.create_agent", return_value=member),
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("agno.team.Team.__init__", return_value=None) as mock_team_init,
         ):
             from mindroom.api.openai_compat import _build_team  # noqa: PLC0415
@@ -4951,7 +5262,10 @@ class TestTeamCompletion:
 
         with (
             patch("mindroom.teams.create_agent", return_value=member),
-            patch("mindroom.model_loading.get_model_instance", return_value="openai:test-model"),
+            patch(
+                "mindroom.providers.model_loading.get_model_instance",
+                return_value=FakeModel(id="test-model", provider="fake"),
+            ),
         ):
             from mindroom.api.openai_compat import _build_team  # noqa: PLC0415
 
@@ -5008,7 +5322,7 @@ class TestTeamCompletion:
                 execution_identity=execution_identity,
                 team_name="super_team",
             ) as scope_context,
-            patch("mindroom.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
         ):
             assert scope_context is not None
             agents, team, mode = openai_compat._build_team(
@@ -5118,7 +5432,7 @@ class TestTeamCompletion:
         mock_knowledge = MagicMock()
         with (
             patch("mindroom.teams.create_agent") as mock_create,
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch(
                 "mindroom.teams.resolve_agent_knowledge_access",
                 return_value=_KnowledgeResolution(knowledge=mock_knowledge),
@@ -5197,7 +5511,7 @@ def knowledge_app_client(knowledge_config: Config) -> Iterator[TestClient]:
     initialize_api_app(app, runtime_paths)
     with (
         patch("mindroom.api.openai_compat._load_config", return_value=(knowledge_config, runtime_paths)),
-        TestClient(app) as client,
+        TestClient(app, base_url="http://localhost") as client,
     ):
         yield client
 
@@ -5260,7 +5574,7 @@ class TestKnowledgeIntegration:
             patch("mindroom.api.openai_compat._load_config", return_value=(knowledge_config, runtime_paths)),
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
             patch("mindroom.knowledge.utils._lookup_knowledge_for_base", side_effect=fake_lookup_knowledge_for_base),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             mock_ai.return_value = "Response with keyed knowledge"
             response = client.post(
@@ -5423,7 +5737,7 @@ class TestKnowledgeIntegration:
             patch("mindroom.api.openai_compat._load_config", return_value=(knowledge_config, runtime_paths)),
             patch("mindroom.api.openai_compat.ai_response", new_callable=AsyncMock) as mock_ai,
             patch("mindroom.knowledge.utils._lookup_knowledge_for_base", side_effect=fake_lookup_knowledge_for_base),
-            TestClient(app) as client,
+            TestClient(app, base_url="http://localhost") as client,
         ):
             mock_ai.return_value = "Merged knowledge response"
             response = client.post(
@@ -5571,7 +5885,7 @@ def test_response_activity_releases_cancelled_openai_request(
         monkeypatch.setattr(openai_compat, "_chat_completions", complete)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app_client.app),
-            base_url="http://test",
+            base_url="http://localhost",
         ) as client:
             task = asyncio.create_task(
                 client.post(

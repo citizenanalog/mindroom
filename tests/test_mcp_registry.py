@@ -28,6 +28,7 @@ from mindroom.tool_system.metadata import (
     TOOL_REGISTRY,
     get_tool_by_name,
 )
+from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
     resolve_worker_target,
@@ -249,6 +250,17 @@ def test_sync_mcp_tool_registry_removes_untracked_dynamic_entries(tmp_path: Path
     assert "mcp_demo" not in TOOL_REGISTRY
 
 
+def test_plugin_load_keeps_registered_mcp_tools(tmp_path: Path) -> None:
+    """Plugin loads must not drop live MCP tools that concurrent agent builds read."""
+    config = _config(tmp_path)
+    sync_mcp_tool_registry(config)
+
+    load_plugins(config, _runtime_paths(tmp_path))
+
+    assert "mcp_demo" in TOOL_REGISTRY
+    assert "mcp_demo" in TOOL_METADATA
+
+
 def test_sync_mcp_tool_registry_rejects_name_collisions(tmp_path: Path) -> None:
     """Fail fast instead of silently overwriting an existing built-in tool entry."""
     TOOL_REGISTRY["mcp_demo"] = TOOL_REGISTRY["shell"]
@@ -287,7 +299,7 @@ def test_config_validation_rejects_runtime_mcp_name_collisions(tmp_path: Path) -
     )
     (plugin_root / "tools.py").write_text(
         "from agno.tools import Toolkit\n"
-        "from mindroom.tool_system.declarations import ToolCategory\nfrom mindroom.tool_system.registration import register_tool_with_metadata\n"
+        "from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess\nfrom mindroom.tool_system.registration import register_tool_with_metadata\n"
         "\n"
         "class DemoTool(Toolkit):\n"
         "    def __init__(self) -> None:\n"
@@ -295,6 +307,7 @@ def test_config_validation_rejects_runtime_mcp_name_collisions(tmp_path: Path) -
         "\n"
         "@register_tool_with_metadata(\n"
         "    name='mcp_demo',\n"
+        "    file_access=ToolFileAccess.NONE,\n"
         "    display_name='Plugin MCP Demo',\n"
         "    description='Should collide',\n"
         "    category=ToolCategory.DEVELOPMENT,\n"
@@ -336,7 +349,7 @@ def test_config_validation_allows_non_mcp_prefixed_plugin_tools_on_isolating_sco
     )
     (plugin_root / "tools.py").write_text(
         "from agno.tools import Toolkit\n"
-        "from mindroom.tool_system.declarations import ToolCategory\nfrom mindroom.tool_system.registration import register_tool_with_metadata\n"
+        "from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess\nfrom mindroom.tool_system.registration import register_tool_with_metadata\n"
         "\n"
         "class DemoTool(Toolkit):\n"
         "    def __init__(self) -> None:\n"
@@ -344,6 +357,7 @@ def test_config_validation_allows_non_mcp_prefixed_plugin_tools_on_isolating_sco
         "\n"
         "@register_tool_with_metadata(\n"
         "    name='mcp_custom_plugin',\n"
+        "    file_access=ToolFileAccess.NONE,\n"
         "    display_name='Plugin MCP Custom',\n"
         "    description='Not an MCP server',\n"
         "    category=ToolCategory.DEVELOPMENT,\n"

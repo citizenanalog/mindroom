@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock
 
 import nio
 import pytest
@@ -107,6 +107,7 @@ def test_managed_room_initial_state_does_not_embed_admin_ownership_metadata() ->
         ["@power:example.com"],
         ["@admin:example.com"],
         encrypted=False,
+        creators=frozenset(),
     )
 
     power_levels = initial_state[0]["content"]
@@ -292,16 +293,13 @@ async def test_managed_room_reconciliation_has_bounded_overlap(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_aliases_of_same_room_do_not_reconcile_concurrently(
+async def test_keys_recorded_for_one_room_do_not_reconcile_concurrently(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Alias duplication must not interleave policy updates to one physical room."""
+    """Keys recorded for one physical room must not interleave its policy updates."""
     config = membership_config(tmp_path, agent_rooms=["first", "second"])
     client = AsyncMock()
-    client.homeserver = "https://example.com"
-    client.rooms = {"!same:example.com": Mock()}
-    client.room_resolve_alias.return_value = nio.RoomResolveAliasResponse("#alias:example.com", "!same:example.com", [])
     active = 0
     peak = 0
 
@@ -314,9 +312,8 @@ async def test_aliases_of_same_room_do_not_reconcile_concurrently(
         finally:
             active -= 1
 
-    monkeypatch.setattr(matrix_rooms, "_add_room", Mock())
     monkeypatch.setattr(matrix_rooms, "_reconcile_joined_existing_room", reconcile)
-    result = await matrix_rooms.ensure_all_rooms_exist(client, config, runtime_paths_for(config))
+    room_ids = {"first": "!same:example.com", "second": "!same:example.com"}
     client.user_id = "@router:example.com"
     client.room_get_state.return_value = nio.RoomGetStateResponse(
         [
@@ -324,6 +321,5 @@ async def test_aliases_of_same_room_do_not_reconcile_concurrently(
         ],
         "!same:example.com",
     )
-    await matrix_rooms.reconcile_managed_rooms(client, config, runtime_paths_for(config), result)
-    assert result == {"first": "!same:example.com", "second": "!same:example.com"}
+    await matrix_rooms.reconcile_managed_rooms(client, config, runtime_paths_for(config), room_ids)
     assert peak == 1

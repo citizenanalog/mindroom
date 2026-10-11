@@ -16,8 +16,8 @@ from agno.run.team import TeamRunOutput
 from agno.team import Team
 from agno.tools.function import Function
 
-from mindroom.approval_execution import _collect_agent_continuation
-from mindroom.synthetic_model import SyntheticModel
+from mindroom.approval.execution import _collect_agent_continuation
+from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.teams import _collect_team_continuation, _TeamStreamPresentation
 from mindroom.tool_system.events import CollectedStreamPresentation
 
@@ -32,8 +32,14 @@ if TYPE_CHECKING:
 
 async def _collect(events: AsyncIterator[object], *, team: bool) -> RunOutput | TeamRunOutput:
     if team:
-        return await _collect_team_continuation(events, _TeamStreamPresentation.new([], [], show_tool_calls=True))
-    return (await _collect_agent_continuation(events, CollectedStreamPresentation(show_tool_calls=True))).response
+        return await _collect_team_continuation(
+            events,
+            _TeamStreamPresentation.new([], [], show_tool_calls=True),
+            progress=None,
+        )
+    return (
+        await _collect_agent_continuation(events, CollectedStreamPresentation(show_tool_calls=True), progress=None)
+    ).response
 
 
 @pytest.mark.parametrize("team", [False, True])

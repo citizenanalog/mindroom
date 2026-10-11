@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from contextlib import suppress
 from io import BytesIO
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from mindroom.api import knowledge as knowledge_api
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config
 from mindroom.knowledge.availability import KnowledgeAvailability
+from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge.registry import (
     load_published_index_state,
     published_index_metadata_path,
@@ -32,6 +34,7 @@ from mindroom.knowledge.registry import (
 from mindroom.knowledge.status import get_knowledge_index_status
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
@@ -126,17 +129,26 @@ def _assert_file_mode_metadata_blocks_old_semantic_index(
     assert semantic_status.availability is KnowledgeAvailability.CONFIG_MISMATCH
 
 
-def _init_git_checkout(path: Path, *tracked_paths: str) -> None:
-    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+def _checkout_git_dir(tmp_path: Path, path: Path) -> Path:
+    """Return the MindRoom-owned Git directory the API resolves for one checkout."""
+    return knowledge_git_dir(_runtime_paths(tmp_path).storage_root, path)
+
+
+def _init_git_checkout(tmp_path: Path, path: Path, *tracked_paths: str) -> None:
+    """Create a checkout laid out as MindRoom keeps one: its Git directory under the storage root."""
+    git_dir = _checkout_git_dir(tmp_path, path)
+    git_dir.parent.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(path)}
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, env=env)
     if tracked_paths:
-        subprocess.run(["git", "add", *tracked_paths], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "add", *tracked_paths], cwd=path, check=True, capture_output=True, env=env)
 
 
 def _test_client(tmp_path: Path) -> TestClient:
     runtime_paths = _runtime_paths(tmp_path)
     main.initialize_api_app(main.app, runtime_paths)
     config_lifecycle.app_state(main.app).knowledge_refresh_scheduler = None
-    return TestClient(main.app)
+    return TestClient(main.app, base_url="http://localhost")
 
 
 class _RecordingRefreshScheduler:
@@ -436,6 +448,7 @@ def test_knowledge_files_use_managed_file_filters(tmp_path: Path) -> None:
     (docs / ".hidden" / "note.md").write_text("hidden", encoding="utf-8")
     (docs / "outside.md").write_text("outside include pattern", encoding="utf-8")
     _init_git_checkout(
+        tmp_path,
         docs,
         "content/guide.md",
         "content/raw.txt",
@@ -492,6 +505,120 @@ def test_knowledge_files_under_symlinked_root_are_listed(tmp_path: Path) -> None
     assert status_response.json()["file_count"] == 1
 
 
+def test_knowledge_files_inside_an_agent_workspace_never_follow_a_planted_link(tmp_path: Path) -> None:
+    """A shared base inside an agent workspace is bound like the runtime binds it, never through a link there."""
+    client = _test_client(tmp_path)
+    victim = tmp_path / "mindroom_data" / "private_instances" / "victim-scope" / "mind" / "mind_data"
+    victim.mkdir(parents=True)
+    (victim / "secret.md").write_text("victim-only note", encoding="utf-8")
+    workspace = tmp_path / "mindroom_data" / "agents" / "helper" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "exports").symlink_to(victim, target_is_directory=True)
+    _publish_committed_runtime_config(client.app, _knowledge_config(workspace / "exports"))
+
+    files_response = client.get("/api/knowledge/bases/research/files")
+
+    assert files_response.status_code == 400
+    assert "victim-only" not in files_response.text
+
+
+def test_knowledge_files_use_the_checked_root_instead_of_resolving_it_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root swapped for a link after the binding check lists nothing instead of the link target."""
+    client = _test_client(tmp_path)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "secret.md").write_text("victim-only note", encoding="utf-8")
+    docs = tmp_path / "mindroom_data" / "agents" / "helper" / "workspace" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "own.md").write_text("own notes", encoding="utf-8")
+    _publish_committed_runtime_config(client.app, _knowledge_config(docs))
+    checked = knowledge_api.shared_knowledge_path
+
+    def check_then_swap(raw_path: str, runtime_paths: RuntimePaths) -> Path:
+        root = checked(raw_path, runtime_paths)
+        if root.is_dir() and not root.is_symlink():
+            root.rename(root.with_name("docs-moved"))
+            root.symlink_to(victim, target_is_directory=True)
+        return root
+
+    monkeypatch.setattr(knowledge_api, "shared_knowledge_path", check_then_swap)
+
+    files_response = client.get("/api/knowledge/bases/research/files")
+
+    assert "secret.md" not in files_response.text
+
+
+def _victim_and_workspace_docs(tmp_path: Path) -> tuple[Path, Path]:
+    storage = tmp_path / "mindroom_data"
+    victim = storage / "private_instances" / "victim-scope" / "mind" / "mind_data"
+    victim.mkdir(parents=True)
+    docs = storage / "agents" / "helper" / "workspace" / "docs"
+    docs.mkdir(parents=True)
+    return victim, docs
+
+
+def _swap_for_link_after_path_check(monkeypatch: pytest.MonkeyPatch, folder: Path, victim: Path) -> None:
+    """Swap ``folder`` for a link to ``victim`` right after the last path check, as a racing worker can."""
+    checked = knowledge_api._reject_unmanaged_knowledge_file_path
+
+    def check_then_swap(config: Config, base_id: str, relative_path: str) -> None:
+        checked(config, base_id, relative_path)
+        if not folder.is_symlink():
+            folder.rename(folder.with_name(f"{folder.name}-moved"))
+            folder.symlink_to(victim, target_is_directory=True)
+
+    async def mark_source_changed(*_args: object, **_kwargs: object) -> bool:
+        # The worker restores the real folder while this re-resolves the base, then swaps it back.
+        return False
+
+    monkeypatch.setattr(knowledge_api, "_reject_unmanaged_knowledge_file_path", check_then_swap)
+    monkeypatch.setattr(knowledge_api, "_mark_committed_mutation_and_schedule_refresh", mark_source_changed)
+
+
+@pytest.mark.parametrize(("folder", "path"), [("", "secret.md"), ("notes", "notes/secret.md")])
+def test_delete_never_follows_a_folder_swapped_for_a_link_after_the_path_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    folder: str,
+    path: str,
+) -> None:
+    """A workspace base folder replaced by a link after the path check never deletes the link target's file."""
+    client = _test_client(tmp_path)
+    victim, docs = _victim_and_workspace_docs(tmp_path)
+    (victim / "secret.md").write_text("victim-only note", encoding="utf-8")
+    (docs / folder).mkdir(exist_ok=True)
+    (docs / path).write_text("own notes", encoding="utf-8")
+    _publish_committed_runtime_config(client.app, _knowledge_config(docs))
+    _swap_for_link_after_path_check(monkeypatch, docs / folder, victim)
+
+    with pytest.raises(OSError, match=f"'{(docs / folder).name}'"):
+        client.delete(f"/api/knowledge/bases/research/files/{path}")
+
+    assert (victim / "secret.md").read_text(encoding="utf-8") == "victim-only note"
+
+
+def test_upload_never_publishes_through_a_base_swapped_for_a_link_after_the_path_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workspace base replaced by a link after the path check never receives the uploaded file."""
+    client = _test_client(tmp_path)
+    victim, docs = _victim_and_workspace_docs(tmp_path)
+    _publish_committed_runtime_config(client.app, _knowledge_config(docs))
+    _swap_for_link_after_path_check(monkeypatch, docs, victim)
+
+    with pytest.raises(OSError, match="'docs'"):
+        client.post(
+            "/api/knowledge/bases/research/upload",
+            files=[("files", ("planted.md", b"planted", "text/markdown"))],
+        )
+
+    assert list(victim.iterdir()) == []
+
+
 def test_git_backed_file_counts_use_tracked_semantic_files(tmp_path: Path) -> None:
     """Git-backed API file counts should match the tracked files the indexer can search."""
     client = _test_client(tmp_path)
@@ -499,7 +626,7 @@ def test_git_backed_file_counts_use_tracked_semantic_files(tmp_path: Path) -> No
     docs.mkdir()
     (docs / "tracked.md").write_text("tracked", encoding="utf-8")
     (docs / "untracked.md").write_text("untracked", encoding="utf-8")
-    _init_git_checkout(docs, "tracked.md")
+    _init_git_checkout(tmp_path, docs, "tracked.md")
     config = _knowledge_config(docs, git=True)
     _publish_committed_runtime_config(client.app, config)
 
@@ -550,7 +677,7 @@ def test_git_status_reads_disk_and_index_metadata(tmp_path: Path) -> None:
     runtime_paths = main._app_context(client.app).runtime_paths
     docs = tmp_path / "docs"
     docs.mkdir()
-    _init_git_checkout(docs)
+    _init_git_checkout(tmp_path, docs)
     config = _knowledge_config(docs, git=True)
     _publish_committed_runtime_config(client.app, config)
     _write_index_metadata(
@@ -703,6 +830,80 @@ def test_upload_schedules_refresh_without_inline_indexing(tmp_path: Path) -> Non
     refresh.assert_not_awaited()
 
 
+def test_upload_authenticates_the_caller_before_reading_the_body(tmp_path: Path) -> None:
+    """An unauthenticated upload is refused before any multipart byte is read or spooled to disk."""
+    runtime_paths = constants.resolve_primary_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={"MINDROOM_API_KEY": "upload-key"},
+    )
+    main.initialize_api_app(main.app, runtime_paths)
+    config_lifecycle.app_state(main.app).knowledge_refresh_scheduler = _RecordingRefreshScheduler()
+    docs = tmp_path / "docs"
+    _publish_committed_runtime_config(main.app, _knowledge_config(docs))
+    client = TestClient(main.app, base_url="http://localhost")
+    body_read = False
+
+    def body() -> Iterator[bytes]:
+        nonlocal body_read
+        body_read = True
+        yield b"--b\r\nContent-Disposition: form-data; name=files; filename=guide.md\r\n\r\nhello\r\n--b--\r\n"
+
+    refused = client.post(
+        "/api/knowledge/bases/research/upload",
+        content=body(),
+        headers={"content-type": "multipart/form-data; boundary=b"},
+    )
+    assert refused.status_code == 401
+    assert not body_read
+
+    with patch("mindroom.api.knowledge.refresh_knowledge_binding_in_subprocess", new=AsyncMock()):
+        accepted = client.post(
+            "/api/knowledge/bases/research/upload",
+            content=body(),
+            headers={"content-type": "multipart/form-data; boundary=b", "authorization": "Bearer upload-key"},
+        )
+    assert accepted.json()["uploaded"] == ["guide.md"]
+    assert (docs / "guide.md").read_text(encoding="utf-8") == "hello"
+
+
+def test_upload_reports_unparseable_bodies_as_400_and_missing_files_as_422(tmp_path: Path) -> None:
+    """Parsing the form in the handler keeps the error responses FastAPI gave the former File parameter."""
+    client = _test_client(tmp_path)
+    _publish_committed_runtime_config(client.app, _knowledge_config(tmp_path / "docs"))
+    multipart = {"content-type": "multipart/form-data; boundary=b"}
+
+    malformed = client.post("/api/knowledge/bases/research/upload", content=b"garbage", headers=multipart)
+    no_boundary = client.post(
+        "/api/knowledge/bases/research/upload",
+        content=b"garbage",
+        headers={"content-type": "multipart/form-data"},
+    )
+    no_files = client.post(
+        "/api/knowledge/bases/research/upload",
+        content=b"--b\r\nContent-Disposition: form-data; name=files\r\n\r\nnot a file\r\n--b--\r\n",
+        headers=multipart,
+    )
+
+    assert (malformed.status_code, malformed.json()) == (400, {"detail": "There was an error parsing the body"})
+    assert (no_boundary.status_code, no_boundary.json()) == (400, {"detail": "Missing boundary in multipart."})
+    assert no_files.status_code == 422
+    assert no_files.json()["detail"][0]["loc"] == ["body", "files"]
+    assert not (tmp_path / "docs").exists()
+
+
+def test_upload_documents_its_multipart_files_body() -> None:
+    """The API docs still offer the file input that the handler parses itself."""
+    operation = main.app.openapi()["paths"]["/api/knowledge/bases/{base_id}/upload"]["post"]
+
+    schema = operation["requestBody"]["content"]["multipart/form-data"]["schema"]
+    assert operation["requestBody"]["required"] is True
+    assert schema["required"] == ["files"]
+    items = schema["properties"]["files"]["items"]
+    assert items["format"] == "binary"
+    assert items["contentMediaType"] == "application/octet-stream"
+
+
 def test_upload_rejects_default_unsupported_extension_before_writing(tmp_path: Path) -> None:
     """Uploads must match the same semantic filters used by listing and indexing."""
     client = _test_client(tmp_path)
@@ -853,7 +1054,7 @@ async def test_empty_upload_parts_are_noop_without_source_change_mark_or_refresh
         patch("mindroom.api.knowledge.mark_knowledge_source_changed_async", side_effect=AssertionError("no mutation")),
         patch("mindroom.api.knowledge.refresh_knowledge_binding_in_subprocess", new=AsyncMock()) as refresh,
     ):
-        response = await knowledge_api.upload_knowledge_files(
+        response = await knowledge_api._upload_knowledge_files(
             "research",
             Request(
                 {
@@ -989,14 +1190,14 @@ async def test_upload_cancellation_during_write_removes_temp_file(
     scheduler = _RecordingRefreshScheduler()
     config_lifecycle.app_state(client.app).knowledge_refresh_scheduler = scheduler
 
-    async def _cancel_stream(_upload: UploadFile, destination: Path, _filename: str) -> None:
-        destination.write_text("partial", encoding="utf-8")
+    async def _cancel_stream(_upload: UploadFile, destination: BinaryIO, _filename: str) -> None:
+        destination.write(b"partial")
         raise asyncio.CancelledError
 
     monkeypatch.setattr(knowledge_api, "_stream_upload_to_destination", _cancel_stream)
 
     with pytest.raises(asyncio.CancelledError):
-        await knowledge_api.upload_knowledge_files(
+        await knowledge_api._upload_knowledge_files(
             "research",
             Request(
                 {
@@ -1030,14 +1231,14 @@ async def test_replacement_upload_cancellation_preserves_existing_file(
     scheduler = _RecordingRefreshScheduler()
     config_lifecycle.app_state(client.app).knowledge_refresh_scheduler = scheduler
 
-    async def _cancel_stream(_upload: UploadFile, destination: Path, _filename: str) -> None:
-        destination.write_text("partial", encoding="utf-8")
+    async def _cancel_stream(_upload: UploadFile, destination: BinaryIO, _filename: str) -> None:
+        destination.write(b"partial")
         raise asyncio.CancelledError
 
     monkeypatch.setattr(knowledge_api, "_stream_upload_to_destination", _cancel_stream)
 
     with pytest.raises(asyncio.CancelledError):
-        await knowledge_api.upload_knowledge_files(
+        await knowledge_api._upload_knowledge_files(
             "research",
             Request(
                 {
@@ -1081,7 +1282,7 @@ async def test_upload_cancellation_after_source_change_mark_finalizes_backup_and
     monkeypatch.setattr(knowledge_api, "mark_knowledge_source_changed_async", _slow_source_change_mark)
 
     upload_task = asyncio.create_task(
-        knowledge_api.upload_knowledge_files(
+        knowledge_api._upload_knowledge_files(
             "research",
             Request(
                 {
@@ -1166,20 +1367,20 @@ def test_upload_replace_failure_schedules_refresh_for_partial_commit(
     _write_index_metadata(config, runtime_paths, base_id="research")
     scheduler = _RecordingRefreshScheduler()
     config_lifecycle.app_state(client.app).knowledge_refresh_scheduler = scheduler
-    original_replace = type(docs).replace
+    original_replace = os.replace
     replace_count = 0
 
-    def _fail_second_replace(self: object, target: object) -> object:
+    def _fail_second_replace(source: str, destination: str, **dir_fds: int) -> None:
         nonlocal replace_count
-        if isinstance(self, type(docs)) and self.name.endswith(".upload.tmp"):
+        if str(source).endswith(".upload.tmp"):
             replace_count += 1
             if replace_count == 2:
                 msg = "replace failed"
                 raise RuntimeError(msg)
-        return original_replace(self, target)
+        original_replace(source, destination, **dir_fds)
 
     with (
-        patch("pathlib.Path.replace", _fail_second_replace),
+        patch("os.replace", _fail_second_replace),
         patch("mindroom.api.knowledge.refresh_knowledge_binding_in_subprocess", new=AsyncMock()) as refresh,
         pytest.raises(RuntimeError, match="replace failed"),
     ):
@@ -1634,7 +1835,7 @@ def test_delete_filesystem_failure_leaves_ready_index_unchanged_and_skips_refres
         raise RuntimeError(msg)
 
     with (
-        patch("pathlib.Path.unlink", _fail_delete_stage),
+        patch("os.unlink", _fail_delete_stage),
         patch(
             "mindroom.api.knowledge.mark_knowledge_source_changed_async",
             side_effect=AssertionError("no source change"),

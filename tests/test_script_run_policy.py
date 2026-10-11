@@ -10,6 +10,7 @@ import pytest
 
 import mindroom.agents as agents_module
 import mindroom.tools  # noqa: F401
+from mindroom.approval.tool_approval import _matching_tool_approval_rule, tool_may_require_approval
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
@@ -19,7 +20,6 @@ from mindroom.script_runs.policy import (
     resolve_current_script_tool,
     resolve_script_launch_grants,
 )
-from mindroom.tool_approval import _matching_tool_approval_rule, tool_may_require_approval
 from mindroom.tool_system.automation_approval import build_automation_approval_config
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import (
@@ -130,6 +130,23 @@ def test_launch_grants_exclude_stateful_browser_toolkit(tmp_path: Path) -> None:
     grants = resolve_script_launch_grants(context)
 
     assert all(grant.toolkit_name != "browser" for grant in grants)
+
+
+def test_launch_grants_exclude_skill_manage(tmp_path: Path) -> None:
+    """Like self_config, skill_manage stays with the agent's chat even when the agent lists it."""
+    context = _context_for_config(
+        tmp_path,
+        Config(
+            agents={"general": AgentConfig(display_name="General Agent", tools=["calculator", "skill_manage"])},
+            defaults=DefaultsConfig(tools=[]),
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
+        ),
+    )
+
+    grants = resolve_script_launch_grants(context)
+
+    assert ScriptToolGrant("calculator", "add") in grants
+    assert all(grant.toolkit_name != "skill_manage" for grant in grants)
 
 
 def test_requested_toolkit_is_revoked_when_the_agent_is_removed(tmp_path: Path) -> None:

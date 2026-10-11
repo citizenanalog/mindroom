@@ -16,7 +16,7 @@ import time
 import weakref
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 from uuid import uuid4
 
 from agno.run.agent import RunCompletedEvent, RunContentEvent, RunErrorEvent, RunOutput
@@ -33,6 +33,7 @@ from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.agent_run_context import prepend_knowledge_availability_notice
 from mindroom.ai import AIStreamChunk, ResponseTurnContext, ai_response, stream_agent_response
 from mindroom.api import config_lifecycle
+from mindroom.api.open_access import open_access_rejection
 from mindroom.api.openai_request_parsing import (
     AUTO_MODEL_NAME,
     RESERVED_MODEL_NAMES,
@@ -78,8 +79,9 @@ from mindroom.api.openai_streaming_protocol import (
 from mindroom.api.response_activity import track_openai_request
 from mindroom.authorization import is_sender_allowed_for_responder
 from mindroom.config.access import validate_concrete_matrix_user_ids
-from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths, runtime_env_flag
+from mindroom.constants import AI_RUN_METADATA_KEY, ROUTER_AGENT_NAME, RuntimePaths, runtime_env_flag
 from mindroom.execution_preparation import render_prepared_team_messages_text
+from mindroom.helper_usage import helper_usage_context
 from mindroom.history.session_context import (
     ScopeSessionContext,
     close_team_runtime_state_dbs,
@@ -92,6 +94,7 @@ from mindroom.llm_request_logging import (
     stream_with_llm_request_log_context,
 )
 from mindroom.logging_config import get_logger
+from mindroom.model_usage import context_input_tokens_from_counts
 from mindroom.requester_identity import is_human_requester_id, resolve_human_requester_alias
 from mindroom.response_activity import ResponseIdentity  # noqa: TC001 - FastAPI evaluates dependency annotations.
 from mindroom.routing import suggest_responder
@@ -239,11 +242,80 @@ class _ChatCompletionChoice(BaseModel):
 
 
 class _UsageInfo(BaseModel):
-    """Token usage fields default to zero and are not populated from run metrics."""
+    """Model token usage of the run behind one response, zero when the run reported none."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+
+
+def _usage_info(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int | None,
+    cache_write_tokens: int | None,
+    provider: str | None,
+    model_id: str | None,
+) -> _UsageInfo:
+    """Build OpenAI-style usage, where prompt_tokens includes cached input on every provider."""
+    prompt_tokens = (
+        context_input_tokens_from_counts(
+            input_tokens=input_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            provider=provider,
+            configured_provider=None,
+            model_id=model_id,
+        )
+        or 0
+    )
+    return _UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=prompt_tokens + output_tokens,
+    )
+
+
+def _usage_from_run_metadata(run_metadata: dict[str, Any]) -> _UsageInfo:
+    """Read usage from the versioned AI run metadata that an agent run reports."""
+    payload = run_metadata.get(AI_RUN_METADATA_KEY, {})
+    usage = payload.get("usage") or {}
+    model = payload.get("model") or {}
+    return _usage_info(
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=usage.get("cache_read_tokens"),
+        cache_write_tokens=usage.get("cache_write_tokens"),
+        provider=model.get("provider"),
+        model_id=model.get("id"),
+    )
+
+
+def _usage_from_team_output(response: TeamRunOutput | RunOutput) -> _UsageInfo:
+    """Sum usage over the leader and every member run, normalizing each run for its own provider."""
+    runs: list[TeamRunOutput | RunOutput] = [response]
+    total = _UsageInfo()
+    while runs:
+        run = runs.pop()
+        if isinstance(run, TeamRunOutput):
+            runs.extend(run.member_responses)
+        if run.metrics is None:
+            continue
+        usage = _usage_info(
+            input_tokens=run.metrics.input_tokens,
+            output_tokens=run.metrics.output_tokens,
+            cache_read_tokens=run.metrics.cache_read_tokens,
+            cache_write_tokens=run.metrics.cache_write_tokens,
+            provider=run.model_provider,
+            model_id=run.model,
+        )
+        total = _UsageInfo(
+            prompt_tokens=total.prompt_tokens + usage.prompt_tokens,
+            completion_tokens=total.completion_tokens + usage.completion_tokens,
+            total_tokens=total.total_tokens + usage.total_tokens,
+        )
+    return total
 
 
 class _ChatCompletionResponse(BaseModel):
@@ -281,10 +353,20 @@ class _ModelListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _authenticate_request(
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedCaller:
+    """One authenticated `/v1` caller."""
+
+    # Full digest of the validated key, or "noauth" when no keys are configured.
+    session_namespace: str
+    requester_id: str | None
+
+
+def _authenticate_request(  # noqa: PLR0911
+    request: Request,
     authorization: str | None,
     runtime_paths: RuntimePaths,
-) -> JSONResponse | str | None:
+) -> JSONResponse | _AuthenticatedCaller:
     """Authenticate one `/v1` request."""
     keys_env = runtime_paths.env_value("OPENAI_COMPAT_API_KEYS", default="") or ""
     allow_unauthenticated = runtime_env_flag(
@@ -294,7 +376,11 @@ def _authenticate_request(
     )
     if not keys_env.strip():
         if allow_unauthenticated:
-            return None
+            # A completion runs an agent with its tools, so a rebound or cross-site page must not trigger one.
+            rejection = open_access_rejection(request.headers, request.method, runtime_paths)
+            if rejection is not None:
+                return _error_response(rejection.status_code, rejection.detail, code="permission_denied")
+            return _AuthenticatedCaller(session_namespace="noauth", requester_id=None)
         return _error_response(
             401,
             "OpenAI-compatible API keys are not configured",
@@ -314,7 +400,13 @@ def _authenticate_request(
     if token not in valid_keys:
         return _error_response(401, "Invalid API key", code="invalid_api_key")
 
-    return _api_key_requester(token, runtime_paths)
+    requester_id = _api_key_requester(token, runtime_paths)
+    if isinstance(requester_id, JSONResponse):
+        return requester_id
+    return _AuthenticatedCaller(
+        session_namespace=hashlib.sha256(token.encode()).hexdigest(),
+        requester_id=requester_id,
+    )
 
 
 def _api_key_requester(token: str, runtime_paths: RuntimePaths) -> JSONResponse | str | None:
@@ -388,23 +480,19 @@ def _requester_authority(
 
 
 def _requester_allows_model(model: str, authority: DetachedRequesterContext | None) -> bool:
-    """Apply responder access to a mapped caller and every configured team member."""
+    """Apply the selected agent's or team's own responder access to a mapped caller.
+
+    A team's access grants its exact member agents for team requests, so members are not checked separately.
+    """
     if authority is None:
         return True
-    entities = [model]
-    if model.startswith(TEAM_MODEL_PREFIX):
-        team_name = model.removeprefix(TEAM_MODEL_PREFIX)
-        entities = [team_name, *authority.config.teams[team_name].agents]
-    return all(
-        is_sender_allowed_for_responder(
-            authority.requester_id,
-            entity_name,
-            None,
-            authority.config,
-            authority.runtime_paths,
-            authority.agent_reply_memberships,
-        )
-        for entity_name in entities
+    return is_sender_allowed_for_responder(
+        authority.requester_id,
+        model.removeprefix(TEAM_MODEL_PREFIX),
+        None,
+        authority.config,
+        authority.runtime_paths,
+        authority.agent_reply_memberships,
     )
 
 
@@ -464,13 +552,13 @@ async def list_models(
 ) -> JSONResponse:
     """List available models (agents) in OpenAI format."""
     runtime_paths = config_lifecycle.bind_current_request_snapshot(request).runtime_paths
-    auth_error = _authenticate_request(authorization, runtime_paths)
-    if isinstance(auth_error, JSONResponse):
-        return auth_error
+    caller = _authenticate_request(request, authorization, runtime_paths)
+    if isinstance(caller, JSONResponse):
+        return caller
 
     config, runtime_paths = _load_config(request, runtime_paths=runtime_paths)
 
-    authority = _requester_authority(request, auth_error, config, runtime_paths)
+    authority = _requester_authority(request, caller.requester_id, config, runtime_paths)
     if isinstance(authority, JSONResponse):
         return authority
 
@@ -531,15 +619,15 @@ async def chat_completions(
 ) -> JSONResponse | StreamingResponse:
     """Create a chat completion (non-streaming or streaming)."""
     runtime_paths = config_lifecycle.bind_current_request_snapshot(request).runtime_paths
-    auth_error = _authenticate_request(authorization, runtime_paths)
-    if isinstance(auth_error, JSONResponse):
-        return auth_error
+    caller = _authenticate_request(request, authorization, runtime_paths)
+    if isinstance(caller, JSONResponse):
+        return caller
 
     parsed = _parse_chat_request(request, await request.body(), runtime_paths=runtime_paths)
     if isinstance(parsed, JSONResponse):
         return parsed
     req, config, runtime_paths, prompt, thread_history = parsed
-    authority = _requester_authority(request, auth_error, config, runtime_paths)
+    authority = _requester_authority(request, caller.requester_id, config, runtime_paths)
     if isinstance(authority, JSONResponse):
         return authority
     with detached_requester_context(authority):
@@ -552,6 +640,7 @@ async def chat_completions(
             thread_history,
             authority,
             activity,
+            session_namespace=caller.session_namespace,
         )
     if isinstance(response, StreamingResponse):
         body_iterator = response.body_iterator
@@ -571,6 +660,8 @@ async def _chat_completions(  # noqa: C901, PLR0912
     thread_history: Sequence[ResolvedVisibleMessage] | None,
     authority: DetachedRequesterContext | None,
     activity: ResponseIdentity,
+    *,
+    session_namespace: str,
 ) -> JSONResponse | StreamingResponse:
     """Execute a completion inside its authenticated requester boundary."""
     # Resolve auto-routing if model is "auto"
@@ -593,8 +684,8 @@ async def _chat_completions(  # noqa: C901, PLR0912
     activity.responder = agent_name
     activity.requester_id = authority.requester_id if authority is not None else None
 
-    # Derive a namespaced session ID from request headers or fallback UUID.
-    session_id = _derive_session_id(agent_name, request)
+    # Derive a key-namespaced session ID from request headers or fallback UUID.
+    session_id = _derive_session_id(agent_name, request, session_namespace)
     if authority is not None:
         requester_digest = hashlib.sha256(authority.requester_id.encode()).hexdigest()
         session_id = f"requester:{requester_digest}:{session_id}"
@@ -636,7 +727,6 @@ async def _chat_completions(  # noqa: C901, PLR0912
                     config,
                     runtime_paths,
                     thread_history,
-                    req.user,
                     execution_identity=execution_identity,
                     refresh_scheduler=knowledge_refresh_scheduler,
                 )
@@ -650,7 +740,6 @@ async def _chat_completions(  # noqa: C901, PLR0912
                         config,
                         runtime_paths,
                         thread_history,
-                        req.user,
                         execution_identity=execution_identity,
                         refresh_scheduler=knowledge_refresh_scheduler,
                     )
@@ -680,7 +769,6 @@ async def _chat_completions(  # noqa: C901, PLR0912
                     config,
                     runtime_paths,
                     thread_history,
-                    req.user,
                     knowledge,
                     execution_identity=execution_identity,
                     refresh_scheduler=knowledge_refresh_scheduler,
@@ -694,7 +782,6 @@ async def _chat_completions(  # noqa: C901, PLR0912
                         config,
                         runtime_paths,
                         thread_history,
-                        req.user,
                         knowledge,
                         execution_identity=execution_identity,
                         refresh_scheduler=knowledge_refresh_scheduler,
@@ -738,12 +825,12 @@ async def _non_stream_completion(
     config: Config,
     runtime_paths: RuntimePaths,
     thread_history: Sequence[ResolvedVisibleMessage] | None,
-    _user: str | None,
     knowledge: Knowledge | None = None,
     execution_identity: ToolExecutionIdentity | None = None,
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
 ) -> JSONResponse:
     """Handle non-streaming chat completion."""
+    run_metadata: dict[str, Any] = {}
     response_text = await ai_response(
         _openai_agent_turn_context(agent_name, session_id=session_id, execution_identity=execution_identity),
         prompt=prompt,
@@ -753,6 +840,7 @@ async def _non_stream_completion(
         knowledge=knowledge,
         include_interactive_questions=False,
         include_openai_compat_guidance=True,
+        run_metadata_collector=run_metadata,
         execution_identity=execution_identity,
         refresh_scheduler=refresh_scheduler,
     )
@@ -772,6 +860,7 @@ async def _non_stream_completion(
                 message=_ChatMessage(role="assistant", content=response_text),
             ),
         ],
+        usage=_usage_from_run_metadata(run_metadata),
     )
     return _OpenAIJSONResponse(content=response.model_dump())
 
@@ -788,7 +877,6 @@ async def _stream_completion(  # noqa: C901, PLR0915
     config: Config,
     runtime_paths: RuntimePaths,
     thread_history: Sequence[ResolvedVisibleMessage] | None,
-    _user: str | None,
     knowledge: Knowledge | None = None,
     execution_identity: ToolExecutionIdentity | None = None,
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
@@ -1016,7 +1104,6 @@ async def _non_stream_team_completion(
     config: Config,
     runtime_paths: RuntimePaths,
     thread_history: Sequence[ResolvedVisibleMessage] | None,
-    user: str | None = None,
     execution_identity: ToolExecutionIdentity | None = None,
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
 ) -> JSONResponse:
@@ -1079,19 +1166,23 @@ async def _non_stream_team_completion(
                 logger.exception("Team member preparation failed", team=team_name)
                 return _error_response(500, "Team execution failed", error_type="server_error")
             try:
-                with bind_llm_request_log_context(
-                    **_openai_team_request_log_context(
-                        team_name=team_name,
-                        session_id=session_id,
-                        requester_id=execution_identity.requester_id if execution_identity else None,
-                        prompt=prepared_team_run.prompt,
-                        metadata=prepared_team_run.run_metadata,
+                with (
+                    bind_llm_request_log_context(
+                        **_openai_team_request_log_context(
+                            team_name=team_name,
+                            session_id=session_id,
+                            requester_id=execution_identity.requester_id if execution_identity else None,
+                            prompt=prepared_team_run.prompt,
+                            metadata=prepared_team_run.run_metadata,
+                        ),
                     ),
+                    # Helper work during the run, such as a member's Claude Code session, belongs to this conversation.
+                    helper_usage_context(scope_context),
                 ):
                     response = await team.arun(
                         prepared_team_run.prompt,
                         session_id=session_id,
-                        user_id=user,
+                        user_id=execution_identity.requester_id if execution_identity else None,
                         metadata=prepared_team_run.run_metadata,
                     )
             except Exception:
@@ -1122,6 +1213,11 @@ async def _non_stream_team_completion(
                         message=_ChatMessage(role="assistant", content=response_text),
                     ),
                 ],
+                usage=(
+                    _usage_from_team_output(response)
+                    if isinstance(response, (TeamRunOutput, RunOutput))
+                    else _UsageInfo()
+                ),
             )
             return _OpenAIJSONResponse(content=result.model_dump())
     finally:
@@ -1140,7 +1236,6 @@ async def _stream_team_completion(  # noqa: C901, PLR0915
     config: Config,
     runtime_paths: RuntimePaths,
     thread_history: Sequence[ResolvedVisibleMessage] | None,
-    user: str | None = None,
     execution_identity: ToolExecutionIdentity | None = None,
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
 ) -> StreamingResponse | JSONResponse:
@@ -1231,19 +1326,23 @@ async def _stream_team_completion(  # noqa: C901, PLR0915
                 "AsyncGenerator[RunOutputEvent | TeamRunOutputEvent | RunOutput | TeamRunOutput, None]",
                 stream_with_tool_execution_identity(
                     execution_identity,
-                    stream_factory=lambda: stream_with_llm_request_log_context(
-                        cast(
-                            "AsyncGenerator[RunOutputEvent | TeamRunOutputEvent | RunOutput | TeamRunOutput, None]",
-                            team.arun(
-                                prepared_team_run.prompt,
-                                stream=True,
-                                stream_events=True,
-                                session_id=session_id,
-                                user_id=user,
-                                metadata=prepared_team_run.run_metadata,
+                    # Helper work during the run, such as a member's Claude Code session, belongs to this conversation.
+                    stream_factory=lambda: context_bound_async_stream(
+                        context_factory=lambda: helper_usage_context(scope_context),
+                        stream_factory=lambda: stream_with_llm_request_log_context(
+                            cast(
+                                "AsyncGenerator[RunOutputEvent | TeamRunOutputEvent | RunOutput | TeamRunOutput, None]",
+                                team.arun(
+                                    prepared_team_run.prompt,
+                                    stream=True,
+                                    stream_events=True,
+                                    session_id=session_id,
+                                    user_id=execution_identity.requester_id if execution_identity else None,
+                                    metadata=prepared_team_run.run_metadata,
+                                ),
                             ),
+                            request_context=request_log_context,
                         ),
-                        request_context=request_log_context,
                     ),
                 ),
             )

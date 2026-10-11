@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from mindroom.attachments import parse_attachment_ids_from_event_source
@@ -38,6 +38,7 @@ from mindroom.matrix.message_content import resolve_event_source_content
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.thread_membership import (
+    RelatedEventUnavailableError,
     ThreadMembershipAccess,
     ThreadMembershipLookupError,
     ThreadResolution,
@@ -47,7 +48,6 @@ from mindroom.matrix.thread_membership import (
     thread_messages_thread_membership_access,
 )
 from mindroom.message_target import MessageTarget
-from mindroom.requester_identity import resolve_human_requester_alias
 from mindroom.runtime_protocols import SupportsClientConfig  # noqa: TC001
 from mindroom.thread_utils import check_agent_mentioned
 from mindroom.turn_origin import TurnOrigin, classify_turn_origin
@@ -607,7 +607,12 @@ class ConversationResolver:
         room: nio.MatrixRoom,
         event: DispatchEvent | MatrixMediaEvent,
     ) -> str | None:
-        """Return the coalescing thread scope for one inbound event."""
+        """Return the coalescing thread scope for one inbound event.
+
+        Raises ``RelatedEventUnavailableError`` when the event's relation
+        target is one the homeserver will not serve, and
+        ``ThreadMembershipLookupError`` when the scope is unknown for now.
+        """
         config = self.deps.runtime.config
         event_info = EventInfo.from_event(event.source)
         if (
@@ -649,6 +654,10 @@ class ConversationResolver:
         if resolution.state is ThreadResolutionState.ROOM_LEVEL:
             return None
         msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
+        if isinstance(resolution.error, RelatedEventUnavailableError):
+            # The event names a relation target the homeserver will not serve,
+            # so no retry can place it either.
+            raise RelatedEventUnavailableError(msg) from resolution.error
         if resolution.error is not None:
             raise ThreadMembershipLookupError(msg) from resolution.error
         raise ThreadMembershipLookupError(msg)
@@ -662,6 +671,7 @@ class ConversationResolver:
         mode: ThreadReadMode,
     ) -> ThreadResolution:
         """Resolve one event's coalescing membership under one read mode."""
+        msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
         try:
             return await resolve_event_thread_membership(
                 room.room_id,
@@ -672,8 +682,9 @@ class ConversationResolver:
                     requires_complete_history=True,
                 ),
             )
+        except RelatedEventUnavailableError as exc:
+            raise RelatedEventUnavailableError(msg) from exc
         except Exception as exc:
-            msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
             raise ThreadMembershipLookupError(msg) from exc
 
     async def _explicit_thread_id_for_event(
@@ -1100,48 +1111,16 @@ class ConversationResolver:
             mode=ThreadReadMode.STRICT,
         )
 
-    def canonical_source_requester(self, message: ResolvedVisibleMessage) -> str:
-        """Resolve the authenticated physical sender through configured human aliases."""
-        return resolve_human_requester_alias(message.sender, self.deps.runtime.config, self.deps.runtime_paths)
+    async def consecutive_agent_messages(self, room_id: str, thread_id: str | None, *, limit: int) -> int:
+        """Count the newest messages in one conversation that agents or teams wrote, looking back at most ``limit``.
 
-    async def resolve_exact_source(
-        self,
-        *,
-        target: MessageTarget,
-        source_event_id: str,
-        requester_id: str,
-    ) -> ResolvedVisibleMessage | None:
-        """Prove an exact physical source and revision, paging beyond prompt windows."""
-        reader = self.deps.conversation_reader
-        if await reader.is_event_redacted(room_id=target.room_id, event_id=source_event_id):
-            return None
-        before = None
-        while True:
-            page = await reader.read_strict(
-                room_id=target.room_id,
-                thread_id=target.resolved_thread_id,
-                limit=HYDRATED_PROMPT_WINDOW_MESSAGES,
-                before=before,
-            )
-            for message in projected_thread_history(page, complete=True):
-                if message.event_id != source_event_id:
-                    continue
-                if self.canonical_source_requester(message) != requester_id:
-                    msg = "Canonical source requester does not match the recorded owner"
-                    raise ThreadMembershipLookupError(msg)
-                resolved = await resolve_event_source_content(
-                    {"content": dict(message.content)},
-                    self._client(),
-                )
-                content = resolved["content"]
-                body = content.get("body")
-                if not isinstance(body, str):
-                    msg = "Canonical source has no resolved text body"
-                    raise ThreadMembershipLookupError(msg)
-                return replace(message, body=body, content=content)
-            if page.next_cursor is None:
-                if await reader.is_event_redacted(room_id=target.room_id, event_id=source_event_id):
-                    return None
-                msg = "Exact canonical source is unavailable in the strict conversation projection"
-                raise ThreadMembershipLookupError(msg)
-            before = page.next_cursor
+        Any other sender, the router included, ends the run: it writes only for a person.
+        """
+        page = await self.deps.conversation_reader.read(room_id=room_id, thread_id=thread_id, limit=limit)
+        registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
+        count = 0
+        for message in reversed(page.messages):
+            if registry.current_entity_name_for_user_id(message.sender, include_router=False) is None:
+                break
+            count += 1
+        return count

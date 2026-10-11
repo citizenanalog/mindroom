@@ -9,7 +9,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -35,7 +35,8 @@ from mindroom.script_runs.worker_client import (
     WorkerScriptCancel,
     WorkerScriptStatus,
 )
-from mindroom.shell_execution import ShellRunResult
+from mindroom.shell.execution import ShellRunResult
+from mindroom.tool_system.sandbox_proxy import runner_config_snapshot
 from mindroom.tool_system.worker_routing import agent_workspace_root_path, worker_root_path
 from mindroom.workers.backends.static_runner import StaticSandboxRunnerBackend
 from mindroom.workers.models import ScriptResourceProfileName, WorkerHandle, WorkerSpec
@@ -212,7 +213,14 @@ class _WorkerBackend:
         del now
         return []
 
-    def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
+    def record_failure(
+        self,
+        worker_key: str,
+        failure_reason: str,
+        *,
+        now: float | None = None,
+        **_kwargs: object,
+    ) -> WorkerHandle:
         del failure_reason, now
         return self.handles[worker_key]
 
@@ -229,6 +237,7 @@ class _WorkerClient:
     store: ScriptRunStore
     launch_paths: dict[str, tuple[Path, Path]] = field(default_factory=dict)
     launch_state_scope_worker_keys: list[str | None] = field(default_factory=list)
+    launch_config_snapshots: list[dict[str, object] | None] = field(default_factory=list)
     cancel_observed_revocation: bool = False
     cancel_forces: list[bool] = field(default_factory=list)
     cancel_handles: list[str] = field(default_factory=list)
@@ -253,10 +262,12 @@ class _WorkerClient:
         max_runtime_seconds: int,
         state_scope_worker_key: str | None = None,
         private_agent_names: tuple[str, ...] | None = None,
+        config_snapshot: dict[str, object] | None = None,
     ) -> None:
         del source_digest, gateway_url, private_agent_names
         assert max_runtime_seconds > 0
         self.launch_state_scope_worker_keys.append(state_scope_worker_key)
+        self.launch_config_snapshots.append(config_snapshot)
         starting = self.store.get_run(run_id)
         assert starting.state is ScriptRunState.STARTING
         assert starting.worker_id == worker.worker_id
@@ -353,6 +364,23 @@ async def test_launch_persists_recovery_contract_only_for_kubernetes(tmp_path: P
     assert run.state is ScriptRunState.RUNNING
     assert (run.recovery_signature is not None) is (backend_name == "kubernetes")
     assert ScriptRunStore(context.runtime_paths).get_run(run.run_id).recovery_signature == run.recovery_signature
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_name", ["kubernetes", "docker"])
+async def test_launch_sends_live_config_only_to_seeded_workers(tmp_path: Path, backend_name: str) -> None:
+    """Kubernetes script workers mount no config, so the launch carries the allowlisted live config fields."""
+    manager, backend, client = _manager(tmp_path, backend=backend_name, isolated_script_gateway=True)
+    backend.backend_name = backend_name
+    context = _context(tmp_path, backend=backend_name, isolated_script_gateway=True)
+
+    run = await manager.run(context, source="print('ok')\n")
+
+    assert run.state is ScriptRunState.RUNNING
+    expected = runner_config_snapshot(context.runtime_paths, context.config) if backend_name == "kubernetes" else None
+    assert client.launch_config_snapshots == [expected]
+    if expected is not None:
+        assert set(expected["agents"]) == {"watcher", "analyzer"}
 
 
 async def _wait_for_cancel_request(manager: ScriptRunManager, run_id: str) -> None:
@@ -541,6 +569,27 @@ async def test_launch_persists_backend_admitted_after_global_launch_gate(
     assert run.worker_backend_locator == replacement_backend.cleanup_locator
     assert stale_backend.specs == []
     assert len(replacement_backend.specs) == 1
+
+
+@pytest.mark.asyncio
+async def test_local_launch_keeps_workspace_code_out_of_the_shim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shim runs from the workspace, so neither its cwd nor its `HOME` may reach `sys.path`."""
+    manager, _backend, _client = _manager(tmp_path, mode="local")
+    launched_argv: list[list[str]] = []
+
+    async def launch_local(*_args: object, **kwargs: object) -> ShellRunResult:
+        launched_argv.append(list(cast("list[str]", kwargs["argv"])))
+        return ShellRunResult(message="Started background process", handle=str(kwargs["handle"]))
+
+    monkeypatch.setattr(manager_module, "ensure_shell_supervisor", lambda: "/control/shell.sock")
+    monkeypatch.setattr(manager_module, "run_command_via_supervisor", launch_local)
+
+    await manager.run(_context(tmp_path, mode="local"), source="print('ok')\n")
+
+    assert [argv[:5] for argv in launched_argv] == [[sys.executable, "-P", "-s", "-m", "mindroom.script_runs.shim"]]
 
 
 @pytest.mark.asyncio
@@ -2167,18 +2216,18 @@ async def test_partial_snapshot_cleanup_preserves_original_launch_error(
 ) -> None:
     """A token-write failure remains the launch error after partial snapshot cleanup."""
     manager, _backend, _client = _manager(tmp_path)
-    original_write = manager_module._write_private_file
+    original_write = manager_module.write_file_within_root
     calls = 0
 
-    def fail_token_write(path: Path, content: bytes) -> None:
+    def fail_token_write(root: Path, relative_path: Path, payload: bytes, **kwargs: object) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             message = "token write denied"
             raise PermissionError(message)
-        original_write(path, content)
+        original_write(root, relative_path, payload, **kwargs)
 
-    monkeypatch.setattr(manager_module, "_write_private_file", fail_token_write)
+    monkeypatch.setattr(manager_module, "write_file_within_root", fail_token_write)
 
     with pytest.raises(PermissionError, match="token write denied"):
         await manager.run(_context(tmp_path), source="print('ok')\n")
@@ -2791,3 +2840,22 @@ async def test_local_launch_does_not_publish_running_after_unconfirmed_cancel(
     process_exited = True
     reconciled = await manager.reconcile_durable(run_id=starting.run_id)
     assert reconciled.state is ScriptRunState.CANCELLED
+
+
+@pytest.mark.parametrize("planted", ["linked_mindroom_dir", "linked_script_runs_dir"])
+def test_snapshot_write_refuses_linked_workspace_directories(tmp_path: Path, planted: str) -> None:
+    """A run snapshot and its capability never land where a planted workspace link points."""
+    workspace = tmp_path / "workspace"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    workspace.mkdir()
+    if planted == "linked_mindroom_dir":
+        (workspace / ".mindroom").symlink_to(elsewhere, target_is_directory=True)
+    else:
+        (workspace / ".mindroom").mkdir()
+        (workspace / ".mindroom" / "script-runs").symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(OSError, match=r"Too many levels|Not a directory"):
+        manager_module._write_snapshot(workspace, f"script-{'a' * 32}", source=b"print('ok')\n", token="secret")  # noqa: S106
+
+    assert list(elsewhere.iterdir()) == []

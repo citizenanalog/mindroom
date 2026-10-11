@@ -13,8 +13,8 @@ import pytest
 from agno.media import Image
 
 from mindroom.attachments import _attachment_id_for_event, register_local_attachment
-from mindroom.coalescing import CoalescingGate, LaneSlot, ReadyPendingEvent
-from mindroom.coalescing_batch import CoalescingKey, PreparedTurn, RequesterCoalescingOwner
+from mindroom.coalescing.batch import CoalescingKey, PreparedTurn, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate, LaneSlot, ReadyPendingEvent
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
     SOURCE_KIND_KEY,
@@ -73,7 +73,7 @@ from tests.conftest import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from mindroom.ingress_lanes import ReceiptLaneKey
+    from mindroom.coalescing.ingress_lanes import ReceiptLaneKey
     from mindroom.matrix.users import AgentMatrixUser
 
 
@@ -194,9 +194,7 @@ class TestAgentBot(AgentBotTestBase):
             agent_name=mock_agent_user.agent_name,
             room_id=room.room_id,
             event_id="$img_event",
-            response_event_id="$response",
             requester_id="@user:localhost",
-            correlation_id="$img_event",
             source_event_prompts={"$img_event": "[Attached image]"},
         )
         expected_handled_turn = replace(
@@ -813,10 +811,8 @@ class TestAgentBot(AgentBotTestBase):
                 agent_name=mock_agent_user.agent_name,
                 room_id=room.room_id,
                 event_id="$img_event_history",
-                response_event_id="$response",
                 thread_id="$thread_root",
                 requester_id="@user:localhost",
-                correlation_id="$img_event_history",
                 source_event_prompts={"$img_event_history": "[Attached image]"},
             ),
         )
@@ -943,6 +939,57 @@ class TestAgentBot(AgentBotTestBase):
         inline_image_paths = [image.filepath for image in payload.media.images]
         assert inline_image_paths == [current_path]
         assert payload.attachment_ids == [current_attachment_id, thread_attachment_id, history_attachment_id]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_payload_takes_an_edited_thread_root_media_from_history(
+        self,
+        mock_agent_user: AgentMatrixUser,
+        tmp_path: Path,
+    ) -> None:
+        """An edited root's original media is not added beside the edited revision's media."""
+        config = self._config_for_storage(tmp_path)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot.client = _make_matrix_client_mock()
+        original_content = {"msgtype": "m.image", "body": "old.png", "url": "mxc://localhost/old"}
+        bot.client.room_get_event = AsyncMock(
+            return_value=nio.RoomGetEventResponse.from_dict(
+                {
+                    "event_id": "$thread",
+                    "sender": "@user:localhost",
+                    "origin_server_ts": 1000,
+                    "type": "m.room.message",
+                    "room_id": "!test:localhost",
+                    "content": original_content,
+                },
+            ),
+        )
+        _register_payload_image_attachment(
+            tmp_path,
+            attachment_id=_attachment_id_for_event("$thread"),
+            filename="old.png",
+        )
+        revision_attachment_id = _attachment_id_for_event("$root-edit")
+        _register_payload_image_attachment(tmp_path, attachment_id=revision_attachment_id, filename="new.png")
+        root = _visible_message(sender="@user:localhost", event_id="$thread", content=original_content)
+        root.apply_edit(
+            body="new.png",
+            timestamp=1,
+            latest_event_id="$root-edit",
+            content={"msgtype": "m.image", "body": "new.png", "url": "mxc://localhost/new"},
+        )
+
+        payload = await bot._inbound_turn_normalizer.build_dispatch_payload_with_attachments(
+            DispatchPayloadWithAttachmentsRequest(
+                room_id="!test:localhost",
+                prompt="describe this",
+                current_attachment_ids=[],
+                thread_id="$thread",
+                media_thread_id="$thread",
+                thread_history=[root],
+            ),
+        )
+
+        assert payload.attachment_ids == [revision_attachment_id]
 
     @pytest.mark.asyncio
     async def test_dispatch_payload_inline_media_empty_when_no_attachments(
@@ -1358,7 +1405,7 @@ class TestAgentBot(AgentBotTestBase):
         assert attachment_id in generate_kwargs["model_prompt"]
         media = generate_kwargs["media"]
         assert len(media.files) == 1
-        assert str(media.files[0].filepath) == str(local_media_path)
+        assert str(media.files[0].filepath) == str(attachment_record.local_path)
         assert list(media.videos) == []
         tracker.record_handled_turn.assert_called_once_with(
             replace(
@@ -1366,9 +1413,7 @@ class TestAgentBot(AgentBotTestBase):
                     agent_name=mock_agent_user.agent_name,
                     room_id=room.room_id,
                     event_id="$file_event",
-                    response_event_id="$response",
                     requester_id="@user:localhost",
-                    correlation_id="$file_event",
                     source_event_prompts={"$file_event": "[Attached file]"},
                 ),
                 response_owner=mock_agent_user.agent_name,

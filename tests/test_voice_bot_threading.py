@@ -15,8 +15,8 @@ from agno.media import Audio
 
 from mindroom import inbound_turn_normalizer
 from mindroom.attachments import _attachment_id_for_event, load_attachment
-from mindroom.coalescing import CoalescingGate
-from mindroom.coalescing_batch import CoalescingKey, RequesterCoalescingOwner
+from mindroom.coalescing.batch import CoalescingKey, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate
 from mindroom.config.main import Config
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
@@ -370,8 +370,8 @@ async def test_voice_message_in_main_room_creates_thread(
     voice_event = _make_voice_event(event_id="$voice123", source={"content": {}})
 
     with (
-        patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.voice_handler._handle_voice_message", return_value="🎤 what is the weather"),
+        patch("mindroom.voice.handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
+        patch("mindroom.voice.handler._handle_voice_message", return_value="🎤 what is the weather"),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
@@ -426,8 +426,8 @@ async def test_voice_message_in_thread_continues_thread(
     )
 
     with (
-        patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.voice_handler._handle_voice_message", return_value="🎤 show me the forecast"),
+        patch("mindroom.voice.handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
+        patch("mindroom.voice.handler._handle_voice_message", return_value="🎤 show me the forecast"),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
@@ -480,8 +480,8 @@ async def test_voice_plain_reply_to_thread_message_stays_threaded_transitively(
     )
 
     with (
-        patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.voice_handler._handle_voice_message", return_value="🎤 continue the same thread"),
+        patch("mindroom.voice.handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
+        patch("mindroom.voice.handler._handle_voice_message", return_value="🎤 continue the same thread"),
         patch.object(
             bot._turn_controller.deps.resolver,
             "coalescing_thread_id",
@@ -1526,7 +1526,7 @@ async def test_raw_voice_normalization_exception_dispatches_audio_fallback(mock_
             "prepare_voice_event",
             new=AsyncMock(side_effect=RuntimeError("stt failed")),
         ),
-        patch("mindroom.voice_handler.download_media_bytes", new=AsyncMock(return_value=b"raw audio bytes")),
+        patch("mindroom.voice.handler.download_media_bytes", new=AsyncMock(return_value=b"raw audio bytes")),
         patch(
             "mindroom.turn_controller.dispatch_text_message",
             new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
@@ -1569,7 +1569,7 @@ async def test_raw_voice_download_failure_dispatches_text_only_fallback(mock_hom
         dispatches.append((dispatched_event, _handled_source_event_ids(handled_turn)))
 
     with (
-        patch("mindroom.voice_handler.download_media_bytes", new=AsyncMock(return_value=None)),
+        patch("mindroom.voice.handler.download_media_bytes", new=AsyncMock(return_value=None)),
         patch(
             "mindroom.turn_controller.dispatch_text_message",
             new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
@@ -1582,6 +1582,50 @@ async def test_raw_voice_download_failure_dispatches_text_only_fallback(mock_hom
     dispatched_event = _assert_voice_fallback_dispatch(
         dispatches,
         source_event_id="$audio-download-fails",
+        thread_id="$thread_root",
+    )
+    assert ATTACHMENT_IDS_KEY not in dispatched_event.source["content"]
+
+
+@pytest.mark.asyncio
+async def test_text_only_voice_fallback_drops_sender_supplied_attachment_ids(mock_home_bot: AgentBot) -> None:
+    """The fallback registers no audio, so attachment IDs the sender wrote must not become trusted metadata."""
+    bot = mock_home_bot
+    room = _threaded_room()
+    voice_event = _make_threaded_voice_event(event_id="$audio-preparers-fail")
+    voice_event.source["content"][ATTACHMENT_IDS_KEY] = ["att_other_room"]
+    dispatches: list[tuple[PreparedIngress | nio.RoomMessageText, list[str]]] = []
+
+    async def record_dispatch(
+        _room: nio.MatrixRoom,
+        dispatched_event: PreparedIngress | nio.RoomMessageText,
+        _requester_user_id: str,
+        *,
+        handled_turn: TurnRecord | None = None,
+        **_metadata: object,
+    ) -> None:
+        dispatches.append((dispatched_event, _handled_source_event_ids(handled_turn)))
+
+    normalizer = bot._turn_controller.deps.normalizer
+    with (
+        patch.object(normalizer, "prepare_voice_event", new=AsyncMock(side_effect=RuntimeError("stt failed"))),
+        patch.object(
+            normalizer,
+            "prepare_raw_voice_fallback_event",
+            new=AsyncMock(side_effect=RuntimeError("registration failed")),
+        ),
+        patch(
+            "mindroom.turn_controller.dispatch_text_message",
+            new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
+        ),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+    ):
+        await bot._on_media_message(room, voice_event)
+        await drain_coalescing(bot)
+
+    dispatched_event = _assert_voice_fallback_dispatch(
+        dispatches,
+        source_event_id="$audio-preparers-fail",
         thread_id="$thread_root",
     )
     assert ATTACHMENT_IDS_KEY not in dispatched_event.source["content"]
@@ -1675,7 +1719,7 @@ async def test_raw_voice_root_target_failures_do_not_dispatch_guessed_fallbacks(
             "coalescing_thread_id",
             new=AsyncMock(side_effect=RuntimeError("thread lookup failed")),
         ),
-        patch("mindroom.voice_handler.download_media_bytes", new=AsyncMock(return_value=None)),
+        patch("mindroom.voice.handler.download_media_bytes", new=AsyncMock(return_value=None)),
         patch.object(bot._turn_controller.deps.normalizer, "prepare_voice_event", new=AsyncMock()),
         patch(
             "mindroom.turn_controller.dispatch_text_message",

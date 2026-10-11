@@ -12,7 +12,7 @@ from agno.tools.function import ToolResult
 from PIL import Image
 
 from mindroom.attachments import load_attachment, register_local_attachment
-from mindroom.config.models import ModelConfig
+from mindroom.config.models import FileAccess, ModelConfig
 from mindroom.custom_tools.attachments import AttachmentTools
 from mindroom.custom_tools.matrix_message import MatrixMessageTools
 from mindroom.tool_system import media_attachments
@@ -36,6 +36,29 @@ async def test_view_file_path_delivers_image_in_one_call(tmp_path: Path) -> None
     assert receipt["path"] == "result.png"
     assert receipt["attachment_id"].startswith("att_")
     assert not context.client.room_send.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_access", ["workspace", "unrestricted"])
+async def test_view_file_path_outside_workspace_follows_file_access(tmp_path: Path, file_access: FileAccess) -> None:
+    """Unrestricted agents view any readable image; workspace agents keep the rejection."""
+    context = _tool_context(tmp_path, process_env={"MINDROOM_EXECUTION_MODE": "off"})
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(image_bytes())
+    tools = AttachmentTools(tool_output_workspace_root=workspace, file_access=file_access)
+    with tool_runtime_context(context):
+        result = await tools.view_file(path=str(outside))
+    receipt = json.loads(result.content)
+    if file_access == "workspace":
+        assert not result.images
+        assert receipt["view_status"] == "error"
+        return
+    assert result.images
+    assert result.images[0].content == image_bytes()
+    assert receipt["view_status"] == "ready"
+    assert receipt["path"] == str(outside.resolve())
 
 
 @pytest.mark.asyncio
@@ -243,7 +266,7 @@ async def test_retention_failure_preserves_viewable_image(tmp_path: Path, monkey
     """A failed retention reports its limitation without discarding model-visible pixels."""
     context = _tool_context(tmp_path, process_env={"MINDROOM_EXECUTION_MODE": "off"})
     (tmp_path / "image.png").write_bytes(image_bytes())
-    monkeypatch.setattr(media_attachments, "register_image_bytes_attachment", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(media_attachments, "register_bytes_attachment", lambda *_args, **_kwargs: None)
     with tool_runtime_context(context):
         result = await AttachmentTools(tool_output_workspace_root=tmp_path).view_file(path="image.png")
     assert result.images

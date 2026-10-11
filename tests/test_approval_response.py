@@ -15,12 +15,12 @@ from agno.run.base import RunStatus
 from agno.run.requirement import RunRequirement
 from agno.session.agent import AgentSession
 
-from mindroom.approval_execution import _collect_agent_continuation
-from mindroom.approval_response import identify_approval_tools, require_ordered_pause_presentation
-from mindroom.approval_tools import approval_denial_context
+from mindroom.approval.execution import _collect_agent_continuation
+from mindroom.approval.response import identify_approval_tools, require_ordered_pause_presentation
+from mindroom.approval.tool_owners import approval_denial_context
 from mindroom.event_journal import ApprovalCall
+from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.response_turn import PausedAttempt
-from mindroom.synthetic_model import SyntheticModel
 from mindroom.tool_system.events import CollectedStreamPresentation, ToolTraceEntry
 from tests.conftest import unwrap_extracted_collaborator
 from tests.response_runner_helpers import _bot
@@ -208,7 +208,7 @@ async def test_agent_continuation_defers_terminal_only_content() -> None:
         yield RunCompletedEvent(content="After approval.")
         yield terminal
 
-    response = await _collect_agent_continuation(events(), presentation)
+    response = await _collect_agent_continuation(events(), presentation, progress=None)
 
     assert response.response is terminal
     assert response.terminal_content == "After approval."
@@ -235,7 +235,7 @@ async def test_agent_chained_pause_anchors_a_terminal_only_pending_tool() -> Non
     async def events() -> AsyncIterator[object]:
         yield terminal
 
-    await _collect_agent_continuation(events(), presentation)
+    await _collect_agent_continuation(events(), presentation, progress=None)
 
     assert presentation.response_text.endswith("🔧 `publish_report` [1] ⏳\n\n")
     assert len(presentation.tool_trace) == 1
@@ -274,7 +274,7 @@ async def test_agent_continuation_keeps_text_after_a_stripped_tool_marker() -> N
         yield RunCompletedEvent(content="After approval.")
         yield terminal
 
-    collected = await _collect_agent_continuation(events(), presentation)
+    collected = await _collect_agent_continuation(events(), presentation, progress=None)
     presentation.append_text(collected.terminal_content)
 
     assert presentation.final_text() == "Before approval.\n\n🔧 `inspect` [1]\n\nAfter approval."
@@ -306,7 +306,7 @@ async def test_agent_continuation_reuses_an_existing_visible_tool_separator() ->
         yield RunCompletedEvent(content="After approval.")
         yield terminal
 
-    collected = await _collect_agent_continuation(events(), presentation)
+    collected = await _collect_agent_continuation(events(), presentation, progress=None)
     presentation.append_text(collected.terminal_content)
 
     assert presentation.final_text() == "Before approval.\n\n🔧 `inspect` [1]\n\nAfter approval."
@@ -339,7 +339,7 @@ async def test_hidden_agent_continuation_separates_text_across_the_tool_boundary
         yield RunCompletedEvent(content="After approval.")
         yield terminal
 
-    collected = await _collect_agent_continuation(events(), presentation)
+    collected = await _collect_agent_continuation(events(), presentation, progress=None)
     presentation.append_text(collected.terminal_content)
 
     assert presentation.final_text() == "Before approval.\n\nAfter approval."
@@ -369,7 +369,7 @@ async def test_hidden_agent_continuation_separates_text_across_a_new_tool_bounda
         yield RunCompletedEvent(content="After tool.")
         yield terminal
 
-    collected = await _collect_agent_continuation(events(), presentation)
+    collected = await _collect_agent_continuation(events(), presentation, progress=None)
     presentation.append_text(collected.terminal_content)
 
     assert presentation.final_text() == "Before tool.\n\nAfter tool."

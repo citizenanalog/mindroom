@@ -65,6 +65,7 @@ def _publish_static_site(test_client: TestClient) -> tuple[str, str]:
             title="Demo Site",
             requested_by="@alice:example.org",
             artifact_kind="static_site",
+            artifact_root=source_dir.parent,
         ),
         published_by="@alice:example.org",
         base_url="https://mindroom.lab.mindroom.chat",
@@ -96,6 +97,7 @@ def _publish_origin_report(test_client: TestClient, *, static_site: bool = False
             title="Protected Report",
             requested_by="@alice:example.org",
             artifact_kind=artifact_kind,
+            artifact_root=artifact_path.parent,
         ),
         published_by="@alice:example.org",
         origin_room=OriginRoomBinding(

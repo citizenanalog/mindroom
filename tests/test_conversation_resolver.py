@@ -8,19 +8,18 @@ has a direct safety net.
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import nio
 import pytest
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.constants import ATTACHMENT_IDS_KEY, SKIP_MENTIONS_KEY
+from mindroom.constants import ATTACHMENT_IDS_KEY, HOOK_SOURCE_KEY, SKIP_MENTIONS_KEY
 from mindroom.conversation_resolver import ConversationResolver, ConversationResolverDeps, MessageContext
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.event_journal import (
@@ -38,7 +37,7 @@ from mindroom.matrix.conversation_reads import ConversationReader
 from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.journal_ingress import _inbound_event, _projected_event
 from mindroom.matrix.relation_lookup import RelationLookup
-from mindroom.matrix.thread_membership import ThreadMembershipLookupError
+from mindroom.matrix.thread_membership import RelatedEventUnavailableError, ThreadMembershipLookupError
 from mindroom.message_target import MessageTarget
 from tests.conftest import (
     bind_runtime_paths,
@@ -49,7 +48,7 @@ from tests.conftest import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
 _ROOM_ID = "!test:localhost"
@@ -860,94 +859,123 @@ async def test_coalescing_still_fails_closed_when_the_repair_cannot_prove_the_ro
             await resolver.coalescing_thread_id(_room(), _reply_event())
 
 
+@dataclass
+class _HomeserverRefusingEveryEvent(_HomeserverWithAThread):
+    """A homeserver that answers every event lookup with one fixed error."""
+
+    errcode: str = "M_NOT_FOUND"
+
+    async def room_get_event(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> nio.RoomGetEventResponse | nio.RoomGetEventError:
+        """Refuse the event, whatever it is."""
+        del room_id, event_id
+        return nio.RoomGetEventError("refused", self.errcode)
+
+
+def _reference_event() -> nio.RoomMessageText:
+    return _event(
+        {
+            "body": "a reference",
+            "m.relates_to": {"rel_type": "m.reference", "event_id": "$fabricated:localhost"},
+        },
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("newer_during_download", [False, True])
-@pytest.mark.parametrize("aliased_requester", [False, True])
-async def test_exact_source_pages_and_resolves_sidecar_with_revision_proof(
+@pytest.mark.parametrize("errcode", ["M_NOT_FOUND", "M_FORBIDDEN"])
+@pytest.mark.parametrize("make_event", [_reply_event, _reference_event])
+async def test_coalescing_reports_a_relation_target_the_homeserver_will_not_serve(
     config: Config,
-    journal_store: EventJournalStore,
-    monkeypatch: pytest.MonkeyPatch,
-    newer_during_download: bool,
-    aliased_requester: bool,
+    tmp_path: Path,
+    errcode: str,
+    make_event: Callable[[], nio.RoomMessageText],
 ) -> None:
-    """Exact refill reads past the prompt window and rejects a stale sidecar snapshot."""
-    principal = journal_store.principal("general")
-    requester_id = "@canonical:test" if aliased_requester else _SENDER
-    if aliased_requester:
-        config.authorization.aliases = {requester_id: [_SENDER]}
-    source_id = "$a-source"
-    sidecar = _event(
-        {
-            "msgtype": "m.file",
-            "body": "preview",
-            "url": "mxc://server/source",
-            "info": {"mimetype": "application/json"},
-            "io.mindroom.long_text": {"version": 2, "encoding": "matrix_event_content_json"},
-            "m.relates_to": {"rel_type": "m.thread", "event_id": _PARENT},
-        },
-        event_id=source_id,
-    )
-    newer = _event(
-        {
-            "body": "newer unrelated",
-            "m.relates_to": {"rel_type": "m.thread", "event_id": _PARENT},
-        },
-        event_id="$z-newer",
-    )
-    await principal.install_hydrated_conversation(
-        room_id=_ROOM_ID,
-        thread_id=_PARENT,
-        complete=True,
-        expected_membership_epoch=await principal.membership_epoch(_ROOM_ID),
-        events=tuple(
-            _projected_event(_ROOM_ID, event, EventKind.MESSAGE, self_sender=_BOT_USER_ID) for event in (sidecar, newer)
-        ),
-    )
-    resolver = _resolver(config)
-    runtime = resolver.deps.runtime
-    reader = ConversationReader(
-        store=principal,
-        hydrator=ConversationHydrator(store=principal, runtime=runtime, self_sender=_BOT_USER_ID),
-    )
-    resolver.deps = replace(resolver.deps, conversation_reader=reader)
-    monkeypatch.setattr("mindroom.conversation_resolver.HYDRATED_PROMPT_WINDOW_MESSAGES", 1)
+    """A target that is missing or hidden fails the same way on every retry.
 
-    async def download(*_args: object, **_kwargs: object) -> nio.DownloadResponse:
-        if newer_during_download:
-            edit = _event(
-                {
-                    "body": "* NEWER_SURVIVING",
-                    "m.new_content": {"msgtype": "m.text", "body": "NEWER_SURVIVING"},
-                    "m.relates_to": {"rel_type": "m.replace", "event_id": source_id},
-                },
-                event_id="$latest-edit",
-            )
-            await principal.admit(
-                _inbound_event(_ROOM_ID, edit, EventKind.MESSAGE, EventClass.ACTIONABLE),
-                _projected_event(_ROOM_ID, edit, EventKind.MESSAGE, self_sender=_BOT_USER_ID),
-            )
-            snapshot = await principal.read_conversation(room_id=_ROOM_ID, thread_id=_PARENT, limit=10)
-            assert any(message.revision_event_id == "$latest-edit" for message in snapshot.messages), snapshot
-        return MagicMock(
-            spec=nio.DownloadResponse,
-            body=json.dumps({"msgtype": "m.text", "body": "FULL_SIDECAR_BODY"}).encode(),
+    Anyone in the room can name one, so the caller has to be able to tell it
+    from a lookup that failed for a moment, or one message holds up the room.
+    """
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverRefusingEveryEvent(errcode=errcode),
+    ) as resolver:
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), make_event())
+
+
+@dataclass
+class _HomeserverServingAStateEvent(_HomeserverWithAThread):
+    """A homeserver whose ``$parent`` is a membership event, not a message."""
+
+    async def room_get_event(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> nio.RoomGetEventResponse | nio.RoomGetEventError:
+        """Serve a join event under the ID every relation in these tests names."""
+        del room_id, event_id
+        response = nio.RoomGetEventResponse()
+        response.event = _parse(
+            {
+                "event_id": _PARENT,
+                "sender": _SENDER,
+                "origin_server_ts": 1_000,
+                "type": "m.room.member",
+                "state_key": _SENDER,
+                "room_id": _ROOM_ID,
+                "content": {"membership": "join"},
+            },
         )
+        return response
 
-    assert runtime.client is not None
-    response = nio.RoomGetEventResponse()
-    response.event = sidecar
-    monkeypatch.setattr(runtime.client, "room_get_event", AsyncMock(return_value=response))
-    monkeypatch.setattr(runtime.client, "download", download)
-    target = MessageTarget.resolve(_ROOM_ID, _PARENT, source_id)
-    resolved = await resolver.resolve_exact_source(
-        target=target,
-        source_event_id=source_id,
-        requester_id=requester_id,
+
+@pytest.mark.asyncio
+async def test_coalescing_reports_a_relation_target_that_is_not_a_message(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    """An event's type never changes, so a reply to a join fails the same way on every retry."""
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverServingAStateEvent(),
+    ) as resolver:
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), _reply_event())
+
+
+@pytest.mark.asyncio
+async def test_coalescing_keeps_a_server_failure_retryable(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    """A homeserver that failed to answer may answer next time, so it is not a refusal."""
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverRefusingEveryEvent(errcode="M_UNKNOWN"),
+    ) as resolver:
+        with pytest.raises(ThreadMembershipLookupError) as raised:
+            await resolver.coalescing_thread_id(_room(), _reply_event())
+
+    assert not isinstance(raised.value, RelatedEventUnavailableError)
+
+
+def test_only_a_managed_sender_can_mark_a_turn_as_an_automation_turn(config: Config) -> None:
+    """A person's message carrying an automation hook source is an ordinary turn, so auto-flush still keeps it."""
+    resolver = _resolver(config)
+    event = _event({"body": "hello", HOOK_SOURCE_KEY: "automation/dreaming"})
+
+    envelope = resolver.build_ingress_envelope(
+        event=event,
+        requester_user_id=_SENDER,
+        target=MessageTarget.resolve(_ROOM_ID, None, _EVENT_ID),
+        body="hello",
+        mentioned_agents=[],
     )
-    assert resolved.body == ("NEWER_SURVIVING" if newer_during_download else "FULL_SIDECAR_BODY")
-    assert resolved.event_id == source_id
-    assert resolved.latest_event_id == ("$latest-edit" if newer_during_download else source_id)
-    with pytest.raises(ThreadMembershipLookupError, match="requester"):
-        await resolver.resolve_exact_source(target=target, source_event_id=source_id, requester_id="@wrong:test")
-    with pytest.raises(ThreadMembershipLookupError, match="unavailable"):
-        await resolver.resolve_exact_source(target=target, source_event_id="$absent", requester_id=_SENDER)
+
+    assert envelope.hook_source is None

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -20,10 +21,13 @@ from mindroom.attachments import (
     load_attachment,
     register_local_attachment,
 )
+from mindroom.constants import SKIP_MENTIONS_KEY
+from mindroom.file_access import AuthorizedFile, resolve_agent_file
 from mindroom.matrix.client_delivery import send_file_message, send_runtime_encrypted_media_message
 from mindroom.matrix.media import resolve_image_mime_type
 from mindroom.matrix.runtime_media import RuntimeEncryptedMediaAttachment
-from mindroom.media_delivery import MAX_SOURCE_BYTES, image_result, media_error, view_image_path
+from mindroom.media_delivery import MAX_SOURCE_BYTES, image_result, media_error, view_agent_image
+from mindroom.path_confinement import open_regular_file_within_root
 from mindroom.tool_system.media_attachments import finalize_tool_media
 from mindroom.tool_system.output_files import (
     ToolOutputFilePolicy,
@@ -46,15 +50,19 @@ from mindroom.tool_system.sandbox_proxy import (
     save_attachment_to_worker,
     view_file_from_worker,
 )
-from mindroom.workspaces import resolve_workspace_relative_path
 
 if TYPE_CHECKING:
+    from mindroom.config.models import FileAccess
     from mindroom.constants import RuntimePaths
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 _LocalAttachmentKind = Literal["audio", "file", "image", "video"]
-_ResolvedSendAttachment = Path | RuntimeEncryptedMediaAttachment
+_ResolvedSendAttachment = AttachmentRecord | RuntimeEncryptedMediaAttachment
+_WORKER_ATTACHMENT_USAGE = (
+    "Not in your workspace. Copy it there with get_attachment(attachment_id, mindroom_output_path=...) "
+    "before file, coding, python, or shell tools use it."
+)
 
 
 def _attachment_tool_payload(status: str, **kwargs: object) -> str:
@@ -78,9 +86,21 @@ def _infer_local_attachment_metadata(local_path: Path) -> tuple[_LocalAttachment
     return "file", local_path.name, mime_type
 
 
+def _attachment_record_payload(record: AttachmentRecord, *, tools_use_worker: bool) -> dict[str, object]:
+    """Render one retained attachment, replacing the runtime path with copy instructions for worker tools."""
+    payload = attachments_for_tool_payload([record])[0]
+    if tools_use_worker:
+        # The path names the primary runtime's storage, which worker tools cannot open.
+        del payload["local_path"]
+        payload["usage"] = _WORKER_ATTACHMENT_USAGE
+    return payload
+
+
 def _get_attachment_listing(
     context: ToolRuntimeContext,
     target: str | None,
+    *,
+    tools_use_worker: bool,
 ) -> tuple[list[str], list[dict[str, object]], list[str], str | None]:
     """List requested context attachments and report missing metadata records."""
     requested_attachment_ids = list_tool_runtime_attachment_ids(context)
@@ -102,7 +122,7 @@ def _get_attachment_listing(
             continue
         attachment_record = load_attachment(context.storage_path, attachment_id)
         if attachment_record is not None:
-            attachments.extend(attachments_for_tool_payload([attachment_record]))
+            attachments.append(_attachment_record_payload(attachment_record, tools_use_worker=tools_use_worker))
             resolved_attachment_ids.append(attachment_id)
     missing_attachment_ids = [
         attachment_id for attachment_id in requested_attachment_ids if attachment_id not in resolved_attachment_ids
@@ -115,7 +135,7 @@ def _get_attachment_listing(
     )
 
 
-def _resolve_context_attachment_path(
+def resolve_context_attachment_path(
     context: ToolRuntimeContext,
     attachment_id: str,
 ) -> tuple[Path | None, str | None]:
@@ -152,21 +172,21 @@ def _read_attachment_bytes(
     byte_limit: int,
     limit_label: str,
 ) -> tuple[bytes | None, str | None]:
-    """Read attachment bytes with a bounded read and the selected destination cap."""
+    """Read attachment bytes with a bounded no-follow read and the selected destination cap."""
     try:
-        size_bytes = attachment.local_path.stat().st_size
-    except OSError:
-        return None, f"Attachment file is missing on disk: {attachment.attachment_id}"
-    if size_bytes > byte_limit:
-        return (
-            None,
-            f"Attachment {attachment.attachment_id} exceeds {limit_label} size limit "
-            f"({size_bytes} bytes > {byte_limit} bytes).",
-        )
-    try:
-        with attachment.local_path.open("rb") as attachment_file:
+        with (
+            open_regular_file_within_root(attachment.local_path.parent, attachment.local_path.name) as descriptor,
+            os.fdopen(descriptor, "rb", closefd=False) as attachment_file,
+        ):
+            size_bytes = os.fstat(descriptor).st_size
+            if size_bytes > byte_limit:
+                return (
+                    None,
+                    f"Attachment {attachment.attachment_id} exceeds {limit_label} size limit "
+                    f"({size_bytes} bytes > {byte_limit} bytes).",
+                )
             payload = attachment_file.read(byte_limit + 1)
-    except OSError:
+    except (OSError, ValueError):
         return None, f"Attachment file is missing on disk: {attachment.attachment_id}"
     if len(payload) > byte_limit:
         return None, f"Attachment {attachment.attachment_id} exceeds {limit_label} size limit ({byte_limit} bytes)."
@@ -226,7 +246,7 @@ def _resolve_attachment_ids(
     context: ToolRuntimeContext,
     attachment_ids: list[str],
 ) -> tuple[list[_ResolvedSendAttachment], list[str], str | None]:
-    """Resolve context attachment IDs into local files or encrypted in-memory handles."""
+    """Resolve context attachment IDs into retained records or encrypted in-memory handles."""
     if not attachment_ids:
         return [], [], None
 
@@ -244,13 +264,13 @@ def _resolve_attachment_ids(
             resolved_attachment_ids.append(attachment_id)
             continue
 
-        attachment_path, error = _resolve_context_attachment_path(context, attachment_id)
+        attachment, error = _resolve_context_attachment_record(context, attachment_id)
         if error is not None:
             return [], [], error
-        if attachment_path is None:
+        if attachment is None:
             continue
 
-        resolved_attachments.append(attachment_path)
+        resolved_attachments.append(attachment)
         resolved_attachment_ids.append(attachment_id)
     return resolved_attachments, resolved_attachment_ids, None
 
@@ -259,20 +279,28 @@ def _register_attachment_file_path(
     context: ToolRuntimeContext,
     file_path: str,
     *,
-    workspace_root: Path | None = None,
+    workspace_root: Path | None,
+    file_access: FileAccess,
 ) -> tuple[AttachmentRecord | None, str | None]:
     """Register a local file path in the current tool context."""
     if context.storage_path is None:
         return None, "Attachment storage path is unavailable in this runtime path."
 
-    resolved_path, path_error = _resolve_attachment_file_path(file_path, workspace_root=workspace_root)
-    if path_error is not None or resolved_path is None:
+    authorized, path_error = _resolve_attachment_file_path(
+        file_path,
+        workspace_root=workspace_root,
+        file_access=file_access,
+    )
+    if path_error is not None or authorized is None:
         return None, path_error
+    source_root = authorized.root
+    resolved_path = authorized.root / authorized.relative
     kind, filename, mime_type = _infer_local_attachment_metadata(resolved_path)
     attachment_record = register_local_attachment(
         context.storage_path,
         resolved_path,
         kind=kind,
+        source_root=source_root,
         filename=filename,
         mime_type=mime_type,
         room_id=context.room_id,
@@ -289,51 +317,56 @@ def _register_attachment_file_path(
 def _resolve_attachment_file_path(
     file_path: str,
     *,
-    workspace_root: Path | None = None,
-) -> tuple[Path | None, str | None]:
-    """Resolve one model-requested attachment file path."""
-    requested_path = Path(file_path)
-    if requested_path.is_absolute() or workspace_root is None:
-        return Path(file_path).expanduser().resolve(), None
+    workspace_root: Path | None,
+    file_access: FileAccess,
+) -> tuple[AuthorizedFile | None, str | None]:
+    """Resolve one model-requested attachment file path under the agent's file access.
+
+    The path is model-supplied and reaches an open in the primary process, so
+    workspace access confines it to the workspace and fails closed without one;
+    only already authorized ``att_*`` IDs then remain sendable. Registration
+    copies the file below the returned root without following links.
+    """
     try:
-        return (
-            resolve_workspace_relative_path(
-                workspace_root,
-                requested_path,
-                field_name="attachment file path",
-            ),
-            None,
+        authorized = resolve_agent_file(
+            file_path,
+            workspace_root=workspace_root,
+            file_access=file_access,
+            field_name="attachment file path",
         )
     except ValueError as exc:
         return None, str(exc)
+    return authorized, None
 
 
 def _resolve_attachment_file_paths(
     context: ToolRuntimeContext,
     attachment_file_paths: list[str],
     *,
-    workspace_root: Path | None = None,
-) -> tuple[list[Path], list[str], str | None]:
-    """Register file paths and return local paths plus generated attachment IDs."""
+    workspace_root: Path | None,
+    file_access: FileAccess,
+) -> tuple[list[AttachmentRecord], list[str], str | None]:
+    """Register file paths and return retained records plus generated attachment IDs."""
     if not attachment_file_paths:
         return [], [], None
 
-    resolved_paths: list[Path] = []
+    resolved_records: list[AttachmentRecord] = []
     newly_registered_attachment_ids: list[str] = []
     for attachment_file_path in attachment_file_paths:
         attachment_record, register_error = _register_attachment_file_path(
             context,
             attachment_file_path,
             workspace_root=workspace_root,
+            file_access=file_access,
         )
         if register_error is not None:
             return [], [], register_error
         if attachment_record is None:
             continue
-        resolved_paths.append(attachment_record.local_path)
+        resolved_records.append(attachment_record)
         newly_registered_attachment_ids.append(attachment_record.attachment_id)
 
-    return resolved_paths, newly_registered_attachment_ids, None
+    return resolved_records, newly_registered_attachment_ids, None
 
 
 def resolve_send_attachments(
@@ -342,6 +375,7 @@ def resolve_send_attachments(
     attachment_ids: list[str],
     attachment_file_paths: list[str],
     workspace_root: Path | None = None,
+    file_access: FileAccess = "workspace",
 ) -> tuple[list[_ResolvedSendAttachment], list[str], list[str], str | None]:
     """Resolve context IDs and/or local paths to ordered sendable attachments."""
     attachments, resolved_attachment_ids, attachment_error = _resolve_attachment_ids(
@@ -350,14 +384,15 @@ def resolve_send_attachments(
     )
     if attachment_error is not None:
         return [], [], [], attachment_error
-    file_paths, newly_registered_attachment_ids, file_path_error = _resolve_attachment_file_paths(
+    file_records, newly_registered_attachment_ids, file_path_error = _resolve_attachment_file_paths(
         context,
         attachment_file_paths,
         workspace_root=workspace_root,
+        file_access=file_access,
     )
     if file_path_error is not None:
         return [], [], [], file_path_error
-    attachments.extend(file_paths)
+    attachments.extend(file_records)
     resolved_attachment_ids.extend(newly_registered_attachment_ids)
     if not attachments:
         return [], [], [], "At least one of attachment_ids or attachment_file_paths must be provided."
@@ -372,12 +407,15 @@ async def send_resolved_attachments(
     attachments: list[_ResolvedSendAttachment],
     known_latest_thread_event_id: str | None = None,
 ) -> tuple[list[str], str | None]:
-    """Send local files or already-encrypted Matrix media while preserving order.
+    """Send retained files or already-encrypted Matrix media while preserving order.
 
     ``known_latest_thread_event_id`` is for a caller that already sent into this
     thread in this same execution. Each attachment after the first chains from
     the send response of the one before it; this is the same fact for the first,
     which the projection cannot supply until the earlier send echoes back.
+
+    Each event asks receivers to ignore its mentions, because its body is a file
+    name rather than an address, so a name like ``@agent.txt`` wakes no entity.
     """
     attachment_event_ids: list[str] = []
     latest_thread_event_id = await context.conversation_reader.latest_thread_event_id(
@@ -386,15 +424,18 @@ async def send_resolved_attachments(
         known_latest_thread_event_id=known_latest_thread_event_id,
     )
     for attachment in attachments:
-        if isinstance(attachment, Path):
+        if isinstance(attachment, AttachmentRecord):
             attachment_event_id = await send_file_message(
                 context.client,
                 room_id,
-                attachment,
+                attachment.local_path,
+                filename=attachment.filename,
+                mimetype=attachment.mime_type,
                 thread_id=thread_id,
                 latest_thread_event_id=latest_thread_event_id,
+                extra_content={SKIP_MENTIONS_KEY: True},
             )
-            attachment_label = str(attachment)
+            attachment_label = attachment.attachment_id
         else:
             attachment_event_id = await send_runtime_encrypted_media_message(
                 context.client,
@@ -402,6 +443,7 @@ async def send_resolved_attachments(
                 attachment,
                 thread_id=thread_id,
                 latest_thread_event_id=latest_thread_event_id,
+                extra_content={SKIP_MENTIONS_KEY: True},
             )
             attachment_label = attachment.attachment_id
         if attachment_event_id is None:
@@ -421,9 +463,11 @@ class AttachmentTools(Toolkit):
         worker_target: ResolvedWorkerTarget | None = None,
         worker_tools_override: list[str] | None = None,
         tool_output_workspace_root: Path | None = None,
+        file_access: FileAccess = "workspace",
     ) -> None:
         self._runtime_paths = runtime_paths
         self._worker_target = worker_target
+        self._file_access = file_access
         self._worker_tools_override = worker_tools_override
         self._tool_output_workspace_root = tool_output_workspace_root
         super().__init__(
@@ -465,15 +509,22 @@ class AttachmentTools(Toolkit):
             )
         else:
             assert path is not None
-            result = await self._view_workspace_image(context, path)
+            result = await self._view_path_image(context, path)
         finalized = await asyncio.to_thread(finalize_tool_media, result)
         assert isinstance(finalized, ToolResult)
         return finalized
 
-    async def _view_workspace_image(self, context: ToolRuntimeContext, path: str) -> ToolResult:
+    def _tools_use_worker(self, context: ToolRuntimeContext) -> bool:
+        """Return whether this agent's workspace tools run in a worker, away from runtime attachment storage."""
+        return attachment_save_uses_worker(
+            runtime_paths=self._runtime_paths or context.runtime_paths,
+            worker_tools_override=self._worker_tools_override,
+        )
+
+    async def _view_path_image(self, context: ToolRuntimeContext, path: str) -> ToolResult:
         runtime_paths = self._runtime_paths or context.runtime_paths
         metadata: dict[str, object] = {"tool": "view_file", "path": path}
-        if attachment_save_uses_worker(runtime_paths=runtime_paths, worker_tools_override=self._worker_tools_override):
+        if self._tools_use_worker(context):
             try:
                 result = await asyncio.to_thread(
                     view_file_from_worker,
@@ -486,9 +537,12 @@ class AttachmentTools(Toolkit):
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 return media_error(str(exc), metadata=metadata)
             return result or media_error("Worker workspace is unavailable.", metadata=metadata)
-        if self._tool_output_workspace_root is None:
-            return media_error("An authorized workspace is required for path viewing.", metadata=metadata)
-        return await asyncio.to_thread(view_image_path, path, workspace=self._tool_output_workspace_root)
+        return await asyncio.to_thread(
+            view_agent_image,
+            path,
+            workspace=self._tool_output_workspace_root,
+            file_access=self._file_access,
+        )
 
     def _describe_get_attachment_schema(self) -> None:
         """Attach explicit model-facing descriptions for bespoke attachment args."""
@@ -513,7 +567,11 @@ class AttachmentTools(Toolkit):
                 message="Tool runtime context is unavailable in this runtime path.",
             )
 
-        requested_attachment_ids, attachments, missing_attachment_ids, error = _get_attachment_listing(context, target)
+        requested_attachment_ids, attachments, missing_attachment_ids, error = _get_attachment_listing(
+            context,
+            target,
+            tools_use_worker=self._tools_use_worker(context),
+        )
         if error is not None:
             return _attachment_tool_payload("error", message=error)
 
@@ -562,6 +620,7 @@ class AttachmentTools(Toolkit):
         requested_attachment_ids, attachments, missing_attachment_ids, error = _get_attachment_listing(
             context,
             requested_attachment_id,
+            tools_use_worker=self._tools_use_worker(context),
         )
         if error is not None:
             return _attachment_tool_payload("error", message=error)
@@ -628,16 +687,12 @@ class AttachmentTools(Toolkit):
     ) -> tuple[bool, ToolOutputFilePolicy | None]:
         """Resolve whether this save lands on a worker and the local validation policy."""
         runtime_paths = self._runtime_paths or context.runtime_paths
-        use_worker = attachment_save_uses_worker(
-            runtime_paths=runtime_paths,
-            worker_tools_override=self._worker_tools_override,
-        )
         local_policy = (
             ToolOutputFilePolicy.from_runtime(self._tool_output_workspace_root, runtime_paths)
             if self._tool_output_workspace_root is not None
             else None
         )
-        return use_worker, local_policy
+        return self._tools_use_worker(context), local_policy
 
     def _validate_output_path_before_save(
         self,
@@ -771,7 +826,7 @@ class AttachmentTools(Toolkit):
     async def register_attachment(self, file_path: str) -> str:
         """Register a local file as a context attachment ID.
 
-        Relative paths resolve from the agent workspace when one is available.
+        Paths resolve from the agent workspace and must stay inside it.
         """
         context = get_tool_runtime_context()
         if context is None:
@@ -786,6 +841,7 @@ class AttachmentTools(Toolkit):
             context,
             file_path.strip(),
             workspace_root=self._tool_output_workspace_root,
+            file_access=self._file_access,
         )
         if register_error is not None or attachment_record is None:
             return _attachment_tool_payload(
@@ -796,5 +852,5 @@ class AttachmentTools(Toolkit):
         return _attachment_tool_payload(
             "ok",
             attachment_id=attachment_record.attachment_id,
-            attachment=attachments_for_tool_payload([attachment_record])[0],
+            attachment=_attachment_record_payload(attachment_record, tools_use_worker=self._tools_use_worker(context)),
         )

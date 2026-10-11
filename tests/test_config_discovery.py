@@ -48,6 +48,8 @@ _EXECUTION_IDENTITY_ENV_ALLOWLIST = {
     "src/mindroom/tool_system/worker_routing.py",
 }
 _AMBIENT_EXECUTION_IDENTITY_ALLOWLIST = {
+    # Canonical prepared dispatch installs its explicitly retained runtime identity.
+    "src/mindroom/tool_system/agent_tool_calls.py",
     "src/mindroom/api/openai_compat.py",
     "src/mindroom/api/sandbox_runner.py",
     "src/mindroom/bot.py",
@@ -80,9 +82,9 @@ _EXPLICIT_RUNTIME_SCOPE_NO_DEFAULTS = {
     ("src/mindroom/agents.py", "build_agent_toolkit", "execution_identity"),
     ("src/mindroom/agent_storage.py", "create_session_storage", "execution_identity"),
     ("src/mindroom/agents.py", "create_agent", "execution_identity"),
-    ("src/mindroom/credentials.py", "load_scoped_credentials", "worker_target"),
-    ("src/mindroom/credentials.py", "_resolve_worker_credentials_manager", "worker_target"),
-    ("src/mindroom/credentials.py", "save_scoped_credentials", "worker_target"),
+    ("src/mindroom/credentials/manager.py", "load_scoped_credentials", "worker_target"),
+    ("src/mindroom/credentials/manager.py", "_resolve_worker_credentials_manager", "worker_target"),
+    ("src/mindroom/credentials/manager.py", "save_scoped_credentials", "worker_target"),
     ("src/mindroom/tool_system/metadata.py", "_build_tool_instance", "worker_target"),
     ("src/mindroom/runtime_resolution.py", "resolve_agent_execution", "execution_identity"),
     ("src/mindroom/runtime_resolution.py", "resolve_agent_runtime", "execution_identity"),
@@ -237,6 +239,17 @@ def _collect_execution_identity_keyword_violations() -> list[str]:
             if not isinstance(node, ast.Call):
                 continue
             call_name = _call_name(node)
+            # These calls use ToolRuntimeContext's bound method, which builds
+            # and passes execution_identity explicitly to the routing helper.
+            # Keep exact expressions: a new free helper call still needs review.
+            bound_target_calls = {
+                ("src/mindroom/approval/execution.py", "runtime_context.resolve_worker_target"),
+                ("src/mindroom/approval/tool_owners.py", "context.resolve_worker_target"),
+                ("src/mindroom/agent_cli/response_owner.py", "runtime.resolve_worker_target"),
+                ("src/mindroom/custom_tools/dynamic_workflow.py", "context.resolve_worker_target"),
+            }
+            if (relative_path, ast.unparse(node.func)) in bound_target_calls:
+                continue
             required_keyword = _EXPLICIT_RUNTIME_SCOPE_KEYWORDS.get(call_name)
             if required_keyword is None:
                 continue

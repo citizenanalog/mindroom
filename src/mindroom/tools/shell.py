@@ -11,6 +11,7 @@ from typing import cast
 
 from agno.tools.toolkit import Toolkit
 
+from mindroom.agent_cli.shell_contract import current_agent_cli_shell_env
 from mindroom.constants import (
     WORKSPACE_HOME_CONTRACT_ENV_NAMES,
     RuntimePaths,
@@ -18,15 +19,15 @@ from mindroom.constants import (
     subprocess_path_with_prepends,
     workspace_home_identity_env,
 )
-from mindroom.shell_execution import (
+from mindroom.shell.execution import (
     DEFAULT_RUN_TIMEOUT_SECONDS,
     ProcessRecord,
     check_command,
     kill_command,
     run_command,
 )
-from mindroom.shell_output_capture import ShellOutputDestination
-from mindroom.shell_supervisor import (
+from mindroom.shell.output_capture import ShellOutputDestination
+from mindroom.shell.supervisor import (
     SHELL_SUPERVISOR_SOCKET_ENV,
     check_command_via_supervisor,
     kill_command_via_supervisor,
@@ -37,6 +38,7 @@ from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
@@ -87,6 +89,20 @@ _WORKSPACE_CWD_NOTE = (
     "(echoed as a `[cwd: ...]` first line in the result). Always use relative paths or "
     "`$MINDROOM_AGENT_WORKSPACE` for workspace files instead of `~`: worker-routed execution maps `~` "
     "to the workspace, while local execution maps it to the host home."
+)
+# Working method distilled from RRSI harness-search runs on graded terminal tasks, where these habits
+# removed the most common silent failures of a shell agent (wrong field matched, merged file boundaries,
+# reserialized edits, unverified renames, truncated reads).
+_WORKING_METHOD_NOTE = (
+    "Working method: inspect inputs first, sampling large files or outputs with head, tail, grep, or wc instead "
+    "of printing everything, but compute results over the full input. Match filters against the extracted field "
+    "value, not the whole line, and check them on a few sample records. When combining the lines or words of "
+    "several text files, do not concatenate them raw: a file may lack its final newline, which merges its last "
+    "word or record with the next file's first, so process each file separately or add a separator, and test "
+    "with files that lack a trailing newline (joining split chunks of one file byte for byte is different). When "
+    "only one value must change, replace just that span and keep every other byte, including comments and "
+    "spacing. Afterwards verify the result: read outputs back, search for leftover old names after a rename, run "
+    "available tests, and recheck suspicious results such as a zero count."
 )
 
 # Module-level process registry shared across all MindRoomShellTools instances.
@@ -162,6 +178,7 @@ def _shell_subprocess_env(
     *,
     base_process_env: dict[str, str] | None = None,
     shell_path_prepend: str | None = None,
+    extra_path_prepend: tuple[str, ...] = (),
     workspace_dir: Path | None = None,
 ) -> dict[str, str]:
     """Build the env passed to shell subprocesses."""
@@ -180,7 +197,7 @@ def _shell_subprocess_env(
 
     path_value = subprocess_path_with_prepends(
         env.get("PATH"),
-        prepend_entries=_shell_path_prepend_entries(shell_path_prepend),
+        prepend_entries=(*extra_path_prepend, *_shell_path_prepend_entries(shell_path_prepend)),
     )
     if path_value is None:
         env.pop("PATH", None)
@@ -255,6 +272,8 @@ def _handle_namespace(*, runtime_paths: RuntimePaths, base_dir: Path | None) -> 
     display_name="Shell Commands",
     description="Run terminal commands and scripts in the agent workspace",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.UNCONFINED,
+    executes_code=True,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.WORKER,
@@ -370,9 +389,14 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
                 ),
             )
             self._base_process_env = dict(runtime_paths.process_env)
-            if run_shell_command_function is not None and self.base_dir is not None:
-                run_shell_command_function.description = (
-                    f"{run_shell_command_function.description or ''}\n\n{_WORKSPACE_CWD_NOTE}"
+            if run_shell_command_function is not None:
+                notes = (
+                    (_WORKSPACE_CWD_NOTE, _WORKING_METHOD_NOTE)
+                    if self.base_dir is not None
+                    else (_WORKING_METHOD_NOTE,)
+                )
+                run_shell_command_function.description = "\n\n".join(
+                    (run_shell_command_function.description or "", *notes),
                 ).strip()
             self._handle_namespace = _handle_namespace(runtime_paths=runtime_paths, base_dir=self.base_dir)
             self._shell_path_prepend = shell_path_prepend
@@ -390,8 +414,9 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
             """Runs a shell command and returns the output or error.
 
             If the command completes within ``timeout`` seconds the last ``tail``
-            lines of stdout are returned (or the stderr on non-zero exit).  When
-            the timeout is exceeded the process keeps running in the background
+            lines of stdout are returned. On non-zero exit, useful stdout is
+            preserved together with stderr. When the timeout is exceeded, the
+            process keeps running in the background
             and a handle string is returned that can be polled with
             ``check_shell_command`` or stopped with ``kill_shell_command``.
 
@@ -416,10 +441,19 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
                 command_args = _normalize_shell_args(args)
             except ValueError as exc:
                 return f"Error: {exc}"
+            runtime_env = self._runtime_env
+            extra_path_prepend: tuple[str, ...] = ()
+            if (cli_env := current_agent_cli_shell_env()) is not None:
+                runtime_env = {**runtime_env, **cli_env.env()}
+                if cli_env.bin_dir is not None:
+                    # First, so an older `mindroom-agent` on the agent's configured PATH cannot shadow this response's CLI.
+                    # Kept out of the comma-separated setting, whose parsing would split a path containing a comma.
+                    extra_path_prepend = (cli_env.bin_dir,)
             subprocess_env = _shell_subprocess_env(
-                self._runtime_env,
+                runtime_env,
                 base_process_env=self._base_process_env,
                 shell_path_prepend=self._shell_path_prepend,
+                extra_path_prepend=extra_path_prepend,
                 workspace_dir=self.base_dir,
             )
             argv = _shell_subprocess_args(command_args, subprocess_env)

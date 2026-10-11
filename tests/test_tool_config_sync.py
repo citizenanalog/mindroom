@@ -2,7 +2,7 @@
 
 import inspect
 from pathlib import Path
-from types import UnionType
+from types import SimpleNamespace, UnionType
 from typing import Any, Union, cast, get_args, get_origin, get_type_hints
 
 import pytest
@@ -10,6 +10,7 @@ from agno.tools import Toolkit
 
 # Import tools to ensure they're registered
 import mindroom.tools  # noqa: F401
+from mindroom.config.models import FileAccess
 from mindroom.constants import RuntimePaths
 from mindroom.tool_system.declarations import ToolManagedInitArg, ToolStatus
 from mindroom.tool_system.metadata import TOOL_METADATA, TOOL_REGISTRY, validate_authored_tool_entry_overrides
@@ -30,10 +31,7 @@ SKIP_CONFIG_FIELD_VALIDATION = {
 # host runs this suite without it.
 OPTIONAL_TOOL_IMPORTS = frozenset({"apify", "scrapegraph"})
 IGNORED_AGNO_PARAMS = {
-    # Agno still exposes deprecated BigQuery aliases in its constructor, but MindRoom intentionally only surfaces canonical flags.
-    "google_bigquery": {"enable_list_tables", "enable_describe_table", "enable_run_sql_query"},
     # Mapping-only inputs have no safe authored ConfigField representation.
-    "crawl4ai": {"proxy_config"},
     "firecrawl": {"search_params"},
     "spider": {"optional_params"},
     "mem0": {"config"},
@@ -44,6 +42,8 @@ IGNORED_AGNO_PARAMS = {
     "youtube": {"proxies"},
     # Agno accepts a live HTTP session object, which MindRoom cannot serialize safely in UI/YAML config.
     "yfinance": {"session"},
+    # Agno never runs newspaper4k's nlp(), the only step that fills an article summary, so this flag has no effect.
+    "newspaper": {"include_summary"},
 }
 IGNORED_EXTRA_CONFIG_FIELDS = {
     # DockerTools accepts toolkit options through **kwargs, so inspect.signature cannot see include_tools.
@@ -232,6 +232,34 @@ def test_daytona_blank_optional_sandbox_values_become_none(monkeypatch: pytest.M
     assert captured["sandbox_labels"] is None
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [({}, True), ({"verify_ssl": None}, True), ({"verify_ssl": True}, True), ({"verify_ssl": False}, False)],
+)
+def test_daytona_verifies_tls_certificates_unless_explicitly_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    *,
+    expected: bool,
+) -> None:
+    """Only an explicit false may disable certificate checks for Daytona's API key traffic; unset and null verify."""
+    from agno.tools.daytona import DaytonaTools  # noqa: PLC0415
+
+    captured: dict[str, object] = {}
+
+    def capture_init(_self: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(DaytonaTools, "__init__", capture_init)
+    tool_class = cast("Any", TOOL_REGISTRY["daytona"]())
+
+    tool_class(api_key="dt-test", **overrides)
+
+    assert captured["verify_ssl"] is expected
+    fields = {field.name: field for field in TOOL_METADATA["daytona"].config_fields or []}
+    assert fields["verify_ssl"].default is True
+
+
 def test_tool_metadata_lists_only_model_callable_functions() -> None:
     """Tool metadata must not advertise internal toolkit helpers."""
     assert TOOL_METADATA["pubmed"].function_names == ("search_pubmed",)
@@ -263,6 +291,29 @@ def test_tool_metadata_lists_only_model_callable_functions() -> None:
         "send_message_thread",
         "upload_file",
     )
+
+
+def test_slack_upload_file_sends_model_content_without_opening_local_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slack runs in the primary runtime, so a path-like upload argument must never read that file."""
+    secret_path = tmp_path / ".env"
+    secret_path.write_text("MINDROOM_API_KEY=secret\n")
+    tool = cast("Any", TOOL_REGISTRY["slack"]())(token="xoxb-test")  # noqa: S106
+    captured: dict[str, object] = {}
+
+    def files_upload_v2(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(data={"ok": True})
+
+    monkeypatch.setattr(tool.client, "files_upload_v2", files_upload_v2)
+
+    tool.upload_file(channel="C0123", content=str(secret_path), filename=str(secret_path))
+
+    assert "file" not in captured
+    assert captured["content"] == str(secret_path).encode()
+    assert captured["filename"] == ".env"
 
 
 def test_zep_metadata_lists_only_model_callable_functions() -> None:
@@ -336,6 +387,8 @@ def verify_tool_configfields(  # noqa: C901, PLR0912, PLR0915
         tool_class.__init__,
         globalns=tool_class.__init__.__globals__
         | {
+            "FileAccess": FileAccess,
+            "Path": Path,
             "ResolvedWorkerTarget": ResolvedWorkerTarget,
             "RuntimePaths": RuntimePaths,
         },
@@ -412,6 +465,11 @@ def verify_tool_configfields(  # noqa: C901, PLR0912, PLR0915
                 or "password" in param_name.lower()
                 or "secret" in param_name.lower()
                 or "key" in param_name.lower()
+                or "credential" in param_name.lower()
+                or "headers" in param_name.lower()
+                or "db_url" in param_name.lower()
+                or "env_vars" in param_name.lower()
+                or param_name.lower().endswith("_pat")  # personal access token
             ):
                 expected_type = "password"
             elif (

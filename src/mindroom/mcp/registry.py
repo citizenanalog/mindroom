@@ -15,11 +15,12 @@ from mindroom.tool_system.catalog import (
     SetupType,
     ToolAuthoredOverrideValidator,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolMetadata,
     ToolStatus,
 )
-from mindroom.tool_system.registry_state import TOOL_REGISTRY, reconcile_dynamic_tool_state
+from mindroom.tool_system.registry_state import MCP_TOOL_FACTORY_MARKER, TOOL_REGISTRY, reconcile_dynamic_tool_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.mcp.config import MCPServerConfig
     from mindroom.mcp.manager import MCPServerManager
     from mindroom.mcp.types import MCPServerCatalog
@@ -38,7 +39,6 @@ logger = get_logger(__name__)
 
 _MCP_TOOL_PREFIX = "mcp_"
 _MCP_TOOL_NAMES: set[str] = set()
-_MCP_TOOL_FACTORY_MARKER = "__mindroom_mcp_tool_factory__"
 # MindRoomMCPToolkit declares these constructor args for every MCP tool; metadata
 # mirrors that contract even though credentials are used only by OAuth-backed servers.
 _MCP_MANAGED_INIT_ARGS = (
@@ -58,7 +58,7 @@ def mcp_server_id_from_tool_name(tool_name: str) -> str | None:
     if not tool_name.startswith(_MCP_TOOL_PREFIX):
         return None
     factory = TOOL_REGISTRY.get(tool_name)
-    if tool_name not in _MCP_TOOL_NAMES and not getattr(factory, _MCP_TOOL_FACTORY_MARKER, False):
+    if tool_name not in _MCP_TOOL_NAMES and not getattr(factory, MCP_TOOL_FACTORY_MARKER, False):
         return None
     server_id = tool_name.removeprefix(_MCP_TOOL_PREFIX)
     return server_id or None
@@ -71,7 +71,7 @@ def _registered_mcp_tool_names() -> set[str]:
         *(
             tool_name
             for tool_name, factory in TOOL_REGISTRY.items()
-            if getattr(factory, _MCP_TOOL_FACTORY_MARKER, False)
+            if getattr(factory, MCP_TOOL_FACTORY_MARKER, False)
         ),
     }
 
@@ -147,6 +147,8 @@ def _tool_metadata(server_id: str, server_config: MCPServerConfig) -> ToolMetada
         description=server_config.summary or "Tools provided by this MCP server",
         icon=server_config.icon,
         category=ToolCategory.DEVELOPMENT,
+        # A local stdio server is an operator-launched program that file_access cannot confine.
+        file_access=ToolFileAccess.UNCONFINED if server_config.transport == "stdio" else ToolFileAccess.NONE,
         status=ToolStatus.REQUIRES_CONFIG if is_oauth else ToolStatus.AVAILABLE,
         setup_type=SetupType.OAUTH if is_oauth else SetupType.NONE,
         auth_provider=auth_provider,
@@ -212,7 +214,7 @@ def _tool_factory(server_id: str, server_config: MCPServerConfig) -> Callable[[]
         BoundMindRoomMCPToolkit.__name__ = f"MindRoomMCPToolkit_{server_id}"
         return BoundMindRoomMCPToolkit
 
-    setattr(factory, _MCP_TOOL_FACTORY_MARKER, True)
+    setattr(factory, MCP_TOOL_FACTORY_MARKER, True)
     return factory
 
 

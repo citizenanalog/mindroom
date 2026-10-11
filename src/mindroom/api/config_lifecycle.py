@@ -31,23 +31,24 @@ from mindroom.config.yaml_includes import (
     partial_source_uses_includes,
     source_files_fingerprint,
 )
-from mindroom.event_journal_open import pending_event_journal_restart
+from mindroom.event_journal.opening import pending_event_journal_restart
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
+    from mindroom.agent_cli.session import TurnToolRegistry
     from mindroom.api.computers import ComputerRuntime
     from mindroom.api.mcp_gateway import GatewayRuntime
     from mindroom.api.usage_export import UsageExportRunner
-    from mindroom.config_reload import ConfigReloadStatus
+    from mindroom.config.reload_status import ConfigReloadStatus
     from mindroom.external_triggers.store import TriggerDeliverySnapshot
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.knowledge.watch import KnowledgeSourceWatcher
     from mindroom.report_publishing.authorization import ReportAuthorizationReason
     from mindroom.report_publishing.store import OriginRoomBinding
-    from mindroom.response_activity import ResponseIdentity
+    from mindroom.response_activity import ActiveScriptRunInfo, ResponseIdentity
     from mindroom.response_admission import ResponseAdmissionGate
     from mindroom.thread_export.workspace_sync import WorkspaceThreadExportRunner
     from mindroom.worker_computer.sessions import ComputerSessionStore
@@ -142,11 +143,14 @@ class _MindroomAppState:
     agent_reply_memberships: AgentReplyMembershipIndex = field(default_factory=AgentReplyMembershipIndex)
     response_admission_gate: ResponseAdmissionGate | None = None
     openai_responses: set[ResponseIdentity] = field(default_factory=set)
+    active_calls: Callable[[], list[ResponseIdentity]] | None = None
+    active_script_runs: Callable[[], Awaitable[list[ActiveScriptRunInfo]]] | None = None
     config_reload_status: Callable[[], ConfigReloadStatus] | None = None
     script_worker_keepalive: Callable[[WorkerBackend], None] | None = None
     mcp_gateway_runtime: GatewayRuntime | None = None
     computer_runtime: ComputerRuntime | None = None
     computer_sessions: ComputerSessionStore | None = None
+    agent_cli_registry: TurnToolRegistry | None = None
     usage_export_runner: UsageExportRunner | None = None
 
 
@@ -759,7 +763,7 @@ def _build_and_commit_mutation[T](
     except HTTPException:
         raise
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors(include_context=False)) from e
+        raise HTTPException(status_code=422, detail=e.errors(include_context=False, include_input=False)) from e
     except _ConfigComposedFromIncludesError as e:
         raise _composed_from_includes_http_error(e) from e
     except ConfigRuntimeValidationError as e:
@@ -797,7 +801,7 @@ def _build_and_commit_replacement(
     except HTTPException:
         raise
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors(include_context=False)) from e
+        raise HTTPException(status_code=422, detail=e.errors(include_context=False, include_input=False)) from e
     except _ConfigComposedFromIncludesError as e:
         raise _composed_from_includes_http_error(e) from e
     except ConfigRuntimeValidationError as e:

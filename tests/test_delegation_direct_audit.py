@@ -19,8 +19,8 @@ from mindroom.ai import run_delegated_child_response
 from mindroom.config.agent import AgentConfig
 from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.delegation.lifecycle import observe_child_event, prepare_child_turn
-from mindroom.tool_schema_cache import cached_processed_schema
 from mindroom.tool_system.runtime_context import tool_runtime_context
+from mindroom.tool_system.tool_schema_cache import cached_processed_schema
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.access_schema_support import with_responder_access
 from tests.history_helpers import RecordingModel
@@ -197,6 +197,7 @@ async def test_real_parent_tool_call_records_direct_provenance_without_schema_fi
     function = tools.async_functions["run_subagent"]
     schema = cached_processed_schema(function, strict=False)
     assert schema is not None
+    # Minimal mode is hidden here because no allowed subagent can run it.
     assert set(schema.parameters["properties"]) == {"agent_name", "task", "model"}
 
     async def complete_child(ctx: object, **kwargs: object) -> str:

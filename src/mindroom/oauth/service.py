@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.oauth.credential_binding import (
     OAuthCredentialBinding,
     OAuthCredentialBindingParseError,
@@ -37,10 +37,12 @@ _OAUTH_CONNECT_TOKEN_KIND = "conversation_oauth_connect"  # noqa: S105
 _GOOGLE_SERVICE_ACCOUNT_PROVIDER_IDS = frozenset(
     {
         "google_calendar",
+        "google_cloud",
         "google_docs",
         "google_drive",
         "google_gmail",
         "google_sheets",
+        "google_tasks",
     },
 )
 __all__ = [
@@ -294,7 +296,7 @@ def oauth_connection_required(
     if reason == OAUTH_RESET_REQUIRED_REASON:
         instruction = (
             f"{context.provider.display_name} credentials for this requester cannot be read. "
-            "Use the authenticated MindRoom dashboard's Integrations page to reset this provider connection, "
+            "Use the Tools tab of the authenticated MindRoom dashboard to reset this provider connection, "
             "then reconnect and retry the request."
         )
         return OAuthConnectionRequired(
