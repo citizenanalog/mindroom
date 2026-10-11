@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Mic, Settings, Volume2, Info } from "lucide-react";
+import { Mic, Settings, Volume2, Info, PhoneCall } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -21,8 +21,16 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
 import { showSaveFailureToastIfNeeded } from "@/components/shared";
-import { useConfigStore } from "@/store/configStore";
+import { readConfigRoot, useConfigStore } from "@/store/configStore";
+import {
+  SchemaFields,
+  SchemaSection,
+  SchemaUnavailable,
+} from "@/components/SchemaForm";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
 import { VoiceConfig as VoiceConfigType } from "@/types/config";
+
+const STT_EDITOR_FIELDS = ["provider", "model", "api_key", "host"] as const;
 
 const OPENAI_TRANSCRIPTION_ENDPOINT =
   "https://api.openai.com/v1/audio/transcriptions";
@@ -32,7 +40,7 @@ const DEFAULT_VOICE_CONFIG: VoiceConfigType = {
   visible_router_echo: true,
   stt: {
     provider: "openai",
-    model: "gpt-4o-transcribe",
+    model: "gpt-transcribe",
     api_key: "",
     host: "",
   },
@@ -81,7 +89,14 @@ function normalizeSTTConfig(
 }
 
 export function VoiceConfig() {
-  const { config, isLoading, saveConfig, updateVoiceConfig } = useConfigStore();
+  const { config, isLoading, saveConfig, updateConfigValue } = useConfigStore();
+  const {
+    schema: schemaRoot,
+    error: schemaError,
+    retry: retrySchema,
+  } = useConfigSchema();
+  const callsConfig =
+    config == null ? undefined : readConfigRoot(config, "calls");
   const { toast } = useToast();
 
   // Initialize local state with default values if voice config doesn't exist
@@ -98,7 +113,7 @@ export function VoiceConfig() {
     const newConfig = { ...voiceConfig, ...updates };
     setVoiceConfig(newConfig);
 
-    updateVoiceConfig(newConfig);
+    updateConfigValue(["voice"], newConfig);
   };
 
   const handleSTTChange = (updates: Partial<VoiceConfigType["stt"]>) => {
@@ -136,7 +151,7 @@ export function VoiceConfig() {
   const providerLabel = isCompatibleProvider ? "OpenAI-compatible" : "OpenAI";
 
   const handleSave = async () => {
-    updateVoiceConfig({
+    updateConfigValue(["voice"], {
       ...voiceConfig,
       stt: normalizeSTTConfig(voiceConfig.stt),
     });
@@ -152,6 +167,23 @@ export function VoiceConfig() {
     toast({
       title: "Voice Configuration Saved",
       description: "Your voice settings have been updated successfully.",
+    });
+  };
+
+  // Saves the draft as is; unlike handleSave it must not write voice defaults.
+  const handleSaveCalls = async () => {
+    const result = await saveConfig();
+    if (
+      showSaveFailureToastIfNeeded(result, {
+        staleMessage: "Save was superseded by newer call configuration edits.",
+        fallbackMessage: "Failed to save call configuration.",
+      })
+    ) {
+      return;
+    }
+    toast({
+      title: "Call Settings Saved",
+      description: "Your voice call settings have been updated successfully.",
     });
   };
 
@@ -232,7 +264,7 @@ export function VoiceConfig() {
                 </span>
               </div>
               <div className="flex items-start justify-between gap-4">
-                <span className="text-muted-foreground">Command Model:</span>
+                <span className="text-muted-foreground">Transcript Model:</span>
                 <span className="font-mono text-right text-foreground">
                   {voiceConfig.intelligence.model}
                 </span>
@@ -312,7 +344,7 @@ export function VoiceConfig() {
                   id="stt-model"
                   value={voiceConfig.stt.model}
                   onChange={(e) => handleSTTChange({ model: e.target.value })}
-                  placeholder="gpt-4o-transcribe"
+                  placeholder="gpt-transcribe"
                 />
               </div>
 
@@ -355,12 +387,12 @@ export function VoiceConfig() {
             </div>
           </div>
 
-          {/* Command Intelligence Model */}
+          {/* Transcript Intelligence Model */}
           <div className="space-y-4">
             <div className="flex items-center gap-2">
               <Settings className="h-4 w-4" />
               <Label className="text-base font-semibold">
-                Command Intelligence
+                Transcript Intelligence
               </Label>
             </div>
 
@@ -390,11 +422,21 @@ export function VoiceConfig() {
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Model used to process transcriptions into commands and agent
-                mentions
+                Model used for mention normalization and light ASR cleanup
               </p>
             </div>
           </div>
+
+          <SchemaSection
+            title="More speech-to-text settings"
+            definition="VoiceSTTConfig"
+            value={config?.voice?.stt}
+            path={["voice", "stt"]}
+            exclude={STT_EDITOR_FIELDS}
+            onFieldChange={(key, next) =>
+              updateConfigValue(["voice", "stt", key], next)
+            }
+          />
 
           {/* Save Button */}
           <div className="flex justify-end">
@@ -402,6 +444,52 @@ export function VoiceConfig() {
               Save Voice Configuration
             </Button>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <PhoneCall className="h-5 w-5 text-primary" />
+            Voice Calls
+          </CardTitle>
+          <CardDescription>
+            Let agents join Element Call (MatrixRTC) voice calls with named call
+            profiles.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {schemaError != null && (
+            <SchemaUnavailable
+              subject="Call settings"
+              error={schemaError}
+              onRetry={retrySchema}
+            />
+          )}
+          {schemaRoot == null && schemaError == null && (
+            <p className="text-sm text-muted-foreground">
+              Loading call settings...
+            </p>
+          )}
+          {schemaRoot?.properties?.calls != null && (
+            <>
+              <SchemaFields
+                schema={schemaRoot.properties.calls}
+                root={schemaRoot}
+                value={callsConfig}
+                path={["calls"]}
+                showOwnError
+                onFieldChange={(key, next) =>
+                  updateConfigValue(["calls", key], next)
+                }
+              />
+              <div className="flex justify-end">
+                <Button onClick={handleSaveCalls} disabled={isLoading}>
+                  Save Call Settings
+                </Button>
+              </div>
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -425,9 +513,8 @@ export function VoiceConfig() {
             <li className="flex items-start gap-2">
               <span className="text-primary mt-0.5">🤖</span>
               <span>
-                {
-                  'Smart command recognition (e.g., "schedule a meeting" -> "!schedule meeting")'
-                }
+                Transcript cleanup without converting natural language into chat
+                commands
               </span>
             </li>
             <li className="flex items-start gap-2">

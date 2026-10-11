@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, Mock
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
@@ -66,7 +65,7 @@ def write_thread_export_matrix_state(
 
 def write_invited_rooms(runtime_paths: RuntimePaths, entity_name: str, room_ids: list[str]) -> None:
     """Persist invited-room IDs for one managed entity."""
-    path = invited_rooms_path(runtime_paths.storage_root, entity_name)
+    path = invited_rooms_path(runtime_paths, entity_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(room_ids), encoding="utf-8")
 
@@ -75,14 +74,6 @@ def mark_thread_export_root(output_dir: Path) -> None:
     """Mark one manually assembled thread-export test root as owned."""
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / _ROOT_MARKER_FILENAME).write_text(_ROOT_MARKER_TEXT, encoding="utf-8")
-
-
-def mock_runtime_support() -> Mock:
-    """Return initialized-cache-shaped runtime support."""
-    support = Mock()
-    support.event_cache = Mock()
-    support.event_cache.initialize = AsyncMock()
-    return support
 
 
 def successful_group_result(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="youtube",
+    file_access=ToolFileAccess.NONE,
     display_name="YouTube",
     description="Extract video data, captions, and timestamps from YouTube videos",
     category=ToolCategory.ENTERTAINMENT,
@@ -52,16 +53,16 @@ if TYPE_CHECKING:
         ConfigField(
             name="languages",
             label="Languages",
-            type="text",
+            type="string[]",
             required=False,
             default=None,
         ),
         ConfigField(
-            name="proxies",
-            label="Proxies",
-            type="text",
+            name="timeout",
+            label="Timeout",
+            type="number",
             required=False,
-            default=None,
+            default=30,
         ),
     ],
     dependencies=["youtube_transcript_api"],
@@ -70,7 +71,6 @@ if TYPE_CHECKING:
         "get_video_timestamps",
         "get_youtube_video_captions",
         "get_youtube_video_data",
-        "get_youtube_video_id",
     ),
 )
 def youtube_tools() -> type[YouTubeTools]:

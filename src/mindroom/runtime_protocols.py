@@ -9,16 +9,24 @@ if TYPE_CHECKING:
 
     import nio
 
+    from mindroom.agent_cli.session import TurnToolRegistry
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+    from mindroom.automations.runner import AutomationRunner
     from mindroom.bot import AgentBot, TeamBot
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.desktop.identity import DesktopControllerIdentity
     from mindroom.hooks import HookMatrixAdmin, HookMessageSender, HookRoomStatePutter, HookRoomStateQuerier
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
+    from mindroom.response_admission import ResponseAdmissionGate
+    from mindroom.skill_learning.runner import SkillReviewRunner
     from mindroom.tool_system.plugins import PluginReloadResult
 
 __all__ = [
     "OrchestratorRuntime",
+    "SupportsAgentReplyMemberships",
     "SupportsClientConfig",
+    "SupportsClientConfigMemberships",
     "SupportsClientConfigOrchestrator",
     "SupportsConfig",
     "SupportsConfigOrchestrator",
@@ -47,6 +55,18 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     @property
     def knowledge_refresh_scheduler(self) -> KnowledgeRefreshScheduler: ...  # noqa: D102
 
+    @property
+    def agent_cli_registry(self) -> TurnToolRegistry: ...  # noqa: D102
+
+    @property
+    def skill_reviews(self) -> SkillReviewRunner: ...  # noqa: D102
+
+    @property
+    def automations(self) -> AutomationRunner: ...  # noqa: D102
+
+    @property
+    def agent_reply_memberships(self) -> AgentReplyMembershipIndex: ...  # noqa: D102
+
     def hook_message_sender(self) -> HookMessageSender | None: ...  # noqa: D102
 
     def hook_room_state_querier(self) -> HookRoomStateQuerier | None: ...  # noqa: D102
@@ -54,6 +74,10 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     def hook_room_state_putter(self) -> HookRoomStatePutter | None: ...  # noqa: D102
 
     def hook_matrix_admin(self) -> HookMatrixAdmin | None: ...  # noqa: D102
+
+    def running_entity_client(self, entity_name: str) -> nio.AsyncClient | None:
+        """Return the Matrix client of one running managed entity."""
+        ...
 
     def reload_plugins_now(self, *, source: str) -> Awaitable[PluginReloadResult]: ...  # noqa: D102
 
@@ -65,8 +89,32 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
         """Return first-sync readiness for the current entity generation."""
         ...
 
+    def desktop_controller_identity(self, entity_name: str) -> DesktopControllerIdentity:
+        """Resolve the current running bot's already-owned Matrix device pin."""
+        ...
+
     def handle_bot_ready(self, bot: AgentBot | TeamBot) -> Awaitable[None]:
         """Handle a managed bot completing its first sync."""
+        ...
+
+    def invalidate_agent_reply_memberships(self, *, reason: str) -> None:
+        """Revoke room-backed reply grants until the router refreshes them."""
+        ...
+
+    def refresh_agent_reply_memberships(self) -> Awaitable[None]:
+        """Rebuild room-backed reply grants from the router client."""
+        ...
+
+    async def reconcile_reply_authorized_calls(self) -> None:
+        """Revoke denied calls, then reconcile newly authorized joined rooms."""
+        ...
+
+    async def reconcile_pending_invites(self) -> None:
+        """Recheck cached room invites against each entity's invitation policy."""
+        ...
+
+    def revoke_reply_authorized_calls(self) -> Awaitable[None]:
+        """End active calls without running positive room reconciliation."""
         ...
 
     def send_approval_notice(
@@ -88,6 +136,13 @@ class SupportsConfig(Protocol):
     def config(self) -> Config: ...  # noqa: D102
 
 
+class SupportsAgentReplyMemberships(Protocol):
+    """Expose the shared room-membership reply grant index."""
+
+    @property
+    def agent_reply_memberships(self) -> AgentReplyMembershipIndex: ...  # noqa: D102
+
+
 class SupportsClientConfig(Protocol):
     """Expose the Matrix client plus runtime config."""
 
@@ -98,18 +153,25 @@ class SupportsClientConfig(Protocol):
     def config(self) -> Config: ...  # noqa: D102
 
 
-class SupportsConfigOrchestrator(SupportsConfig, Protocol):
+class SupportsClientConfigMemberships(SupportsClientConfig, SupportsAgentReplyMemberships, Protocol):
+    """Expose Matrix client/config state plus shared reply membership grants."""
+
+
+class SupportsConfigOrchestrator(SupportsConfig, SupportsAgentReplyMemberships, Protocol):
     """Expose the config plus optional orchestrator handle."""
 
     @property
     def orchestrator(self) -> OrchestratorRuntime | None: ...  # noqa: D102
 
 
-class SupportsClientConfigOrchestrator(SupportsClientConfig, Protocol):
+class SupportsClientConfigOrchestrator(SupportsClientConfig, SupportsAgentReplyMemberships, Protocol):
     """Expose client/config access, orchestrator access, and runtime freshness."""
 
     @property
     def orchestrator(self) -> OrchestratorRuntime | None: ...  # noqa: D102
+
+    @property
+    def response_admission_gate(self) -> ResponseAdmissionGate: ...  # noqa: D102
 
     @property
     def runtime_started_at(self) -> float: ...  # noqa: D102

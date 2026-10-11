@@ -14,6 +14,7 @@ from mindroom.dispatch_source import (
     HOOK_DISPATCH_SOURCE_KIND,
     HOOK_SOURCE_KIND,
     IMAGE_SOURCE_KIND,
+    INTERACTIVE_SELECTION_SOURCE_KIND,
     MEDIA_SOURCE_KIND,
     MESSAGE_SOURCE_KIND,
     SCHEDULED_SOURCE_KIND,
@@ -51,6 +52,7 @@ def test_scheduled_history_limit_from_content(content: dict[str, object], expect
         HOOK_SOURCE_KIND,
         HOOK_DISPATCH_SOURCE_KIND,
         SCHEDULED_SOURCE_KIND,
+        INTERACTIVE_SELECTION_SOURCE_KIND,
         TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
     ],
 )
@@ -118,6 +120,7 @@ def test_source_kind_allows_trusted_original_sender_rejects_plain_turns(source_k
             },
             True,
         ),
+        ({SOURCE_KIND_KEY: HOOK_DISPATCH_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: True}, True),
         ({SOURCE_KIND_KEY: HOOK_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: True}, False),
         ({SOURCE_KIND_KEY: SCHEDULED_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: False}, False),
         ({SOURCE_KIND_KEY: SCHEDULED_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: "$root"}, False),

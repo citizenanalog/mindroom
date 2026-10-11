@@ -13,12 +13,11 @@ import pytest
 from agno.run.agent import RunCompletedEvent, RunContentEvent, ToolCallCompletedEvent, ToolCallStartedEvent
 
 from mindroom import interactive
+from mindroom.cancellation import request_task_cancel
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig
-from mindroom.constants import STREAM_STATUS_ERROR, STREAM_STATUS_KEY
 from mindroom.delivery_gateway import (
-    CancelledVisibleNoteRequest,
     DeliveryGateway,
     DeliveryGatewayDeps,
     FinalDeliveryRequest,
@@ -26,30 +25,40 @@ from mindroom.delivery_gateway import (
     ResponseIdentity,
 )
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
+from mindroom.event_journal.models import DeliveryStage
 from mindroom.final_delivery import StreamTransportOutcome
 from mindroom.hooks import MessageEnvelope
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client import DeliveredMatrixEvent
 from mindroom.message_target import MessageTarget
 from mindroom.post_response_effects import (
-    PostResponseEffectsDeps,
     PostResponseEffectsSupport,
     ResponseOutcome,
     apply_post_response_effects,
 )
-from mindroom.response_lifecycle import ResponseLifecycle, ResponseLifecycleDeps
+from mindroom.response_sources import ResponseSources
 from mindroom.streaming import StreamingResponse, send_streaming_response
 from tests.conftest import (
     bind_runtime_paths,
+    ignore_final_delivery_handoff,
+    make_conversation_reader_mock,
     make_matrix_client_mock,
+    make_membership_stub,
+    make_outbox_mock,
     message_origin,
     runtime_paths_for,
     test_runtime_paths,
 )
+from tests.reply_span_helpers import reply_span
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from contextlib import AbstractAsyncContextManager
     from pathlib import Path
+
+    from mindroom.event_journal import EventJournalStore, PrincipalStore
+    from mindroom.event_journal.views import MatrixDeliveryView
+    from mindroom.reply_scope import SpanHandle
 
 
 def _config(tmp_path: Path) -> Config:
@@ -113,7 +122,24 @@ def _envelope() -> MessageEnvelope:
     )
 
 
-def _delivery_gateway(tmp_path: Path) -> DeliveryGateway:
+def _reply_span(
+    principal: PrincipalStore,
+    *,
+    thread_id: str | None = None,
+    placeholder_event_id: str | None = None,
+) -> AbstractAsyncContextManager[SpanHandle]:
+    """Run delivery in the reply span of the test envelope's source."""
+    return reply_span(
+        principal,
+        source_event_id=_envelope().source_event_id,
+        room_id="!room:localhost",
+        thread_id=thread_id,
+        entity_name="code",
+        placeholder_event_id=placeholder_event_id,
+    )
+
+
+def _delivery_gateway(tmp_path: Path, outbox: MatrixDeliveryView | None = None) -> DeliveryGateway:
     config = _config(tmp_path)
     response_hooks = SimpleNamespace(
         _apply_before_response=AsyncMock(
@@ -137,15 +163,10 @@ def _delivery_gateway(tmp_path: Path) -> DeliveryGateway:
             agent_name="code",
             logger=Mock(),
             redact_message_event=AsyncMock(return_value=True),
-            resolver=SimpleNamespace(
-                deps=SimpleNamespace(
-                    conversation_cache=SimpleNamespace(
-                        get_latest_thread_event_id_if_needed=AsyncMock(return_value=None),
-                        notify_outbound_message=Mock(),
-                    ),
-                ),
-            ),
+            resolver=SimpleNamespace(deps=SimpleNamespace()),
             response_hooks=response_hooks,
+            outbox=outbox or make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
@@ -200,6 +221,50 @@ async def test_completed_terminal_edit_opts_into_sync_recovery_retry(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_a_completed_first_event_answer_goes_through_the_durable_sender(tmp_path: Path) -> None:
+    """A stream with no placeholder still owes its answer a durable row.
+
+    When the placeholder was suppressed or its send failed, the answer is the
+    stream's first visible event and reaches the room through the send path.
+    Leaving that path on the plain sender makes exactly those answers
+    unrecoverable -- the ones whose turn already had a delivery problem.
+    """
+    streaming = _streaming_response(_config(tmp_path))
+    streaming.event_id = None
+    streaming.accumulated_text = "complete answer"
+    delivered = DeliveredMatrixEvent(event_id="$answer", content_sent={"body": "complete answer"})
+    terminal_send = AsyncMock(return_value=delivered)
+    streaming.terminal_send = terminal_send
+    plain_send = AsyncMock(return_value=delivered)
+
+    with patch("mindroom.streaming.send_message_result", new=plain_send):
+        outcome = await streaming.finalize(_client())
+
+    assert outcome.terminal_status == "completed"
+    terminal_send.assert_awaited_once()
+    plain_send.assert_not_awaited()
+    assert terminal_send.await_args.args[3] == "complete answer"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_event_note_stays_on_the_plain_sender(tmp_path: Path) -> None:
+    """A cancellation note is transport, not an answer, first event or not."""
+    streaming = _streaming_response(_config(tmp_path))
+    streaming.event_id = None
+    streaming.accumulated_text = "partial answer"
+    delivered = DeliveredMatrixEvent(event_id="$note", content_sent={"body": "partial answer"})
+    terminal_send = AsyncMock(return_value=delivered)
+    streaming.terminal_send = terminal_send
+    plain_send = AsyncMock(return_value=delivered)
+
+    with patch("mindroom.streaming.send_message_result", new=plain_send):
+        await streaming.finalize(_client(), cancelled=True, cancel_source="user_stop")
+
+    terminal_send.assert_not_awaited()
+    plain_send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_terminal_sync_recovery_error_does_not_backoff(tmp_path: Path) -> None:
     """Cancellation notes retain their immediate terminal-delivery semantics."""
     streaming = _streaming_response(_config(tmp_path))
@@ -250,6 +315,7 @@ async def test_transport_cancelled_terminal_update_does_not_sleep_behind_retry_b
     streaming.event_id = "$placeholder"
     streaming.accumulated_text = "partial answer"
     sleep_mock = AsyncMock()
+    warning = MagicMock()
 
     with (
         patch(
@@ -257,45 +323,51 @@ async def test_transport_cancelled_terminal_update_does_not_sleep_behind_retry_b
             new=AsyncMock(side_effect=asyncio.CancelledError("user-stop")),
         ),
         patch("mindroom.streaming.asyncio.sleep", new=sleep_mock),
+        patch("mindroom.streaming.logger.warning", new=warning),
     ):
         outcome = await streaming.finalize(_client(), cancelled=True)
 
     sleep_mock.assert_not_awaited()
     assert outcome.terminal_status == "cancelled"
     assert outcome.failure_reason == "cancelled_by_user"
+    warning.assert_called_once()
+    assert warning.call_args.kwargs["exc_info"] is True
 
 
 @pytest.mark.asyncio
-async def test_failed_terminal_update_releases_existing_thread_reservation(tmp_path: Path) -> None:
-    """Terminal failure should release an adopted response claim even when no edit lands."""
-    config = _config(tmp_path)
-    conversation_cache = MagicMock()
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!room:localhost", "$thread", "$reply"),
-        config=config,
-        runtime_paths=runtime_paths_for(config),
-        conversation_cache=conversation_cache,
-    )
-    streaming.event_id = "$placeholder"
-    streaming.accumulated_text = "partial answer"
-    streaming._reserve_thread_write_reservation()
+async def test_process_shutdown_stream_cancellations_do_not_format_tracebacks(
+    tmp_path: Path,
+) -> None:
+    """A saturated orderly stop must not synchronously render one traceback per stream."""
+    streams = [_streaming_response(_config(tmp_path)) for _ in range(16)]
+    started = asyncio.Event()
+    entered = 0
 
-    with patch(
-        "mindroom.streaming.edit_message_result",
-        new=AsyncMock(return_value=None),
+    async def blocked_edit(*_args: object, **_kwargs: object) -> None:
+        nonlocal entered
+        entered += 1
+        if entered == len(streams):
+            started.set()
+        await asyncio.Future()
+
+    for index, stream in enumerate(streams):
+        stream.event_id = f"$placeholder-{index}"
+        stream.accumulated_text = "partial answer"
+
+    warning = MagicMock()
+    with (
+        patch("mindroom.streaming.edit_message_result", new=blocked_edit),
+        patch("mindroom.streaming.logger.warning", new=warning),
     ):
-        outcome = await streaming.finalize(_client(), error=RuntimeError("delivery failed"))
+        tasks = [asyncio.create_task(stream.finalize(_client())) for stream in streams]
+        await started.wait()
+        for task in tasks:
+            request_task_cancel(task, process_shutdown=True)
+        outcomes = await asyncio.gather(*tasks)
 
-    assert outcome.terminal_status == "error"
-    conversation_cache.reserve_outbound_thread.assert_called_once_with(
-        "!room:localhost",
-        "$placeholder",
-        "$thread",
-    )
-    conversation_cache.release_outbound_thread.assert_called_once_with(
-        "!room:localhost",
-        "$placeholder",
-    )
+    assert all(outcome.terminal_status == "cancelled" for outcome in outcomes)
+    assert warning.call_count == len(streams)
+    assert all(call.kwargs["exc_info"] is False for call in warning.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -313,7 +385,7 @@ async def test_transport_restart_interrupted_terminal_update_does_not_sleep_behi
         patch("mindroom.streaming.edit_message_result", new=AsyncMock(return_value=None)) as mock_edit,
         patch("mindroom.streaming.asyncio.sleep", new=sleep_mock),
     ):
-        outcome = await streaming.finalize(_client(), restart_interrupted=True)
+        outcome = await streaming.finalize(_client(), cancel_source="sync_restart")
 
     assert mock_edit.await_count == 1
     sleep_mock.assert_not_awaited()
@@ -338,7 +410,7 @@ async def test_transport_restart_interrupted_terminal_update_reports_committed(t
             ),
         ),
     ):
-        outcome = await streaming.finalize(_client(), restart_interrupted=True)
+        outcome = await streaming.finalize(_client(), cancel_source="sync_restart")
 
     assert outcome.terminal_status == "cancelled"
     assert outcome.terminal_update_committed is True
@@ -414,7 +486,7 @@ async def test_transport_failed_terminal_update_drops_committed_interactive_meta
         "mindroom.streaming.edit_message_result",
         new=AsyncMock(return_value=None),
     ):
-        transport_outcome = await streaming.finalize(_client(), restart_interrupted=True)
+        transport_outcome = await streaming.finalize(_client(), cancel_source="sync_restart")
 
     response_hooks = SimpleNamespace(
         _apply_before_response=AsyncMock(),
@@ -431,6 +503,8 @@ async def test_transport_failed_terminal_update_drops_committed_interactive_meta
             redact_message_event=AsyncMock(return_value=True),
             resolver=Mock(),
             response_hooks=response_hooks,
+            outbox=make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
@@ -443,6 +517,7 @@ async def test_transport_failed_terminal_update_drops_committed_interactive_meta
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-interactive-preserved",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -476,6 +551,8 @@ async def test_transport_failed_terminal_update_ignores_hidden_canonical_interac
             redact_message_event=AsyncMock(return_value=True),
             resolver=Mock(),
             response_hooks=response_hooks,
+            outbox=make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
@@ -495,6 +572,7 @@ async def test_transport_failed_terminal_update_ignores_hidden_canonical_interac
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-hidden-canonical-interactive",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -536,170 +614,112 @@ async def test_transport_empty_adopted_placeholder_finishes_as_error_note(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_final_delivery_failure_replaces_placeholder_with_failure_update(tmp_path: Path) -> None:
-    """A failed final placeholder edit should get one clear terminal failure update when possible."""
-    gateway = _delivery_gateway(tmp_path)
-    edit_outcomes = [False, True]
-    object.__setattr__(
-        gateway,
-        "edit_text",
-        AsyncMock(side_effect=lambda _request: edit_outcomes.pop(0)),
-    )
-
-    outcome = await gateway.deliver_final(
-        FinalDeliveryRequest(
-            target=MessageTarget.resolve("!room:localhost", None, "$reply"),
-            existing_event_id="$placeholder",
-            existing_event_is_placeholder=True,
-            response_text="final answer",
-            identity=ResponseIdentity(
-                response_kind="ai",
-                response_envelope=_envelope(),
-                correlation_id="corr-final-delivery-failure",
-            ),
-            tool_trace=None,
-            extra_content=None,
-        ),
-    )
-
-    assert outcome.terminal_status == "error"
-    assert outcome.final_visible_event_id == "$placeholder"
-    assert outcome.final_visible_body == "Response delivery failed. Please retry."
-    assert outcome.delivery_kind == "edited"
-    assert outcome.failure_reason == "delivery_failed"
-    assert gateway.edit_text.await_count == 2
-    failure_update_request = gateway.edit_text.await_args_list[-1].args[0]
-    assert failure_update_request.new_text == "Response delivery failed. Please retry."
-    assert failure_update_request.extra_content[STREAM_STATUS_KEY] == STREAM_STATUS_ERROR
-
-
-@pytest.mark.asyncio
-async def test_persistent_sync_recovery_barrier_settles_placeholder_as_delivery_failure(tmp_path: Path) -> None:
-    """An exhausted final-edit retry should still run placeholder failure settlement."""
-    gateway = _delivery_gateway(tmp_path)
+async def test_persistent_sync_recovery_barrier_preserves_owed_final_until_recovery(
+    tmp_path: Path,
+    journal_store: EventJournalStore,
+) -> None:
+    """A retryable barrier keeps the immutable FINAL owed without a competing error edit."""
+    principal = journal_store.principal("code@alice")
+    gateway = _delivery_gateway(tmp_path, principal)
+    gateway = replace(gateway, deps=replace(gateway.deps, sending_device_id=lambda: "DEVICE"))
     barrier_error = nio.SendRetryError("Room timeline recovery is still pending.")
-    with patch(
-        "mindroom.delivery_gateway.edit_message_result",
-        new=AsyncMock(side_effect=[barrier_error, None]),
-    ) as edit:
-        outcome = await gateway.deliver_final(
-            FinalDeliveryRequest(
-                target=MessageTarget.resolve("!room:localhost", None, "$reply"),
-                existing_event_id="$placeholder",
-                existing_event_is_placeholder=True,
-                response_text="final answer",
-                identity=ResponseIdentity(
-                    response_kind="ai",
-                    response_envelope=_envelope(),
-                    correlation_id="corr-persistent-sync-recovery-barrier",
+    durable_edit = AsyncMock(side_effect=barrier_error)
+    failure_edit = AsyncMock(return_value=None)
+    with (
+        patch("mindroom.delivery_gateway.send_message_outcome", new=durable_edit),
+        patch("mindroom.delivery_gateway.edit_message_outcome", new=failure_edit),
+    ):
+        async with _reply_span(principal, placeholder_event_id="$placeholder"):
+            outcome = await gateway.deliver_final(
+                FinalDeliveryRequest(
+                    target=MessageTarget.resolve("!room:localhost", None, "$reply"),
+                    existing_event_id="$placeholder",
+                    response_text="final answer",
+                    identity=ResponseIdentity(
+                        response_kind="ai",
+                        response_envelope=_envelope(),
+                        correlation_id="corr-persistent-sync-recovery-barrier",
+                        sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
+                    ),
+                    tool_trace=None,
+                    extra_content=None,
                 ),
-                tool_trace=None,
-                extra_content=None,
-            ),
-        )
+            )
 
-    assert edit.await_count == 2
-    assert edit.await_args_list[0].kwargs["retry_sync_recovery"] is True
-    assert edit.await_args_list[1].kwargs["retry_sync_recovery"] is False
-    assert outcome.terminal_status == "error"
-    assert outcome.final_visible_event_id == "$placeholder"
+    assert durable_edit.await_count == 1
+    assert durable_edit.await_args.kwargs["retry_sync_recovery"] is True
+    failure_edit.assert_not_awaited()
+    assert outcome.terminal_status == "suspended"
+    assert outcome.final_visible_event_id is None
+    assert not outcome.mark_handled
     assert outcome.failure_reason == "delivery_failed"
+    owed = await gateway.deps.outbox.load_matrix_delivery(delivery_id="$reply", stage=DeliveryStage.FINAL)
+    assert owed is not None
+    assert owed.attempted
+    assert not owed.retired
+    assert not owed.permanently_failed
+    assert owed.acknowledged_event_id is None
+    assert owed.edits_event_id == "$placeholder"
+    assert owed.payload["m.new_content"]["body"] == "final answer"
+    first_attempt = durable_edit.await_args
+    durable_edit.side_effect = None
+    durable_edit.return_value = DeliveredMatrixEvent("$final-edit", content_sent=owed.payload)
+    with (
+        patch("mindroom.delivery_gateway.send_message_outcome", new=durable_edit),
+        patch("mindroom.delivery_gateway.edit_message_outcome", new=failure_edit),
+    ):
+        await gateway._recovery_worker().flush(delivery_id="$reply", stage=DeliveryStage.FINAL)
+    assert durable_edit.await_count == 2
+    assert durable_edit.await_args.args == first_attempt.args
+    for key in ("transaction_id", "retry_sync_recovery", "content_is_prepared"):
+        assert durable_edit.await_args.kwargs[key] == first_attempt.kwargs[key]
+    failure_edit.assert_not_awaited()
+    delivered = await gateway.deps.outbox.load_matrix_delivery(delivery_id="$reply", stage=DeliveryStage.FINAL)
+    assert delivered is not None
+    assert delivered.acknowledged_event_id == "$final-edit"
+    assert delivered.payload == owed.payload
+    assert delivered.transaction_id == owed.transaction_id
 
 
 @pytest.mark.asyncio
-async def test_persistent_sync_recovery_barrier_returns_new_send_delivery_failure(tmp_path: Path) -> None:
-    """An exhausted final-send retry should retain the gateway failure contract."""
-    gateway = _delivery_gateway(tmp_path)
+async def test_persistent_sync_recovery_barrier_leaves_a_new_send_owed(
+    tmp_path: Path,
+    journal_store: EventJournalStore,
+) -> None:
+    """An exhausted final-send retry leaves the answer owed to recovery."""
+    principal = journal_store.principal("code@alice")
+    gateway = _delivery_gateway(tmp_path, principal)
     barrier_error = nio.SendRetryError("Room timeline recovery is still pending.")
     with patch(
-        "mindroom.delivery_gateway.send_message_result",
+        "mindroom.delivery_gateway.send_message_outcome",
         new=AsyncMock(side_effect=barrier_error),
     ) as send:
-        outcome = await gateway.deliver_final(
-            FinalDeliveryRequest(
-                target=MessageTarget.resolve("!room:localhost", None, "$reply"),
-                existing_event_id=None,
-                response_text="final answer",
-                identity=ResponseIdentity(
-                    response_kind="ai",
-                    response_envelope=_envelope(),
-                    correlation_id="corr-persistent-sync-recovery-send-barrier",
+        async with _reply_span(principal):
+            outcome = await gateway.deliver_final(
+                FinalDeliveryRequest(
+                    target=MessageTarget.resolve("!room:localhost", None, "$reply"),
+                    existing_event_id=None,
+                    response_text="final answer",
+                    identity=ResponseIdentity(
+                        response_kind="ai",
+                        response_envelope=_envelope(),
+                        correlation_id="corr-persistent-sync-recovery-send-barrier",
+                        sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
+                    ),
+                    tool_trace=None,
+                    extra_content=None,
                 ),
-                tool_trace=None,
-                extra_content=None,
-            ),
-        )
+            )
 
     send.assert_awaited_once()
     assert send.await_args.kwargs["retry_sync_recovery"] is True
-    assert outcome.terminal_status == "error"
+    assert outcome.terminal_status == "suspended"
     assert outcome.final_visible_event_id is None
     assert outcome.failure_reason == "delivery_failed"
-
-
-@pytest.mark.asyncio
-async def test_streaming_placeholder_delivery_failure_stays_terminal_when_failure_update_fails(
-    tmp_path: Path,
-) -> None:
-    """If Matrix rejects the failure update too, finalization still returns a failed visible outcome."""
-    config = _config(tmp_path)
-    response_hooks = SimpleNamespace(
-        _apply_before_response=AsyncMock(),
-        _apply_final_response_transform=AsyncMock(),
-        emit_after_response=AsyncMock(),
-        emit_cancelled_response=AsyncMock(),
-    )
-    logger = Mock()
-    gateway = DeliveryGateway(
-        DeliveryGatewayDeps(
-            runtime=SimpleNamespace(client=_client(), orchestrator=None, config=config, runtime_started_at=0.0),
-            runtime_paths=runtime_paths_for(config),
-            agent_name="code",
-            logger=logger,
-            redact_message_event=AsyncMock(return_value=True),
-            resolver=Mock(),
-            response_hooks=response_hooks,
-        ),
-    )
-    object.__setattr__(gateway, "edit_text", AsyncMock(return_value=False))
-
-    outcome = await gateway.finalize_streamed_response(
-        FinalizeStreamedResponseRequest(
-            target=MessageTarget.resolve("!room:localhost", None, "$reply"),
-            stream_transport_outcome=StreamTransportOutcome(
-                last_physical_stream_event_id="$placeholder",
-                terminal_status="error",
-                rendered_body="Thinking...",
-                visible_body_state="placeholder_only",
-                failure_reason="terminal_update_failed",
-            ),
-            initial_delivery_kind="edited",
-            identity=ResponseIdentity(
-                response_kind="ai",
-                response_envelope=_envelope(),
-                correlation_id="corr-stream-delivery-failure",
-            ),
-            tool_trace=None,
-            extra_content=None,
-            existing_event_id="$placeholder",
-            existing_event_is_placeholder=True,
-        ),
-    )
-
-    assert outcome.terminal_status == "error"
-    assert outcome.final_visible_event_id == "$placeholder"
-    assert outcome.final_visible_body is None
-    assert outcome.failure_reason == "terminal_update_failed"
-    assert outcome.mark_handled is True
-    logger.error.assert_called_once_with(
-        "Failed to deliver placeholder failure update",
-        room_id="!room:localhost",
-        event_id="$placeholder",
-        response_kind="ai",
-        source_event_id="$reply",
-        correlation_id="corr-stream-delivery-failure",
-        failure_reason="terminal_update_failed",
-    )
+    owed = await principal.load_matrix_delivery(delivery_id="$reply", stage=DeliveryStage.FINAL)
+    assert owed is not None
+    assert owed.acknowledged_event_id is None
+    assert not owed.permanently_failed
 
 
 @pytest.mark.asyncio
@@ -809,12 +829,17 @@ async def test_streamed_interactive_final_reply_registers_reactions_on_root_even
             response_stream=interactive_stream(),
             existing_event_id="$displayed-root",
             adopt_existing_placeholder=True,
+            interactive_creator_agent="code",
+            interactive_source_event_id="$source",
         )
 
     assert stream_outcome.last_physical_stream_event_id == "$displayed-root"
     assert stream_outcome.rendered_body == formatted_interactive.formatted_text
     assert stream_outcome.canonical_final_body_candidate == raw_interactive
+    assert len(captured_stream_edits) >= 2
+    assert all("io.mindroom.interactive" not in content for content in captured_stream_edits[:-1])
     assert captured_stream_edits[-1]["body"] == formatted_interactive.formatted_text
+    assert captured_stream_edits[-1]["io.mindroom.interactive"]["source_event_id"] == "$source"
 
     envelope = _envelope()
     response_hooks = SimpleNamespace(
@@ -838,6 +863,8 @@ async def test_streamed_interactive_final_reply_registers_reactions_on_root_even
             redact_message_event=AsyncMock(return_value=True),
             resolver=Mock(),
             response_hooks=response_hooks,
+            outbox=make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
@@ -850,6 +877,7 @@ async def test_streamed_interactive_final_reply_registers_reactions_on_root_even
                 response_kind="ai",
                 response_envelope=envelope,
                 correlation_id="corr-streamed-interactive",
+                sources=ResponseSources((envelope.source_event_id,), (envelope.source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -878,38 +906,31 @@ async def test_streamed_interactive_final_reply_registers_reactions_on_root_even
         _room_send_response("$reaction-no"),
         _room_send_response("$reaction-test"),
     ]
-    interactive._cleanup()
-    try:
-        support = PostResponseEffectsSupport(
-            runtime=SimpleNamespace(client=client, config=config),
-            logger=get_logger("tests.post_response"),
-            runtime_paths=runtime_paths_for(config),
-            delivery_gateway=Mock(),
-            conversation_cache=Mock(),
-        )
-        await apply_post_response_effects(
-            final_outcome,
-            ResponseOutcome(interactive_target=target),
-            support.build_deps(
-                room_id=target.room_id,
-                interactive_agent_name="code",
-            ),
-        )
+    support = PostResponseEffectsSupport(
+        runtime=SimpleNamespace(client=client, config=config),
+        logger=get_logger("tests.post_response"),
+        runtime_paths=runtime_paths_for(config),
+        conversation_reader=make_conversation_reader_mock(),
+        membership=make_membership_stub(),
+        agent_name="agent",
+    )
+    await apply_post_response_effects(
+        final_outcome,
+        ResponseOutcome(response_target=target),
+        support.build_deps(
+            room_id=target.room_id,
+            membership_turn_id="$turn",
+        ),
+    )
 
-        registered = interactive._active_questions["$displayed-root"]
-        assert registered.thread_id == "$thread-root"
-        assert registered.options == final_outcome.option_map
-        reaction_targets = [
-            call.kwargs["content"]["m.relates_to"]["event_id"] for call in client.room_send.await_args_list
-        ]
-        reaction_keys = [call.kwargs["content"]["m.relates_to"]["key"] for call in client.room_send.await_args_list]
-        assert reaction_targets == ["$displayed-root", "$displayed-root", "$displayed-root"]
-        assert "$obsolete-edit" not in reaction_targets
-        assert reaction_keys == ["✅", "❌", "🧪"]
-    finally:
-        interactive._cleanup()
+    reaction_targets = [call.kwargs["content"]["m.relates_to"]["event_id"] for call in client.room_send.await_args_list]
+    reaction_keys = [call.kwargs["content"]["m.relates_to"]["key"] for call in client.room_send.await_args_list]
+    assert reaction_targets == ["$displayed-root", "$displayed-root", "$displayed-root"]
+    assert "$obsolete-edit" not in reaction_targets
+    assert reaction_keys == ["✅", "❌", "🧪"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_streamed_interactive_metadata_survives_unparseable_canonical_final_body(tmp_path: Path) -> None:
     """Registration should use the same interactive parse that rendered the visible streamed body."""
@@ -970,6 +991,8 @@ async def test_streamed_interactive_metadata_survives_unparseable_canonical_fina
             redact_message_event=AsyncMock(return_value=True),
             resolver=Mock(),
             response_hooks=response_hooks,
+            outbox=make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
@@ -982,6 +1005,7 @@ async def test_streamed_interactive_metadata_survives_unparseable_canonical_fina
                 response_kind="ai",
                 response_envelope=_envelope(),
                 correlation_id="corr-streamed-interactive-unparseable-canonical",
+                sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -996,98 +1020,6 @@ async def test_streamed_interactive_metadata_survives_unparseable_canonical_fina
         "📂": "inspect",
         "2": "inspect",
     }
-
-
-@pytest.mark.asyncio
-async def test_final_response_transform_failure_keeps_visible_stream_text(tmp_path: Path) -> None:
-    """A failed one-shot final transform edit must keep the visible streamed text and resolve cleanly."""
-    config = _config(tmp_path)
-    envelope = _envelope()
-    response_hooks = SimpleNamespace(
-        _apply_before_response=AsyncMock(
-            return_value=SimpleNamespace(
-                response_text="chunk",
-                response_kind="ai",
-                tool_trace=None,
-                extra_content=None,
-                envelope=envelope,
-                suppress=False,
-            ),
-        ),
-        _apply_final_response_transform=AsyncMock(
-            return_value=SimpleNamespace(
-                response_text="updated text",
-                response_kind="ai",
-                envelope=envelope,
-            ),
-        ),
-        emit_after_response=AsyncMock(),
-        emit_cancelled_response=AsyncMock(),
-    )
-    gateway = DeliveryGateway(
-        DeliveryGatewayDeps(
-            runtime=SimpleNamespace(client=_client(), orchestrator=None, config=config, runtime_started_at=0.0),
-            runtime_paths=runtime_paths_for(config),
-            agent_name="code",
-            logger=get_logger("tests.delivery"),
-            redact_message_event=AsyncMock(return_value=True),
-            resolver=Mock(),
-            response_hooks=response_hooks,
-        ),
-    )
-    object.__setattr__(gateway, "edit_text", AsyncMock(return_value=False))
-
-    outcome = await gateway.finalize_streamed_response(
-        FinalizeStreamedResponseRequest(
-            target=MessageTarget.resolve("!room:localhost", None, "$reply"),
-            stream_transport_outcome=StreamTransportOutcome(
-                last_physical_stream_event_id="$streaming",
-                terminal_status="completed",
-                rendered_body="chunk",
-                visible_body_state="visible_body",
-            ),
-            initial_delivery_kind="sent",
-            identity=ResponseIdentity(
-                response_kind="ai",
-                response_envelope=envelope,
-                correlation_id="corr-final-transform-failure",
-            ),
-            tool_trace=None,
-            extra_content=None,
-        ),
-    )
-
-    assert outcome.terminal_status == "completed"
-    assert outcome.final_visible_event_id == "$streaming"
-    assert outcome.final_visible_body == "chunk"
-    response_hooks._apply_before_response.assert_not_awaited()
-    response_hooks._apply_final_response_transform.assert_awaited_once()
-    gateway.edit_text.assert_awaited_once()
-    lifecycle = ResponseLifecycle(
-        ResponseLifecycleDeps(
-            response_hooks=response_hooks,
-            logger=get_logger("tests.response_lifecycle"),
-        ),
-        identity=ResponseIdentity(
-            response_kind="ai",
-            response_envelope=envelope,
-            correlation_id="corr-final-transform-failure",
-        ),
-        pipeline_timing=None,
-    )
-    finalized = await lifecycle.finalize(
-        outcome,
-        build_post_response_outcome=lambda _delivered: ResponseOutcome(),
-        post_response_deps=PostResponseEffectsDeps(logger=get_logger("tests.post_response")),
-    )
-
-    assert finalized.response_text == "chunk"
-    assert finalized.delivery_kind == "sent"
-    response_hooks.emit_after_response.assert_awaited_once()
-    after_kwargs = response_hooks.emit_after_response.await_args.kwargs
-    assert after_kwargs["response_text"] == "chunk"
-    assert after_kwargs["delivery_kind"] == "sent"
-    response_hooks.emit_cancelled_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1110,6 +1042,8 @@ async def test_finalize_streamed_response_restart_interruption_preserves_cancell
             redact_message_event=AsyncMock(return_value=True),
             resolver=Mock(),
             response_hooks=response_hooks,
+            outbox=make_outbox_mock(),
+            turn_handoff=ignore_final_delivery_handoff,
         ),
     )
 
@@ -1129,6 +1063,7 @@ async def test_finalize_streamed_response_restart_interruption_preserves_cancell
                 response_kind="ai",
                 response_envelope=envelope,
                 correlation_id="corr-stream-restart-cancelled",
+                sources=ResponseSources((envelope.source_event_id,), (envelope.source_event_id,)),
             ),
             tool_trace=None,
             extra_content=None,
@@ -1144,51 +1079,80 @@ async def test_finalize_streamed_response_restart_interruption_preserves_cancell
 
 
 @pytest.mark.asyncio
-async def test_failed_cancelled_placeholder_cleanup_preserves_cancel_source(tmp_path: Path) -> None:
-    """A failed cancellation edit and redaction must retain the original restart provenance."""
-    gateway = _delivery_gateway(tmp_path)
-    gateway.deps.redact_message_event.return_value = False
-
-    with patch.object(DeliveryGateway, "edit_text", new=AsyncMock(return_value=False)):
-        outcome = await gateway.deliver_cancelled_visible_note(
-            CancelledVisibleNoteRequest(
-                target=MessageTarget.resolve("!room:localhost", "$thread", "$reply"),
-                event_id="$placeholder",
-                existing_event_is_placeholder=True,
-                cancel_source="sync_restart",
-                identity=ResponseIdentity(
-                    response_kind="ai",
-                    response_envelope=_envelope(),
-                    correlation_id="corr-cancel-cleanup-failure",
-                ),
-            ),
-        )
-
-    assert outcome.terminal_status == "error"
-    assert outcome.final_visible_event_id == "$placeholder"
-    assert outcome.cancel_source == "sync_restart"
-
-
-@pytest.mark.asyncio
-async def test_hook_failure_cleanup_propagates_restart_cancellation(tmp_path: Path) -> None:
+async def test_hook_failure_cleanup_propagates_restart_cancellation(
+    tmp_path: Path,
+    journal_store: EventJournalStore,
+) -> None:
     """Cancellation during cleanup of an ordinary hook failure must reach source settlement."""
-    gateway = _delivery_gateway(tmp_path)
+    principal = journal_store.principal("code@alice")
+    gateway = _delivery_gateway(tmp_path, principal)
     gateway.deps.response_hooks._apply_before_response.side_effect = RuntimeError("hook failed")
     gateway.deps.redact_message_event.side_effect = asyncio.CancelledError("sync_restart")
 
     with pytest.raises(asyncio.CancelledError, match="sync_restart"):
-        await gateway.deliver_final(
-            FinalDeliveryRequest(
-                target=MessageTarget.resolve("!room:localhost", "$thread", "$reply"),
-                existing_event_id="$placeholder",
-                existing_event_is_placeholder=True,
-                response_text="answer",
-                identity=ResponseIdentity(
-                    response_kind="ai",
-                    response_envelope=_envelope(),
-                    correlation_id="corr-hook-failure-cleanup-cancel",
+        async with _reply_span(principal, thread_id="$thread", placeholder_event_id="$placeholder"):
+            await gateway.deliver_final(
+                FinalDeliveryRequest(
+                    target=MessageTarget.resolve("!room:localhost", "$thread", "$reply"),
+                    existing_event_id="$placeholder",
+                    response_text="answer",
+                    identity=ResponseIdentity(
+                        response_kind="ai",
+                        response_envelope=_envelope(),
+                        correlation_id="corr-hook-failure-cleanup-cancel",
+                        sources=ResponseSources((_envelope().source_event_id,), (_envelope().source_event_id,)),
+                    ),
+                    tool_trace=None,
+                    extra_content=None,
                 ),
-                tool_trace=None,
-                extra_content=None,
-            ),
-        )
+            )
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_send_freezes_the_payload_matrix_receives(tmp_path: Path) -> None:
+    """The frozen row must be the wire event, not the oversized original.
+
+    The sidecar upload used to happen inside the send, after the row was
+    claimed and frozen, so the durable payload kept the whole body while
+    Matrix received an MXC reference. They disagreed, and a recovery resend
+    would upload again -- minting a new MXC, and new encrypted-file keys,
+    under a transaction ID the homeserver had already accepted.
+    """
+    from mindroom.delivery_gateway import SendTextRequest  # noqa: PLC0415 - a request type only this test builds
+
+    gateway = _delivery_gateway(tmp_path)
+
+    await gateway._send_content(
+        SendTextRequest(
+            target=MessageTarget.resolve("!room:localhost", None, "$src"),
+            response_text="",
+            delivery_turn_id="$turn",
+        ),
+        "!room:localhost",
+        {"body": "x" * 100_000, "msgtype": "m.text"},
+    )
+
+    rows = gateway.deps.outbox.rows  # type: ignore[attr-defined]
+    assert rows, "the send never reached the outbox"
+    frozen = next(iter(rows.values())).payload
+    # Whether the sidecar upload succeeds or degrades to an inline preview is
+    # the homeserver's business; either way the row must hold the *prepared*
+    # payload, because that is what goes on the wire and what a resend replays.
+    assert len(frozen["body"]) < 100_000, "the row kept the oversized original"
+
+
+def test_the_gateway_hands_the_final_transform_to_the_stream() -> None:
+    """The transform only helps if the stream is actually given it.
+
+    The unit tests for this behaviour drive `StreamingResponse` directly, so
+    they pass whether or not the gateway wires the hook in -- deleting the
+    wiring leaves them green. This reads the construction instead: the stream
+    must be built with a `final_text_transform`, and it must come from the
+    request's identity rather than being hardcoded, since a request with no
+    identity has no hook to apply.
+    """
+    import inspect  # noqa: PLC0415 - reading the construction is this test's whole point
+
+    source = inspect.getsource(DeliveryGateway._deliver_stream)
+
+    assert "final_text_transform=self._final_text_transform(request.identity)" in source

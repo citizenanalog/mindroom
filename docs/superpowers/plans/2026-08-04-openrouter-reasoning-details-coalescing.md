@@ -14,7 +14,7 @@
 
 **Files:**
 - Modify: `tests/test_openai_models.py`
-- Modify: `src/mindroom/openai_models.py`
+- Modify: `src/mindroom/providers/openai_models.py`
 
 - [ ] **Step 1: Write failing pure-helper tests**
 
@@ -42,7 +42,7 @@ Expected: all new helper tests pass.
 
 **Files:**
 - Modify: `tests/test_openai_models.py`
-- Modify: `src/mindroom/openai_models.py`
+- Modify: `src/mindroom/providers/openai_models.py`
 
 - [ ] **Step 1: Write failing integration tests**
 
@@ -74,7 +74,7 @@ Expected: all tests pass.
 
 - [ ] **Step 6: Run static checks**
 
-Run: `uv run ruff check src/mindroom/openai_models.py tests/test_openai_models.py && uv run ruff format --check src/mindroom/openai_models.py tests/test_openai_models.py && uv run ty check src/mindroom/openai_models.py`
+Run: `uv run ruff check src/mindroom/providers/openai_models.py tests/test_openai_models.py && uv run ruff format --check src/mindroom/providers/openai_models.py tests/test_openai_models.py && uv run ty check src/mindroom/providers/openai_models.py`
 
 Expected: zero errors.
 
@@ -113,7 +113,7 @@ Copy the fixture database, run both `--dry-run` and `--apply`, inspect the emitt
 ### Task 4: Commit the implementation
 
 **Files:**
-- Modify: `src/mindroom/openai_models.py`
+- Modify: `src/mindroom/providers/openai_models.py`
 - Modify: `tests/test_openai_models.py`
 - Add: `scripts/normalize_openrouter_reasoning_details.py`
 - Add: `tests/test_normalize_openrouter_reasoning_details.py`
@@ -121,15 +121,15 @@ Copy the fixture database, run both `--dry-run` and `--apply`, inspect the emitt
 
 - [ ] **Step 1: Review the diff**
 
-Run: `git diff --check && git diff -- src/mindroom/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py`
+Run: `git diff --check && git diff -- src/mindroom/providers/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py`
 
 - [ ] **Step 2: Run the broader relevant suite**
 
-Run: `uv run pytest -q tests/test_openai_models.py tests/test_normalize_openrouter_reasoning_details.py && uv run ruff check src/mindroom/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py && uv run ruff format --check src/mindroom/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py && uv run ty check src/mindroom/openai_models.py scripts/normalize_openrouter_reasoning_details.py`
+Run: `uv run pytest -q tests/test_openai_models.py tests/test_normalize_openrouter_reasoning_details.py && uv run ruff check src/mindroom/providers/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py && uv run ruff format --check src/mindroom/providers/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py && uv run ty check src/mindroom/providers/openai_models.py scripts/normalize_openrouter_reasoning_details.py`
 
 - [ ] **Step 3: Commit locally**
 
-Run: `git add src/mindroom/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py && git add -f docs/superpowers/plans/2026-08-04-openrouter-reasoning-details-coalescing.md && git commit -m "fix: coalesce OpenRouter reasoning stream details"`
+Run: `git add src/mindroom/providers/openai_models.py tests/test_openai_models.py scripts/normalize_openrouter_reasoning_details.py tests/test_normalize_openrouter_reasoning_details.py && git add -f docs/superpowers/plans/2026-08-04-openrouter-reasoning-details-coalescing.md && git commit -m "fix: coalesce OpenRouter reasoning stream details"`
 
 Do not push without separate authorization.
 
@@ -156,7 +156,7 @@ Record checkout SHA/status, service state, PID, `NRestarts`, current/peak memory
 ### Task 6: Deploy the committed revision and normalize Mom's history
 
 **Files:**
-- Deploy from the committed revision: `src/mindroom/openai_models.py`
+- Deploy from the committed revision: `src/mindroom/providers/openai_models.py`
 - Deploy from the committed revision: `tests/test_openai_models.py`
 - Deploy from the committed revision: `scripts/normalize_openrouter_reasoning_details.py`
 - Deploy from the committed revision: `tests/test_normalize_openrouter_reasoning_details.py`

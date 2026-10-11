@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 from mindroom.session_ids import create_session_id
 
 if TYPE_CHECKING:
-    from mindroom.scheduling import ScheduledWorkflow
+    from mindroom.scheduling.tasks import ScheduledWorkflow
 
 
 class _MessageTargetMetadata(TypedDict):
@@ -20,6 +20,14 @@ class _MessageTargetMetadata(TypedDict):
     resolved_thread_id: str | None
     reply_to_event_id: str | None
     session_id: str
+
+
+@dataclass(frozen=True)
+class ResponseLifecycleKey:
+    """Response-lifecycle identity: one room-level or threaded conversation in one room."""
+
+    room_id: str
+    thread_id: str | None
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,11 @@ class MessageTarget:
     def is_room_mode(self) -> bool:
         """Return whether the target resolves to room-level delivery."""
         return self.resolved_thread_id is None
+
+    @property
+    def lifecycle_key(self) -> ResponseLifecycleKey:
+        """Return the response-lifecycle identity this target serializes under."""
+        return ResponseLifecycleKey(room_id=self.room_id, thread_id=self.resolved_thread_id)
 
     @property
     def log_context(self) -> dict[str, str | None]:

@@ -7,26 +7,33 @@ import hashlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from typing import TYPE_CHECKING, Any
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import nio
 import pytest
 from agno.models.vertexai.claude import Claude as VertexAIClaude
+from agno.run.agent import RunOutput
 from pydantic import ValidationError
 
-from mindroom.anthropic_claude import MindRoomAnthropicClaude
+from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths
 from mindroom.entity_resolution import resolve_room_scoped_model_override
-from mindroom.google_gemini import MindRoomGoogleGemini
 from mindroom.logging_config import setup_logging
 from mindroom.matrix.client import ResolvedVisibleMessage
+from mindroom.matrix.client_delivery import DeliveredMatrixEvent
+from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES
+from mindroom.matrix.conversation_reads import DeliveredResponse, complete_thread_history
+from mindroom.matrix.thread_history_result import ThreadHistoryResult, thread_history_result
 from mindroom.prompts import THREAD_SUMMARY_INSTRUCTIONS
+from mindroom.providers.anthropic_claude import MindRoomAnthropicClaude
+from mindroom.providers.google_gemini import MindRoomGoogleGemini
+from mindroom.providers.openai_models import MindRoomOpenAIResponses, MindRoomOpenRouter
 from mindroom.thread_summary import (
     _MAX_MESSAGES_BEFORE_TRUNCATION,
+    _THREAD_SUMMARY_MAX_LENGTH,
     _TRUNCATION_SAMPLE_SIZE,
-    THREAD_SUMMARY_MAX_LENGTH,
     ThreadSummaryWriteError,
     _build_conversation_text,
     _configure_summary_model_temperature,
@@ -36,22 +43,22 @@ from mindroom.thread_summary import (
     _last_summary_counts,
     _next_thread_summary_threshold,
     _next_threshold,
+    _normalize_thread_summary_text,
     _recover_initial_enrichment_complete,
     _recover_last_summary_count,
     _recover_pin_state,
     _resolve_thread_summary_model_name,
+    _send_thread_summary_event,
     _thread_is_resolved,
     _thread_locks,
     _thread_summary_cache_key,
     _ThreadEnrichment,
     _ThreadSummary,
+    _update_last_summary_count,
     maybe_generate_thread_summary,
-    normalize_thread_summary_text,
-    send_thread_summary_event,
     set_manual_thread_summary,
     should_queue_thread_summary,
     thread_summary_message_count_hint,
-    update_last_summary_count,
 )
 from mindroom.thread_tag_vocabulary import _TagUsage, _TagVocabularySnapshot
 from mindroom.thread_tags import (
@@ -60,10 +67,20 @@ from mindroom.thread_tags import (
     ThreadTagsError,
     ThreadTagsState,
 )
-from tests.conftest import make_matrix_client_mock
+from tests.conftest import make_conversation_reader_mock, make_matrix_client_mock, serve_conversation_reader
+from tests.test_thread_export_projected_history import PRINCIPAL as _PROJECTION_PRINCIPAL
+from tests.test_thread_export_projected_history import ROOM as _PROJECTION_ROOM
+from tests.test_thread_export_projected_history import ROOT as _PROJECTION_ROOT
+from tests.test_thread_export_projected_history import ROUTER as _PROJECTION_BOT
+from tests.test_thread_export_projected_history import FakeHomeserver as ProjectionHomeserver
+from tests.test_thread_export_projected_history import admit_live, prompt_reader_for, serve_thread
+from tests.test_thread_export_projected_history import raw as _projection_raw
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from mindroom.event_journal import EventJournalStore, PrincipalStore
+    from mindroom.matrix.conversation_reads import ConversationReader
 
 _TRUSTED_SUMMARY_SENDERS = frozenset(
     {
@@ -72,6 +89,16 @@ _TRUSTED_SUMMARY_SENDERS = frozenset(
         "@peer:localhost",
     },
 )
+
+
+def _full(messages: object) -> ThreadHistoryResult:
+    """Return one patched history as a complete projected read.
+
+    The loader returns a result rather than a list because summaries record
+    the count they are given as the size of the thread, so they have to be
+    able to tell a whole conversation from one page of a longer one.
+    """
+    return thread_history_result(list(messages), is_full_history=True)  # type: ignore[call-overload]
 
 
 def _make_thread_history(count: int) -> list[ResolvedVisibleMessage]:
@@ -85,6 +112,14 @@ def _make_thread_history(count: int) -> list[ResolvedVisibleMessage]:
         )
         for i in range(count)
     ]
+
+
+# Every automatic pass is queued by a delivery, so the production caller always
+# names the answer it just sent. These fixtures already list the whole thread
+# including that answer, so the delivered fact names a message they contain:
+# the patch collapses onto it, which is the state right after its echo. Tests
+# about the fold itself supply an event the projection has not seen yet.
+_DELIVERED_AND_ECHOED = DeliveredResponse(event_id="$event0", body="Message 0")
 
 
 def _make_summary_notice_message(
@@ -158,14 +193,14 @@ def _mock_client() -> AsyncMock:
 def test_thread_summary_model_rejects_overlong_summary() -> None:
     """Structured summary responses should reject content beyond the hard length limit."""
     with pytest.raises(ValidationError):
-        _ThreadSummary(summary="x" * (THREAD_SUMMARY_MAX_LENGTH + 1))
+        _ThreadSummary(summary="x" * (_THREAD_SUMMARY_MAX_LENGTH + 1))
 
 
 def test_normalize_thread_summary_text_strips_common_markdown_syntax() -> None:
     """Thread summary normalization should remove markdown syntax while preserving readable text."""
     raw_summary = "# **Fix** [ISSUE-116](http://example.com)\n> `deploy` ~~done~~"
 
-    assert normalize_thread_summary_text(raw_summary) == "Fix ISSUE-116 deploy done"
+    assert _normalize_thread_summary_text(raw_summary) == "Fix ISSUE-116 deploy done"
 
 
 # -- threshold arithmetic --
@@ -203,8 +238,8 @@ class TestUpdateLastSummaryCount:
 
     def test_ignores_lower_write_after_higher_write(self) -> None:
         """A later stale write must not move the summary baseline backwards."""
-        update_last_summary_count("!room:x", "$thread1", 12)
-        update_last_summary_count("!room:x", "$thread1", 7)
+        _update_last_summary_count("!room:x", "$thread1", 12)
+        _update_last_summary_count("!room:x", "$thread1", 7)
 
         assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$thread1")] == 12
 
@@ -635,7 +670,7 @@ class TestShouldQueueThreadSummary:
 
     def test_cached_summary_uses_subsequent_threshold(self) -> None:
         """Once a summary baseline exists, the gate should honor the same margin."""
-        update_last_summary_count("!room:x", "$thread1", 5)
+        _update_last_summary_count("!room:x", "$thread1", 5)
         config = _mock_config()
 
         assert _next_thread_summary_threshold("!room:x", "$thread1", config) == 15
@@ -672,14 +707,16 @@ class TestMaybeGenerateThreadSummary:
     """Integration tests for the threshold-gated summary pipeline."""
 
     @pytest.fixture(autouse=True)
-    def _conversation_cache(self) -> Iterator[None]:
+    def _conversation_reader(self) -> Iterator[None]:
         """Provide one explicit conversation-cache mock per test."""
-        self.conversation_cache = MagicMock()
-        self.conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$thread1")
-        self.conversation_cache.notify_outbound_message = Mock()
-        # The pre-delivery pin guard reads from source; default it to "no pin".
-        self.conversation_cache.refresh_strict_thread_history_from_source = AsyncMock(return_value=[])
+        self.conversation_reader = make_conversation_reader_mock()
+        # The pre-delivery pin guard reads from the homeserver; default "no pin".
+        self.source_read = AsyncMock(return_value=[])
         with (
+            patch(
+                "mindroom.thread_summary.fetch_thread_messages_from_source",
+                new=self.source_read,
+            ),
             patch(
                 "mindroom.thread_summary.maybe_rebuild_tag_vocabulary",
                 new=AsyncMock(return_value=None),
@@ -704,7 +741,10 @@ class TestMaybeGenerateThreadSummary:
             "$thread1",
             config,
             rp,
-            conversation_cache=self.conversation_cache,
+            conversation_reader=self.conversation_reader,
+            delivered_response=_DELIVERED_AND_ECHOED,
+            entity_name="router",
+            membership_index=AgentReplyMembershipIndex(),
         )
 
     async def test_pinned_thread_skips_generation(self) -> None:
@@ -722,7 +762,7 @@ class TestMaybeGenerateThreadSummary:
                 "mindroom.thread_summary.current_internal_sender_ids",
                 return_value=_TRUSTED_SUMMARY_SENDERS,
             ),
-            patch("mindroom.thread_summary._load_thread_history", return_value=history),
+            patch("mindroom.thread_summary._load_thread_history", return_value=_full(history)),
             patch("mindroom.thread_summary._generate_summary") as mock_gen,
         ):
             await self._maybe_generate(client, config, rp)
@@ -744,7 +784,7 @@ class TestMaybeGenerateThreadSummary:
                 "mindroom.thread_summary.current_internal_sender_ids",
                 return_value=_TRUSTED_SUMMARY_SENDERS,
             ),
-            patch("mindroom.thread_summary._load_thread_history", return_value=history),
+            patch("mindroom.thread_summary._load_thread_history", return_value=_full(history)),
             patch("mindroom.thread_summary._generate_summary"),
         ):
             await self._maybe_generate(client, config, rp)
@@ -777,7 +817,7 @@ class TestMaybeGenerateThreadSummary:
                 "mindroom.thread_summary.current_internal_sender_ids",
                 return_value=_TRUSTED_SUMMARY_SENDERS,
             ),
-            patch("mindroom.thread_summary._load_thread_history", return_value=history),
+            patch("mindroom.thread_summary._load_thread_history", return_value=_full(history)),
             patch(
                 "mindroom.thread_summary._generate_summary",
                 return_value="Fresh summary",
@@ -810,7 +850,7 @@ class TestMaybeGenerateThreadSummary:
             ),
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(12),
+                return_value=_full(_make_thread_history(12)),
             ),
             patch(
                 "mindroom.thread_summary.get_thread_tags",
@@ -836,7 +876,7 @@ class TestMaybeGenerateThreadSummary:
             ),
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(12),
+                return_value=_full(_make_thread_history(12)),
             ),
             patch(
                 "mindroom.thread_summary.get_thread_tags",
@@ -865,7 +905,7 @@ class TestMaybeGenerateThreadSummary:
             ),
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(3),
+                return_value=_full(_make_thread_history(3)),
             ),
             patch("mindroom.thread_summary.get_thread_tags", new=get_tags),
             patch("mindroom.thread_summary._generate_summary"),
@@ -883,7 +923,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(3),
+                return_value=_full(_make_thread_history(3)),
             ) as mock_fetch,
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -903,7 +943,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(3),
+                return_value=_full(_make_thread_history(3)),
             ),
             patch(
                 "mindroom.thread_summary._timed_generate_summary",
@@ -924,7 +964,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -946,17 +986,20 @@ class TestMaybeGenerateThreadSummary:
         thread_history = _make_thread_history(2)
 
         with (
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=thread_history)) as load,
+            patch(
+                "mindroom.thread_summary._load_thread_history",
+                new=AsyncMock(return_value=_full(thread_history)),
+            ) as load,
             patch(
                 "mindroom.thread_summary._generate_summary",
                 new=AsyncMock(return_value="🧵 Login failure investigation"),
             ) as generate,
-            patch("mindroom.thread_summary.send_thread_summary_event", new=AsyncMock(return_value="$summary")) as send,
+            patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")) as send,
             patch("mindroom.thread_summary.set_thread_tags_if_empty", new=AsyncMock()) as set_tags,
         ):
             await self._maybe_generate(client, config, rp)
 
-        load.assert_awaited_once_with(self.conversation_cache, "!room:x", "$thread1")
+        load.assert_awaited_once_with(self.conversation_reader, "!room:x", "$thread1")
         generate.assert_awaited_once_with(
             thread_history,
             config,
@@ -972,8 +1015,9 @@ class TestMaybeGenerateThreadSummary:
             "🧵 Login failure investigation",
             2,
             "default",
-            self.conversation_cache,
+            self.conversation_reader,
             initial_enrichment_complete=None,
+            generated_at=ANY,
         )
         set_tags.assert_not_awaited()
 
@@ -995,9 +1039,9 @@ class TestMaybeGenerateThreadSummary:
         )
 
         with (
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=thread_history)),
+            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=_full(thread_history))),
             patch("mindroom.thread_summary._generate_summary", new=AsyncMock(return_value=generated)) as generate,
-            patch("mindroom.thread_summary.send_thread_summary_event", new=AsyncMock(return_value="$summary")) as send,
+            patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")) as send,
             patch(
                 "mindroom.thread_summary.set_thread_tags_if_empty",
                 new=AsyncMock(
@@ -1026,8 +1070,9 @@ class TestMaybeGenerateThreadSummary:
             "🧵 Login failure investigation",
             12,
             "default",
-            self.conversation_cache,
+            self.conversation_reader,
             initial_enrichment_complete=True,
+            generated_at=ANY,
         )
         set_tags.assert_awaited_once_with(
             client,
@@ -1051,12 +1096,12 @@ class TestMaybeGenerateThreadSummary:
         thread_history = [*_make_thread_history(4), forged_notice]
 
         with (
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=thread_history)),
+            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=_full(thread_history))),
             patch(
                 "mindroom.thread_summary._generate_summary",
                 new=AsyncMock(return_value="🧵 Login failure investigation"),
             ) as generate,
-            patch("mindroom.thread_summary.send_thread_summary_event", new=AsyncMock(return_value="$summary")) as send,
+            patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")) as send,
             patch(
                 "mindroom.thread_summary.set_thread_tags_if_empty",
                 new=AsyncMock(
@@ -1111,7 +1156,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                new=AsyncMock(return_value=_make_due_second_summary_history()),
+                new=AsyncMock(return_value=_full(_make_due_second_summary_history())),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1123,7 +1168,7 @@ class TestMaybeGenerateThreadSummary:
                 ),
             ),
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value="$summary"),
             ) as send,
             patch(
@@ -1144,7 +1189,7 @@ class TestMaybeGenerateThreadSummary:
 
     async def test_later_summary_refresh_does_not_touch_tag_state(self) -> None:
         """Later threshold calls should use the summary-only schema and never retag."""
-        update_last_summary_count("!room:x", "$thread1", 5)
+        _update_last_summary_count("!room:x", "$thread1", 5)
         client = _mock_client()
         config = _mock_config()
         rp = _mock_runtime_paths()
@@ -1154,14 +1199,14 @@ class TestMaybeGenerateThreadSummary:
         ]
 
         with (
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=thread_history)),
+            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=_full(thread_history))),
             patch(
                 "mindroom.thread_summary.maybe_rebuild_tag_vocabulary",
                 new=AsyncMock(return_value=None),
             ) as rebuild,
             patch("mindroom.thread_summary.load_tag_vocabulary_snapshot") as load_vocabulary,
             patch("mindroom.thread_summary._generate_summary", new=AsyncMock(return_value="🧵 Refreshed")) as generate,
-            patch("mindroom.thread_summary.send_thread_summary_event", new=AsyncMock(return_value="$summary")),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")),
             patch("mindroom.thread_summary.set_thread_tags_if_empty", new=AsyncMock()) as set_tags,
         ):
             await self._maybe_generate(client, config, rp)
@@ -1188,7 +1233,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                new=AsyncMock(return_value=_make_due_second_summary_history()),
+                new=AsyncMock(return_value=_full(_make_due_second_summary_history())),
             ),
             patch(
                 "mindroom.thread_summary.maybe_rebuild_tag_vocabulary",
@@ -1204,7 +1249,7 @@ class TestMaybeGenerateThreadSummary:
                 ),
             ),
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(side_effect=RuntimeError("send failed")),
             ),
             patch(
@@ -1240,7 +1285,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                new=AsyncMock(return_value=_make_due_second_summary_history()),
+                new=AsyncMock(return_value=_full(_make_due_second_summary_history())),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1252,7 +1297,7 @@ class TestMaybeGenerateThreadSummary:
                 ),
             ),
             patch("mindroom.thread_summary.set_thread_tags_if_empty", new=set_tags),
-            patch("mindroom.thread_summary.send_thread_summary_event", new=send_summary),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=send_summary),
         ):
             await self._maybe_generate(client, config, rp)
 
@@ -1277,7 +1322,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                new=AsyncMock(return_value=_make_due_second_summary_history()),
+                new=AsyncMock(return_value=_full(_make_due_second_summary_history())),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1292,7 +1337,7 @@ class TestMaybeGenerateThreadSummary:
                 "mindroom.thread_summary.set_thread_tags_if_empty",
                 new=AsyncMock(side_effect=TimeoutError("timed out")),
             ) as set_tags,
-            patch("mindroom.thread_summary.send_thread_summary_event", new=send_summary),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=send_summary),
         ):
             await self._maybe_generate(client, config, rp)
 
@@ -1310,7 +1355,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                new=AsyncMock(return_value=_make_due_second_summary_history()),
+                new=AsyncMock(return_value=_full(_make_due_second_summary_history())),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1331,7 +1376,7 @@ class TestMaybeGenerateThreadSummary:
                     ),
                 ),
             ),
-            patch("mindroom.thread_summary.send_thread_summary_event", new=send_summary),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=send_summary),
         ):
             await self._maybe_generate(client, config, rp)
 
@@ -1354,9 +1399,9 @@ class TestMaybeGenerateThreadSummary:
                 new=AsyncMock(return_value=snapshot),
             ),
             patch("mindroom.thread_summary.load_tag_vocabulary_snapshot") as load_vocabulary,
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=thread_history)),
+            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=_full(thread_history))),
             patch("mindroom.thread_summary._generate_summary", new=AsyncMock(return_value="Summary")) as generate,
-            patch("mindroom.thread_summary.send_thread_summary_event", new=AsyncMock(return_value="$summary")),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")),
         ):
             await self._maybe_generate(client, config, rp)
 
@@ -1379,7 +1424,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._timed_generate_summary",
@@ -1407,7 +1452,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=thread_history,
+                return_value=_full(thread_history),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1446,7 +1491,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(message_count),
+                return_value=_full(_make_thread_history(message_count)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1468,7 +1513,7 @@ class TestMaybeGenerateThreadSummary:
     )
     async def test_second_threshold_boundaries(self, message_count: int, should_generate: bool) -> None:
         """The second-threshold boundary should trigger only at count 15 or above."""
-        update_last_summary_count("!room:x", "$thread1", 5)
+        _update_last_summary_count("!room:x", "$thread1", 5)
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$summary2", room_id="!room:x"))
         config = _mock_config()
@@ -1477,7 +1522,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(message_count),
+                return_value=_full(_make_thread_history(message_count)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1505,14 +1550,14 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
                 new=AsyncMock(side_effect=_blocked_generate),
             ) as mock_gen,
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value="$summary1"),
             ) as mock_send,
         ):
@@ -1533,8 +1578,9 @@ class TestMaybeGenerateThreadSummary:
             "Users discussed testing strategies",
             5,
             "default",
-            self.conversation_cache,
+            self.conversation_reader,
             initial_enrichment_complete=None,
+            generated_at=ANY,
         )
         assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$thread1")] == 5
 
@@ -1547,14 +1593,14 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
                 return_value="# **Fix** [ISSUE-116](http://example.com)",
             ),
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value="$summary1"),
             ) as mock_send,
         ):
@@ -1567,14 +1613,15 @@ class TestMaybeGenerateThreadSummary:
             "Fix ISSUE-116",
             5,
             "default",
-            self.conversation_cache,
+            self.conversation_reader,
             initial_enrichment_complete=None,
+            generated_at=ANY,
         )
         assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$thread1")] == 5
 
     async def test_already_summarized_skips(self) -> None:
         """No LLM call when count hasn't crossed the next threshold."""
-        update_last_summary_count("!room:x", "$thread1", 5)
+        _update_last_summary_count("!room:x", "$thread1", 5)
         client = _mock_client()
         config = _mock_config()
         rp = _mock_runtime_paths()
@@ -1582,7 +1629,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(10),
+                return_value=_full(_make_thread_history(10)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1594,7 +1641,7 @@ class TestMaybeGenerateThreadSummary:
 
     async def test_crosses_second_threshold(self) -> None:
         """Summary is generated when crossing the second threshold (15)."""
-        update_last_summary_count("!room:x", "$thread1", 5)
+        _update_last_summary_count("!room:x", "$thread1", 5)
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$summary2", room_id="!room:x"))
         config = _mock_config()
@@ -1603,7 +1650,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(15),
+                return_value=_full(_make_thread_history(15)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1625,7 +1672,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(1),
+                return_value=_full(_make_thread_history(1)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1640,7 +1687,7 @@ class TestMaybeGenerateThreadSummary:
 
     async def test_custom_subsequent_interval_controls_next_threshold(self) -> None:
         """A custom interval should defer the next summary until the configured count is reached."""
-        update_last_summary_count("!room:x", "$thread1", 3)
+        _update_last_summary_count("!room:x", "$thread1", 3)
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$summary-custom", room_id="!room:x"))
         config = _mock_config(first_threshold=3, subsequent_interval=4)
@@ -1649,7 +1696,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(6),
+                return_value=_full(_make_thread_history(6)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1662,7 +1709,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(7),
+                return_value=_full(_make_thread_history(7)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1677,7 +1724,7 @@ class TestMaybeGenerateThreadSummary:
 
     async def test_manual_summary_below_first_threshold_delays_next_auto_summary(self) -> None:
         """A manual summary below the first threshold should suppress auto-summary until the interval is reached."""
-        update_last_summary_count("!room:x", "$thread1", 3)
+        _update_last_summary_count("!room:x", "$thread1", 3)
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$summary-manual", room_id="!room:x"))
         config = _mock_config(first_threshold=5, subsequent_interval=10)
@@ -1686,7 +1733,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1699,7 +1746,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(12),
+                return_value=_full(_make_thread_history(12)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1712,7 +1759,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(13),
+                return_value=_full(_make_thread_history(13)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1727,7 +1774,7 @@ class TestMaybeGenerateThreadSummary:
 
     async def test_existing_summary_notice_does_not_advance_threshold(self) -> None:
         """Existing thread summary notices must not count toward the next automatic threshold."""
-        update_last_summary_count("!room:x", "$thread1", 5)
+        _update_last_summary_count("!room:x", "$thread1", 5)
         client = _mock_client()
         config = _mock_config()
         rp = _mock_runtime_paths()
@@ -1739,7 +1786,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=thread_history,
+                return_value=_full(thread_history),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1759,7 +1806,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1787,9 +1834,12 @@ class TestMaybeGenerateThreadSummary:
         )
 
         with (
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(side_effect=histories)),
+            patch(
+                "mindroom.thread_summary._load_thread_history",
+                new=AsyncMock(side_effect=[_full(entry) for entry in histories]),
+            ),
             patch("mindroom.thread_summary._generate_summary", new=generate),
-            patch("mindroom.thread_summary.send_thread_summary_event", new=AsyncMock(return_value="$summary")),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")),
         ):
             await self._maybe_generate(client, config, rp)
             await self._maybe_generate(client, config, rp)
@@ -1818,7 +1868,7 @@ class TestMaybeGenerateThreadSummary:
             pytest.raises(asyncio.CancelledError),
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                new=AsyncMock(return_value=_make_due_second_summary_history()),
+                new=AsyncMock(return_value=_full(_make_due_second_summary_history())),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1831,7 +1881,7 @@ class TestMaybeGenerateThreadSummary:
             ),
             patch("mindroom.thread_summary.set_thread_tags_if_empty", new=set_tags),
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(side_effect=asyncio.CancelledError),
             ),
         ):
@@ -1849,7 +1899,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1872,7 +1922,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1899,7 +1949,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=thread_history,
+                return_value=_full(thread_history),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1924,7 +1974,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=thread_history,
+                return_value=_full(thread_history),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -1965,7 +2015,7 @@ class TestMaybeGenerateThreadSummary:
         )
 
         with (
-            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=thread_history)),
+            patch("mindroom.thread_summary._load_thread_history", new=AsyncMock(return_value=_full(thread_history))),
             patch("mindroom.thread_summary._generate_summary", new=AsyncMock(return_value=generated)) as generate,
             patch(
                 "mindroom.thread_summary.set_thread_tags_if_empty",
@@ -1978,7 +2028,7 @@ class TestMaybeGenerateThreadSummary:
                 ),
             ) as set_tags,
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value="$summary"),
             ) as send_summary,
         ):
@@ -2004,7 +2054,7 @@ class TestMaybeGenerateThreadSummary:
         with (
             patch(
                 "mindroom.thread_summary._load_thread_history",
-                return_value=_make_thread_history(5),
+                return_value=_full(_make_thread_history(5)),
             ),
             patch(
                 "mindroom.thread_summary._generate_summary",
@@ -2029,12 +2079,12 @@ class TestMaybeGenerateThreadSummary:
         release_fetch = asyncio.Event()
         fetch_calls = 0
 
-        async def _blocked_fetch(*_args: object, **_kwargs: object) -> list[ResolvedVisibleMessage]:
+        async def _blocked_fetch(*_args: object, **_kwargs: object) -> ThreadHistoryResult:
             nonlocal fetch_calls
             fetch_calls += 1
             fetch_started.set()
             await release_fetch.wait()
-            return _make_thread_history(5)
+            return _full(_make_thread_history(5))
 
         with (
             patch(
@@ -2046,7 +2096,7 @@ class TestMaybeGenerateThreadSummary:
                 return_value="Users discussed testing strategies",
             ),
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value="$summary1"),
             ) as mock_send,
         ):
@@ -2073,18 +2123,17 @@ class TestSendSummaryEvent:
         """Verify the public summary-send API writes the expected event payload."""
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$s1", room_id="!r:x"))
-        conversation_cache = AsyncMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$reply1")
-        conversation_cache.notify_outbound_message = Mock()
+        conversation_reader = AsyncMock()
+        conversation_reader.latest_thread_event_id = AsyncMock(return_value="$reply1")
 
-        result = await send_thread_summary_event(
+        result = await _send_thread_summary_event(
             client,
             room_id="!room:x",
             thread_id="$root1",
             summary="Discussed deployment plan",
             message_count=15,
             model_name="haiku",
-            conversation_cache=conversation_cache,
+            conversation_reader=conversation_reader,
             initial_enrichment_complete=True,
         )
 
@@ -2109,63 +2158,34 @@ class TestSendSummaryEvent:
         assert meta["model"] == "haiku"
         assert meta["initial_enrichment_complete"] is True
         assert "generated_at" in meta
-        conversation_cache.get_latest_thread_event_id_if_needed.assert_awaited_once_with(
-            "!room:x",
-            "$root1",
-            caller_label="thread_summary_send",
-        )
-        conversation_cache.notify_outbound_message.assert_called_once_with("!room:x", "$s1", content)
-
-    async def test_known_latest_thread_event_id_skips_the_history_read(self) -> None:
-        """A caller that already knows the newest thread event should not trigger a history read."""
-        client = _mock_client()
-        client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$s1", room_id="!r:x"))
-        conversation_cache = AsyncMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$never-read")
-        conversation_cache.notify_outbound_message = Mock()
-
-        result = await send_thread_summary_event(
-            client,
+        conversation_reader.latest_thread_event_id.assert_awaited_once_with(
             room_id="!room:x",
             thread_id="$root1",
-            summary="Spawned an isolated session",
-            message_count=1,
-            model_name="manual",
-            conversation_cache=conversation_cache,
-            known_latest_thread_event_id="$root1",
         )
-
-        assert result == "$s1"
-        conversation_cache.get_latest_thread_event_id_if_needed.assert_not_awaited()
-        relates_to = client.room_send.call_args.kwargs["content"]["m.relates_to"]
-        assert relates_to["rel_type"] == "m.thread"
-        assert relates_to["event_id"] == "$root1"
-        assert relates_to["m.in_reply_to"] == {"event_id": "$root1"}
 
     async def test_event_content_truncates_overlong_summary(self) -> None:
         """Overlong summaries should be truncated before sending to Matrix."""
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$s1", room_id="!r:x"))
-        conversation_cache = AsyncMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$reply1")
-        conversation_cache.notify_outbound_message = Mock()
-        summary = "x" * (THREAD_SUMMARY_MAX_LENGTH + 1)
+        conversation_reader = AsyncMock()
+        conversation_reader.latest_thread_event_id = AsyncMock(return_value="$reply1")
+        summary = "x" * (_THREAD_SUMMARY_MAX_LENGTH + 1)
 
-        result = await send_thread_summary_event(
+        result = await _send_thread_summary_event(
             client,
             room_id="!room:x",
             thread_id="$root1",
             summary=summary,
             message_count=15,
             model_name="haiku",
-            conversation_cache=conversation_cache,
+            conversation_reader=conversation_reader,
         )
 
         assert result == "$s1"
         content = client.room_send.call_args.kwargs["content"]
-        truncated_summary = ("x" * (THREAD_SUMMARY_MAX_LENGTH - 3)) + "..."
+        truncated_summary = ("x" * (_THREAD_SUMMARY_MAX_LENGTH - 3)) + "..."
         assert content["body"] == truncated_summary
-        assert len(content["body"]) == THREAD_SUMMARY_MAX_LENGTH
+        assert len(content["body"]) == _THREAD_SUMMARY_MAX_LENGTH
         assert content["io.mindroom.thread_summary"]["summary"] == truncated_summary
         assert "initial_enrichment_complete" not in content["io.mindroom.thread_summary"]
 
@@ -2173,57 +2193,53 @@ class TestSendSummaryEvent:
         """Return None when room_send fails."""
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendError(message="forbidden"))
-        conversation_cache = AsyncMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$reply1")
-        conversation_cache.notify_outbound_message = Mock()
+        conversation_reader = AsyncMock()
+        conversation_reader.latest_thread_event_id = AsyncMock(return_value="$reply1")
 
-        result = await send_thread_summary_event(
+        result = await _send_thread_summary_event(
             client,
             room_id="!room:x",
             thread_id="$root1",
             summary="test",
             message_count=5,
             model_name="default",
-            conversation_cache=conversation_cache,
+            conversation_reader=conversation_reader,
         )
 
         assert result is None
-        conversation_cache.notify_outbound_message.assert_not_called()
 
     async def test_latest_thread_lookup_failure_falls_back_to_thread_root(self) -> None:
         """Summary sending should remain threaded when latest-event lookup fails."""
         client = _mock_client()
         client.room_send = AsyncMock(return_value=nio.RoomSendResponse(event_id="$s1", room_id="!r:x"))
-        conversation_cache = AsyncMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(side_effect=RuntimeError("lookup boom"))
-        conversation_cache.notify_outbound_message = Mock()
+        conversation_reader = AsyncMock()
+        conversation_reader.latest_thread_event_id = AsyncMock(side_effect=RuntimeError("lookup boom"))
 
-        result = await send_thread_summary_event(
+        result = await _send_thread_summary_event(
             client,
             room_id="!room:x",
             thread_id="$root1",
             summary="test",
             message_count=5,
             model_name="default",
-            conversation_cache=conversation_cache,
+            conversation_reader=conversation_reader,
         )
 
         assert result == "$s1"
         relates_to = client.room_send.call_args.kwargs["content"]["m.relates_to"]
         assert relates_to["event_id"] == "$root1"
         assert relates_to["m.in_reply_to"] == {"event_id": "$root1"}
-        conversation_cache.notify_outbound_message.assert_called_once()
 
 
 @pytest.mark.asyncio
 class TestSetManualThreadSummary:
     """Direct tests for the shared manual summary write path."""
 
-    async def test_sets_summary_and_updates_cache(self) -> None:
+    async def test_sets_summary_and_updates_reader(self) -> None:
         """Manual summary writes should normalize text, count non-summary messages, and update the cache."""
         client = _mock_client()
-        conversation_cache = AsyncMock()
-        conversation_cache.get_strict_thread_history.return_value = [
+        conversation_reader = make_conversation_reader_mock()
+        seeded_history = [
             *_make_thread_history(3),
             _make_summary_notice_message("$root1", message_count=2),
             _make_summary_notice_message(
@@ -2232,9 +2248,10 @@ class TestSetManualThreadSummary:
                 sender="@attacker:localhost",
             ),
         ]
+        serve_conversation_reader(conversation_reader, seeded_history)
 
         with patch(
-            "mindroom.thread_summary.send_thread_summary_event",
+            "mindroom.thread_summary._send_thread_summary_event",
             new=AsyncMock(return_value="$summary1"),
         ) as mock_send:
             result = await set_manual_thread_summary(
@@ -2244,13 +2261,15 @@ class TestSetManualThreadSummary:
                 "  # **Fix** [ISSUE-116](http://example.com)  ",
                 config=_mock_config(),
                 runtime_paths=_mock_runtime_paths(),
-                conversation_cache=conversation_cache,
+                conversation_reader=conversation_reader,
+                entity_name="router",
+                membership_index=AgentReplyMembershipIndex(),
             )
 
         assert result.event_id == "$summary1"
         assert result.summary == "Fix ISSUE-116"
         assert result.message_count == _count_non_summary_thread_messages(
-            conversation_cache.get_strict_thread_history.return_value,
+            seeded_history,
             trusted_sender_ids=_TRUSTED_SUMMARY_SENDERS,
         )
         mock_send.assert_awaited_once_with(
@@ -2260,21 +2279,22 @@ class TestSetManualThreadSummary:
             "Fix ISSUE-116",
             4,
             "manual",
-            conversation_cache,
+            conversation_reader,
             pinned=True,
+            generated_at=ANY,
         )
         assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$root1")] == 4
 
     async def test_send_failure_raises_and_leaves_cache_unchanged(self) -> None:
         """A failed manual summary send should not advance the cached threshold baseline."""
         client = _mock_client()
-        conversation_cache = AsyncMock()
-        conversation_cache.get_strict_thread_history.return_value = _make_thread_history(5)
-        update_last_summary_count("!room:x", "$root1", 2)
+        conversation_reader = make_conversation_reader_mock()
+        serve_conversation_reader(conversation_reader, _make_thread_history(5))
+        _update_last_summary_count("!room:x", "$root1", 2)
 
         with (
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value=None),
             ),
             pytest.raises(ThreadSummaryWriteError, match=r"Failed to send thread summary event\."),
@@ -2286,7 +2306,9 @@ class TestSetManualThreadSummary:
                 "failed write",
                 config=_mock_config(),
                 runtime_paths=_mock_runtime_paths(),
-                conversation_cache=conversation_cache,
+                conversation_reader=conversation_reader,
+                entity_name="router",
+                membership_index=AgentReplyMembershipIndex(),
             )
 
         assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$root1")] == 2
@@ -2294,8 +2316,8 @@ class TestSetManualThreadSummary:
     async def test_fetch_failure_raises_before_send(self) -> None:
         """A failed history fetch should raise the shared manual-summary fetch error."""
         client = _mock_client()
-        conversation_cache = AsyncMock()
-        conversation_cache.get_strict_thread_history.side_effect = TimeoutError("timed out")
+        conversation_reader = make_conversation_reader_mock()
+        conversation_reader.read_strict.side_effect = TimeoutError("timed out")
 
         with pytest.raises(ThreadSummaryWriteError, match=r"Failed to fetch thread history for the target thread\."):
             await set_manual_thread_summary(
@@ -2305,7 +2327,9 @@ class TestSetManualThreadSummary:
                 "done",
                 config=_mock_config(),
                 runtime_paths=_mock_runtime_paths(),
-                conversation_cache=conversation_cache,
+                conversation_reader=conversation_reader,
+                entity_name="router",
+                membership_index=AgentReplyMembershipIndex(),
             )
 
 
@@ -2354,11 +2378,11 @@ class TestGenerateSummary:
         config = _mock_config()
         rp = _mock_runtime_paths()
         mock_model = _TemperatureAwareModel()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="🧵 ISSUE-133 prompt preserved")
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=mock_model),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model),
             patch("mindroom.thread_summary.Agent") as mock_agent_cls,
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)) as mock_run,
         ):
@@ -2411,7 +2435,7 @@ class TestGenerateSummary:
         config = _mock_config(summary_temperature=0.1)
         rp = _mock_runtime_paths()
         mock_model = _TemperatureAwareModel(temperature=0.9)
-        mock_response = MagicMock(
+        mock_response = RunOutput(
             content=_ThreadEnrichment(
                 summary="🧵 Login parser hardening",
                 tags=["Bug Fix", "bug-fix", "resolved!"],
@@ -2419,7 +2443,7 @@ class TestGenerateSummary:
         )
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=mock_model),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model),
             patch("mindroom.thread_summary.Agent") as agent_class,
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)) as run,
         ):
@@ -2445,10 +2469,10 @@ class TestGenerateSummary:
 
     async def test_initial_enrichment_rejects_summary_only_output(self) -> None:
         """The initial call must not persist a summary without its requested tags."""
-        mock_response = MagicMock(content=_ThreadSummary(summary="🧵 Missing tags"))
+        mock_response = RunOutput(content=_ThreadSummary(summary="🧵 Missing tags"))
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=_TemperatureAwareModel()),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=_TemperatureAwareModel()),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
         ):
@@ -2467,7 +2491,7 @@ class TestGenerateSummary:
         generated_tags: list[str],
     ) -> None:
         """Invalid or automatic-excluded tags should not discard the valid refreshed summary."""
-        mock_response = MagicMock(
+        mock_response = RunOutput(
             content=_ThreadEnrichment(
                 summary="🧵 Invalid tags",
                 tags=generated_tags,
@@ -2475,7 +2499,7 @@ class TestGenerateSummary:
         )
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=_TemperatureAwareModel()),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=_TemperatureAwareModel()),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
         ):
@@ -2490,7 +2514,7 @@ class TestGenerateSummary:
 
     async def test_later_summary_rejects_unrequested_enrichment_output(self) -> None:
         """A later summary call must never revive automatic tagging."""
-        mock_response = MagicMock(
+        mock_response = RunOutput(
             content=_ThreadEnrichment(
                 summary="🧵 Unexpected retag",
                 tags=["bug"],
@@ -2498,7 +2522,7 @@ class TestGenerateSummary:
         )
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=_TemperatureAwareModel()),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=_TemperatureAwareModel()),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
         ):
@@ -2516,11 +2540,11 @@ class TestGenerateSummary:
         config = _mock_config(summary_temperature=0.1)
         rp = _mock_runtime_paths()
         mock_model = _TemperatureAwareModel(temperature=0.9)
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="🧪 ISSUE-148 matrix cache invalidate-and-refetch live test")
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=mock_model),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
         ):
@@ -2529,16 +2553,74 @@ class TestGenerateSummary:
         assert result == "🧪 ISSUE-148 matrix cache invalidate-and-refetch live test"
         assert mock_model.temperature == 0.1
 
+    @pytest.mark.parametrize("model_id", ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"])
+    async def test_generate_summary_omits_unsupported_direct_gpt6_temperature_from_request(self, model_id: str) -> None:
+        """Direct GPT-6 summary requests must omit unsupported sampling controls."""
+        model = MindRoomOpenAIResponses(id=model_id, api_key="dummy-key", temperature=0.9)
+
+        _configure_summary_model_temperature(
+            model,
+            summary_temperature=0.2,
+            model_name="summary",
+        )
+
+        assert "temperature" not in model.get_request_params()
+
+    @pytest.mark.parametrize("model_id", ["openai/gpt-6-astra", "openai/gpt-6.1-sol", "openai/gpt-6-luna"])
+    async def test_generate_summary_omits_unsupported_openrouter_gpt6_temperature_from_request(
+        self,
+        model_id: str,
+    ) -> None:
+        """OpenRouter GPT-6 summary requests must omit unsupported sampling controls."""
+        model = MindRoomOpenRouter(
+            id=model_id,
+            api_key="dummy-key",
+            max_tokens=None,
+            temperature=0.9,
+        )
+
+        _configure_summary_model_temperature(
+            model,
+            summary_temperature=0.2,
+            model_name="summary",
+        )
+
+        assert "temperature" not in model.get_request_params()
+
+    async def test_generate_summary_preserves_supported_openrouter_temperature_in_request(self) -> None:
+        """OpenRouter summary requests keep configured temperature for models that support it."""
+        model = MindRoomOpenRouter(
+            id="deepseek/deepseek-v4.1-flash",
+            api_key="dummy-key",
+            max_tokens=None,
+            temperature=0.9,
+        )
+
+        _configure_summary_model_temperature(
+            model,
+            summary_temperature=0.2,
+            model_name="summary",
+        )
+
+        assert model.get_request_params()["temperature"] == 0.2
+
     @pytest.mark.parametrize(
         "model_id",
         [
+            "claude-fable-5-1",
+            "anthropic.claude-fable-5-1",
+            "anthropic/claude-fable-5.1",
             "claude-fable-5",
             "anthropic.claude-fable-5",
             "anthropic/claude-fable-5",
+            "anthropic.claude-opus-5-5",
+            "anthropic/claude-opus-5.5",
+            "anthropic.claude-sonnet-5-5",
+            "anthropic/claude-sonnet-5.5",
         ],
     )
-    async def test_generate_summary_omits_invalid_fable_temperature(self, model_id: str) -> None:
-        """Fable requests through each supported provider must omit invalid temperature."""
+    async def test_generate_summary_omits_invalid_current_claude_temperature(self, model_id: str) -> None:
+        """Current Claude requests through each supported provider must omit invalid temperature."""
         model = _TemperatureAwareIdentifiedModel(model_id, temperature=0.9)
 
         _configure_summary_model_temperature(
@@ -2549,7 +2631,7 @@ class TestGenerateSummary:
 
         assert model.temperature is None
 
-    @pytest.mark.parametrize("model_id", ["claude-opus-5", "claude-sonnet-5"])
+    @pytest.mark.parametrize("model_id", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-5", "claude-sonnet-5"])
     async def test_generate_summary_omits_invalid_current_direct_claude_temperature(self, model_id: str) -> None:
         """Current direct Claude requests must omit deprecated sampling controls."""
         model = MindRoomAnthropicClaude(id=model_id, api_key="dummy-key", temperature=0.9)
@@ -2562,7 +2644,10 @@ class TestGenerateSummary:
 
         assert model.temperature is None
 
-    @pytest.mark.parametrize("model_id", ["gemini-3.6-flash", "gemini-3.5-flash-lite"])
+    @pytest.mark.parametrize(
+        "model_id",
+        ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"],
+    )
     async def test_generate_summary_omits_deprecated_direct_google_temperature(self, model_id: str) -> None:
         """Current direct Gemini requests must omit deprecated sampling controls."""
         model = MindRoomGoogleGemini(id=model_id, api_key="dummy-key", temperature=0.9)
@@ -2575,7 +2660,7 @@ class TestGenerateSummary:
 
         assert model.temperature is None
 
-    @pytest.mark.parametrize("model_id", ["google/gemini-3.6-flash", "google/gemini-3.5-flash-lite"])
+    @pytest.mark.parametrize("model_id", ["google/gemini-3.8-flash", "google/gemini-3.5-flash-lite"])
     async def test_generate_summary_preserves_supported_openrouter_gemini_temperature(self, model_id: str) -> None:
         """OpenRouter supports temperature for current Gemini request IDs."""
         model = _TemperatureAwareIdentifiedModel(model_id, temperature=0.9)
@@ -2594,11 +2679,11 @@ class TestGenerateSummary:
         config = _mock_config(model_name="haiku")
         rp = _mock_runtime_paths()
         mock_model = _TemperatureAwareModel()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="🧵 Room-specific summary model")
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=mock_model) as mock_get_model,
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model) as mock_get_model,
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
         ):
@@ -2613,11 +2698,11 @@ class TestGenerateSummary:
         config = _mock_config(summary_temperature=None)
         rp = _mock_runtime_paths()
         mock_model = _TemperatureAwareModel(temperature=0.9)
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="🧪 ISSUE-149 provider default summary")
 
         with (
-            patch("mindroom.model_loading.get_model_instance", return_value=mock_model),
+            patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
         ):
@@ -2637,7 +2722,7 @@ class TestGenerateSummary:
         config = _mock_config()
         rp = _mock_runtime_paths()
         mock_model = _ModelWithoutTemperature()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="🧵 ISSUE-153 unsupported provider summary")
         monkeypatch.delenv("MINDROOM_LOG_FORMAT", raising=False)
         setup_logging(level="WARNING", runtime_paths=_logging_runtime_paths(tmp_path))
@@ -2648,7 +2733,7 @@ class TestGenerateSummary:
         try:
             with (
                 caplog.at_level("WARNING", logger="mindroom.thread_summary"),
-                patch("mindroom.model_loading.get_model_instance", return_value=mock_model),
+                patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model),
                 patch("mindroom.thread_summary.Agent"),
                 patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
             ):
@@ -2676,8 +2761,8 @@ class TestGenerateSummary:
         history = _make_thread_history(3)
         config = _mock_config(summary_temperature=0.4)
         rp = _mock_runtime_paths()
-        mock_model = VertexAIClaude(id="claude-sonnet-4@20250514", temperature=0.9)
-        mock_response = MagicMock()
+        mock_model = VertexAIClaude(id="claude-sonnet-5", temperature=0.9)
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="🧵 ISSUE-200 vertex claude summary")
         monkeypatch.delenv("MINDROOM_LOG_FORMAT", raising=False)
         setup_logging(level="WARNING", runtime_paths=_logging_runtime_paths(tmp_path))
@@ -2688,7 +2773,7 @@ class TestGenerateSummary:
         try:
             with (
                 caplog.at_level("WARNING", logger="mindroom.thread_summary"),
-                patch("mindroom.model_loading.get_model_instance", return_value=mock_model),
+                patch("mindroom.providers.model_loading.get_model_instance", return_value=mock_model),
                 patch("mindroom.thread_summary.Agent"),
                 patch("mindroom.thread_summary.cached_agent_run", new=AsyncMock(return_value=mock_response)),
             ):
@@ -2712,7 +2797,7 @@ class TestGenerateSummary:
 
         for example in _EXPECTED_GOOD_PROMPT_EXAMPLES:
             assert example in instructions
-            assert len(example) <= THREAD_SUMMARY_MAX_LENGTH
+            assert len(example) <= _THREAD_SUMMARY_MAX_LENGTH
             lowered = example.lower()
             assert not any(term in lowered for term in _TRANSIENT_STATUS_TERMS)
 
@@ -2721,11 +2806,11 @@ class TestGenerateSummary:
         history = _make_thread_history(5)
         config = _mock_config()
         rp = _mock_runtime_paths()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = _ThreadSummary(summary="\U0001f527 Auth deployment discussed and approved")
 
         with (
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", return_value=mock_response),
         ):
@@ -2738,11 +2823,11 @@ class TestGenerateSummary:
         history = _make_thread_history(5)
         config = _mock_config()
         rp = _mock_runtime_paths()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = None
 
         with (
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", return_value=mock_response),
         ):
@@ -2755,10 +2840,10 @@ class TestGenerateSummary:
         history = _make_thread_history(5)
         config = _mock_config()
         rp = _mock_runtime_paths()
-        mock_response = MagicMock(content={"summary": "unvalidated"})
+        mock_response = RunOutput(content={"summary": "unvalidated"})
 
         with (
-            patch("mindroom.model_loading.get_model_instance"),
+            patch("mindroom.providers.model_loading.get_model_instance"),
             patch("mindroom.thread_summary.Agent"),
             patch("mindroom.thread_summary.cached_agent_run", return_value=mock_response),
         ):
@@ -2964,25 +3049,21 @@ class TestSummaryWritersLeavePinStateAlone:
     """Writers that summarize as a side effect must not disturb a user's pin."""
 
     async def test_default_write_omits_pinned_key(self) -> None:
-        """send_thread_summary_event must not record a pin decision unless asked.
+        """_send_thread_summary_event must not record a pin decision unless asked.
 
-        The subagent spawn path reuses an existing thread by label and writes a
-        summary outside the per-thread summary lock. Recording pinned=False by
-        default there would silently release a pin the user had set.
+        Automatic summary writers must preserve a pin the user has set.
         """
         client = _mock_client()
-        conversation_cache = MagicMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$thread1")
-        conversation_cache.notify_outbound_message = Mock()
+        conversation_reader = MagicMock()
 
-        await send_thread_summary_event(
+        await _send_thread_summary_event(
             client,
             "!room:x",
             "$thread1",
             "Spawned session summary",
             1,
             "manual",
-            conversation_cache,
+            conversation_reader,
         )
 
         sent_content = client.room_send.await_args.kwargs["content"]
@@ -2992,18 +3073,16 @@ class TestSummaryWritersLeavePinStateAlone:
     async def test_explicit_decision_lands_in_sent_metadata(self, pinned: bool) -> None:
         """An explicit pin decision must reach the Matrix event, not just the call."""
         client = _mock_client()
-        conversation_cache = MagicMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$thread1")
-        conversation_cache.notify_outbound_message = Mock()
+        conversation_reader = MagicMock()
 
-        await send_thread_summary_event(
+        await _send_thread_summary_event(
             client,
             "!room:x",
             "$thread1",
             "A deliberate title",
             1,
             "manual",
-            conversation_cache,
+            conversation_reader,
             pinned=pinned,
         )
 
@@ -3048,18 +3127,16 @@ async def test_pin_decision_survives_a_real_write_and_read_round_trip(pinned: bo
     This drives the real send path, then recovers from exactly what was sent.
     """
     client = _mock_client()
-    conversation_cache = MagicMock()
-    conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$thread1")
-    conversation_cache.notify_outbound_message = Mock()
+    conversation_reader = MagicMock()
 
-    await send_thread_summary_event(
+    await _send_thread_summary_event(
         client,
         "!room:x",
         "$thread1",
         "A deliberate title",
         4,
         "manual",
-        conversation_cache,
+        conversation_reader,
         pinned=pinned,
     )
 
@@ -3079,18 +3156,12 @@ async def test_pin_decision_survives_a_real_write_and_read_round_trip(pinned: bo
 class TestPinLandingDuringGeneration:
     """A pin written while the model runs must supersede the in-flight summary."""
 
-    def _cache(self, source_history: list | None = None) -> MagicMock:
-        conversation_cache = MagicMock()
-        conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$thread1")
-        conversation_cache.notify_outbound_message = Mock()
-        # The guard must read from source, not through the cache: a pin written
-        # by another runtime is not in this runtime's cache yet.
-        conversation_cache.refresh_strict_thread_history_from_source = AsyncMock(
-            return_value=source_history if source_history is not None else [],
-        )
-        return conversation_cache
+    def _reader(self, source_history: list | None = None) -> AsyncMock:
+        # The guard must read from the homeserver, not through the projection:
+        # a pin written by another runtime has not reached this one yet.
+        return AsyncMock(return_value=source_history if source_history is not None else [])
 
-    async def _run(self, conversation_cache: MagicMock, histories: list) -> AsyncMock:
+    async def _run(self, source_read: AsyncMock, histories: list) -> AsyncMock:
         client = _mock_client()
         with (
             patch("mindroom.thread_summary.maybe_rebuild_tag_vocabulary", new=AsyncMock(return_value=None)),
@@ -3099,13 +3170,20 @@ class TestPinLandingDuringGeneration:
                 "mindroom.thread_summary.current_internal_sender_ids",
                 return_value=_TRUSTED_SUMMARY_SENDERS,
             ),
-            patch("mindroom.thread_summary._load_thread_history", side_effect=histories),
+            patch(
+                "mindroom.thread_summary._load_thread_history",
+                side_effect=[_full(entry) for entry in histories],
+            ),
             patch(
                 "mindroom.thread_summary._generate_summary",
                 return_value="Freshly generated title",
             ),
             patch(
-                "mindroom.thread_summary.send_thread_summary_event",
+                "mindroom.thread_summary.fetch_thread_messages_from_source",
+                new=source_read,
+            ),
+            patch(
+                "mindroom.thread_summary._send_thread_summary_event",
                 new=AsyncMock(return_value="$summary1"),
             ) as deliver,
         ):
@@ -3115,47 +3193,283 @@ class TestPinLandingDuringGeneration:
                 "$thread1",
                 _mock_config(),
                 _mock_runtime_paths(),
-                conversation_cache=conversation_cache,
+                conversation_reader=make_conversation_reader_mock(),
+                delivered_response=_DELIVERED_AND_ECHOED,
+                entity_name="router",
+                membership_index=AgentReplyMembershipIndex(),
             )
         return deliver
 
     async def test_pin_visible_only_at_source_discards_the_summary(self) -> None:
         """A pin another runtime wrote is not in this runtime's cache yet.
 
-        get_strict_thread_history is strict about staleness but still accepts a
-        valid local cache hit, so reading through it would miss the pin and
-        deliver the stale title anyway.
+        A projected read is strict about staleness but still answers from local
+        state, so reading through it would miss the pin and deliver the stale
+        title anyway.
         """
         unpinned = _make_thread_history(12)
         pinned_at_source = [
             *_make_thread_history(12),
             _make_summary_notice_message("$thread1", message_count=12, pinned=True),
         ]
-        conversation_cache = self._cache(source_history=pinned_at_source)
+        conversation_reader = self._reader(source_history=pinned_at_source)
 
         # Cache reads stay unpinned for the whole pass.
-        deliver = await self._run(conversation_cache, [unpinned, unpinned])
+        deliver = await self._run(conversation_reader, [unpinned, unpinned])
 
         deliver.assert_not_awaited()
-        conversation_cache.refresh_strict_thread_history_from_source.assert_awaited_once()
+        conversation_reader.assert_awaited_once()
         assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$thread1")] == 12
 
     async def test_still_delivers_when_no_pin_landed(self) -> None:
         """The re-check must not suppress ordinary summaries."""
         unpinned = _make_thread_history(12)
 
-        deliver = await self._run(self._cache(source_history=list(unpinned)), [unpinned, unpinned])
+        deliver = await self._run(self._reader(source_history=list(unpinned)), [unpinned, unpinned])
 
         deliver.assert_awaited_once()
 
-    async def test_recheck_failure_still_delivers(self) -> None:
-        """A failed source re-read falls back to the pre-generation decision."""
+    async def test_recheck_failure_suppresses_delivery_until_next_interval(self) -> None:
+        """An unverified title is dropped without retrying the model on every turn."""
         unpinned = _make_thread_history(12)
-        conversation_cache = self._cache()
-        conversation_cache.refresh_strict_thread_history_from_source = AsyncMock(
-            side_effect=RuntimeError("source read failed"),
+        conversation_reader = AsyncMock(side_effect=RuntimeError("source read failed"))
+
+        deliver = await self._run(conversation_reader, [unpinned, unpinned])
+
+        deliver.assert_not_awaited()
+        conversation_reader.assert_awaited_once()
+        assert _last_summary_counts[_thread_summary_cache_key("!room:x", "$thread1")] == 12
+
+        recovered = self._reader(source_history=_make_thread_history(22))
+        deliver = await self._run(recovered, [_make_thread_history(21)])
+        deliver.assert_not_awaited()
+        recovered.assert_not_awaited()
+
+        deliver = await self._run(recovered, [_make_thread_history(22)])
+        deliver.assert_awaited_once()
+        recovered.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestTruncatedHistoryIsNotCounted:
+    """A page of a longer thread must not become the thread's recorded size."""
+
+    async def _generate(self, history: ThreadHistoryResult, generate: AsyncMock, send: AsyncMock) -> None:
+        """Run one automatic pass over the given history."""
+        with (
+            patch("mindroom.thread_summary.maybe_rebuild_tag_vocabulary", new=AsyncMock(return_value=None)),
+            patch("mindroom.thread_summary.get_thread_tags", new=AsyncMock(return_value=None)),
+            patch(
+                "mindroom.thread_summary.current_internal_sender_ids",
+                return_value=_TRUSTED_SUMMARY_SENDERS,
+            ),
+            # Patched below the loader on purpose: the guard being tested is
+            # inside it, so a test that replaced the loader would never reach
+            # the code it claims to cover.
+            patch(
+                "mindroom.thread_summary.complete_thread_history",
+                new=AsyncMock(return_value=history),
+            ),
+            patch("mindroom.thread_summary._generate_summary", new=generate),
+            patch("mindroom.thread_summary._send_thread_summary_event", new=send),
+        ):
+            await maybe_generate_thread_summary(
+                _mock_client(),
+                "!room:x",
+                "$thread1",
+                _mock_config(),
+                _mock_runtime_paths(),
+                conversation_reader=make_conversation_reader_mock(),
+                delivered_response=_DELIVERED_AND_ECHOED,
+                entity_name="router",
+                membership_index=AgentReplyMembershipIndex(),
+            )
+
+    async def test_an_automatic_summary_is_skipped_for_a_truncated_history(self) -> None:
+        """The count an automatic pass writes becomes the durable baseline.
+
+        Every outcome of a generated pass updates it, so the length of a page
+        of a longer conversation would move the baseline to the wrong number
+        and every later pass would compare against that.
+        """
+        generate = AsyncMock(return_value="a title")
+        send = AsyncMock(return_value="$s")
+
+        await self._generate(
+            thread_history_result(_make_thread_history(12), is_full_history=False),
+            generate,
+            send,
         )
 
-        deliver = await self._run(conversation_cache, [unpinned, unpinned])
+        generate.assert_not_awaited()
+        send.assert_not_awaited()
 
-        deliver.assert_awaited_once()
+    async def test_a_complete_history_still_summarizes(self) -> None:
+        """The mirror, so "never summarize" cannot pass the test above."""
+        generate = AsyncMock(return_value="a title")
+        send = AsyncMock(return_value="$s")
+
+        await self._generate(
+            thread_history_result(_make_thread_history(12), is_full_history=True),
+            generate,
+            send,
+        )
+
+        generate.assert_awaited()
+
+
+# -- the answer this pass was queued for, before its echo lands --
+
+
+@pytest.mark.asyncio
+class TestSummaryReadsTheAnswerItWasQueuedFor:
+    """The post-response pass over a real projection with no echo admitted.
+
+    Every other test in this file hands the pass a mocked history loader, which
+    is exactly the seam that makes the ordering unobservable: a mocked
+    projection can be told about the answer and a real one cannot. These run
+    the real ``ConversationReader`` over a real journal and never admit the
+    response's echo, which is the state the projection is genuinely in at the
+    moment this pass starts.
+    """
+
+    async def _warm_projection(
+        self,
+        store: PrincipalStore,
+        homeserver: ProjectionHomeserver,
+        *,
+        asks: int,
+    ) -> ConversationReader:
+        """Return a reader over a hydrated thread of *asks* user messages."""
+        root = _projection_raw(_PROJECTION_ROOT, "ask 0", ts=1000)
+        replies = [
+            _projection_raw(f"$ask{index}:example.org", f"ask {index}", ts=1000 + index, thread_id=_PROJECTION_ROOT)
+            for index in range(1, asks)
+        ]
+        serve_thread(homeserver, root, replies)
+        await admit_live(store, [root, *replies])
+        reader = prompt_reader_for(store, homeserver, window_messages=HYDRATED_PROMPT_WINDOW_MESSAGES)
+        # Hydrate through the reader the pass will use, then zero the counters.
+        # Without this the pass's own read could walk the homeserver and find
+        # the answer there, and the test would prove nothing about the
+        # delivered fact being what supplied it.
+        await complete_thread_history(reader, _PROJECTION_ROOM, _PROJECTION_ROOT)
+        homeserver.reset_counts()
+        return reader
+
+    async def _run_pass(
+        self,
+        reader: ConversationReader,
+        *,
+        first_threshold: int,
+        answer: str = "here is the answer",
+        answer_event_id: str = "$answer:example.org",
+    ) -> tuple[AsyncMock, list[dict[str, Any]]]:
+        """Run one post-response pass and return its generator and sent payloads."""
+        client = _mock_client()
+        client.user_id = _PROJECTION_BOT
+        generate = AsyncMock(return_value="🧵 a title")
+        sent: list[dict[str, Any]] = []
+
+        async def capture(_client: object, _room_id: str, content: dict[str, Any], **_: object) -> DeliveredMatrixEvent:
+            sent.append(content)
+            return DeliveredMatrixEvent(event_id="$summary:example.org", content_sent=content)
+
+        with (
+            patch(
+                "mindroom.thread_summary.current_internal_sender_ids",
+                return_value=frozenset({_PROJECTION_BOT}),
+            ),
+            patch("mindroom.thread_summary.fetch_thread_messages_from_source", new=AsyncMock(return_value=[])),
+            patch("mindroom.thread_summary.maybe_rebuild_tag_vocabulary", new=AsyncMock(return_value=None)),
+            patch("mindroom.thread_summary.get_thread_tags", new=AsyncMock(return_value=None)),
+            patch("mindroom.thread_summary._generate_summary", new=generate),
+            patch("mindroom.thread_summary.send_message_result", new=capture),
+        ):
+            await maybe_generate_thread_summary(
+                client,
+                _PROJECTION_ROOM,
+                _PROJECTION_ROOT,
+                _mock_config(first_threshold=first_threshold),
+                _mock_runtime_paths(),
+                conversation_reader=reader,
+                delivered_response=DeliveredResponse(event_id=answer_event_id, body=answer),
+                entity_name="router",
+                membership_index=AgentReplyMembershipIndex(),
+            )
+        return generate, sent
+
+    async def test_the_delivered_answer_is_what_reaches_the_threshold(
+        self,
+        journal_store: EventJournalStore,
+    ) -> None:
+        """Four asks plus the answer is five, so the title lands on this turn.
+
+        Reading the projection alone counts four and returns, leaving the
+        thread untitled until some later message pushes the projection past the
+        threshold on its own -- a title a whole turn late.
+        """
+        homeserver = ProjectionHomeserver()
+        reader = await self._warm_projection(journal_store.principal(_PROJECTION_PRINCIPAL), homeserver, asks=4)
+
+        generate, sent = await self._run_pass(reader, first_threshold=5)
+
+        generate.assert_awaited_once()
+        assert len(sent) == 1
+        # The answer came from the delivered fact, not from a homeserver walk.
+        assert homeserver.history_calls == 0
+
+    async def test_the_count_written_down_includes_the_answer(
+        self,
+        journal_store: EventJournalStore,
+    ) -> None:
+        """The count in the summary metadata is the durable baseline.
+
+        Every later threshold is measured from it, so a number one short of the
+        thread is not a transient off-by-one: it persists in the notice and
+        moves every subsequent summary of this thread.
+        """
+        homeserver = ProjectionHomeserver()
+        reader = await self._warm_projection(journal_store.principal(_PROJECTION_PRINCIPAL), homeserver, asks=6)
+
+        _, sent = await self._run_pass(reader, first_threshold=5)
+
+        assert sent[0]["io.mindroom.thread_summary"]["message_count"] == 7
+        assert _last_summary_counts[_thread_summary_cache_key(_PROJECTION_ROOM, _PROJECTION_ROOT)] == 7
+
+    async def test_the_title_is_generated_from_a_thread_that_has_its_answer(
+        self,
+        journal_store: EventJournalStore,
+    ) -> None:
+        """A title summarizing a question with no answer describes half a thread."""
+        homeserver = ProjectionHomeserver()
+        reader = await self._warm_projection(journal_store.principal(_PROJECTION_PRINCIPAL), homeserver, asks=6)
+
+        generate, _ = await self._run_pass(reader, first_threshold=5, answer="the cache key was stale")
+
+        conversation = _build_conversation_text(
+            generate.await_args.args[0],
+            trusted_sender_ids=frozenset({_PROJECTION_BOT}),
+        )
+        assert f"{_PROJECTION_BOT}: the cache key was stale" in conversation
+
+    async def test_an_echo_that_already_landed_is_not_counted_twice(
+        self,
+        journal_store: EventJournalStore,
+    ) -> None:
+        """The patch is keyed on the logical event, so a raced echo collapses onto it."""
+        store = journal_store.principal(_PROJECTION_PRINCIPAL)
+        homeserver = ProjectionHomeserver()
+        reader = await self._warm_projection(store, homeserver, asks=6)
+        echo = _projection_raw(
+            "$answer:example.org",
+            "here is the answer",
+            ts=2000,
+            sender=_PROJECTION_BOT,
+            thread_id=_PROJECTION_ROOT,
+        )
+        await admit_live(store, [echo])
+
+        _, sent = await self._run_pass(reader, first_threshold=5)
+
+        assert sent[0]["io.mindroom.thread_summary"]["message_count"] == 7

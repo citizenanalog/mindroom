@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from weakref import WeakValueDictionary
 
 from mindroom.commands.handler import (
     COMMAND_TYPES_WITH_SIDE_EFFECTS,
@@ -16,6 +17,7 @@ from mindroom.commands.parsing import CommandType
 from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths
 from mindroom.hooks import build_hook_matrix_admin
 from mindroom.inbound_turn_normalizer import TextNormalizationRequest
+from mindroom.model_selection import model_selection_targets_other_runtime
 from mindroom.turn_record import canonicalize_turn_record
 
 if TYPE_CHECKING:
@@ -25,13 +27,14 @@ if TYPE_CHECKING:
     import structlog
 
     from mindroom.commands.parsing import Command
-    from mindroom.dispatch_handoff import TextDispatchEvent
+    from mindroom.desktop.identity import DesktopControllerIdentity
+    from mindroom.dispatch_handoff import PreparedIngress
     from mindroom.handled_turns import TurnRecord
     from mindroom.hooks import HookMatrixAdmin
     from mindroom.inbound_turn_normalizer import InboundTurnNormalizer
-    from mindroom.matrix.cache import ConversationEventCache
-    from mindroom.matrix.conversation_cache import MatrixConversationCache
+    from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.message_target import MessageTarget
+    from mindroom.model_selection import CommandResultContent
     from mindroom.runtime_protocols import SupportsClientConfigOrchestrator
     from mindroom.turn_policy import TurnPolicy
     from mindroom.turn_store import TurnStore
@@ -52,12 +55,12 @@ class CommandTurnExecutorDeps:
     runtime_paths: RuntimePaths
     agent_name: str
     normalizer: InboundTurnNormalizer
-    conversation_cache: MatrixConversationCache
+    conversation_reader: ConversationReader
     turn_policy: TurnPolicy
     turn_store: TurnStore
     visible_responses: VisibleResponseReconciler
-    event_cache: Callable[[], ConversationEventCache]
     recover_config_confirmation_setup: Callable[[str, str], Awaitable[bool]]
+    controller_identity: Callable[[str], DesktopControllerIdentity]
 
 
 @dataclass
@@ -65,6 +68,9 @@ class CommandTurnExecutor:
     """Own the durable command journal from admission through visible settlement."""
 
     deps: CommandTurnExecutorDeps
+    _model_command_locks: WeakValueDictionary[tuple[str, str | None], asyncio.Lock] = field(
+        default_factory=WeakValueDictionary,
+    )
 
     def _client(self) -> nio.AsyncClient:
         client = self.deps.runtime.client
@@ -76,7 +82,7 @@ class CommandTurnExecutor:
     async def execute(
         self,
         room: nio.MatrixRoom,
-        event: TextDispatchEvent,
+        event: PreparedIngress,
         requester_user_id: str,
         command: Command,
         *,
@@ -84,13 +90,42 @@ class CommandTurnExecutor:
         handled_turn: TurnRecord,
     ) -> None:
         """Run one explicit command under its durable turn journal."""
+        if command.type is CommandType.MODEL and model_selection_targets_other_runtime(
+            event.source.get("content", {}),
+            self._client().user_id,
+            self._client().device_id,
+        ):
+            return
+        if command.type is CommandType.MODEL:
+            key = room.room_id, target.resolved_thread_id
+            lock = self._model_command_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._model_command_locks[key] = lock
+            # Keep a strong local reference while waiting. Text and structured
+            # model commands share the same order across requester ingress lanes.
+            async with lock:
+                await self._execute(room, event, requester_user_id, command, target=target, handled_turn=handled_turn)
+        else:
+            await self._execute(room, event, requester_user_id, command, target=target, handled_turn=handled_turn)
+
+    async def _execute(
+        self,
+        room: nio.MatrixRoom,
+        event: PreparedIngress,
+        requester_user_id: str,
+        command: Command,
+        *,
+        target: MessageTarget,
+        handled_turn: TurnRecord,
+    ) -> None:
+        """Execute after target ownership and any model command ordering barrier."""
         event = await self.deps.normalizer.resolve_text_event(
             TextNormalizationRequest(event=event),
         )
         command_turn, recovered_response_event_id = await self.deps.visible_responses.prepare_visible_delivery_turn(
             handled_turn,
             requester_id=requester_user_id,
-            correlation_id=event.event_id,
             target=target,
         )
         if command_turn is None:
@@ -120,20 +155,25 @@ class CommandTurnExecutor:
             return await self.deps.visible_responses.deliver_recoverable_text(
                 active_command_turn,
                 target=target,
-                response_text=response_text,
+                response_text=active_command_turn.command_result_text or response_text,
                 recovered_response_event_id=recovered_response_event_id,
                 skip_mentions=skip_mentions,
             )
 
-        async def record_command_result(response_text: str) -> None:
+        async def record_command_result(
+            response_text: str,
+            *,
+            extra_content: CommandResultContent | None = None,
+        ) -> None:
             nonlocal active_command_turn
             active_command_turn = await self._persist_checkpoint(
                 active_command_turn,
                 command_result_text=response_text,
+                command_result_extra_content=extra_content,
             )
 
-        def record_command_turn(outcome: TurnRecord) -> None:
-            self.deps.turn_store.record_responded_turn(
+        async def record_command_turn(outcome: TurnRecord) -> None:
+            await self.deps.turn_store.record_responded_turn(
                 canonicalize_turn_record(active_command_turn, response_event_id=outcome.response_event_id),
             )
 
@@ -146,8 +186,7 @@ class CommandTurnExecutor:
             config=self.deps.runtime.config,
             runtime_paths=self.deps.runtime_paths,
             logger=self.deps.logger,
-            conversation_cache=self.deps.conversation_cache,
-            event_cache=self.deps.event_cache(),
+            conversation_reader=self.deps.conversation_reader,
             matrix_admin=self._matrix_admin(),
             stable_target=target,
             record_handled_turn=record_command_turn,
@@ -155,6 +194,9 @@ class CommandTurnExecutor:
             send_response=send_response,
             reload_plugins=reload_plugins,
             responder_candidates_for_room=self.deps.turn_policy.responder_candidates_for_room,
+            controller_identity=self.deps.controller_identity,
+            agent_reply_memberships=self.deps.runtime.agent_reply_memberships,
+            config_provider=lambda: orchestrator.config if orchestrator is not None else self.deps.runtime.config,
         )
         await handle_command(
             context=context,
@@ -162,6 +204,7 @@ class CommandTurnExecutor:
             event=event,
             command=command,
             requester_user_id=requester_user_id,
+            acts_for_requester=event.acts_for_requester,
         )
 
     def _matrix_admin(self) -> HookMatrixAdmin | None:
@@ -191,7 +234,7 @@ class CommandTurnExecutor:
             response_event_id,
         ):
             return False
-        self.deps.turn_store.record_responded_turn(
+        await self.deps.turn_store.record_responded_turn(
             canonicalize_turn_record(command_turn, response_event_id=response_event_id),
         )
         return True
@@ -202,9 +245,9 @@ class CommandTurnExecutor:
         *,
         command_execution_started: bool | None = None,
         command_result_text: str | None = None,
+        command_result_extra_content: CommandResultContent | None = None,
     ) -> TurnRecord:
-        persisted_turn = await asyncio.to_thread(
-            self.deps.turn_store.record_pending_turn,
+        persisted_turn = await self.deps.turn_store.record_pending_turn(
             canonicalize_turn_record(
                 command_turn,
                 command_execution_started=(
@@ -213,6 +256,7 @@ class CommandTurnExecutor:
                     else command_execution_started
                 ),
                 command_result_text=command_result_text,
+                command_result_extra_content=command_result_extra_content,
             ),
         )
         if persisted_turn is None or persisted_turn.completed:
@@ -232,10 +276,15 @@ class CommandTurnExecutor:
             command_turn,
             target=target,
             response_text=response_text,
+            # The same turn as the live send above, deliberately. A resumed
+            # command reaches the room through whichever of the two paths runs
+            # first, so both must key the same outbox row: whichever loses the
+            # race finds the answer already acknowledged instead of sending it
+            # a second time.
             recovered_response_event_id=recovered_response_event_id,
             skip_mentions=True,
         )
-        self.deps.turn_store.record_responded_turn(
+        await self.deps.turn_store.record_responded_turn(
             canonicalize_turn_record(command_turn, response_event_id=response_event_id),
         )
 
@@ -270,7 +319,7 @@ class CommandTurnExecutor:
     async def execute_if_owned(
         self,
         room: nio.MatrixRoom,
-        event: TextDispatchEvent,
+        event: PreparedIngress,
         requester_user_id: str,
         command: Command,
         *,
@@ -278,6 +327,12 @@ class CommandTurnExecutor:
         handled_turn: TurnRecord,
     ) -> bool:
         """Execute only on the bot that owns this command response."""
+        if command.type is CommandType.MODEL and model_selection_targets_other_runtime(
+            event.source.get("content", {}),
+            self._client().user_id,
+            self._client().device_id,
+        ):
+            return False
         if not agent_owns_command(
             command,
             agent_name=self.deps.agent_name,

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
-from mindroom.openai_models import _coalesced_openrouter_reasoning_details
+from mindroom.providers.agno_compat_openrouter_reasoning import coalesced_openrouter_reasoning_details
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REQUIRED_COLUMNS = frozenset({"session_id", "runs"})
@@ -134,7 +134,7 @@ def _normalize_value(value: JsonValue) -> JsonValue:
     for key, child in value.items():
         normalized_child = _normalize_value(child)
         if key == "reasoning_details":
-            normalized_child = cast("JsonValue", _coalesced_openrouter_reasoning_details(normalized_child))
+            normalized_child = cast("JsonValue", coalesced_openrouter_reasoning_details(normalized_child))
         normalized[key] = normalized_child
     return normalized
 

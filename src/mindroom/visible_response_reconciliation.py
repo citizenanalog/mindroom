@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mindroom.constants import STREAM_STATUS_COMPLETED, STREAM_STATUS_KEY, VISIBLE_ROUTER_VOICE_ECHO_KEY
 from mindroom.delivery_gateway import SendTextRequest
-from mindroom.matrix.client_thread_history import find_response_event_ids_via_room_messages
+from mindroom.matrix.room_history_reads import find_response_event_ids_via_room_messages
+from mindroom.model_selection import command_result_content_to_dict
 from mindroom.turn_record import canonicalize_turn_record
 
 if TYPE_CHECKING:
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from mindroom.delivery_gateway import DeliveryGateway
     from mindroom.handled_turns import TurnRecord
     from mindroom.message_target import MessageTarget
+    from mindroom.reply_scope import ReplyRuntime
     from mindroom.runtime_protocols import SupportsClientConfig
     from mindroom.turn_store import TurnStore
 
@@ -34,6 +35,7 @@ class VisibleResponseReconcilerDeps:
     turn_store: TurnStore
     delivery_gateway: DeliveryGateway
     settle_ignored_sources: Callable[[tuple[str, ...]], Awaitable[None]]
+    replies: ReplyRuntime
 
 
 @dataclass
@@ -129,10 +131,18 @@ class VisibleResponseReconciler:
         """Compact exact callback obligations without growing the handled-turn ledger."""
         await self.deps.settle_ignored_sources(handled_turn.source_event_ids)
 
+    async def settle_superseded_turn(self, handled_turn: TurnRecord) -> bool:
+        """Discard a superseded replay unless what it would answer still owes Matrix a write."""
+        superseded = await self.deps.delivery_gateway.supersede_replay(handled_turn.source_event_ids)
+        if superseded is not None:
+            # The reply's records settled what the replay would have answered.
+            return superseded
+        await self.settle_source_events_ignored(handled_turn)
+        return True
+
     async def record_pending_visible_response(self, handled_turn: TurnRecord, response_event_id: str) -> None:
         """Durably bind one visible response to its incomplete turn before generation."""
-        await asyncio.to_thread(
-            self.deps.turn_store.record_pending_turn,
+        await self.deps.turn_store.record_pending_turn(
             canonicalize_turn_record(handled_turn, response_event_id=response_event_id, completed=False),
         )
 
@@ -145,22 +155,94 @@ class VisibleResponseReconciler:
         recovered_response_event_id: str | None,
         skip_mentions: bool = False,
     ) -> str | None:
-        """Send and durably bind one non-model reply unless recovery already found it."""
+        """Send and durably bind one non-model reply unless recovery already found it.
+
+        Every reply here has a turn behind it, so every one goes through the
+        same claim-before-send row a model answer uses. Two things follow from
+        that, and both are the point.
+
+        The journal sources this turn answers settle inside the enqueue, so the
+        answer becoming durably owed and the turn stopping being the journal's
+        work are one commit. On the direct path the terminal record would land
+        in the handled-turn ledger first and the journal would settle
+        afterwards, leaving a window where a pending row describes finished
+        work -- the window the degraded replay guard has to consult two records
+        to survive.
+
+        And a crashed send is recovered by resending the frozen row rather than
+        by scanning the room for what might already be there. The scan still
+        runs ahead of the send here, because a row from a previous membership
+        is gone and its answer is not, but it stops being the only thing
+        standing between a crash and a lost reply.
+
+        Only callers that send exactly once per turn may use this. The outbox
+        freezes a row at its first attempt, so a second send for the same turn
+        would be refused and its text would never reach the room.
+
+        A send that genuinely is not a turn -- a voice echo, a reconciliation
+        notice -- has no identity a restart can resolve and does not belong
+        here at all; it builds its own ``SendTextRequest`` and the gateway
+        gives it the direct path.
+        """
         if recovered_response_event_id is not None:
             return recovered_response_event_id
         response_event_id = await self.deps.delivery_gateway.send_text(
-            SendTextRequest(target=target, response_text=response_text, skip_mentions=skip_mentions),
+            SendTextRequest(
+                target=target,
+                response_text=response_text,
+                extra_content=command_result_content_to_dict(handled_turn.command_result_extra_content),
+                skip_mentions=skip_mentions,
+                delivery_turn_id=handled_turn.anchor_event_id,
+            ),
         )
         if response_event_id is not None:
             await self.record_pending_visible_response(handled_turn, response_event_id)
         return response_event_id
+
+    async def deliver_selection_acknowledgement(
+        self,
+        handled_turn: TurnRecord,
+        *,
+        target: MessageTarget,
+        response_text: str,
+        delivery_turn_id: str,
+    ) -> tuple[str | None, str | None]:
+        """Send an interactive selection's acknowledgement, which creates the reply its answer then edits.
+
+        Returns the acknowledgement's event and the span it created for the
+        answer to adopt. A retry resolves to the row its first
+        attempt recorded, so it neither sends nor creates a second reply.
+        """
+        replies = self.deps.replies
+        event_id = await self.deps.delivery_gateway.send_text(
+            SendTextRequest(
+                target=target,
+                response_text=response_text,
+                reply_write=await replies.acknowledgement(
+                    delivery_id=delivery_turn_id,
+                    pending=tuple(dict.fromkeys((delivery_turn_id, *handled_turn.source_event_ids))),
+                    logical=handled_turn.source_event_ids,
+                    discovery=handled_turn.discovery_event_ids,
+                    room_id=target.room_id,
+                    thread_id=target.resolved_thread_id,
+                    text=response_text,
+                ),
+            ),
+        )
+        if event_id is None:
+            return None, None
+        # The answer adopts the acknowledgement's span until some span has run it.
+        reply = await replies.store.replies.for_event(event_id)
+        if reply is None:
+            return event_id, None
+        span = await replies.store.replies.span(reply.last_span_id)
+        return event_id, span.span_id if span is not None and span.outcome is None else None
 
     async def prepare_visible_delivery_turn(
         self,
         handled_turn: TurnRecord,
         *,
         requester_id: str,
-        correlation_id: str,
         target: MessageTarget,
         excluded_event_ids: Collection[str] = (),
     ) -> tuple[TurnRecord | None, str | None]:
@@ -172,12 +254,11 @@ class VisibleResponseReconciler:
             canonicalize_turn_record(
                 handled_turn,
                 requester_id=requester_id,
-                correlation_id=correlation_id,
             ),
             history_scope=None,
             conversation_target=target,
         )
-        pending_turn = await asyncio.to_thread(self.deps.turn_store.record_pending_turn, tracked_turn)
+        pending_turn = await self.deps.turn_store.record_pending_turn(tracked_turn)
         if pending_turn is None or pending_turn.completed:
             return None, None
         if pending_turn.redacted_source_event_ids:

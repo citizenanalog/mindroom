@@ -20,15 +20,14 @@ from agno.session.summary import SessionSummary
 from agno.tools.function import Function
 
 from mindroom.agent_storage import create_session_storage, get_agent_session
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import CompactionConfig, DefaultsConfig, ModelConfig
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.custom_tools.compact_context import CompactContextTools
 from mindroom.history.manual import request_compaction_before_next_reply
-from mindroom.history.runtime import ScopeSessionContext, open_scope_session_context
-from mindroom.history.storage import read_scope_state, write_scope_state
+from mindroom.history.session_context import ScopeSessionContext, open_scope_session_context
+from mindroom.history.storage import read_scope_state, set_force_compaction_state
 from mindroom.history.types import (
     CompactionLifecycleStart,
     CompactionOutcome,
@@ -37,18 +36,24 @@ from mindroom.history.types import (
 )
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
-from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_PASSWORD,
     FakeModel,
     bind_runtime_paths,
     delivered_matrix_side_effect,
-    install_runtime_cache_support,
-    make_conversation_cache_mock,
-    make_event_cache_mock,
+    install_runtime_journal_support,
+    make_conversation_reader_mock,
+    make_relation_lookup,
     prepare_history_for_run_for_test,
+    seed_session,
 )
+from tests.history_helpers import archived_run_ids
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -213,7 +218,7 @@ async def test_compact_context_sets_force_flag_for_agent_scope(tmp_path: Path) -
     config, runtime_paths = _make_config(tmp_path)
     identity = _execution_identity()
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=identity)
-    storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
+    seed_session(storage, _session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -236,7 +241,7 @@ def test_request_compaction_before_next_reply_is_public_manual_seam(tmp_path: Pa
     config, runtime_paths = _make_config(tmp_path)
     identity = _execution_identity()
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=identity)
-    storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
+    seed_session(storage, _session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
     session_state: dict[str, object] = {}
 
     result = request_compaction_before_next_reply(
@@ -263,7 +268,7 @@ async def test_compact_context_requires_compaction_window(tmp_path: Path) -> Non
     config, runtime_paths = _make_config_with_context_window(tmp_path, context_window=None)
     identity = _execution_identity()
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=identity)
-    storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
+    seed_session(storage, _session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -347,7 +352,7 @@ async def test_compact_context_requires_positive_summary_input_budget(tmp_path: 
     config, runtime_paths = _make_config_with_context_window(tmp_path, context_window=4096)
     identity = _execution_identity()
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=identity)
-    storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
+    seed_session(storage, _session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -377,7 +382,7 @@ async def test_compact_context_requires_summary_input_budget_with_retry_headroom
     )
     identity = _execution_identity()
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=identity)
-    storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
+    seed_session(storage, _session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -427,7 +432,7 @@ async def test_compact_context_can_use_compaction_model_window_when_active_model
             _completed_run("run-4", agent_id="test_agent"),
         ],
     )
-    storage.upsert_session(session)
+    seed_session(storage, session)
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -441,7 +446,7 @@ async def test_compact_context_can_use_compaction_model_window_when_active_model
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -482,7 +487,7 @@ async def test_compact_context_can_use_compaction_model_window_when_active_model
 async def test_compaction_lifecycle_success_edits_notice_with_html_body(tmp_path: Path) -> None:
     """Lifecycle completion edits should reuse the outcome notice text."""
     config, runtime_paths = _make_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=AgentMatrixUser(
             agent_name="test_agent",
             password=TEST_PASSWORD,
@@ -495,7 +500,7 @@ async def test_compaction_lifecycle_success_edits_notice_with_html_body(tmp_path
         rooms=["!room:localhost"],
     )
     bot.client = AsyncMock()
-    install_runtime_cache_support(bot)
+    install_runtime_journal_support(bot)
     outcome = CompactionOutcome(
         mode="auto",
         session_id="session-1",
@@ -516,11 +521,11 @@ async def test_compaction_lifecycle_success_edits_notice_with_html_body(tmp_path
     target = MessageTarget.resolve("!room:localhost", None, "$reply")
     with (
         patch(
-            "mindroom.delivery_gateway.send_message_result",
+            "mindroom.delivery_gateway.send_message_outcome",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$notice")),
         ) as mock_send,
         patch(
-            "mindroom.delivery_gateway.edit_message_result",
+            "mindroom.delivery_gateway.edit_message_outcome",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$notice-edit")),
         ) as mock_edit,
     ):
@@ -566,7 +571,7 @@ async def test_compact_context_sets_force_flag_for_team_scope_only(tmp_path: Pat
     config, runtime_paths = _make_config(tmp_path)
     identity = _execution_identity()
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=identity)
-    storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
+    seed_session(storage, _session("session-1", runs=[_completed_run("run-1", agent_id="test_agent")]))
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -586,7 +591,7 @@ async def test_compact_context_sets_force_flag_for_team_scope_only(tmp_path: Pat
         create_session_if_missing=True,
     ) as team_context:
         assert team_context.session is not None
-        team_context.storage.upsert_session(team_context.session)
+        seed_session(team_context.storage, team_context.session)
     await tool.compact_context(agent=team_agent)
 
     persisted = get_agent_session(storage, "session-1")
@@ -613,17 +618,13 @@ async def test_prepare_history_for_run_clears_forced_flag_when_no_visible_runs(t
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=_execution_identity())
     session = _session("session-1")
     scope = HistoryScope(kind="agent", scope_id="test_agent")
-    write_scope_state(
-        session,
-        scope,
-        HistoryScopeState(force_compact_before_next_run=True),
-    )
-    storage.upsert_session(session)
+    set_force_compaction_state(session, scope, HistoryScopeState(), force=True)
+    seed_session(storage, session)
 
     summary_mock = AsyncMock()
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -664,17 +665,13 @@ async def test_prepare_history_for_run_forced_compaction_compacts_single_run(tmp
         ],
     )
     scope = HistoryScope(kind="agent", scope_id="test_agent")
-    write_scope_state(
-        session,
-        scope,
-        HistoryScopeState(force_compact_before_next_run=True),
-    )
-    storage.upsert_session(session)
+    set_force_compaction_state(session, scope, HistoryScopeState(), force=True)
+    seed_session(storage, session)
 
     agent = _agent()
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -703,7 +700,7 @@ async def test_prepare_history_for_run_forced_compaction_compacts_single_run(tmp
     assert persisted.runs == []
     state = read_scope_state(persisted, scope)
     assert state.force_compact_before_next_run is False
-    assert state.last_compacted_run_count == 1
+    assert len(archived_run_ids(storage)) == 1
     assert len(prepared.compaction_outcomes) == 1
 
 
@@ -720,7 +717,7 @@ async def test_compact_context_persists_pending_force_flag_across_stale_run_save
             _completed_run("run-2", agent_id="test_agent"),
         ],
     )
-    storage.upsert_session(session)
+    seed_session(storage, session)
 
     tool = CompactContextTools(
         agent_name="test_agent",
@@ -743,11 +740,11 @@ async def test_compact_context_persists_pending_force_flag_across_stale_run_save
     result = await tool.compact_context(agent=_agent(), run_context=run_context)
     assert result == COMPACT_CONTEXT_SUCCESS
     assert run_context.session_state is live_session_state
-    storage.upsert_session(stale_live_session)
+    seed_session(storage, stale_live_session)
 
     with (
         patch(
-            "mindroom.model_loading.get_model_instance",
+            "mindroom.providers.model_loading.get_model_instance",
             return_value=FakeModel(id="summary-model", provider="fake"),
         ),
         patch(
@@ -793,7 +790,7 @@ async def test_compact_context_uses_stable_team_scope_storage(tmp_path: Path) ->
         runtime_paths,
     )
     legacy_storage = create_session_storage("alpha", config, runtime_paths, execution_identity=None)
-    legacy_storage.upsert_session(_session("session-1", runs=[_completed_run("run-1", agent_id="alpha")]))
+    seed_session(legacy_storage, _session("session-1", runs=[_completed_run("run-1", agent_id="alpha")]))
 
     identity = _execution_identity(agent_name="beta")
     tool = CompactContextTools(
@@ -863,9 +860,9 @@ async def test_compact_context_uses_active_team_model_from_runtime_context(tmp_p
     ) as team_context:
         assert team_context.session is not None
         team_context.session.runs = [_completed_run("run-1", agent_id="test_agent")]
-        team_context.storage.upsert_session(team_context.session)
+        seed_session(team_context.storage, team_context.session)
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="test_agent",
         target=MessageTarget(
             room_id="!room:localhost",
@@ -878,8 +875,8 @@ async def test_compact_context_uses_active_team_model_from_runtime_context(tmp_p
         client=SimpleNamespace(),
         config=config,
         runtime_paths=runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=make_conversation_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         active_model_name="large",
     )
 
@@ -948,9 +945,9 @@ async def test_compact_context_uses_room_resolved_team_model_when_runtime_model_
     ) as team_context:
         assert team_context.session is not None
         team_context.session.runs = [_completed_run("run-1", agent_id="test_agent")]
-        team_context.storage.upsert_session(team_context.session)
+        seed_session(team_context.storage, team_context.session)
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="test_agent",
         target=MessageTarget(
             room_id="!room:localhost",
@@ -963,8 +960,8 @@ async def test_compact_context_uses_room_resolved_team_model_when_runtime_model_
         client=SimpleNamespace(),
         config=config,
         runtime_paths=runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=make_conversation_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         active_model_name=None,
     )
 
@@ -1029,9 +1026,9 @@ async def test_compact_context_uses_room_resolved_agent_model_when_runtime_model
     ) as scope_context:
         assert scope_context.session is not None
         scope_context.session.runs = [_completed_run("run-1", agent_id="test_agent")]
-        scope_context.storage.upsert_session(scope_context.session)
+        seed_session(scope_context.storage, scope_context.session)
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="test_agent",
         target=MessageTarget(
             room_id="!room:localhost",
@@ -1044,8 +1041,8 @@ async def test_compact_context_uses_room_resolved_agent_model_when_runtime_model
         client=SimpleNamespace(),
         config=config,
         runtime_paths=runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=make_conversation_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         active_model_name=None,
     )
 

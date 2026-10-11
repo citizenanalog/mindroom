@@ -1,31 +1,48 @@
 """Persist canonical turn records for one runtime entity.
 
-Reads are served from in-memory state shared across every ledger bound to the
-same responses file, so sibling ledger instances in one process observe each
-other's writes without touching the filesystem. Disk persistence uses one
-ordered drain per ledger on a bounded process-wide worker pool. One runtime
-process owns semantic ordering; an advisory lock keeps file updates atomic
-without blocking the event loop on filesystem I/O (issue #1260).
+"Has this turn finished?" is the fact this module owns, and it now lives in the
+journal's own database rather than a JSON file beside it. That is the whole
+point: a terminal record and the settlement of the journal sources it answers
+can only agree by being in one transaction, and a separate substrate can never
+join one. Everything that existed to make two substrates approximately agree --
+a write-behind queue, durability barriers, a retry timer, corruption
+quarantine, and a startup pass that rejoined acknowledged deliveries to records
+that had not caught up -- is deleted rather than ported, because awaiting the
+write *is* the durability wait.
+
+Reads stay synchronous and are served from in-memory state shared by every
+ledger for one agent, so sibling instances in a process observe each other's
+writes. That map is populated once by ``load`` and not lazily: a synchronous
+read cannot await a database, and pretending otherwise is exactly the
+sync-over-async bridge this change removes. Callers warm the ledger during
+startup, before anything can ask it a question.
+
+The scope is the agent, not the journal principal. A turn record is the proof
+that a message was already answered, and that stays true across a re-login,
+while every other table here is only meaningful beside the sync that produced
+it. Transactionality comes from sharing the database, not the scope key.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import threading
 import time
 import typing
 from collections.abc import Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
 from mindroom import constants
-from mindroom.durable_write import write_json_file_durable
-from mindroom.file_locks import advisory_file_lock
+from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.history.types import HistoryScope
+from mindroom.legacy_handled_turns import import_legacy_ledger, restore_legacy_revision_replay
 from mindroom.logging_config import get_logger
 from mindroom.message_target import MessageTarget
+from mindroom.model_selection import command_result_content_to_dict, freeze_command_result_content
 from mindroom.turn_record import (
     SourceEventMetadata,
     SourceEventRevision,
@@ -35,11 +52,14 @@ from mindroom.turn_record import (
     canonicalize_turn_record,
     merge_edit_facts,
     same_turn_identity,
+    sanitize_revision_replay,
 )
 
 if typing.TYPE_CHECKING:
     from collections.abc import Callable, Collection, Sequence
     from pathlib import Path
+
+    from mindroom.event_journal.store import TurnRecordStore
 
 logger = get_logger(__name__)
 
@@ -51,54 +71,12 @@ __all__ = [
     "TurnRecordCodec",
     "canonicalize_turn_record",
     "merge_edit_facts",
-    "with_user_stop",
+    "resolve_turn_record",
 ]
-
-_TURN_RECORD_SCHEMA_VERSION = 1
-_LEDGER_SCHEMA_VERSION_KEY = "schema_version"
-_LEDGER_RECORDS_KEY = "records"
-# Let independent agent ledgers make progress without allowing unbounded
-# concurrent durable writes and fsync pressure.
-_PERSIST_EXECUTOR_MAX_WORKERS = 8
-_PERSIST_RETRY_INITIAL_DELAY_SECONDS = 0.05
-_PERSIST_RETRY_MAX_DELAY_SECONDS = 5.0
-
-
-def with_user_stop(
-    turn_record: TurnRecord,
-    response_event_id: str,
-    stop_receipt_order: int,
-    *,
-    delivery_settled: bool = False,
-) -> TurnRecord:
-    """Return the monotonic durable state for one admitted STOP callback."""
-    if isinstance(stop_receipt_order, bool) or stop_receipt_order <= 0:
-        msg = "User-stop receipt order must be positive"
-        raise ValueError(msg)
-    return canonicalize_turn_record(
-        turn_record,
-        response_event_id=response_event_id,
-        completed=True,
-        user_stop_receipt_order=max(
-            stop_receipt_order,
-            turn_record.user_stop_receipt_order or stop_receipt_order,
-        ),
-        user_stop_settled_receipt_order=max(
-            turn_record.user_stop_settled_receipt_order or 0,
-            stop_receipt_order if delivery_settled else 0,
-        )
-        or None,
-        timestamp=0.0,
-    )
 
 
 class TurnRecordCodec:
     """Encode the canonical record into its two intentional physical projections."""
-
-    @staticmethod
-    def schema_version() -> int:
-        """Return the persisted schema version emitted by this codec."""
-        return _TURN_RECORD_SCHEMA_VERSION
 
     @staticmethod
     def _to_ledger_record(record: TurnRecord) -> dict[str, object]:  # noqa: C901, PLR0912
@@ -107,13 +85,19 @@ class TurnRecordCodec:
             "anchor_event_id": record.anchor_event_id,
             "source_event_ids": list(record.source_event_ids),
             "redacted_source_event_ids": list(record.redacted_source_event_ids),
-            "pending_redaction_cleanup_event_ids": list(record.pending_redaction_cleanup_event_ids),
             "response_event_id": record.response_event_id,
             "completed": record.completed,
             "timestamp": record.timestamp,
+            "revision_replay": {
+                event_id: revision.to_record() for event_id, revision in (record.revision_replay or {}).items()
+            },
         }
         if record.discovery_event_ids:
             payload["discovery_event_ids"] = list(record.discovery_event_ids)
+        if record.prepared_voice_sources is not None:
+            payload["prepared_voice_sources"] = {
+                event_id: prepared.to_record() for event_id, prepared in record.prepared_voice_sources.items()
+            }
         if record.visible_echo_event_id is not None:
             payload["visible_echo_event_id"] = record.visible_echo_event_id
         if record.visible_echo_is_fallback is not None:
@@ -128,12 +112,6 @@ class TurnRecordCodec:
             payload["suppressed_source_event_revisions"] = {
                 event_id: list(revision) for event_id, revision in record.suppressed_source_event_revisions.items()
             }
-        if record.latest_edit_receipt_order is not None:
-            payload["latest_edit_receipt_order"] = record.latest_edit_receipt_order
-        if record.user_stop_receipt_order is not None:
-            payload["user_stop_receipt_order"] = record.user_stop_receipt_order
-        if record.user_stop_settled_receipt_order is not None:
-            payload["user_stop_settled_receipt_order"] = record.user_stop_settled_receipt_order
         if record.source_event_metadata is not None:
             payload["source_event_metadata"] = {
                 event_id: metadata._to_record() for event_id, metadata in record.source_event_metadata.items()
@@ -142,12 +120,14 @@ class TurnRecordCodec:
             payload["response_owner"] = record.response_owner
         if record.requester_id is not None:
             payload["requester_id"] = record.requester_id
-        if record.correlation_id is not None:
-            payload["correlation_id"] = record.correlation_id
         if record.command_execution_started:
             payload["command_execution_started"] = True
         if record.command_result_text is not None:
             payload["command_result_text"] = record.command_result_text
+        if record.command_result_extra_content is not None:
+            payload["command_result_extra_content"] = command_result_content_to_dict(
+                record.command_result_extra_content,
+            )
         if record.history_scope is not None:
             payload["history_scope"] = record.history_scope.to_metadata()
         if record.conversation_target is not None:
@@ -156,14 +136,37 @@ class TurnRecordCodec:
 
     @staticmethod
     def _from_ledger_record(event_id: str, raw_record: object) -> TurnRecord | None:
-        """Parse one record from the current ledger schema without legacy migration."""
+        """Parse one record from the current ledger schema without legacy migration.
+
+        Every field is read by name, so a key an older writer emitted and this
+        one no longer knows about is dropped rather than rejected. That is what
+        lets an optional field be retired without a schema version bump, which
+        would quarantine every existing ledger file and discard the live turn
+        identity in it over a field nothing reads.
+        """
         if not isinstance(raw_record, Mapping):
             return None
         record = typing.cast("Mapping[str, object]", raw_record)
         raw_source_event_ids = record.get("source_event_ids")
         raw_discovery_event_ids = record.get("discovery_event_ids", [])
         raw_redacted_source_event_ids = record.get("redacted_source_event_ids", [])
-        raw_pending_redaction_cleanup_event_ids = record.get("pending_redaction_cleanup_event_ids", [])
+        # LEGACY_COMPAT: Ledger records carrying redaction cleanup obligations.
+        # Legacy format: A stored record with pending_redaction_cleanup_event_ids, and revision replay
+        # entries with cleanup_pending, naming session cleanup still owed for its tombstoned sources.
+        # Last legacy release: v2026.10.145; replacement: the next release derives session cleanup at
+        # each response from the history's own event ids against the journal and ledger tombstones.
+        # Handling: Both keys are ignored on read and dropped on the next write; every owed event is
+        # also a ledger tombstone, so the next response of each affected history finds and removes it.
+        # Coverage: tests/test_handled_turns.py::test_stored_cleanup_obligations_are_ignored_on_read.
+        # LEGACY_COMPAT: Turn records carrying Stop, edit order, and correlation state.
+        # Legacy format: A stored record with user_stop_receipt_order, user_stop_settled_receipt_order,
+        # latest_edit_receipt_order, or correlation_id.
+        # Last legacy release: v2026.10.227; replacement: the unreleased durable reply messages own Stop and edit
+        # state in reply_messages and reply_spans.
+        # Handling: The keys are ignored on read and dropped on the next write; an edit of an answer that has no
+        # reply record regenerates nothing.
+        # Coverage: tests/test_handled_turns.py::test_stored_stop_and_edit_order_keys_are_ignored_on_read,
+        # tests/test_edit_regenerator.py::test_edit_without_previous_response_event_is_skipped.
         anchor_event_id = record.get("anchor_event_id")
         completed = record.get("completed")
         timestamp = record.get("timestamp")
@@ -172,7 +175,6 @@ class TurnRecordCodec:
             not isinstance(raw_source_event_ids, list)
             or not isinstance(raw_discovery_event_ids, list)
             or not isinstance(raw_redacted_source_event_ids, list)
-            or not isinstance(raw_pending_redaction_cleanup_event_ids, list)
             or not isinstance(anchor_event_id, str)
             or not anchor_event_id
             or not isinstance(completed, bool)
@@ -188,9 +190,6 @@ class TurnRecordCodec:
             source_event_ids,
             discovery_event_ids=canonical_source_event_ids(raw_discovery_event_ids),
             redacted_source_event_ids=canonical_source_event_ids(raw_redacted_source_event_ids),
-            pending_redaction_cleanup_event_ids=canonical_source_event_ids(
-                raw_pending_redaction_cleanup_event_ids,
-            ),
             anchor_event_id=anchor_event_id,
             response_event_id=response_event_id,
             completed=completed,
@@ -198,143 +197,88 @@ class TurnRecordCodec:
             visible_echo_is_fallback=_bool_or_none(record.get("visible_echo_is_fallback")),
             source_event_prompts=_mapping_or_none(record.get("source_event_prompts")),
             source_event_revisions=_mapping_or_none(record.get("source_event_revisions")),
+            revision_replay=_mapping_or_none(record.get("revision_replay")),
             suppressed_source_event_revisions=_mapping_or_none(
                 record.get("suppressed_source_event_revisions"),
             ),
-            latest_edit_receipt_order=_positive_int_or_none(record.get("latest_edit_receipt_order")),
-            user_stop_receipt_order=_positive_int_or_none(record.get("user_stop_receipt_order")),
-            user_stop_settled_receipt_order=_positive_int_or_none(
-                record.get("user_stop_settled_receipt_order"),
-            ),
             source_event_metadata=_mapping_or_none(record.get("source_event_metadata")),
+            prepared_voice_sources=_mapping_or_none(record.get("prepared_voice_sources")),
             response_owner=canonical_optional_string(record.get("response_owner")),
             requester_id=canonical_optional_string(record.get("requester_id")),
-            correlation_id=canonical_optional_string(record.get("correlation_id")),
             command_execution_started=record.get("command_execution_started") is True,
             command_result_text=canonical_optional_string(record.get("command_result_text")),
+            command_result_extra_content=freeze_command_result_content(record.get("command_result_extra_content")),
             history_scope=HistoryScope.from_metadata(record.get("history_scope")),
             conversation_target=MessageTarget.from_metadata(record.get("conversation_target")),
             timestamp=float(timestamp),
         )
         if event_id not in turn_record.indexed_event_ids:
             return None
-        return turn_record
+        return restore_legacy_revision_replay(turn_record, record)
 
     @staticmethod
-    def to_run_metadata(record: TurnRecord) -> dict[str, object]:  # noqa: C901
-        """Project one record into the recoverable subset stored with an Agno run."""
+    def to_run_metadata(record: TurnRecord) -> dict[str, object]:
+        """Project the record's sources, prompts, and revisions that history and request logs read from an Agno run."""
         if not record.source_event_ids:
             return {}
         metadata: dict[str, object] = {
-            constants.MATRIX_TURN_SCHEMA_VERSION_METADATA_KEY: TurnRecordCodec.schema_version(),
             constants.MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: list(record.source_event_ids),
         }
         if record.discovery_event_ids:
             metadata[constants.MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY] = list(record.discovery_event_ids)
-        if record.redacted_source_event_ids:
-            metadata[constants.MATRIX_TURN_REDACTED_SOURCE_EVENT_IDS_METADATA_KEY] = list(
-                record.redacted_source_event_ids,
-            )
         if record.source_event_prompts is not None:
             metadata[constants.MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY] = dict(record.source_event_prompts)
         if record.source_event_revisions is not None:
             metadata[constants.MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY] = {
                 event_id: list(revision) for event_id, revision in record.source_event_revisions.items()
             }
-        if record.source_event_metadata is not None:
-            metadata[constants.MATRIX_SOURCE_EVENT_METADATA_KEY] = {
-                event_id: source_metadata._to_record()
-                for event_id, source_metadata in record.source_event_metadata.items()
-            }
-        if record.response_owner is not None:
-            metadata[constants.MATRIX_RESPONSE_OWNER_METADATA_KEY] = record.response_owner
         if record.requester_id is not None:
             metadata["requester_id"] = record.requester_id
-        if record.history_scope is not None:
-            metadata[constants.MATRIX_HISTORY_SCOPE_METADATA_KEY] = record.history_scope.to_metadata()
-        if record.conversation_target is not None:
-            metadata[constants.MATRIX_CONVERSATION_TARGET_METADATA_KEY] = record.conversation_target.to_metadata()
         return metadata
 
-    @staticmethod
-    def from_run_metadata(metadata: Mapping[str, object]) -> TurnRecord | None:
-        """Parse current Agno metadata, using response linkage as terminal-delivery evidence."""
-        if metadata.get(constants.MATRIX_TURN_SCHEMA_VERSION_METADATA_KEY) != TurnRecordCodec.schema_version():
-            return None
-        anchor_event_id = metadata.get(constants.MATRIX_EVENT_ID_METADATA_KEY)
-        if not isinstance(anchor_event_id, str) or not anchor_event_id:
-            return None
-        raw_source_event_ids = metadata.get(constants.MATRIX_SOURCE_EVENT_IDS_METADATA_KEY)
-        raw_discovery_event_ids = metadata.get(constants.MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY)
-        raw_redacted_source_event_ids = metadata.get(
-            constants.MATRIX_TURN_REDACTED_SOURCE_EVENT_IDS_METADATA_KEY,
-        )
-        source_event_ids = (
-            canonical_source_event_ids(raw_source_event_ids)
-            if isinstance(raw_source_event_ids, list)
-            else (anchor_event_id,)
-        ) or (anchor_event_id,)
-        response_event_id = canonical_optional_string(metadata.get(constants.MATRIX_RESPONSE_EVENT_ID_METADATA_KEY))
-        return TurnRecord.create(
-            source_event_ids,
-            discovery_event_ids=(
-                canonical_source_event_ids(raw_discovery_event_ids) if isinstance(raw_discovery_event_ids, list) else ()
-            ),
-            redacted_source_event_ids=(
-                canonical_source_event_ids(raw_redacted_source_event_ids)
-                if isinstance(raw_redacted_source_event_ids, list)
-                else ()
-            ),
-            anchor_event_id=anchor_event_id,
-            response_event_id=response_event_id,
-            completed=response_event_id is not None,
-            source_event_prompts=_mapping_or_none(metadata.get(constants.MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY)),
-            source_event_revisions=_mapping_or_none(
-                metadata.get(constants.MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY),
-            ),
-            source_event_metadata=_mapping_or_none(metadata.get(constants.MATRIX_SOURCE_EVENT_METADATA_KEY)),
-            response_owner=canonical_optional_string(metadata.get(constants.MATRIX_RESPONSE_OWNER_METADATA_KEY)),
-            requester_id=canonical_optional_string(metadata.get("requester_id")),
-            correlation_id=canonical_optional_string(metadata.get("correlation_id")),
-            history_scope=HistoryScope.from_metadata(metadata.get(constants.MATRIX_HISTORY_SCOPE_METADATA_KEY)),
-            conversation_target=MessageTarget.from_metadata(
-                metadata.get(constants.MATRIX_CONVERSATION_TARGET_METADATA_KEY),
-            ),
-        )
 
+@dataclass(frozen=True)
+class _PendingLedgerWrite:
+    """One provisional mutation and the identities held until its outcome settles."""
 
-@dataclass
-class _PersistRequest:
-    """One ordered ledger persist request and its exact durability waiter."""
-
-    records: tuple[TurnRecord, ...]
-    completion: Future[None] | None
-    on_persisted: Callable[[], None] | None = None
+    record: TurnRecord
+    superseded: dict[str, TurnRecord | None]
+    keys: frozenset[str]
+    settled: asyncio.Future[None]
 
 
 @dataclass
 class _LedgerState:
-    """In-memory canonical records shared by every ledger bound to one file."""
+    """In-memory canonical records shared by every ledger for one agent."""
 
     responses: dict[str, TurnRecord] = field(default_factory=dict)
+    conversation_responses: dict[str, dict[str, TurnRecord]] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    # Reserve conflicting identities briefly; cleanup holds this mutex while
+    # draining active writes. Unrelated updates may await persistence together.
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    pending_writes: dict[str, asyncio.Future[None]] = field(default_factory=dict, repr=False)
     loaded: bool = False
-    persist_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    pending_persists: list[_PersistRequest] = field(default_factory=list, repr=False)
-    persist_active: bool = False
-    persist_retry_timer: threading.Timer | None = field(default=None, repr=False)
-    persist_retry_delay_seconds: float = _PERSIST_RETRY_INITIAL_DELAY_SECONDS
-    shutting_down: bool = False
 
 
 _LEDGER_STATES: dict[str, _LedgerState] = {}
 _LEDGER_RUNTIME_LOCK = threading.Lock()
-_PERSIST_EXECUTOR: ThreadPoolExecutor | None = None
 
 
-def _shared_ledger_state(responses_file: Path) -> _LedgerState:
-    """Return the process-wide shared state for one responses file."""
-    key = str(responses_file.absolute())
+def _shared_ledger_state(store_key: str, agent_name: str) -> _LedgerState:
+    """Return the process-wide shared state for one agent's records in one store.
+
+    Two ledgers for one agent in one database must observe each other's writes,
+    or a turn answered through one could be answered again through the other.
+
+    The database has to be part of the key as well as the agent. Keyed by agent
+    alone, two ledgers over *different* databases alias: the second binds to
+    state the first already marked loaded, skips its own read, and answers
+    "handled" from rows its database has never held. One process normally owns
+    one database, but tests routinely open several, which is exactly where that
+    aliasing turns into a green run that proves nothing.
+    """
+    key = f"{store_key}\x00{agent_name}"
     with _LEDGER_RUNTIME_LOCK:
         state = _LEDGER_STATES.get(key)
         if state is None:
@@ -343,34 +287,15 @@ def _shared_ledger_state(responses_file: Path) -> _LedgerState:
         return state
 
 
-def _persist_executor() -> ThreadPoolExecutor:
-    """Return a bounded shared executor; each ledger still schedules only one drain."""
-    global _PERSIST_EXECUTOR
-    with _LEDGER_RUNTIME_LOCK:
-        if _PERSIST_EXECUTOR is None:
-            _PERSIST_EXECUTOR = ThreadPoolExecutor(
-                max_workers=_PERSIST_EXECUTOR_MAX_WORKERS,
-                thread_name_prefix="handled-turn-persist",
-            )
-        return _PERSIST_EXECUTOR
-
-
 def _reset_handled_turn_ledger_runtime() -> None:
-    """Flush pending persists and drop shared ledger state (tests and forked runtimes)."""
-    global _PERSIST_EXECUTOR
+    """Drop shared ledger state (tests and forked runtimes).
+
+    Nothing has to be flushed first any more. Every write is awaited before
+    its caller continues, so there is no queue that could still owe the
+    database a record when this runs.
+    """
     with _LEDGER_RUNTIME_LOCK:
-        executor = _PERSIST_EXECUTOR
-        _PERSIST_EXECUTOR = None
-        states = tuple(_LEDGER_STATES.values())
         _LEDGER_STATES.clear()
-    for state in states:
-        with state.persist_lock:
-            state.shutting_down = True
-            if state.persist_retry_timer is not None:
-                state.persist_retry_timer.cancel()
-                state.persist_retry_timer = None
-    if executor is not None:
-        executor.shutdown(wait=True)
 
 
 @dataclass
@@ -378,105 +303,314 @@ class HandledTurnLedger:
     """Store exact canonical records without reassigning completed source identities."""
 
     agent_name: str
-    base_path: Path
-    _responses_file: Path = field(init=False)
-    _responses_lock_file: Path = field(init=False)
+    records: TurnRecordStore
+    # Where this agent's records were kept before they moved into the journal
+    # database. Present so an installation that has been running can be
+    # upgraded; see ``legacy_handled_turns.import_legacy_ledger``. ``None`` means there is no
+    # history to inherit, which is true for a fresh install and for tests that
+    # start from an empty database.
+    legacy_responses_file: Path | None = None
     _state: _LedgerState = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Bind shared ledger state for this agent without touching the filesystem."""
-        self._responses_file = _responses_file_path(self.base_path, self.agent_name)
-        self._responses_lock_file = self._responses_file.with_suffix(f"{self._responses_file.suffix}.lock")
-        self._state = _shared_ledger_state(self._responses_file)
+        """Bind shared in-memory state for this agent without reading the database."""
+        self._state = _shared_ledger_state(self.records.state_key, self.agent_name)
 
     @property
     def _responses(self) -> dict[str, TurnRecord]:
         return self._state.responses
 
-    @_responses.setter
-    def _responses(self, responses: dict[str, TurnRecord]) -> None:
-        self._state.responses = responses
+    def _publish_responses(self, indexes: _ResponseIndexes) -> None:
+        """Install a detached map and its indexes with the state lock held."""
+        self._state.responses, self._state.conversation_responses = indexes
 
-    def load(self) -> None:
-        """Load persisted truth without pruning records needed by later recovery."""
+    def _set_response(self, event_id: str, record: TurnRecord | None) -> None:
+        """Publish or restore one alias and its read indexes with the state lock held.
+
+        Index the actual aliases, including partially superseded owners, so the
+        scoped views agree with the primary map during provisional writes too.
+        Startup and retention rebuild these derived indexes from that same map.
+        """
+        previous = self._responses.get(event_id)
+        previous_session = (
+            previous.conversation_target.session_id if previous is not None and previous.conversation_target else None
+        )
+        session = record.conversation_target.session_id if record is not None and record.conversation_target else None
+        if previous_session is not None and previous_session != session:
+            conversation = self._state.conversation_responses[previous_session]
+            del conversation[event_id]
+            if not conversation:
+                del self._state.conversation_responses[previous_session]
+        if record is None:
+            self._responses.pop(event_id, None)
+        else:
+            self._responses[event_id] = record
+            if session is not None:
+                self._state.conversation_responses.setdefault(session, {})[event_id] = record
+
+    async def load(self) -> None:
+        """Read every stored record into memory, once per process.
+
+        Every read on this class is synchronous and answers from the map this
+        fills, so it has to run before anything asks a question. Lazily loading
+        from inside a read is what the old file-backed ledger did, and it is
+        not available here: a synchronous method cannot await a database, and
+        bridging it to one deadlocks against the same executor the database
+        offloads onto.
+
+        The whole sequence runs under the write lock, not just the install.
+        Two sibling ledgers for one agent -- which a hot replacement creates
+        routinely -- would otherwise both pass the unloaded check, both read
+        the same legacy file, and both try to rename it; the loser calls
+        ``Path.replace`` on a path that no longer exists and dies with
+        ``FileNotFoundError`` during startup, having done nothing wrong. The
+        lock also means the second caller finds the state already loaded and
+        returns without touching the database at all.
+        """
         with self._state.lock:
-            self._wait_for_pending_persists_locked()
-            self._ensure_loaded_locked()
+            if self._state.loaded:
+                return
+        async with self._state.write_lock:
+            with self._state.lock:
+                if self._state.loaded:
+                    return
+            await self._load_locked()
 
-    def cleanup(self, *, unsettled_source_event_ids: Collection[str] = ()) -> None:
+    async def _load_locked(self) -> None:
+        """Read storage into the shared map, with the write lock already held."""
+        stored = await self.records.load_all()
+        if imported := await import_legacy_ledger(
+            path=self.legacy_responses_file,
+            agent_name=self.agent_name,
+            records=self.records,
+            already_stored={index_event_id for index_event_id, _, _ in stored},
+            codec=TurnRecordCodec,
+        ):
+            stored = imported
+        indexes = await run_blocking_until_complete(_decode_response_indexes, stored)
+        with self._state.lock:
+            self._publish_responses(indexes)
+            self._state.loaded = True
+
+    async def cleanup(self, *, unsettled_source_event_ids: Collection[str] = ()) -> None:
         """Compact terminal history while retaining truth still owned by dispatch."""
-        self._cleanup_old_events(unsettled_source_event_ids=unsettled_source_event_ids)
+        await self._cleanup_old_events(unsettled_source_event_ids=unsettled_source_event_ids)
 
-    def flush(self) -> None:
-        """Block until every scheduled persist completes, propagating write failures."""
-        with self._state.lock:
-            self._wait_for_pending_persists_locked()
-
-    def record_handled_turn(self, turn_record: TurnRecord) -> None:
+    async def record_handled_turn(self, turn_record: TurnRecord) -> None:
         """Persist one exact record for every source event in the turn."""
-        self.update_handled_turn(
+        await self.update_handled_turn(
             turn_record.indexed_event_ids,
             lambda _existing_records: turn_record,
         )
 
-    def update_handled_turn(
+    def _write_keys(self, event_ids: Collection[str], anchor: str | None = None) -> set[str]:
+        """Include sibling identities that an anchor-based SQL upsert can delete."""
+        keys = set(event_ids)
+        if anchor is not None:
+            keys.add(anchor)
+        for event_id in event_ids:
+            if (record := self._responses.get(event_id)) is not None:
+                keys.update(record.indexed_event_ids)
+                keys.update(record.revision_replay or {})
+                if record.anchor_event_id is not None:
+                    keys.add(record.anchor_event_id)
+        return keys
+
+    async def _reserve_update(
+        self,
+        lookup_event_ids: tuple[str, ...],
+        update: Callable[[Mapping[str, TurnRecord]], TurnRecord | None],
+    ) -> _PendingLedgerWrite | None:
+        """Derive and publish after earlier conflicting writes have settled."""
+        while True:
+            async with self._state.write_lock:
+                with self._state.lock:
+                    self._require_loaded()
+                    keys = self._write_keys(lookup_event_ids)
+                    blockers = {self._state.pending_writes[key] for key in keys if key in self._state.pending_writes}
+                    if not blockers:
+                        existing = MappingProxyType(
+                            {
+                                key: record
+                                for key in lookup_event_ids
+                                if (record := self._responses.get(key)) is not None
+                            },
+                        )
+                        updated = update(existing)
+                        if updated is None:
+                            return None
+                        candidate = canonicalize_turn_record(
+                            updated,
+                            timestamp=updated.timestamp if updated.timestamp != 0.0 else time.time(),
+                        )
+                        if not candidate.source_event_ids:
+                            return None
+                        keys.update(self._write_keys(candidate.indexed_event_ids, candidate.anchor_event_id))
+                        keys.update(candidate.revision_replay or {})
+                        record = resolve_turn_record(candidate, self._responses)
+                        if record is not None:
+                            keys.update(self._write_keys(record.indexed_event_ids, record.anchor_event_id))
+                            keys.update(record.revision_replay or {})
+                        blockers = {
+                            self._state.pending_writes[key] for key in keys if key in self._state.pending_writes
+                        }
+                        if not blockers:
+                            if record is None:
+                                return None
+                            pending = _PendingLedgerWrite(
+                                record,
+                                {key: self._responses.get(key) for key in record.indexed_event_ids},
+                                frozenset(keys),
+                                asyncio.get_running_loop().create_future(),
+                            )
+                            self._state.pending_writes.update(dict.fromkeys(keys, pending.settled))
+                            for key in record.indexed_event_ids:
+                                self._set_response(key, record)
+                            return pending
+            await asyncio.gather(*(asyncio.shield(blocker) for blocker in blockers))
+
+    async def update_handled_turn(
         self,
         lookup_event_ids: Sequence[str],
-        update: Callable[[Mapping[str, TurnRecord]], TurnRecord],
-        *,
-        wait_for_persist: bool = False,
-        on_persisted: Callable[[TurnRecord], None] | None = None,
+        update: Callable[[Mapping[str, TurnRecord]], TurnRecord | None],
     ) -> TurnRecord | None:
-        """Atomically update one record, optionally waiting for its exact persist."""
-        normalized_lookup_event_ids = canonical_source_event_ids(lookup_event_ids)
-        if not normalized_lookup_event_ids:
+        """Persist an update, serializing mutations of related identities.
+
+        Unrelated turns can wait for their writes independently. The synchronous
+        derivation may run again after a conflicting write settles; it must not
+        perform external effects. Returning ``None`` declines the mutation before
+        provisional publication. Provisional claims remain visible until the write
+        commits or its definite failure has been rolled back.
+        """
+        normalized = canonical_source_event_ids(lookup_event_ids)
+        if not normalized:
             return None
-        with self._state.lock:
-            self._ensure_loaded_locked()
-            existing_records = MappingProxyType(
-                {
-                    event_id: record
-                    for event_id in normalized_lookup_event_ids
-                    if (record := self._responses.get(event_id)) is not None
-                },
+        pending = await self._reserve_update(normalized, update)
+        if pending is None:
+            return None
+        persisted_record = pending.record
+        write: asyncio.Future[str | None] | None = None
+        try:
+            # Canonicalization derives an anchor from the sources whenever one was
+            # not supplied, and a record with no sources was already rejected above.
+            assert persisted_record.anchor_event_id is not None
+            # Shielded, so cancellation cannot leave the outcome unknown.
+            #
+            # Publishing before the commit is deliberate: it stops a
+            # synchronous reader seeing "not handled" while this turn's write
+            # is in flight and answering the same message twice. Undoing that
+            # publication is therefore only correct when the write definitely
+            # did not land.
+            #
+            # Cancelling a bare `await` gives no such certainty. The backend
+            # runs the statement on an `asyncio.to_thread` worker that a
+            # cancelled await cannot stop, so the transaction commits anyway
+            # while the rollback removes the record from memory -- leaving the
+            # live process answering a message it has already answered, and a
+            # restart disagreeing with it. Shielding lets the write settle and
+            # report, after which the cancellation propagates as it should.
+            #
+            # The task, not the shield, is what is kept. A shield reports its
+            # own cancellation and nothing after it, so asking the shield how
+            # the write ended answers "cancelled" for a write that is still
+            # running -- and asking a cancelled future for its exception raises
+            # instead of answering, which skipped the rollback below entirely.
+            #
+            # The backends draining their own worker threads does not replace
+            # this, which is the tempting simplification. They answer a
+            # different question: that nothing else may touch a connection
+            # while a statement is on it. This one needs to know *how* its own
+            # write ended, and a cancelled caller of the backend is told only
+            # that it was cancelled -- correctly, because swallowing the
+            # cancellation would be worse. Awaiting the upsert bare is weaker
+            # still: it cancels the coroutine outright, so the write never
+            # reaches a backend that could have drained it.
+            write = asyncio.ensure_future(
+                self.records.upsert(
+                    index_event_ids=persisted_record.indexed_event_ids,
+                    anchor_event_id=persisted_record.anchor_event_id,
+                    record_json=json.dumps(TurnRecordCodec._to_ledger_record(persisted_record)),
+                ),
             )
-            updated_record = update(existing_records)
-            candidate_record = canonicalize_turn_record(
-                updated_record,
-                timestamp=(updated_record.timestamp if updated_record.timestamp != 0.0 else time.time()),
-            )
-            if not candidate_record.source_event_ids:
-                return None
-            persisted_record = _resolve_turn_record(candidate_record, self._responses)
-            if persisted_record is None:
-                return None
-            for event_id in persisted_record.indexed_event_ids:
-                self._responses[event_id] = persisted_record
-            persist_future = self._schedule_persist_locked(
-                persisted_record,
-                on_persisted=on_persisted,
-            )
-        if wait_for_persist:
-            persist_future.result()
-        logger.debug("handled_turn_recorded", indexed_event_count=len(persisted_record.indexed_event_ids))
+            try:
+                await asyncio.shield(write)
+            except BaseException:
+                # A cancelled caller has not learned the write's fate yet: the
+                # shield only detached the wait, so the write is still running
+                # and has to be waited for before memory can be judged wrong.
+                # Every further cancellation re-attaches rather than escaping,
+                # because a caller cancelled twice would otherwise decide the
+                # record's fate while the transaction is still open.
+                while not write.done():
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(write)
+                # Only a write that reported failure did definitely not land. A
+                # cancelled write did not report anything: the backend hands the
+                # statement to a writer that outlives the await, so unpublishing
+                # it risks re-answering a message the database already records as
+                # answered -- the very outcome publishing early exists to prevent.
+                if write.cancelled() or write.exception() is None:
+                    raise
+                self._restore_superseded(persisted_record, pending.superseded)
+                raise
+        finally:
+            with self._state.lock:
+                if write is not None and write.done() and not write.cancelled() and write.exception() is None:
+                    persisted_record = self._publish_write_result(pending, write.result())
+                for key in pending.keys:
+                    del self._state.pending_writes[key]
+                pending.settled.set_result(None)
+        if persisted_record is not None:
+            logger.debug("handled_turn_recorded", indexed_event_count=len(persisted_record.indexed_event_ids))
         return persisted_record
+
+    def _publish_write_result(self, pending: _PendingLedgerWrite, result: str | None) -> TurnRecord | None:
+        """Replace the provisional claim with the transaction's actual merged record."""
+        self._restore_superseded(pending.record, pending.superseded)
+        if result is None:
+            return None
+        raw_record = json.loads(result)
+        record = TurnRecordCodec._from_ledger_record(raw_record["source_event_ids"][0], raw_record)
+        assert record is not None, "Corrupt committed turn record"
+        for key in record.indexed_event_ids:
+            self._set_response(key, record)
+        return record
 
     def has_responded(self, event_id: str) -> bool:
         """Return whether the source event has a terminal recorded outcome."""
         with self._state.lock:
-            self._ensure_loaded_locked()
+            self._require_loaded()
             return self._has_responded_locked(event_id)
 
-    def has_durably_responded(self, event_id: str) -> bool:
-        """Return terminal truth only after all preceding ledger writes reach disk."""
+    def _restore_superseded(
+        self,
+        published: TurnRecord,
+        superseded: Mapping[str, TurnRecord | None],
+    ) -> None:
+        """Undo one failed write's publication, leaving any later one alone.
+
+        A newer record for the same event is not rolled back. Reservations
+        exclude competing writes, but restoring an older record over a
+        newer one is the kind of mistake that only shows up as a turn answered
+        twice, so the check is cheap insurance rather than dead code.
+        """
         with self._state.lock:
-            self._ensure_loaded_locked()
-            if not self._has_responded_locked(event_id):
-                return False
-            barrier = self._schedule_persist_barrier_locked()
-        barrier.result()
-        with self._state.lock:
-            return self._has_responded_locked(event_id)
+            for event_id, previous in superseded.items():
+                if self._responses.get(event_id) is not published:
+                    continue
+                self._set_response(event_id, previous)
+
+    def _require_loaded(self) -> None:
+        """Fail loudly if a reader arrives before the records are in memory.
+
+        Answering "no record" from an unloaded map is the worst possible
+        wrong answer: it reads as "this turn was never handled", and the bot
+        answers a message it has already answered. Better to refuse than to
+        guess, and the refusal is a startup-ordering bug the caller can fix.
+        """
+        if not self._state.loaded:
+            msg = f"Turn records for {self.agent_name!r} were read before they were loaded"
+            raise RuntimeError(msg)
 
     def _has_responded_locked(self, event_id: str) -> bool:
         record = self._responses.get(event_id)
@@ -487,27 +621,32 @@ class HandledTurnLedger:
     def get_visible_echo_event_id(self, source_event_id: str) -> str | None:
         """Return the tracked visible echo event ID for one source event."""
         with self._state.lock:
-            self._ensure_loaded_locked()
+            self._require_loaded()
             record = self._responses.get(source_event_id)
             return record.visible_echo_event_id if record is not None else None
 
     def get_turn_record(self, source_event_id: str) -> TurnRecord | None:
         """Return the canonical record for one source event."""
         with self._state.lock:
-            self._ensure_loaded_locked()
+            self._require_loaded()
             return self._responses.get(source_event_id)
 
-    def pending_redaction_cleanup_event_ids(self) -> tuple[str, ...]:
-        """Return every durable redaction cleanup intent still awaiting completion."""
+    async def get_settled_turn_record(self, source_event_id: str) -> TurnRecord | None:
+        """Return one record after owning writes and cache replacement settle."""
+        while True:
+            async with self._state.write_lock:
+                with self._state.lock:
+                    self._require_loaded()
+                    pending_write = self._state.pending_writes.get(source_event_id)
+                    if pending_write is None:
+                        return self._responses.get(source_event_id)
+            await asyncio.shield(pending_write)
+
+    def all_turn_records(self) -> tuple[TurnRecord, ...]:
+        """Return each retained owner once without publishing provenance aliases."""
         with self._state.lock:
-            self._ensure_loaded_locked()
-            return canonical_source_event_ids(
-                tuple(
-                    event_id
-                    for record in self._responses.values()
-                    for event_id in record.pending_redaction_cleanup_event_ids
-                ),
-            )
+            self._require_loaded()
+            return tuple({record.indexed_event_ids: record for record in self._responses.values()}.values())
 
     def turn_records_for_conversation(
         self,
@@ -516,19 +655,14 @@ class HandledTurnLedger:
     ) -> tuple[TurnRecord, ...]:
         """Return unique records that can identify persisted scopes for one conversation."""
         with self._state.lock:
-            self._ensure_loaded_locked()
-            unique_records: dict[tuple[str, ...], TurnRecord] = {}
-            for record in self._responses.values():
-                target = record.conversation_target
-                if target is None or target.session_id != session_id:
-                    continue
-                unique_records[record.indexed_event_ids] = record
-            return tuple(unique_records.values())
+            self._require_loaded()
+            records = self._state.conversation_responses.get(session_id, {})
+            return tuple({record.indexed_event_ids: record for record in records.values()}.values())
 
     def turn_record_for_response_event_id(self, response_event_id: str) -> TurnRecord | None:
         """Return the sole turn whose visible response has this Matrix event ID."""
         with self._state.lock:
-            self._ensure_loaded_locked()
+            self._require_loaded()
             matches = {
                 record.indexed_event_ids: record
                 for record in self._responses.values()
@@ -539,298 +673,113 @@ class HandledTurnLedger:
             raise RuntimeError(msg)
         return next(iter(matches.values()), None)
 
-    def _ensure_loaded_locked(self) -> None:
-        """Load persisted records into shared memory once while the state lock is held."""
-        if self._state.loaded:
-            return
-        self.base_path.mkdir(parents=True, exist_ok=True)
-        with advisory_file_lock(self._responses_lock_file, exclusive=True):
-            self._responses = self._read_responses_file_locked()
-        self._state.loaded = True
-
-    def _wait_for_pending_persists_locked(self) -> None:
-        """Wait for the exact FIFO prefix queued before this barrier."""
-        self._schedule_persist_barrier_locked().result()
-
-    def _schedule_persist_barrier_locked(self) -> Future[None]:
-        """Queue one exact FIFO durability barrier while state mutation is excluded."""
-        barrier: Future[None] = Future()
-        with self._state.persist_lock:
-            self._state.pending_persists.append(_PersistRequest(records=(), completion=barrier))
-            self._ensure_persist_drain_locked()
-        return barrier
-
-    def _schedule_persist_locked(
-        self,
-        turn_record: TurnRecord,
-        *,
-        on_persisted: Callable[[TurnRecord], None] | None = None,
-    ) -> Future[None]:
-        """Queue one write-behind disk merge for records already applied to memory."""
-        completion: Future[None] = Future()
-        with self._state.persist_lock:
-            self._state.pending_persists.append(
-                _PersistRequest(
-                    records=(turn_record,),
-                    completion=completion,
-                    on_persisted=(lambda: on_persisted(turn_record)) if on_persisted is not None else None,
-                ),
-            )
-            self._ensure_persist_drain_locked()
-        return completion
-
-    def _ensure_persist_drain_locked(self) -> None:
-        """Start this ledger's sole drain while ``persist_lock`` is held."""
-        if self._state.persist_active or self._state.shutting_down:
-            return
-        self._state.persist_active = True
-        try:
-            _persist_executor().submit(self._persist_pending_records)
-        except Exception:
-            self._state.persist_active = False
-            raise
-
-    def _persist_pending_records(self) -> None:
-        """Drain FIFO batches, retrying one failed batch without failing later traffic."""
-        retry_available = True
-        while True:
-            with self._state.persist_lock:
-                if not self._state.pending_persists:
-                    self._state.persist_active = False
-                    self._reset_persist_retry_locked()
-                    return
-                requests = tuple(self._state.pending_persists)
-                self._state.pending_persists.clear()
-                # Nothing but already-failed records left to retry: stop rather
-                # than spin against a disk that is still refusing writes.
-                if not retry_available and all(request.completion is None for request in requests):
-                    self._state.pending_persists[0:0] = requests
-                    self._state.persist_active = False
-                    self._schedule_persist_retry_locked()
-                    return
-            records = tuple(record for request in requests for record in request.records)
-            try:
-                if records:
-                    self._persist_records(records)
-            except Exception as exc:
-                self._requeue_failed_persist_batch(
-                    requests,
-                    exc,
-                    retry_available=retry_available,
-                )
-                # One retry per failure: the requeued batch is attempted once more,
-                # and if that also fails its waiters are failed instead of looping.
-                retry_available = False
-                continue
-            for request in requests:
-                if request.completion is not None and not request.completion.done():
-                    request.completion.set_result(None)
-                if request.on_persisted is not None:
-                    try:
-                        request.on_persisted()
-                    except Exception:
-                        logger.exception("handled_turn_persist_notification_failed", agent=self.agent_name)
-            retry_available = True
-
-    def _schedule_persist_retry_locked(self) -> None:
-        """Schedule one delayed autonomous retry without occupying a persist worker."""
-        if self._state.shutting_down:
-            return
-        existing_retry_timer = self._state.persist_retry_timer
-        if existing_retry_timer is not None and existing_retry_timer.is_alive():
-            return
-        delay_seconds = self._state.persist_retry_delay_seconds
-
-        def retry_pending() -> None:
-            self._retry_pending_persists(scheduled_retry_timer)
-
-        scheduled_retry_timer = threading.Timer(delay_seconds, retry_pending)
-        scheduled_retry_timer.daemon = True
-        self._state.persist_retry_timer = scheduled_retry_timer
-        self._state.persist_retry_delay_seconds = min(
-            delay_seconds * 2,
-            _PERSIST_RETRY_MAX_DELAY_SECONDS,
-        )
-        scheduled_retry_timer.start()
-
-    def _retry_pending_persists(self, retry_timer: threading.Timer) -> None:
-        """Return delayed failed records to their ledger's sole drain."""
-        with self._state.persist_lock:
-            if self._state.persist_retry_timer is not retry_timer:
-                return
-            self._state.persist_retry_timer = None
-            self._ensure_persist_drain_locked()
-
-    def _reset_persist_retry_locked(self) -> None:
-        """Reset retry backoff after the pending queue drains successfully."""
-        retry_timer = self._state.persist_retry_timer
-        if retry_timer is not None:
-            retry_timer.cancel()
-            self._state.persist_retry_timer = None
-        self._state.persist_retry_delay_seconds = _PERSIST_RETRY_INITIAL_DELAY_SECONDS
-
-    def _requeue_failed_persist_batch(
-        self,
-        requests: tuple[_PersistRequest, ...],
-        error: Exception,
-        *,
-        retry_available: bool,
-    ) -> None:
-        """Requeue the failed batch, failing only the waiters it actually attempted.
-
-        While a retry is still available the batch is requeued intact so the next
-        attempt can still satisfy its waiters. Once exhausted, the records are kept
-        for a later drain but their waiters are failed. Requests queued *after* this
-        batch were never written, so they always keep their completions: failing them
-        would report a durability error for a write that was never attempted.
-        """
-        with self._state.persist_lock:
-            if retry_available:
-                self._state.pending_persists[0:0] = requests
-                return
-            # Keep records and post-persist notifications for autonomous retry,
-            # but drop waiters that are about to receive this bounded failure.
-            retry_requests = tuple(
-                _PersistRequest(
-                    records=request.records,
-                    completion=None,
-                    on_persisted=request.on_persisted,
-                )
-                for request in requests
-                if request.records
-            )
-            self._state.pending_persists[0:0] = retry_requests
-        attempted_completions = tuple(
-            request.completion
-            for request in requests
-            if request.completion is not None and not request.completion.done()
-        )
-        for completion in attempted_completions:
-            completion.set_exception(error)
-
-    def _persist_records(self, turn_records: tuple[TurnRecord, ...]) -> None:
-        """Merge one batch of already-applied records from the persistence worker."""
-        try:
-            with advisory_file_lock(self._responses_lock_file, exclusive=True):
-                persisted_responses = self._read_responses_file_locked()
-                for turn_record in turn_records:
-                    for event_id in turn_record.indexed_event_ids:
-                        persisted_responses[event_id] = turn_record
-                self._write_responses_file_locked(persisted_responses)
-        except Exception:
-            logger.exception(
-                "handled_turn_persist_failed",
-                agent=self.agent_name,
-                responses_file=str(self._responses_file),
-                batch_size=len(turn_records),
-            )
-            raise
-
-    def _write_responses_file_locked(self, responses: dict[str, TurnRecord]) -> None:
-        """Atomically write one versioned ledger payload while the file lock is held."""
-        payload = {
-            _LEDGER_SCHEMA_VERSION_KEY: TurnRecordCodec.schema_version(),
-            _LEDGER_RECORDS_KEY: {
-                event_id: TurnRecordCodec._to_ledger_record(record) for event_id, record in responses.items()
-            },
-        }
-        write_json_file_durable(self._responses_file, payload, temp_dir=self.base_path, indent=2)
-
-    def _cleanup_old_events(
+    async def _cleanup_old_events(
         self,
         max_events: int = 10000,
         max_age_days: int = 30,
         *,
         unsettled_source_event_ids: Collection[str] = (),
     ) -> None:
-        """Drop stale persisted records by age and count, then reload shared memory."""
-        with self._state.lock:
-            self._wait_for_pending_persists_locked()
-            self.base_path.mkdir(parents=True, exist_ok=True)
-            with advisory_file_lock(self._responses_lock_file, exclusive=True):
-                self._responses = _cleaned_responses(
-                    self._read_responses_file_locked(),
-                    max_events=max_events,
-                    max_age_days=max_age_days,
-                    unsettled_source_event_ids=unsettled_source_event_ids,
-                )
-                self._write_responses_file_locked(self._responses)
-            self._state.loaded = True
+        """Drop stale records by age and count, in memory and in the database.
+
+        The retained set is computed from what is already in memory rather than
+        re-read first, because memory is now the authority a reader answers
+        from and the database agrees with it after every awaited write.
+
+        Only the dropped ids are deleted, rather than rewriting the whole set.
+        The old ledger had to rewrite its file wholesale because that was the
+        only way to remove an entry from it; a delete by key costs nothing and
+        cannot lose the records it is not about.
+
+        Cleanup blocks new reservations and drains active writes before choosing
+        the retained set. The delete commits *before* memory forgets, the opposite
+        ordering to a write and for the same reason. Forgetting first would let
+        a synchronous reader see "not handled" for a row the database still
+        holds, and answer it again -- and if the delete then failed, that split
+        would last until a restart put the row back. Deleting first can only
+        leave memory holding a record the database no longer has, which
+        suppresses one duplicate rather than causing one, and is corrected by
+        the next load.
+        """
+        async with self._state.write_lock:
+            await asyncio.gather(*(asyncio.shield(write) for write in set(self._state.pending_writes.values())))
+            with self._state.lock:
+                self._require_loaded()
+                snapshot = dict(self._responses)
+            indexes, dropped = await run_blocking_until_complete(
+                _prepare_response_cleanup,
+                snapshot,
+                max_events,
+                max_age_days,
+                tuple(unsettled_source_event_ids),
+            )
+            if dropped:
+                await self.records.forget(index_event_ids=dropped)
+            with self._state.lock:
+                self._publish_responses(indexes)
         logger.info(
             "handled_turn_cleanup_completed",
             agent=self.agent_name,
             kept_event_count=len(self._responses),
+            dropped_event_count=len(dropped),
         )
 
-    def _read_responses_file_locked(self) -> dict[str, TurnRecord]:
-        """Read current-version canonical records while the file lock is held."""
-        if not self._responses_file.exists():
-            return {}
-        try:
-            with self._responses_file.open(encoding="utf-8") as response_file:
-                data = json.load(response_file)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._quarantine_with_warning("malformed")
-            return {}
-        if not isinstance(data, dict):
-            self._quarantine_with_warning("structurally invalid", payload_type=type(data).__name__)
-            return {}
-        if data.get(_LEDGER_SCHEMA_VERSION_KEY) != TurnRecordCodec.schema_version():
-            self._quarantine_with_warning("unsupported-schema")
-            return {}
-        raw_records = data.get(_LEDGER_RECORDS_KEY)
-        if not isinstance(raw_records, dict):
-            self._quarantine_with_warning("structurally invalid records")
-            return {}
-        records: dict[str, TurnRecord] = {}
-        invalid_event_ids: list[str] = []
-        for event_id, raw_record in raw_records.items():
-            record = TurnRecordCodec._from_ledger_record(event_id, raw_record) if isinstance(event_id, str) else None
-            if record is None:
-                invalid_event_ids.append(event_id if isinstance(event_id, str) else repr(event_id))
-                continue
-            records[event_id] = record
-        rehydrated_records = {event_id: record for record in records.values() for event_id in record.indexed_event_ids}
-        rehydrated_records.update(records)
-        records = rehydrated_records
-        if invalid_event_ids and not records:
-            self._quarantine_with_warning("invalid event entries", invalid_event_ids=invalid_event_ids)
-        elif invalid_event_ids:
-            logger.warning(
-                "Ignored invalid handled-turn ledger entries",
-                agent=self.agent_name,
-                responses_file=str(self._responses_file),
-                invalid_event_ids=invalid_event_ids,
-            )
-        return records
 
-    def _quarantine_with_warning(self, reason: str, **context: object) -> None:
-        """Quarantine an unreadable ledger and log why its current schema was rejected."""
-        quarantined_file = self._quarantine_corrupt_responses_file_locked()
-        logger.warning(
-            "Quarantined handled-turn ledger file",
-            reason=reason,
-            agent=self.agent_name,
-            responses_file=str(self._responses_file),
-            quarantined_file=str(quarantined_file or self._responses_file),
-            **context,
-        )
-
-    def _quarantine_corrupt_responses_file_locked(self) -> Path | None:
-        """Move a corrupt responses file aside while the file lock is held."""
-        quarantined_file = self.base_path / f"{self._responses_file.name}.corrupt-{time.time_ns()}"
-        try:
-            self._responses_file.replace(quarantined_file)
-        except FileNotFoundError:
-            return None
-        return quarantined_file
+type _ResponseIndexes = tuple[dict[str, TurnRecord], dict[str, dict[str, TurnRecord]]]
 
 
-def _resolve_turn_record(
+def _index_responses(responses: dict[str, TurnRecord]) -> _ResponseIndexes:
+    """Build detached lookup maps before publishing them to synchronous readers."""
+    conversations: dict[str, dict[str, TurnRecord]] = {}
+    for event_id, record in responses.items():
+        if record.conversation_target is not None:
+            conversations.setdefault(record.conversation_target.session_id, {})[event_id] = record
+    return responses, conversations
+
+
+def _decode_response_indexes(stored: Sequence[tuple[str, str, str]]) -> _ResponseIndexes:
+    """Decode persisted aliases and prepare all read indexes in one worker."""
+    return _index_responses(
+        {
+            index_event_id: record
+            for index_event_id, _anchor_event_id, record_json in stored
+            if (record := TurnRecordCodec._from_ledger_record(index_event_id, json.loads(record_json))) is not None
+        },
+    )
+
+
+def _prepare_response_cleanup(
+    responses: dict[str, TurnRecord],
+    max_events: int,
+    max_age_days: int,
+    unsettled_source_event_ids: Collection[str],
+) -> tuple[_ResponseIndexes, tuple[str, ...]]:
+    """Compute retention and replacement indexes without mutating live state."""
+    retained = _cleaned_responses(
+        responses,
+        max_events=max_events,
+        max_age_days=max_age_days,
+        unsettled_source_event_ids=unsettled_source_event_ids,
+    )
+    return _index_responses(retained), tuple(sorted(set(responses) - set(retained)))
+
+
+def resolve_turn_record(
     turn_record: TurnRecord,
     existing_records: Mapping[str, TurnRecord],
 ) -> TurnRecord | None:
     """Resolve one candidate against completed identities and newer same-turn rows."""
+    turn_record = sanitize_revision_replay(
+        turn_record,
+        tombstoned_event_ids=tuple(
+            event_id
+            for event_id in {
+                *(turn_record.revision_replay or {}),
+                *(revision[1] for revision in (turn_record.source_event_revisions or {}).values()),
+            }
+            if (record := existing_records.get(event_id)) is not None and event_id in record.redacted_source_event_ids
+        ),
+    )
     conflicting_source_event_ids = tuple(
         event_id
         for event_id in turn_record.source_event_ids
@@ -895,19 +844,20 @@ def _project_redaction_alias(
         turn_record,
         source_event_ids=retained_source_event_ids,
         anchor_event_id=anchor_event_id,
+        # An explicit empty source map keeps per-source replay ownership fail-closed after projection.
         source_event_metadata=(
             {}
             if turn_record.is_coalesced and turn_record.source_event_metadata is None
             else turn_record.source_event_metadata
         ),
-        # Turn-level requester context remains required for owed redaction cleanup; an explicit
-        # empty source map keeps per-source replay ownership fail-closed after projection.
         requester_id=turn_record.requester_id,
     )
 
 
 def _merge_same_identity_records(candidate: TurnRecord, existing: TurnRecord) -> TurnRecord:
     """Keep the newer same-turn record while preserving older echo and discovery facts."""
+    candidate = sanitize_revision_replay(candidate, authority=existing)
+    existing = sanitize_revision_replay(existing, authority=candidate)
     if candidate.completed != existing.completed:
         newer, older = (candidate, existing) if candidate.completed else (existing, candidate)
     else:
@@ -919,6 +869,7 @@ def _merge_same_identity_records(candidate: TurnRecord, existing: TurnRecord) ->
             *newer.redacted_source_event_ids,
             *older.redacted_source_event_ids,
         ),
+        prepared_voice_sources={**(candidate.prepared_voice_sources or {}), **(existing.prepared_voice_sources or {})},
         visible_echo_event_id=newer.visible_echo_event_id or older.visible_echo_event_id,
         visible_echo_is_fallback=(
             newer.visible_echo_is_fallback
@@ -927,21 +878,11 @@ def _merge_same_identity_records(candidate: TurnRecord, existing: TurnRecord) ->
         ),
         command_execution_started=newer.command_execution_started or older.command_execution_started,
         command_result_text=newer.command_result_text or older.command_result_text,
-        latest_edit_receipt_order=max(
-            newer.latest_edit_receipt_order or 0,
-            older.latest_edit_receipt_order or 0,
-        )
-        or None,
-        user_stop_receipt_order=max(
-            newer.user_stop_receipt_order or 0,
-            older.user_stop_receipt_order or 0,
-        )
-        or None,
-        user_stop_settled_receipt_order=max(
-            newer.user_stop_settled_receipt_order or 0,
-            older.user_stop_settled_receipt_order or 0,
-        )
-        or None,
+        command_result_extra_content=(
+            newer.command_result_extra_content
+            if newer.command_result_text is not None
+            else older.command_result_extra_content
+        ),
     )
 
 
@@ -950,22 +891,9 @@ def _bool_or_none(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _positive_int_or_none(value: object) -> int | None:
-    """Return one positive non-boolean integer or None."""
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
-
-
 def _mapping_or_none(value: object) -> Mapping[str, Any] | None:
     """Return a typed mapping for codec input."""
     return typing.cast("Mapping[str, Any]", value) if isinstance(value, Mapping) else None
-
-
-def _responses_file_path(base_path: Path, agent_name: str) -> Path:
-    """Return the lexically validated ledger path for one agent."""
-    if not agent_name or ".." in agent_name or "/" in agent_name or "\\" in agent_name:
-        message = f"Invalid handled-turn ledger agent name: {agent_name!r}"
-        raise ValueError(message)
-    return base_path / f"{agent_name}_responded.json"
 
 
 @dataclass(frozen=True)
@@ -976,18 +904,41 @@ class _ResponseGroup:
     records: dict[str, TurnRecord]
 
 
+def _is_prepared_voice_checkpoint_only(record: TurnRecord) -> bool:
+    """Recognize transient preparation without overlooking other unfinished facts."""
+    return record.prepared_voice_sources is not None and record == TurnRecord.create(
+        record.source_event_ids,
+        completed=False,
+        prepared_voice_sources=record.prepared_voice_sources,
+        timestamp=record.timestamp,
+    )
+
+
 def _response_group_requires_retention(
     group: _ResponseGroup,
     unsettled_source_event_ids: frozenset[str],
 ) -> bool:
-    """Return whether one group still owns unfinished durable work."""
+    """Return whether one group still owns unfinished durable work or redaction evidence.
+
+    A conversation's ledger tombstones are what history cleanup derives from when the
+    journal no longer has them, and nothing tracks which histories still hold an event,
+    so they are kept for good; their number grows only with redactions.
+    """
     return (
         not unsettled_source_event_ids.isdisjoint(group.records)
-        or any(record.pending_redaction_cleanup_event_ids for record in group.records.values())
-        or any(not record.completed and record.replay_source_event_ids for record in group.records.values())
         or any(
-            record.user_stop_receipt_order is not None
-            and (record.user_stop_settled_receipt_order or 0) < record.user_stop_receipt_order
+            record.conversation_target is not None
+            and (
+                bool(record.redacted_source_event_ids)
+                or any(revision.redacted for revision in (record.revision_replay or {}).values())
+            )
+            for record in group.records.values()
+        )
+        or any(
+            not unsettled_source_event_ids.isdisjoint(record.revision_replay or {}) for record in group.records.values()
+        )
+        or any(
+            not record.completed and record.replay_source_event_ids and not _is_prepared_voice_checkpoint_only(record)
             for record in group.records.values()
         )
     )

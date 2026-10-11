@@ -21,7 +21,6 @@ from agno.run.agent import ModelRequestCompletedEvent, RunCompletedEvent, RunCon
 from agno.run.base import RunStatus
 
 from mindroom.ai import _PreparedAgentRun, ai_response, stream_agent_response
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DebugConfig, ModelConfig
@@ -38,6 +37,7 @@ from mindroom.tool_system.runtime_context import ToolDispatchContext
 from mindroom.tool_system.tool_hooks import build_tool_hook_bridge
 from mindroom.tool_system.worker_routing import build_tool_execution_identity
 from mindroom.turn_policy import PreparedDispatch, ResponseAction
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     bind_runtime_paths,
     make_turn_context,
@@ -247,7 +247,7 @@ async def test_cross_sink_correlation_invariant_for_matrix_turn_processing_log( 
         display_name="GeneralAgent",
         password="test_password",  # noqa: S106
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -372,7 +372,6 @@ async def test_cross_sink_correlation_invariant_for_matrix_turn_processing_log( 
         handled_turn=TurnRecord.create(
             [event.event_id],
             requester_id="@user:localhost",
-            correlation_id="$event:localhost",
         ),
     )
 
@@ -383,15 +382,12 @@ async def test_cross_sink_correlation_invariant_for_matrix_turn_processing_log( 
         for payload in _json_log_payloads(capsys.readouterr().err)
         if payload.get("event") == "Processing" and payload.get("correlation_id") == "$event:localhost"
     )
-    turn_record = bot._turn_store.get_turn_record("$event:localhost")
-    assert turn_record is not None
     metadata = captured_metadata[0]
 
     assert llm_entry["correlation_id"] == "$event:localhost"
     assert tool_entry["correlation_id"] == "$event:localhost"
     assert log_payload["correlation_id"] == "$event:localhost"
     assert metadata["correlation_id"] == "$event:localhost"
-    assert turn_record.correlation_id == "$event:localhost"
 
     assert llm_entry["agent_id"] == "general"
     assert llm_entry["model_id"] == "test-model"
@@ -426,7 +422,6 @@ async def test_cross_sink_correlation_invariant_for_matrix_turn_processing_log( 
         "matrix_event_id": "$event:localhost",
         "matrix_seen_event_ids": ["$event:localhost"],
     }
-    assert turn_record.requester_id == "@user:localhost"
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -54,11 +55,13 @@ def build_mindroom_workflow() -> dict[str, Any]:
 
 def _run_bash(script: str, env: dict[str, str], tmp_path: Path) -> subprocess.CompletedProcess[str]:
     """Run a workflow ``run:`` script with a stubbed ``gh`` on PATH."""
+    bash = shutil.which("bash")
+    assert bash is not None, "release workflow tests require bash"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     stub = bin_dir / "gh"
     stub.write_text(
-        """#!/usr/bin/env bash
+        f"""#!{bash}
 echo "$@" >>"$GH_CALLS"
 case "$*" in
   *git/ref/tags/*) echo "$STUB_TAG_OBJECT" ;;
@@ -80,7 +83,7 @@ esac
     outputs = tmp_path / "github-output.txt"
     outputs.write_text("", encoding="utf-8")
     return subprocess.run(
-        ["bash", "-e", "-c", script],
+        [bash, "-e", "-c", script],
         env={
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "GH_CALLS": str(calls),
@@ -281,3 +284,20 @@ def test_build_mindroom_publishes_release_images_on_dispatch(
     manifest = build_mindroom_workflow["jobs"]["manifest"]
     assert manifest["if"] == "github.event_name == 'workflow_dispatch'"
     assert manifest["needs"] == "build"
+
+
+def _manifest_create_args(script: str) -> list[str]:
+    """Return the ``docker manifest create`` arguments of one workflow step, one image per continued line."""
+    lines = [line.removesuffix("\\").strip() for line in script.splitlines()]
+    start = lines.index("docker manifest create") + 1
+    return lines[start : lines.index("", start)]
+
+
+def test_latest_manifest_combines_this_releases_images(build_mindroom_workflow: dict[str, Any]) -> None:
+    """Overlapping releases rewrite the bare arch tags, so latest uses the same per-release images as the ref tag."""
+    runs = {step["name"]: step["run"] for step in _steps(build_mindroom_workflow, "manifest") if "run" in step}
+    latest = _manifest_create_args(runs["Create and push latest manifest"])
+    release = _manifest_create_args(runs["Create and push ref manifest"])
+
+    assert latest[0].endswith(":latest")
+    assert latest[1:] == release[1:]

@@ -10,7 +10,7 @@ from mindroom.custom_tools.attachment_helpers import (
     room_access_allowed,
 )
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
-from mindroom.matrix.conversation_cache import resolve_thread_root_event_id_for_client
+from mindroom.matrix.thread_room_scan import resolve_thread_root_event_id_for_client
 from mindroom.thread_summary import ThreadSummaryWriteError, set_manual_thread_summary
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
 
@@ -49,12 +49,14 @@ class ThreadSummaryTools(Toolkit):
         Pinning stops automatic re-summarization from overwriting the title, and
         is the default. Pass pin=False for a routine update that later automatic
         summaries may replace; that also releases an earlier pin.
+        To retitle many threads, start from matrix_room(action="threads",
+        include_summaries=True): each row shows the current summary and
+        summary_pinned, so there is no need to read whole threads to find the
+        titles or the threads already pinned.
         """
         context = get_tool_runtime_context()
         if context is None:
             return self._context_error()
-        conversation_cache = context.conversation_cache
-
         resolved_room_id, room_error = resolve_requested_room_id(context, room_id)
         if room_error is not None:
             return self._payload(
@@ -65,7 +67,7 @@ class ThreadSummaryTools(Toolkit):
             )
         assert resolved_room_id is not None
 
-        if not room_access_allowed(context, resolved_room_id):
+        if not await room_access_allowed(context, resolved_room_id):
             return self._payload(
                 "error",
                 action="set",
@@ -88,7 +90,7 @@ class ThreadSummaryTools(Toolkit):
                 context.client,
                 normalize_room_id,
                 normalize_event_id,
-                conversation_cache=context.conversation_cache,
+                relations=context.relations,
             ),
             fail_closed_on_normalization_error=True,
         )
@@ -111,7 +113,9 @@ class ThreadSummaryTools(Toolkit):
                 summary,
                 config=context.config,
                 runtime_paths=context.runtime_paths,
-                conversation_cache=conversation_cache,
+                conversation_reader=context.conversation_reader,
+                entity_name=context.agent_name,
+                membership_index=context.require_agent_reply_memberships(),
                 pin=pin,
             )
         except ThreadSummaryWriteError as exc:
