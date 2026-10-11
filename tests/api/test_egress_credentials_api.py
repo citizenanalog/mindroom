@@ -1916,9 +1916,11 @@ def test_a_restrict_only_limit_is_saved_listed_and_never_takes_a_key(egress_port
     """A manager limits a shared agent's GitHub in place: the limit saves without auth or key and narrows the config row."""
     portal = egress_portal
     client, admin = portal["client"], portal["headers"]["admin"]
+    # The limit editor sends restrict_to_rules with restrict_only, which implies it anyway.
     limit = {
         "display_name": "GitHub (o/a)",
         "restrict_only": True,
+        "restrict_to_rules": True,
         "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}],
     }
 

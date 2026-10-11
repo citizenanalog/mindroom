@@ -266,6 +266,11 @@ def test_restrict_only_implies_restriction_and_needs_no_auth_on_its_rules() -> N
     }
     assert EgressService.model_validate({"preset": "github"}).restricts_paths is False
     assert all("restrict_only" not in preset for preset in EGRESS_PRESETS.values())
+    # Setting both, as the limit editor does, is the same service.
+    both = EgressService.model_validate(
+        {"restrict_only": True, "restrict_to_rules": True, "rules": [{"host": "api.github.com"}]},
+    )
+    assert (both.restrict_only, both.restricts_paths) == (True, True)
 
 
 def test_a_service_that_sends_a_credential_needs_auth_on_every_rule() -> None:
