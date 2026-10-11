@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import partial
 from typing import TYPE_CHECKING, Annotated
 
@@ -164,7 +164,8 @@ async def _load_service_statuses_for_target(
                 source=service_source(config.egress_broker, name),
                 rules=rule_summaries(service_config),
                 restrict_only=service_config.restrict_only,
-                **sources.model_dump(),
+                updated_at=sources.key_updated_at,
+                **asdict(sources),
             ),
         )
 

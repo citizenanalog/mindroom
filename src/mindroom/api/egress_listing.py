@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import partial
 from typing import TYPE_CHECKING, Literal
 
@@ -30,7 +30,12 @@ from mindroom.api.egress_status import (
 )
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
-from mindroom.egress_broker.user_services import InactiveReason, ServiceSource, inactive_user_services, service_source
+from mindroom.egress_broker.user_services import (
+    InactiveUserService,
+    ServiceSource,
+    inactive_user_services,
+    service_source,
+)
 from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
@@ -70,17 +75,6 @@ class EgressCredentialService(EgressSourceStatus):
     restrict_only: bool
 
 
-class EgressInactiveService(BaseModel):
-    """A service entry stored in the agent's scope that the broker ignores, so a user can still remove it.
-
-    `shadowed` means an administrator's service has the same name now; `invalid` means the entry no longer
-    validates as a service. Inactive entries count toward the scope's limits, and the delete route removes them.
-    """
-
-    name: str
-    reason: InactiveReason
-
-
 type _AgentScope = Literal["user", "user_agent", "shared", "unscoped"]
 
 
@@ -90,7 +84,9 @@ class EgressCredentialAgent(BaseModel):
     `shared` is true for a shared or unscoped agent, whose services and keys everyone using it shares, and
     `can_manage` says whether the caller may change them: their own agent, or a shared one they manage. Both are
     known even when the agent has no services yet. `inactive_services` lists the stored entries of the agent's
-    scope that are not in `services`.
+    scope that the broker ignores, so a user can still remove them: `shadowed` means an administrator's service has
+    the same name now, `invalid` that the entry no longer validates as a service. They count toward the scope's
+    limits.
 
     `scope` says whose store the services and keys live in: one `user_agent` agent's own, every `user` agent's
     of the caller, everyone's on a `shared` agent, or the global store of an `unscoped` one. `scope_agents` names
@@ -107,7 +103,7 @@ class EgressCredentialAgent(BaseModel):
     scope_agents: list[str]
     managers: list[str]
     services: list[EgressCredentialService]
-    inactive_services: list[EgressInactiveService]
+    inactive_services: list[InactiveUserService]
 
 
 class EgressCredentialsResponse(BaseModel):
@@ -234,7 +230,8 @@ async def egress_services_for_agent(
                 rules=rule_summaries(service),
                 placeholder_names=list(service.placeholder_env),
                 restrict_only=service.restrict_only,
-                **sources.model_dump(),
+                updated_at=sources.key_updated_at,
+                **asdict(sources),
             ),
         )
     return rows
@@ -302,7 +299,7 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
                 scope_agents=list(user_store_agents) if scope == "user" else [],
                 managers=list(agent.credential_managers) if is_shared else [],
                 services=services,
-                inactive_services=[EgressInactiveService(name=entry.name, reason=entry.reason) for entry in inactive],
+                inactive_services=inactive,
             ),
         )
     return agents

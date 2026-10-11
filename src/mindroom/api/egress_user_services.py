@@ -143,7 +143,7 @@ def delete_user_service_route(
     """Delete one of the scope's own services together with its stored key.
 
     Returns 404 when the scope has no such service. A config service cannot be deleted, so its name is a 409. An
-    inactive entry (see `EgressInactiveService`) can still be removed: one stored under a name that a config service
+    inactive entry (see `InactiveUserService`) can still be removed: one stored under a name that a config service
     has since taken keeps the key, which the config service uses, and one that no longer validates takes its key
     with it.
     """

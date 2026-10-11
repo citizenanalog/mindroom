@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException
@@ -270,28 +269,6 @@ def audit_logs_response(records: Iterable[AuditRecord]) -> AuditLogsResponse:
     )
 
 
-class EgressOAuthStatus(BaseModel):
-    """Connection state of the OAuth account a service can use instead of an API key.
-
-    `connected` means the broker would inject a personal access token. `service_account` marks a provider that a
-    shared service account serves instead: the broker cannot inject that, and personal accounts are not connectable.
-    `unavailable_reason` is `shared_sandbox` where the broker never uses a requester's own account (GitHub,
-    Atlassian) because several requesters share the sandbox; nothing is connected or connectable then.
-    `shared_worker_opt_in` marks such a sandbox whose service allows it anyway (`oauth_on_shared_workers`), so every
-    user of the agent can act with the connected account.
-    """
-
-    provider: str
-    display_name: str
-    connected: bool
-    account_label: str | None
-    can_connect: bool
-    reset_required: bool
-    service_account: bool
-    unavailable_reason: Literal["shared_sandbox"] | None
-    shared_worker_opt_in: bool
-
-
 class EgressSourceStatus(BaseModel):
     """Which secret sources a service has in one scope.
 
@@ -304,19 +281,7 @@ class EgressSourceStatus(BaseModel):
     active_source: Literal["key", "oauth"] | None
     key_configured: bool
     key_updated_at: str | None
-    oauth: EgressOAuthStatus | None
-
-    @classmethod
-    def from_status(cls, status: EgressServiceStatus) -> EgressSourceStatus:
-        """Describe the sources of one service for an API response."""
-        return cls(
-            configured=status.configured,
-            updated_at=status.key_updated_at,
-            active_source=status.active_source,
-            key_configured=status.key_configured,
-            key_updated_at=status.key_updated_at,
-            oauth=EgressOAuthStatus(**asdict(status.oauth)) if status.oauth is not None else None,
-        )
+    oauth: OAuthStatus | None
 
 
 async def egress_oauth_status(
@@ -371,12 +336,12 @@ async def egress_service_status(
     service: EgressService,
     name: str,
     oauth_part: OAuthStatus | None,
-) -> EgressSourceStatus:
+) -> EgressServiceStatus:
     """Combine a service's key status with its already loaded OAuth status; an explicit key wins.
 
     The key status reads and decrypts a credential file, so it runs in a thread.
     """
-    status = await asyncio.to_thread(
+    return await asyncio.to_thread(
         service_status,
         manager,
         target,
@@ -384,7 +349,6 @@ async def egress_service_status(
         name,
         oauth_status=lambda _provider_id, _target: oauth_part,
     )
-    return EgressSourceStatus.from_status(status)
 
 
 def service_oauth_provider(snapshot: ApiSnapshot, service: EgressService | None) -> OAuthProvider | None:
