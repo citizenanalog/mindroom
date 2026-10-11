@@ -9,6 +9,7 @@ import ssl
 import stat
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
@@ -46,10 +47,10 @@ from tests.oauth_test_utils import (
     serve_token_endpoint,
 )
 
-from .conftest import audit_records, connect_request, proxy_authorization
+from .conftest import audit_records, connect_request, free_port, proxy_authorization
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
     from mindroom.worker_computer.browser_proxy import BrowserEgress
 
     from .conftest import RawResponse, Upstream, UpstreamCA
+
+type GetThrough = Callable[[dict[str, str]], Awaitable[httpx.Response]]
 
 _THREAD_NAME = "mindroom-egress-broker"
 _PLACEHOLDER = "mindroom-brokered"
@@ -118,12 +121,6 @@ def trust_upstream(upstream_ca: UpstreamCA, tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setenv("SSL_CERT_FILE", str(path))
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _broker_env(port: int, **extra: str) -> dict[str, str]:
     return {
         "MINDROOM_EGRESS_BROKER_PORT": str(port),
@@ -153,12 +150,14 @@ def _target(
     *,
     scope: WorkerScope = "user_agent",
 ) -> ResolvedWorkerTarget:
-    return resolve_worker_target(
+    target = resolve_worker_target(
         scope,
         agent_name,
         _identity(requester_id, agent_name),
         private_agent_names=frozenset(),
     )
+    # An unscoped call has no worker key; it is routed to a worker that its proxy token names.
+    return replace(target, worker_key="v1:local:unscoped:code") if target.worker_key is None else target
 
 
 def _config(**services: object) -> Config:
@@ -175,8 +174,28 @@ def _broker_threads() -> list[threading.Thread]:
     return [thread for thread in threading.enumerate() if thread.name == _THREAD_NAME]
 
 
-async def _get_through(env: dict[str, str], url: str, runner_dir: Path) -> httpx.Response:
-    """Send one request the way a worker's tool would: the env's proxy and the runner's trust bundle."""
+@pytest.fixture
+def get_through(
+    allow_loopback: None,  # noqa: ARG001 - the broker must dial the loopback fake upstream
+    trust_upstream: None,  # noqa: ARG001 - the broker must trust the fake upstream's CA
+    tls_upstream: Upstream,
+    tmp_path: Path,
+) -> GetThrough:
+    """Return ``get(env)``: ``GET /echo`` on the fake TLS upstream, sent as a worker's tool would with `env`.
+
+    The request uses the env's proxy and the runner's trust bundle, so the service's broker has to intercept it.
+    """
+
+    async def get(env: dict[str, str]) -> httpx.Response:
+        async with _worker_client(env, tmp_path / "runner") as client:
+            return await client.get(tls_upstream.url("/echo"))
+
+    return get
+
+
+@asynccontextmanager
+async def _worker_client(env: dict[str, str], runner_dir: Path) -> AsyncIterator[httpx.AsyncClient]:
+    """Yield an HTTP client configured as a worker's tool is: the env's proxy and the runner's trust bundle."""
     worker_env = dict(env)
     assert apply_runner_ca_bundle(worker_env, runner_dir)
     async with httpx.AsyncClient(
@@ -184,7 +203,7 @@ async def _get_through(env: dict[str, str], url: str, runner_dir: Path) -> httpx
         verify=ssl.create_default_context(cafile=worker_env["SSL_CERT_FILE"]),
         trust_env=False,
     ) as client:
-        return await client.get(url)
+        yield client
 
 
 @pytest.mark.asyncio
@@ -215,7 +234,7 @@ async def test_requires_url_when_port_set(
     manager: CredentialsManager,
 ) -> None:
     """A port without the worker-facing URL refuses to start."""
-    runtime_paths = tmp_runtime_paths(MINDROOM_EGRESS_BROKER_PORT=str(_free_port()))
+    runtime_paths = tmp_runtime_paths(MINDROOM_EGRESS_BROKER_PORT=str(free_port()))
     with pytest.raises(
         ValueError,
         match="MINDROOM_EGRESS_BROKER_URL is required when MINDROOM_EGRESS_BROKER_PORT is set",
@@ -250,7 +269,7 @@ async def test_invalid_settings_refuse_to_start(
     value: str,
 ) -> None:
     """An invalid port, URL, or token TTL raises before any state is written or any thread starts."""
-    runtime_paths = tmp_runtime_paths(**{**_broker_env(_free_port()), name: value})
+    runtime_paths = tmp_runtime_paths(**{**_broker_env(free_port()), name: value})
     with pytest.raises(ValueError, match=name):
         async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
             pytest.fail("the broker must not start")
@@ -258,16 +277,14 @@ async def test_invalid_settings_refuse_to_start(
     assert not (tmp_path / "mindroom_data" / "egress_broker").exists()
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_end_to_end_inject_through_running_service(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """A worker using only the env from execution_env_for_worker reaches the upstream with the scope's secret."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
     target = _target()
     save_secret(manager, target, "github", "s3cret")
@@ -275,7 +292,7 @@ async def test_end_to_end_inject_through_running_service(
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         assert env["GH_TOKEN"] == _PLACEHOLDER
         assert "s3cret" not in str(env)
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
         assert response.status_code == 200
         assert response.json()["headers"]["authorization"] == ["Bearer s3cret"]
         audit = active_audit_log()
@@ -284,17 +301,16 @@ async def test_end_to_end_inject_through_running_service(
         assert (record.host, record.service, record.agent_name) == ("localhost", "github", "code")
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_missing_secret_reports_manage_url(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """A brokered host without a secret in scope answers 403 with the Connections link, without reaching upstream."""
     runtime_paths = tmp_runtime_paths(
-        **_broker_env(_free_port()),
+        **_broker_env(free_port()),
         MINDROOM_PUBLIC_URL="https://chat.example.org/",
         MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
     )
@@ -305,7 +321,7 @@ async def test_missing_secret_reports_manage_url(
             config=config,
             worker_target=_target(),
         )
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert response.status_code == 403
     assert response.json() == {
         "error": "credential_not_configured",
@@ -316,16 +332,14 @@ async def test_missing_secret_reports_manage_url(
     assert tls_upstream.hits == []
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_unreadable_config_tunnels_without_injection(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """When the config provider raises, the broker has no rules: traffic is tunnelled and nothing is injected."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
     target = _target()
     save_secret(manager, target, "github", "s3cret")
@@ -336,7 +350,7 @@ async def test_unreadable_config_tunnels_without_injection(
 
     async with serve_egress_broker(runtime_paths, config_provider=broken, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert response.status_code == 200
     assert "authorization" not in response.json()["headers"]
 
@@ -350,7 +364,7 @@ async def test_last_good_config_survives_unreadable_config(
     raw_proxy: Callable[[int, bytes], Awaitable[RawResponse]],
 ) -> None:
     """Once the broker has read a config, a provider that raises or has none keeps that config, deny included."""
-    port = _free_port()
+    port = free_port()
     runtime_paths = tmp_runtime_paths(**_broker_env(port))
     config = Config(egress_broker={"unmatched_hosts": "deny", "services": {"openai": _OPENAI}})
     state = {"mode": "good"}
@@ -380,7 +394,7 @@ async def test_placeholder_env_only_when_secret_configured(
     manager: CredentialsManager,
 ) -> None:
     """Placeholders come only from services with a secret in this worker's scope; the proxy env is always set."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB, openai=_OPENAI)
     alice = _target("@alice:example.org")
     save_secret(manager, alice, "github", "s3cret")
@@ -409,7 +423,7 @@ async def test_secret_status_failure_skips_only_that_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A secret store error for one service drops that service's placeholders, logs only names, and spares the call."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB, openai=_OPENAI)
     target = _target()
     save_secret(manager, target, "github", "s3cret")
@@ -450,7 +464,7 @@ async def test_no_env_without_config_or_claims(
     manager: CredentialsManager,
 ) -> None:
     """A running broker still gives nothing when the call has no config or no worker identity to sign."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
     no_identity = resolve_worker_target("user_agent", "code", None)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
@@ -473,7 +487,7 @@ async def test_state_files_and_modes(
     tmp_path: Path,
 ) -> None:
     """State lives under <storage>/egress_broker with private keys and log; the holder is cleared on exit."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     state = tmp_path / "mindroom_data" / "egress_broker"
     async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
         for name in ("ca.key", "token.key", "requests.sqlite3"):
@@ -493,7 +507,7 @@ async def test_ca_key_encrypted_with_credentials_key(
     """With a credentials encryption key set, the CA key is encrypted with it."""
     encryption_key = "dGhpcyBpcyBhIDMyIGJ5dGUgdGVzdCBrZXkgISEhISE="
     runtime_paths = tmp_runtime_paths(
-        **_broker_env(_free_port()),
+        **_broker_env(free_port()),
         MINDROOM_CREDENTIALS_ENCRYPTION_KEY=encryption_key,
     )
     async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
@@ -512,7 +526,7 @@ async def test_token_ttl_from_env(
 ) -> None:
     """Minted tokens expire after MINDROOM_EGRESS_BROKER_TOKEN_TTL_SECONDS."""
     runtime_paths = tmp_runtime_paths(
-        **_broker_env(_free_port()),
+        **_broker_env(free_port()),
         MINDROOM_EGRESS_BROKER_TOKEN_TTL_SECONDS="600",  # noqa: S106 - a lifetime, not a secret
     )
     config = _config(github=_GITHUB)
@@ -536,7 +550,7 @@ async def test_thread_stops_on_exit(
     manager: CredentialsManager,
 ) -> None:
     """The broker runs on its own named thread, which is gone and has released the port after exit."""
-    port = _free_port()
+    port = free_port()
     runtime_paths = tmp_runtime_paths(**_broker_env(port))
     async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
         [thread] = _broker_threads()
@@ -555,7 +569,7 @@ async def test_error_inside_context_still_stops_broker(
     manager: CredentialsManager,
 ) -> None:
     """An exception raised while the broker runs propagates after the thread stops and the holder clears."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
 
     async def fail_while_running() -> None:
         async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
@@ -607,7 +621,7 @@ async def test_dial_policy_follows_the_primary_proxy_env(
         return policies[-1]
 
     monkeypatch.setattr(service, "DialPolicy", dial_policy)
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()), **env)
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()), **env)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
         pass
     [policy] = policies
@@ -642,7 +656,7 @@ async def test_unusable_operator_proxy_stops_startup(
     value: str,
 ) -> None:
     """A proxy variable the broker cannot use refuses startup, naming the variable and never its value."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()), **env)
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()), **env)
     with pytest.raises(ValueError, match=variable) as refused:
         async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
             pytest.fail("the broker must not start")
@@ -661,7 +675,7 @@ async def test_unused_all_proxy_does_not_stop_startup(
 ) -> None:
     """ALL_PROXY only fills in schemes without their own variable, so a broken one beside both is never used."""
     env = {"HTTP_PROXY": "http://proxy:3128", "HTTPS_PROXY": "http://proxy:3128", "ALL_PROXY": "socks5://x:1080"}
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()), **env)
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()), **env)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: None, credentials_manager=manager):
         assert active_ca_pem() is not None
 
@@ -708,6 +722,33 @@ def github_oauth_client(manager: CredentialsManager) -> None:
     manager.save_credentials("github_oauth_client", {"client_id": "github-client-id", "client_secret": "gh-secret"})
 
 
+def _no_key_refusal(message: str, *, service: str = "github") -> dict[str, str]:
+    """Return the 403 body for a service without a key whose refusal names only the Connections page."""
+    return {
+        "error": "credential_not_configured",
+        "service": service,
+        "manage_url": f"{_PUBLIC_URL}/connections/egress",
+        "message": message,
+    }
+
+
+def _save_mine(
+    manager: CredentialsManager,
+    target: ResolvedWorkerTarget,
+    config: Config,
+    service: dict[str, object],
+) -> None:
+    """Save `service` as the scope's own user service ``mine``, checked against `config`'s services as the API does."""
+    save_user_service(
+        manager,
+        target,
+        "mine",
+        EgressService.model_validate(service),
+        config_services=config.egress_broker.services,
+        oauth_providers=_PROVIDERS,
+    )
+
+
 def _connect_github(
     manager: CredentialsManager,
     requester_id: str,
@@ -737,20 +778,19 @@ def _connect_github(
 def _oauth_runtime(tmp_runtime_paths: Callable[..., RuntimePaths], backend: str = "docker") -> RuntimePaths:
     """Return a runtime on `backend`: personal accounts need a dedicated one (the default) to count as private."""
     return tmp_runtime_paths(
-        **_broker_env(_free_port()),
+        **_broker_env(free_port()),
         MINDROOM_PUBLIC_URL=_PUBLIC_URL,
         MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
         MINDROOM_WORKER_BACKEND=backend,
     )
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_stored_key_wins_over_oauth_and_its_removal_falls_back_without_restart(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """With both sources the stored key is injected; once it is removed the same token gets the OAuth token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
@@ -760,9 +800,9 @@ async def test_stored_key_wins_over_oauth_and_its_removal_falls_back_without_res
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        with_key = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        with_key = await get_through(env)
         delete_secret(manager, target, "github")
-        with_oauth = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        with_oauth = await get_through(env)
     assert with_key.json()["headers"]["authorization"] == ["Bearer s3cret"]
     assert with_oauth.json()["headers"]["authorization"] == ["Bearer alice-oauth"]
 
@@ -785,15 +825,15 @@ async def test_placeholder_env_when_only_oauth_is_connected(
     assert "GH_TOKEN" not in bob_env
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.parametrize("scope", ["shared", None], ids=["shared", "unscoped"])
 @pytest.mark.asyncio
 async def test_requester_scoped_oauth_is_not_used_where_requesters_share_a_worker(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     tls_upstream: Upstream,
-    tmp_path: Path,
     scope: WorkerScope | None,
+    get_through: GetThrough,
 ) -> None:
     """On a shared or unscoped worker a connected GitHub account is never injected, placeheld, or offered.
 
@@ -804,24 +844,15 @@ async def test_requester_scoped_oauth_is_not_used_where_requesters_share_a_worke
     config = _config(github=_GITHUB_OAUTH)
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     target = _target(scope=scope)
-    if target.worker_key is None:
-        # An unscoped call is routed to a worker that its proxy token names.
-        target = replace(target, worker_key="v1:local:unscoped:code")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert "GH_TOKEN" not in env
     assert response.status_code == 403
-    assert response.json() == {
-        "error": "credential_not_configured",
-        "service": "github",
-        "manage_url": f"{_PUBLIC_URL}/connections/egress",
-        "message": _NO_SHARED_GITHUB_KEY,
-    }
+    assert response.json() == _no_key_refusal(_NO_SHARED_GITHUB_KEY)
     assert tls_upstream.hits == []
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.parametrize(
     ("scope", "managers", "message"),
     [
@@ -848,11 +879,10 @@ async def test_requester_scoped_oauth_is_not_used_where_requesters_share_a_worke
 async def test_missing_key_message_names_the_calling_agents_credential_managers(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
     scope: WorkerScope | None,
     managers: list[str],
     message: str,
+    get_through: GetThrough,
 ) -> None:
     """The refusal reads the calling agent's credential managers from the config, and names them only when shared."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
@@ -861,27 +891,19 @@ async def test_missing_key_message_names_the_calling_agents_credential_managers(
         egress_broker={"services": {"github": _GITHUB}},
     )
     target = _target(scope=scope)
-    if target.worker_key is None:
-        target = replace(target, worker_key="v1:local:unscoped:code")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert response.status_code == 403
-    assert response.json() == {
-        "error": "credential_not_configured",
-        "service": "github",
-        "manage_url": f"{_PUBLIC_URL}/connections/egress",
-        "message": message,
-    }
+    assert response.json() == _no_key_refusal(message)
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_requester_scoped_oauth_on_a_shared_agent_injects_the_callers_token_with_the_opt_in(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """With `oauth_on_shared_workers`, two requesters on one shared agent each get their own GitHub token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
@@ -894,20 +916,20 @@ async def test_requester_scoped_oauth_on_a_shared_agent_injects_the_callers_toke
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=alice)
         bob_env = execution_env_for_worker(runtime_paths, config=config, worker_target=bob)
-        alice_response = await _get_through(alice_env, tls_upstream.url("/echo"), tmp_path / "runner")
-        bob_response = await _get_through(bob_env, tls_upstream.url("/echo"), tmp_path / "runner")
+        alice_response = await get_through(alice_env)
+        bob_response = await get_through(bob_env)
     assert alice_env["GH_TOKEN"] == _PLACEHOLDER
     assert alice_response.json()["headers"]["authorization"] == ["Bearer alice-oauth"]
     assert bob_response.json()["headers"]["authorization"] == ["Bearer bob-oauth"]
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_requester_scoped_oauth_is_not_used_on_the_static_runner_without_the_opt_in(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """Every call shares the static runner's process, so even a `user_agent` call gets no GitHub account there."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths, backend="static_runner")
@@ -915,25 +937,19 @@ async def test_requester_scoped_oauth_is_not_used_on_the_static_runner_without_t
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert "GH_TOKEN" not in env
     assert response.status_code == 403
-    assert response.json() == {
-        "error": "credential_not_configured",
-        "service": "github",
-        "manage_url": f"{_PUBLIC_URL}/connections/egress",
-        "message": _NO_GITHUB_KEY,
-    }
+    assert response.json() == _no_key_refusal(_NO_GITHUB_KEY)
     assert tls_upstream.hits == []
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_requester_scoped_oauth_is_used_on_the_static_runner_with_the_opt_in(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """With `oauth_on_shared_workers`, a `user_agent` call on the static runner gets the requester's own token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths, backend="static_runner")
@@ -941,7 +957,7 @@ async def test_requester_scoped_oauth_is_used_on_the_static_runner_with_the_opt_
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert env["GH_TOKEN"] == _PLACEHOLDER
     assert response.json()["headers"]["authorization"] == ["Bearer alice-oauth"]
 
@@ -961,13 +977,8 @@ async def test_concurrent_requests_refresh_an_expired_token_once(
     _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
     presented = serve_token_endpoint(monkeypatch, [DelayedTokenEndpointOutcome(0.3, rotated_token_response())])
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        worker_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        assert apply_runner_ca_bundle(worker_env, tmp_path / "runner")
-        async with httpx.AsyncClient(
-            proxy=worker_env["HTTPS_PROXY"],
-            verify=ssl.create_default_context(cafile=worker_env["SSL_CERT_FILE"]),
-            trust_env=False,
-        ) as client:
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
+        async with _worker_client(env, tmp_path / "runner") as client:
             responses = await asyncio.gather(*(client.get(tls_upstream.url("/echo")) for _ in range(6)))
     assert [response.json()["headers"]["authorization"] for response in responses] == [
         ["Bearer rotated-access-token"],
@@ -975,14 +986,14 @@ async def test_concurrent_requests_refresh_an_expired_token_once(
     assert presented == [_OAUTH_REFRESH_TOKEN]
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_revoked_grant_returns_oauth_connection_required(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     tls_upstream: Upstream,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    get_through: GetThrough,
 ) -> None:
     """A refresh the provider rejects answers 403 with a reconnect link; no token reaches the body or the logs."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
@@ -992,7 +1003,7 @@ async def test_revoked_grant_returns_oauth_connection_required(
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
         with capture_logs() as logs:
-            response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+            response = await get_through(env)
     body = response.json()
     assert response.status_code == 403
     assert body.keys() == {"error", "service", "provider", "connect_url", "manage_url", "message"}
@@ -1010,20 +1021,20 @@ async def test_revoked_grant_returns_oauth_connection_required(
     assert any(entry["event"] == "egress_broker_oauth_token_unavailable" for entry in logs)
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_missing_connection_returns_connect_url(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """With neither a key nor a connection, the 403 offers both the key page and a link to connect the account."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     body = response.json()
     assert response.status_code == 403
     assert body.keys() == {"error", "service", "manage_url", "provider", "connect_url", "message"}
@@ -1076,13 +1087,8 @@ async def test_provider_outage_is_a_retryable_503_off_the_shared_executor(
 
     monkeypatch.setattr(service, "resolve_oauth_token", recording_resolve_oauth_token)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        worker_env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        assert apply_runner_ca_bundle(worker_env, tmp_path / "runner")
-        async with httpx.AsyncClient(
-            proxy=worker_env["HTTPS_PROXY"],
-            verify=ssl.create_default_context(cafile=worker_env["SSL_CERT_FILE"]),
-            trust_env=False,
-        ) as client:
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
+        async with _worker_client(env, tmp_path / "runner") as client:
             stalled = [asyncio.create_task(client.get(tls_upstream.url("/ok"))) for _ in range(2)]
             assert await asyncio.to_thread(grant_started.wait, 5)
             keyed_response = await client.get(tls_upstream.url("/echo"))
@@ -1106,37 +1112,28 @@ async def test_provider_outage_is_a_retryable_503_off_the_shared_executor(
     assert all(name.startswith("mindroom-egress-oauth") for name in lookup_threads)
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_unconnectable_provider_gives_the_plain_missing_credential_body(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """Without an OAuth client to connect, the 403 names neither a provider nor a connect link, only the key page."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        response = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        response = await get_through(env)
     assert response.status_code == 403
-    assert response.json() == {
-        "error": "credential_not_configured",
-        "service": "github",
-        "manage_url": f"{_PUBLIC_URL}/connections/egress",
-        "message": _NO_GITHUB_KEY,
-    }
+    assert response.json() == _no_key_refusal(_NO_GITHUB_KEY)
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_shared_agent_scoped_provider_refusal_has_no_connect_link(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    get_through: GetThrough,
 ) -> None:
     """A shared-scope link skips sign-in and any process in the worker can read it, so a shared 403 only has the page."""
     drive = google_drive_oauth_provider()
@@ -1147,52 +1144,40 @@ async def test_shared_agent_scoped_provider_refusal_has_no_connect_link(
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         shared_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target(scope="shared"))
         private_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_target())
-        shared = await _get_through(shared_env, tls_upstream.url("/echo"), tmp_path / "runner")
-        private = await _get_through(private_env, tls_upstream.url("/echo"), tmp_path / "runner")
+        shared = await get_through(shared_env)
+        private = await get_through(private_env)
     assert shared.status_code == 403
-    assert shared.json() == {
-        "error": "credential_not_configured",
-        "service": "drive",
-        "manage_url": f"{_PUBLIC_URL}/connections/egress",
-        "message": "No drive key is set for this shared agent. Only an administrator can add one, at manage_url.",
-    }
+    assert shared.json() == _no_key_refusal(
+        "No drive key is set for this shared agent. Only an administrator can add one, at manage_url.",
+        service="drive",
+    )
     assert private.status_code == 403
     assert private.json()["provider"] == drive.id
     assert "connect_token=" in private.json()["connect_url"]
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_user_service_injects_its_owners_key_and_leaves_other_requesters_alone(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """Alice's own service intercepts its host for her workers only, with her key and her placeholders.
 
     Bob holds a key under the same name but has no such service, so his CONNECT to the host stays a blind tunnel
     and his worker gets no placeholder.
     """
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config()
     alice, bob = _target(), _target("@bob:example.org")
-    mine = EgressService.model_validate(_GITHUB)
-    save_user_service(
-        manager,
-        alice,
-        "mine",
-        mine,
-        config_services=config.egress_broker.services,
-        oauth_providers=_PROVIDERS,
-    )
+    _save_mine(manager, alice, config, _GITHUB)
     save_secret(manager, alice, "mine", "alice-key")
     save_secret(manager, bob, "mine", "bob-key")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=alice)
         bob_env = execution_env_for_worker(runtime_paths, config=config, worker_target=bob)
-        alice_response = await _get_through(alice_env, tls_upstream.url("/echo"), tmp_path / "runner")
-        bob_response = await _get_through(bob_env, tls_upstream.url("/echo"), tmp_path / "runner")
+        alice_response = await get_through(alice_env)
+        bob_response = await get_through(bob_env)
         audit = active_audit_log()
         assert audit is not None
         records = await audit_records(audit, 2)
@@ -1207,68 +1192,50 @@ async def test_user_service_injects_its_owners_key_and_leaves_other_requesters_a
     ]
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream")
 @pytest.mark.asyncio
 async def test_user_service_edits_apply_to_the_running_broker(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
-    tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """Saving a service starts injection and deleting it stops it, from the next request on and without a restart."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config()
     target = _target()
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        before = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
-        mine = EgressService.model_validate(_GITHUB)
-        save_user_service(
-            manager,
-            target,
-            "mine",
-            mine,
-            config_services=config.egress_broker.services,
-            oauth_providers=_PROVIDERS,
-        )
+        before = await get_through(env)
+        _save_mine(manager, target, config, _GITHUB)
         # A new service starts without a key, so the key is set after it.
         save_secret(manager, target, "mine", "alice-key")
-        saved = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        saved = await get_through(env)
         assert delete_user_service(manager, target, "mine", config_services=config.egress_broker.services)
-        deleted = await _get_through(env, tls_upstream.url("/echo"), tmp_path / "runner")
+        deleted = await get_through(env)
     assert "authorization" not in before.json()["headers"]
     assert saved.json()["headers"]["authorization"] == ["Bearer alice-key"]
     assert "authorization" not in deleted.json()["headers"]
 
 
-@pytest.mark.usefixtures("allow_loopback", "trust_upstream", "github_oauth_client")
+@pytest.mark.usefixtures("github_oauth_client")
 @pytest.mark.asyncio
 async def test_user_service_uses_only_its_scopes_oauth_connection(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     tls_upstream: Upstream,
-    tmp_path: Path,
+    get_through: GetThrough,
 ) -> None:
     """A user service naming an OAuth provider injects its owner's connected account and nobody else's."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config()
     alice, bob = _target(), _target("@bob:example.org")
-    mine = EgressService.model_validate(_GITHUB_OAUTH)
     for target in (alice, bob):
-        save_user_service(
-            manager,
-            target,
-            "mine",
-            mine,
-            config_services=config.egress_broker.services,
-            oauth_providers=_PROVIDERS,
-        )
+        _save_mine(manager, target, config, _GITHUB_OAUTH)
     _connect_github(manager, "@alice:example.org", "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=alice)
         bob_env = execution_env_for_worker(runtime_paths, config=config, worker_target=bob)
-        alice_response = await _get_through(alice_env, tls_upstream.url("/echo"), tmp_path / "runner")
-        bob_response = await _get_through(bob_env, tls_upstream.url("/echo"), tmp_path / "runner")
+        alice_response = await get_through(alice_env)
+        bob_response = await get_through(bob_env)
     assert alice_env["GH_TOKEN"] == _PLACEHOLDER
     assert alice_response.json()["headers"]["authorization"] == ["Bearer alice-oauth"]
     assert "GH_TOKEN" not in bob_env
@@ -1286,19 +1253,11 @@ async def test_user_service_cannot_open_a_host_under_deny(
     raw_proxy: Callable[[int, bytes], Awaitable[RawResponse]],
 ) -> None:
     """Under deny the running broker refuses a host only Alice's service names, as if her service did not exist."""
-    port = _free_port()
+    port = free_port()
     runtime_paths = tmp_runtime_paths(**_broker_env(port))
     config = Config(egress_broker={"unmatched_hosts": "deny", "services": {"openai": _OPENAI}})
     target = _target()
-    mine = EgressService.model_validate(_GITHUB)
-    save_user_service(
-        manager,
-        target,
-        "mine",
-        mine,
-        config_services=config.egress_broker.services,
-        oauth_providers=_PROVIDERS,
-    )
+    _save_mine(manager, target, config, _GITHUB)
     save_secret(manager, target, "mine", "alice-key")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
@@ -1314,23 +1273,14 @@ async def test_config_placeholders_win_over_user_placeholders(
     manager: CredentialsManager,
 ) -> None:
     """A user service cannot replace a config service's placeholder; its own variables still reach the worker."""
-    runtime_paths = tmp_runtime_paths(**_broker_env(_free_port()))
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
     config = _config(github=_GITHUB)
     target = _target()
-    mine = EgressService.model_validate(
-        {
-            "rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}],
-            "placeholder_env": {"GH_TOKEN": "user-value", "MINE_TOKEN": "mine-placeholder"},
-        },
-    )
-    save_user_service(
-        manager,
-        target,
-        "mine",
-        mine,
-        config_services=config.egress_broker.services,
-        oauth_providers=_PROVIDERS,
-    )
+    mine = {
+        "rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}],
+        "placeholder_env": {"GH_TOKEN": "user-value", "MINE_TOKEN": "mine-placeholder"},
+    }
+    _save_mine(manager, target, config, mine)
     save_secret(manager, target, "github", "s3cret")
     save_secret(manager, target, "mine", "mine-key")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
