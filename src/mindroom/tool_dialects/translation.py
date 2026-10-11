@@ -17,7 +17,7 @@ from agno.tools.function import Function
 
 from mindroom.config.main import Config
 from mindroom.logging_config import get_logger
-from mindroom.model_loading import canonical_provider
+from mindroom.providers.model_loading import canonical_provider
 from mindroom.tool_dialects.claude import CLAUDE_DIALECT
 from mindroom.tool_dialects.codex import CODEX_DIALECT
 from mindroom.tool_dialects.types import (

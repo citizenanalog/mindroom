@@ -19,7 +19,7 @@ from openai import AsyncOpenAI
 
 from mindroom.agents import set_toolkit_owner
 from mindroom.config.models import ModelConfig
-from mindroom.openai_models import MindRoomOpenAIChat, MindRoomOpenAIResponses
+from mindroom.providers.openai_models import MindRoomOpenAIChat, MindRoomOpenAIResponses
 from mindroom.tool_dialects.agno_compat_model import install_tool_dialect
 from mindroom.tool_dialects.translation import resolve_tool_dialect
 from mindroom.tool_dialects.types import DialectArgumentError, ToolDialect, WireFunction

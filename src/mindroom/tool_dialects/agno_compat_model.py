@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from agno.models.message import Message
 
 from mindroom.agno_compat_model_hooks import install_async_invocation_hooks
-from mindroom.model_instance_checks import MINDROOM_OPENAI_RESPONSES_CLASS, isinstance_of_loaded
+from mindroom.providers.model_instance_checks import MINDROOM_OPENAI_RESPONSES_CLASS, isinstance_of_loaded
 from mindroom.tool_dialects.translation import (
     canonical_tool_calls,
     presents,
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from agno.models.response import ModelResponse
     from agno.tools.function import Function, FunctionCall
 
-    from mindroom.openai_models import MindRoomOpenAIResponses
+    from mindroom.providers.openai_models import MindRoomOpenAIResponses
     from mindroom.tool_dialects.types import ToolDialect
 
 _TOOL_DIALECT_MARKER = "_mindroom_tool_dialect"

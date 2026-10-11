@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from mindroom.shell_execution import MAX_CHECK_WAIT_SECONDS, MAX_OUTPUT_LINES
+from mindroom.shell.execution import MAX_CHECK_WAIT_SECONDS, MAX_OUTPUT_LINES
 from mindroom.tool_dialects.types import (
     APPLY_PATCH,
     FILE_EDITS,

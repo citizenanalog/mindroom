@@ -40,10 +40,11 @@ from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.skill_manage import SkillManageTools
 from mindroom.llm_request_logging import current_llm_request_log_context
 from mindroom.mid_turn import QueuedMessage
-from mindroom.model_loading import get_model_instance
-from mindroom.openai_models import MindRoomOpenAIResponses
 from mindroom.path_confinement import open_directory_within_root
-from mindroom.provider_tool_policy import provider_tools_disabled
+from mindroom.providers.model_loading import get_model_instance
+from mindroom.providers.openai_models import MindRoomOpenAIResponses
+from mindroom.providers.synthetic_model import SyntheticModel
+from mindroom.providers.tool_policy import provider_tools_disabled
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.skill_learning import library
 from mindroom.skill_learning import reviewer as reviewer_module
@@ -53,14 +54,13 @@ from mindroom.skill_learning.reviewer import review_conversation
 from mindroom.skill_learning.runner import SkillReviewRunner
 from mindroom.skill_learning.tools import ReviewProgress, SkillTools, load_skill_catalog
 from mindroom.skill_learning.transcript import count_model_replies, render_transcript
-from mindroom.synthetic_model import SyntheticModel
 from mindroom.tool_dialects.agno_compat_model import install_tool_dialect, installed_tool_dialect
 from mindroom.tool_dialects.claude import CLAUDE_DIALECT
 from mindroom.tool_dialects.codex import CODEX_DIALECT
 from mindroom.tool_system.dynamic_toolkits import visible_tool_surface
 from mindroom.tool_system.skill_usage import load_skill_usage, update_skill_usages
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
-from mindroom.usage_stats import collect_admin_usage
+from mindroom.usage.stats import collect_admin_usage
 from tests.conftest import seed_session
 
 if TYPE_CHECKING:
@@ -688,7 +688,7 @@ async def test_a_replayed_review_creates_views_and_patches_with_only_skill_tools
         ("skill_manage", {**patch_step, "name": "deploy-checks", "new_string": "1. Run the smoke test.\n2. Retry."}),
     )
     progress = ReviewProgress()
-    with patch("mindroom.model_loading.get_model_instance", return_value=model):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
         await review_conversation(
             config=config,
             runtime_paths=paths,
@@ -752,7 +752,7 @@ async def test_reviewer_patches_and_support_files_refuse_literal_credentials(tmp
         ),
     )
     progress = ReviewProgress()
-    with patch("mindroom.model_loading.get_model_instance", return_value=model):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
         await review_conversation(
             config=config,
             runtime_paths=paths,
@@ -930,7 +930,7 @@ async def test_reviewer_refuses_protected_skills_and_stops_at_its_budget(tmp_pat
         *[("get_skill_instructions", {"skill_name": "handwritten"})] * 12,
     )
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.reviewer.record_helper_usage", AsyncMock()),
     ):
         await _review(config, paths)
@@ -955,7 +955,7 @@ async def test_the_budget_counts_what_each_request_sends(tmp_path: Path) -> None
         ("skill_manage", {**patch_step, "new_string": "1. Run the smoke test.\n2. Check logs."}),
     )
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.reviewer.record_helper_usage", AsyncMock()),
     ):
         await _review(config, paths)
@@ -972,7 +972,7 @@ async def test_reviews_start_at_the_interval_and_post_a_notice(tmp_path: Path) -
     client = object()
     send = AsyncMock(return_value=object())
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.runner.send_message_result", send),
     ):
         runner = _runner(paths, client)
@@ -1018,7 +1018,7 @@ async def test_review_archives_inactive_learned_skills_without_announcing_them(t
         )
     send = AsyncMock(return_value=object())
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=_model()),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=_model()),
         patch("mindroom.skill_learning.runner.send_message_result", send),
     ):
         await _review_due(config, paths, object(), identity=ALICE)
@@ -1032,7 +1032,7 @@ async def test_review_requests_log_the_conversation_and_the_response_that_starte
     config, paths = _learner(tmp_path)
     _seed(config, paths, _tool_turn("r1"), identity=ALICE)
     model = _model()
-    with patch("mindroom.model_loading.get_model_instance", return_value=model):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
         task = await _count(_runner(paths), config, identity=ALICE, correlation_id="$request")
         assert task is not None
         await task
@@ -1056,7 +1056,7 @@ async def test_private_reviews_stay_in_the_requester_workspace(tmp_path: Path) -
     _seed(config, paths, _tool_turn("r1"), identity=ALICE)
     _seed(config, paths, _tool_turn("b1", result="bob private result"), identity=BOB)
     model = _model(("skill_manage", {"action": "create", "name": "deploy-checks", "content": LEARNED}))
-    with patch("mindroom.model_loading.get_model_instance", return_value=model):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
         await _review_due(config, paths, identity=ALICE)
     assert "tests passed" in model.requests[0][-1]
     assert "bob private result" not in model.requests[0][-1]
@@ -1080,7 +1080,7 @@ async def test_skill_manage_offers_its_actions_as_a_string_enum(tmp_path: Path) 
     _seed(config, paths, _tool_turn("r1"))
     model = _model()
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.reviewer.record_helper_usage", AsyncMock()),
     ):
         await _review(config, paths)
@@ -1125,7 +1125,7 @@ async def test_adopted_skill_in_a_differently_named_directory_can_be_patched(tmp
     )
     progress = ReviewProgress()
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.reviewer.record_helper_usage", AsyncMock()),
     ):
         await review_conversation(
@@ -1151,7 +1151,7 @@ async def test_unreadable_user_skill_does_not_block_reviews(tmp_path: Path) -> N
     locked.chmod(0)
     model = _model()
     try:
-        with patch("mindroom.model_loading.get_model_instance", return_value=model):
+        with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
             await _review_due(config, paths)
     finally:
         locked.chmod(0o755)
@@ -1167,7 +1167,7 @@ async def test_reviewer_refuses_edits_to_unknown_skills(tmp_path: Path) -> None:
         ("skill_manage", {"action": "write_file", "name": "", "file_path": "references/x.md", "file_content": "x"}),
     )
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.reviewer.record_helper_usage", AsyncMock()),
     ):
         await _review(config, paths)
@@ -1239,7 +1239,7 @@ async def test_skill_edits_sent_in_one_reply_both_land(tmp_path: Path) -> None:
             ("skill_manage", {**patch_step, "old_string": "the web service", "new_string": "the web app"}),
         ],
     )
-    with patch("mindroom.model_loading.get_model_instance", return_value=model):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
         await review_conversation(
             config=config,
             runtime_paths=paths,
@@ -1318,7 +1318,7 @@ async def test_compaction_never_lowers_the_count_and_the_replay_sees_its_summary
     finally:
         storage.close()
     model = _model()
-    with patch("mindroom.model_loading.get_model_instance", return_value=model):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=model):
         task = await _count(runner, config, run_id="r2")
         assert task is not None
         await task
@@ -1468,7 +1468,7 @@ async def test_the_review_replays_the_stored_conversation_when_it_cannot_fork(tm
         # The final request already used more than a quarter of the default 120,000-token review budget.
         final_metrics.input_tokens = 40_000
     replay = _model()
-    with patch("mindroom.model_loading.get_model_instance", return_value=replay):
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=replay):
         await _review(config, paths, captured=None if reason == "no capture" else capture.latest)
     assert len(replay.requests) == 1
     assert "<conversation>" in replay.requests[0][-1]
@@ -1640,7 +1640,7 @@ async def test_a_review_a_new_response_stops_after_its_writes_still_posts_its_no
     send = AsyncMock(return_value=object())
     runner = _runner(paths, object())
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.runner.send_message_result", send),
     ):
         task = await _count(runner, config, identity=ALICE)
@@ -1669,7 +1669,7 @@ async def test_a_response_starting_while_the_notice_is_sent_never_stops_it(tmp_p
 
     runner = _runner(paths, object())
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.runner.send_message_result", send),
     ):
         assert await _count(runner, config, identity=ALICE) is not None
@@ -1689,7 +1689,7 @@ async def test_a_review_runs_in_a_fresh_context(tmp_path: Path) -> None:
     notice = "Pause tool use and summarize before handling the newer message."
     install_queued_message_notice_hook(model, notice_text=notice)
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         queued_message_signal_context(_PendingMessage()),
     ):
         await _review_due(config, paths)
@@ -1717,7 +1717,7 @@ async def test_a_replay_reviews_on_the_model_the_response_used(tmp_path: Path) -
     assert capture.latest is not None
     unforkable = replace(capture.latest, messages=capture.latest.messages[:-1])
     replay = _model()
-    with patch("mindroom.model_loading.get_model_instance", return_value=replay) as load:
+    with patch("mindroom.providers.model_loading.get_model_instance", return_value=replay) as load:
         await _review(config, paths, captured=unforkable)
     assert load.call_args.args[2] == "thread"
     assert len(replay.requests) == 1
@@ -1768,7 +1768,7 @@ async def test_the_review_validates_skill_tool_arguments_like_agno(tmp_path: Pat
         ("skill_manage", {**patch_step, "new_string": "1. Smoke.", "replace_all": "false"}),
     )
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch("mindroom.skill_learning.reviewer.record_helper_usage", AsyncMock()),
     ):
         await _review(config, paths)
@@ -1900,7 +1900,7 @@ async def test_the_review_closes_the_claude_client_it_opens(tmp_path: Path, endi
         return clients[-1]
 
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=model),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
         patch.object(model, "get_async_client", opening),
     ):
         review = asyncio.create_task(_review(config, paths))

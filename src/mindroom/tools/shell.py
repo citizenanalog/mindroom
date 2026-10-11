@@ -19,7 +19,7 @@ from mindroom.constants import (
     subprocess_path_with_prepends,
     workspace_home_identity_env,
 )
-from mindroom.shell_execution import (
+from mindroom.shell.execution import (
     DEFAULT_RUN_TIMEOUT_SECONDS,
     ProcessRecord,
     check_command,
@@ -27,8 +27,8 @@ from mindroom.shell_execution import (
     run_command,
     wait_for_command,
 )
-from mindroom.shell_output_capture import ShellOutputDestination
-from mindroom.shell_supervisor import (
+from mindroom.shell.output_capture import ShellOutputDestination
+from mindroom.shell.supervisor import (
     SHELL_SUPERVISOR_SOCKET_ENV,
     kill_command_via_supervisor,
     poll_command_via_supervisor,

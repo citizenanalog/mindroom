@@ -35,7 +35,7 @@ from mindroom.agno_compat_prepared_tools import prepare_team_prompt_tools, tempo
 from mindroom.timing import timed_block
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from mindroom.tool_dialects.agno_compat_model import installed_tool_dialect, presented_tool_pairs
-from mindroom.tool_schema_cache import cached_processed_schema
+from mindroom.tool_system.tool_schema_cache import cached_processed_schema
 
 if TYPE_CHECKING:
     from agno.agent import Agent

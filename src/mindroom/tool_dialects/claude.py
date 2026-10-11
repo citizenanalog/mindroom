@@ -9,7 +9,7 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
-from mindroom.shell_execution import DEFAULT_RUN_TIMEOUT_SECONDS, MAX_OUTPUT_LINES
+from mindroom.shell.execution import DEFAULT_RUN_TIMEOUT_SECONDS, MAX_OUTPUT_LINES
 from mindroom.tool_dialects.types import (
     APPLY_PATCH,
     FILE_EDITS,

@@ -10,7 +10,7 @@ from agno.tools.function import Function
 
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
-from mindroom.shell_execution import MAX_OUTPUT_LINES
+from mindroom.shell.execution import MAX_OUTPUT_LINES
 from mindroom.tool_dialects.claude import CLAUDE_DIALECT
 from mindroom.tool_dialects.codex import CODEX_DIALECT
 from mindroom.tool_dialects.translation import canonical_tool_calls, resolve_tool_dialect, wire_tools

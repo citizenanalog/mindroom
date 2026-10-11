@@ -12,9 +12,9 @@ from agno.tools.toolkit import Toolkit
 from anthropic import AsyncAnthropic
 
 from mindroom.agents import set_toolkit_owner
-from mindroom.anthropic_claude import MindRoomAnthropicClaude
 from mindroom.config.models import ModelConfig
-from mindroom.shell_execution import MAX_OUTPUT_LINES
+from mindroom.providers.anthropic_claude import MindRoomAnthropicClaude
+from mindroom.shell.execution import MAX_OUTPUT_LINES
 from mindroom.tool_dialects.agno_compat_model import install_tool_dialect
 from mindroom.tool_dialects.claude import CLAUDE_DIALECT
 from mindroom.tool_dialects.translation import resolve_tool_dialect
