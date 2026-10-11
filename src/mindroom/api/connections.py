@@ -20,7 +20,7 @@ from mindroom.api.connection_agents import (
     resolve_connection_user,
 )
 from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.logging_config import get_logger
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
 from mindroom.matrix.users import create_agent_http_client
@@ -80,6 +80,7 @@ class AgentConnections(BaseModel):
     is_shared: bool
     can_use: bool
     managers: list[str] = []
+    mcp_available: bool
     services: list[ConnectionService]
     tools: list[ConnectionTool]
     egress_services: list[EgressCredentialService] | None = None
@@ -209,6 +210,7 @@ def _agent_connections(
         is_shared=agent.private is None,
         can_use=agent_name in user.agent_names,
         managers=list(agent.credential_managers) if entity.execution_scope in {None, "shared"} else [],
+        mcp_available=agent_name in user.gateway_agent_names,
         services=list(services.values()),
         tools=tools,
     )

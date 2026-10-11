@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from agno.tools import Toolkit
 
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.oauth_source import oauth_status
 from mindroom.egress_broker.secrets import service_status
 from mindroom.egress_broker.service import manage_url
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from mindroom.config.egress_broker import EgressService
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.egress_broker.user_services import ServiceSource
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 

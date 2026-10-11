@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, AgentThreadExportConfig
 from mindroom.config.main import Config
 from mindroom.event_journal import EventJournalStore
@@ -93,6 +94,7 @@ def _runner(config: Config, bots: dict[str, _ThreadExportBot]) -> WorkspaceThrea
             config_provider=lambda: config,
             bot_provider=bots.get,
             response_admission_gate=ResponseAdmissionGate(),
+            agent_reply_memberships=AgentReplyMembershipIndex(),
             debounce_seconds=0,
         ),
     )
@@ -643,7 +645,7 @@ async def test_unreadable_private_identity_clears_that_instance_and_keeps_the_pa
 
     with (
         patch(
-            "mindroom.private_instance_identity_store.load_private_instance_record_payload",
+            "mindroom.private_storage.private_instance_identity_store.load_private_instance_record_payload",
             side_effect=PermissionError("record unreadable"),
         ),
         patch(EXPORT_PATH, new=export),

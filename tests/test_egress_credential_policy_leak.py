@@ -6,7 +6,7 @@ import json
 from typing import TYPE_CHECKING
 
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credentials import CredentialsManager, save_scoped_credentials
+from mindroom.credentials.manager import CredentialsManager, save_scoped_credentials
 from mindroom.egress_broker.secrets import save_secret
 from mindroom.egress_broker.tokens import WorkerClaims
 from mindroom.tool_system.sandbox_proxy import _read_credential_policy

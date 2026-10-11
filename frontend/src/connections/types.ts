@@ -25,6 +25,7 @@ export interface AgentConnections {
    * Absent in responses from before the server sent it.
    */
   managers?: string[];
+  mcp_available: boolean;
   services: ConnectionService[];
   tools: ConnectionTool[];
   /**

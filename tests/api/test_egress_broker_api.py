@@ -14,7 +14,7 @@ from fastapi import HTTPException
 
 from mindroom.api import egress_broker, egress_status, oauth
 from mindroom.config.egress_broker import EgressService
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.presets import EGRESS_PRESETS

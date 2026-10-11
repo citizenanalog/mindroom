@@ -13,7 +13,7 @@ from structlog.testing import capture_logs
 from mindroom.config.egress_broker import EgressService
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.custom_tools import egress_credentials as egress_credentials_module
 from mindroom.custom_tools.egress_credentials import EgressCredentialsTools
 from mindroom.egress_broker.secrets import save_secret
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth.providers import OAuthProvider
 
 _SECRET = "ghp_super_secret_token_value"  # noqa: S105

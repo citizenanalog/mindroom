@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.workers.backend import WorkerBackend
 
 _DEFAULT_SANDBOX_PROXY_TIMEOUT_SECONDS = 120.0
@@ -270,7 +270,7 @@ def _read_proxy_tools(
 
 
 def _read_credential_policy(runtime_paths: RuntimePaths) -> dict[str, tuple[str, ...]]:  # noqa: C901
-    from mindroom.credential_policy import is_egress_broker_service  # noqa: PLC0415
+    from mindroom.credentials.policy import is_egress_broker_service  # noqa: PLC0415
 
     raw_policy = (
         runtime_paths.env_value(SANDBOX_RUNTIME_ENV_BY_KEY["credential_policy_json"], default="") or ""

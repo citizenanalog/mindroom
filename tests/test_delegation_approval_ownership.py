@@ -21,7 +21,7 @@ from agno.tools.function import UserInputField
 from mindroom.agent_storage import create_session_storage
 from mindroom.agents import apply_tool_approval_capability
 from mindroom.ai import run_delegated_child_response
-from mindroom.approval_tools import toolkit_owners_for_agents
+from mindroom.approval.tool_owners import toolkit_owners_for_agents
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig
@@ -30,14 +30,14 @@ from mindroom.delegation.execution import drive_delegations
 from mindroom.delegation.lifecycle import child_execution_identity
 from mindroom.delegation.recovery import read_child_run
 from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationState
-from mindroom.event_journal import ApprovalCall, ApprovalContinuation, approval_arguments_digest
+from mindroom.event_journal import ApprovalCall, approval_arguments_digest
 from mindroom.history.session_context import open_resolved_scope_session_context
 from mindroom.history.types import HistoryScope
-from mindroom.response_sources import ResponseSources
-from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, paused_attempt_from_response
+from mindroom.response_turn import CompletedApprovalRun, PausedAnswer, PausedAttempt, paused_attempt_from_response
 from mindroom.teams import TeamMode, _attach_team_pause_presentation, continue_paused_team_run
 from mindroom.tool_system import dynamic_toolkits
 from mindroom.tool_system.runtime_context import LiveToolDispatchContext, tool_runtime_context
+from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import unwrap_extracted_collaborator
 from tests.identity_helpers import entity_ids
 from tests.response_runner_helpers import _bot, _noop_typing
@@ -121,7 +121,7 @@ async def test_saved_child_approval_preserves_executable_ownership(  # noqa: C90
         "mindroom.agents._load_agent_model_instance",
         lambda _config, _paths, _name, owner: parent_model if owner.session_id == identity.session_id else child_model,
     )
-    monkeypatch.setattr("mindroom.model_loading.get_model_instance", lambda *_args, **_kwargs: team_model)
+    monkeypatch.setattr("mindroom.providers.model_loading.get_model_instance", lambda *_args, **_kwargs: team_model)
     executed = []
     original_add = CalculatorTools.add
 
@@ -297,7 +297,6 @@ async def test_saved_child_approval_preserves_executable_ownership(  # noqa: C90
                         approval_calls=(call,),
                         history_scope=history_scope,
                         prior_presentation_state=paused.response_presentation_state,
-                        prior_response_text=paused.response_text,
                         prior_tool_trace=paused.tool_trace,
                         progress=None,
                     )
@@ -309,23 +308,21 @@ async def test_saved_child_approval_preserves_executable_ownership(  # noqa: C90
                         "resolve_for_agent_async",
                         AsyncMock(return_value=SimpleNamespace(knowledge=None)),
                     )
-                    monkeypatch.setattr("mindroom.approval_execution.typing_indicator", _noop_typing)
-                    continuation = ApprovalContinuation(
+                    monkeypatch.setattr("mindroom.approval.execution.typing_indicator", _noop_typing)
+                    continuation = approval_continuation(
                         approval_id="saved-child-approval",
                         run_id=paused.run_id,
                         session_id=identity.session_id,
-                        entity_kind="agent",
                         entity_name="leader",
                         room_id=identity.room_id,
                         thread_id=identity.thread_id,
                         requester_id=identity.requester_id,
-                        response_event_id="$waiting",
-                        sources=ResponseSources(("$source",), ("$source",)),
                         state="claimed",
                         calls=(call,),
                     )
                     result = await execution.continue_run(
                         continuation,
+                        paused_answer=PausedAnswer(),
                         execution_identity=identity,
                         tool_dispatch=LiveToolDispatchContext(execution_identity=identity, runtime_context=context),
                         decisions=decisions,
@@ -423,7 +420,7 @@ async def test_parent_call_beside_a_pausing_delegation_runs_once_every_card_is_a
         "mindroom.agents._load_agent_model_instance",
         lambda _config, _paths, _name, owner: parent_model if owner.session_id == identity.session_id else child_model,
     )
-    monkeypatch.setattr("mindroom.model_loading.get_model_instance", lambda *_args, **_kwargs: team_model)
+    monkeypatch.setattr("mindroom.providers.model_loading.get_model_instance", lambda *_args, **_kwargs: team_model)
     executed = []
     original_add = CalculatorTools.add
 
@@ -507,7 +504,7 @@ async def test_parent_call_beside_a_pausing_delegation_runs_once_every_card_is_a
         "resolve_for_agent_async",
         AsyncMock(return_value=SimpleNamespace(knowledge=None)),
     )
-    monkeypatch.setattr("mindroom.approval_execution.typing_indicator", _noop_typing)
+    monkeypatch.setattr("mindroom.approval.execution.typing_indicator", _noop_typing)
     cards = []
     for _ in range(3):
         if not isinstance(result, PausedAttempt):
@@ -545,27 +542,24 @@ async def test_parent_call_beside_a_pausing_delegation_runs_once_every_card_is_a
                     approval_calls=calls,
                     history_scope=history_scope,
                     prior_presentation_state=result.response_presentation_state,
-                    prior_response_text=result.response_text,
                     prior_tool_trace=result.tool_trace,
                     progress=None,
                 )
             else:
-                continuation = ApprovalContinuation(
+                continuation = approval_continuation(
                     approval_id=f"card-{len(cards)}",
                     run_id=result.run_id,
                     session_id=identity.session_id,
-                    entity_kind="agent",
                     entity_name="leader",
                     room_id=identity.room_id,
                     thread_id=identity.thread_id,
                     requester_id=identity.requester_id,
-                    response_event_id="$waiting",
-                    sources=ResponseSources(("$source",), ("$source",)),
                     state="claimed",
                     calls=calls,
                 )
                 result = await execution.continue_run(
                     continuation,
+                    paused_answer=PausedAnswer(),
                     execution_identity=identity,
                     tool_dispatch=LiveToolDispatchContext(execution_identity=identity, runtime_context=context),
                     decisions=decisions,

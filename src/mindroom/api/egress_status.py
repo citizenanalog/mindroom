@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from mindroom.api.config_lifecycle import ApiSnapshot
     from mindroom.config.egress_broker import EgressAuth
     from mindroom.config.main import Config
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.egress_broker.audit import AuditRecord
     from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget

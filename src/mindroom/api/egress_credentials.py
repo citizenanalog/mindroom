@@ -37,7 +37,7 @@ from mindroom.api.egress_status import (
 )
 from mindroom.authorization import is_sender_allowed_for_agent_credential_management, is_sender_allowed_for_responder
 from mindroom.config.egress_broker import EgressService
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
 from mindroom.egress_broker.secrets import OAuthStatus, delete_secret, save_secret
 from mindroom.egress_broker.service import active_audit_log
@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from mindroom.config.egress_broker import EgressBrokerConfig
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 

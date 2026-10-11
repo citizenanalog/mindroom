@@ -13,8 +13,8 @@ import pytest
 from agno.media import Image
 
 from mindroom.attachments import _attachment_id_for_event, register_local_attachment
-from mindroom.coalescing import CoalescingGate, LaneSlot, ReadyPendingEvent
-from mindroom.coalescing_batch import CoalescingKey, PreparedTurn, RequesterCoalescingOwner
+from mindroom.coalescing.batch import CoalescingKey, PreparedTurn, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate, LaneSlot, ReadyPendingEvent
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
     SOURCE_KIND_KEY,
@@ -73,7 +73,7 @@ from tests.conftest import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from mindroom.ingress_lanes import ReceiptLaneKey
+    from mindroom.coalescing.ingress_lanes import ReceiptLaneKey
     from mindroom.matrix.users import AgentMatrixUser
 
 
@@ -194,9 +194,7 @@ class TestAgentBot(AgentBotTestBase):
             agent_name=mock_agent_user.agent_name,
             room_id=room.room_id,
             event_id="$img_event",
-            response_event_id="$response",
             requester_id="@user:localhost",
-            correlation_id="$img_event",
             source_event_prompts={"$img_event": "[Attached image]"},
         )
         expected_handled_turn = replace(
@@ -813,10 +811,8 @@ class TestAgentBot(AgentBotTestBase):
                 agent_name=mock_agent_user.agent_name,
                 room_id=room.room_id,
                 event_id="$img_event_history",
-                response_event_id="$response",
                 thread_id="$thread_root",
                 requester_id="@user:localhost",
-                correlation_id="$img_event_history",
                 source_event_prompts={"$img_event_history": "[Attached image]"},
             ),
         )
@@ -1417,9 +1413,7 @@ class TestAgentBot(AgentBotTestBase):
                     agent_name=mock_agent_user.agent_name,
                     room_id=room.room_id,
                     event_id="$file_event",
-                    response_event_id="$response",
                     requester_id="@user:localhost",
-                    correlation_id="$file_event",
                     source_event_prompts={"$file_event": "[Attached file]"},
                 ),
                 response_owner=mock_agent_user.agent_name,

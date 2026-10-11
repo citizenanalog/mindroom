@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from mindroom.config.egress_broker import EgressService
-from mindroom.credential_policy import credential_service_policy
-from mindroom.credentials import CredentialsManager, load_scoped_credentials
+from mindroom.credentials.manager import CredentialsManager, load_scoped_credentials
+from mindroom.credentials.policy import credential_service_policy
 from mindroom.egress_broker.secrets import (
     EgressServiceStatus,
     OAuthStatus,

@@ -6,7 +6,7 @@ import asyncio
 import signal
 import time
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, suppress
+from contextlib import suppress
 from contextvars import Context
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -20,16 +20,18 @@ from mindroom.agent_cli.session import TurnToolRegistry
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex, agent_reply_membership_policy_changed
 from mindroom.agent_reply_membership_sync import AgentReplyMembershipSync
 from mindroom.agents import ensure_default_agent_workspaces
-from mindroom.approval_manager import initialize_approval_store
-from mindroom.approval_recovery import ApprovalRecovery
-from mindroom.approval_transport import ApprovalMatrixTransport
+from mindroom.approval.manager import initialize_approval_store
+from mindroom.approval.recovery import ApprovalRecovery
+from mindroom.approval.tool_approval import shutdown_approval_runtime
+from mindroom.approval.transport import ApprovalMatrixTransport
 from mindroom.attachments import wait_for_attachment_cleanup_tasks
 from mindroom.automations.runner import AutomationRunner
 from mindroom.background_tasks import create_background_task, run_blocking_until_complete, wait_for_background_tasks
-from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.constants import ROUTER_AGENT_NAME, tracking_dir
+from mindroom.credentials.legacy_tool_credentials import migrate_tool_credential_defaults
 from mindroom.delegation.recovery import cancel_approval_delegations
 from mindroom.desktop.identity import controller_identity_for_live_bot
-from mindroom.embedder_health import check_embedder_health, handle_embedder_config_reload
+from mindroom.embeddings.embedder_health import check_embedder_health, handle_embedder_config_reload
 from mindroom.entity_resolution import (
     DuplicateManagedEntityIdentityError,
     MissingManagedEntityAccountError,
@@ -39,6 +41,7 @@ from mindroom.entity_resolution import (
 )
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.event_loop_stall import EventLoopStallDetector, start_event_loop_stall_detector
+from mindroom.file_locks import release_file_lock, try_exclusive_file_lock
 from mindroom.heap_probe import start_heap_type_probe
 from mindroom.hooks import (
     EVENT_CONFIG_RELOADED,
@@ -53,10 +56,7 @@ from mindroom.hooks import (
 from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
 from mindroom.knowledge.status import reconcile_knowledge_mode_transition_states
 from mindroom.knowledge.watch import KnowledgeSourceWatcher
-from mindroom.legacy_private_storage import migrate_private_storage
 from mindroom.legacy_state_root_records import migrate_state_root_records
-from mindroom.legacy_tool_credentials import migrate_tool_credential_defaults
-from mindroom.legacy_usage_storage import migrate_usage_storage
 from mindroom.matrix.client_room_admin import get_joined_rooms, get_room_members, invite_to_room
 from mindroom.matrix.health import reset_matrix_sync_health
 from mindroom.matrix.identity import managed_account_user_id
@@ -66,9 +66,6 @@ from mindroom.matrix.rooms import (
     ensure_root_space,
     ensure_user_in_rooms,
     reconcile_managed_rooms,
-)
-from mindroom.matrix.stale_stream_cleanup import (
-    recover_stale_streaming_messages,
 )
 from mindroom.matrix.state import load_rooms, resolve_room_aliases
 from mindroom.matrix.users import (
@@ -86,6 +83,7 @@ from mindroom.mcp.manager import MCPServerManager
 from mindroom.mcp.registry import mcp_tool_name
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.memory import MemoryAutoFlushWorker, auto_flush_enabled
+from mindroom.private_storage.legacy_private_storage import migrate_private_storage
 from mindroom.response_activity import ResponseIdentity
 from mindroom.response_admission import ResponseAdmissionGate
 from mindroom.runtime_env_policy import EGRESS_BROKER_ENV_BY_KEY
@@ -104,11 +102,10 @@ from mindroom.runtime_state import (
     set_runtime_ready,
     set_runtime_starting,
 )
-from mindroom.scheduling_executor import set_scheduling_hook_registry
+from mindroom.scheduling.executor import set_scheduling_hook_registry
 from mindroom.skill_learning.runner import SkillReviewRunner
-from mindroom.startup_errors import PermanentStartupError
+from mindroom.startup_errors import EventJournalHoldLostError, PermanentStartupError
 from mindroom.startup_maintenance import StartupMaintenanceController
-from mindroom.tool_approval import shutdown_approval_runtime
 from mindroom.tool_system.plugins import (
     PluginReloadResult,
     apply_prepared_plugin_reload,
@@ -118,6 +115,7 @@ from mindroom.tool_system.plugins import (
     reload_plugins,
 )
 from mindroom.tool_system.skills import clear_skill_cache, get_skill_snapshot
+from mindroom.usage.legacy_usage_storage import migrate_usage_storage
 from mindroom.workers.backends.legacy_state_root_mounts import retire_state_root_worker_mounts
 from mindroom.workers.runtime import (
     clear_worker_validation_snapshot_cache,
@@ -129,8 +127,8 @@ from mindroom.workers.runtime import (
 from . import file_watcher
 from .bot import AgentBot, TeamBot, create_bot_for_entity
 from .config.main import Config, load_config
-from .credentials_sync import sync_env_to_credentials
-from .event_journal_open import OpenEventJournal, bind_event_journal, open_event_journal
+from .credentials.sync import sync_env_to_credentials
+from .event_journal.opening import OpenEventJournal, bind_event_journal, open_event_journal
 from .logging_config import get_logger, setup_logging
 from .orchestration.computer_runtime import ComputerRuntimeCoordinator
 from .orchestration.config_lifecycle import ConfigReloadLifecycle
@@ -171,7 +169,7 @@ if TYPE_CHECKING:
     import nio
     from fastapi import FastAPI
 
-    from mindroom.config_reload import ConfigReloadStatus
+    from mindroom.config.reload_status import ConfigReloadStatus
     from mindroom.desktop.identity import DesktopControllerIdentity
     from mindroom.event_journal import ApprovalContinuation, ApprovalDeliveryView
     from mindroom.hooks import HookMatrixAdmin, HookMessageSender, HookRoomStatePutter, HookRoomStateQuerier
@@ -206,6 +204,7 @@ _AUXILIARY_TASK_RESTART_INITIAL_DELAY_SECONDS = 1.0
 _AUXILIARY_TASK_RESTART_MAX_DELAY_SECONDS = 30.0
 _EMBEDDED_API_SHUTDOWN_GRACE_SECONDS = 5.0
 _DEFERRED_RESPONSE_DIAGNOSTIC_INTERVAL_SECONDS = 5.0
+_EVENT_JOURNAL_HOLD_CHECK_SECONDS = 30.0
 
 
 async def _gather_periodic_shutdown_phase(
@@ -405,6 +404,7 @@ class _MultiAgentOrchestrator:
     # The one journal every bot in this process borrows a store from, opened on
     # first use and closed after the last bot stops.
     _open_journal: OpenEventJournal | None = field(default=None, init=False, repr=False)
+    _journal_held: bool = field(default=False, init=False, repr=False)
     running: bool = field(default=False, init=False)
     config: Config | None = field(default=None, init=False)
     _sync_tasks: dict[str, asyncio.Task] = field(default_factory=dict, init=False)
@@ -491,6 +491,7 @@ class _MultiAgentOrchestrator:
                 config_provider=lambda: self.config,
                 bot_provider=lambda entity_name: self.agent_bots.get(entity_name),
                 response_admission_gate=self._response_admission_gate,
+                agent_reply_memberships=self.agent_reply_memberships,
             ),
         )
         self._script_runtime = build_script_runtime(
@@ -534,11 +535,6 @@ class _MultiAgentOrchestrator:
             ),
         )
         self._startup_maintenance = StartupMaintenanceController(
-            recover_stale_streams=lambda bots, config, startup_cutoff_ms: self._recover_stale_streams_after_restart(
-                bots,
-                config,
-                startup_cutoff_ms,
-            ),
             setup_rooms_and_memberships=self._setup_startup_rooms_and_memberships,
             sync_runtime_support=lambda config: self._sync_runtime_support_services(config, start_watcher=True),
             mark_runtime_support_ready=lambda: self._approval_recovery.mark_startup_runtime_support_ready(),
@@ -1486,6 +1482,13 @@ class _MultiAgentOrchestrator:
             return None
         return build_hook_matrix_admin(router_bot.client, self.runtime_paths, config=self.config)
 
+    def running_entity_client(self, entity_name: str) -> nio.AsyncClient | None:
+        """Return the Matrix client of one running managed entity."""
+        bot = self.agent_bots.get(entity_name)
+        if bot is None or not bot.running:
+            return None
+        return bot.client
+
     def _log_degraded_startup(self, failed_agents: list[str]) -> None:
         """Log degraded startup status for failed non-router bots."""
         if failed_agents:
@@ -1498,42 +1501,6 @@ class _MultiAgentOrchestrator:
             )
             return
         logger.info("All agent bots started successfully")
-
-    async def _recover_stale_streams_after_restart(
-        self,
-        bots: list[AgentBot | TeamBot],
-        config: Config,
-        startup_cutoff_ms: int | None,
-    ) -> None:
-        """Finish orphaned streams identified by the durable delivery outbox."""
-        actors: dict[str, nio.AsyncClient] = {}
-        for bot in bots:
-            if bot.client is None or not bot.agent_user.user_id:
-                continue
-            actors[bot.agent_user.user_id] = bot.client
-        if not actors:
-            return
-
-        recovery_bots = {bot.agent_name: bot for bot in bots if bot.client is not None}
-
-        def response_recovery_scope(agent_name: str, room_id: str, event_id: str) -> AbstractAsyncContextManager[bool]:
-            return recovery_bots[agent_name].response_recovery_scope(room_id, event_id)
-
-        result = await recover_stale_streaming_messages(
-            actors,
-            principals={
-                bot.agent_user.user_id: bot.journal_principal() for bot in bots if bot.agent_user.user_id in actors
-            },
-            response_recovery_scope=response_recovery_scope,
-            config=config,
-            runtime_paths=self.runtime_paths,
-            startup_cutoff_ms=startup_cutoff_ms,
-        )
-        logger.info(
-            "Completed stale stream recovery",
-            room_count=result.room_count,
-            cleaned_count=result.cleaned_count,
-        )
 
     def _resolve_bot_room_aliases(self, bots: list[AgentBot | TeamBot], config: Config) -> None:
         """Resolve currently known room aliases into each bot's configured room IDs."""
@@ -1608,6 +1575,14 @@ class _MultiAgentOrchestrator:
         for bot in self.agent_bots.values():
             bot.schedule_reply_authorized_call_reconciliation()
 
+    async def _end_unconfigured_entity_replies(self, config: Config) -> None:
+        """End the replies of entities removed while MindRoom was stopped; no bot finishes them."""
+        configured = {ROUTER_AGENT_NAME, *config.agents, *config.teams}
+        await self._shared_journal_store().end_entity_replies(
+            lambda entity_name: entity_name not in configured,
+            now_ns=time.time_ns(),
+        )
+
     async def _start_runtime(self) -> None:
         """Run the startup sequence before handing off to the sync loops."""
         runtime_shutdown_event = self._reset_runtime_shutdown_event()
@@ -1641,6 +1616,7 @@ class _MultiAgentOrchestrator:
         )
 
         config = self._require_config()
+        await self._end_unconfigured_entity_replies(config)
         self._log_mcp_degraded_entities(config)
         self._resolve_bot_room_aliases(started_bots, config)
         phase_started = log_startup_phase_started("bind_runtime_support")
@@ -1659,8 +1635,7 @@ class _MultiAgentOrchestrator:
                 self._start_sync_task(bot.agent_name, bot)
             log_startup_phase_finished("start_matrix_sync_loops", phase_started)
 
-            startup_cutoff_ms = int(time.time() * 1000)
-            self._startup_maintenance.start(started_bots, config, startup_cutoff_ms=startup_cutoff_ms)
+            self._startup_maintenance.start(started_bots, config)
             room_membership_policy_configured = self.agent_reply_memberships.needs_refresh(config)
             if room_membership_policy_configured:
                 set_runtime_starting("Waiting for the router's first Matrix sync")
@@ -1837,6 +1812,9 @@ class _MultiAgentOrchestrator:
             if bot is not None:
                 await bot.stop(shutdown_intent=ENTITY_REMOVED_SHUTDOWN)
                 self.agent_bots.pop(entity_name, None)
+        if removed_entities:
+            # No bot remains to finish their replies.
+            await self._shared_journal_store().end_entity_replies(removed_entities.__contains__, now_ns=time.time_ns())
 
     async def _stop_entities_before_mcp_sync(
         self,
@@ -2405,12 +2383,24 @@ class _MultiAgentOrchestrator:
         re-answer a past that already happened.
         """
         config = self._require_config()
-        await bind_event_journal(
-            self._shared_journal_store(),
+        store = self._shared_journal_store()
+        identity = await bind_event_journal(
+            store,
             journal_config=config.event_journal,
             runtime_paths=self.runtime_paths,
             storage_path=self.storage_path,
         )
+        # Storage roots bound to one database share its identity: a second
+        # runtime against it would answer every message again.
+        if not await store.hold_exclusively(identity):
+            msg = "Another MindRoom runtime is already using this event journal"
+            raise PermanentStartupError(msg)
+        self._journal_held = True
+
+    async def event_journal_still_held(self) -> bool:
+        """Return whether this runtime still holds the journal it claimed; true before it claims one."""
+        journal = self._open_journal
+        return journal is None or not self._journal_held or await journal.store.still_held()
 
     def _shared_journal_store(self) -> EventJournalStore:
         """Return the one journal store every bot in this process borrows.
@@ -2544,6 +2534,7 @@ class _MultiAgentOrchestrator:
         journal_failures: list[BaseException] = []
         if self._open_journal is not None and pending_response_owner_count == 0 and not callback_cleanup_pending:
             journal, self._open_journal = self._open_journal, None
+            self._journal_held = False
             close_results, cancellation = await _run_shutdown_step(
                 "event_journal",
                 gather_shutdown_phase(journal.close()),
@@ -2691,7 +2682,7 @@ async def _run_api_server(  # noqa: PLR0915 - the primary API and its worker-fac
     from mindroom.api import main as api_main  # noqa: PLC0415
     from mindroom.api.agent_cli import bind_agent_cli_registry  # noqa: PLC0415
     from mindroom.api.script_gateway import serve_script_gateway_listener  # noqa: PLC0415
-    from mindroom.credentials import get_runtime_credentials_manager  # noqa: PLC0415
+    from mindroom.credentials.manager import get_runtime_credentials_manager  # noqa: PLC0415
     from mindroom.egress_broker.service import serve_egress_broker  # noqa: PLC0415
 
     api_server = _EmbeddedApiServerContext(host=host, port=port)
@@ -3047,10 +3038,26 @@ def _sync_credentials_and_prepare_storage(runtime_paths: RuntimePaths, storage_p
     storage_path.mkdir(parents=True, exist_ok=True)
 
 
+async def _watch_event_journal_hold(
+    orchestrator: _MultiAgentOrchestrator,
+    shutdown_requested: asyncio.Event,
+    hold_lost: asyncio.Event,
+) -> None:
+    """Stop the runtime once it no longer holds its event journal, before another runtime can take it over."""
+    while not shutdown_requested.is_set():
+        await asyncio.sleep(_EVENT_JOURNAL_HOLD_CHECK_SECONDS)
+        if not await orchestrator.event_journal_still_held():
+            logger.error("event_journal_hold_lost")
+            hold_lost.set()
+            shutdown_requested.set()
+            return
+
+
 def _start_auxiliary_tasks(
     orchestrator: _MultiAgentOrchestrator,
     runtime_paths: RuntimePaths,
     shutdown_requested: asyncio.Event,
+    journal_hold_lost: asyncio.Event,
 ) -> list[asyncio.Task]:
     """Start the non-critical background tasks that run beside the orchestrator."""
     # First, so an invalid probe interval fails before any task exists that shutdown could not cancel.
@@ -3075,6 +3082,12 @@ def _start_auxiliary_tasks(
         )
         for task_name, operation, supervisor_name in auxiliary_specs
     ]
+    tasks.append(
+        create_background_task(
+            _watch_event_journal_hold(orchestrator, shutdown_requested, journal_hold_lost),
+            name="event_journal_hold_watch",
+        ),
+    )
     # The heartbeat ends by itself for unpaired or rejected installs, so it must not be restarted;
     # create_background_task logs an unexpected failure as soon as it happens.
     tasks.append(create_background_task(run_provisioning_heartbeat(runtime_paths), name="provisioning_heartbeat"))
@@ -3083,7 +3096,7 @@ def _start_auxiliary_tasks(
     return tasks
 
 
-async def main(  # noqa: PLR0915
+async def main(
     log_level: str,
     runtime_paths: RuntimePaths,
     *,
@@ -3091,7 +3104,30 @@ async def main(  # noqa: PLR0915
     api_port: int = 8765,
     api_host: str = "0.0.0.0",  # noqa: S104
 ) -> None:
-    """Main entry point for the multi-agent bot system."""
+    """Main entry point for the multi-agent bot system; one runtime per storage root.
+
+    Two runtimes on one storage root would both answer every message and take
+    each other's replies over, so the second refuses to start.
+    """
+    runtime_lock = try_exclusive_file_lock(tracking_dir(runtime_paths) / "runtime.lock")
+    if runtime_lock is None:
+        msg = f"Another MindRoom is already running with the storage at {runtime_paths.storage_root}"
+        raise PermanentStartupError(msg)
+    try:
+        await _run_runtime(log_level, runtime_paths, api=api, api_port=api_port, api_host=api_host)
+    finally:
+        release_file_lock(runtime_lock)
+
+
+async def _run_runtime(  # noqa: PLR0915
+    log_level: str,
+    runtime_paths: RuntimePaths,
+    *,
+    api: bool,
+    api_port: int,
+    api_host: str,
+) -> None:
+    """Run the multi-agent bot system until it stops."""
     await migrate_private_storage(runtime_paths)
     await migrate_state_root_records(runtime_paths)
     await migrate_usage_storage(runtime_paths)
@@ -3100,6 +3136,7 @@ async def main(  # noqa: PLR0915
     orchestrator: _MultiAgentOrchestrator | None = None
     auxiliary_tasks: list[asyncio.Task] = []
     shutdown_requested = asyncio.Event()
+    journal_hold_lost = asyncio.Event()
     api_server = _EmbeddedApiServerContext(host=api_host, port=api_port)
     orchestrator_task: asyncio.Task[None] | None = None
     shutdown_wait_task: asyncio.Task[bool] | None = None
@@ -3123,7 +3160,9 @@ async def main(  # noqa: PLR0915
         logger.info("Starting orchestrator...")
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths, api_enabled=api)
         set_runtime_starting()
-        auxiliary_tasks.extend(_start_auxiliary_tasks(orchestrator, runtime_paths, shutdown_requested))
+        auxiliary_tasks.extend(
+            _start_auxiliary_tasks(orchestrator, runtime_paths, shutdown_requested, journal_hold_lost),
+        )
 
         if api:
             api_task = asyncio.create_task(
@@ -3196,3 +3235,7 @@ async def main(  # noqa: PLR0915
             cleanup_task,
             shutdown_was_requested=shutdown_was_requested,
         )
+    if journal_hold_lost.is_set():
+        # Exiting with a failure lets a supervisor that restarts only on failure bring the runtime back.
+        msg = "MindRoom stopped because it no longer holds its event journal"
+        raise EventJournalHoldLostError(msg)

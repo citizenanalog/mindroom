@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
 
     from mindroom.config.egress_broker import EgressBrokerConfig
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 __all__ = [

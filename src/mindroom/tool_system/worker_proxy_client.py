@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 import httpx
 
-from mindroom.credentials import load_scoped_credentials
+from mindroom.credentials.manager import load_scoped_credentials
 from mindroom.logging_config import get_logger
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.workers.models import WorkerHandle, worker_api_endpoint
 
 if TYPE_CHECKING:
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
     from mindroom.workers.backend import WorkerBackend
 
@@ -440,7 +440,7 @@ def _collect_credential_overrides(
     if not services:
         return {}
 
-    from mindroom.credential_policy import is_egress_broker_service  # noqa: PLC0415
+    from mindroom.credentials.policy import is_egress_broker_service  # noqa: PLC0415
 
     merged_overrides: dict[str, object] = {}
     for service in services:

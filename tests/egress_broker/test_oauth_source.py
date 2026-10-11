@@ -15,7 +15,7 @@ from structlog.testing import capture_logs
 
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import oauth_source
 from mindroom.egress_broker.oauth_source import (
     Missing,
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth.credential_lifecycle import OAuthCredentialContext
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, WorkerScope
 

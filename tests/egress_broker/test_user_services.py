@@ -8,7 +8,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from mindroom.config.egress_broker import EgressBrokerConfig, EgressService
-from mindroom.credentials import CredentialsManager
+from mindroom.credentials.manager import CredentialsManager
 from mindroom.egress_broker import user_services
 from mindroom.egress_broker.rules import EgressRules, host_has_rules, route_request
 from mindroom.egress_broker.secrets import load_secret, save_secret

@@ -28,15 +28,15 @@ from mindroom.constants import (
     resolve_runtime_paths,
     runtime_env_values,
 )
-from mindroom.credentials import get_runtime_shared_credentials_manager
-from mindroom.embedder_health import (
+from mindroom.credentials.manager import get_runtime_shared_credentials_manager
+from mindroom.embeddings.embedder_health import (
     EmbedderHealthRecorder,
     capture_embedder_health_recorder,
     check_embedder_health,
     embedder_in_use,
     get_embedder_failure,
 )
-from mindroom.embedding_errors import extract_classified_embedder_detail
+from mindroom.embeddings.errors import extract_classified_embedder_detail
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.github_app_auth import (
     GitHubAppTokenBinding,
@@ -71,7 +71,7 @@ from mindroom.knowledge.registry import (
     source_root_for_published_index_key,
     source_root_for_refresh_target,
 )
-from mindroom.logging_config import get_logger
+from mindroom.logging_config import get_logger, setup_subprocess_logging, subprocess_logging_env
 from mindroom.runtime_resolution import resolve_knowledge_binding
 from mindroom.tool_system.worker_routing import (
     SerializedToolExecutionIdentity,
@@ -333,6 +333,7 @@ async def _refresh_index_in_subprocess(  # noqa: PLR0915 - Keep process and resu
                 env = dict(runtime_env_values(runtime_paths))
                 env.setdefault("PATH", os.environ.get("PATH") or os.defpath)
                 env.update(_REFRESH_SUBPROCESS_THREAD_ENV)
+                env.update(subprocess_logging_env())
                 env["MINDROOM_KNOWLEDGE_REFRESH_SUBPROCESS"] = "1"
                 # Parent and child derive the cross-process refresh lock from their temp
                 # root, so the child shares this one whatever the runtime env names.
@@ -340,7 +341,7 @@ async def _refresh_index_in_subprocess(  # noqa: PLR0915 - Keep process and resu
                 process = await asyncio.create_subprocess_exec(
                     sys.executable,
                     "-m",
-                    "mindroom.knowledge_refresh_runner",
+                    "mindroom.knowledge.refresh_entrypoint",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=output,
                     env=env,
@@ -1404,6 +1405,7 @@ def _parse_refresh_runner_args(argv: list[str] | None = None) -> argparse.Namesp
 def main(argv: list[str] | None = None) -> int:
     """Internal CLI used by scheduled knowledge refresh subprocesses."""
     _parse_refresh_runner_args(argv)
+    setup_subprocess_logging()
     payload = sys.stdin.buffer.read()
     # Native libraries and configured handlers can retain stdout's descriptor.
     with os.fdopen(os.dup(sys.stdout.fileno()), "wb") as output:

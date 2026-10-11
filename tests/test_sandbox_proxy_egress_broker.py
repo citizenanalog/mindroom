@@ -12,7 +12,7 @@ import pytest
 import mindroom.tool_system.sandbox_proxy as sandbox_proxy_module
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credentials import CredentialsManager
+from mindroom.credentials.manager import CredentialsManager
 from mindroom.egress_broker.secrets import save_secret
 from mindroom.egress_broker.service import serve_egress_broker
 from mindroom.egress_broker.tokens import TokenSigner

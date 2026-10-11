@@ -21,7 +21,7 @@ from structlog.testing import capture_logs
 from mindroom.config.egress_broker import EgressService
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.credentials import CredentialsManager
+from mindroom.credentials.manager import CredentialsManager
 from mindroom.egress_broker import oauth_source, service
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.dial import DialPolicy

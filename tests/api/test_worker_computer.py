@@ -24,8 +24,8 @@ from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.browser import BrowserTools
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_key
-from mindroom.worker_browser import WorkerBrowserRuntime
 from mindroom.worker_computer.runtime import WorkerComputerRuntime
+from mindroom.worker_computer.worker_browser import WorkerBrowserRuntime
 from mindroom.workers.backends.local import local_worker_state_paths_for_root
 from mindroom.workers.models import WorkerHandle
 from tests.test_worker_computer_runtime import FakeDisplay
@@ -154,7 +154,7 @@ def socket_dir() -> Iterator[Path]:
         shutil.rmtree(path, ignore_errors=True)
 
 
-@pytest.mark.parametrize("termination", ["normal", "text", "bug"])
+@pytest.mark.parametrize("termination", ["normal", "text", "protocol", "bug"])
 def test_rfb_stream(  # noqa: PLR0915 - transport lifecycle through teardown
     tmp_path: Path,
     socket_dir: Path,
@@ -232,10 +232,17 @@ def test_rfb_stream(  # noqa: PLR0915 - transport lifecycle through teardown
                 ws.send_bytes(key)
             elif termination == "text":
                 ws.send_text("credential-bearing-secret")
+            elif termination == "protocol":
+                ws.send_bytes(b"\x07")
             if termination != "normal":
                 with pytest.raises(WebSocketDisconnect):
                     ws.receive_bytes()
         assert client.get("/computer", headers=headers).json()["controller_session_id"] is None
+        assert [entry["ended_by"] for entry in logs if entry["event"] == "Worker computer stream ended"] == [["viewer"]]
+        rejections = [entry for entry in logs if entry["event"] == "Worker computer stream rejected client input"]
+        assert [entry["reason"] for entry in rejections] == (
+            ["Unsupported RFB client message."] if termination == "protocol" else []
+        )
         if termination == "bug":
             assert any(entry.get("error_type") == "KeyError" for entry in logs)
         assert "credential-bearing-secret" not in str(logs)

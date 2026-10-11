@@ -6,13 +6,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from mindroom.credentials import delete_scoped_credentials, load_scoped_credentials, save_scoped_credentials
+from mindroom.credentials.manager import delete_scoped_credentials, load_scoped_credentials, save_scoped_credentials
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from mindroom.config.egress_broker import EgressService
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 __all__ = [

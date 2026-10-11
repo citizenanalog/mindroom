@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from mindroom.credential_policy import is_oauth_client_config_service, is_oauth_token_service
+from mindroom.credentials.policy import is_oauth_client_config_service, is_oauth_token_service
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 
 if TYPE_CHECKING:

@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
 
 CONNECTIONS_HEADERS = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer"}
+SHARED_CREDENTIALS_GATEWAY_MESSAGE = (
+    "This shared agent runs tools with credentials shared by all its users and is not available through MCP. "
+    "Use it in MindRoom chat."
+)
 
 
 def require_connections_same_origin(
@@ -67,6 +71,7 @@ class ConnectionUserContext:
     agent_names: tuple[str, ...]
     personal_agent_name: str | None
     credential_agent_names: tuple[str, ...]
+    gateway_agent_names: tuple[str, ...]
 
     @property
     def visible_agent_names(self) -> tuple[str, ...]:
@@ -117,6 +122,14 @@ def resolve_connection_user(
             and is_sender_allowed_for_agent_credential_management(requester_id, name, config, paths)
         )
     )
+    # With a shared or unset worker scope, every requester runs tools with the same credentials and worker.
+    # The gateway runs tools without the agent's instructions, so those agents need an explicit opt-in.
+    gateway = tuple(
+        name
+        for name in usable
+        if config.resolve_entity(name).execution_scope in {"user", "user_agent"}
+        or config.agents[name].mcp_gateway_shared_credentials
+    )
     return ConnectionUserContext(
         GatewayOwner(authenticated_user_id, requester_id, account_id),
         config,
@@ -124,6 +137,7 @@ def resolve_connection_user(
         usable,
         personal_agent_name,
         managed,
+        gateway,
     )
 
 

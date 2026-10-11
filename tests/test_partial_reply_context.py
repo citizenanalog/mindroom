@@ -21,6 +21,7 @@ from mindroom.constants import (
     STREAM_STATUS_KEY,
     STREAM_STATUS_PENDING,
     STREAM_STATUS_STREAMING,
+    THREAD_SUMMARY_CONTENT_KEY,
     UI_ACTION_CONTENT_KEY,
 )
 from mindroom.execution_preparation import (
@@ -41,9 +42,9 @@ from mindroom.matrix.client_visible_messages import _stream_status_from_content
 from mindroom.message_target import MessageTarget
 from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.streaming import (
-    _CANCELLED_RESPONSE_NOTE,
     _INTERRUPTED_RESPONSE_NOTE,
     _PROGRESS_PLACEHOLDER,
+    CANCELLED_RESPONSE_NOTE,
     RESTART_INTERRUPTED_RESPONSE_NOTE,
     TEAM_PROGRESS_PLACEHOLDER,
     StreamingResponse,
@@ -296,7 +297,7 @@ class TestClassifyPartialReply:
     @pytest.mark.parametrize(
         "body",
         [
-            f"Legacy partial\n\n{_CANCELLED_RESPONSE_NOTE}",
+            f"Legacy partial\n\n{CANCELLED_RESPONSE_NOTE}",
             f"Legacy partial\n\n{_INTERRUPTED_RESPONSE_NOTE}",
             f"Legacy partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}",
             "Legacy partial\n\n**[Response interrupted by an error: boom]**",
@@ -331,7 +332,7 @@ class TestCleanPartialReplyBody:
     @pytest.mark.parametrize(
         ("body", "expected"),
         [
-            (f"Partial answer\n\n{_CANCELLED_RESPONSE_NOTE}", "Partial answer"),
+            (f"Partial answer\n\n{CANCELLED_RESPONSE_NOTE}", "Partial answer"),
             (f"Partial answer\n\n{_INTERRUPTED_RESPONSE_NOTE}", "Partial answer"),
             (f"Partial answer\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}", "Partial answer"),
             ("Partial answer [cancelled]", "Partial answer"),
@@ -352,7 +353,7 @@ class TestCleanPartialReplyBody:
     def test_replay_text_byte_identical_across_cancel_sources(self) -> None:
         """Canonical interrupted replay text must stay byte-identical across cancel sources."""
         rendered = [
-            _render_normalized_interrupted_replay(f"Partial answer\n\n{_CANCELLED_RESPONSE_NOTE}").encode("utf-8"),
+            _render_normalized_interrupted_replay(f"Partial answer\n\n{CANCELLED_RESPONSE_NOTE}").encode("utf-8"),
             _render_normalized_interrupted_replay(f"Partial answer\n\n{_INTERRUPTED_RESPONSE_NOTE}").encode("utf-8"),
             _render_normalized_interrupted_replay(
                 f"Partial answer\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}",
@@ -376,7 +377,7 @@ class TestUnseenMessagesPartialReplies:
             _make_visible_message(
                 event_id="e1",
                 sender=agent_id,
-                body=f"Partial answer\n\n{_CANCELLED_RESPONSE_NOTE}",
+                body=f"Partial answer\n\n{CANCELLED_RESPONSE_NOTE}",
                 stream_status=STREAM_STATUS_CANCELLED,
             ),
             _make_visible_message(event_id="e2", sender="@user:localhost", body="Continue"),
@@ -467,10 +468,20 @@ class TestUnseenMessagesPartialReplies:
                     body="Interactive panel: Seats. Open it in MindRoom Chat to respond.",
                     content={UI_ACTION_CONTENT_KEY: {"version": 1, "action": "show_canvas"}},
                 ),
+                # A thread summary is the thread's title, not something the agent said.
+                _make_visible_message(
+                    event_id="e1e",
+                    sender=agent_id,
+                    body="Release checklist review",
+                    content={
+                        "msgtype": "m.notice",
+                        THREAD_SUMMARY_CONTENT_KEY: {"version": 1, "summary": "Release checklist review"},
+                    },
+                ),
                 _make_visible_message(
                     event_id="e2",
                     sender=agent_id,
-                    body=f"Interrupted answer\n\n{_CANCELLED_RESPONSE_NOTE}",
+                    body=f"Interrupted answer\n\n{CANCELLED_RESPONSE_NOTE}",
                     stream_status=STREAM_STATUS_CANCELLED,
                 ),
                 _make_visible_message(
@@ -499,7 +510,7 @@ class TestUnseenMessagesPartialReplies:
             _make_visible_message(
                 event_id="e1",
                 sender=agent_id,
-                body=f"Partial answer\n\n{_CANCELLED_RESPONSE_NOTE}",
+                body=f"Partial answer\n\n{CANCELLED_RESPONSE_NOTE}",
                 stream_status=STREAM_STATUS_CANCELLED,
             ),
             _make_visible_message(event_id="e2", sender="@user:localhost", body="Continue"),
@@ -698,7 +709,7 @@ class TestUnseenMessagesPartialReplies:
                 _make_visible_message(
                     event_id="e1",
                     sender=agent_id,
-                    body=f"Partial reply\n\n{_CANCELLED_RESPONSE_NOTE}",
+                    body=f"Partial reply\n\n{CANCELLED_RESPONSE_NOTE}",
                     stream_status=STREAM_STATUS_CANCELLED,
                 ),
                 _make_visible_message(event_id="e2", sender="@user:localhost", body="Continue"),
@@ -722,7 +733,7 @@ class TestUnseenMessagesPartialReplies:
                 _make_visible_message(
                     event_id="e1",
                     sender=agent_id,
-                    body=f"Partial reply\n\n{_CANCELLED_RESPONSE_NOTE}",
+                    body=f"Partial reply\n\n{CANCELLED_RESPONSE_NOTE}",
                     stream_status=STREAM_STATUS_CANCELLED,
                 ),
                 _make_visible_message(event_id="e3", sender="@user:localhost", body="New question"),
@@ -782,7 +793,7 @@ class TestUnseenMessagesPartialReplies:
                 _make_visible_message(
                     event_id="e1",
                     sender=agent_id,
-                    body=f"Partial reply\n\n{_CANCELLED_RESPONSE_NOTE}",
+                    body=f"Partial reply\n\n{CANCELLED_RESPONSE_NOTE}",
                     stream_status=STREAM_STATUS_CANCELLED,
                 ),
                 _make_visible_message(event_id="e3", sender="@user:localhost", body="Continue"),

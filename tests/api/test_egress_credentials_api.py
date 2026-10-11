@@ -23,7 +23,7 @@ from structlog.testing import capture_logs
 from mindroom.api import config_lifecycle, connections, egress_credentials, egress_status, main, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.main import Config
-from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.oauth_source import Token, resolve_oauth_token
