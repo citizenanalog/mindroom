@@ -7653,7 +7653,7 @@ expose = [
     "remove_default_pragmas",
     "owned_table",
     "insert_run_row",
-    "move_run_to_end",
+    "stored_run_indexes",
     "upsert_run_at_end",
     "run_deletion_transaction",
     "cached_run_counts",
