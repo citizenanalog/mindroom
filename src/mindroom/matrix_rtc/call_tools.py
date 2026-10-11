@@ -43,6 +43,7 @@ from mindroom.background_tasks import (
     run_coroutine_until_complete,
     wait_for_future_until_complete,
 )
+from mindroom.budgets.monitor import budget_model
 from mindroom.history.interrupted_replay import persist_interrupted_replay
 from mindroom.history.session_context import (
     close_agent_runtime_state_dbs,
@@ -386,6 +387,7 @@ class _CallAgentCache:
             knowledge=resolution.knowledge,
             knowledge_identity=knowledge_runtime_identity(resolution.knowledge),
             refresh_scheduler=scheduler,
+            active_model_name=self.active_model_name,
             operation=render,
         )
 
@@ -395,18 +397,21 @@ class _CallAgentCache:
         knowledge: KnowledgeProtocol | None,
         knowledge_identity: tuple[int, ...],
         refresh_scheduler: KnowledgeRefreshScheduler | None,
+        active_model_name: str | None,
         operation: Callable[[AgnoAgent], Awaitable[str]],
     ) -> str:
-        """Run one turn, rebuilding only when call dependencies change identity."""
+        """Run one turn, rebuilding only when call dependencies or the turn's model change."""
         async with self.lock:
             reusing_agent = self._can_reuse_agent(
                 knowledge_identity=knowledge_identity,
                 refresh_scheduler=refresh_scheduler,
+                active_model_name=active_model_name,
             )
             agent = await self._get_agent(
                 knowledge=knowledge,
                 knowledge_identity=knowledge_identity,
                 refresh_scheduler=refresh_scheduler,
+                active_model_name=active_model_name,
             )
             if reusing_agent:
                 await arefresh_session_backed_bedrock_async_client(agent.model)
@@ -417,12 +422,14 @@ class _CallAgentCache:
         *,
         knowledge_identity: tuple[int, ...],
         refresh_scheduler: KnowledgeRefreshScheduler | None,
+        active_model_name: str | None,
     ) -> bool:
         """Return whether the cached agent matches this turn's dependencies."""
         return (
             self.agent is not None
             and self.knowledge_identity == knowledge_identity
             and self.refresh_scheduler is refresh_scheduler
+            and self.active_model_name == active_model_name
         )
 
     async def aclose(self) -> None:
@@ -452,10 +459,12 @@ class _CallAgentCache:
         knowledge: KnowledgeProtocol | None,
         knowledge_identity: tuple[int, ...],
         refresh_scheduler: KnowledgeRefreshScheduler | None,
+        active_model_name: str | None,
     ) -> AgnoAgent:
         if self._can_reuse_agent(
             knowledge_identity=knowledge_identity,
             refresh_scheduler=refresh_scheduler,
+            active_model_name=active_model_name,
         ):
             assert self.agent is not None
             return self.agent
@@ -464,6 +473,7 @@ class _CallAgentCache:
             self.knowledge_identity = ()
             self.refresh_scheduler = None
             await self._close_agent(agent)
+        self.active_model_name = active_model_name
         build_task = asyncio.create_task(
             asyncio.to_thread(
                 self._build_agent,
@@ -568,8 +578,18 @@ async def build_call_tools(
     if context is None:
         msg = f"Tool runtime context unavailable for voice agent {agent_name}"
         raise RuntimeError(msg)
+    requested_model_name = active_model_name
+    if enable_responder and active_model_name is not None:
+        active_model_name = budget_model(
+            config,
+            runtime_paths,
+            context.budget_monitor,
+            requester_id,
+            active_model_name,
+        )
     context = replace(
         context,
+        active_model_name=active_model_name,
         tool_function_filter=functools.partial(
             _function_available_during_call,
             config=config,
@@ -619,7 +639,7 @@ async def build_call_tools(
             voice_enrichment_items=voice_enrichment_items,
             response_tracker=response_tracker,
             agent_cache=agent_cache,
-            active_model_name=active_model_name,
+            active_model_name=requested_model_name,
             authorize_operation=authorize_operation,
             reconcile_spoken_response=reconcile_spoken_response,
         )
@@ -664,29 +684,18 @@ async def build_call_tools(
         session_id=session_id,
         requester_id=requester_id,
     )
-    tools: list[Any] = []
-    visible_functions: list[Function | dict[Any, Any]] = []
-    for tool in effective_tools:
-        if not isinstance(tool, Function):
-            msg = f"Voice calls cannot expose provider-native tool definitions for agent {agent_name}"
-            raise TypeError(msg)
-        if _function_requires_text_chat(tool, config):
-            logger.info("call_tool_hidden_needs_text_chat", tool=tool.name, agent=agent_name)
-            continue
-        # Realtime voice models see MindRoom's own tool names, so they get the default dialect's tool set.
-        if not presents(resolve_tool_dialect(None), tool, effective_tools):
-            continue
-        visible_functions.append(tool)
-        tools.append(
-            _wrap_agno_function(
-                tool,
-                context=context,
-                agent_name=agent_name,
-                config=config,
-                authorize_operation=authorize_operation,
-            ),
+    visible_functions = _realtime_visible_functions(effective_tools, agent_name=agent_name, config=config)
+    tools = [
+        _wrap_agno_function(
+            tool,
+            context=context,
+            agent_name=agent_name,
+            config=config,
+            authorize_operation=authorize_operation,
         )
-    instructions = await _render_system_prompt(agent, session, run_context, visible_functions)
+        for tool in visible_functions
+    ]
+    instructions = await _render_system_prompt(agent, session, run_context, [*visible_functions])
     logger.info("call_tools_built", agent=agent_name, room_id=room_id, tool_count=len(tools))
     return CallAgentTooling(
         tools=tuple(tools),
@@ -802,6 +811,10 @@ async def _run_authorized_call_agent(
     """Run one admitted call transcript through the normal MindRoom agent."""
     from mindroom.ai import ResponseTurnContext, ai_response  # noqa: PLC0415 - heavy optional call path
 
+    if active_model_name is not None:
+        # Spend can cross the cap during a call, so each reply checks the budget again.
+        active_model_name = budget_model(config, runtime_paths, context.budget_monitor, requester_id, active_model_name)
+        context = replace(context, active_model_name=active_model_name)
     recorder = TurnRecorder(user_message=transcript)
     fallback_run_id = f"{session_id}:turn:{uuid4().hex}"
     try:
@@ -868,6 +881,7 @@ async def _run_authorized_call_agent(
             knowledge=knowledge_resolution.knowledge,
             knowledge_identity=knowledge_runtime_identity(knowledge_resolution.knowledge),
             refresh_scheduler=refresh_scheduler,
+            active_model_name=active_model_name,
             operation=_run_with_agent,
         )
     except asyncio.CancelledError:
@@ -959,6 +973,27 @@ def _function_requires_async_execution(function: Function) -> bool:
         callback is not None and (iscoroutinefunction(callback) or isasyncgenfunction(callback))
         for callback in callbacks
     )
+
+
+def _realtime_visible_functions(
+    effective_tools: list[Function | dict[Any, Any]],
+    *,
+    agent_name: str,
+    config: Config,
+) -> list[Function]:
+    """Return the functions a realtime voice model may call."""
+    visible_functions: list[Function] = []
+    for tool in effective_tools:
+        if not isinstance(tool, Function):
+            msg = f"Voice calls cannot expose provider-native tool definitions for agent {agent_name}"
+            raise TypeError(msg)
+        if _function_requires_text_chat(tool, config):
+            logger.info("call_tool_hidden_needs_text_chat", tool=tool.name, agent=agent_name)
+            continue
+        # Realtime voice models see MindRoom's own tool names, so they get the default dialect's tool set.
+        if presents(resolve_tool_dialect(None), tool, effective_tools):
+            visible_functions.append(tool)
+    return visible_functions
 
 
 def _function_requires_text_chat(function: Function, config: Config) -> bool:

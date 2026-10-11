@@ -40,6 +40,10 @@ path = "mindroom.bounded_bytes"
 depends_on = []
 
 [[modules]]
+path = "mindroom.origins"
+depends_on = []
+
+[[modules]]
 path = "mindroom.embeddings.factory"
 depends_on = [
     "mindroom.credentials.sync",
@@ -1473,6 +1477,7 @@ depends_on = [
     "mindroom.tool_system",
     "mindroom.tool_system.catalog",
     "mindroom.tool_system.runtime_context",
+    "mindroom.tool_system.skills",
 ]
 
 [[modules]]
@@ -1518,6 +1523,7 @@ depends_on = [
     "mindroom.api.config_lifecycle",
     "mindroom.api.open_access",
     "mindroom.constants",
+    "mindroom.origins",
     "mindroom.tool_system.dependencies",
 ]
 
@@ -1669,6 +1675,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.connections"
 depends_on = [
+    "mindroom.origins",
     "mindroom.matrix.users",
     "mindroom.matrix.media",
     "mindroom.api.auth",
@@ -1727,6 +1734,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.main"
 depends_on = [
+    "mindroom.origins",
     "mindroom.api.agent_cli",
     "mindroom.api.config_reload",
     "mindroom.api.response_activity",
@@ -1761,6 +1769,7 @@ depends_on = [
     "mindroom.api.script_gateway",
     "mindroom.api.skills",
     "mindroom.api.tools",
+    "mindroom.api.budgets",
     "mindroom.api.usage",
     "mindroom.api.usage_export",
     "mindroom.api.workers",
@@ -2023,6 +2032,12 @@ path = "mindroom.api.skills"
 depends_on = [
     "mindroom.constants",
     "mindroom.tool_system.skills",
+]
+
+[[modules]]
+path = "mindroom.api.budgets"
+depends_on = [
+    "mindroom.api.config_lifecycle",
 ]
 
 [[modules]]
@@ -4137,7 +4152,9 @@ path = "mindroom.matrix_rtc.live_voice_agent"
 depends_on = [
     "mindroom.background_tasks",
     "mindroom.logging_config",
+    "mindroom.matrix_rtc.transcript",
     "mindroom.matrix_rtc.voice_agent",
+    "mindroom.timing",
 ]
 
 [[modules]]
@@ -5664,6 +5681,7 @@ expose = [
     "is_cancelled_run_output",
     "is_errored_run_output",
     "resolve_team_turn_models",
+    "TeamTurnModelSelection",
     "select_model_for_team",
     "strip_team_display",
     "team_response",
@@ -6250,6 +6268,7 @@ expose = [
     "ToolRuntimeContext",
     "DetachedRequesterContext",
     "detached_requester_context",
+    "current_budget_monitor",
     "get_detached_requester_context",
     "ToolRuntimeModelBinding",
     "ToolRuntimeHookBindings",
@@ -6514,6 +6533,7 @@ depends_on = [
     "mindroom.api.connection_agents",
     "mindroom.logging_config",
     "mindroom.mcp.manager",
+    "mindroom.origins",
     "mindroom.mcp_gateway.admission",
     "mindroom.mcp_gateway.accounts",
     "mindroom.mcp_gateway.consent",
@@ -6698,6 +6718,8 @@ expose = [
     "MAX_WORKSPACE_SKILL_FILE_BYTES",
     "MAX_WORKSPACE_SKILL_NAME_CHARS",
     "SKILL_FILENAME",
+    "SKILL_FUNCTION_NAMES",
+    "SKILL_READ_FUNCTION_NAMES",
     "SkillMarkdownError",
     "agent_workspace_skills_root",
     "build_agent_skills",
@@ -7278,6 +7300,7 @@ depends_on = [
     "mindroom.bounded_bytes",
     "mindroom.runtime_env_policy",
     "mindroom.constants",
+    "mindroom.origins",
     "mindroom.requester_identity",
     "mindroom.worker_computer.sessions",
 ]

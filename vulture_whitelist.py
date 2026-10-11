@@ -1,6 +1,8 @@
 # ruff: noqa: D100, B018, F821
 # Generated Vulture baseline for dynamic/framework entry points.
 _.validate_personal_rooms  # Pydantic model validator (src/mindroom/config/main.py)
+_.validate_budgets  # Pydantic model validator (src/mindroom/config/main.py)
+_._validate_user_ids  # Pydantic field validator (src/mindroom/config/budgets.py)
 _.validate_template  # Pydantic field validator (src/mindroom/config/personal_rooms.py)
 _.validate_commands  # Pydantic field validator (src/mindroom/config/personal_rooms.py)
 _.validate_cron  # Pydantic field validator (src/mindroom/config/automations.py)
@@ -254,6 +256,7 @@ _.query_room_state  # unused method (src/mindroom/hooks/context.py)
 _.get_latest_agent_message_snapshot  # hook plugins call this public method (src/mindroom/hooks/context.py)
 _openclaw_compat_tools  # unused function (src/mindroom/tools/__init__.py)
 _reset_credentials_manager_cache  # unused function (src/mindroom/credentials/manager.py)
+_discard_warm_reader  # unused function (src/mindroom/knowledge/read_process.py)
 _reset_handled_turn_ledger_runtime  # unused function (src/mindroom/handled_turns.py)
 _reset_primary_worker_manager  # unused function (src/mindroom/workers/runtime.py)
 _reset_visible_voice_echo_barriers  # unused function (src/mindroom/voice/visible_voice_echo.py)

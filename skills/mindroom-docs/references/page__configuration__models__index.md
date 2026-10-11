@@ -40,6 +40,7 @@ The [macOS app's local model setup](https://docs.mindroom.chat/installation/maco
 | `extra_kwargs` | No | `null` | Additional provider-specific parameters (see [Extra Kwargs](#extra-kwargs)) |
 | `context_window` | No | `null` | Provider context window in tokens, at least 1; budgets history replay and compaction (see [Context Window](https://docs.mindroom.chat/configuration/history/#context-window)); a `compaction.model` or `compaction.fallback_model` needs its own value |
 | `tool_dialect` | No | `auto` | `auto`, `mindroom`, `claude`, or `codex`; the shape of the shell and file-editing tools this model sees (see [Tool Dialect](#tool-dialect)) |
+| `pricing` | No | `null` | Prices in USD per million tokens for [Budgets](https://docs.mindroom.chat/budgets/): `input` and `output` (both required), plus `cache_read` and `cache_write`, which default to the `input` price; set `cache_write` for Claude models, whose cache writes cost more than input |
 | `stream_idle_timeout_seconds` | No | `null` | Seconds a streamed request may go without a provider event before it counts as stalled, at least 0; `0` disables the limit (see [Stalled Streams](#stalled-streams)) |
 
 The mapping key, such as `default` below, is the stable name agents, teams, the router, and commands use.

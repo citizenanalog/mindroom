@@ -1,6 +1,7 @@
 """Test configuration and fixtures for MindRoom tests."""
 
 import asyncio
+import gc
 import os
 import re
 import shutil
@@ -50,6 +51,7 @@ import mindroom.approval.manager as approval_manager_module
 import mindroom.bot  # noqa: F401
 import mindroom.custom_tools.todo as todo_tool_module
 import mindroom.handled_turns as handled_turns_module
+import mindroom.knowledge.read_process as knowledge_read_process_module
 import mindroom.managed_avatars as managed_avatars_module
 import mindroom.matrix.client_room_admin as client_room_admin_module
 import mindroom.matrix.rooms as matrix_rooms_module
@@ -126,6 +128,7 @@ from mindroom.matrix.large_messages import _oversized_nonterminal_streaming_edit
 from mindroom.matrix.media import is_matrix_media_dispatch_event
 from mindroom.matrix.relation_lookup import RelationLookup
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
+from mindroom.mcp import toolkit as mcp_toolkit_module
 from mindroom.message_target import MessageTarget
 from mindroom.personal_room_lifecycle import PersonalRoomLifecycle
 from mindroom.providers.media_fallback import reset_model_media_capability_cache
@@ -146,6 +149,7 @@ from mindroom.turn_store import TurnStore
 from mindroom.user_stop_reconciliation import UserStopReconciler
 from mindroom.visible_response_reconciliation import VisibleResponseReconciler
 from mindroom.voice.visible_voice_echo import VisibleVoiceEchoLifecycle, _reset_visible_voice_echo_barriers
+from mindroom.workers import runtime as workers_runtime_module
 from tests.identity_helpers import persist_entity_accounts
 
 if TYPE_CHECKING:
@@ -2930,6 +2934,11 @@ async def aioresponse() -> AsyncGenerator[aioresponses, None]:
         yield m
 
 
+# Deadline for a test wait that should finish. A passing wait returns as soon as its work is done,
+# so the deadline only bounds a hang; it is generous because parallel runs stall background work.
+SETTLE_TIMEOUT_SECONDS = 30.0
+
+
 @pytest.fixture(autouse=True)
 def _isolate_structlog_configuration(
     monkeypatch: pytest.MonkeyPatch,
@@ -2977,6 +2986,20 @@ def _reset_scheduled_task_runner_owner(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _reset_active_mcp_server_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep an orchestrator's process-wide MCP manager from leaking into later tests."""
+    monkeypatch.setattr(mcp_toolkit_module, "_ACTIVE_MCP_SERVER_MANAGER", None)
+
+
+@pytest.fixture(autouse=True)
+def _reopen_primary_worker_manager() -> Generator[None, None, None]:
+    """Reopen the process-wide primary worker manager after a test runs a real shutdown."""
+    yield
+    if not workers_runtime_module._PRIMARY_WORKER_MANAGER_ACCEPTING_BUILDS:
+        workers_runtime_module.reset_primary_worker_manager()
+
+
+@pytest.fixture(autouse=True)
 def _never_build_the_dashboard(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep `mindroom run` from shelling out to a real frontend build.
 
@@ -3008,6 +3031,18 @@ def _never_download_stock_avatars(monkeypatch: pytest.MonkeyPatch) -> None:
         raise httpx.ConnectError(message, request=httpx.Request("GET", url))
 
     monkeypatch.setattr(managed_avatars_module, "_download_stock_avatar", offline)
+
+
+@pytest.fixture(autouse=True)
+def _never_freeze_the_test_heap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep orchestrator initialization from freezing the pytest worker's heap.
+
+    Cycles among frozen objects are never collected, so every test that
+    initializes an orchestrator would pin its own fixtures, mocks, and
+    orchestrator for the rest of the worker's life.
+    `tests/test_heap_probe.py` covers the real freeze against a fake `gc`.
+    """
+    monkeypatch.setattr(gc, "freeze", lambda: None)
 
 
 @pytest.fixture(scope="session")
@@ -3117,6 +3152,14 @@ def _reset_approval_manager_runtime() -> Generator[None, None, None]:
     approval_manager_module._MANAGER = None
     yield
     approval_manager_module._MANAGER = None
+
+
+@pytest.fixture(autouse=True)
+def _discard_warm_knowledge_reader() -> Generator[None, None, None]:
+    """Keep the idle knowledge reader child one test started, with its environment, out of the next test."""
+    knowledge_read_process_module._discard_warm_reader()
+    yield
+    knowledge_read_process_module._discard_warm_reader()
 
 
 @pytest.fixture(autouse=True)
