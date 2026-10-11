@@ -12,8 +12,8 @@ from google.oauth2.credentials import Credentials
 
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
-from mindroom.model_loading import get_model_instance
-from mindroom.vertex_claude_compat import MindroomVertexAIClaude
+from mindroom.providers.model_loading import get_model_instance
+from mindroom.providers.vertex_claude_compat import MindroomVertexAIClaude
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 
 if TYPE_CHECKING:

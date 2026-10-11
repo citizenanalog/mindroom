@@ -20,7 +20,7 @@ from mindroom.history.message_content import media_payload_snapshot, message_med
 from mindroom.history.replay import history_skip_roles
 from mindroom.timing import timed
 from mindroom.token_budget import estimate_compaction_input_tokens, stable_serialize
-from mindroom.usage_storage import COMPACTED_REQUESTS_METADATA_KEY
+from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence

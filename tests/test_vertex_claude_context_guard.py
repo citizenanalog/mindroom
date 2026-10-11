@@ -12,7 +12,7 @@ from anthropic.types import Message as AnthropicMessage
 from anthropic.types import ParsedMessage, Usage
 
 from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE, ModelSafeguardRefusalError
-from mindroom.vertex_claude_compat import (
+from mindroom.providers.vertex_claude_compat import (
     MindroomVertexAIClaude,
 )
 

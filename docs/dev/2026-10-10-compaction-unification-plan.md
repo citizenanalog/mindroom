@@ -115,7 +115,7 @@ A pre-request hook on every model folds replayed history and the turn's model an
 - Modify: `src/mindroom/history/runtime.py` (public `resolve_entity_preparation_inputs`, `summarize_run_locally`)
 - Modify: `src/mindroom/history/compaction.py` (`summarize_runs`)
 - Modify: `src/mindroom/agents.py`, `src/mindroom/teams.py` (install hook, then the cap), `src/mindroom/ai.py` and the team preparation in `teams.py` (lifecycle binding)
-- Modify: `src/mindroom/constants.py` (`COMPACTED_REQUESTS_METADATA_KEY = "mindroom_compacted_requests"`), `src/mindroom/usage_storage.py`, `src/mindroom/history/summary_input.py`
+- Modify: `src/mindroom/constants.py` (`COMPACTED_REQUESTS_METADATA_KEY = "mindroom_compacted_requests"`), `src/mindroom/usage/storage.py`, `src/mindroom/history/summary_input.py`
 - Modify: `tach.toml`
 - Test: `tests/test_mid_turn_compaction.py` (create), `tests/test_usage_storage.py`
 
@@ -123,7 +123,7 @@ A pre-request hook on every model folds replayed history and the turn's model an
 - Consumes: Tasks 1 and 3.
 - Produces: `install_mid_turn_compaction(target: Agent | Team, *, config: Config, runtime_paths: RuntimePaths, entity_name: str | None, model_name: str) -> None` and `bind_compaction_lifecycle(target: Agent | Team, lifecycle: CompactionLifecycle | None) -> None`.
 - Produces: `summarize_runs(*, summary_model: SummaryModel, fallback_summary_model: SummaryModel | None, previous_summary: str | None, runs: Sequence[RunOutput | TeamRunOutput], history_settings: ResolvedHistorySettings, summary_prompt: str, timeout_seconds: float) -> str` in `compaction.py`, one chunk through `_generate_compaction_summary_with_retry`.
-- Produces: `project_requests(messages: Sequence[dict[str, object]]) -> list[dict[str, object]] | None` in `usage_storage.py` (today's `_project_requests`); `project_usage` prepends `metadata[COMPACTED_REQUESTS_METADATA_KEY]`.
+- Produces: `project_requests(messages: Sequence[dict[str, object]]) -> list[dict[str, object]] | None` in `usage/storage.py` (today's `_project_requests`); `project_usage` prepends `metadata[COMPACTED_REQUESTS_METADATA_KEY]`.
 - Produces: `summarize_run_locally(*, resolved_inputs: _HistoryPreparationInputs, previous_summary: str | None, snapshot: RunOutput | TeamRunOutput, config: Config, runtime_paths: RuntimePaths) -> str` in `runtime.py`, loading the summary and fallback models like `_run_scope_compaction` and calling `summarize_runs`.
 
 - [ ] **Step 1: Write failing tests** (scripted `SyntheticModel` whose tool results grow the request past a small `context_window`):
@@ -205,7 +205,7 @@ A pre-request hook on every model folds replayed history and the turn's model an
 
 **Files:**
 - Modify: `src/mindroom/history/mid_turn_compaction.py` (native projection sizing, native off, canonical compaction)
-- Modify: `src/mindroom/vertex_claude_compat.py` (delete `_fit_request_messages`, counting helpers, trimming; `ainvoke`/`ainvoke_stream` keep `_messages_with_replay_safe_reasoning(self.native_replay_messages(messages))`)
+- Modify: `src/mindroom/providers/vertex_claude_compat.py` (delete `_fit_request_messages`, counting helpers, trimming; `ainvoke`/`ainvoke_stream` keep `_messages_with_replay_safe_reasoning(self.native_replay_messages(messages))`)
 - Delete or rewrite: `tests/test_vertex_claude_context_guard.py`, counting cases in `tests/test_vertex_native_compaction_count.py`, `tests/test_claude_native_compaction.py:529`, `tests/test_claude_authored_compaction.py:75`, `tests/test_extra_kwargs.py:896`
 - Test: `tests/test_mid_turn_compaction.py`
 
@@ -218,7 +218,7 @@ A pre-request hook on every model folds replayed history and the turn's model an
 ### Task 8: Notices and documentation
 
 **Files:**
-- Modify: `src/mindroom/delivery_gateway.py` (failure text), `src/mindroom/claude_prompt_cache.py` (module docstring no longer mentions summaries in the system prompt)
+- Modify: `src/mindroom/delivery_gateway.py` (failure text), `src/mindroom/providers/claude_prompt_cache.py` (module docstring no longer mentions summaries in the system prompt)
 - Modify: `docs/configuration/history.md` (spec "User docs"), `docs/architecture/compaction.md`, `docs/architecture/agno-compatibility.md`, `docs/architecture/code-map.md`
 - Test: existing notice tests in `tests/test_history_prepare_lifecycle.py`
 

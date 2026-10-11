@@ -55,7 +55,7 @@ from mindroom.logging_config import get_logger
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, checkpoint_items, native_replay_messages
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
-from mindroom.usage_storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
+from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence

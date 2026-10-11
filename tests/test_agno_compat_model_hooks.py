@@ -13,7 +13,7 @@ from agno.models.response import ModelResponse
 from agno.run.agent import RunOutput
 
 from mindroom.agno_compat_model_hooks import install_request_preparation
-from mindroom.synthetic_model import SyntheticModel
+from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.tool_call_budget import install_model_call_cap
 
 if TYPE_CHECKING:

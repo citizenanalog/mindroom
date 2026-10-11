@@ -12,12 +12,12 @@ from agno.media import File, Image
 from agno.models.anthropic import Claude
 from agno.models.message import Message
 
-from mindroom import claude_prompt_cache
 from mindroom.attachment_media import attachment_records_to_media
 from mindroom.attachments import AttachmentRecord
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
-from mindroom.model_loading import get_model_instance
+from mindroom.providers import claude_prompt_cache
+from mindroom.providers.model_loading import get_model_instance
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.vertex_request_helpers import vertex_request_body
 

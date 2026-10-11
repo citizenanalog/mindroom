@@ -40,8 +40,8 @@ from mindroom.history.replay import compaction_summary_message, is_compaction_su
 from mindroom.history.storage import read_scope_state, set_force_compaction_state
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState
 from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
-from mindroom.synthetic_model import SyntheticModel
-from mindroom.usage_storage import project_usage
+from mindroom.providers.synthetic_model import SyntheticModel
+from mindroom.usage.storage import project_usage
 from tests.conftest import FakeModel, runtime_paths_for, seed_session
 from tests.history_helpers import (
     RecordingCompactionLifecycle,
@@ -161,7 +161,7 @@ def summary_calls(monkeypatch: pytest.MonkeyPatch) -> _SummaryCalls:
     calls = _SummaryCalls()
     monkeypatch.setattr("mindroom.history.compaction.generate_compaction_summary", calls)
     monkeypatch.setattr(
-        "mindroom.model_loading.get_model_instance",
+        "mindroom.providers.model_loading.get_model_instance",
         lambda *_args, **_kwargs: FakeModel(id="summary-model", provider="fake"),
     )
     return calls
@@ -503,7 +503,7 @@ async def test_turn_larger_than_one_summary_input_folds_whole_in_chunks(
 ) -> None:
     # A Claude summarizer sizes its input by bytes, more conservatively than request estimates.
     monkeypatch.setattr(
-        "mindroom.model_loading.get_model_instance",
+        "mindroom.providers.model_loading.get_model_instance",
         lambda *_args, **_kwargs: Claude(id="claude-haiku-5-5", api_key="test"),
     )
     config, paths = _config(tmp_path, context_window=20_000, summary_context_window=8_000)
