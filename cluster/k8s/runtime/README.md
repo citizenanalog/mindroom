@@ -894,14 +894,17 @@ With the broker on, each of them still gets the personal Connections page at `/c
 
 - The egress services of every agent they may use, with the state of their own keys and accounts.
 - Their own services: add, edit, and delete them on `user` and `user_agent` agents, including a GitHub "Limit to repositories" helper. The editor saves the service and its API key in one step. On shared and unscoped agents only administrators and the agent's `credential_managers` change services.
-- Their own keys, and **Connect** and **Disconnect** for their Google, GitHub, and Atlassian accounts. For a shared agent's team account (the Google providers), **Connect** first asks "Connect a shared account?", and every user of the agent sees the connected account.
-- Their own request log, a **Recent requests** table per agent.
+- Limits in place: **Limit to repositories** on the administrator's GitHub service saves a `restrict_only` service of the user's own, which limits the paths of that service without replacing its credential, so the user's account or key still applies. The row then reads "Limited to {repos}" with **Change limit** and **Remove limit**. It has no key, and the broker refuses to store one.
+- Their own keys, and **Connect** and **Disconnect** for their Google, GitHub, and Atlassian accounts. For a shared agent's team account (the Google providers), **Connect** first asks "Connect a shared account?", and every user of the agent sees the connected account. The login popup tells the page how it ended (connected, cancelled, or failed) and closes itself.
+- Each row says how the service sends its key ("Sent as a bearer token", "Sent as header {name}", and so on), what the agent sees ("Your agent sees GH_TOKEN=mindroom-brokered"), and what happens while no key is set.
+- Their own request log, a **Recent requests** table per agent that shows the latest 10 requests, with **Show all** for the rest.
 
 Both Connections pages show "Signed in as {matrix_user_id}" and link to each other as "Agents" and "API keys and accounts"; administrators also get a "Dashboard" link.
-With `MINDROOM_CONNECTIONS_AGENT` set, a user outside `administrators` who opens a dashboard page in a browser is redirected (303) to `/connections`; API calls keep the 403.
+With `MINDROOM_CONNECTIONS_AGENT` set, a user outside `administrators` who opens a dashboard page in a browser is redirected (303) to `/connections?notice=admin-only`, which says the dashboard is for administrators; API calls keep the 403.
 The Connections portal links every agent the user may use for egress to its section on this page with **Manage services**, even an agent that has no services yet.
 Services from `config.yaml` appear read-only under "From your administrator".
-Users' services can narrow what the administrator allows but never widen it, and a user's "Refuse other paths on these hosts" also limits the administrator's services on those hosts for that scope; see [User services](../../../docs/deployment/egress-broker.md#user-services) and [Limiting paths and repositories](../../../docs/deployment/egress-broker.md#limiting-paths-and-repositories).
+Users' services can narrow what the administrator allows but never widen it, and a user's "Refuse other paths on these hosts" also limits the administrator's services on those hosts for that scope; see [User services](../../../docs/deployment/egress-broker.md#user-services), [Limiting paths and repositories](../../../docs/deployment/egress-broker.md#limiting-paths-and-repositories), and [Limiting in place](../../../docs/deployment/egress-broker.md#limiting-in-place).
+A refused request tells the agent why: the broker's reason phrase is the message, `X-MindRoom-Error` carries the code, and `git` prints `remote error: <message>` with the manage link; see [Error responses](../../../docs/deployment/egress-broker.md#error-responses).
 
 The page needs these settings, which the chart does not render for you:
 

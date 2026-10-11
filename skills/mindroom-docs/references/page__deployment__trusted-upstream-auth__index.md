@@ -152,7 +152,7 @@ Both charts fail to render when `enabled` is true without `userIdHeader`, when `
 Dashboard configuration is an operator capability.
 Without `MINDROOM_CONNECTIONS_AGENT`, every user the upstream authenticates can read and change dashboard configuration regardless of the Matrix `administrators` list, so admit only trusted operators through the gateway in that mode.
 With the Connections portal enabled, ordinary dashboard pages and APIs also require a Matrix identity listed in `administrators`, while the portal and the OAuth callback, success, and reset pages keep their own access checks.
-A user outside `administrators` who opens a dashboard page in a browser (a `GET` that accepts `text/html`, outside `/api/`) is redirected with 303 to `/connections`; API calls keep the 403 JSON.
+A user outside `administrators` who opens a dashboard page in a browser (a `GET` that accepts `text/html`, outside `/api/`) is redirected with 303 to `/connections?notice=admin-only`, where the Connections page says the dashboard is for administrators; API calls keep the 403 JSON.
 
 Strict JWT mode adds signature checks but does not replace header stripping, which every network path still needs.
 A personal OAuth link opened by a browser signed in as anyone other than the requester who received it fails with `403`; see [Connect An Account](https://docs.mindroom.chat/oauth-framework/#connect-an-account) for link rules.
