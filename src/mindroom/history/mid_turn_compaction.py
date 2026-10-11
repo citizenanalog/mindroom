@@ -84,8 +84,9 @@ class _RunState:
     # Identity of the response loop being prepared, and the message ids it started with.
     loop_identity: int
     start_ids: frozenset[str]
-    # A failed compaction stops compacting for the rest of the run, including after an approval resume.
-    failed: bool = False
+    # Set when compaction failed or cannot bring the request under the limit; the rest of the run, including after
+    # an approval resume, is not compacted again.
+    stopped: bool = False
 
 
 @dataclass
@@ -124,7 +125,7 @@ class _MidTurnCompaction:
         state = self.runs.pop(run_id, None)
         if state is None or state.loop_identity != id(run_response):
             ids = frozenset(message.id for message in messages if message.id)
-            state = _RunState(id(run_response), ids, failed=state.failed if state is not None else False)
+            state = _RunState(id(run_response), ids, stopped=state.stopped if state is not None else False)
         self.runs[run_id] = state
         while len(self.runs) > _RUN_STATES_KEPT:
             self.runs.pop(next(iter(self.runs)))
@@ -200,7 +201,7 @@ async def _prepare_request(
         return
     state = binding.run_state(run_response.run_id, run_response, messages)
     built_session = built_request_session(binding.target, run_response.run_id)
-    if state.failed or built_session is None:
+    if state.stopped or built_session is None:
         return
     loaded_ids = state.start_ids
     policy = _policy(binding)
@@ -213,7 +214,7 @@ async def _prepare_request(
         return
     summary_message = await _summarize(binding, policy, layout, messages, run_response, session)
     if summary_message is None:
-        state.failed = True
+        state.stopped = True
         return
     if policy.replay_model is not None and policy.replay_model.native_compaction is not None:
         # The provider's own compaction could not keep this request within the window.
@@ -224,6 +225,14 @@ async def _prepare_request(
         policy.replay_model.configure_native_compaction(threshold=None)
     _finish(messages, layout, summary_message, run_response)
     _require_fit(policy, messages, tools, summary_message)
+    if _estimated_request_tokens(policy, messages, tools) > policy.limit:
+        # What stays (system prompt, tools, summary, prompt) exceeds the replay window on its own; compacting again
+        # would only summarize each new tool result before the model ever saw it.
+        logger.warning(
+            "Compacted request still exceeds the replay window; not compacting again",
+            run_id=run_response.run_id,
+        )
+        state.stopped = True
 
 
 async def _summarize(

@@ -463,8 +463,9 @@ async def test_rewritten_request_within_the_model_window_is_sent(
 
     output = await _run(_agent(model, config, paths), [Message(role="user", content="p" * 16_000)])
 
-    assert summary_calls.inputs
     assert str(output.content).endswith("done")
+    # The prompt alone exceeds the replay window, so compacting again would only summarize every new tool result.
+    assert len(summary_calls.inputs) == 1
 
 
 @pytest.mark.asyncio
