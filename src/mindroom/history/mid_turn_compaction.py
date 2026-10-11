@@ -462,11 +462,7 @@ def _request_tokens(
                 + estimate_request_messages_tokens(newer, replay_model=policy.replay_model)
                 + _thinking_tokens(newer)
             )
-    return (
-        estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
-        + _thinking_tokens(messages)
-        + _tool_tokens(policy.model, tools)
-    )
+    return _estimated_request_tokens(policy, messages, tools)
 
 
 def _estimated_request_tokens(policy: _Policy, messages: list[Message], tools: list[dict[str, Any]] | None) -> int:
@@ -597,63 +593,48 @@ def _snapshots(
     Separate runs let the summary chunker size the turn with the summary model's own estimator and summarize it in
     as many chunks as it needs, without truncating any exchange that fits a summary input by itself.
     """
-    origin = run_response.run_id or ""
     snapshots: list[RunOutput | TeamRunOutput] = []
     budget_tokens = inputs.execution_plan.summary_input_budget_tokens or 0
     for index, exchange in enumerate(layout.exchanges):
         lead = (_prompt_context(layout.prompt, budget_tokens),) if index == 0 and layout.prompt is not None else ()
-        run_messages = [*lead, *(message.model_copy(deep=True) for message in exchange)]
-        run_id = archive.snapshot_run_id(origin)
         # The run's metadata (provenance for redaction) is the same for every exchange, so the first snapshot holds it.
         metadata = deepcopy(run_response.metadata) if index == 0 else None
-        if isinstance(run_response, TeamRunOutput):
-            snapshot: RunOutput | TeamRunOutput = TeamRunOutput(
-                run_id=run_id,
-                team_id=run_response.team_id,
-                session_id=run_response.session_id,
-                status=RunStatus.completed,
-                messages=run_messages,
-                metadata=metadata,
-                created_at=run_response.created_at,
-            )
-        else:
-            snapshot = RunOutput(
-                run_id=run_id,
-                agent_id=run_response.agent_id,
-                session_id=run_response.session_id,
-                status=RunStatus.completed,
-                messages=run_messages,
-                metadata=metadata,
-                created_at=run_response.created_at,
-            )
-        snapshots.append(snapshot)
+        snapshots.append(_snapshot_run(run_response, [*lead, *exchange], metadata))
     return snapshots
 
 
 def _history_snapshot(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list[RunOutput | TeamRunOutput]:
     """Return the request's replayed history as one completed run to summarize, or nothing when there is none."""
-    if not layout.history:
-        return []
-    messages = [message.model_copy(deep=True) for message in layout.history]
+    return [_snapshot_run(run_response, layout.history, None)] if layout.history else []
+
+
+def _snapshot_run(
+    run_response: RunOutput | TeamRunOutput,
+    messages: Sequence[Message],
+    metadata: dict[str, Any] | None,
+) -> RunOutput | TeamRunOutput:
+    """Return a completed copy of part of the running turn under a fresh snapshot run id."""
+    run_id = archive.snapshot_run_id(run_response.run_id or "")
+    copies = [message.model_copy(deep=True) for message in messages]
     if isinstance(run_response, TeamRunOutput):
-        return [
-            TeamRunOutput(
-                run_id=archive.snapshot_run_id(run_response.run_id or ""),
-                team_id=run_response.team_id,
-                session_id=run_response.session_id,
-                status=RunStatus.completed,
-                messages=messages,
-            ),
-        ]
-    return [
-        RunOutput(
-            run_id=archive.snapshot_run_id(run_response.run_id or ""),
-            agent_id=run_response.agent_id,
+        return TeamRunOutput(
+            run_id=run_id,
+            team_id=run_response.team_id,
             session_id=run_response.session_id,
             status=RunStatus.completed,
-            messages=messages,
-        ),
-    ]
+            messages=copies,
+            metadata=metadata,
+            created_at=run_response.created_at,
+        )
+    return RunOutput(
+        run_id=run_id,
+        agent_id=run_response.agent_id,
+        session_id=run_response.session_id,
+        status=RunStatus.completed,
+        messages=copies,
+        metadata=metadata,
+        created_at=run_response.created_at,
+    )
 
 
 def _prompt_context(prompt: Message, budget_tokens: int) -> Message:

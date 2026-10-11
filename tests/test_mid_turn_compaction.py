@@ -10,6 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock
 
 import pytest
 from agno.agent import Agent
@@ -27,7 +28,7 @@ from agno.session.summary import SessionSummary
 from agno.team import Team
 from agno.tools.function import Function
 
-from mindroom import helper_usage
+from mindroom import ai, helper_usage
 from mindroom.agent_storage import create_session_storage, get_agent_session, get_team_session
 from mindroom.agents import create_agent
 from mindroom.agno_compat_model_hooks import install_request_preparation
@@ -40,7 +41,7 @@ from mindroom.history.agno_compat_message_builder import built_request_session
 from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
 from mindroom.history.replay import compaction_summary_message, estimate_request_messages_tokens, is_compaction_summary
 from mindroom.history.storage import new_scope_session, read_scope_state, set_force_compaction_state
-from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState
+from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState, PreparedHistoryState
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
 from mindroom.providers.anthropic_claude import MindRoomAnthropicClaude
@@ -48,8 +49,9 @@ from mindroom.providers.claude_prompt_cache import install_claude_deferred_tool_
 from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.providers.openai_tool_search import install_openai_deferred_tool_search
 from mindroom.providers.synthetic_model import SyntheticModel
+from mindroom.teams import TeamMode, _create_team_instance
 from mindroom.usage.storage import project_usage
-from tests.conftest import FakeModel, runtime_paths_for, seed_session
+from tests.conftest import FakeModel, make_turn_context, seed_session
 from tests.history_helpers import (
     RecordingCompactionLifecycle,
     _completed_run,
@@ -60,7 +62,6 @@ from tests.history_helpers import (
     archived_run_ids,
     compaction_generations,
 )
-from tests.test_agents import _test_config
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -990,13 +991,104 @@ async def test_scoped_compaction_after_resume_keeps_the_run_local_summary(
     assert f"SUMMARY-{local_summaries}" in summary_calls.inputs[local_summaries]
 
 
-def test_factories_install_mid_turn_compaction() -> None:
+def _factory_target(kind: str, config: Config, paths: RuntimePaths) -> Agent | Team:
+    if kind == "agent":
+        target: Agent | Team = create_agent("test_agent", config, paths, execution_identity=None)
+    else:
+        target = _create_team_instance(
+            agents=[],
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=paths,
+            team_display_name="Test Team",
+            scope_context=None,
+            execution_identity=None,
+            model_name="default",
+            configured_team_name="test_team",
+        )
+    target.tools = [probe]
+    return target
 
-    config = _test_config()
-    agent = create_agent("calculator", config, runtime_paths_for(config), execution_identity=None)
 
-    assert vars(agent.model).get("_mindroom_mid_turn_compaction_installed") is True
-    assert vars(agent.model).get("_mindroom_model_call_cap_installed") is True
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["agent", "team"])
+async def test_factories_cap_a_request_before_compacting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary_calls: _SummaryCalls,
+    kind: str,
+) -> None:
+    config, paths = _config(
+        tmp_path,
+        context_window=12_000,
+        teams={"test_team": TeamConfig(display_name="Test Team", role="Test team", agents=["test_agent"])},
+    )
+    # The fourth response reports a request far over the window, so only the fifth request would compact.
+    model = _ToolLoopModel(
+        tool_rounds=8,
+        usage=lambda number: MessageMetrics(input_tokens=1_000_000 if number == 4 else 10, output_tokens=1),
+    )
+
+    def load_model(_config: Config, _paths: RuntimePaths, model_name: str = "default", **_kwargs: object) -> object:
+        return model if model_name == "default" else FakeModel(id="summary-model", provider="fake")
+
+    monkeypatch.setattr("mindroom.providers.model_loading.get_model_instance", load_model)
+    target = _factory_target(kind, config, paths)
+    # The cap allows the limit plus two requests, so it refuses the fifth.
+    target.tool_call_limit = 2
+
+    await target.arun("Do the task")
+
+    assert len(model.requests) == 4
+    assert summary_calls.inputs == []
+
+
+@pytest.mark.asyncio
+async def test_prepared_agent_reply_posts_mid_turn_compaction_notices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    agent = _scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage)
+    prepared = ai._PreparedAgentRun(
+        agent=agent,
+        messages=(Message(role="user", content="Do the task"),),
+        unseen_event_ids=[],
+        prepared_history=PreparedHistoryState(),
+        runtime_model_name="default",
+    )
+    monkeypatch.setattr(ai, "_prepare_agent_and_prompt", AsyncMock(return_value=prepared))
+    lifecycle = RecordingCompactionLifecycle()
+
+    await ai._prepare_agent_run_context(
+        make_turn_context("test_agent", session_id="session-1"),
+        prompt="Do the task",
+        session_id="session-1",
+        runtime_paths=paths,
+        config=config,
+        scope_context=None,
+        thread_history=None,
+        knowledge=None,
+        include_interactive_questions=False,
+        tool_function_filter=None,
+        include_openai_compat_guidance=False,
+        execution_identity=None,
+        compaction_lifecycle=lifecycle,
+        delegation_depth=0,
+        refresh_scheduler=None,
+        model_prompt=None,
+        current_timestamp_ms=None,
+        current_event_id=None,
+        current_prompt_is_structured=False,
+        turn_recorder=None,
+        pipeline_timing=None,
+    )
+    await _run_in_session(agent, "Do the task")
+
+    assert summary_calls.inputs
+    assert any(isinstance(event, CompactionOutcome) for event in lifecycle.events)
 
 
 class _DelegatingLeader(SyntheticModel):

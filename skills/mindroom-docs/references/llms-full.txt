@@ -2956,7 +2956,7 @@ If the summary model fails, the reply continues without compacting and may then 
 
 A compaction leaves the system prompt and tools unchanged, so provider prompt caching keeps working after it.
 Agents, teams, subagents, workflow participants, and minimal-mode agents all compact the same way.
-Team members, workflow participants, and scheduled tasks with a `history_limit` of `0` compact their own work without posting the notice.
+Team members, workflow participants, subagents, replies resuming after a tool approval, and scheduled tasks with a `history_limit` of `0` compact their own work without posting the notice.
 
 ### Compacted history and redaction
 

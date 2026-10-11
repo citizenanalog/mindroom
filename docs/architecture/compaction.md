@@ -28,7 +28,7 @@ All paths below are relative to `src/mindroom/`.
 
 `SummaryModel` binds the serving model, its configured name, and its input budget.
 A fallback switch replaces that whole value, so later chunks cannot accidentally use the previous model's budget or identity.
-Persisted replay fitting runs once before a reply; the mid-turn hook measures every model request of the reply, anchored on the latest response's provider usage when this loop received one.
+Persisted replay fitting runs once before a reply; the mid-turn hook measures every model request of the reply, anchored on the latest response's provider usage when this loop received one, except on native routes, which size the projected request by estimate.
 
 ## Compatibility code
 
