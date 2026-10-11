@@ -242,6 +242,10 @@ class TlsInterceptor:
             return None
         headers = upstream_request_headers(list(request.headers), host=host_header or tunnel.authority)
         if _is_websocket_upgrade(list(request.headers)):
+            if client.close_after_response:
+                # Conflicting lengths mean the connection closes after this response, so it never becomes a splice.
+                await self._relay.deny(client, entry, refusal_body("bad_request"), status=400)
+                return None
             headers += [(b"connection", b"Upgrade"), (b"upgrade", b"websocket")]
         match = route.match
         if match is None:

@@ -306,6 +306,16 @@ REQUEST_CASES = [
         check=_no_upgrade,
     ),
     Case(
+        # A websocket upgrade whose connection must close after the response (both lengths) is never spliced.
+        "upgrade-websocket-with-both-lengths",
+        _GET + "Connection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 4\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + _SMUGGLED,
+        # Plain requests never upgrade, so it is served as a plain request that closes; in a tunnel it is refused.
+        plain=Outcome((200,), 1, closes=True),
+        tunnel=Outcome((400,), 0),
+        check=_no_upgrade,
+    ),
+    Case(
         "upgrade-websocket-and-h2c",
         _GET + "Connection: Upgrade\r\nUpgrade: websocket, h2c\r\n\r\n",
         **_same((200,), 1),
