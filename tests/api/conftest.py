@@ -1,7 +1,8 @@
 """Pytest configuration and fixtures for dashboard backend tests."""
 
 # Import the app after we can mock the config path
-from collections.abc import Generator
+import asyncio
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -115,3 +116,26 @@ def test_ca_pem() -> str:
     from tests.test_helpers import make_test_ca_pem  # noqa: PLC0415
 
     return make_test_ca_pem()
+
+
+@pytest.fixture
+def calls_on_event_loop(monkeypatch: pytest.MonkeyPatch) -> Callable[[object, str], list[bool]]:
+    """Return ``record(module, name)``: wrap ``module.name`` and log, for each call, whether it ran on the event loop."""
+
+    def record(module: object, name: str) -> list[bool]:
+        real = getattr(module, name)
+        on_loop: list[bool] = []
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, recorded)
+        return on_loop
+
+    return record

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
@@ -24,7 +23,7 @@ from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_w
 from tests.api.test_oauth_api import _fake_provider
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
     from pathlib import Path
 
     from fastapi.testclient import TestClient
@@ -110,11 +109,35 @@ def mock_active_ca_pem() -> Generator[MagicMock, None, None]:
         yield mock
 
 
-@pytest.fixture
-def mock_audit_query() -> Generator[MagicMock, None, None]:
-    """Mock AuditLog.query method."""
-    with patch("mindroom.egress_broker.audit.AuditLog.query") as mock:
-        yield mock
+def _scope_params(agent_name: str | None) -> dict[str, str]:
+    """Return the query parameters that select an agent's scope; none selects the global one."""
+    return {} if agent_name is None else {"agent_name": agent_name}
+
+
+def _service(client: TestClient, name: str, agent_name: str | None = None) -> dict[str, Any]:
+    response = client.get("/api/egress-broker/services", params=_scope_params(agent_name))
+    assert response.status_code == 200, response.text
+    return next(service for service in response.json()["services"] if service["name"] == name)
+
+
+def _audit_record(**fields: Any) -> AuditRecord:  # noqa: ANN401
+    """Return a request record from an agent on GitHub, with `fields` overriding any default."""
+    defaults: dict[str, Any] = {
+        "at": datetime.now(UTC),
+        "kind": "request",
+        "scope": "shared",
+        "agent_name": "test_agent",
+        "requester_id": "@user:example.org",
+        "method": "GET",
+        "host": "api.github.com",
+        "path": "/repos",
+        "service": "github",
+        "status": 200,
+        "bytes_up": 1,
+        "bytes_down": 1,
+        "duration_ms": 1,
+    }
+    return AuditRecord(**{**defaults, **fields})
 
 
 def test_services_status_never_returns_secret(broker_test_client: TestClient) -> None:
@@ -261,28 +284,14 @@ def test_presets_route_sits_behind_the_dashboard_auth() -> None:
 def test_logs_return_the_refusal_code(broker_test_client: TestClient, tmp_path: Path) -> None:
     """The administrator's log shows why a request was refused, and null for one that was forwarded."""
     audit = AuditLog(tmp_path / "codes.sqlite3")
-    base = {
-        "scope": "shared",
-        "agent_name": "test_agent",
-        "requester_id": "@user:example.org",
-        "method": "GET",
-        "host": "api.github.com",
-        "service": "github",
-        "bytes_up": 0,
-        "bytes_down": 0,
-        "duration_ms": 1,
-    }
+    audit.record(_audit_record(at=datetime(2026, 10, 1, tzinfo=UTC), path="/ok"))
     audit.record(
-        AuditRecord(at=datetime(2026, 10, 1, tzinfo=UTC), kind="request", path="/ok", status=200, **base),
-    )
-    audit.record(
-        AuditRecord(
+        _audit_record(
             at=datetime(2026, 10, 2, tzinfo=UTC),
             kind="denied",
             path="/nope",
             status=403,
             code="path_not_allowed",
-            **base,
         ),
     )
 
@@ -307,64 +316,27 @@ def test_routes_require_dashboard_auth(broker_test_client: TestClient) -> None:
     assert response.status_code == 200  # Should work with proper config
 
 
-def test_delete_global_secret_flips_status(broker_test_client: TestClient) -> None:
-    """DELETE should flip configured status to false for global secrets."""
-    # Set a global secret
+@pytest.mark.parametrize("agent_name", [None, "test_agent"], ids=["global", "agent-scoped"])
+def test_delete_secret_flips_status(broker_test_client: TestClient, agent_name: str | None) -> None:
+    """DELETE should flip configured status to false, for global and agent-scoped secrets."""
+    params = _scope_params(agent_name)
+    # Set a secret
     response = broker_test_client.put(
         "/api/egress-broker/services/github/secret",
+        params=params,
         json={"secret": "test-secret"},
     )
     assert response.status_code == 204
 
     # Check it's configured
-    response = broker_test_client.get("/api/egress-broker/services")
-    assert response.status_code == 200
-    services = response.json()["services"]
-    github = next((s for s in services if s["name"] == "github"), None)
-    assert github is not None
-    assert github["configured"] is True
+    assert _service(broker_test_client, "github", agent_name)["configured"] is True
 
     # Delete it
-    response = broker_test_client.delete("/api/egress-broker/services/github/secret")
+    response = broker_test_client.delete("/api/egress-broker/services/github/secret", params=params)
     assert response.status_code == 204
 
     # Check it's no longer configured
-    response = broker_test_client.get("/api/egress-broker/services")
-    assert response.status_code == 200
-    services = response.json()["services"]
-    github = next((s for s in services if s["name"] == "github"), None)
-    assert github is not None
-    assert github["configured"] is False
-
-
-def test_delete_agent_scoped_secret_flips_status(broker_test_client: TestClient) -> None:
-    """DELETE should flip configured status to false for agent-scoped secrets."""
-    # Set an agent-scoped secret
-    response = broker_test_client.put(
-        "/api/egress-broker/services/github/secret?agent_name=test_agent",
-        json={"secret": "agent-secret"},
-    )
-    assert response.status_code == 204
-
-    # Check it's configured
-    response = broker_test_client.get("/api/egress-broker/services?agent_name=test_agent")
-    assert response.status_code == 200
-    services = response.json()["services"]
-    github = next((s for s in services if s["name"] == "github"), None)
-    assert github is not None
-    assert github["configured"] is True
-
-    # Delete it
-    response = broker_test_client.delete("/api/egress-broker/services/github/secret?agent_name=test_agent")
-    assert response.status_code == 204
-
-    # Check it's no longer configured
-    response = broker_test_client.get("/api/egress-broker/services?agent_name=test_agent")
-    assert response.status_code == 200
-    services = response.json()["services"]
-    github = next((s for s in services if s["name"] == "github"), None)
-    assert github is not None
-    assert github["configured"] is False
+    assert _service(broker_test_client, "github", agent_name)["configured"] is False
 
 
 def test_logs_filtering_with_real_audit_log(
@@ -377,35 +349,14 @@ def test_logs_filtering_with_real_audit_log(
     audit = AuditLog(log_path)
 
     # Add some test records
+    audit.record(_audit_record(bytes_up=100, bytes_down=500, duration_ms=50))
     audit.record(
-        AuditRecord(
-            at=datetime.now(UTC),
-            kind="request",
-            scope="shared",
-            agent_name="test_agent",
-            requester_id="@user:example.org",
-            method="GET",
-            host="api.github.com",
-            path="/repos",
-            service="github",
-            status=200,
-            bytes_up=100,
-            bytes_down=500,
-            duration_ms=50,
-        ),
-    )
-    audit.record(
-        AuditRecord(
-            at=datetime.now(UTC),
-            kind="request",
-            scope="shared",
+        _audit_record(
             agent_name="other_agent",
-            requester_id="@user:example.org",
             method="POST",
             host="api.openai.com",
             path="/chat/completions",
             service="openai",
-            status=200,
             bytes_up=200,
             bytes_down=1000,
             duration_ms=100,
@@ -454,23 +405,7 @@ def test_admin_logs_carry_requester_and_filter_by_it(broker_test_client: TestCli
         ("@alice:example.org", "/c"),
         (None, "/d"),
     ):
-        audit.record(
-            AuditRecord(
-                at=datetime.now(UTC),
-                kind="request",
-                scope="shared",
-                agent_name="test_agent",
-                requester_id=requester_id,
-                method="GET",
-                host="api.github.com",
-                path=path,
-                service="github",
-                status=200,
-                bytes_up=1,
-                bytes_down=1,
-                duration_ms=1,
-            ),
-        )
+        audit.record(_audit_record(requester_id=requester_id, path=path))
 
     with patch("mindroom.api.egress_broker.active_audit_log", return_value=audit):
         everyone = broker_test_client.get("/api/egress-broker/logs").json()["records"]
@@ -500,7 +435,7 @@ def test_admin_logs_carry_requester_and_filter_by_it(broker_test_client: TestCli
 @pytest.mark.parametrize("agent_name", [None, "test_agent"])
 def test_credentials_list_omits_egress_secrets(broker_test_client: TestClient, agent_name: str | None) -> None:
     """The Credentials tab lists only services its status route serves, so egress secrets stay out."""
-    params = {} if agent_name is None else {"agent_name": agent_name}
+    params = _scope_params(agent_name)
     response = broker_test_client.put(
         "/api/egress-broker/services/github/secret",
         params=params,
@@ -556,7 +491,7 @@ def _save_own_service(name: str, agent_name: str | None = None) -> None:
 
 
 def _listed(client: TestClient, agent_name: str | None = None) -> list[tuple[str, str, bool]]:
-    params = {} if agent_name is None else {"agent_name": agent_name}
+    params = _scope_params(agent_name)
     response = client.get("/api/egress-broker/services", params=params)
     assert response.status_code == 200, response.text
     return [(s["name"], s["source"], s["configured"]) for s in response.json()["services"]]
@@ -597,23 +532,11 @@ def test_dashboard_lists_a_scopes_own_services_and_accepts_their_keys(broker_tes
 
 def test_dashboard_reads_a_scopes_own_services_off_the_event_loop(
     broker_test_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    calls_on_event_loop: Callable[[object, str], list[bool]],
 ) -> None:
     """The async listing reads a scope's own services from the credential store in a thread."""
     _save_own_service("everyone")
-    real = egress_status.effective_config
-    on_loop: list[bool] = []
-
-    def recorded(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            on_loop.append(False)
-        else:
-            on_loop.append(True)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(egress_status, "effective_config", recorded)
+    on_loop = calls_on_event_loop(egress_status, "effective_config")
     assert _listed(broker_test_client) == [("github", "config", False), ("everyone", "user", False)]
     assert on_loop
     assert not any(on_loop)
@@ -657,16 +580,9 @@ def oauth_broker_client(egress_config_file: Path, monkeypatch: pytest.MonkeyPatc
     return TestClient(main.app, base_url="http://localhost")
 
 
-def _service(client: TestClient, name: str, agent_name: str | None = None) -> dict[str, object]:
-    params = {} if agent_name is None else {"agent_name": agent_name}
-    response = client.get("/api/egress-broker/services", params=params)
-    assert response.status_code == 200, response.text
-    return next(service for service in response.json()["services"] if service["name"] == name)
-
-
 def _connect(client: TestClient, name: str, provider: str, agent_name: str | None = None) -> None:
     """Run the whole OAuth flow through the admin connect route and the shared callback."""
-    params = {} if agent_name is None else {"agent_name": agent_name}
+    params = _scope_params(agent_name)
     response = client.post(f"/api/egress-broker/services/{name}/connect", params=params)
     assert response.status_code == 200, response.text
     state = parse_qs(urlparse(response.json()["auth_url"]).query)["state"][0]
@@ -705,7 +621,7 @@ def test_connect_stores_the_account_and_a_key_takes_precedence(
     agent_name: str | None,
 ) -> None:
     """A connected account shows in the scope it was connected for, and an explicit key takes over."""
-    params = {} if agent_name is None else {"agent_name": agent_name}
+    params = _scope_params(agent_name)
     _connect(oauth_broker_client, "drive", "google_drive", agent_name)
 
     drive = _service(oauth_broker_client, "drive", agent_name)
@@ -730,7 +646,7 @@ def test_connect_stores_the_account_and_a_key_takes_precedence(
 @pytest.mark.parametrize("agent_name", [None, "test_agent"])
 def test_disconnect_clears_the_connection(oauth_broker_client: TestClient, agent_name: str | None) -> None:
     """Disconnect resets the scope's connection."""
-    params = {} if agent_name is None else {"agent_name": agent_name}
+    params = _scope_params(agent_name)
     _connect(oauth_broker_client, "drive", "google_drive", agent_name)
 
     response = oauth_broker_client.post("/api/egress-broker/services/drive/disconnect", params=params)
@@ -781,7 +697,7 @@ def test_requester_scoped_provider_status_follows_the_dashboard_requester(
 
     response = oauth_broker_client.post(
         "/api/egress-broker/services/gh/disconnect",
-        params={} if agent_name is None else {"agent_name": agent_name},
+        params=_scope_params(agent_name),
     )
     assert response.status_code == 200, response.text
     assert _service(oauth_broker_client, "gh", agent_name)["oauth"]["connected"] is False
@@ -887,7 +803,7 @@ def test_connect_and_disconnect_are_refused_in_a_scope_the_broker_refuses_the_ac
     agent_name: str | None,
 ) -> None:
     """The panel offers nothing there, so the routes answer 409 with a readable string until the service opts in."""
-    params = {} if agent_name is None else {"agent_name": agent_name}
+    params = _scope_params(agent_name)
     url = f"/api/egress-broker/services/gh/{action}"
 
     refused = oauth_broker_client.post(url, params=params)
@@ -959,22 +875,10 @@ def test_listing_authenticates_once_not_per_service(
 
 def test_key_status_is_read_off_the_event_loop(
     oauth_broker_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    calls_on_event_loop: Callable[[object, str], list[bool]],
 ) -> None:
     """Reading a key's status decrypts a credential file, so the async listing runs it in a thread."""
-    real = secrets.secret_status
-    on_loop: list[bool] = []
-
-    def recorded(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            on_loop.append(False)
-        else:
-            on_loop.append(True)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(secrets, "secret_status", recorded)
+    on_loop = calls_on_event_loop(secrets, "secret_status")
     assert oauth_broker_client.get("/api/egress-broker/services").status_code == 200
     assert on_loop
     assert not any(on_loop)
