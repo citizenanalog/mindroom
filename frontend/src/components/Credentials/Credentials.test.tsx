@@ -9,10 +9,19 @@ vi.mock("@/components/ui/use-toast", () => ({
 }));
 
 // The egress panel has its own tests and fetches on mount, which would consume
-// the ordered fetch mocks below.
-vi.mock("./EgressBroker", () => ({
-  EgressBroker: () => <div data-testid="egress-broker" />,
-}));
+// the ordered fetch mocks below. Only the test of the page order asks for the real one.
+const realPanel = vi.hoisted(() => ({ wanted: false }));
+vi.mock("./EgressBroker", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./EgressBroker")>();
+  return {
+    EgressBroker: () =>
+      realPanel.wanted ? (
+        <actual.EgressBroker />
+      ) : (
+        <div data-testid="egress-broker" />
+      ),
+  };
+});
 
 global.fetch = vi.fn();
 
@@ -29,6 +38,7 @@ describe("Credentials", () => {
     vi.restoreAllMocks();
     vi.clearAllMocks();
     (global.fetch as any).mockReset();
+    realPanel.wanted = false;
   });
 
   it("loads services and selected service credentials", async () => {
@@ -79,6 +89,66 @@ describe("Credentials", () => {
 
     await screen.findByText(/No services found yet/);
     expect(screen.getByTestId("egress-broker")).toBeInTheDocument();
+  });
+
+  it("puts Agent API keys and accounts before Raw credential payloads (advanced)", async () => {
+    realPanel.wanted = true;
+    (global.fetch as any).mockImplementation(async (input: string) => {
+      const path = String(input).split("?")[0];
+      const body =
+        path === "/api/egress-broker/services"
+          ? { services: [] }
+          : path === "/api/egress-broker/logs"
+            ? { records: [] }
+            : [];
+      return { ok: true, status: 200, json: async () => body };
+    });
+
+    render(<Credentials />);
+
+    const panel = await screen.findByRole("heading", {
+      name: "Agent API keys and accounts",
+    });
+    const raw = screen.getByRole("heading", {
+      name: "Raw credential payloads (advanced)",
+    });
+    expect(
+      panel.compareDocumentPosition(raw) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText("Credentials Manager")).toBeNull();
+  });
+
+  it("keeps the raw editor's error under the raw editor, after the panel", async () => {
+    (global.fetch as any).mockRejectedValue(new Error("Failed to load"));
+
+    render(<Credentials />);
+
+    const error = await screen.findByText("Failed to load");
+    const panel = screen.getByTestId("egress-broker");
+    const raw = screen.getByRole("heading", {
+      name: "Raw credential payloads (advanced)",
+    });
+    expect(
+      panel.compareDocumentPosition(raw) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      raw.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("names the raw editor's save button Save payload", async () => {
+    (global.fetch as any).mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+
+    render(<Credentials />);
+
+    await screen.findByText(/No services found yet/);
+    expect(
+      screen.getByRole("button", { name: "Save payload" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 
   it("hides credentials by default and reveals them on demand", async () => {
@@ -178,7 +248,7 @@ describe("Credentials", () => {
     fireEvent.change(editor, {
       target: { value: '{"username":"x-access-token","token":"ghp_updated"}' },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save payload" }));
 
     await waitFor(() => {
       expect(global.fetch).toHaveBeenCalledWith(
@@ -254,7 +324,7 @@ describe("Credentials", () => {
     fireEvent.change(screen.getByPlaceholderText('{"api_key":"..."}'), {
       target: { value: '{"api_key":"sk-ant-dashboard"}' },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save payload" }));
 
     await waitFor(() => {
       expect(mockToast).toHaveBeenCalledWith({
@@ -303,7 +373,7 @@ describe("Credentials", () => {
     fireEvent.change(screen.getByPlaceholderText('{"api_key":"..."}'), {
       target: { value: '{"broken_json": ' },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save payload" }));
 
     await waitFor(() => {
       expect(

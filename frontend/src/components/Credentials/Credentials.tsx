@@ -453,9 +453,13 @@ export function Credentials() {
   return (
     <div className="h-full overflow-y-auto overflow-x-hidden">
       <div className="h-full flex flex-col gap-4">
+        <EgressBroker />
+
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="text-xl">Credentials Manager</CardTitle>
+            <CardTitle className="text-xl">
+              Raw credential payloads (advanced)
+            </CardTitle>
             <CardDescription>
               Manage raw credential payloads by service name (for tools, model
               aliases, and private integrations).
@@ -610,7 +614,7 @@ export function Credentials() {
                       disabled={!selectedService || isSaving}
                     >
                       <Save className="h-4 w-4 mr-2" />
-                      {isSaving ? "Saving..." : "Save"}
+                      {isSaving ? "Saving..." : "Save payload"}
                     </Button>
                     <Button
                       variant="outline"
@@ -654,8 +658,6 @@ export function Credentials() {
             </CardContent>
           </Card>
         ) : null}
-
-        <EgressBroker />
       </div>
     </div>
   );

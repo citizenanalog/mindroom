@@ -1,5 +1,6 @@
 import {
   type FormEvent,
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -57,7 +58,9 @@ const NOT_RUNNING_MESSAGE =
   "Egress broker is not running. Set MINDROOM_EGRESS_BROKER_PORT and MINDROOM_EGRESS_BROKER_URL.";
 const LOG_ERROR_MESSAGE = "Could not load the request log. Try again.";
 const LOG_TIMEOUT_MS = 30_000;
-const GLOBAL_OPTION = "Global (unscoped agents)";
+const UNSCOPED_OPTION = "Agents without a scope";
+// The target that uses the one set of keys all agents without a worker scope share.
+const UNSCOPED_VALUE = "";
 // Brokered traffic only exists for agents that can run commands.
 const EGRESS_TOOLS = ["shell", "python"];
 const SECRET_ERROR_MESSAGES: RequestErrorMessages = {
@@ -83,6 +86,8 @@ interface BrokerService {
 interface AuditRecord {
   at: string;
   agent_name: string | null;
+  /** The Matrix ID of the user whose request this was; `null` when none is known. */
+  requester_id: string | null;
   method: string;
   host: string;
   path: string;
@@ -94,6 +99,7 @@ interface AuditRecord {
 }
 
 interface LogFilters {
+  user: string;
   agent: string;
   host: string;
   service: string;
@@ -107,6 +113,7 @@ type LogState =
 
 const LOG_COLUMNS = [
   "Time",
+  "User",
   "Agent",
   "Method",
   "Host",
@@ -116,7 +123,7 @@ const LOG_COLUMNS = [
   "Duration",
 ];
 
-const NO_FILTERS: LogFilters = { agent: "", host: "", service: "" };
+const NO_FILTERS: LogFilters = { user: "", agent: "", host: "", service: "" };
 
 function errorMessage(cause: unknown, fallback: string): string {
   return cause instanceof Error && cause.message ? cause.message : fallback;
@@ -186,15 +193,15 @@ function canUseEgress(agent: Agent, defaults: Config["defaults"]): boolean {
   );
 }
 
+type KeyScope = "shared" | "unscoped" | "requester";
+
 // Keys for `user` and `user_agent` agents belong to each requester, so the
-// admin API rejects them; their users set keys on the personal egress page.
-function isRequesterScoped(
-  agent: Agent,
-  defaults: Config["defaults"],
-): boolean {
-  if (agent.private != null) return true;
+// admin API rejects them; their users set keys on the Connections page.
+function keyScope(agent: Agent, defaults: Config["defaults"]): KeyScope {
+  if (agent.private != null) return "requester";
   const scope = agent.worker_scope ?? defaults?.worker_scope ?? null;
-  return scope === "user" || scope === "user_agent";
+  if (scope === "user" || scope === "user_agent") return "requester";
+  return scope === "shared" ? "shared" : "unscoped";
 }
 
 function ServiceSection({ agentName }: { agentName: string | null }) {
@@ -356,6 +363,17 @@ function ServiceSection({ agentName }: { agentName: string | null }) {
           Add service
         </Button>
       </div>
+      <p className="text-xs text-muted-foreground">
+        Services you add here are offered to every agent and user. Private
+        agents are not listed: each user sets their own keys on the{" "}
+        <a
+          href="/connections"
+          className="font-medium text-primary underline-offset-4 hover:underline"
+        >
+          Connections page
+        </a>
+        .
+      </p>
       {error && (
         <Alert variant="destructive" className="p-2">
           <AlertDescription>{error}</AlertDescription>
@@ -435,6 +453,18 @@ function ServiceSection({ agentName }: { agentName: string | null }) {
   );
 }
 
+// A long refusal code wraps after an underscore, so it shows in full, never
+// clipped and never split inside a word.
+function breakAfterUnderscores(code: string) {
+  const parts = code.match(/[^_]*_|[^_]+/g) ?? [];
+  return parts.map((part, index) => (
+    <Fragment key={index}>
+      {part}
+      {index < parts.length - 1 && <wbr />}
+    </Fragment>
+  ));
+}
+
 function LogTable({ records }: { records: AuditRecord[] }) {
   if (records.length === 0)
     return (
@@ -462,6 +492,7 @@ function LogTable({ records }: { records: AuditRecord[] }) {
               <td className="whitespace-nowrap px-3 py-2">
                 {new Date(record.at).toLocaleString()}
               </td>
+              <td className="px-3 py-2">{record.requester_id ?? "-"}</td>
               <td className="px-3 py-2">{record.agent_name ?? "-"}</td>
               <td className="px-3 py-2 font-mono text-xs">{record.method}</td>
               <td className="px-3 py-2">{record.host}</td>
@@ -480,9 +511,9 @@ function LogTable({ records }: { records: AuditRecord[] }) {
                   {record.status}
                 </Badge>
                 {record.code && (
-                  <span className="ml-2 text-xs text-muted-foreground">
-                    {record.code}
-                  </span>
+                  <div className="mt-1 break-words text-xs text-muted-foreground">
+                    {breakAfterUnderscores(record.code)}
+                  </div>
                 )}
               </td>
               <td className="whitespace-nowrap px-3 py-2">
@@ -513,6 +544,7 @@ function LogSection() {
     try {
       const response = await fetch(
         withQueryParams(API_ENDPOINTS.egressBroker.logs, {
+          requester: applied.user.trim(),
           agent_name: applied.agent.trim(),
           host: applied.host.trim(),
           service: applied.service.trim(),
@@ -568,6 +600,7 @@ function LogSection() {
         Request log
       </h3>
       <form className="flex flex-wrap items-center gap-2" onSubmit={submit}>
+        {filterInput("user", "User")}
         {filterInput("agent", "Agent")}
         {filterInput("host", "Host")}
         {filterInput("service", "Service")}
@@ -615,31 +648,45 @@ function LogSection() {
   );
 }
 
-/** Egress broker secrets for the global scope or one agent, plus its request log. */
+/** The keys and accounts of the shared agents and of the agents without a scope, plus the request log. */
 export function EgressBroker() {
   const agents = useConfigStore((state) => state.agents);
   const defaults = useConfigStore((state) => state.config?.defaults);
   const [selected, setSelected] = useState<string | null>(null);
 
-  const commandAgents = useMemo(
-    () => agents.filter((agent) => canUseEgress(agent, defaults)),
-    [agents, defaults],
-  );
-  const eligibleAgents = useMemo(
-    () => commandAgents.filter((agent) => !isRequesterScoped(agent, defaults)),
-    [commandAgents, defaults],
-  );
-  const hidesRequesterScopedAgents =
-    eligibleAgents.length < commandAgents.length;
-  // An agent that disappears from the config falls back to the global scope.
-  const agentName = eligibleAgents.some((agent) => agent.id === selected)
-    ? selected
-    : null;
+  // Brokered traffic only exists for agents that can run commands. Shared
+  // agents come first, each with keys of its own. All agents without a worker
+  // scope share one set of keys, so they are one option, offered only when
+  // such an agent exists.
+  const targets = useMemo(() => {
+    const commandAgents = agents.filter((agent) =>
+      canUseEgress(agent, defaults),
+    );
+    const shared = commandAgents
+      .filter((agent) => keyScope(agent, defaults) === "shared")
+      .map((agent) => ({
+        value: agent.id,
+        label: agent.display_name || agent.id,
+      }));
+    const hasUnscoped = commandAgents.some(
+      (agent) => keyScope(agent, defaults) === "unscoped",
+    );
+    return hasUnscoped
+      ? [...shared, { value: UNSCOPED_VALUE, label: UNSCOPED_OPTION }]
+      : shared;
+  }, [agents, defaults]);
+  // The first target is the default, and the fallback when the selected one
+  // disappears from the config.
+  const target = targets.find((item) => item.value === selected) ?? targets[0];
+  const agentName =
+    target === undefined || target.value === UNSCOPED_VALUE
+      ? null
+      : target.value;
 
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-xl">Egress broker</CardTitle>
+        <CardTitle className="text-xl">Agent API keys and accounts</CardTitle>
         <CardDescription>
           API keys and connected accounts the broker injects into outbound
           requests from agent workers. Keys are write-only and never shown
@@ -648,28 +695,22 @@ export function EgressBroker() {
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="flex flex-wrap items-center gap-2">
-          <label htmlFor="egress-secret-target" className="text-sm font-medium">
-            Secrets for
+          <label htmlFor="egress-key-target" className="text-sm font-medium">
+            Keys for
           </label>
           <select
-            id="egress-secret-target"
+            id="egress-key-target"
             className="h-9 rounded-md border border-input bg-background px-3 text-sm"
-            value={agentName ?? ""}
-            onChange={(event) => setSelected(event.target.value || null)}
+            value={target?.value ?? UNSCOPED_VALUE}
+            disabled={targets.length === 0}
+            onChange={(event) => setSelected(event.target.value)}
           >
-            <option value="">{GLOBAL_OPTION}</option>
-            {eligibleAgents.map((agent) => (
-              <option key={agent.id} value={agent.id}>
-                {agent.display_name || agent.id}
+            {targets.map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.label}
               </option>
             ))}
           </select>
-          {hidesRequesterScopedAgents && (
-            <p className="w-full text-xs text-muted-foreground">
-              Agents with user or user_agent scope are not listed: each user
-              sets their own keys on the personal egress page.
-            </p>
-          )}
         </div>
         {/* Keyed so an unsaved secret never carries over to another target. */}
         <ServiceSection

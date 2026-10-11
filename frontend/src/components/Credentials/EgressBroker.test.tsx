@@ -96,7 +96,7 @@ const newest = {
   kind: "request",
   scope: "shared",
   agent_name: "coder",
-  requester_id: null,
+  requester_id: "@bob:example.com",
   method: "POST",
   host: "api.github.com",
   path: "/repos/acme/app/issues",
@@ -111,6 +111,7 @@ const oldest = {
   ...newest,
   at: "2026-10-09T10:00:00+00:00",
   agent_name: null,
+  requester_id: null,
   method: "GET",
   host: "example.com",
   path: "/",
@@ -154,9 +155,19 @@ function requests(pathname: string, method = "GET") {
 
 const row = (name: string) => screen.getByRole("listitem", { name });
 const selectTarget = (value: string) =>
-  fireEvent.change(screen.getByLabelText("Secrets for"), {
+  fireEvent.change(screen.getByLabelText("Keys for"), {
     target: { value },
   });
+// The panel starts on the first shared agent; "" is Agents without a scope.
+function sharedCoder() {
+  storeState = {
+    agents: [
+      agent("coder", ["shell"], { worker_scope: "shared" }),
+      agent("scripter", ["python"]),
+    ],
+    config: { defaults: {} },
+  };
+}
 
 beforeEach(() => {
   storeState = {
@@ -180,6 +191,50 @@ afterEach(() => {
 });
 
 describe("egress broker panel", () => {
+  it("is titled Agent API keys and accounts", async () => {
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+
+    expect(
+      screen.getByRole("heading", { name: "Agent API keys and accounts" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Egress broker")).toBeNull();
+  });
+
+  it("says what Add service offers and links the Connections page", async () => {
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+
+    const note = screen.getByText(/Services you add here are offered/);
+    expect(note.textContent).toBe(
+      "Services you add here are offered to every agent and user. Private agents are not listed: each user sets their own keys on the Connections page.",
+    );
+    expect(
+      within(note).getByRole("link", { name: "Connections page" }),
+    ).toHaveAttribute("href", "/connections");
+    // It sits under the Add service button, whatever the agents are.
+    expect(
+      screen
+        .getByRole("button", { name: "Add service" })
+        .compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("repeats the note for every target", async () => {
+    sharedCoder();
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+    expect(
+      screen.getAllByRole("link", { name: "Connections page" }),
+    ).toHaveLength(1);
+
+    selectTarget("");
+    await screen.findByText("GitHub");
+    expect(
+      screen.getAllByRole("link", { name: "Connections page" }),
+    ).toHaveLength(1);
+  });
+
   it("lists the services with their status", async () => {
     render(<EgressBroker />);
 
@@ -227,51 +282,93 @@ describe("egress broker panel", () => {
   });
 });
 
-describe("egress broker secret target", () => {
-  it("offers the global scope first, then agents that can run commands", async () => {
-    render(<EgressBroker />);
-    await screen.findByText("GitHub");
-
-    const options = within(screen.getByLabelText("Secrets for"))
-      .getAllByRole("option")
+describe("egress broker key target", () => {
+  const optionsOf = () =>
+    within(screen.getByLabelText("Keys for"))
+      .queryAllByRole("option")
       .map((option) => option.textContent);
-    // `writer` and `isolated` have no shell or python of their own and opt out
-    // of defaults.tools, which `inheriting` receives (shell).
-    expect(options).toEqual([
-      "Global (unscoped agents)",
-      "Agent coder",
-      "Agent scripter",
-      "Agent inheriting",
-    ]);
-    expect(screen.getByLabelText("Secrets for")).toHaveValue("");
-  });
 
-  it("leaves out agents whose keys belong to each requester", async () => {
+  it("lists shared agents first, then Agents without a scope", async () => {
     storeState = {
       agents: [
         agent("coder", ["shell"]),
         agent("mine", ["shell"], { private: { per: "user_agent" } }),
-        agent("per_user", ["shell"], { worker_scope: "user" }),
         agent("team", ["python"], { worker_scope: "shared" }),
-        agent("unscoped", ["shell"], { worker_scope: null }),
+        agent("per_user", ["shell"], { worker_scope: "user" }),
+        agent("ops", ["shell"], { worker_scope: "shared" }),
+        agent("per_agent", ["shell"], { worker_scope: "user_agent" }),
       ],
       config: { defaults: { worker_scope: null } },
     };
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    const options = within(screen.getByLabelText("Secrets for"))
-      .getAllByRole("option")
-      .map((option) => option.textContent);
-    expect(options).toEqual([
-      "Global (unscoped agents)",
-      "Agent coder",
+    // `coder` comes first in the config but has no scope, so it is part of the
+    // last option. Agents whose keys belong to each requester are left out.
+    expect(optionsOf()).toEqual([
       "Agent team",
-      "Agent unscoped",
+      "Agent ops",
+      "Agents without a scope",
     ]);
+  });
+
+  it("defaults to the first shared agent and loads its keys", async () => {
+    storeState = {
+      agents: [
+        agent("coder", ["shell"]),
+        agent("team", ["python"], { worker_scope: "shared" }),
+        agent("ops", ["shell"], { worker_scope: "shared" }),
+      ],
+      config: { defaults: {} },
+    };
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+
+    expect(screen.getByLabelText("Keys for")).toHaveValue("team");
+    const loads = requests("/api/egress-broker/services");
+    expect(loads).toHaveLength(1);
+    expect(loads[0].searchParams.get("agent_name")).toBe("team");
+  });
+
+  it("offers Agents without a scope only when such agents exist", async () => {
+    // Shared agents only.
+    storeState = {
+      agents: [agent("team", ["shell"], { worker_scope: "shared" })],
+      config: { defaults: {} },
+    };
+    const { unmount } = render(<EgressBroker />);
+    await screen.findByText("GitHub");
+    expect(optionsOf()).toEqual(["Agent team"]);
+    unmount();
+
+    // An agent without a scope that cannot run commands never reaches the
+    // broker, so it does not count.
+    storeState = {
+      agents: [
+        agent("team", ["shell"], { worker_scope: "shared" }),
+        agent("writer", ["file"], { include_default_tools: false }),
+      ],
+      config: { defaults: {} },
+    };
+    const second = render(<EgressBroker />);
+    await screen.findByText("GitHub");
+    expect(optionsOf()).toEqual(["Agent team"]);
+    second.unmount();
+
+    // Only agents without a scope: the one option is the default and uses the
+    // keys that all of them share, so no agent is named.
+    storeState = {
+      agents: [agent("coder", ["shell"])],
+      config: { defaults: {} },
+    };
+    vi.mocked(fetch).mockClear();
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+    expect(optionsOf()).toEqual(["Agents without a scope"]);
+    expect(screen.getByLabelText("Keys for")).toHaveValue("");
     expect(
-      screen.getByText(/Agents with user or user_agent scope are not listed/),
-    ).toBeInTheDocument();
+      requests("/api/egress-broker/services")[0].searchParams.get("agent_name"),
+    ).toBeNull();
   });
 
   it("follows the default worker scope for agents without their own", async () => {
@@ -282,55 +379,74 @@ describe("egress broker secret target", () => {
       ],
       config: { defaults: { worker_scope: "user_agent" } },
     };
+    const { unmount } = render(<EgressBroker />);
+    await screen.findByText("GitHub");
+    expect(optionsOf()).toEqual(["Agent team"]);
+    unmount();
+
+    storeState = {
+      agents: [agent("inherits", ["shell"])],
+      config: { defaults: { worker_scope: "shared" } },
+    };
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+    expect(optionsOf()).toEqual(["Agent inherits"]);
+  });
+
+  it("has nothing to choose while the config is not loaded", async () => {
+    storeState = { agents: [], config: null };
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    const options = within(screen.getByLabelText("Secrets for"))
-      .getAllByRole("option")
-      .map((option) => option.textContent);
-    expect(options).toEqual(["Global (unscoped agents)", "Agent team"]);
+    expect(optionsOf()).toEqual([]);
+    expect(screen.getByLabelText("Keys for")).toBeDisabled();
   });
 
-  it("does not mention requester-scoped agents when there are none", async () => {
+  it("no longer says that requester-scoped agents are left out", async () => {
+    storeState = {
+      agents: [
+        agent("team", ["shell"], { worker_scope: "shared" }),
+        agent("mine", ["shell"], { private: { per: "user" } }),
+      ],
+      config: { defaults: {} },
+    };
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
     expect(
       screen.queryByText(/Agents with user or user_agent scope/),
     ).toBeNull();
+    expect(screen.queryByText(/personal egress page/)).toBeNull();
   });
 
-  it("only offers the global scope while the config is not loaded", async () => {
-    storeState = { agents: [], config: null };
+  it("loads the services of the selected target", async () => {
+    sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
-
     expect(
-      within(screen.getByLabelText("Secrets for")).getAllByRole("option"),
-    ).toHaveLength(1);
-  });
+      requests("/api/egress-broker/services")[0].searchParams.get("agent_name"),
+    ).toBe("coder");
 
-  it("loads the services of the selected agent", async () => {
-    render(<EgressBroker />);
-    await screen.findByText("GitHub");
-
-    selectTarget("coder");
-
+    selectTarget("");
     await waitFor(() =>
       expect(requests("/api/egress-broker/services")).toHaveLength(2),
     );
     expect(
       requests("/api/egress-broker/services")[1].searchParams.get("agent_name"),
+    ).toBeNull();
+
+    selectTarget("coder");
+    await waitFor(() =>
+      expect(requests("/api/egress-broker/services")).toHaveLength(3),
+    );
+    expect(
+      requests("/api/egress-broker/services")[2].searchParams.get("agent_name"),
     ).toBe("coder");
   });
 
   it("saves a secret for the selected agent and clears the input", async () => {
+    sharedCoder();
     render(<EgressBroker />);
-    await screen.findByText("GitHub");
-    selectTarget("coder");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
     await screen.findByText("GitHub");
 
     fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
@@ -358,7 +474,7 @@ describe("egress broker secret target", () => {
     expect(screen.queryByLabelText("GitHub API key")).toBeNull();
     // The list is reloaded after a save.
     await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(3),
+      expect(requests("/api/egress-broker/services")).toHaveLength(2),
     );
     // Reopening the editor must not show the previous value.
     fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
@@ -386,21 +502,22 @@ describe("egress broker secret target", () => {
   });
 
   it("never carries a typed secret over to another target", async () => {
+    sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
     fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
-      target: { value: "global-only" },
+      target: { value: "coder-only" },
     });
-    selectTarget("coder");
+    selectTarget("");
 
     // The services reload for the new target, so nothing is left to submit.
     await waitFor(() =>
       expect(screen.queryByLabelText("GitHub API key")).toBeNull(),
     );
     await screen.findByText("GitHub");
-    expect(screen.queryByDisplayValue("global-only")).toBeNull();
+    expect(screen.queryByDisplayValue("coder-only")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Set GitHub API key" }));
     expect(screen.getByLabelText("GitHub API key")).toHaveValue("");
     expect(
@@ -409,38 +526,44 @@ describe("egress broker secret target", () => {
   });
 
   it("does not show the previous target's services while the new ones load", async () => {
+    sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
     vi.mocked(fetch).mockImplementation(
       () => new Promise<Response>(() => undefined),
     );
 
-    selectTarget("coder");
+    selectTarget("");
 
     expect(screen.queryByText("GitHub")).toBeNull();
     expect(screen.getByText("Loading services...")).toBeInTheDocument();
   });
 
-  it("falls back to the global scope when the selected agent goes away", async () => {
+  it("falls back to the first target when the selected one goes away", async () => {
+    sharedCoder();
     const { rerender } = render(<EgressBroker />);
     await screen.findByText("GitHub");
-    selectTarget("coder");
+    selectTarget("");
     await waitFor(() =>
-      expect(screen.getByLabelText("Secrets for")).toHaveValue("coder"),
+      expect(screen.getByLabelText("Keys for")).toHaveValue(""),
     );
 
-    storeState = { ...storeState, agents: [agent("writer", ["file"])] };
+    // No agent without a scope is left, so that option goes too.
+    storeState = {
+      ...storeState,
+      agents: [agent("coder", ["shell"], { worker_scope: "shared" })],
+    };
     rerender(<EgressBroker />);
 
-    expect(screen.getByLabelText("Secrets for")).toHaveValue("");
+    expect(screen.getByLabelText("Keys for")).toHaveValue("coder");
     await waitFor(() => {
       const loads = requests("/api/egress-broker/services");
       expect(loads).toHaveLength(3);
-      expect(loads[2].searchParams.get("agent_name")).toBeNull();
+      expect(loads[2].searchParams.get("agent_name")).toBe("coder");
     });
   });
 
-  it("warns about shared keys only for the global scope", async () => {
+  it("warns about shared keys only for the keys of agents without a scope", async () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
@@ -458,10 +581,9 @@ describe("egress broker secret target", () => {
       }),
     );
 
-    selectTarget("coder");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
+    sharedCoder();
+    cleanup();
+    render(<EgressBroker />);
     fireEvent.click(
       await screen.findByRole("button", { name: "Remove openai API key" }),
     );
@@ -473,12 +595,9 @@ describe("egress broker secret target", () => {
   });
 
   it("removes a secret after confirmation", async () => {
+    sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
-    selectTarget("coder");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Remove openai API key" }),
@@ -520,12 +639,10 @@ describe("egress broker secret target", () => {
 
     mutationResponse = () => json({ detail: "nope" }, 403);
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(
-      await screen.findByText(
-        "You are not allowed to change egress keys or accounts.",
-      ),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/Connections/)).toBeNull();
+    const forbidden = await screen.findByText(
+      "You are not allowed to change egress keys or accounts.",
+    );
+    expect(forbidden.textContent).not.toMatch(/Connections/);
   });
 });
 
@@ -548,12 +665,9 @@ describe("egress broker connected accounts", () => {
 
   it("connects an account for the selected agent and reloads the list", async () => {
     mutationResponse = () => json(authorization);
+    sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
-    selectTarget("coder");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Connect GitHub" }),
@@ -588,7 +702,7 @@ describe("egress broker connected accounts", () => {
       }),
     );
     expect(await screen.findByText("Connected as octocat")).toBeInTheDocument();
-    expect(requests("/api/egress-broker/services")).toHaveLength(3);
+    expect(requests("/api/egress-broker/services")).toHaveLength(2);
   });
 
   it("disconnects the global account without an agent_name", async () => {
@@ -640,6 +754,7 @@ describe("egress broker request log", () => {
         .map((cell) => cell.textContent),
     ).toEqual([
       "Time",
+      "User",
       "Agent",
       "Method",
       "Host",
@@ -654,6 +769,7 @@ describe("egress broker request log", () => {
         .map((cell) => cell.textContent),
     ).toEqual([
       new Date(newest.at).toLocaleString(),
+      "@bob:example.com",
       "coder",
       "POST",
       "api.github.com",
@@ -669,6 +785,7 @@ describe("egress broker request log", () => {
     ).toEqual([
       new Date(oldest.at).toLocaleString(),
       "-",
+      "-",
       "GET",
       "example.com",
       "/",
@@ -678,6 +795,56 @@ describe("egress broker request log", () => {
       "3 ms",
     ]);
     expect(within(rows[1]).queryByText("host_not_allowed")).toBeNull();
+  });
+
+  it("offers the user filter without a value until one is typed", async () => {
+    render(<EgressBroker />);
+    await screen.findByRole("table", { name: "Request log" });
+
+    expect(screen.getByLabelText("Filter by user")).toHaveValue("");
+    expect(
+      requests("/api/egress-broker/logs")[0].searchParams.has("requester"),
+    ).toBe(false);
+  });
+
+  it("shows refusal codes in full and lets them wrap instead of clipping", async () => {
+    const code = "credential_not_configured";
+    logsResponse = () => json({ records: [{ ...oldest, status: 403, code }] });
+    render(<EgressBroker />);
+
+    const table = await screen.findByRole("table", { name: "Request log" });
+    const shown = within(table).getByText(code);
+    expect(shown.textContent).toBe(code);
+    // Nothing from the code up to the table truncates, hides overflow, or
+    // forbids wrapping, so a narrow Status column wraps the code.
+    expect(shown).toHaveClass("break-words");
+    for (
+      let node: HTMLElement | null = shown;
+      node !== null && node !== table;
+      node = node.parentElement
+    ) {
+      expect(node.className).not.toMatch(
+        /\b(truncate|overflow-hidden|text-ellipsis|whitespace-nowrap)\b/,
+      );
+    }
+  });
+
+  it("wraps a refusal code after an underscore, not inside a word", async () => {
+    logsResponse = () =>
+      json({
+        records: [
+          { ...oldest, status: 403, code: "credential_not_configured" },
+        ],
+      });
+    render(<EgressBroker />);
+
+    const table = await screen.findByRole("table", { name: "Request log" });
+    const shown = within(table).getByText("credential_not_configured");
+    expect(
+      Array.from(shown.childNodes)
+        .map((node) => (node.nodeName === "WBR" ? "|" : node.textContent))
+        .join(""),
+    ).toBe("credential_|not_|configured");
   });
 
   it("says so when no requests are logged", async () => {
@@ -690,11 +857,14 @@ describe("egress broker request log", () => {
     expect(screen.queryByRole("table")).toBeNull();
   });
 
-  it("filters the log by agent, host and service on refresh", async () => {
+  it("filters the log by user, agent, host and service on refresh", async () => {
     render(<EgressBroker />);
     await screen.findByRole("table", { name: "Request log" });
     expect(requests("/api/egress-broker/logs")[0].search).toBe("");
 
+    fireEvent.change(screen.getByLabelText("Filter by user"), {
+      target: { value: " @bob:example.com " },
+    });
     fireEvent.change(screen.getByLabelText("Filter by agent"), {
       target: { value: "coder" },
     });
@@ -710,16 +880,20 @@ describe("egress broker request log", () => {
       expect(requests("/api/egress-broker/logs")).toHaveLength(2),
     );
     const { searchParams } = requests("/api/egress-broker/logs")[1];
+    // The admin API calls the user filter `requester`.
+    expect(searchParams.get("requester")).toBe("@bob:example.com");
+    expect(searchParams.has("user")).toBe(false);
     expect(searchParams.get("agent_name")).toBe("coder");
     expect(searchParams.get("host")).toBe("api.github.com");
     expect(searchParams.get("service")).toBe("github");
   });
 
   it("keeps the log filter independent of the secret target", async () => {
+    sharedCoder();
     render(<EgressBroker />);
     await screen.findByRole("table", { name: "Request log" });
 
-    selectTarget("coder");
+    selectTarget("");
     await waitFor(() =>
       expect(requests("/api/egress-broker/services")).toHaveLength(2),
     );
@@ -823,7 +997,9 @@ describe("egress broker CA certificate", () => {
     render(<EgressBroker />);
     await screen.findByText(NOT_RUNNING);
 
-    expect(screen.queryByRole("link")).toBeNull();
+    expect(
+      screen.queryByRole("link", { name: "Download CA certificate" }),
+    ).toBeNull();
     expect(
       screen.getByRole("button", { name: "Download CA certificate" }),
     ).toBeDisabled();
