@@ -169,6 +169,7 @@ def _config(
     enabled: bool = True,
     context_window: int | None = 4000,
     replay_window_tokens: int | None = None,
+    summary_context_window: int = 100_000,
     teams: dict[str, TeamConfig] | None = None,
 ) -> tuple[Config, RuntimePaths]:
     return _make_config(
@@ -182,7 +183,7 @@ def _config(
         ),
         models={
             "default": ModelConfig(provider="openai", id="test-model", context_window=context_window),
-            "summary": ModelConfig(provider="openai", id="summary-model", context_window=100_000),
+            "summary": ModelConfig(provider="openai", id="summary-model", context_window=summary_context_window),
         },
     )
 
@@ -464,6 +465,46 @@ async def test_rewritten_request_within_the_model_window_is_sent(
 
 
 @pytest.mark.asyncio
+async def test_turn_larger_than_the_summary_input_keeps_its_newest_exchanges(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path, context_window=20_000, summary_context_window=8_000)
+    model = _ToolLoopModel(tool_rounds=25)
+
+    output = await _run(_agent(model, config, paths), "Do the task")
+
+    assert str(output.content).endswith("done")
+    assert summary_calls.inputs
+    assert all("Run truncated to fit compaction budget." not in summary for summary in summary_calls.inputs)
+    compacted = _first_compacted(model)
+    assert compacted.roles[-1] == "tool"
+    assert compacted.contents.index("Do the task") < compacted.roles.index("tool")
+
+
+@pytest.mark.asyncio
+async def test_partial_fold_that_still_overflows_folds_again(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path, context_window=20_000, summary_context_window=6_000)
+    model = _ToolLoopModel(tool_rounds=8)
+    sizes = iter([4_000] * 6 + [72_000] + [4_000] * 10)
+
+    def probe() -> str:
+        """Return one tool result whose size varies by call."""
+        return "r" * next(sizes)
+
+    agent = _agent(model, config, paths)
+    agent.tools = [probe]
+
+    output = await _run(agent, "Do the task")
+
+    assert str(output.content).endswith("done")
+    assert len(summary_calls.inputs) >= 2
+
+
+@pytest.mark.asyncio
 async def test_folded_request_usage_stays_in_the_usage_projection(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
@@ -521,7 +562,7 @@ def test_replayed_queued_notice_is_folded() -> None:
     ]
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
-    layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=True, fold_budget=100_000)
 
     assert layout.kept == (prompt,)
     assert old_notice in layout.folded
@@ -1161,7 +1202,7 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     messages = [legacy_system, prompt, Message(role="assistant", content="step"), Message(role="tool", content="r")]
     run_response = RunOutput(run_id="run", input=RunInput(input_content=[prompt]))
 
-    layout = mid_turn_compaction._layout(messages, run_response, scoped=True)
+    layout = mid_turn_compaction._layout(messages, run_response, scoped=True, fold_budget=100_000)
     mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
 
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"

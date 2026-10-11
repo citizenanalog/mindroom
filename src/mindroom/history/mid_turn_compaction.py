@@ -74,6 +74,8 @@ logger = get_logger(__name__)
 _HOOK_MARKER = "_mindroom_mid_turn_compaction_installed"
 _BINDING_KEY = "_mindroom_mid_turn_compaction"
 _PROMPT_ROLES = frozenset({"system", "developer"})
+# Room in one summary input for its wrapper and the summary prompt's framing.
+_SUMMARY_INPUT_MARGIN_TOKENS = 1024
 
 
 @dataclass
@@ -133,6 +135,8 @@ class _Layout:
     folded: tuple[Message, ...]
     prompt: Message | None
     previous_run_local_summary: str | None
+    # True when newer turn exchanges stayed unfolded because the summary input could not hold them.
+    partial: bool
 
 
 def install_mid_turn_compaction(
@@ -196,32 +200,47 @@ async def _prepare_request(
     if policy is None or _request_tokens(binding, policy, messages, tools, loaded_ids) <= policy.limit:
         return
     session = _scoped_session(binding, built_session, run_response)
-    layout = _layout(messages, run_response, scoped=session is not None)
-    if all(is_compaction_summary(message) for message in layout.folded):
-        # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
-        return
+    while True:
+        layout = _layout(messages, run_response, scoped=session is not None, fold_budget=_fold_budget(policy, messages))
+        if all(is_compaction_summary(message) for message in layout.folded):
+            # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
+            return
+        summary_message = await _summarize(binding, policy, layout, messages, run_response, session)
+        if summary_message is None:
+            binding.failed_run_id = run_response.run_id
+            return
+        if policy.replay_model is not None and policy.replay_model.native_compaction is not None:
+            # The provider's own compaction could not keep this request within the window.
+            logger.warning(
+                "Native compaction left the request over its limit; compacted as text",
+                run_id=run_response.run_id,
+            )
+            policy.replay_model.configure_native_compaction(threshold=None)
+        _finish(messages, layout, summary_message, run_response)
+        # A turn larger than one summary input folds in more passes, as long as the request cannot be sent.
+        if not layout.partial or _estimated_request_tokens(policy, messages, tools) <= policy.fit_limit:
+            break
+    _require_fit(policy, messages, tools, summary_message)
+
+
+async def _summarize(
+    binding: _MidTurnCompaction,
+    policy: _Policy,
+    layout: _Layout,
+    messages: list[Message],
+    run_response: RunOutput | TeamRunOutput,
+    session: AgentSession | TeamSession | None,
+) -> Message | None:
+    """Summarize one layout's folded messages, or return None when compaction failed."""
     try:
         if session is None:
-            summary_message = await _summarize_run_locally(binding, policy.inputs, layout, run_response, messages)
-        else:
-            summary_message = await _compact_scope(binding, policy, layout, messages, run_response, session)
+            return await _summarize_run_locally(binding, policy.inputs, layout, run_response, messages)
+        return await _compact_scope(binding, policy, layout, messages, run_response, session)
     except asyncio.CancelledError:
         raise
     except Exception:
-        summary_message = None
         logger.exception("Mid-turn compaction failed; continuing without it", run_id=run_response.run_id)
-    if summary_message is None:
-        binding.failed_run_id = run_response.run_id
-        return
-    if policy.native_route is not None and policy.replay_model is not None:
-        # The provider's own compaction could not keep this request within the window.
-        logger.warning(
-            "Native compaction left the request over its limit; compacted as text",
-            run_id=run_response.run_id,
-        )
-        policy.replay_model.configure_native_compaction(threshold=None)
-    _finish(messages, layout, summary_message, run_response)
-    _require_fit(policy, messages, tools, summary_message)
+        return None
 
 
 def _finish(
@@ -351,7 +370,7 @@ def _require_fit(
     summary_message: Message,
 ) -> None:
     """Refuse to send a rewritten request whose kept messages and summary exceed the model's own window."""
-    tokens = estimate_request_messages_tokens(messages, replay_model=policy.replay_model) + _tool_tokens(tools)
+    tokens = _estimated_request_tokens(policy, messages, tools)
     if tokens <= policy.fit_limit:
         return
     summary_tokens = estimate_text_tokens(str(summary_message.content))
@@ -413,6 +432,14 @@ def _request_tokens(
     )
 
 
+def _estimated_request_tokens(policy: _Policy, messages: list[Message], tools: list[dict[str, Any]] | None) -> int:
+    return (
+        estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
+        + _reasoning_tokens(messages)
+        + _tool_tokens(tools)
+    )
+
+
 def _tool_tokens(tools: list[dict[str, Any]] | None) -> int:
     return estimate_text_tokens(stable_serialize(tools)) if tools else 0
 
@@ -426,11 +453,18 @@ def _reasoning_tokens(messages: Sequence[Message]) -> int:
     )
 
 
-def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput, *, scoped: bool) -> _Layout:
+def _layout(
+    messages: list[Message],
+    run_response: RunOutput | TeamRunOutput,
+    *,
+    scoped: bool,
+    fold_budget: int,
+) -> _Layout:
     """Split a request into kept and folded messages.
 
     A run-local summary this run already wrote seeds the next run-local summary; a scoped compaction folds it into
-    the snapshot instead, since the scope summary never saw it.
+    the snapshot instead, since the scope summary never saw it. The turn's own exchanges fold oldest first, and
+    only as many as the summary input can hold whole; the newer ones stay in the request for a later compaction.
     """
     leading = next(
         (index for index, message in enumerate(messages) if message.role not in _PROMPT_ROLES),
@@ -440,24 +474,57 @@ def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput, *,
     kept: list[Message] = []
     folded: list[Message] = []
     previous: str | None = None
-    for message in messages[leading:]:
+    turn_tokens = 0
+    keep_rest = False
+    for exchange in _exchanges(messages[leading:]):
+        head = exchange[0]
         if (
-            message is prompt
-            or not message.add_to_agent_memory
-            or (_is_queued_notice(message) and not message.from_history)
+            keep_rest
+            or head is prompt
+            or not head.add_to_agent_memory
+            or (_is_queued_notice(head) and not head.from_history)
         ):
-            kept.append(message)
-        elif is_compaction_summary(message) and not message.from_history and not scoped:
-            previous = compaction_summary_text(message)
-        else:
-            folded.append(message)
+            kept.extend(exchange)
+            continue
+        if is_compaction_summary(head) and not head.from_history and not scoped:
+            previous = compaction_summary_text(head)
+            continue
+        if not head.from_history:
+            tokens = estimate_request_messages_tokens(exchange, replay_model=None)
+            keep_rest = turn_tokens > 0 and turn_tokens + tokens > fold_budget
+            if keep_rest:
+                kept.extend(exchange)
+                continue
+            turn_tokens += tokens
+        folded.extend(exchange)
     return _Layout(
         leading=leading,
         kept=tuple(kept),
         folded=tuple(folded),
         prompt=prompt,
         previous_run_local_summary=previous,
+        partial=keep_rest,
     )
+
+
+def _exchanges(messages: Sequence[Message]) -> list[list[Message]]:
+    """Group each message with the tool results that answer it, so a tool batch is never split."""
+    exchanges: list[list[Message]] = []
+    for message in messages:
+        if message.role == "tool" and exchanges:
+            exchanges[-1].append(message)
+        else:
+            exchanges.append([message])
+    return exchanges
+
+
+def _fold_budget(policy: _Policy, messages: Sequence[Message]) -> int:
+    """Return how much of the turn one summary input can hold beside the summaries it merges with."""
+    budget = policy.inputs.execution_plan.summary_input_budget_tokens or 0
+    summaries = sum(
+        estimate_text_tokens(str(message.content)) for message in messages if is_compaction_summary(message)
+    )
+    return budget - 2 * summaries - _SUMMARY_INPUT_MARGIN_TOKENS
 
 
 def _current_prompt(messages: Sequence[Message], run_response: RunOutput | TeamRunOutput) -> Message | None:
