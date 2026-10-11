@@ -2543,7 +2543,7 @@ visibility = [
 
 [[modules]]
 path = "mindroom.history.turn_recorder"
-depends_on = ["mindroom.history.interrupted_replay"]
+depends_on = ["mindroom.constants", "mindroom.history.interrupted_replay"]
 visibility = [
     "mindroom.ai",
     "mindroom.matrix_rtc.call_tools",

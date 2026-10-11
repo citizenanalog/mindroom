@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from agno.run.base import RunStatus
 
+from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history.interrupted_replay import InterruptedReplaySnapshot, build_interrupted_replay_snapshot
 
 if TYPE_CHECKING:
@@ -30,10 +31,17 @@ class TurnRecorder:
     outcome: str = "pending"
     original_status: RunStatus | None = None
     interrupted_persisted: bool = False
+    # The newest mid-turn compaction this turn's run record reflects, kept apart from the metadata snapshots
+    # the drivers replace.
+    mid_turn_generation: int | None = None
 
     def set_run_metadata(self, metadata: dict[str, Any] | None) -> None:
         """Replace the current Matrix run metadata snapshot."""
         self.run_metadata = dict(metadata) if metadata is not None else None
+
+    def record_mid_turn_generation(self, generation_id: int) -> None:
+        """Remember the turn's newest mid-turn compaction, so an interrupted record of the run still names it."""
+        self.mid_turn_generation = generation_id
 
     def set_run_id(self, run_id: str | None) -> None:
         """Replace the current top-level Agno run identifier."""
@@ -131,7 +139,11 @@ class TurnRecorder:
             partial_text=self.assistant_text,
             completed_tools=self.completed_tools,
             interrupted_tools=self.interrupted_tools,
-            run_metadata=self.run_metadata,
+            run_metadata=(
+                {**(self.run_metadata or {}), MID_TURN_GENERATION_METADATA_KEY: self.mid_turn_generation}
+                if self.mid_turn_generation is not None
+                else self.run_metadata
+            ),
             response_event_id=self.response_event_id,
             original_status=self.original_status or RunStatus.cancelled,
         )

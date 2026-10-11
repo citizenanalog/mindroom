@@ -20,6 +20,7 @@ from mindroom import constants
 from mindroom.agent_storage import create_state_storage, get_agent_session, get_team_session
 from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history import archive
+from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot
 from mindroom.history.storage import (
     _read_scope_history_event_ids,
     _remove_redacted_event_from_compaction,
@@ -31,6 +32,7 @@ from mindroom.history.storage import (
     remove_runs_for_sources,
     update_scope_seen_event_ids,
 )
+from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import HistoryScope
 from tests.conftest import seed_session
 from tests.history_helpers import archived_content
@@ -626,6 +628,55 @@ def test_a_fold_of_a_run_that_then_stopped_keeps_its_folded_events_seen(storage:
     reconcile_compaction_state(storage, session, _SCOPE)
 
     assert "$thread-context" in _seen(storage, _stored(storage))
+
+
+def test_a_deleted_fold_with_no_earlier_generation_stops_replaying_its_summary(storage: SqliteDb) -> None:
+    """A crash after Agno saved the session but not the run must not leave the discarded summary replaying."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"))
+    _fold(storage, session, "p", ["r1"], applied=False)
+    # Agno writes the session row, carrying the new summary, before the run row.
+    session.summary = SessionSummary(summary="folded", updated_at=datetime.now(UTC))
+    storage.upsert_session(session)
+
+    reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert _summary(_stored(storage)) is None
+    assert _live(storage) == ["r1", "p"]
+
+
+def test_an_interrupted_record_keeps_the_fold_its_turn_applied(storage: SqliteDb) -> None:
+    """Stopping a reply after a mid-turn compaction keeps that compaction for the next reply."""
+    session = _seed_runs(storage, _run("r1"))
+    generation_id = record_mid_turn_generation(
+        storage,
+        session=session,
+        scope=_SCOPE,
+        summary="folded",
+        summary_model="summary-model",
+        position_run=_run("x"),
+        covered_runs=[run for run in session.runs or [] if run.run_id == "r1"],
+    )
+    recorder = TurnRecorder(user_message="Do the task", run_metadata={})
+    recorder.record_mid_turn_generation(generation_id)
+    recorder.record_interrupted(run_metadata={}, assistant_text="partial", completed_tools=[], interrupted_tools=[])
+
+    persist_interrupted_replay_snapshot(
+        storage=storage,
+        session=None,
+        session_id="session",
+        scope_id="code",
+        run_id="x",
+        snapshot=recorder.interrupted_snapshot(),
+        is_team=False,
+    )
+    reconcile_compaction_state(storage, _stored(storage), _SCOPE)
+
+    assert [
+        generation.id
+        for generation in archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE.key)
+    ] == [generation_id]
+    assert _summary(_stored(storage)) == "folded"
+    assert _live(storage) == ["x"]
 
 
 def test_a_fold_a_crash_kept_out_of_its_run_is_resolved_before_redaction(storage: SqliteDb) -> None:

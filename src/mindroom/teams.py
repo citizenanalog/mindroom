@@ -2877,6 +2877,7 @@ async def prepare_materialized_team_execution(
     compaction_lifecycle: CompactionLifecycle | None = None,
     thread_history_render_limits: ThreadHistoryRenderLimits | None = None,
     pipeline_timing: DispatchPipelineTiming | None = None,
+    turn_recorder: TurnRecorder | None = None,
 ) -> _PreparedMaterializedTeamExecution:
     """Prepare one materialized team for execution."""
     if ctx.system_enrichment_items:
@@ -2914,7 +2915,7 @@ async def prepare_materialized_team_execution(
         pipeline_timing=pipeline_timing,
     )
     prepared_history = prepared_execution.prepared_history
-    bind_compaction_lifecycle(team, compaction_lifecycle)
+    bind_compaction_lifecycle(team, compaction_lifecycle, turn_recorder)
     if pipeline_timing is not None:
         pipeline_timing.mark("history_ready")
         note_prepared_history_timing(pipeline_timing, prepared_history)
@@ -3098,6 +3099,7 @@ async def team_response(  # noqa: C901, PLR0915
             configured_team_name=configured_team_name,
             thread_history_render_limits=_MATRIX_TEAM_THREAD_HISTORY_RENDER_LIMITS,
             pipeline_timing=pipeline_timing,
+            turn_recorder=turn_recorder,
         )
         run_input = prepared_execution.run_input
         run.unseen_event_ids = prepared_execution.unseen_event_ids
@@ -3570,6 +3572,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
             configured_team_name=configured_team_name,
             thread_history_render_limits=_MATRIX_TEAM_THREAD_HISTORY_RENDER_LIMITS,
             pipeline_timing=pipeline_timing,
+            turn_recorder=turn_recorder,
         )
         run_input = prepared_execution.run_input
         run.unseen_event_ids = prepared_execution.unseen_event_ids

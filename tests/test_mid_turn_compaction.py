@@ -47,6 +47,7 @@ from mindroom.history.storage import (
     reconcile_compaction_state,
     set_force_compaction_state,
 )
+from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState, PreparedHistoryState
 from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, HookRegistry, hook
 from mindroom.model_usage import response_context_tokens
@@ -1134,6 +1135,7 @@ async def test_prepared_agent_reply_posts_mid_turn_compaction_notices(
     )
     monkeypatch.setattr(ai, "_prepare_agent_and_prompt", AsyncMock(return_value=prepared))
     lifecycle = RecordingCompactionLifecycle()
+    recorder = TurnRecorder(user_message="Do the task")
 
     await ai._prepare_agent_run_context(
         make_turn_context("test_agent", session_id="session-1"),
@@ -1155,13 +1157,18 @@ async def test_prepared_agent_reply_posts_mid_turn_compaction_notices(
         current_timestamp_ms=None,
         current_event_id=None,
         current_prompt_is_structured=False,
-        turn_recorder=None,
+        turn_recorder=recorder,
         pipeline_timing=None,
     )
     await _run_in_session(agent, "Do the task")
 
     assert summary_calls.inputs
     assert any(isinstance(event, CompactionOutcome) for event in lifecycle.events)
+    # An interrupted record of this run would still name the fold.
+    stored = get_agent_session(storage, "session-1")
+    assert stored is not None
+    assert recorder.mid_turn_generation is not None
+    assert (stored.runs or [])[-1].metadata[MID_TURN_GENERATION_METADATA_KEY] == recorder.mid_turn_generation
 
 
 @pytest.mark.asyncio
@@ -1203,6 +1210,7 @@ async def test_prepared_team_reply_posts_mid_turn_compaction_notices(
     )
     monkeypatch.setattr("mindroom.teams.prepare_bound_team_run_context", AsyncMock(return_value=prepared))
     lifecycle = RecordingCompactionLifecycle()
+    recorder = TurnRecorder(user_message="Do the task")
 
     await prepare_materialized_team_execution(
         make_turn_context("test_team", session_id="session-1"),
@@ -1218,11 +1226,13 @@ async def test_prepared_team_reply_posts_mid_turn_compaction_notices(
         current_sender_id=None,
         configured_team_name="test_team",
         compaction_lifecycle=lifecycle,
+        turn_recorder=recorder,
     )
     await team.arun("Do the task", session_id="session-1")
 
     assert summary_calls.inputs
     assert any(isinstance(event, CompactionOutcome) for event in lifecycle.events)
+    assert recorder.mid_turn_generation is not None
 
 
 class _DelegatingLeader(SyntheticModel):
@@ -1482,6 +1492,22 @@ async def test_request_with_only_the_summary_to_fold_is_sent_as_is(
     assert str(output.content) == "done"
     assert summary_calls.inputs == []
     assert any("EARLIER-WORK" in content for content in model.requests[0].contents)
+
+
+@pytest.mark.asyncio
+async def test_a_first_turn_compacts_mid_turn_before_its_session_row_exists(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+
+    output = await _run_in_session(_scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage), "Do the task")
+
+    assert summary_calls.inputs
+    positioned = archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert positioned
+    assert positioned[0].through_run_id == output.run_id
 
 
 @pytest.mark.asyncio

@@ -1348,7 +1348,7 @@ async def _prepare_agent_run_context(
             note_prepared_history_timing(pipeline_timing, prepared_run.prepared_history)
 
         agent = prepared_run.agent
-        bind_compaction_lifecycle(agent, compaction_lifecycle)
+        bind_compaction_lifecycle(agent, compaction_lifecycle, turn_recorder)
         if agent.model is not None:
             ai_runtime.install_queued_message_notice_hook(
                 agent.model,

@@ -19,6 +19,7 @@ from mindroom.history.claude_replay_compat import strip_stale_anthropic_replay_f
 from mindroom.history.replay import current_summary_text, estimate_prompt_visible_history_tokens, scope_visible_runs
 from mindroom.history.storage import (
     archive_compaction_chunk,
+    ensure_session_row,
     record_mid_turn_generation,
     record_summary_usage,
     save_working_run_changes,
@@ -557,6 +558,8 @@ async def compact_running_turn(
     Nothing is written until every chunk has been summarized, and no run moves.
     """
     runs = [*covered_runs, *snapshots]
+    # The summary's usage row references the session row, which a first turn has not written yet.
+    await run_blocking_until_complete(partial(ensure_session_row, storage, session, scope))
     collect_compaction_hook_messages = _should_collect_compaction_hook_messages()
     messages = tuple(messages_for_runs(runs, history_settings)) if collect_compaction_hook_messages else ()
     await _emit_compaction_hook(

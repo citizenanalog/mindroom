@@ -32,6 +32,13 @@ _GENERATION_COLUMNS = ", ".join(f"{name} {kind}" for name, kind in _ADDED_GENERA
 _ARCHIVED_RUN_COLUMNS = ", ".join(f"{name} {kind}" for name, kind in _ADDED_ARCHIVED_RUN_COLUMNS)
 
 
+# LEGACY_COMPAT: Compaction archives without positioned-generation and run-index columns.
+# Legacy format: ``<session_table>_compactions`` without ``through_run_id``, ``covered_run_ids``, ``event_ids``, and
+# ``seen_event_ids``, and ``<session_table>_compacted_runs`` without ``run_index``, as every earlier archive was created.
+# Last legacy release: v2026.10.253; replacement: the next release creates and upgrades archives with those columns.
+# Handling: Missing columns are added in place as nullable columns whenever the archive is ensured, so earlier
+# generations read as unpositioned and earlier archived runs as having no recorded index.
+# Coverage: tests/test_history_archive.py::test_an_existing_archive_gains_the_new_columns.
 def upgrade_archive_schema(connection: Connection, session_table: str) -> None:
     """Add the columns an archive created by an earlier release lacks; their NULLs mean what the release meant."""
     for table, columns in zip(

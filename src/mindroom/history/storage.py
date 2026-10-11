@@ -603,8 +603,7 @@ def _sync_after_history_removal(
     target_session = _latest_persisted_session(storage, session)
     _replace_scope_seen_event_ids(target_session, scope, set())
     generation = archive.latest_generation(storage, session_id=session.session_id, scope_key=scope.key)
-    if generation is not None:
-        _refresh_summary(target_session, generation.summary)
+    _refresh_summary(target_session, generation.summary if generation is not None else None)
     storage.upsert_session(target_session)
     _adopt_session_fields(session, target_session)
 
@@ -695,11 +694,6 @@ def record_mid_turn_generation(
 
     The running run's consumed events count even when it later ends paused, cancelled, or failed.
     """
-    # A first turn's session row does not exist until Agno writes it when the run ends.
-    if storage.get_session(session_id=session.session_id, session_type=_session_type(session)) is None:
-        storage.upsert_session(
-            new_scope_session(session_id=session.session_id, scope_id=scope.scope_id, is_team=scope.kind == "team"),
-        )
     position_ids = _run_seen_event_ids(position_run) | _run_source_event_ids(position_run)
     return archive.record_positioned_generation(
         storage,
@@ -714,6 +708,14 @@ def record_mid_turn_generation(
             *(_run_seen_event_ids(run) for run in covered_runs if is_model_history_visible_run(run)),
         ),
     )
+
+
+def ensure_session_row(storage: BaseDb, session: AgentSession | TeamSession, scope: HistoryScope) -> None:
+    """Create the session row a first turn's compaction writes against; Agno writes its own when the run ends."""
+    if storage.get_session(session_id=session.session_id, session_type=_session_type(session)) is None:
+        storage.upsert_session(
+            new_scope_session(session_id=session.session_id, scope_id=scope.scope_id, is_team=scope.kind == "team"),
+        )
 
 
 def _resolve_positioned_generations(
@@ -762,6 +764,9 @@ def _resolve_positioned_generations(
     for generation in applied:
         if generation.has_summary:
             _materialize(storage, target_session, scope, generation)
+    if unapplied or orphaned:
+        # Agno writes the session row before the run row, so the cached summary may name a discarded fold.
+        _sync_after_history_removal(storage, target_session, scope)
     _adopt_session_fields(session, _latest_persisted_session(storage, target_session))
 
 

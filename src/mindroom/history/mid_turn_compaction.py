@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.history.runtime import HistoryPreparationInputs
+    from mindroom.history.turn_recorder import TurnRecorder
     from mindroom.history.types import CompactionLifecycle
 
 logger = get_logger(__name__)
@@ -104,6 +105,7 @@ class _MidTurnCompaction:
     entity_name: str | None
     model_name: str
     lifecycle: CompactionLifecycle | None = None
+    turn_recorder: TurnRecorder | None = None
     # Parallel delegations can run one member several times at once, so state is kept per run.
     runs: dict[str, _RunState] = field(default_factory=dict)
 
@@ -174,12 +176,17 @@ def install_mid_turn_compaction(
     install_request_preparation(model, marker=_HOOK_MARKER, prepare=partial(_prepare_request, binding))
 
 
-def bind_compaction_lifecycle(target: Agent | Team, lifecycle: CompactionLifecycle | None) -> None:
-    """Show this reply's mid-turn compactions through the same notices as its pre-reply compaction."""
+def bind_compaction_lifecycle(
+    target: Agent | Team,
+    lifecycle: CompactionLifecycle | None,
+    turn_recorder: TurnRecorder | None = None,
+) -> None:
+    """Show this reply's mid-turn compactions through its notices, and record them for an interrupted record."""
     model = target.model
     binding = vars(model).get(_BINDING_KEY) if isinstance(model, Model) else None
     if isinstance(binding, _MidTurnCompaction):
         binding.lifecycle = lifecycle
+        binding.turn_recorder = turn_recorder
 
 
 @dataclass(frozen=True)
@@ -328,6 +335,9 @@ async def _compact_scope(
     summary = commit.outcome.summary
     # No await from here on: the run's record, the session Agno writes at the end, and the request change together.
     run_response.metadata = {**(run_response.metadata or {}), MID_TURN_GENERATION_METADATA_KEY: commit.generation_id}
+    if binding.turn_recorder is not None:
+        # A stopped or failed reply records the run from its recorder, which must still name this fold.
+        binding.turn_recorder.record_mid_turn_generation(commit.generation_id)
     session.summary = SessionSummary(summary=summary, updated_at=datetime.now(UTC))
     return compaction_summary_message(summary, run_local=False)
 
