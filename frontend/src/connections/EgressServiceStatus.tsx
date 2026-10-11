@@ -18,10 +18,7 @@ export function ServiceStatus({
   serviceEditing?: ServiceEditing;
 }) {
   const oauth = service.oauth;
-  const sourceLabel =
-    serviceEditing && service.source
-      ? serviceEditing.labels?.[service.source]
-      : undefined;
+  const sourceLabel = serviceEditing?.labels?.[service.source];
   // Once a key is saved there is nothing left to ask for, so the hint goes.
   const refusalShown =
     oauth?.unavailable_reason === "shared_sandbox" && !service.key_configured;

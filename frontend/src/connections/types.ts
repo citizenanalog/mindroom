@@ -93,7 +93,7 @@ export interface EgressRuleSummary {
   /** `null` matches any port. */
   port: number | null;
   path_prefix: string;
-  /** Absent in responses from before the server sent it. */
+  /** Sent for a service's rules; a preset's rules leave this and `auth_name` out. */
   auth_type?: EgressRuleAuthType | null;
   /** The header or query parameter the key goes in; `null` for any other way to send it. */
   auth_name?: string | null;
@@ -103,16 +103,14 @@ export interface EgressCredentialService {
   name: string;
   display_name: string;
   description: string;
-  /** Absent for responses that do not say who defined the service. */
-  source?: EgressServiceSource;
-  /** Where the service applies, in rule order. Absent in responses from before the server sent it. */
-  rules?: EgressRuleSummary[];
+  source: EgressServiceSource;
+  /** Where the service applies, in rule order. */
+  rules: EgressRuleSummary[];
   /**
    * The service only limits which paths a request may reach: its rules never
-   * pick a credential, and it has no key or account. Absent in responses from
-   * before the server sent it.
+   * pick a credential, and it has no key or account.
    */
-  restrict_only?: boolean;
+  restrict_only: boolean;
   /**
    * The names of the variables the service sets in the sandbox, a preset's
    * included, so a service of one's own that sets the same one can be warned

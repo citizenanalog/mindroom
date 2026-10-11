@@ -134,17 +134,17 @@ export function limitedNote(service: EgressCredentialService): string | null {
 }
 
 /** The hosts a service's rules cover, each once, with the port when a rule names one. */
-function ruleHosts(rules: readonly EgressRuleSummary[] | undefined): string[] {
+function ruleHosts(rules: readonly EgressRuleSummary[]): string[] {
   return [
     ...new Set(
-      (rules ?? []).map(
+      rules.map(
         (rule) => `${rule.host}${rule.port === null ? "" : `:${rule.port}`}`,
       ),
     ),
   ];
 }
 
-/** "Sends to a.com, b.com:8443" for the hosts a service's rules cover, each once; null where the listing gives no rules. */
+/** "Sends to a.com, b.com:8443" for the hosts a service's rules cover, each once; null without rules. */
 export function hostsNote(service: EgressCredentialService): string | null {
   const hosts = ruleHosts(service.rules);
   return hosts.length > 0 ? `Sends to ${hosts.join(", ")}` : null;
@@ -161,13 +161,13 @@ const SENT_AS: Record<string, (name: string | null | undefined) => string> = {
 
 /**
  * How the service's rules send the key: "Sent as a bearer token", "Sent as
- * header X-Api-Key", and so on, once for each way its rules differ. Null where
- * the listing does not say, and for a service that sends no key.
+ * header X-Api-Key", and so on, once for each way its rules differ. Null for
+ * a service that sends no key.
  */
 export function sentAsNote(service: EgressCredentialService): string | null {
   const ways = [
     ...new Set(
-      (service.rules ?? []).flatMap((rule) =>
+      service.rules.flatMap((rule) =>
         rule.auth_type ? [SENT_AS[rule.auth_type]?.(rule.auth_name)] : [],
       ),
     ),
@@ -183,7 +183,7 @@ export function sentAsNote(service: EgressCredentialService): string | null {
  */
 export function agentSeesNote(service: EgressCredentialService): string | null {
   const names = service.placeholder_names;
-  if (names === undefined || service.restrict_only === true) return null;
+  if (names === undefined || service.restrict_only) return null;
   if (names.length > 0)
     return `Your agent sees ${names.map((name) => `${name}=${BROKERED_PLACEHOLDER}`).join(", ")}`;
   const hosts = ruleHosts(service.rules);
@@ -195,9 +195,7 @@ export function agentSeesNote(service: EgressCredentialService): string | null {
 /** What happens to requests while the service has no key or account; null once it has, and for a limit. */
 export function unsetNote(service: EgressCredentialService): string | null {
   const hosts = ruleHosts(service.rules);
-  return service.configured ||
-    service.restrict_only === true ||
-    hosts.length === 0
+  return service.configured || service.restrict_only || hosts.length === 0
     ? null
     : `While no key is set, requests to ${formatList(hosts)} are refused.`;
 }
@@ -221,17 +219,14 @@ export function limitOf(
   service: EgressCredentialService,
   services: readonly EgressCredentialService[],
 ): EgressCredentialService | null {
-  if (service.source !== "config" || service.restrict_only === true)
-    return null;
-  const hosts = new Set(
-    (service.rules ?? []).map((rule) => rule.host.toLowerCase()),
-  );
+  if (service.source !== "config" || service.restrict_only) return null;
+  const hosts = new Set(service.rules.map((rule) => rule.host.toLowerCase()));
   return (
     services.find(
       (other) =>
-        other.restrict_only === true &&
+        other.restrict_only &&
         other.source === "user" &&
-        (other.rules ?? []).some((rule) => hosts.has(rule.host.toLowerCase())),
+        other.rules.some((rule) => hosts.has(rule.host.toLowerCase())),
     ) ?? null
   );
 }

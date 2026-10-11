@@ -29,7 +29,6 @@ describe("GitHub coverage", () => {
       coversGithub([rule("httpbin.org"), rule("github.example.com")]),
     ).toBe(false);
     expect(coversGithub([])).toBe(false);
-    expect(coversGithub(undefined)).toBe(false);
   });
 });
 
@@ -65,7 +64,6 @@ describe("repositories a service is limited to", () => {
     expect(limitedRepositories([rule("httpbin.org", "/repos/a/b")])).toEqual(
       [],
     );
-    expect(limitedRepositories(undefined)).toEqual([]);
   });
 
   it("takes a path of the wrong shape for the host as no repository", () => {
@@ -113,7 +111,6 @@ describe("the choices behind a limit's rules", () => {
       graphql: false,
       exact: false,
     });
-    expect(parseGithubLimit(undefined).repositories).toEqual([]);
   });
 });
 

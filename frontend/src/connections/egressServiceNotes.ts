@@ -86,10 +86,10 @@ export function overlapWarnings(
   );
   if (covered.size === 0) return [];
   return others.flatMap((other) => {
-    if (other.restrict_only === true || other.name === editingName) return [];
+    if (other.restrict_only || other.name === editingName) return [];
     const shared = [
       ...new Set(
-        (other.rules ?? [])
+        other.rules
           .filter((rule) => rule.auth_type !== null)
           .map((rule) => rule.host.toLowerCase())
           .filter((host) => covered.has(host)),

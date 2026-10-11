@@ -31,7 +31,7 @@ describe("a placeholder the administrator also sets", () => {
 
 describe("finding who sets a placeholder in a listing", () => {
   const listed = (
-    source: "config" | "user" | undefined,
+    source: "config" | "user",
     display_name: string,
     placeholder_names?: string[],
   ) => ({ source, display_name, placeholder_names });
@@ -53,7 +53,6 @@ describe("finding who sets a placeholder in a listing", () => {
     expect(
       configPlaceholderOwners([
         listed("user", "Mine", ["MY_KEY"]),
-        listed(undefined, "Old", ["OLD_KEY"]),
         listed("config", "Plain"),
       ]),
     ).toEqual({});
@@ -218,17 +217,6 @@ describe("services of the agent that already send a key to a website", () => {
         }),
         undefined,
         [listed("a", "A", [rule("")])],
-        undefined,
-      ),
-    ).toEqual([]);
-  });
-
-  it("does not compare services whose listing has no rules", () => {
-    expect(
-      overlapWarnings(
-        form(),
-        undefined,
-        [{ name: "old", display_name: "Old", rules: undefined }],
         undefined,
       ),
     ).toEqual([]);

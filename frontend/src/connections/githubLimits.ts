@@ -10,7 +10,7 @@ import type { EgressRuleSummary } from "./types";
 const API_HOSTS = [GITHUB_API_HOST, GITHUB_UPLOADS_HOST];
 const GRAPHQL_PATH = "/graphql";
 
-type Rules = readonly EgressRuleSummary[] | undefined;
+type Rules = readonly EgressRuleSummary[];
 
 const hostOf = (rule: { host: string }) => rule.host.trim().toLowerCase();
 const onGithub = (rule: { host: string }) =>
@@ -18,7 +18,7 @@ const onGithub = (rule: { host: string }) =>
 
 /** Whether any rule applies to GitHub's API, web, or upload host. */
 export function coversGithub(rules: Rules): boolean {
-  return (rules ?? []).some(onGithub);
+  return rules.some(onGithub);
 }
 
 /** Whether to offer the GitHub helper: the GitHub preset, or the service's own rules on a GitHub host. */
@@ -50,7 +50,7 @@ function repositoryOf(rule: EgressRuleSummary): string | null {
  */
 export function limitedRepositories(rules: Rules): string[] {
   const repositories: string[] = [];
-  for (const rule of (rules ?? []).filter(onGithub)) {
+  for (const rule of rules.filter(onGithub)) {
     const repository = repositoryOf(rule);
     if (repository === null) return [];
     if (!repositories.includes(repository)) repositories.push(repository);
@@ -75,12 +75,11 @@ export const GRAPHQL_CAVEAT =
 export function limitedTo(
   rules: Rules,
 ): { repositories: string[]; graphql: boolean } | null {
-  const all = rules ?? [];
   const repositories = limitedRepositories(
-    all.filter((rule) => !isGraphql(rule)),
+    rules.filter((rule) => !isGraphql(rule)),
   );
   return repositories.length > 0
-    ? { repositories, graphql: all.some(isGraphql) }
+    ? { repositories, graphql: rules.some(isGraphql) }
     : null;
 }
 
@@ -102,12 +101,11 @@ const ruleKey = (rule: EgressRuleSummary) => `${rule.host}${rule.path_prefix}`;
  * would be lost by writing the rules anew.
  */
 export function parseGithubLimit(rules: Rules): GithubLimit {
-  const all = rules ?? [];
-  const uploads = all.some((rule) => hostOf(rule) === GITHUB_UPLOADS_HOST);
-  const graphql = all.some(isGraphql);
+  const uploads = rules.some((rule) => hostOf(rule) === GITHUB_UPLOADS_HOST);
+  const graphql = rules.some(isGraphql);
   const repositories = [
     ...new Set(
-      all
+      rules
         .filter((rule) => onGithub(rule) && !isGraphql(rule))
         .flatMap((rule) => repositoryOf(rule) ?? []),
     ),
@@ -126,7 +124,7 @@ export function parseGithubLimit(rules: Rules): GithubLimit {
       }),
     ),
   );
-  const actual = new Set(all.map(ruleKey));
+  const actual = new Set(rules.map(ruleKey));
   return {
     repositories,
     graphql,

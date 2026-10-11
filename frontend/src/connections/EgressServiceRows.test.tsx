@@ -43,6 +43,9 @@ const github: EgressCredentialService = {
   name: "github",
   display_name: "GitHub",
   description: "GitHub API and git over HTTPS",
+  source: "config",
+  rules: [],
+  restrict_only: false,
   is_shared: false,
   can_manage: true,
   configured: false,
@@ -1095,21 +1098,12 @@ describe("egress service rows with service editing", () => {
     expect(screen.queryByRole("button", { name: /Edit|Delete/ })).toBeNull();
   });
 
-  it("offers nothing without service editing or without a known source", () => {
-    const { rerender } = render(
+  it("offers nothing without service editing", () => {
+    render(
       <EgressServiceRows
         agentName="personal"
         services={[mine]}
         onChanged={vi.fn()}
-      />,
-    );
-    expect(screen.queryByRole("button", { name: /Edit|Delete/ })).toBeNull();
-    rerender(
-      <EgressServiceRows
-        agentName="personal"
-        services={[{ ...mine, source: undefined }]}
-        onChanged={vi.fn()}
-        serviceEditing={editing()}
       />,
     );
     expect(screen.queryByRole("button", { name: /Edit|Delete/ })).toBeNull();
@@ -1701,7 +1695,6 @@ describe("rows with an agent's wording", () => {
           rules: [{ host: "httpbin.org", port: null, path_prefix: "/" }],
         }),
       ],
-      ["the response lists no rules", base({ rules: undefined })],
     ])("does not offer it when %s", (_why, service) => {
       renderRows([service], undefined, { serviceEditing: limiting() });
       expect(screen.queryByText("Limit to repositories")).toBeNull();

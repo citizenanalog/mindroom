@@ -3196,6 +3196,7 @@ describe("a website another service of the agent already sends a key to", () => 
     key_updated_at: null,
     oauth: null,
     source: "config",
+    restrict_only: false,
     rules: [
       {
         host: "api.github.com",
@@ -3255,11 +3256,10 @@ describe("a website another service of the agent already sends a key to", () => 
     await waitFor(() => expect(onSave).toHaveBeenCalled());
   });
 
-  it("ignores a service that only limits paths, one with no rules, and the service being edited", async () => {
+  it("ignores a service that only limits paths, one that sends no key there, and the service being edited", async () => {
     await renderEditor({
       agentServices: [
         sending({ name: "limit", display_name: "Limit", restrict_only: true }),
-        sending({ name: "bare", display_name: "Bare", rules: undefined }),
         sending({
           name: "nokey",
           display_name: "NoKey",

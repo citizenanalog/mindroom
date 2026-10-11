@@ -40,7 +40,7 @@ const accountKey = (agentName: string, provider: string) =>
 function accountCounts(agent: AgentTableRow) {
   // A service that only limits paths is neither an account nor a key.
   const egress = (agent.egress_services ?? []).filter(
-    (service) => service.restrict_only !== true,
+    (service) => !service.restrict_only,
   );
   const connectedServices = agent.services.filter(
     (service) =>
@@ -68,7 +68,7 @@ function searchTerms(agent: AgentConnections): string[] {
     ...(agent.egress_services ?? []).flatMap((service) => [
       service.name,
       service.display_name,
-      ...(service.rules ?? []).map((rule) => rule.host),
+      ...service.rules.map((rule) => rule.host),
     ]),
   ];
 }
