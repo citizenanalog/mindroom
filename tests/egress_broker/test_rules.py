@@ -393,10 +393,9 @@ def _merged(
 ) -> EgressRules:
     """Return an operator config merged with one scope's user services, as the broker builds them."""
     unmatched = "deny" if deny else "passthrough"
-    return EgressRules(
-        operator=EgressBrokerConfig(unmatched_hosts=unmatched, services=operator),
-        effective=EgressBrokerConfig(unmatched_hosts=unmatched, services={**operator, **user}),
-    )
+    config = EgressBrokerConfig(unmatched_hosts=unmatched, services=operator)
+    # Unvalidated, like `effective_config`: a config refuses restrict_only services, which only users add.
+    return EgressRules(operator=config, effective=config.model_copy(update={"services": {**operator, **user}}))
 
 
 def test_deny_keeps_user_rules_to_hosts_and_ports_the_operator_names() -> None:
@@ -550,12 +549,12 @@ def test_a_restrict_only_service_never_injects() -> None:
     assert docs.match is not None
     assert docs.match.service == "docs"
     assert route_request(rules, "api.example.com", 443, "/other").refusal == "path_not_allowed"
-    # Alone on a host, as an operator service too, it limits paths and never matches.
-    alone = EgressBrokerConfig(services={"limit": _limit(_rule("api.example.com", "/ok"))})
-    assert _route(alone, "api.example.com", 443, "/ok/x") == Route(host_has_rules=True)
-    assert _route(alone, "api.example.com", 443, "/no").refusal == "path_not_allowed"
-    assert match_rule(alone, "api.example.com", 443, "/ok/x") is None
-    assert EgressRules.from_config(alone).intercepts("api.example.com", 443)
+    # Alone on a host it limits paths and never matches.
+    alone = _merged({}, {"limit": _limit(_rule("api.example.com", "/ok"))})
+    assert route_request(alone, "api.example.com", 443, "/ok/x") == Route(host_has_rules=True)
+    assert route_request(alone, "api.example.com", 443, "/no").refusal == "path_not_allowed"
+    assert match_rule(alone.effective, "api.example.com", 443, "/ok/x") is None
+    assert alone.intercepts("api.example.com", 443)
 
 
 def test_shared_agent_refusal_names_an_administrator_for_an_operator_limit_and_managers_for_their_own() -> None:

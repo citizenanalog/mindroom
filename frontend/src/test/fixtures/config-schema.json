@@ -1761,7 +1761,7 @@
         },
         "restrict_only": {
           "default": false,
-          "description": "Only limit paths: the rules take part in the path check like restrict_to_rules (which this implies), but never choose a credential, so an allowed path still uses the credential of the most specific other service on the host. Such a service has no key, OAuth login, or placeholders, its rules need no auth, and a preset contributes only its display_name, description, and rules. Presets never set this",
+          "description": "Only limit paths, for a service a user adds; a config service is refused with it and uses restrict_to_rules. The rules take part in the path check like restrict_to_rules (which this implies), but never choose a credential, so an allowed path still uses the credential of the most specific other service on the host. Such a service has no key, OAuth login, or placeholders, its rules need no auth, and a preset contributes only its display_name, description, and rules. Presets never set this",
           "title": "Restrict Only",
           "type": "boolean"
         }

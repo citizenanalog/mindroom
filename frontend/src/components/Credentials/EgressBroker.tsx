@@ -138,8 +138,6 @@ const STALE_SAVE_MESSAGE =
 const USER_SERVICE_LABEL = "User service";
 const DELETE_WARNING =
   "This removes the service from the configuration. Saved keys stay stored and apply again if a service with the same name is added back.";
-const REMOVE_LIMIT_WARNING =
-  "This removes the limit from the configuration. The services it limited can then reach every path their rules allow.";
 // Saving writes the whole draft, so the other unsaved changes go out with the service.
 const OTHER_CHANGES_WARNING =
   "This also saves your other unsaved settings changes.";
@@ -354,12 +352,7 @@ function ServiceSection({
     onDelete: (service) => deleteService(service.name),
     deleteWarning: () =>
       saveWarning ? `${DELETE_WARNING} ${saveWarning}` : DELETE_WARNING,
-    // A service in the config that only limits paths is changed and removed as a limit.
-    onChangeLimit: (limit) => requestEdit(limit.name),
-    onRemoveLimit: (limit) => deleteService(limit.name),
-    removeLimitWarning: saveWarning
-      ? `${REMOVE_LIMIT_WARNING} ${saveWarning}`
-      : REMOVE_LIMIT_WARNING,
+    // Limits are services users add, so they show read-only like the other user services.
     labels: { user: USER_SERVICE_LABEL },
   };
 

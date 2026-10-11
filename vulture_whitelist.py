@@ -481,7 +481,7 @@ _.validate_type_requirements  # Pydantic model validator (src/mindroom/config/eg
 _.validate_host  # Pydantic field validator (src/mindroom/config/egress_broker.py)
 _.validate_path_prefix  # Pydantic field validator (src/mindroom/config/egress_broker.py)
 _.validate_placeholder_env  # Pydantic field validator (src/mindroom/config/egress_broker.py)
-_.validate_service_names  # Pydantic field validator (src/mindroom/config/egress_broker.py)
+_.validate_services  # Pydantic field validator (src/mindroom/config/egress_broker.py)
 _.expand_preset  # Pydantic model validator (src/mindroom/config/egress_broker.py)
 placeholder_env  # Pydantic field (src/mindroom/config/egress_broker.py)
 unmatched_hosts  # Pydantic field (src/mindroom/config/egress_broker.py)

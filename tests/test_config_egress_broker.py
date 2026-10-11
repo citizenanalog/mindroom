@@ -323,6 +323,21 @@ def test_restrict_only_keeps_a_presets_rules_and_names_but_not_its_login_or_plac
         EgressService.model_validate({"preset": "github", "restrict_only": True, "oauth_provider": "github"})
 
 
+def test_a_config_service_cannot_be_restrict_only() -> None:
+    """Only a service a user adds may be a limit; an administrator limits paths with restrict_to_rules instead."""
+    limit = {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r"}]}
+    message = "service 'github-limited': restrict_only is only for services users add; use restrict_to_rules in config"
+
+    with pytest.raises(ValidationError, match=message):
+        Config(egress_broker={"services": {"github": {"preset": "github"}, "github-limited": limit}})
+    with pytest.raises(ValidationError, match=message):
+        EgressBrokerConfig.model_validate({"services": {"github-limited": limit}})
+    # The same service is valid on its own, as a user service is validated, and so is `restrict_only: false`.
+    assert EgressService.model_validate(limit).restrict_only is True
+    unlimited = {"services": {"github": {"preset": "github", "restrict_only": False}}}
+    assert EgressBrokerConfig.model_validate(unlimited).services["github"].restrict_only is False
+
+
 @pytest.mark.parametrize("value", ["true", "yes", 1, "false"])
 def test_restrict_only_must_be_a_real_boolean(value: object) -> None:
     """A string or number is refused, so `restrict_only: "true"` never quietly turns a service into a limit or not."""

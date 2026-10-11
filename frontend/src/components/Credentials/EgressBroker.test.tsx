@@ -17,7 +17,6 @@ import {
   vi,
 } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { githubRepositoryRules } from "@/connections/egressServiceModel";
 import { EgressBroker } from "./EgressBroker";
 
 const NOT_RUNNING =
@@ -1245,7 +1244,9 @@ describe("egress broker service editor", () => {
     expect(updateConfigValue).toHaveBeenCalledTimes(1);
     expect(updateConfigValue).toHaveBeenCalledWith(
       ["egress_broker", "services", "myapi"],
-      { preset: "anthropic" },
+      {
+        preset: "anthropic",
+      },
     );
     // The value is in the draft before the save, which is what Settings does too.
     expect(updateConfigValue.mock.invocationCallOrder[0]).toBeLessThan(
@@ -1323,102 +1324,32 @@ describe("egress broker service editor", () => {
     );
   });
 
-  describe("a service in the config that only limits paths", () => {
-    // A limit's rules send nothing, so the config keeps them without auth.
-    const limitRules = githubRepositoryRules("acme/app", {
-      uploads: false,
-      graphql: false,
-    }).rules.map(({ auth: _auth, ...rule }) => rule);
-    const authoredLimit = {
-      display_name: "GitHub (acme/app)",
-      rules: limitRules,
-      restrict_to_rules: true,
-      restrict_only: true,
-    };
-    beforeEach(() => {
-      storeState = {
-        ...storeState,
-        config: {
-          defaults: { tools: ["shell"] },
-          egress_broker: {
-            services: { github: githubPreset, "acme-only": authoredLimit },
+  // Only users add limits, so a limit here is one of the scope's own services, which users change on their page.
+  it("shows a user's limit read-only, on its own row and on the administrator's service it narrows", async () => {
+    services = [
+      configRow("github", "GitHub", githubRules),
+      {
+        ...configRow("github-limited", "GitHub (acme/app)", [
+          {
+            host: "api.github.com",
+            port: null,
+            path_prefix: "/repos/acme/app",
           },
-        },
-      };
-      services = [
-        configRow("github", "GitHub", githubRules),
-        {
-          ...configRow(
-            "acme-only",
-            "GitHub (acme/app)",
-            limitRules.map((rule) => ({
-              host: rule.host,
-              port: null,
-              path_prefix: rule.path_prefix ?? "/",
-            })),
-          ),
-          restrict_only: true,
-        },
-      ];
-    });
+          { host: "github.com", port: null, path_prefix: "/acme/app" },
+        ]),
+        source: "user",
+        restrict_only: true,
+      },
+    ];
+    render(<EgressBroker />);
 
-    it("is a row with no key or status, that can be changed and removed", async () => {
-      render(<EgressBroker />);
-      const row = await screen.findByLabelText("GitHub (acme/app)");
-      expect(within(row).getByText("Limit only")).toBeVisible();
-      expect(within(row).queryByText("Not set")).toBeNull();
-      expect(within(row).queryByRole("button", { name: /key/i })).toBeNull();
-      expect(
-        within(row).getByRole("button", {
-          name: "Change limit for GitHub (acme/app)",
-        }),
-      ).toBeVisible();
-    });
-
-    it("opens as a limit in the editor and saves it back as authored", async () => {
-      render(<EgressBroker />);
-      fireEvent.click(
-        await screen.findByRole("button", {
-          name: "Change limit for GitHub (acme/app)",
-        }),
-      );
-      const form = await screen.findByRole("form", { name: "Change limit" });
-      expect(within(form).getByLabelText("GitHub repositories")).toHaveValue(
-        "acme/app",
-      );
-      expect(
-        within(form).queryByText(/limits services from your administrator/),
-      ).toBeNull();
-      fireEvent.click(within(form).getByRole("button", { name: "Save limit" }));
-      await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
-      expect(updateConfigValue).toHaveBeenCalledWith(
-        ["egress_broker", "services", "acme-only"],
-        authoredLimit,
-      );
-    });
-
-    it("is removed from the config after asking", async () => {
-      render(<EgressBroker />);
-      fireEvent.click(
-        await screen.findByRole("button", {
-          name: "Remove limit for GitHub (acme/app)",
-        }),
-      );
-      const dialog = await screen.findByRole("dialog", {
-        name: "Remove the limit on GitHub (acme/app)?",
-      });
-      expect(
-        within(dialog).getByText(/removes the limit from the configuration/),
-      ).toBeVisible();
-      fireEvent.click(
-        within(dialog).getByRole("button", { name: "Remove limit" }),
-      );
-      await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
-      expect(updateConfigValue).toHaveBeenCalledWith(
-        ["egress_broker", "services", "acme-only"],
-        undefined,
-      );
-    });
+    const limit = await screen.findByLabelText("GitHub (acme/app)");
+    expect(within(limit).getByText("Limit only")).toBeVisible();
+    const githubRow = screen.getByLabelText("GitHub");
+    expect(within(githubRow).getByText("Limited to acme/app")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: /Change limit|Remove limit/ }),
+    ).toBeNull();
   });
 
   it("edits a preset service without expanding it", async () => {
@@ -1435,7 +1366,10 @@ describe("egress broker service editor", () => {
     await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
     expect(updateConfigValue).toHaveBeenCalledWith(
       ["egress_broker", "services", "github"],
-      { preset: "github", restrict_to_rules: true },
+      {
+        preset: "github",
+        restrict_to_rules: true,
+      },
     );
   });
 
@@ -1674,7 +1608,9 @@ describe("egress broker service editor", () => {
     await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
     expect(updateConfigValue).toHaveBeenCalledWith(
       ["egress_broker", "services", "myapi"],
-      { preset: "openai" },
+      {
+        preset: "openai",
+      },
     );
   });
 

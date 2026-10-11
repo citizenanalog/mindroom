@@ -237,7 +237,8 @@ class EgressService(BaseModel):
     restrict_only: StrictBool = Field(
         default=False,
         description=(
-            "Only limit paths: the rules take part in the path check like restrict_to_rules (which this implies), "
+            "Only limit paths, for a service a user adds; a config service is refused with it and uses "
+            "restrict_to_rules. The rules take part in the path check like restrict_to_rules (which this implies), "
             "but never choose a credential, so an allowed path still uses the credential of the most specific other "
             "service on the host. Such a service has no key, OAuth login, or placeholders, its rules need no auth, "
             "and a preset contributes only its display_name, description, and rules. Presets never set this"
@@ -370,8 +371,16 @@ class EgressBrokerConfig(BaseModel):
 
     @field_validator("services")
     @classmethod
-    def validate_service_names(cls, value: dict[str, EgressService]) -> dict[str, EgressService]:
-        """Validate service names."""
-        for name in value:
+    def validate_services(cls, value: dict[str, EgressService]) -> dict[str, EgressService]:
+        """Validate service names, and refuse `restrict_only`, which only services users add may set.
+
+        A user's limit narrows the administrator's service in place; in the config, the service that holds the
+        credential limits its own paths with `restrict_to_rules`. The broker merges a scope's user services into a
+        copy of this config without validating it again (`user_services.effective_config`).
+        """
+        for name, service in value.items():
             validate_egress_service_name(name)
+            if service.restrict_only:
+                msg = f"service '{name}': restrict_only is only for services users add; use restrict_to_rules in config"
+                raise ValueError(msg)
         return value
