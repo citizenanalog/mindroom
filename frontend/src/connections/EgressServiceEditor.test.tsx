@@ -977,6 +977,75 @@ describe("saving with a wider effect", () => {
   });
 });
 
+describe("the question before deleting from inside the editor", () => {
+  const ask = async (props: Partial<EgressServiceEditorProps>) => {
+    await renderEditor({
+      name: "mine",
+      service: { preset: "github" },
+      onDelete: vi.fn(),
+      ...props,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Delete service" }));
+    return screen.getByRole("button", { name: "Confirm delete" }).parentElement;
+  };
+
+  it("says that the one agent loses access on a user_agent scope", async () => {
+    expect(
+      await ask({ scope: "user_agent", agentName: "Coder", scopeAgents: [] }),
+    ).toHaveTextContent(
+      "Delete mine? This deletes the service and its saved key. Your Coder loses access through it.",
+    );
+  });
+
+  it("names every agent that shares the workspace on a user scope", async () => {
+    expect(
+      await ask({
+        scope: "user",
+        agentName: "Coder",
+        scopeAgents: ["Coder", "Writer"],
+      }),
+    ).toHaveTextContent(
+      "Delete mine? This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Coder, Writer.",
+    );
+  });
+
+  it.each(["shared", "unscoped"] as const)(
+    "says everyone using the agent loses access on a %s scope",
+    async (scope) => {
+      expect(
+        await ask({ scope, agentName: "Team Bot", scopeAgents: [] }),
+      ).toHaveTextContent(
+        "Delete mine? This deletes the service and its shared key. Everyone using Team Bot loses access through it.",
+      );
+    },
+  );
+
+  it("keeps the other-unsaved-changes warning after the scope sentence", async () => {
+    expect(
+      await ask({
+        scope: "user_agent",
+        agentName: "Coder",
+        saveWarning: "This also saves your other unsaved settings changes.",
+      }),
+    ).toHaveTextContent(
+      "Delete mine? This deletes the service and its saved key. Your Coder loses access through it. This also saves your other unsaved settings changes.",
+    );
+  });
+
+  it("asks only the plain question without a scope, as on the dashboard", async () => {
+    const asked = await ask({ context: "operator" });
+    expect(asked).toHaveTextContent(/^Delete mine\?Confirm deleteKeep$/);
+    cleanup();
+    // Even a scope handed to the dashboard editor changes nothing there.
+    const withScope = await ask({
+      context: "operator",
+      scope: "shared",
+      agentName: "Team Bot",
+    });
+    expect(withScope).not.toHaveTextContent("loses access");
+  });
+});
+
 describe("reporting unsaved changes", () => {
   it("tells the parent when the form differs from what it opened with", async () => {
     const onDirtyChange = vi.fn();

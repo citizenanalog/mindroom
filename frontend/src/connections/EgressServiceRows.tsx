@@ -321,7 +321,7 @@ function EgressServiceRow({
               <Button
                 size="sm"
                 disabled={busy !== null}
-                aria-label={`Connect ${oauth.display_name}`}
+                aria-label={`Connect ${oauth.display_name} for ${service.display_name}`}
                 onClick={() =>
                   asksAboutSharedAccount ? setConfirm("shared") : void connect()
                 }
@@ -363,6 +363,7 @@ function EgressServiceRow({
               size="sm"
               variant="ghost"
               disabled={busy !== null}
+              aria-label={`Use an API key instead for ${service.display_name}`}
               onClick={() => {
                 setError(null);
                 setEditing(true);

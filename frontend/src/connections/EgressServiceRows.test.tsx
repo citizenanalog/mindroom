@@ -464,23 +464,29 @@ describe("connected accounts", () => {
     const github = row("GitHub");
     expect(within(github).getByText("Not set")).toBeInTheDocument();
     expect(
-      within(github).getByRole("button", { name: "Connect GitHub" }),
+      within(github).getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
     expect(
       within(github).queryByRole("button", { name: "Set key for GitHub" }),
     ).toBeNull();
 
     fireEvent.click(
-      within(github).getByRole("button", { name: "Use an API key instead" }),
+      within(github).getByRole("button", {
+        name: "Use an API key instead for GitHub",
+      }),
     );
     expect(within(github).getByLabelText("GitHub API key")).toBeInTheDocument();
     expect(
-      within(github).queryByRole("button", { name: "Use an API key instead" }),
+      within(github).queryByRole("button", {
+        name: "Use an API key instead for GitHub",
+      }),
     ).toBeNull();
     // Cancelling folds the key controls away again.
     fireEvent.click(within(github).getByRole("button", { name: "Cancel" }));
     expect(
-      within(github).getByRole("button", { name: "Use an API key instead" }),
+      within(github).getByRole("button", {
+        name: "Use an API key instead for GitHub",
+      }),
     ).toBeInTheDocument();
   });
 
@@ -494,7 +500,9 @@ describe("connected accounts", () => {
         onChanged={onChanged}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
 
     await waitFor(() =>
       expect(popup.location.href).toBe(authorization.auth_url),
@@ -505,7 +513,7 @@ describe("connected accounts", () => {
       expect.objectContaining({ method: "POST", credentials: "same-origin" }),
     );
     expect(
-      screen.getByRole("button", { name: "Connect GitHub" }),
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeDisabled();
     expect(onChanged).not.toHaveBeenCalled();
 
@@ -513,7 +521,7 @@ describe("connected accounts", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     expect(popup.close).toHaveBeenCalled();
     expect(
-      screen.getByRole("button", { name: "Connect GitHub" }),
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
   });
 
@@ -532,7 +540,9 @@ describe("connected accounts", () => {
         onChanged={onChanged}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
     await waitFor(() =>
       expect(popup.location.href).toBe(authorization.auth_url),
     );
@@ -574,13 +584,15 @@ describe("connected accounts", () => {
         onChanged={onChanged}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Could not complete the request. Try again.",
     );
     expect(onChanged).not.toHaveBeenCalled();
     expect(
-      screen.getByRole("button", { name: "Connect GitHub" }),
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
   });
 
@@ -593,7 +605,9 @@ describe("connected accounts", () => {
         onChanged={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The popup was blocked",
     );
@@ -610,7 +624,7 @@ describe("connected accounts", () => {
     );
     expect(screen.queryByRole("button", { name: /Connect/ })).toBeNull();
     expect(
-      screen.getByRole("button", { name: "Use an API key instead" }),
+      screen.getByRole("button", { name: "Use an API key instead for GitHub" }),
     ).toBeInTheDocument();
   });
 
@@ -623,7 +637,7 @@ describe("connected accounts", () => {
       />,
     );
     expect(
-      screen.getByRole("button", { name: "Connect GitHub" }),
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
     expect(
       screen.queryByRole("button", { name: /^(Set|Replace|Remove) key for / }),
@@ -762,7 +776,9 @@ describe("connected accounts", () => {
       within(github).getByRole("button", { name: "Remove key for GitHub" }),
     ).toBeInTheDocument();
     expect(
-      within(github).queryByRole("button", { name: "Use an API key instead" }),
+      within(github).queryByRole("button", {
+        name: "Use an API key instead for GitHub",
+      }),
     ).toBeNull();
   });
 
@@ -840,7 +856,9 @@ describe("connected accounts", () => {
       within(github).queryByRole("button", { name: /Connect/ }),
     ).toBeNull();
     expect(
-      within(github).getByRole("button", { name: "Use an API key instead" }),
+      within(github).getByRole("button", {
+        name: "Use an API key instead for GitHub",
+      }),
     ).toBeEnabled();
   });
 
@@ -861,7 +879,7 @@ describe("connected accounts", () => {
       ),
     ).toBeVisible();
     expect(
-      within(github).getByRole("button", { name: "Connect GitHub" }),
+      within(github).getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
   });
 
@@ -902,13 +920,15 @@ describe("connected accounts", () => {
         onChanged={onChanged}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+    );
     await waitFor(() =>
       expect(popup.location.href).toBe(authorization.auth_url),
     );
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(
-      screen.getByRole("button", { name: "Connect GitHub" }),
+      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
     await waitFor(() => expect(popup.close).toHaveBeenCalled());
@@ -1291,7 +1311,9 @@ describe("rows with an agent's wording", () => {
         [sharedGoogle],
         agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
       );
-      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect Google for Gmail" }),
+      );
 
       const dialog = await screen.findByRole("dialog", {
         name: "Connect a shared account?",
@@ -1320,7 +1342,9 @@ describe("rows with an agent's wording", () => {
         [sharedGoogle],
         agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
       );
-      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect Google for Gmail" }),
+      );
       const dialog = await screen.findByRole("dialog");
       fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
       await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -1334,7 +1358,9 @@ describe("rows with an agent's wording", () => {
         [sharedGoogle],
         agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
       );
-      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect Google for Gmail" }),
+      );
       const dialog = await screen.findByRole("dialog");
       const button = within(dialog).getByRole("button", { name: "Continue" });
       // Both clicks reach the dialog before React renders again, as with a
@@ -1354,7 +1380,9 @@ describe("rows with an agent's wording", () => {
         [unknown],
         agent({ shared: true, displayName: "Shared Dev", services: [unknown] }),
       );
-      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect Google for Gmail" }),
+      );
       expect(
         await screen.findByRole("dialog", {
           name: "Connect a shared account?",
@@ -1368,7 +1396,9 @@ describe("rows with an agent's wording", () => {
         { is_shared: true },
       );
       renderRows([optedIn], agent({ services: [optedIn] }));
-      fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+      );
       await waitFor(() => expect(fetch).toHaveBeenCalled());
       expect(screen.queryByRole("dialog")).toBeNull();
     });
@@ -1392,7 +1422,9 @@ describe("rows with an agent's wording", () => {
     it("does not ask on a personal agent", async () => {
       const personal = { ...sharedGoogle, is_shared: false };
       renderRows([personal], agent({ services: [personal] }));
-      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Connect Google for Gmail" }),
+      );
       await waitFor(() => expect(fetch).toHaveBeenCalled());
       expect(screen.queryByRole("dialog")).toBeNull();
     });
@@ -1462,7 +1494,9 @@ describe("rows with an agent's wording", () => {
         within(github).queryByRole("button", { name: /Connect/ }),
       ).toBeNull();
       expect(
-        within(github).getByRole("button", { name: "Use an API key instead" }),
+        within(github).getByRole("button", {
+          name: "Use an API key instead for GitHub",
+        }),
       ).toBeEnabled();
     });
 
@@ -1795,6 +1829,37 @@ describe("rows with an agent's wording", () => {
     expect(new Set(names).size).toBe(names.length);
   });
 
+  it("gives two rows that share a provider different Connect and API key names", () => {
+    const first = withAccount({}, { name: "github", display_name: "GitHub" });
+    const second = withAccount(
+      {},
+      { name: "work", display_name: "Work GitHub" },
+    );
+    renderRows([first, second]);
+    const visible = ["Connect GitHub", "Use an API key instead"];
+    const buttons = screen
+      .getAllByRole("button")
+      .filter((button) => visible.includes(button.textContent ?? ""));
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual([
+      "Connect GitHub for GitHub",
+      "Use an API key instead for GitHub",
+      "Connect GitHub for Work GitHub",
+      "Use an API key instead for Work GitHub",
+    ]);
+    for (const button of buttons)
+      expect(button.getAttribute("aria-label")).toMatch(
+        new RegExp(`^${button.textContent} for `),
+      );
+    const names = buttons.map((button) => button.getAttribute("aria-label"));
+    expect(new Set(names).size).toBe(names.length);
+    // Each name reaches its own row's button.
+    expect(
+      within(row("Work GitHub")).getByRole("button", {
+        name: "Connect GitHub for Work GitHub",
+      }),
+    ).toBeEnabled();
+  });
+
   describe("the hosts a service sends to", () => {
     const rule = (
       host: string,
@@ -1937,7 +2002,7 @@ describe("rows with an agent's wording", () => {
         />,
       );
       expect(
-        screen.getByRole("button", { name: "Connect GitHub" }),
+        screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
       ).toBeEnabled();
       expect(
         screen.getByRole("button", { name: "Remove key for OpenAI" }),

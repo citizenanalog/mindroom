@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { deleteServiceWarning } from "./accountCopy";
 import {
   type EditorContext,
   type EditorOptions,
@@ -254,6 +255,11 @@ export function EgressServiceEditor({
     context === "personal" && agentName !== undefined
       ? scopeNote(scope, agentName, scopeAgents)
       : null;
+  // Deleting takes the service from everyone the store serves, so say who that is.
+  const deleteNote =
+    context === "personal" && scope !== undefined && agentName !== undefined
+      ? deleteServiceWarning(scope, agentName, scopeAgents)
+      : null;
   const primaryRule = form.rules[0] ?? emptyRule();
   const ruleEditing = (index: number, rule: RuleForm): RuleEditing => ({
     index,
@@ -492,7 +498,8 @@ export function EgressServiceEditor({
         )}
         {editing && onDelete && confirmingDelete && (
           <span className="ml-auto flex flex-wrap items-center gap-2 text-xs">
-            Delete {name}?{saveWarning ? ` ${saveWarning}` : ""}
+            Delete {name}?{deleteNote ? ` ${deleteNote}` : ""}
+            {saveWarning ? ` ${saveWarning}` : ""}
             <Button
               type="button"
               size="sm"

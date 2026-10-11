@@ -753,7 +753,7 @@ describe("egress broker connected accounts", () => {
     await screen.findByText("GitHub");
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Connect GitHub" }),
+      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
     );
     // Everyone who uses the shared agent acts as the account, so the admin is asked first.
     const question = await screen.findByRole("dialog", {

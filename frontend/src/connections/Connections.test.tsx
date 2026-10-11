@@ -341,7 +341,7 @@ describe("brokered API keys on agent cards", () => {
     render(<Connections />);
     await expandAgent();
     fireEvent.click(
-      await screen.findByRole("button", { name: "Connect GitHub" }),
+      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
     );
     await waitFor(() =>
       expect(popup.location.href).toBe(

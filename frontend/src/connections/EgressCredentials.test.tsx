@@ -220,7 +220,7 @@ describe("egress credentials page", () => {
     });
     render(<EgressCredentials />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Connect GitHub" }),
+      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
     );
     await waitFor(() =>
       expect(popup.location.href).toBe(
@@ -257,7 +257,7 @@ describe("egress credentials page", () => {
       }),
     );
     expect(
-      await screen.findByRole("button", { name: "Connect GitHub" }),
+      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Connected as/)).toBeNull();
   });
@@ -1974,7 +1974,7 @@ describe("who can change a shared agent's keys", () => {
     };
     show([shared({ can_manage: true, services: [google] })]);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Connect Google" }),
+      await screen.findByRole("button", { name: "Connect Google for Gmail" }),
     );
     expect(
       within(
