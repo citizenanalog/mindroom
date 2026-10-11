@@ -671,7 +671,10 @@ describe("the validation the server sends", () => {
   });
 
   it("matches the value pattern against the whole value", () => {
-    const options = optionsWith({}, { value_pattern: "[a-z]{1,3}" });
+    const options = optionsWith(
+      {},
+      { value_pattern: "[a-z]{1,3}", value_max_length: 3 },
+    );
     const errors = (value: string) =>
       errorsFor(
         { preset: "github" },
@@ -685,8 +688,11 @@ describe("the validation the server sends", () => {
       ]);
   });
 
-  it("says no length for a value pattern that has none", () => {
-    const options = optionsWith({}, { value_pattern: "[a-z]+" });
+  it("says no length when the server sends none", () => {
+    const options = optionsWith(
+      {},
+      { value_pattern: "[a-z]+", value_max_length: undefined },
+    );
     expect(
       errorsFor(
         { preset: "github" },

@@ -52,6 +52,7 @@ __all__ = [
     "PLACEHOLDER_REFUSED_PREFIX",
     "PLACEHOLDER_REFUSED_WORDS",
     "PLACEHOLDER_VALUE",
+    "PLACEHOLDER_VALUE_MAX_LENGTH",
     "USER_SERVICES_CREDENTIAL_SERVICE",
     "InactiveReason",
     "InactiveUserService",
@@ -85,7 +86,8 @@ PLACEHOLDER_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 PLACEHOLDER_NAME_WORDS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PAT", "AUTH", "CREDENTIAL")
 PLACEHOLDER_REFUSED_WORDS = ("COMMAND", "CMD", "FILE", "DIR", "PROVIDER", "HELPER", "OPTS", "OPTIONS", "EXTENSIONS")
 PLACEHOLDER_REFUSED_PREFIX = "SSH_"
-PLACEHOLDER_VALUE = re.compile(r"[A-Za-z0-9._:-]{1,256}")
+PLACEHOLDER_VALUE_MAX_LENGTH = 256
+PLACEHOLDER_VALUE = re.compile(rf"[A-Za-z0-9._:-]{{1,{PLACEHOLDER_VALUE_MAX_LENGTH}}}")
 
 type _ScopeKey = tuple[object, ...]
 type ServiceSource = Literal["config", "user"]
@@ -326,7 +328,7 @@ def _placeholder_error(variable: str, value: str) -> str | None:
             f"or starting with {PLACEHOLDER_REFUSED_PREFIX}, as programs or paths."
         )
     if not PLACEHOLDER_VALUE.fullmatch(value):
-        return f"The value of {variable} must be 1 to 256 letters, digits, or . _ : -"
+        return f"The value of {variable} must be 1 to {PLACEHOLDER_VALUE_MAX_LENGTH} letters, digits, or . _ : -"
     return None
 
 

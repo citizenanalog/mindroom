@@ -681,7 +681,8 @@ Both return the presets as the config model expands them:
       "refused_prefix": "SSH_",
       "reserved_names": ["ALL_PROXY", "HOME", "PATH", "SSL_CERT_FILE"],
       "reserved_prefixes": ["GIT_CONFIG_", "MINDROOM_"],
-      "value_pattern": "[A-Za-z0-9._:-]{1,256}"
+      "value_pattern": "[A-Za-z0-9._:-]{1,256}",
+      "value_max_length": 256
     }
   }
 }

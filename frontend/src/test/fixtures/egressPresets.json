@@ -257,6 +257,7 @@
         "GIT_CONFIG_",
         "MINDROOM_"
       ],
+      "value_max_length": 256,
       "value_pattern": "[A-Za-z0-9._:-]{1,256}"
     }
   }

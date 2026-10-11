@@ -381,7 +381,8 @@ describe("the editor form", () => {
             refused_words: ["SCRIPT"],
             refused_prefix: "SUDO_",
             reserved_prefixes: ["ACME_"],
-            value_pattern: "[a-z]{2,9}",
+            value_pattern: "[a-z]{1,9}",
+            value_max_length: 9,
           },
         },
       })),
@@ -391,7 +392,7 @@ describe("the editor form", () => {
     expect(hint).toHaveTextContent("must be SECRET or TICKET");
     expect(hint).toHaveTextContent("No word may be SCRIPT, and");
     expect(hint).toHaveTextContent("names cannot start with SUDO_ or ACME_.");
-    expect(hint).toHaveTextContent("Values are 2 to 9 letters");
+    expect(hint).toHaveTextContent("Values are 1 to 9 letters");
     expect(hint).not.toHaveTextContent("TOKEN");
     expect(hint).not.toHaveTextContent("SSH_");
   });

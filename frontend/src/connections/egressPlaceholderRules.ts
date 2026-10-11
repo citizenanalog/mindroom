@@ -41,10 +41,13 @@ function orList(words: readonly string[]): string {
   return wordList(words);
 }
 
-/** What a value may look like: `1 to 256 letters, digits, or . _ : -`, with the length read from the pattern's `{min,max}` ending when it has one. */
+/** What a value may look like, `1 to 256 letters, digits, or . _ : -`, with the length the server serves. */
 function valueDescription(validation: EgressPlaceholderValidation): string {
-  const bounds = /\{(\d+),(\d+)\}$/.exec(validation.value_pattern);
-  return `${bounds ? `${bounds[1]} to ${bounds[2]} ` : ""}letters, digits, or . _ : -`;
+  const length =
+    validation.value_max_length === undefined
+      ? ""
+      : `1 to ${validation.value_max_length} `;
+  return `${length}letters, digits, or . _ : -`;
 }
 
 /** The hint under the placeholder rows of a personal service; a short one without the rules when the server did not send them. */

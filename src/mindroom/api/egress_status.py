@@ -24,6 +24,7 @@ from mindroom.egress_broker.user_services import (
     PLACEHOLDER_REFUSED_PREFIX,
     PLACEHOLDER_REFUSED_WORDS,
     PLACEHOLDER_VALUE,
+    PLACEHOLDER_VALUE_MAX_LENGTH,
     ServiceSource,
     effective_config,
 )
@@ -154,6 +155,7 @@ class PlaceholderValidation(BaseModel):
     reserved_names: list[str]
     reserved_prefixes: list[str]
     value_pattern: str
+    value_max_length: int
 
 
 class EgressValidation(BaseModel):
@@ -193,6 +195,7 @@ def _egress_validation() -> EgressValidation:
             reserved_names=sorted(RESERVED_PLACEHOLDER_NAMES),
             reserved_prefixes=sorted(RESERVED_PLACEHOLDER_PREFIXES),
             value_pattern=PLACEHOLDER_VALUE.pattern,
+            value_max_length=PLACEHOLDER_VALUE_MAX_LENGTH,
         ),
     )
 

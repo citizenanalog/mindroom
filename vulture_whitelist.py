@@ -43,6 +43,7 @@ refused_words  # JSON response field consumed by the egress service editor (src/
 refused_prefix  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 reserved_prefixes  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 value_pattern  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
+value_max_length  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 max_services  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 max_rules_per_service  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 max_service_bytes  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)

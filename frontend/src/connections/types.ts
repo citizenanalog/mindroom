@@ -244,6 +244,8 @@ export interface EgressPlaceholderValidation {
   reserved_prefixes: string[];
   /** The values a personal service may set, as a regular expression source that must match the whole value. */
   value_pattern: string;
+  /** The longest value `value_pattern` accepts; absent from servers before it was served. */
+  value_max_length?: number;
 }
 
 /** What the server checks when a service is saved; the editor checks the same before it asks. */

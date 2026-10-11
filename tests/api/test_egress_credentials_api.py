@@ -50,6 +50,7 @@ from mindroom.egress_broker.user_services import (
     PLACEHOLDER_REFUSED_PREFIX,
     PLACEHOLDER_REFUSED_WORDS,
     PLACEHOLDER_VALUE,
+    PLACEHOLDER_VALUE_MAX_LENGTH,
     effective_config,
 )
 from mindroom.oauth import credential_store as oauth_credential_store
@@ -2272,6 +2273,7 @@ def test_presets_serve_the_user_service_validation_the_server_enforces(egress_po
             "reserved_names": sorted(RESERVED_PLACEHOLDER_NAMES),
             "reserved_prefixes": sorted(RESERVED_PLACEHOLDER_PREFIXES),
             "value_pattern": PLACEHOLDER_VALUE.pattern,
+            "value_max_length": PLACEHOLDER_VALUE_MAX_LENGTH,
         },
     }
 
