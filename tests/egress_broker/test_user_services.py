@@ -476,6 +476,21 @@ def test_a_new_service_never_inherits_a_stored_key(manager: CredentialsManager) 
         assert load_secret(manager, target, "mine") is None
 
 
+def test_turning_a_service_into_a_limit_deletes_its_stored_key(manager: CredentialsManager) -> None:
+    """A restrict-only service never uses a key, so saving one, even over an existing service, removes the key."""
+    limit = EgressService.model_validate(
+        {"restrict_only": True, "rules": [{"host": "api.example.com", "path_prefix": "/repos/o/a"}]},
+    )
+    for target in (_target(), _target(scope="shared")):
+        _save(manager, target, "mine", _service())
+        save_secret(manager, target, "mine", "own-key")
+
+        _save(manager, target, "mine", limit)
+
+        assert load_secret(manager, target, "mine") is None
+        assert load_user_services(manager, target)["mine"].restrict_only is True
+
+
 def test_deleting_a_shadowed_entry_keeps_the_key_its_config_service_uses(manager: CredentialsManager) -> None:
     """A config service of the same name shadows the entry and uses the key in this scope, so only the entry goes."""
     shadowing = {**_CONFIG.services, "mine": _service("config.example.com")}
