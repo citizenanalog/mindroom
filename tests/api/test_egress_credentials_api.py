@@ -2248,8 +2248,8 @@ def test_an_agent_without_services_still_reports_the_flags(egress_portal: dict[s
     assert _listed_agents(portal, "bob")["shared_dev"]["can_manage"] is True
 
 
-def test_listing_summarizes_where_each_service_applies_and_nothing_else(egress_portal: dict[str, Any]) -> None:
-    """Rules show host, port, and path prefix, in rule order, for config, preset, and user services; never auth."""
+def test_listing_summarizes_where_each_service_applies_and_how_it_sends_the_key(egress_portal: dict[str, Any]) -> None:
+    """Rules show host, port, path prefix, auth type, and header or parameter name, in rule order; nothing else."""
     portal = egress_portal
     portal["payload"]["egress_broker"]["services"]["drive"] = {"preset": "google_drive"}
     _publish_config(main.app, portal["paths"], portal["payload"])
@@ -2269,23 +2269,84 @@ def test_listing_summarizes_where_each_service_applies_and_nothing_else(egress_p
 
     rows = {service["name"]: service for service in _listed_services(portal, "alice", "personal")}
 
-    assert rows["github"]["rules"] == [{"host": "api.github.com", "port": None, "path_prefix": "/"}]
-    assert rows["drive"]["rules"] == [
-        {"host": "www.googleapis.com", "port": None, "path_prefix": "/drive/"},
-        {"host": "www.googleapis.com", "port": None, "path_prefix": "/upload/drive/"},
+    assert rows["github"]["rules"] == [
+        {"host": "api.github.com", "port": None, "path_prefix": "/", "auth_type": "bearer", "auth_name": None},
     ]
+    assert rows["openai"]["rules"] == [
+        {
+            "host": "api.openai.com",
+            "port": None,
+            "path_prefix": "/",
+            "auth_type": "header",
+            "auth_name": "Authorization",
+        },
+    ]
+    assert rows["drive"]["rules"] == [
+        {
+            "host": "www.googleapis.com",
+            "port": None,
+            "path_prefix": "/drive/",
+            "auth_type": "bearer",
+            "auth_name": None,
+        },
+        {
+            "host": "www.googleapis.com",
+            "port": None,
+            "path_prefix": "/upload/drive/",
+            "auth_type": "bearer",
+            "auth_name": None,
+        },
+    ]
+    # A header with a value template is a custom template; only its header name shows, never the template text.
     assert rows["own"]["rules"] == [
-        {"host": "api.own.example.com", "port": 8443, "path_prefix": "/v1/"},
-        {"host": "*.own.example.com", "port": None, "path_prefix": "/"},
+        {
+            "host": "api.own.example.com",
+            "port": 8443,
+            "path_prefix": "/v1/",
+            "auth_type": "template",
+            "auth_name": "X-Own-Key",
+        },
+        {"host": "*.own.example.com", "port": None, "path_prefix": "/", "auth_type": "basic", "auth_name": None},
     ]
     listing = portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"]).text
-    for hidden in ("X-Own-Key", "Token-", "bot-user", "x-access-token", "bearer"):
+    for hidden in ("Token-", "{secret}", "bot-user", "x-access-token"):
         assert hidden not in listing
     # Another requester's private services never show up in the summaries.
     assert "own" not in {service["name"] for service in _listed_services(portal, "bob", "personal")}
     catalog = portal["client"].get("/api/connections", headers=portal["headers"]["alice"]).json()
     personal = next(agent for agent in catalog["agents"] if agent["agent_name"] == "personal")
     assert {row["name"]: row["rules"] for row in personal["egress_services"]}["own"] == rows["own"]["rules"]
+
+
+def test_query_auth_and_restrict_only_rules_are_summarized(egress_portal: dict[str, Any]) -> None:
+    """A query rule names its parameter, even with a template; a restrict-only service's rules send nothing."""
+    portal = egress_portal
+    query = {
+        "rules": [
+            {"host": "api.query.example.com", "auth": {"type": "query", "name": "api_key"}},
+            {"host": "v2.query.example.com", "auth": {"type": "query", "name": "key", "template": "k-{secret}"}},
+        ],
+    }
+    limit = {
+        "restrict_only": True,
+        "rules": [
+            {"host": "api.github.com", "path_prefix": "/repos/o/a"},
+            {"host": "api.github.com", "path_prefix": "/repos/o/b", "auth": {"type": "header", "name": "X-Ignored"}},
+        ],
+    }
+    assert _put_service(portal, "alice", "personal", "query", query).status_code == 204
+    assert _put_service(portal, "alice", "personal", "github-limited", limit).status_code == 204
+
+    rows = {service["name"]: service for service in _listed_services(portal, "alice", "personal")}
+
+    assert [(rule["auth_type"], rule["auth_name"]) for rule in rows["query"]["rules"]] == [
+        ("query", "api_key"),
+        ("query", "key"),
+    ]
+    assert [(rule["auth_type"], rule["auth_name"]) for rule in rows["github-limited"]["rules"]] == [
+        (None, None),
+        (None, None),
+    ]
 
 
 def test_listing_names_the_placeholder_variables_each_service_sets(egress_portal: dict[str, Any]) -> None:
@@ -2351,6 +2412,11 @@ def test_presets_are_served_as_the_config_model_expands_them(egress_portal: dict
         assert set(preset) == {"id", "display_name", "description", "oauth_provider", "rules", "placeholder_env"}
         assert all(set(rule) == {"host", "port", "path_prefix"} for rule in preset["rules"])
     assert "x-access-token" not in response.text
+    # The account login select offers the registry's providers, the ones a saved service is checked against.
+    providers = response.json()["oauth_providers"]
+    assert {"id": "github", "display_name": "GitHub"} in providers
+    assert {"google_drive", "google_gmail", "atlassian"} <= {provider["id"] for provider in providers}
+    assert all(set(provider) == {"id", "display_name"} for provider in providers)
 
 
 def test_frontend_preset_fixture_matches_the_served_presets() -> None:
@@ -2360,7 +2426,7 @@ def test_frontend_preset_fixture_matches_the_served_presets() -> None:
     # The fixture is the payload `{"presets": [...]}` or just its list.
     presets = fixture["presets"] if isinstance(fixture, dict) else fixture
 
-    assert presets == egress_status.presets_response().model_dump(mode="json")["presets"]
+    assert presets == egress_status.presets_response({}).model_dump(mode="json")["presets"]
 
 
 def test_presets_need_a_signed_user_and_take_no_query(egress_portal: dict[str, Any]) -> None:

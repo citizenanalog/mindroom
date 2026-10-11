@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from fastapi import Request
 
     from mindroom.api.config_lifecycle import ApiSnapshot
+    from mindroom.config.egress_broker import EgressAuth
     from mindroom.config.main import Config
     from mindroom.credentials import CredentialsManager
     from mindroom.egress_broker.audit import AuditRecord
@@ -55,17 +56,54 @@ def service_source(config: Config, name: str) -> EgressServiceSource:
     return config_service_source(config.egress_broker, name)
 
 
-class EgressRuleSummary(BaseModel):
-    """Where one rule applies, for a client that needs to see what a service covers; never its auth settings."""
+class EgressRuleLocation(BaseModel):
+    """Where one rule applies: its host, port, and path prefix."""
 
     host: str
     port: int | None
     path_prefix: str
 
 
+type _EgressAuthKind = Literal["bearer", "basic", "header", "query", "template"]
+
+
+class EgressRuleSummary(EgressRuleLocation):
+    """Where one rule applies and how it sends the key, for a client that shows what a service covers.
+
+    `auth_type` is `bearer`, `basic`, `header`, `query`, or `template` (a header whose value is a template other than
+    the bare key), and `auth_name` the header or query parameter name (null for `bearer` and `basic`). Both are null
+    for a `restrict_only` service, which sends nothing. Never the key, a template's text, or a basic username.
+    """
+
+    auth_type: _EgressAuthKind | None
+    auth_name: str | None
+
+
+def _auth_summary(service: EgressService, auth: EgressAuth | None) -> tuple[_EgressAuthKind | None, str | None]:
+    if service.restrict_only or auth is None:
+        return None, None
+    if auth.type in {"bearer", "basic"}:
+        return auth.type, None
+    if auth.type == "header" and auth.template != "{secret}":
+        return "template", auth.name
+    return auth.type, auth.name
+
+
 def rule_summaries(service: EgressService) -> list[EgressRuleSummary]:
-    """Describe the hosts, ports, and paths a service's rules match, in rule order."""
-    return [EgressRuleSummary(host=rule.host, port=rule.port, path_prefix=rule.path_prefix) for rule in service.rules]
+    """Describe where a service's rules apply and how each sends the key, in rule order."""
+    summaries = []
+    for rule in service.rules:
+        auth_type, auth_name = _auth_summary(service, rule.auth)
+        summaries.append(
+            EgressRuleSummary(
+                host=rule.host,
+                port=rule.port,
+                path_prefix=rule.path_prefix,
+                auth_type=auth_type,
+                auth_name=auth_name,
+            ),
+        )
+    return summaries
 
 
 class EgressPresetResponse(BaseModel):
@@ -75,18 +113,30 @@ class EgressPresetResponse(BaseModel):
     display_name: str
     description: str
     oauth_provider: str | None
-    rules: list[EgressRuleSummary]
+    rules: list[EgressRuleLocation]
     placeholder_env: dict[str, str]
 
 
+class EgressOAuthProviderOption(BaseModel):
+    """One OAuth provider a service's account login can name."""
+
+    id: str
+    display_name: str
+
+
 class PresetsResponse(BaseModel):
-    """The built-in service presets."""
+    """The built-in service presets, and the OAuth providers an account login can name."""
 
     presets: list[EgressPresetResponse]
+    oauth_providers: list[EgressOAuthProviderOption]
 
 
-def presets_response() -> PresetsResponse:
-    """List the presets as the config model expands them, so the editor shows what a `preset:` entry resolves to."""
+def presets_response(oauth_providers: Mapping[str, OAuthProvider]) -> PresetsResponse:
+    """List the presets as the config model expands them, so the editor shows what a `preset:` entry resolves to.
+
+    `oauth_providers` is the registry (`oauth.registry`), the same one a saved service's `oauth_provider` is checked
+    against, listed in registry order.
+    """
     presets = []
     for preset_id in EGRESS_PRESETS:
         service = EgressService.model_validate({"preset": preset_id})
@@ -96,11 +146,18 @@ def presets_response() -> PresetsResponse:
                 display_name=service.display_name or preset_id,
                 description=service.description,
                 oauth_provider=service.oauth_provider,
-                rules=rule_summaries(service),
+                rules=[
+                    EgressRuleLocation(host=rule.host, port=rule.port, path_prefix=rule.path_prefix)
+                    for rule in service.rules
+                ],
                 placeholder_env=service.placeholder_env,
             ),
         )
-    return PresetsResponse(presets=presets)
+    providers = [
+        EgressOAuthProviderOption(id=provider_id, display_name=provider.display_name)
+        for provider_id, provider in oauth_providers.items()
+    ]
+    return PresetsResponse(presets=presets, oauth_providers=providers)
 
 
 class AuditRecordResponse(BaseModel):

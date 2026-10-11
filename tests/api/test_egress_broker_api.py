@@ -202,15 +202,15 @@ def test_logs_and_ca_409_when_inactive(
     assert "not running" in response.json()["detail"]
 
 
-def test_services_listing_summarizes_rules_without_auth(broker_test_client: TestClient) -> None:
-    """The dashboard sees where each service applies, never how it authenticates."""
+def test_services_listing_summarizes_rules_with_how_they_send_the_key(broker_test_client: TestClient) -> None:
+    """The dashboard sees where each service applies and how it sends the key, never a basic username."""
     response = broker_test_client.get("/api/egress-broker/services")
 
     assert response.status_code == 200, response.text
     github = next(service for service in response.json()["services"] if service["name"] == "github")
     assert github["rules"] == [
-        {"host": "api.github.com", "port": None, "path_prefix": "/"},
-        {"host": "github.com", "port": None, "path_prefix": "/"},
+        {"host": "api.github.com", "port": None, "path_prefix": "/", "auth_type": "bearer", "auth_name": None},
+        {"host": "github.com", "port": None, "path_prefix": "/", "auth_type": "basic", "auth_name": None},
     ]
     assert "x-access-token" not in response.text
 
@@ -228,6 +228,9 @@ def test_presets_are_listed_with_their_rules_and_login(broker_test_client: TestC
     assert github["placeholder_env"] == {"GH_TOKEN": "mindroom-brokered", "GITHUB_TOKEN": "mindroom-brokered"}
     assert next(preset for preset in presets if preset["id"] == "anthropic")["oauth_provider"] is None
     assert all(set(rule) == {"host", "port", "path_prefix"} for preset in presets for rule in preset["rules"])
+    providers = {provider["id"]: provider for provider in response.json()["oauth_providers"]}
+    assert providers["github"] == {"id": "github", "display_name": "GitHub"}
+    assert {"google_drive", "google_gmail", "atlassian"} <= set(providers)
 
 
 def test_presets_route_sits_behind_the_dashboard_auth() -> None:

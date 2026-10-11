@@ -224,9 +224,11 @@ async def get_services(
 
 
 @router.get("/presets", response_model=PresetsResponse)
-def get_presets() -> PresetsResponse:
-    """List the built-in service presets with the rules, login, and placeholders each one sets."""
-    return presets_response()
+def get_presets(request: Request) -> PresetsResponse:
+    """List the built-in service presets with the rules, login, and placeholders each one sets, and the providers."""
+    from mindroom.api import config_lifecycle  # noqa: PLC0415
+
+    return presets_response(load_oauth_providers_for_snapshot(config_lifecycle.bind_current_request_snapshot(request)))
 
 
 @router.put("/services/{name}/secret", status_code=204)

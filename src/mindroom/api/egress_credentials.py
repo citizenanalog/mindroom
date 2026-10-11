@@ -51,7 +51,7 @@ from mindroom.egress_broker.user_services import (
     user_service_hosts_not_allowed,
 )
 from mindroom.logging_config import get_logger
-from mindroom.oauth.registry import load_oauth_providers
+from mindroom.oauth.registry import load_oauth_providers, load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
 
 if TYPE_CHECKING:
@@ -449,9 +449,10 @@ async def list_egress_credentials(request: Request, requester_id: _EgressUser) -
 
 
 @router.get("/presets", response_model=PresetsResponse)
-async def get_presets(_requester_id: _EgressUser) -> PresetsResponse:
-    """List the built-in service presets with the rules, login, and placeholders each one sets."""
-    return presets_response()
+async def get_presets(request: Request, _requester_id: _EgressUser) -> PresetsResponse:
+    """List the built-in service presets with the rules, login, and placeholders each one sets, and the providers."""
+    snapshot = config_lifecycle.bind_current_request_snapshot(request)
+    return presets_response(load_oauth_providers_for_snapshot(snapshot))
 
 
 @router.get("/logs", response_model=AuditLogsResponse)
