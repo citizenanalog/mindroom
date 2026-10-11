@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
+import unicodedata
 from collections.abc import Mapping  # noqa: TC003
 from dataclasses import dataclass
 from typing import Literal
@@ -173,8 +174,10 @@ def is_ambiguous_path(path: str) -> bool:
 
     Raw backslashes and empty segments (``//``) are refused outright. Then the raw path and every
     percent-decoded layer must hold no dot segment and no NUL, which catches ``%2e%2e``, ``%252e%252e``,
-    and ``x%2f..%2fy``. A layer that is not valid UTF-8 (such as the overlong ``%c0%ae``) is refused, and so is
-    a path still changing after `_MAX_DECODE_LAYERS` rounds. A bare encoded slash such as GitLab's
+    and ``x%2f..%2fy``. Each layer is also checked, and decoded further, in NFKC form, because a server that
+    applies it reads the two dot leader (U+2025) or two fullwidth full stops (U+FF0E) as ``..``, and the
+    fullwidth form of ``%2e`` as ``%2e``. A layer that is not valid UTF-8 (such as the overlong ``%c0%ae``) is
+    refused, and so is a path still changing after `_MAX_DECODE_LAYERS` rounds. A bare encoded slash such as GitLab's
     ``group%2Fproject`` stays allowed: rules match the raw path, so only a dot segment can climb out of a prefix.
     The broker refuses rather than normalizes, because servers disagree on how to normalize.
     """
@@ -182,10 +185,11 @@ def is_ambiguous_path(path: str) -> bool:
         return True
     layer = path
     for _ in range(_MAX_DECODE_LAYERS + 1):
-        if "\x00" in layer or _has_dot_segment(layer):
+        folded = unicodedata.normalize("NFKC", layer)
+        if "\x00" in layer or _has_dot_segment(layer) or _has_dot_segment(folded):
             return True
         try:
-            decoded = unquote(layer, errors="strict")
+            decoded = unquote(folded, errors="strict")
         except UnicodeDecodeError:
             return True
         if decoded == layer:
