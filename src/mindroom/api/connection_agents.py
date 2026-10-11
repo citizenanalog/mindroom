@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
-from mindroom.api.auth import public_origin, require_same_origin
+from mindroom.api.auth import require_same_origin
 from mindroom.authorization import is_sender_allowed_for_agent_credential_management, is_sender_allowed_for_responder
 from mindroom.matrix.identity import try_parse_historical_matrix_user_id
 from mindroom.mcp_gateway.types import GatewayOwner
+from mindroom.origins import normalized_origin
 from mindroom.requester_identity import resolve_human_requester_alias
 from mindroom.tool_system.worker_routing import build_agent_toolkit_worker_target, build_tool_execution_identity
 
@@ -38,7 +39,7 @@ def require_connections_same_origin(
 ) -> None:
     """Reject mutations from another origin (shared helper for connections and egress routes)."""
     public_url = runtime_paths.env_value("MINDROOM_PUBLIC_URL") or str(request.base_url)
-    expected = public_origin(public_url)
+    expected = normalized_origin(public_url)
     if expected is None or not expected.startswith("https://"):
         raise HTTPException(403, "Connections require an HTTPS public origin", headers=CONNECTIONS_HEADERS)
     require_same_origin(
