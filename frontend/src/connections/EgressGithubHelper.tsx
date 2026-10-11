@@ -54,13 +54,7 @@ export function restoredHelperInput(service: AuthoredEgressService | null): {
       labels: { displayName: "", description: "" },
       applied: null,
     };
-  const limit = parseGithubLimit(
-    (service.rules ?? []).map((rule) => ({
-      host: rule.host,
-      port: null,
-      path_prefix: rule.path_prefix ?? "/",
-    })),
-  );
+  const limit = parseGithubLimit(service.rules ?? []);
   const written = githubLimitLabels(limit.repositories);
   const input = {
     repositories: limit.repositories.join("\n"),

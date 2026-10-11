@@ -5,12 +5,15 @@ import {
   GITHUB_WEB_HOST,
   githubRepositoryRules,
 } from "./githubRepositoryRules";
-import type { EgressRuleSummary } from "./types";
 
 const API_HOSTS = [GITHUB_API_HOST, GITHUB_UPLOADS_HOST];
 const GRAPHQL_PATH = "/graphql";
 
-type Rules = readonly EgressRuleSummary[];
+/** Rules as listed or as authored; only the host and path are read, and an authored rule without a path covers `/`. */
+type Rule = { host: string; path_prefix?: string };
+type Rules = readonly Rule[];
+
+const pathOf = (rule: Rule) => rule.path_prefix ?? "/";
 
 const hostOf = (rule: { host: string }) => rule.host.trim().toLowerCase();
 const onGithub = (rule: { host: string }) =>
@@ -29,15 +32,15 @@ export function looksLikeGithub(form: EgressServiceForm): boolean {
 }
 
 /** The repository a rule names, as `owner/repo` or `owner/*`, or null when it names none. */
-function repositoryOf(rule: EgressRuleSummary): string | null {
+function repositoryOf(rule: Rule): string | null {
   const api = API_HOSTS.includes(hostOf(rule));
   const repo = (
     api ? /^\/repos\/([^/]+)\/([^/]+)$/ : /^\/([^/]+)\/([^/]+?)(?:\.git)?$/
-  ).exec(rule.path_prefix);
+  ).exec(pathOf(rule));
   if (repo) return `${repo[1]}/${repo[2]}`;
   // An owner prefix ends in a slash and takes everything below it.
   const owner = (api ? /^\/repos\/([^/]+)\/$/ : /^\/([^/]+)\/$/).exec(
-    rule.path_prefix,
+    pathOf(rule),
   );
   return owner ? `${owner[1]}/*` : null;
 }
@@ -58,8 +61,8 @@ export function limitedRepositories(rules: Rules): string[] {
   return repositories;
 }
 
-const isGraphql = (rule: EgressRuleSummary) =>
-  hostOf(rule) === GITHUB_API_HOST && rule.path_prefix === GRAPHQL_PATH;
+const isGraphql = (rule: Rule) =>
+  hostOf(rule) === GITHUB_API_HOST && pathOf(rule) === GRAPHQL_PATH;
 
 /** What a limit is said to reach when GraphQL is among its rules. */
 export const GRAPHQL_CAVEAT =
@@ -92,7 +95,7 @@ export interface GithubLimit {
   exact: boolean;
 }
 
-const ruleKey = (rule: EgressRuleSummary) => `${rule.host}${rule.path_prefix}`;
+const ruleKey = (rule: Rule) => `${rule.host}${pathOf(rule)}`;
 
 /**
  * The repositories and options behind a limit's rules, for opening it in the
@@ -115,15 +118,7 @@ export function parseGithubLimit(rules: Rules): GithubLimit {
       ? githubRepositoryRules(repositories.join("\n"), { uploads, graphql })
           .rules
       : [];
-  const expected = new Set(
-    generated.map((rule) =>
-      ruleKey({
-        host: rule.host,
-        port: null,
-        path_prefix: rule.path_prefix ?? "/",
-      }),
-    ),
-  );
+  const expected = new Set(generated.map(ruleKey));
   const actual = new Set(rules.map(ruleKey));
   return {
     repositories,
