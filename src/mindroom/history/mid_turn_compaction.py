@@ -54,6 +54,8 @@ from mindroom.history.types import HistoryScope
 from mindroom.logging_config import get_logger
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, checkpoint_items, native_replay_messages
+from mindroom.providers.claude_prompt_cache import claude_deferred_tool_names
+from mindroom.providers.openai_tool_search import model_deferred_tool_names
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
 
@@ -435,7 +437,7 @@ def _request_tokens(
                     if not checkpoint_items(message, policy.native_route)
                 ],
             )
-            + _tool_tokens(tools)
+            + _tool_tokens(policy.model, tools)
         )
     anchor = next(
         (
@@ -463,7 +465,7 @@ def _request_tokens(
     return (
         estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
         + _thinking_tokens(messages)
-        + _tool_tokens(tools)
+        + _tool_tokens(policy.model, tools)
     )
 
 
@@ -471,12 +473,22 @@ def _estimated_request_tokens(policy: _Policy, messages: list[Message], tools: l
     return (
         estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
         + _thinking_tokens(messages)
-        + _tool_tokens(tools)
+        + _tool_tokens(policy.model, tools)
     )
 
 
-def _tool_tokens(tools: list[dict[str, Any]] | None) -> int:
-    return estimate_text_tokens(stable_serialize(tools)) if tools else 0
+def _tool_tokens(model: Model, tools: list[dict[str, Any]] | None) -> int:
+    """Estimate the tool definitions a request carries in full; tool search keeps deferred ones out until loaded."""
+    if not tools:
+        return 0
+    deferred = claude_deferred_tool_names(model) | model_deferred_tool_names(model)
+    sent = [tool for tool in tools if _tool_name(tool) not in deferred] if deferred else tools
+    return estimate_text_tokens(stable_serialize(sent)) if sent else 0
+
+
+def _tool_name(tool: dict[str, Any]) -> object:
+    function = tool.get("function")
+    return function.get("name") if isinstance(function, dict) else tool.get("name")
 
 
 def _thinking_tokens(messages: Sequence[Message]) -> int:

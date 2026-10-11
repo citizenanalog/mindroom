@@ -43,7 +43,10 @@ from mindroom.history.storage import new_scope_session, read_scope_state, set_fo
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState
 from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, record_native_checkpoint
+from mindroom.providers.anthropic_claude import MindRoomAnthropicClaude
+from mindroom.providers.claude_prompt_cache import install_claude_deferred_tool_search
 from mindroom.providers.openai_models import MindRoomOpenAIResponses
+from mindroom.providers.openai_tool_search import install_openai_deferred_tool_search
 from mindroom.providers.synthetic_model import SyntheticModel
 from mindroom.usage.storage import project_usage
 from tests.conftest import FakeModel, runtime_paths_for, seed_session
@@ -409,6 +412,24 @@ def test_request_sizing_never_counts_attached_file_bytes() -> None:
     tokens = estimate_request_messages_tokens([message], replay_model=model)
 
     assert tokens < 10_000
+
+
+@pytest.mark.parametrize("provider", ["openai", "claude"])
+def test_request_sizing_leaves_out_deferred_tool_definitions(provider: str) -> None:
+    """Tool search keeps deferred definitions out of the context until the model loads them."""
+    if provider == "openai":
+        model: Any = MindRoomOpenAIResponses(id="gpt-6-luna", store=False)
+        install_openai_deferred_tool_search(model, deferred_tool_names=frozenset({"big_tool"}))
+    else:
+        model = MindRoomAnthropicClaude(id="claude-sonnet-5-5", api_key="test")
+        install_claude_deferred_tool_search(model, deferred_tool_names=frozenset({"big_tool"}))
+    tools = [
+        {"type": "function", "function": {"name": "big_tool", "description": "d" * 80_000, "parameters": {}}},
+        {"type": "function", "function": {"name": "lookup", "description": "Look up a value.", "parameters": {}}},
+    ]
+
+    assert mid_turn_compaction._tool_tokens(model, tools) < 1_000
+    assert mid_turn_compaction._tool_tokens(model, tools) > 0
 
 
 def test_aggregate_usage_of_retried_requests_never_anchors_sizing() -> None:
