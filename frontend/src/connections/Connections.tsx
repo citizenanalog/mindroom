@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import mindroomLogo from "../../../assets/logo/logo-mark-animated.svgz?url";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConnectedClients } from "./ConnectedClients";
+import { ConnectionsHeader } from "./ConnectionsHeader";
 import { AgentTable } from "./AgentTable";
 import { requestConnection } from "./request";
 import { useMcpSelection } from "./useMcpSelection";
@@ -41,17 +41,9 @@ export function Connections() {
   return (
     <main className="min-h-screen bg-muted/20 px-4 py-8 sm:px-6 sm:py-12">
       <div className="mx-auto max-w-6xl space-y-6">
-        <header className="flex items-start gap-4">
-          <img src={mindroomLogo} alt="" className="h-12 w-12 shrink-0" />
-          <div className="space-y-1.5">
-            <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-              Your MindRoom connections
-            </h1>
-            <p className="max-w-2xl text-sm text-muted-foreground">
-              See each agent’s tools and connect the accounts they need.
-            </p>
-          </div>
-        </header>
+        <ConnectionsHeader current="agents" title="Your MindRoom connections">
+          See each agent’s tools and connect the accounts they need.
+        </ConnectionsHeader>
         {mcp.selection?.enabled && (
           <p className="text-sm text-muted-foreground">
             The MCP gateway column controls access from external apps. It does

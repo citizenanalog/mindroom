@@ -35,6 +35,14 @@ export interface ConnectionList {
   agents: AgentConnections[];
 }
 
+/** Who the Connections pages are open for, from `GET /api/connections/me`. */
+export interface ConnectionsIdentity {
+  matrix_user_id: string;
+  email: string | null;
+  /** The administrator dashboard is open to this user too. */
+  is_administrator: boolean;
+}
+
 export interface ConnectionStatus {
   provider: string;
   connected: boolean;

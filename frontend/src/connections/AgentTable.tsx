@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useCallback, useMemo, useState } from "react";
 import {
   type ColumnDef,
   type ExpandedState,
@@ -15,10 +15,65 @@ import { Input } from "@/components/ui/input";
 import { AgentTools } from "./AgentTools";
 import { AgentAvatar } from "./AgentAvatar";
 import { EgressServiceRows } from "./EgressServiceRows";
-import type { AgentConnections } from "./types";
+import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
+import type { AgentConnections, ConnectionStatus } from "./types";
 import type { McpSelectionState } from "./useMcpSelection";
 
-type AgentTableRow = AgentConnections & { mcp: McpSelectionState };
+/** Whether each agent's account is connected, by agent and provider, once its status has loaded. */
+type ConnectedAccounts = Record<string, boolean>;
+
+type AgentTableRow = AgentConnections & {
+  mcp: McpSelectionState;
+  accounts: ConnectedAccounts;
+};
+
+const accountKey = (agentName: string, provider: string) =>
+  `${agentName}/${provider}`;
+
+/**
+ * How many of an agent's accounts and keys are set, out of all of them: its
+ * connectable services plus its egress services. The catalog carries no account
+ * state for a service, so a service counts once its status has loaded (when the
+ * agent is opened) or an egress service of the same provider says it is
+ * connected.
+ */
+function accountCounts(agent: AgentTableRow) {
+  const egress = agent.egress_services ?? [];
+  const connectedProviders = new Set(
+    egress.flatMap((service) =>
+      service.oauth?.connected ? [service.oauth.provider] : [],
+    ),
+  );
+  const connectedServices = agent.services.filter(
+    (service) =>
+      agent.accounts[accountKey(agent.agent_name, service.provider)] ??
+      connectedProviders.has(service.provider),
+  );
+  return {
+    set:
+      egress.filter((service) => service.configured).length +
+      connectedServices.length,
+    total: agent.services.length + egress.length,
+  };
+}
+
+/** The agent's services and tools by name, for the search box. */
+function searchTerms(agent: AgentConnections): string[] {
+  return [
+    agent.agent_name,
+    agent.agent_display_name,
+    ...agent.tools.flatMap((tool) => [tool.name, tool.display_name]),
+    ...agent.services.flatMap((service) => [
+      service.provider,
+      service.display_name,
+    ]),
+    ...(agent.egress_services ?? []).flatMap((service) => [
+      service.name,
+      service.display_name,
+      ...(service.rules ?? []).map((rule) => rule.host),
+    ]),
+  ];
+}
 
 const columns: ColumnDef<AgentTableRow>[] = [
   {
@@ -67,13 +122,14 @@ const columns: ColumnDef<AgentTableRow>[] = [
   {
     id: "tools",
     header: "Tools & connections",
-    cell: ({ row }) => (
-      <span className="text-muted-foreground">
-        {row.original.tools.length} tools
-        <span className="mx-2 text-border">/</span>
-        {row.original.services.length} connections
-      </span>
-    ),
+    cell: ({ row }) => {
+      const { set, total } = accountCounts(row.original);
+      return (
+        <span className="text-muted-foreground">
+          {`${row.original.tools.length} tools / ${set} of ${total} accounts and keys set`}
+        </span>
+      );
+    },
   },
   {
     id: "mcp",
@@ -130,6 +186,16 @@ export function AgentTable({
   const [expanded, setExpanded] = useState<ExpandedState>({});
   const [search, setSearch] = useState("");
   const [scope, setScope] = useState("all");
+  const [accounts, setAccounts] = useState<ConnectedAccounts>({});
+  const onAccountStatus = useCallback(
+    (agentName: string, provider: string, status: ConnectionStatus) =>
+      setAccounts((known) =>
+        known[accountKey(agentName, provider)] === status.connected
+          ? known
+          : { ...known, [accountKey(agentName, provider)]: status.connected },
+      ),
+    [],
+  );
   const data = useMemo(
     () =>
       agents
@@ -145,8 +211,8 @@ export function AgentTable({
                   )
                 : true,
         )
-        .map((agent) => ({ ...agent, mcp })),
-    [agents, scope, mcp],
+        .map((agent) => ({ ...agent, mcp, accounts })),
+    [agents, scope, mcp, accounts],
   );
   const table = useReactTable({
     data,
@@ -161,12 +227,10 @@ export function AgentTable({
     getExpandedRowModel: getExpandedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     globalFilterFn: (row, _column, value: string) => {
-      const agent = row.original;
-      return [
-        agent.agent_name,
-        agent.agent_display_name,
-        ...agent.tools.flatMap((tool) => [tool.name, tool.display_name]),
-      ].some((name) => name.toLowerCase().includes(value.toLowerCase().trim()));
+      const needle = value.toLowerCase().trim();
+      return searchTerms(row.original).some((name) =>
+        name.toLowerCase().includes(needle),
+      );
     },
   });
   return (
@@ -182,15 +246,15 @@ export function AgentTable({
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="relative flex-1 sm:w-64">
+          <div className="relative flex-1 max-sm:basis-full sm:w-64">
             <Search
               className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground"
               aria-hidden="true"
             />
             <Input
               type="search"
-              aria-label="Search agents or tools"
-              placeholder="Search agents or tools…"
+              aria-label="Search agents, tools, or services"
+              placeholder="Search agents, tools, services…"
               className="h-9 pl-9"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
@@ -212,8 +276,13 @@ export function AgentTable({
         </div>
       </div>
       <div className="overflow-x-auto">
-        <table aria-label="Agents" className="w-full min-w-[680px] text-sm">
-          <thead className="bg-muted/30 text-left text-xs text-muted-foreground">
+        <table
+          aria-label="Agents"
+          className={`w-full text-sm sm:min-w-[680px] ${STACKED.table}`}
+        >
+          <thead
+            className={`bg-muted/30 text-left text-xs text-muted-foreground ${STACKED.head}`}
+          >
             {table.getHeaderGroups().map((group) => (
               <tr key={group.id}>
                 {group.headers.map((header) => (
@@ -231,14 +300,22 @@ export function AgentTable({
               </tr>
             ))}
           </thead>
-          <tbody>
+          <tbody className={STACKED.body}>
             {table.getRowModel().rows.map((row) => (
               <Fragment key={row.id}>
                 <tr
-                  className={`border-t transition-colors hover:bg-muted/30 ${row.getIsExpanded() ? "bg-muted/30" : ""}`}
+                  className={`border-t transition-colors hover:bg-muted/30 ${STACKED.row} max-sm:px-0 max-sm:py-2 ${row.getIsExpanded() ? "bg-muted/30" : ""}`}
                 >
                   {row.getVisibleCells().map((cell) => (
-                    <td key={cell.id} className="px-5 py-4">
+                    <td
+                      key={cell.id}
+                      data-label={
+                        cell.column.id === "agent"
+                          ? undefined
+                          : String(cell.column.columnDef.header)
+                      }
+                      className={`px-5 py-4 ${STACKED_CELL} max-sm:px-4 max-sm:py-1.5 ${cell.column.id === "agent" ? "" : STACKED_LABEL}`}
+                    >
                       {flexRender(
                         cell.column.columnDef.cell,
                         cell.getContext(),
@@ -247,10 +324,10 @@ export function AgentTable({
                   ))}
                 </tr>
                 {row.getIsExpanded() && (
-                  <tr>
+                  <tr className={STACKED.row}>
                     <td
                       colSpan={columns.length}
-                      className="border-t border-border/60 p-0"
+                      className={`border-t border-border/60 p-0 ${STACKED_CELL}`}
                     >
                       <section
                         id={`agent-tools-${row.original.agent_name}`}
@@ -262,6 +339,7 @@ export function AgentTable({
                           mcp={mcp}
                           refreshVersion={refreshVersion}
                           onConnectionChange={onConnectionChange}
+                          onAccountStatus={onAccountStatus}
                         />
                         {/* An array, even an empty one, marks an agent that can use egress credentials. */}
                         {Array.isArray(row.original.egress_services) ? (
@@ -282,6 +360,10 @@ export function AgentTable({
                                 agentName={row.original.agent_name}
                                 services={row.original.egress_services}
                                 onChanged={onEgressChange}
+                                agent={{
+                                  displayName: row.original.agent_display_name,
+                                  services: row.original.egress_services,
+                                }}
                               />
                             ) : (
                               <p className="px-5 py-4 text-sm text-muted-foreground">
@@ -297,10 +379,10 @@ export function AgentTable({
               </Fragment>
             ))}
             {!table.getRowModel().rows.length && (
-              <tr>
+              <tr className={STACKED.row}>
                 <td
                   colSpan={columns.length}
-                  className="px-5 py-12 text-center text-muted-foreground"
+                  className={`px-5 py-12 text-center text-muted-foreground ${STACKED_CELL}`}
                 >
                   No agents match your search.
                 </td>

@@ -7,7 +7,12 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EgressServiceRows, type ServiceEditing } from "./EgressServiceRows";
+import { githubRepositoryRules } from "./egressServiceModel";
+import {
+  EgressServiceRows,
+  type RowAgent,
+  type ServiceEditing,
+} from "./EgressServiceRows";
 import type { EgressCredentialService, EgressOAuthStatus } from "./types";
 
 const github: EgressCredentialService = {
@@ -1083,5 +1088,511 @@ describe("egress service rows with service editing", () => {
     expect(
       screen.getByRole("button", { name: "Delete Mine service" }),
     ).toBeEnabled();
+  });
+});
+
+describe("rows with an agent's wording", () => {
+  const agent = (overrides: Partial<RowAgent> = {}): RowAgent => ({
+    displayName: "Personal Mind",
+    managers: [],
+    services: [],
+    ...overrides,
+  });
+  const keyed = (
+    overrides: Partial<EgressCredentialService> = {},
+  ): EgressCredentialService => ({
+    ...openai,
+    updated_at: "2026-10-05T12:00:00+00:00",
+    key_updated_at: "2026-10-05T12:00:00+00:00",
+    ...overrides,
+  });
+  const renderRows = (
+    services: EgressCredentialService[],
+    rowAgent: RowAgent = agent({ services }),
+    extra: { serviceEditing?: ServiceEditing } = {},
+  ) =>
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={services}
+        onChanged={vi.fn()}
+        agent={rowAgent}
+        {...extra}
+      />,
+    );
+
+  it("says Key saved with the date, and Set key, Replace key and Remove key on the buttons", () => {
+    renderRows([github, keyed()]);
+    const date = new Date("2026-10-05T12:00:00+00:00").toLocaleDateString();
+    expect(
+      within(row("OpenAI")).getByText(`Key saved ${date}`),
+    ).toBeInTheDocument();
+    expect(within(row("GitHub")).getByText("Not set")).toBeInTheDocument();
+    expect(
+      within(row("GitHub")).getByRole("button", { name: "Set GitHub API key" }),
+    ).toHaveTextContent(/^Set key$/);
+    expect(
+      within(row("OpenAI")).getByRole("button", {
+        name: "Replace OpenAI API key",
+      }),
+    ).toHaveTextContent(/^Replace key$/);
+    expect(
+      within(row("OpenAI")).getByRole("button", {
+        name: "Remove OpenAI API key",
+      }),
+    ).toHaveTextContent(/^Remove key$/);
+  });
+
+  it("says Key saved without a date when the server sends none", () => {
+    renderRows([keyed({ updated_at: null, key_updated_at: null })]);
+    expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
+  });
+
+  it("keeps the dashboard's Updated and Set wording without an agent", () => {
+    render(
+      <EgressServiceRows
+        agentName="personal"
+        services={[keyed()]}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(
+      within(row("OpenAI")).getByText(
+        `Updated ${new Date("2026-10-05T12:00:00+00:00").toLocaleDateString()}`,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("notes that a connected account is kept while an API key is in use", () => {
+    renderRows([
+      withAccount(
+        { connected: true, account_label: "octocat" },
+        { configured: true, active_source: "key", key_configured: true },
+      ),
+    ]);
+    const github = row("GitHub");
+    expect(within(github).getByText("Using API key")).toBeInTheDocument();
+    expect(
+      within(github).getByText(
+        "Your connected GitHub account is kept for other services.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("adds no kept-account note when no account is connected or the account is the one in use", () => {
+    renderRows([
+      withAccount(
+        { connected: false },
+        { configured: true, active_source: "key", key_configured: true },
+      ),
+    ]);
+    expect(screen.queryByText(/is kept for other services/)).toBeNull();
+    cleanup();
+    renderRows([connectedGithub]);
+    expect(screen.queryByText(/is kept for other services/)).toBeNull();
+  });
+
+  it("shows a shared account to everyone as connected and shared with everyone using the agent", () => {
+    const shared = withAccount(
+      { connected: true, account_label: "team@example.org" },
+      {
+        is_shared: true,
+        can_manage: false,
+        configured: true,
+        active_source: "oauth",
+      },
+    );
+    renderRows(
+      [shared],
+      agent({ displayName: "Shared Dev", services: [shared] }),
+    );
+    expect(
+      within(row("GitHub")).getByText(
+        "Connected as team@example.org · shared with everyone using Shared Dev",
+      ),
+    ).toBeVisible();
+  });
+
+  it("names a shared account without a label as Connected, shared with everyone", () => {
+    const shared = withAccount(
+      { connected: true, account_label: null },
+      { is_shared: true, configured: true, active_source: "oauth" },
+    );
+    renderRows(
+      [shared],
+      agent({ displayName: "Shared Dev", services: [shared] }),
+    );
+    expect(
+      within(row("GitHub")).getByText(
+        "Connected · shared with everyone using Shared Dev",
+      ),
+    ).toBeVisible();
+  });
+
+  it("does not call a personal agent's account shared", () => {
+    renderRows([connectedGithub]);
+    expect(
+      within(row("GitHub")).getByText("Connected as octocat"),
+    ).toBeVisible();
+    expect(screen.queryByText(/shared with everyone/)).toBeNull();
+  });
+
+  describe("Connect on a shared agent", () => {
+    const sharedGoogle = withAccount(
+      { provider: "google", display_name: "Google" },
+      { is_shared: true, name: "gmail", display_name: "Gmail" },
+    );
+    beforeEach(() => {
+      vi.spyOn(window, "open").mockReturnValue({
+        closed: false,
+        close: vi.fn(),
+        location: { href: "about:blank" },
+      } as unknown as Window);
+      vi.mocked(fetch).mockImplementation(async () =>
+        json({
+          provider: "google",
+          auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
+          completion_origin: "https://portal.example.com",
+        }),
+      );
+    });
+
+    it("asks Connect a shared account? and only goes on after Continue", async () => {
+      renderRows(
+        [sharedGoogle],
+        agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+
+      const dialog = await screen.findByRole("dialog", {
+        name: "Connect a shared account?",
+      });
+      expect(
+        within(dialog).getByText(
+          "Everyone who uses Shared Dev will act as the Google account you pick. Use a team account, not your personal one.",
+        ),
+      ).toBeVisible();
+      expect(fetch).not.toHaveBeenCalled();
+
+      fireEvent.click(within(dialog).getByRole("button", { name: "Continue" }));
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith(
+          "/api/connections/egress/agents/personal/gmail/connect",
+          expect.objectContaining({ method: "POST" }),
+        ),
+      );
+      expect(
+        screen.queryByRole("dialog", { name: "Connect a shared account?" }),
+      ).toBeNull();
+    });
+
+    it("sends nothing when the question is cancelled", async () => {
+      renderRows(
+        [sharedGoogle],
+        agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(fetch).not.toHaveBeenCalled();
+      expect(window.open).not.toHaveBeenCalled();
+    });
+
+    it("does not ask on a personal agent", async () => {
+      const personal = { ...sharedGoogle, is_shared: false };
+      renderRows([personal], agent({ services: [personal] }));
+      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      await waitFor(() => expect(fetch).toHaveBeenCalled());
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("does not ask without an agent, as on the dashboard", async () => {
+      render(
+        <EgressServiceRows
+          agentName="personal"
+          services={[sharedGoogle]}
+          onChanged={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Connect Google" }));
+      await waitFor(() => expect(fetch).toHaveBeenCalled());
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  describe("a personal account the shared agent refuses", () => {
+    const refused = withAccount(
+      { can_connect: false, unavailable_reason: "shared_sandbox" },
+      { is_shared: true, can_manage: false },
+    );
+
+    it("tells a non-manager whom to ask", () => {
+      renderRows(
+        [refused],
+        agent({
+          managers: ["@bob:example.org", "@carol:example.org"],
+          services: [refused],
+        }),
+      );
+      expect(
+        within(row("GitHub")).getByText(
+          "Personal GitHub accounts can't be used by shared agents. Ask @bob:example.org and @carol:example.org to add a team API key.",
+        ),
+      ).toBeVisible();
+    });
+
+    it("tells a non-manager to ask an administrator when there are no managers", () => {
+      renderRows([refused], agent({ managers: [], services: [refused] }));
+      expect(
+        within(row("GitHub")).getByText(
+          /Ask an administrator to add a team API key\.$/,
+        ),
+      ).toBeVisible();
+    });
+
+    it("tells a manager to add a team key", () => {
+      const asManager = { ...refused, can_manage: true };
+      renderRows(
+        [asManager],
+        agent({ managers: ["@bob:example.org"], services: [asManager] }),
+      );
+      expect(
+        within(row("GitHub")).getByText(
+          "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
+        ),
+      ).toBeVisible();
+    });
+  });
+
+  describe("who manages a shared agent", () => {
+    const readOnly = { ...openai, is_shared: true, can_manage: false };
+
+    it("leaves naming the managers to the agent's note when they are known", () => {
+      renderRows(
+        [readOnly],
+        agent({ managers: ["@bob:example.org"], services: [readOnly] }),
+      );
+      expect(screen.queryByText(/Managed by credential managers/)).toBeNull();
+      expect(screen.queryByRole("button", { name: /API key/ })).toBeNull();
+    });
+
+    it("still says it where the managers are not known", () => {
+      renderRows(
+        [readOnly],
+        agent({ managers: undefined, services: [readOnly] }),
+      );
+      expect(screen.getByText("Managed by credential managers")).toBeVisible();
+    });
+
+    it("does not repeat it beside a refused personal account that says whom to ask", () => {
+      const refused = withAccount(
+        { can_connect: false, unavailable_reason: "shared_sandbox" },
+        { is_shared: true, can_manage: false },
+      );
+      renderRows(
+        [refused],
+        agent({ managers: undefined, services: [refused] }),
+      );
+      expect(
+        within(row("GitHub")).getByText(
+          /Ask its credential managers to add a team API key\.$/,
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText("Managed by credential managers")).toBeNull();
+    });
+  });
+
+  describe("disconnecting an account", () => {
+    const listing = [
+      connectedGithub,
+      {
+        ...connectedGithub,
+        name: "github-limited",
+        display_name: "GitHub (a/b)",
+        source: "user" as const,
+      },
+      openai,
+      withAccount(
+        { provider: "google", display_name: "Google", connected: true },
+        { name: "gmail", display_name: "Gmail" },
+      ),
+    ];
+
+    it("lists every service of the agent that uses the provider", async () => {
+      vi.mocked(fetch).mockImplementation(async () =>
+        json({ status: "disconnected", provider: "github" }),
+      );
+      const onChanged = vi.fn();
+      render(
+        <EgressServiceRows
+          agentName="personal"
+          services={listing}
+          onChanged={onChanged}
+          agent={agent({ services: listing })}
+        />,
+      );
+      fireEvent.click(
+        within(row("GitHub")).getByRole("button", {
+          name: "Disconnect GitHub",
+        }),
+      );
+      const dialog = await screen.findByRole("dialog", {
+        name: "Disconnect GitHub?",
+      });
+      expect(
+        within(dialog).getByText(
+          "This removes the saved GitHub connection for Personal Mind. These services stop working until an account is connected again: GitHub and GitHub (a/b).",
+        ),
+      ).toBeVisible();
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Disconnect" }),
+      );
+      await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    });
+
+    it("keeps the dashboard's wording without an agent", async () => {
+      render(
+        <EgressServiceRows
+          agentName="personal"
+          services={[connectedGithub]}
+          onChanged={vi.fn()}
+        />,
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Disconnect GitHub" }),
+      );
+      expect(
+        await screen.findByText(
+          "This removes the saved GitHub connection. Agents lose access through it until an account is connected again.",
+        ),
+      ).toBeVisible();
+    });
+  });
+
+  describe("limiting a GitHub service to repositories", () => {
+    const base = (overrides: Partial<EgressCredentialService> = {}) => ({
+      ...github,
+      source: "config" as const,
+      rules: [
+        { host: "api.github.com", port: null, path_prefix: "/" },
+        { host: "github.com", port: null, path_prefix: "/" },
+      ],
+      ...overrides,
+    });
+    const limiting = (
+      overrides: Partial<ServiceEditing> = {},
+    ): ServiceEditing => ({
+      editableSource: "user",
+      onEdit: vi.fn(),
+      onDelete: vi.fn(async () => undefined),
+      deleteWarning: () => "",
+      onLimitToRepositories: vi.fn(),
+      ...overrides,
+    });
+
+    it("offers it on an administrator's GitHub row to someone who can manage the agent", () => {
+      const onLimitToRepositories = vi.fn();
+      const service = base();
+      renderRows([service], undefined, {
+        serviceEditing: limiting({ onLimitToRepositories }),
+      });
+      const button = within(row("GitHub")).getByRole("button", {
+        name: "Limit GitHub to repositories",
+      });
+      expect(button).toHaveTextContent("Limit to repositories");
+      fireEvent.click(button);
+      expect(onLimitToRepositories).toHaveBeenCalledWith(service);
+    });
+
+    it.each([
+      ["the viewer cannot manage the agent", base({ can_manage: false })],
+      ["the service is the viewer's own", base({ source: "user" })],
+      [
+        "it has no rule on a GitHub host",
+        base({
+          rules: [{ host: "httpbin.org", port: null, path_prefix: "/" }],
+        }),
+      ],
+      ["the response lists no rules", base({ rules: undefined })],
+    ])("does not offer it when %s", (_why, service) => {
+      renderRows([service], undefined, { serviceEditing: limiting() });
+      expect(screen.queryByText("Limit to repositories")).toBeNull();
+    });
+
+    it("does not offer it without a handler, as on the dashboard", () => {
+      renderRows([base()], undefined, {
+        serviceEditing: limiting({ onLimitToRepositories: undefined }),
+      });
+      expect(screen.queryByText("Limit to repositories")).toBeNull();
+    });
+
+    it("turns it off while the editor is open or something is being written", () => {
+      renderRows([base()], undefined, {
+        serviceEditing: limiting({ limitDisabled: true }),
+      });
+      expect(
+        screen.getByRole("button", { name: "Limit GitHub to repositories" }),
+      ).toBeDisabled();
+      cleanup();
+      renderRows([base()], undefined, {
+        serviceEditing: limiting({ disabled: true }),
+      });
+      expect(
+        screen.getByRole("button", { name: "Limit GitHub to repositories" }),
+      ).toBeDisabled();
+    });
+
+    it("shows which repositories a limited service is limited to", () => {
+      const rules = githubRepositoryRules("a/b\nc/*", {
+        uploads: false,
+        graphql: false,
+      }).rules.map((rule) => ({
+        host: rule.host,
+        port: null,
+        path_prefix: rule.path_prefix ?? "/",
+      }));
+      renderRows([base({ source: "user", display_name: "Mine", rules })]);
+      expect(
+        within(row("Mine")).getByText("Limited to a/b, c/*"),
+      ).toBeVisible();
+    });
+
+    it("shows nothing for a service that reaches all of GitHub", () => {
+      renderRows([base()]);
+      expect(screen.queryByText(/Limited to/)).toBeNull();
+    });
+
+    it("does not repeat a description that already says it", () => {
+      const rules = githubRepositoryRules("a/b", {
+        uploads: false,
+        graphql: false,
+      }).rules.map((rule) => ({
+        host: rule.host,
+        port: null,
+        path_prefix: rule.path_prefix ?? "/",
+      }));
+      renderRows([
+        base({
+          source: "user",
+          display_name: "Mine",
+          description: "Limited to a/b",
+          rules,
+        }),
+      ]);
+      expect(screen.getAllByText("Limited to a/b")).toHaveLength(1);
+    });
+  });
+
+  it("shows no administrator badge when no label is given", () => {
+    renderRows([{ ...github, source: "config" }], undefined, {
+      serviceEditing: {
+        editableSource: "user",
+        onEdit: vi.fn(),
+        onDelete: vi.fn(async () => undefined),
+        deleteWarning: () => "",
+      },
+    });
+    expect(screen.queryByText(/administrator/)).toBeNull();
   });
 });

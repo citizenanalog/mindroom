@@ -19,6 +19,12 @@ beforeEach(() => {
     const path = String(input);
     if (path === "/api/connections/egress") return json({ agents: [] });
     if (path === "/api/connections") return json({ agents: [] });
+    if (path === "/api/connections/me")
+      return json({
+        matrix_user_id: "@bob:example.org",
+        email: null,
+        is_administrator: false,
+      });
     if (path === "/api/connections/mcp/selection")
       return json({ enabled: false, agents: {} });
     if (path === "/api/connections/mcp/clients")

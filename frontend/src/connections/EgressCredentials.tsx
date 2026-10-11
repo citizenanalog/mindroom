@@ -1,14 +1,30 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { ChevronDown, RefreshCw } from "lucide-react";
-import mindroomLogo from "../../../assets/logo/logo-mark-animated.svgz?url";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  PASS_THROUGH_CAPTION,
+  PASSED_THROUGH,
+  sharedAgentNote,
+} from "./accountCopy";
+import { ConnectionsHeader } from "./ConnectionsHeader";
 import { InactiveServices } from "./EgressInactiveServices";
 import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
 import { configPlaceholderOwners } from "./egressServiceModel";
-import { EgressServiceRows, type ServiceEditing } from "./EgressServiceRows";
+import {
+  EgressServiceRows,
+  type RowAgent,
+  type ServiceEditing,
+} from "./EgressServiceRows";
 import { type RequestErrorMessages, requestConnection } from "./request";
+import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
 import type {
   AuthoredEgressService,
   EgressCredentialAgent,
@@ -28,7 +44,7 @@ const SERVICE_ERROR_MESSAGES: RequestErrorMessages = {
 };
 
 type EditorState = (
-  | { kind: "add" }
+  | { kind: "add"; initialPreset?: string; initialName?: string }
   | { kind: "edit"; name: string; service: AuthoredEgressService }
 ) & {
   /**
@@ -58,6 +74,23 @@ function servicePath(agentName: string, serviceName: string): string {
 /** Where a service's API key is written; the rows write the same one. */
 function keyPath(agentName: string, serviceName: string): string {
   return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
+}
+
+/** The name a service limited to repositories starts with: `github-limited`, or the first of `-2`, `-3`... that is free. */
+function limitedServiceName(taken: readonly string[]): string {
+  const base = "github-limited";
+  for (let n = 1; ; n += 1) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    if (!taken.includes(name)) return name;
+  }
+}
+
+/** A refusal code that can wrap after an underscore, and nowhere inside a word. */
+function breakableCode(code: string): ReactNode[] {
+  const words = code.split("_");
+  return words.flatMap((word, index) =>
+    index < words.length - 1 ? [`${word}_`, <wbr key={index} />] : [word],
+  );
 }
 
 function deleteWarning(service: EgressCredentialService): string {
@@ -156,9 +189,14 @@ function RecentRequests({ agentName }: { agentName: string }) {
             <div className="overflow-x-auto rounded-md border border-border/60">
               <table
                 aria-label={`Recent requests for ${agentName}`}
-                className="w-full text-left text-sm"
+                className={`w-full text-left text-sm ${STACKED.table}`}
               >
-                <thead className="bg-muted/40 text-xs text-muted-foreground">
+                <caption className="px-3 py-2 text-left text-xs text-muted-foreground max-sm:block">
+                  {PASS_THROUGH_CAPTION}
+                </caption>
+                <thead
+                  className={`bg-muted/40 text-xs text-muted-foreground ${STACKED.head}`}
+                >
                   <tr>
                     {[
                       "Time",
@@ -174,32 +212,51 @@ function RecentRequests({ agentName }: { agentName: string }) {
                     ))}
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className={STACKED.body}>
                   {log.records.map((record, index) => {
                     const refusal =
                       record.code ??
                       (record.kind === "denied" ? "refused" : null);
+                    // A tunnel the broker only relayed carries no key; a refused one never opened.
+                    const passedThrough =
+                      record.method === "CONNECT" &&
+                      record.service === null &&
+                      refusal === null;
+                    const cell = `px-3 py-2 ${STACKED_CELL} ${STACKED_LABEL} max-sm:py-1`;
                     return (
                       <tr
                         // The log has no unique ids and can repeat identical requests.
                         key={`${record.at}-${index}`}
-                        className="border-t border-border/60"
+                        className={`border-t border-border/60 ${STACKED.row} max-sm:py-2`}
                       >
-                        <td className="whitespace-nowrap px-3 py-2">
+                        <td
+                          data-label="Time"
+                          className={`whitespace-nowrap ${cell}`}
+                        >
                           {new Date(record.at).toLocaleString()}
                         </td>
-                        <td className="px-3 py-2 font-mono text-xs">
+                        <td
+                          data-label="Method"
+                          className={`font-mono text-xs ${cell}`}
+                        >
                           {record.method}
                         </td>
-                        <td className="px-3 py-2">{record.host}</td>
+                        <td data-label="Host" className={cell}>
+                          {record.host}
+                        </td>
                         <td
-                          className="max-w-[14rem] truncate px-3 py-2 font-mono text-xs"
+                          data-label="Path"
+                          className={`font-mono text-xs sm:max-w-[14rem] sm:truncate ${cell}`}
                           title={record.path}
                         >
                           {record.path || "-"}
                         </td>
-                        <td className="px-3 py-2">{record.service ?? "-"}</td>
-                        <td className="px-3 py-2">
+                        <td data-label="Service" className={cell}>
+                          {passedThrough
+                            ? PASSED_THROUGH
+                            : (record.service ?? "-")}
+                        </td>
+                        <td data-label="Status" className={cell}>
                           <Badge
                             variant={
                               record.status >= 400 ? "destructive" : "secondary"
@@ -209,8 +266,8 @@ function RecentRequests({ agentName }: { agentName: string }) {
                             {record.status}
                           </Badge>
                           {refusal && (
-                            <div className="mt-1 break-all text-xs text-muted-foreground">
-                              {refusal}
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {breakableCode(refusal)}
                             </div>
                           )}
                         </td>
@@ -350,15 +407,40 @@ function AgentSection({
     onEdit: requestEdit,
     onDelete: (service) => remove(service.name),
     deleteWarning,
-    labels: { config: "Added by your administrator" },
+    onLimitToRepositories: () => {
+      setError(null);
+      setEditor({
+        kind: "add",
+        initialPreset: "github",
+        initialName: limitedServiceName(
+          agent.services.map((service) => service.name),
+        ),
+      });
+    },
+    limitDisabled: editor !== null,
   };
+  const rowAgent: RowAgent = {
+    displayName: agent.agent_display_name,
+    managers: agent.managers,
+    services: agent.services,
+  };
+  const groups = [
+    {
+      label: "From your administrator",
+      services: agent.services.filter((service) => service.source === "config"),
+    },
+    {
+      label: agent.shared ? "Added by its credential managers" : "Added by you",
+      services: agent.services.filter((service) => service.source !== "config"),
+    },
+  ].filter((group) => group.services.length > 0);
 
   return (
     <section
       aria-labelledby={`egress-agent-${agent.agent_name}`}
       className="overflow-hidden rounded-2xl border bg-card shadow-sm"
     >
-      <div className="flex items-center gap-2 border-b px-5 py-4">
+      <div className="flex flex-wrap items-center gap-2 border-b px-5 py-4">
         <h2 id={`egress-agent-${agent.agent_name}`} className="font-semibold">
           {agent.agent_display_name}
         </h2>
@@ -383,6 +465,11 @@ function AgentSection({
           </Button>
         )}
       </div>
+      {agent.shared && (
+        <p className="border-b border-border/60 px-5 py-3 text-sm text-muted-foreground">
+          {sharedAgentNote(agent.can_manage, agent.managers)}
+        </p>
+      )}
       {error && (
         <Alert variant="destructive" className="m-4 w-auto p-2">
           <AlertDescription>{error}</AlertDescription>
@@ -402,6 +489,10 @@ function AgentSection({
             sharedTarget={agent.shared}
             name={editor.kind === "edit" ? editor.name : undefined}
             service={editor.kind === "edit" ? editor.service : null}
+            initialPreset={
+              editor.kind === "add" ? editor.initialPreset : undefined
+            }
+            initialName={editor.kind === "add" ? editor.initialName : undefined}
             takenNames={agent.services.map((service) => service.name)}
             configPlaceholders={configPlaceholderOwners(agent.services)}
             scope={agent.scope}
@@ -420,12 +511,25 @@ function AgentSection({
         </div>
       )}
       {agent.services.length ? (
-        <EgressServiceRows
-          agentName={agent.agent_name}
-          services={agent.services}
-          onChanged={onChanged}
-          serviceEditing={serviceEditing}
-        />
+        groups.map((group) => (
+          <div
+            key={group.label}
+            role="group"
+            aria-label={group.label}
+            className="border-t border-border/60 first:border-t-0"
+          >
+            <h3 className="px-5 pt-3 text-xs font-medium text-muted-foreground">
+              {group.label}
+            </h3>
+            <EgressServiceRows
+              agentName={agent.agent_name}
+              services={group.services}
+              onChanged={onChanged}
+              serviceEditing={serviceEditing}
+              agent={rowAgent}
+            />
+          </div>
+        ))
       ) : (
         <p className="px-5 py-4 text-sm text-muted-foreground">
           No services are configured yet.
@@ -477,20 +581,14 @@ export function EgressCredentials() {
   return (
     <main className="min-h-screen bg-muted/20 px-4 py-8 sm:px-6 sm:py-12">
       <div className="mx-auto max-w-4xl space-y-6">
-        <header className="flex items-start gap-4">
-          <img src={mindroomLogo} alt="" className="h-12 w-12 shrink-0" />
-          <div className="space-y-1.5">
-            <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-              Your agents' API keys
-            </h1>
-            <p className="max-w-2xl text-sm text-muted-foreground">
-              Connect an account or paste an API key for the services below, or
-              add a service of your own. Accounts and keys are stored on the
-              MindRoom server and added to outgoing requests. Your agents never
-              see them, and saved keys cannot be read back.
-            </p>
-          </div>
-        </header>
+        <ConnectionsHeader current="keys" title="Your agents' API keys">
+          Connect an account or paste an API key for the services below, or add
+          a service of your own. MindRoom stores them and adds them to your
+          agents' requests to the matching websites. Your agents never get the
+          keys themselves, but a website can send a key back in its response (an
+          echo service does), so only add keys for sites you trust. Saved keys
+          cannot be read back.
+        </ConnectionsHeader>
         {error && (
           <Alert variant="destructive">
             <AlertDescription>{error}</AlertDescription>

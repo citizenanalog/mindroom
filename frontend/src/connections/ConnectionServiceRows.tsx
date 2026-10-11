@@ -10,8 +10,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { disconnectDescription, sharedAccountStatus } from "./accountCopy";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { requestConnection } from "./request";
+import { SharedAccountDialog } from "./SharedAccountDialog";
+import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
 import { ToolName, ToolExposure } from "./ToolRow";
 import type {
   AgentConnections,
@@ -27,18 +30,26 @@ export function ConnectionServiceRows({
   mcp,
   refreshVersion,
   onConnectionChange,
+  onStatus,
 }: {
   agent: AgentConnections;
   service: ConnectionService;
   mcp: McpSelectionState;
   refreshVersion: number;
   onConnectionChange: () => void;
+  /** Told whether the account is connected each time its status loads. */
+  onStatus?: (
+    agentName: string,
+    provider: string,
+    status: ConnectionStatus,
+  ) => void;
 }) {
   const [status, setStatus] = useState<ConnectionStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"connect" | "disconnect" | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [sharedOpen, setSharedOpen] = useState(false);
   const statusRequest = useRef<AbortController | null>(null);
   const operation = useRef<AbortController | null>(null);
   const basePath = `/api/connections/agents/${encodeURIComponent(agent.agent_name)}/${encodeURIComponent(service.provider)}`;
@@ -54,7 +65,10 @@ export function ConnectionServiceRows({
         `${basePath}/status`,
         controller.signal,
       );
-      if (!controller.signal.aborted) setStatus(next);
+      if (!controller.signal.aborted) {
+        setStatus(next);
+        onStatus?.(agent.agent_name, service.provider, next);
+      }
     } catch {
       if (!controller.signal.aborted) {
         setStatus(null);
@@ -63,7 +77,7 @@ export function ConnectionServiceRows({
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [basePath]);
+  }, [basePath, agent.agent_name, service.provider, onStatus]);
 
   useEffect(() => {
     void loadStatus();
@@ -129,16 +143,41 @@ export function ConnectionServiceRows({
   const tools = agent.tools.filter(
     (tool) => tool.provider === service.provider,
   );
+  // Everything on this agent that stops working when the account goes: its
+  // services that sign in with the provider, then the tools, once each.
+  const users = [
+    ...(agent.egress_services ?? [])
+      .filter((other) => other.oauth?.provider === service.provider)
+      .map((other) => other.display_name),
+    ...tools.map((tool) => tool.display_name),
+  ];
+  // Everyone who uses a shared agent acts as its connected account, so everyone is told.
+  const sharedConnected =
+    service.is_shared && status?.connected === true && !status.reset_required;
+  const dependents = users.filter(
+    (name, index) =>
+      users.findIndex((other) => other.toLowerCase() === name.toLowerCase()) ===
+      index,
+  );
   return (
     <>
       {tools.map((tool, index) => (
         <Fragment key={tool.name}>
-          <tr className="border-t border-border/60">
-            <th scope="row" className="px-5 py-3 text-left font-normal">
+          <tr
+            className={`border-t border-border/60 ${STACKED.row} max-sm:py-2`}
+          >
+            <th
+              scope="row"
+              className={`px-5 py-3 text-left font-normal ${STACKED_CELL} max-sm:px-4 max-sm:py-1`}
+            >
               <ToolName tool={tool} />
             </th>
             {index === 0 && (
-              <td rowSpan={tools.length} className="px-4 py-3 align-top">
+              <td
+                rowSpan={tools.length}
+                data-label="Connection"
+                className={`px-4 py-3 align-top ${STACKED_CELL} ${STACKED_LABEL} max-sm:py-1`}
+              >
                 {loading ? (
                   <span
                     role="status"
@@ -156,21 +195,26 @@ export function ConnectionServiceRows({
                       <span className="flex items-center gap-1.5 text-sm">
                         {status.connected && (
                           <CheckCircle2
-                            className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400"
+                            className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
                             aria-hidden="true"
                           />
                         )}
-                        {!service.can_manage
-                          ? status.connected
-                            ? "Shared connection configured"
-                            : "Shared connection unavailable"
-                          : status.reset_required
-                            ? "Reset required"
-                            : status.connected
-                              ? "Connected"
-                              : "Not connected"}
+                        {sharedConnected
+                          ? sharedAccountStatus(
+                              status.account_label,
+                              agent.agent_display_name,
+                            )
+                          : !service.can_manage
+                            ? status.connected
+                              ? "Shared connection configured"
+                              : "Shared connection unavailable"
+                            : status.reset_required
+                              ? "Reset required"
+                              : status.connected
+                                ? "Connected"
+                                : "Not connected"}
                       </span>
-                      {status.account_label && (
+                      {status.account_label && !sharedConnected && (
                         <p className="mt-1 max-w-56 break-all text-xs text-muted-foreground">
                           {status.account_label}
                         </p>
@@ -185,13 +229,16 @@ export function ConnectionServiceRows({
                 )}
               </td>
             )}
-            <td className="px-4 py-3">
+            <td
+              data-label="MCP gateway"
+              className={`px-4 py-3 ${STACKED_CELL} ${STACKED_LABEL} max-sm:py-1`}
+            >
               <ToolExposure agent={agent} tool={tool} mcp={mcp} />
             </td>
             {index === 0 && (
               <td
                 rowSpan={tools.length}
-                className="px-5 py-3 text-right align-top"
+                className={`px-5 py-3 text-right align-top ${STACKED_CELL} max-sm:px-4 max-sm:py-2 max-sm:text-left`}
               >
                 {!loading && !status && (
                   <Button variant="outline" onClick={() => void loadStatus()}>
@@ -204,7 +251,7 @@ export function ConnectionServiceRows({
                   </span>
                 )}
                 {!loading && status && service.can_manage && (
-                  <div className="flex flex-wrap items-center justify-end gap-2">
+                  <div className="flex flex-wrap items-center gap-2 max-sm:justify-start sm:justify-end">
                     {status.reset_required ? (
                       <Button
                         size="sm"
@@ -230,7 +277,11 @@ export function ConnectionServiceRows({
                         size="sm"
                         disabled={busy !== null || !status.can_connect}
                         aria-label={`Connect ${service.display_name}`}
-                        onClick={() => void connect()}
+                        onClick={() =>
+                          service.is_shared
+                            ? setSharedOpen(true)
+                            : void connect()
+                        }
                       >
                         {busy === "connect" ? "Connecting…" : "Connect"}
                       </Button>
@@ -256,6 +307,16 @@ export function ConnectionServiceRows({
                       )}
                   </div>
                 )}
+                <SharedAccountDialog
+                  open={sharedOpen}
+                  agent={agent.agent_display_name}
+                  provider={service.display_name}
+                  onCancel={() => setSharedOpen(false)}
+                  onContinue={() => {
+                    setSharedOpen(false);
+                    void connect();
+                  }}
+                />
                 <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
                   <DialogContent>
                     <DialogHeader>
@@ -264,9 +325,11 @@ export function ConnectionServiceRows({
                         {service.display_name}?
                       </DialogTitle>
                       <DialogDescription>
-                        {service.is_shared
-                          ? `This removes the saved connection used by ${agent.agent_display_name}. Anyone using this connection will lose access until you connect again.`
-                          : "This removes your saved connection. Your assistant will lose access until you connect again."}
+                        {disconnectDescription(
+                          service.display_name,
+                          agent.agent_display_name,
+                          dependents,
+                        )}
                       </DialogDescription>
                     </DialogHeader>
                     <DialogFooter>

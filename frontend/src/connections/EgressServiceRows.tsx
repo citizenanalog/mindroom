@@ -12,8 +12,15 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import {
+  disconnectDescription,
+  personalAccountRefusal,
+  sharedAccountStatus,
+} from "./accountCopy";
+import { coversGithub, limitedRepositories } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { type RequestErrorMessages, requestConnection } from "./request";
+import { SharedAccountDialog } from "./SharedAccountDialog";
 import type { EgressCredentialService, EgressServiceSource } from "./types";
 
 type AccountAction = "connect" | "disconnect";
@@ -40,25 +47,57 @@ export interface ServiceEditing {
   /** Rejects with an Error whose message the row shows. */
   onDelete: (service: EgressCredentialService) => Promise<void>;
   deleteWarning: (service: EgressCredentialService) => string;
-  /** Label for services of another source, such as "Added by your administrator". */
-  labels: Partial<Record<EgressServiceSource, string>>;
+  /** Label for services of another source; the personal page groups its rows instead. */
+  labels?: Partial<Record<EgressServiceSource, string>>;
+  /**
+   * Offers Limit to repositories on an administrator's service that reaches
+   * GitHub, when the viewer can manage the agent.
+   */
+  onLimitToRepositories?: (service: EgressCredentialService) => void;
+  /** Turns Limit to repositories off while the editor is open. */
+  limitDisabled?: boolean;
 }
 
-function statusLabel(service: EgressCredentialService): string {
+/**
+ * The agent a list of rows belongs to. Giving it selects the wording of the
+ * personal pages; without it the rows read as on the administrator dashboard.
+ */
+export interface RowAgent {
+  displayName: string;
+  /**
+   * The credential managers' Matrix IDs, when the response names them. Where
+   * the page says who manages a shared agent, the rows leave it out.
+   */
+  managers?: string[];
+  /** Every service of the agent: disconnecting a provider names the ones that use it. */
+  services: EgressCredentialService[];
+}
+
+function statusLabel(
+  service: EgressCredentialService,
+  agent: RowAgent | undefined,
+): string {
   const oauth = service.oauth;
   if (oauth) {
     if (service.active_source === "key") return "Using API key";
-    if (service.active_source === "oauth")
+    if (service.active_source === "oauth") {
+      // Everyone who uses a shared agent acts as its connected account.
+      if (agent && service.is_shared === true && !oauth.service_account)
+        return sharedAccountStatus(oauth.account_label, agent.displayName);
       return oauth.account_label
         ? `Connected as ${oauth.account_label}`
         : "Connected";
+    }
     return oauth.reset_required ? "Reset required" : "Not set";
   }
   if (!service.configured) return "Not set";
   const updated = service.updated_at ? new Date(service.updated_at) : null;
-  return updated && !Number.isNaN(updated.getTime())
-    ? `Updated ${updated.toLocaleDateString()}`
-    : "Set";
+  const date =
+    updated && !Number.isNaN(updated.getTime())
+      ? updated.toLocaleDateString()
+      : null;
+  if (agent) return date ? `Key saved ${date}` : "Key saved";
+  return date ? `Updated ${date}` : "Set";
 }
 
 function removeWarning(service: EgressCredentialService): string {
@@ -79,12 +118,14 @@ function EgressServiceRow({
   onChanged,
   errorMessages,
   serviceEditing,
+  agent,
 }: {
   paths: ServicePaths;
   service: EgressCredentialService;
   onChanged: () => void;
   errorMessages?: RequestErrorMessages;
   serviceEditing?: ServiceEditing;
+  agent?: RowAgent;
 }) {
   const [editing, setEditing] = useState(false);
   const [secret, setSecret] = useState("");
@@ -92,9 +133,9 @@ function EgressServiceRow({
     "save" | "remove" | "connect" | "disconnect" | "delete" | null
   >(null);
   const [error, setError] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<"key" | "account" | "service" | null>(
-    null,
-  );
+  const [confirm, setConfirm] = useState<
+    "key" | "account" | "service" | "shared" | null
+  >(null);
   const operation = useRef<AbortController | null>(null);
   const keyLabel = `${service.display_name} API key`;
   const oauth = service.oauth;
@@ -109,12 +150,36 @@ function EgressServiceRow({
 
   const sourceLabel =
     serviceEditing && service.source
-      ? serviceEditing.labels[service.source]
+      ? serviceEditing.labels?.[service.source]
       : undefined;
   const canEditService =
     serviceEditing !== undefined &&
     service.source === serviceEditing.editableSource &&
     service.can_manage;
+  const canLimit =
+    serviceEditing?.onLimitToRepositories !== undefined &&
+    service.source === "config" &&
+    service.can_manage &&
+    coversGithub(service.rules);
+  const repositories = limitedRepositories(service.rules);
+  const limitedText = repositories.length
+    ? `Limited to ${repositories.join(", ")}`
+    : null;
+  // Everyone using a shared agent acts as the account connected there.
+  const asksAboutSharedAccount =
+    agent !== undefined &&
+    service.is_shared === true &&
+    oauth?.unavailable_reason === null;
+  // The page names a shared agent's managers once, and a refused personal
+  // account row says whom to ask itself, so the row only does without it.
+  const managersNamed =
+    agent?.managers !== undefined ||
+    (agent !== undefined && oauth?.unavailable_reason === "shared_sandbox");
+  const providerServices = oauth
+    ? (agent?.services ?? [])
+        .filter((other) => other.oauth?.provider === oauth.provider)
+        .map((other) => other.display_name)
+    : [];
 
   useEffect(() => () => operation.current?.abort(), []);
 
@@ -271,14 +336,23 @@ function EgressServiceRow({
           >
             {service.description}
           </p>
+          {limitedText && service.description !== limitedText && (
+            <p className="text-xs text-muted-foreground">{limitedText}</p>
+          )}
         </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
+        <div className="flex flex-wrap items-center gap-2 max-sm:justify-start sm:justify-end">
           <Badge
             variant={service.configured ? "secondary" : "outline"}
-            className="font-normal"
+            className="max-w-full font-normal"
           >
-            {statusLabel(service)}
+            {statusLabel(service, agent)}
           </Badge>
+          {agent && service.active_source === "key" && oauth?.connected && (
+            <span className="text-xs text-muted-foreground">
+              Your connected {oauth.display_name} account is kept for other
+              services.
+            </span>
+          )}
           {sourceLabel && (
             <Badge variant="outline" className="font-normal">
               {sourceLabel}
@@ -289,19 +363,28 @@ function EgressServiceRow({
               Uses a shared service account
             </span>
           )}
-          {oauth?.unavailable_reason === "shared_sandbox" && (
-            <span className="text-xs text-muted-foreground">
-              Personal accounts are not used in a shared sandbox; add an API key
-              or ask an administrator
-            </span>
-          )}
+          {oauth?.unavailable_reason === "shared_sandbox" &&
+            (agent ? (
+              <span className="text-xs text-muted-foreground">
+                {personalAccountRefusal(
+                  oauth.display_name,
+                  service.can_manage,
+                  agent.managers,
+                )}
+              </span>
+            ) : (
+              <span className="text-xs text-muted-foreground">
+                Personal accounts are not used in a shared sandbox; add an API
+                key or ask an administrator
+              </span>
+            ))}
           {oauth?.shared_worker_opt_in && (
             <span className="text-xs text-amber-600 dark:text-amber-400">
               Everyone using this agent can act with the connected account until
               its access expires
             </span>
           )}
-          {!service.can_manage && (
+          {!service.can_manage && !managersNamed && (
             <span className="text-xs text-muted-foreground">
               {oauth?.can_connect
                 ? "API key managed by credential managers"
@@ -314,7 +397,9 @@ function EgressServiceRow({
               size="sm"
               disabled={busy !== null}
               aria-label={`Connect ${oauth.display_name}`}
-              onClick={() => void connect()}
+              onClick={() =>
+                asksAboutSharedAccount ? setConfirm("shared") : void connect()
+              }
             >
               {busy === "connect"
                 ? "Connecting…"
@@ -378,6 +463,7 @@ function EgressServiceRow({
                 }}
               >
                 {service.key_configured ? "Replace" : "Set"}
+                {agent && " key"}
               </Button>
               {service.key_configured && (
                 <Button
@@ -387,10 +473,29 @@ function EgressServiceRow({
                   aria-label={`Remove ${keyLabel}`}
                   onClick={() => setConfirm("key")}
                 >
-                  {busy === "remove" ? "Removing…" : "Remove"}
+                  {busy === "remove"
+                    ? "Removing…"
+                    : agent
+                      ? "Remove key"
+                      : "Remove"}
                 </Button>
               )}
             </>
+          )}
+          {canLimit && serviceEditing?.onLimitToRepositories && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={
+                busy !== null ||
+                serviceEditing.disabled ||
+                serviceEditing.limitDisabled
+              }
+              aria-label={`Limit ${service.display_name} to repositories`}
+              onClick={() => serviceEditing.onLimitToRepositories?.(service)}
+            >
+              Limit to repositories
+            </Button>
           )}
           {canEditService && serviceEditing && (
             <>
@@ -430,7 +535,7 @@ function EgressServiceRow({
             autoComplete="off"
             aria-label={keyLabel}
             placeholder="Paste the key"
-            className="h-9 max-w-sm flex-1"
+            className="h-9 max-w-sm flex-1 max-sm:basis-full"
             value={secret}
             disabled={busy !== null}
             onChange={(event) => setSecret(event.target.value)}
@@ -513,6 +618,18 @@ function EgressServiceRow({
           </DialogContent>
         </Dialog>
       )}
+      {oauth && agent && (
+        <SharedAccountDialog
+          open={confirm === "shared"}
+          agent={agent.displayName}
+          provider={oauth.display_name}
+          onCancel={() => setConfirm(null)}
+          onContinue={() => {
+            setConfirm(null);
+            void connect();
+          }}
+        />
+      )}
       {oauth && (
         <Dialog
           open={confirm === "account"}
@@ -524,8 +641,13 @@ function EgressServiceRow({
                 {oauth.connected ? "Disconnect" : "Reset"} {oauth.display_name}?
               </DialogTitle>
               <DialogDescription>
-                This removes the saved {oauth.display_name} connection. Agents
-                lose access through it until an account is connected again.
+                {agent
+                  ? disconnectDescription(
+                      oauth.display_name,
+                      agent.displayName,
+                      providerServices,
+                    )
+                  : `This removes the saved ${oauth.display_name} connection. Agents lose access through it until an account is connected again.`}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -586,6 +708,7 @@ export function EgressServiceRows({
   onChanged,
   errorMessages,
   serviceEditing,
+  agent,
   ...target
 }: ServiceTarget & {
   services: EgressCredentialService[];
@@ -594,6 +717,8 @@ export function EgressServiceRows({
   errorMessages?: RequestErrorMessages;
   /** Edit and delete controls for the services the viewer defines. */
   serviceEditing?: ServiceEditing;
+  /** The agent the rows belong to, on the personal pages. */
+  agent?: RowAgent;
 }) {
   return (
     <ul>
@@ -605,6 +730,7 @@ export function EgressServiceRows({
           onChanged={onChanged}
           errorMessages={errorMessages}
           serviceEditing={serviceEditing}
+          agent={agent}
         />
       ))}
     </ul>

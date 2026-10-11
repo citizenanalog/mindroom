@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import { EgressCredentials } from "./EgressCredentials";
+import { githubRepositoryRules } from "./egressServiceModel";
 import type {
   AuthoredEgressService,
   EgressCredentialAgent,
@@ -77,9 +78,16 @@ const agents: EgressCredentialAgent[] = [
 const json = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), { status });
 
+const identity = {
+  matrix_user_id: "@bob:example.org",
+  email: "bob@example.org",
+  is_administrator: false,
+};
+
 beforeEach(() => {
   vi.mocked(fetch).mockImplementation(async (input) => {
     if (String(input) === "/api/connections/egress") return json({ agents });
+    if (String(input) === "/api/connections/me") return json(identity);
     throw new Error(`Unexpected request: ${String(input)}`);
   });
 });
@@ -652,12 +660,10 @@ describe("egress services on the personal page", () => {
     expect(screen.getByLabelText("My API")).toBeInTheDocument();
   });
 
-  it("shows the administrator's services read-only", async () => {
+  it("shows the administrator's services read-only, without a badge on the row", async () => {
     render(<EgressCredentials />);
     const row = await screen.findByLabelText("GitHub");
-    expect(
-      within(row).getByText("Added by your administrator"),
-    ).toBeInTheDocument();
+    expect(within(row).queryByText(/administrator/)).toBeNull();
     expect(
       within(row).queryByRole("button", { name: /Edit|Delete/ }),
     ).toBeNull();
@@ -665,11 +671,7 @@ describe("egress services on the personal page", () => {
     expect(
       within(row).getByRole("button", { name: "Set GitHub API key" }),
     ).toBeInTheDocument();
-    expect(
-      within(screen.getByLabelText("My API")).queryByText(
-        "Added by your administrator",
-      ),
-    ).toBeNull();
+    expect(within(screen.getByLabelText("My API"))).toBeTruthy();
   });
 
   it("offers Add service by the agent's own can_manage flag", async () => {
@@ -1643,5 +1645,471 @@ describe("recent requests on the personal page", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Could not complete the request. Try again.",
     );
+  });
+});
+
+describe("the page's header and intro", () => {
+  const identityFor = (changes: Partial<typeof identity> = {}) => ({
+    ...identity,
+    ...changes,
+  });
+
+  it("says who is signed in and links Agents and API keys and accounts", async () => {
+    render(<EgressCredentials />);
+    expect(
+      await screen.findByText("Signed in as @bob:example.org"),
+    ).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Connections pages" });
+    expect(within(nav).getByRole("link", { name: "Agents" })).toHaveAttribute(
+      "href",
+      "/connections",
+    );
+    expect(
+      within(nav).getByRole("link", { name: "API keys and accounts" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(within(nav).queryByRole("link", { name: "Dashboard" })).toBeNull();
+  });
+
+  it("links the dashboard for administrators", async () => {
+    vi.mocked(fetch).mockImplementation(async (input) =>
+      String(input) === "/api/connections/me"
+        ? json(
+            identityFor({
+              matrix_user_id: "@alice:example.org",
+              is_administrator: true,
+            }),
+          )
+        : json({ agents }),
+    );
+    render(<EgressCredentials />);
+    expect(
+      await screen.findByRole("link", { name: "Dashboard" }),
+    ).toHaveAttribute("href", "/");
+  });
+
+  it("explains what the page does in the words of the spec", async () => {
+    render(<EgressCredentials />);
+    expect(
+      await screen.findByText(
+        "Connect an account or paste an API key for the services below, or add a service of your own. MindRoom stores them and adds them to your agents' requests to the matching websites. Your agents never get the keys themselves, but a website can send a key back in its response (an echo service does), so only add keys for sites you trust. Saved keys cannot be read back.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/never see them/)).toBeNull();
+  });
+});
+
+describe("rows grouped by who added them", () => {
+  const config = (name: string, display: string): EgressCredentialService => ({
+    ...service,
+    name,
+    display_name: display,
+    source: "config",
+  });
+  const own = (name: string, display: string): EgressCredentialService => ({
+    ...service,
+    name,
+    display_name: display,
+    source: "user",
+  });
+  const agentOf = (
+    changes: Partial<EgressCredentialAgent>,
+  ): EgressCredentialAgent => ({ ...agents[0], ...changes });
+  const show = (listing: EgressCredentialAgent[]) => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input) === "/api/connections/me") return json(identity);
+      return json({ agents: listing });
+    });
+    render(<EgressCredentials />);
+  };
+  const groupsOf = (region: HTMLElement) =>
+    within(region)
+      .getAllByRole("group")
+      .map((group) => [
+        group.getAttribute("aria-label"),
+        within(group)
+          .getAllByRole("listitem")
+          .map((item) => item.getAttribute("aria-label")),
+      ]);
+
+  it("lists the administrator's services apart from the ones you added", async () => {
+    show([
+      agentOf({
+        services: [
+          own("mine", "My API"),
+          config("github", "GitHub"),
+          config("openai", "OpenAI"),
+        ],
+      }),
+    ]);
+    const region = await screen.findByRole("region", { name: "Personal Mind" });
+    expect(groupsOf(region)).toEqual([
+      ["From your administrator", ["GitHub", "OpenAI"]],
+      ["Added by you", ["My API"]],
+    ]);
+    expect(
+      within(region).getByRole("heading", { name: "From your administrator" }),
+    ).toBeVisible();
+    expect(
+      within(region).getByRole("heading", { name: "Added by you" }),
+    ).toBeVisible();
+    expect(
+      within(region).queryByText("Added by your administrator"),
+    ).toBeNull();
+  });
+
+  it("names the credential managers as the source on a shared agent", async () => {
+    show([
+      agentOf({
+        agent_name: "shared_dev",
+        agent_display_name: "Shared Dev",
+        shared: true,
+        scope: "shared",
+        managers: ["@bob:example.org"],
+        services: [own("team", "Team API"), config("github", "GitHub")],
+      }),
+    ]);
+    const region = await screen.findByRole("region", { name: "Shared Dev" });
+    expect(groupsOf(region).map(([name]) => name)).toEqual([
+      "From your administrator",
+      "Added by its credential managers",
+    ]);
+  });
+
+  it("shows only the groups that have rows", async () => {
+    show([agentOf({ services: [config("github", "GitHub")] })]);
+    const region = await screen.findByRole("region", { name: "Personal Mind" });
+    expect(groupsOf(region).map(([name]) => name)).toEqual([
+      "From your administrator",
+    ]);
+  });
+
+  it("keeps the agents in the order the API sends them, also after a reload", async () => {
+    const listing = [
+      agentOf({ agent_name: "z", agent_display_name: "Zed", services: [] }),
+      agentOf({ agent_name: "a", agent_display_name: "Alpha", services: [] }),
+      agentOf({ agent_name: "m", agent_display_name: "Mid", services: [] }),
+    ];
+    show(listing);
+    const names = () =>
+      screen
+        .getAllByRole("region")
+        .map((region) => region.getAttribute("aria-labelledby"));
+    await screen.findByRole("region", { name: "Zed" });
+    expect(names()).toEqual([
+      "egress-agent-z",
+      "egress-agent-a",
+      "egress-agent-m",
+    ]);
+  });
+});
+
+describe("who can change a shared agent's keys", () => {
+  const shared = (
+    changes: Partial<EgressCredentialAgent>,
+  ): EgressCredentialAgent => ({
+    ...agents[1],
+    managers: ["@bob:example.org", "@carol:example.org"],
+    ...changes,
+  });
+  const show = (listing: EgressCredentialAgent[]) => {
+    vi.mocked(fetch).mockImplementation(async (input) =>
+      String(input) === "/api/connections/me"
+        ? json(identity)
+        : json({ agents: listing }),
+    );
+    render(<EgressCredentials />);
+  };
+
+  it("tells a non-manager which managers can", async () => {
+    show([shared({})]);
+    const region = await screen.findByRole("region", { name: "Shared Dev" });
+    expect(
+      within(region).getByText(
+        "Only @bob:example.org and @carol:example.org can change keys for this shared agent.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(region).queryByText(/Managed by credential managers/),
+    ).toBeNull();
+  });
+
+  it("falls back to administrators when no manager is named", async () => {
+    show([shared({ managers: [] })]);
+    expect(
+      await screen.findByText(
+        "Only administrators can change keys for this shared agent.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("tells a manager they manage the keys, and that everyone shares them", async () => {
+    show([
+      shared({
+        can_manage: true,
+        services: [{ ...agents[1].services[0], can_manage: true }],
+      }),
+    ]);
+    expect(
+      await screen.findByText(
+        "You manage this shared agent's keys. Everyone who uses it shares them.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/Only .* can change keys/)).toBeNull();
+  });
+
+  it("says nothing of the sort on an agent that is only yours", async () => {
+    show([agents[0]]);
+    await screen.findByRole("region", { name: "Personal Mind" });
+    expect(screen.queryByText(/shared agent's keys/)).toBeNull();
+    expect(screen.queryByText(/can change keys/)).toBeNull();
+  });
+
+  it("tells a viewer why their personal account is refused, by role", async () => {
+    const refused = {
+      ...service,
+      is_shared: true,
+      can_manage: false,
+      oauth: {
+        ...account,
+        can_connect: false,
+        unavailable_reason: "shared_sandbox" as const,
+      },
+    };
+    show([shared({ services: [refused] })]);
+    expect(
+      await screen.findByText(
+        "Personal GitHub accounts can't be used by shared agents. Ask @bob:example.org and @carol:example.org to add a team API key.",
+      ),
+    ).toBeVisible();
+    cleanup();
+    show([
+      shared({
+        can_manage: true,
+        services: [{ ...refused, can_manage: true }],
+      }),
+    ]);
+    expect(
+      await screen.findByText(
+        "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("asks before connecting a shared account and uses the agent's name", async () => {
+    vi.spyOn(window, "open").mockReturnValue({
+      closed: false,
+      close: vi.fn(),
+      location: { href: "about:blank" },
+    } as unknown as Window);
+    const google = {
+      ...service,
+      name: "gmail",
+      display_name: "Gmail",
+      is_shared: true,
+      can_manage: true,
+      oauth: { ...account, provider: "google", display_name: "Google" },
+    };
+    show([shared({ can_manage: true, services: [google] })]);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Connect Google" }),
+    );
+    expect(
+      within(
+        await screen.findByRole("dialog", {
+          name: "Connect a shared account?",
+        }),
+      ).getByText(
+        "Everyone who uses Shared Dev will act as the Google account you pick. Use a team account, not your personal one.",
+      ),
+    ).toBeVisible();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([input]) => String(input).endsWith("/connect")),
+    ).toHaveLength(0);
+  });
+});
+
+describe("limiting a GitHub service to repositories", () => {
+  let listing: EgressCredentialAgent[];
+  const githubRules = [
+    { host: "api.github.com", port: null, path_prefix: "/" },
+    { host: "github.com", port: null, path_prefix: "/" },
+  ];
+  const limited = (
+    name: string,
+    repositories: string,
+  ): EgressCredentialService => ({
+    ...service,
+    name,
+    display_name: `GitHub (${repositories})`,
+    description: "",
+    source: "user",
+    rules: githubRepositoryRules(repositories, {
+      uploads: false,
+      graphql: false,
+    }).rules.map((rule) => ({
+      host: rule.host,
+      port: null,
+      path_prefix: rule.path_prefix ?? "/",
+    })),
+  });
+
+  beforeEach(() => {
+    listing = [
+      {
+        ...agents[0],
+        services: [{ ...service, source: "config", rules: githubRules }],
+      },
+    ];
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/connections/me") return json(identity);
+      if (path === "/api/connections/egress") return json({ agents: listing });
+      if (path === "/api/connections/egress/presets")
+        return json(egressPresets);
+      throw new Error(`Unexpected request: ${path}`);
+    });
+  });
+
+  it("opens the editor to add a GitHub service named github-limited", async () => {
+    render(<EgressCredentials />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Limit GitHub to repositories",
+      }),
+    );
+    await presetsReady();
+    expect(screen.getByLabelText("Name")).toHaveValue("github-limited");
+    expect(screen.getByLabelText("Preset")).toHaveValue("github");
+    expect(screen.getByRole("button", { name: "Save service" })).toBeVisible();
+    // The editor is open, so a second one is not started.
+    expect(
+      screen.getByRole("button", { name: "Limit GitHub to repositories" }),
+    ).toBeDisabled();
+  });
+
+  it("takes the next free name when github-limited is already there", async () => {
+    listing[0].services.push(limited("github-limited", "a/b"));
+    render(<EgressCredentials />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Limit GitHub to repositories",
+      }),
+    );
+    await presetsReady();
+    expect(screen.getByLabelText("Name")).toHaveValue("github-limited-2");
+  });
+
+  it("offers it only to someone who can manage the agent", async () => {
+    listing[0] = {
+      ...listing[0],
+      can_manage: false,
+      services: [
+        { ...service, source: "config", rules: githubRules, can_manage: false },
+      ],
+    };
+    render(<EgressCredentials />);
+    await screen.findByRole("region", { name: "Personal Mind" });
+    expect(screen.queryByText("Limit to repositories")).toBeNull();
+  });
+
+  it("shows what a limited service is limited to", async () => {
+    listing[0].services.push(limited("gh-a", "basnijholt/agent-cli"));
+    render(<EgressCredentials />);
+    const row = await screen.findByLabelText("GitHub (basnijholt/agent-cli)");
+    expect(
+      within(row).getByText("Limited to basnijholt/agent-cli"),
+    ).toBeVisible();
+  });
+});
+
+describe("recent requests: wording and wrapping", () => {
+  beforeEach(() => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/connections/me") return json(identity);
+      if (path === "/api/connections/egress") return json({ agents });
+      return json({
+        records: [
+          {
+            at: "2026-10-09T10:30:00+00:00",
+            kind: "tunnel",
+            agent_name: "personal",
+            method: "CONNECT",
+            host: "example.com",
+            path: "",
+            service: null,
+            status: 200,
+            code: null,
+          },
+          {
+            at: "2026-10-09T10:00:00+00:00",
+            kind: "denied",
+            agent_name: "personal",
+            method: "GET",
+            host: "api.github.com",
+            path: "/repos/a/b",
+            service: "github",
+            status: 403,
+            code: "credential_not_configured",
+          },
+          {
+            at: "2026-10-09T09:00:00+00:00",
+            kind: "denied",
+            agent_name: "personal",
+            method: "CONNECT",
+            host: "blocked.example",
+            path: "",
+            service: null,
+            status: 403,
+            code: "host_not_allowed",
+          },
+        ],
+      });
+    });
+  });
+
+  const openLog = async () => {
+    fireEvent.click(
+      within(
+        await screen.findByRole("region", { name: "Personal Mind" }),
+      ).getByRole("button", { name: "Recent requests" }),
+    );
+    return screen.findByRole("table", { name: "Recent requests for personal" });
+  };
+
+  it("says a relayed CONNECT passed through with no key added", async () => {
+    render(<EgressCredentials />);
+    const rows = within(await openLog()).getAllByRole("row");
+    expect(within(rows[1]).getAllByRole("cell")[4]).toHaveTextContent(
+      "Passed through (no key added)",
+    );
+    // A refused CONNECT was not passed through, and a request with a service names it.
+    expect(within(rows[2]).getAllByRole("cell")[4]).toHaveTextContent("github");
+    expect(within(rows[3]).getAllByRole("cell")[4]).not.toHaveTextContent(
+      "Passed through",
+    );
+  });
+
+  it("explains in a caption that other sites pass straight through", async () => {
+    render(<EgressCredentials />);
+    const table = await openLog();
+    expect(table.querySelector("caption")).toHaveTextContent(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host.",
+    );
+  });
+
+  it("lets a refusal code wrap after each underscore and never mid-word", async () => {
+    render(<EgressCredentials />);
+    const table = await openLog();
+    const code = within(table)
+      .getByText("credential_not_configured")
+      .closest("div")!;
+    expect(code.className).not.toContain("break-all");
+    expect(code.textContent).toBe("credential_not_configured");
+    expect(code.querySelectorAll("wbr")).toHaveLength(2);
+    // The break opportunities sit right after the underscores.
+    expect(code.innerHTML).toBe("credential_<wbr>not_<wbr>configured");
   });
 });
