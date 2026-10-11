@@ -117,16 +117,22 @@ The rewritten request is `[leading system and developer messages, summary messag
 A request is scoped when its target replays persisted history (`add_history_to_context`) and has session storage.
 
 - The hook runs the existing scope compactor (`compact_scope_history` through `history/runtime.py`) on the session object Agno loaded for this run, which the builder patch recorded, after reconciling it; the compactor already adopts the freshest stored row into that object after every committed chunk, so Agno's end-of-run row write carries the new summary even when a later chunk fails or the run is cancelled.
-  The one addition is an in-progress snapshot appended as the last compactable run.
-- The snapshot is a `RunOutput` or `TeamRunOutput` with the scope's agent or team id, status completed, a copy of the live run's metadata (every Matrix event id the run has consumed so far), and the folded current-turn messages plus the current input as context for the summarizer.
+  The one addition is the running turn's snapshots, appended after every visible run as the last compactable runs.
+- Each folded exchange of the turn (an assistant message with the tool results that answer it) becomes one snapshot: a completed `RunOutput` or `TeamRunOutput` with the scope's agent or team id.
+  The first snapshot also carries the current input, for the summarizer's context, and a copy of the live run's metadata (every Matrix event id the run has consumed so far); the others carry no metadata, since redaction normalizes every snapshot to its run.
+  Separate snapshots let the existing chunker size the turn with the summary model's own estimator and summarize it in as many chunks as it needs, so only an exchange larger than a whole summary input is excerpted.
+  Run-local compaction summarizes the same snapshots in chunks with `summarize_runs`.
   Its run id is unique per snapshot and starts with the live run's id (`archive.snapshot_run_id(origin_run_id)` appends a fresh suffix), so the archive can find every snapshot of a run, two snapshots of one run never collide, and none collides with the live run, which keeps its own id and stays live.
 - Redaction treats a run and its snapshots as one: when redaction removes a live run, or hits a run archived later, compaction rolls back to the earliest archived row of that run or any of its snapshots, using the existing `roll_back_to`.
   Redaction therefore keeps the ids of the runs it removes (`remove_run_by_event_id` returns them) and looks up their snapshots before rolling back.
   This covers events the run consumed after its snapshot was taken and the reply event attached to the live run after it finished.
   Snapshots are always the last run of their generation and are never restored as live runs.
-- The in-flight list is rewritten only when the snapshot was archived, which means every earlier run was archived too; that includes a cancellation that arrives after the snapshot's chunk committed, where the hook rewrites the list before the cancellation propagates.
-  A compaction that commits earlier chunks and then fails leaves the request unchanged and marks the run as failed for mid-turn compaction; storage and the live session stay consistent, and the next reply's preparation continues from the committed chunks.
-- After the rewrite the hook re-sizes the request; when the system prompt, tools, current prompt, and new summary still exceed the limit, it raises the error replay planning already uses, `Saved conversation summary exceeds the available history budget`, instead of sending an oversized request.
+- A turn's snapshots commit together: the in-flight list is rewritten only when every snapshot was archived, including when a cancellation arrives after the last chunk committed.
+  When a later chunk fails or is cancelled after some of the turn's snapshots committed, the turn is rolled back to before its first snapshot (`roll_back_running_turn`), so the request stays unchanged and no kept assistant message sits behind a rewritten prefix.
+  Chunks of earlier runs that committed before the turn's first snapshot stay compacted; the run stops compacting for the rest of the reply.
+- Tool results join the latest assistant tool call even when a projection such as an approval receipt sits between them, so a fold never leaves a tool result without its call.
+- After the rewrite the hook re-sizes the request; when the system prompt, tools, current prompt, and new summary exceed the model's own `context_window` minus `reserve_tokens`, it raises the error replay planning already uses, `Saved conversation summary exceeds the available history budget`, instead of sending an oversized request.
+  When they fit the model window but still exceed the replay window, the run stops compacting, since compacting again would only summarize each new tool result before the model saw it.
 - The force-compaction flag is left untouched, so a `compact_context` request made during the turn still applies before the next reply.
 - Folded assistant messages leave the run record, so their per-request usage is appended to `run_response.metadata` under a dedicated key that `usage_storage.project_usage` merges into the run's request list in order; run totals and the request breakdown stay complete across repeated compactions, approval resumes, and cancellation.
   The summary input omits that metadata key.
