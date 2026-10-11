@@ -235,10 +235,6 @@ def _require_management(context: _Connections, agent_name: str, provider_id: str
     return context.providers[provider_id]
 
 
-def _require_same_origin(request: Request, context: _Connections) -> None:
-    require_connections_same_origin(request, context.runtime_paths)
-
-
 async def _service_connected(
     request: Request,
     context: _Connections,
@@ -436,7 +432,7 @@ async def connect(
     _body: _EmptyMutation,
 ) -> oauth.OAuthConnectResponse:
     """Start existing OAuth state handling with an authorized agent target."""
-    _require_same_origin(request, context)
+    require_connections_same_origin(request, context.runtime_paths)
     provider = _require_management(context, agent_name, provider_id)
     if oauth_provider_service_account_configured(provider, context.runtime_paths):
         raise HTTPException(
@@ -463,7 +459,7 @@ async def disconnect(
     _body: _EmptyMutation,
 ) -> dict[str, str]:
     """Reset the authorized agent's scoped provider credentials."""
-    _require_same_origin(request, context)
+    require_connections_same_origin(request, context.runtime_paths)
     _require_management(context, agent_name, provider_id)
     try:
         return await oauth.disconnect(provider_id, request, agent_name=agent_name)
