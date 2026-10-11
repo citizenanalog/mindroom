@@ -6,7 +6,9 @@ import base64
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from pathlib import Path  # noqa: TC003 - Required at runtime for test fixtures
+from typing import Literal
 
 import pytest
 
@@ -40,14 +42,21 @@ def test_roundtrip(signer: TokenSigner, claims: WorkerClaims) -> None:
     assert signer.verify(signer.mint(claims)) == claims
 
 
-def test_expired_token_rejected(signer: TokenSigner, claims: WorkerClaims) -> None:
-    """Token expired beyond TTL is rejected."""
-    assert signer.verify(signer.mint(claims, now=1000), now=1000 + 604801) is None
-
-
-def test_token_valid_until_ttl(signer: TokenSigner, claims: WorkerClaims) -> None:
-    """Token is valid until TTL."""
-    assert signer.verify(signer.mint(claims, now=1000), now=1000 + 604799) == claims
+@pytest.mark.parametrize(
+    ("age_seconds", "valid"),
+    [
+        pytest.param(604799, True, id="valid-until-ttl"),
+        pytest.param(604801, False, id="expired-beyond-ttl"),
+    ],
+)
+def test_token_expires_with_the_default_ttl(
+    signer: TokenSigner,
+    claims: WorkerClaims,
+    age_seconds: int,
+    valid: bool,
+) -> None:
+    """A token verifies until the default one-week TTL and is rejected after it."""
+    assert signer.verify(signer.mint(claims, now=1000), now=1000 + age_seconds) == (claims if valid else None)
 
 
 def test_custom_ttl(claims: WorkerClaims) -> None:
@@ -153,7 +162,7 @@ def test_signed_payload_with_invalid_content_is_rejected(signer: TokenSigner, pa
     assert signer.verify(_signed_token(payload), now=1000) is None
 
 
-def test_load_or_create_persists_key_with_0600(tmp_path: Path) -> None:
+def test_load_or_create_persists_key_with_0600(tmp_path: Path, claims: WorkerClaims) -> None:
     """load_or_create persists key with mode 0600."""
     key_path = tmp_path / "broker.key"
     signer1 = TokenSigner.load_or_create(key_path)
@@ -168,16 +177,6 @@ def test_load_or_create_persists_key_with_0600(tmp_path: Path) -> None:
     assert parent_mode == 0o700
 
     # Same key works for both signers
-    claims = WorkerClaims(
-        worker_key="test",
-        worker_scope=None,
-        routing_agent_name=None,
-        tenant_id=None,
-        account_id=None,
-        channel="matrix",
-        agent_name="agent",
-        requester_id=None,
-    )
     token = signer1.mint(claims)
     assert signer2.verify(token) == claims
 
@@ -222,6 +221,23 @@ def test_load_or_create_leaves_no_partial_key_on_failure(tmp_path: Path, monkeyp
     assert key_path.stat().st_mode & 0o777 == 0o600
 
 
+def _worker_target(
+    identity: ToolExecutionIdentity | None,
+    *,
+    worker_key: str | None = "worker_abc",
+    tenant_id: str | None = None,
+    account_id: str | None = None,
+) -> ResolvedWorkerTarget:
+    return ResolvedWorkerTarget(
+        worker_scope="user",
+        routing_agent_name="router",
+        execution_identity=identity,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        worker_key=worker_key,
+    )
+
+
 def test_from_worker_target_drops_room_thread_session() -> None:
     """from_worker_target drops room_id, thread_id, session_id."""
     identity = ToolExecutionIdentity(
@@ -235,35 +251,16 @@ def test_from_worker_target_drops_room_thread_session() -> None:
         tenant_id="tenant_1",
         account_id="account_1",
     )
-    target1 = ResolvedWorkerTarget(
-        worker_scope="user",
-        routing_agent_name="router",
-        execution_identity=identity,
-        tenant_id="tenant_1",
-        account_id="account_1",
-        worker_key="worker_abc",
-    )
-    target2 = ResolvedWorkerTarget(
-        worker_scope="user",
-        routing_agent_name="router",
-        execution_identity=ToolExecutionIdentity(
-            channel="matrix",
-            agent_name="agent_1",
-            requester_id="@user:example.com",
-            room_id="!different:example.com",  # different room_id
-            thread_id="$different",  # different thread_id
-            resolved_thread_id="$resolved",
-            session_id="different_session",  # different session_id
-            tenant_id="tenant_1",
-            account_id="account_1",
-        ),
-        tenant_id="tenant_1",
-        account_id="account_1",
-        worker_key="worker_abc",
+    other_conversation = replace(
+        identity,
+        room_id="!different:example.com",
+        thread_id="$different",
+        session_id="different_session",
     )
 
-    claims1 = WorkerClaims.from_worker_target(target1)
-    claims2 = WorkerClaims.from_worker_target(target2)
+    ids = {"tenant_id": "tenant_1", "account_id": "account_1"}
+    claims1 = WorkerClaims.from_worker_target(_worker_target(identity, **ids))
+    claims2 = WorkerClaims.from_worker_target(_worker_target(other_conversation, **ids))
     assert claims1 == claims2
 
 
@@ -321,62 +318,33 @@ def test_to_worker_target_roundtrip_preserves_scope_agent_requester() -> None:
     assert rebuilt_target.private_agent_names is None
 
 
-def test_scope_label() -> None:
+@pytest.mark.parametrize(("worker_scope", "label"), [("user", "user"), (None, "unscoped")])
+def test_scope_label(claims: WorkerClaims, worker_scope: Literal["user"] | None, label: str) -> None:
     """scope_label returns worker_scope or unscoped."""
-    claims_with_scope = WorkerClaims(
-        worker_key="key",
-        worker_scope="user",
-        routing_agent_name=None,
-        tenant_id=None,
-        account_id=None,
-        channel="matrix",
-        agent_name="agent",
-        requester_id=None,
-    )
-    assert claims_with_scope.scope_label == "user"
-
-    claims_unscoped = WorkerClaims(
-        worker_key="key",
-        worker_scope=None,
-        routing_agent_name=None,
-        tenant_id=None,
-        account_id=None,
-        channel="matrix",
-        agent_name="agent",
-        requester_id=None,
-    )
-    assert claims_unscoped.scope_label == "unscoped"
+    assert replace(claims, worker_scope=worker_scope).scope_label == label
 
 
-def test_from_worker_target_returns_none_when_worker_key_is_none() -> None:
-    """from_worker_target returns None when worker_key is None."""
-    target = ResolvedWorkerTarget(
-        worker_scope="user",
-        routing_agent_name="router",
-        execution_identity=ToolExecutionIdentity(
-            channel="matrix",
-            agent_name="agent",
-            requester_id="@user:example.com",
-            room_id=None,
-            thread_id=None,
-            resolved_thread_id=None,
-            session_id=None,
-        ),
-        tenant_id=None,
-        account_id=None,
-        worker_key=None,  # None worker_key
-    )
-    assert WorkerClaims.from_worker_target(target) is None
+_BARE_IDENTITY = ToolExecutionIdentity(
+    channel="matrix",
+    agent_name="agent",
+    requester_id="@user:example.com",
+    room_id=None,
+    thread_id=None,
+    resolved_thread_id=None,
+    session_id=None,
+)
 
 
-def test_from_worker_target_returns_none_when_execution_identity_is_none() -> None:
-    """from_worker_target returns None when execution_identity is None."""
-    target = ResolvedWorkerTarget(
-        worker_scope="user",
-        routing_agent_name="router",
-        execution_identity=None,  # None execution_identity
-        tenant_id=None,
-        account_id=None,
-        worker_key="worker_abc",
-    )
-    assert WorkerClaims.from_worker_target(target) is None
+@pytest.mark.parametrize(
+    ("identity", "worker_key"),
+    [
+        pytest.param(_BARE_IDENTITY, None, id="worker-key-none"),
+        pytest.param(None, "worker_abc", id="execution-identity-none"),
+    ],
+)
+def test_from_worker_target_returns_none_without_a_worker_key_or_identity(
+    identity: ToolExecutionIdentity | None,
+    worker_key: str | None,
+) -> None:
+    """from_worker_target returns None when worker_key or execution_identity is None."""
+    assert WorkerClaims.from_worker_target(_worker_target(identity, worker_key=worker_key)) is None

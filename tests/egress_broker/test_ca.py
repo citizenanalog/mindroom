@@ -17,18 +17,28 @@ from cryptography.x509.oid import NameOID
 from mindroom.egress_broker.ca import BrokerCA, materialize_ca_bundle
 
 
-def test_create_then_load_returns_same_ca(tmp_path: Path) -> None:
+@pytest.fixture
+def ca_dir(tmp_path: Path) -> Path:
+    """Return the directory the CA under test is stored in (not yet created)."""
+    return tmp_path / "ca"
+
+
+@pytest.fixture
+def ca(ca_dir: Path) -> BrokerCA:
+    """Return a CA created, unencrypted, in `ca_dir`."""
+    return BrokerCA.load_or_create(ca_dir, key_password=None)
+
+
+def test_create_then_load_returns_same_ca(ca_dir: Path) -> None:
     """load_or_create returns same CA across calls."""
-    ca_dir = tmp_path / "ca"
     ca1 = BrokerCA.load_or_create(ca_dir, key_password=None)
     ca2 = BrokerCA.load_or_create(ca_dir, key_password=None)
     assert ca1.fingerprint == ca2.fingerprint
     assert ca1.cert_pem == ca2.cert_pem
 
 
-def test_key_file_mode_and_encryption(tmp_path: Path) -> None:
+def test_key_file_mode_and_encryption(ca_dir: Path) -> None:
     """Key file has mode 0600 and is encrypted when password is provided."""
-    ca_dir = tmp_path / "ca"
     password = b"test-password"
 
     BrokerCA.load_or_create(ca_dir, key_password=password)
@@ -75,9 +85,8 @@ def _write_ca_without_subject_key_identifier(ca_dir: Path) -> ec.EllipticCurvePr
     return key
 
 
-def test_ca_without_subject_key_identifier_is_reissued_for_the_same_key(tmp_path: Path) -> None:
+def test_ca_without_subject_key_identifier_is_reissued_for_the_same_key(ca_dir: Path) -> None:
     """A CA from before the SubjectKeyIdentifier fix gets a new certificate for its existing key, written to disk."""
-    ca_dir = tmp_path / "ca"
     key = _write_ca_without_subject_key_identifier(ca_dir)
 
     ca = BrokerCA.load_or_create(ca_dir, key_password=None)
@@ -91,10 +100,9 @@ def test_ca_without_subject_key_identifier_is_reissued_for_the_same_key(tmp_path
     assert BrokerCA.load_or_create(ca_dir, key_password=None).cert_pem == ca.cert_pem
 
 
-def test_ca_key_that_is_not_ecdsa_is_refused(tmp_path: Path) -> None:
+@pytest.mark.usefixtures("ca")
+def test_ca_key_that_is_not_ecdsa_is_refused(ca_dir: Path) -> None:
     """An existing CA key of another type raises TypeError instead of being used."""
-    ca_dir = tmp_path / "ca"
-    BrokerCA.load_or_create(ca_dir, key_password=None)
     rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     (ca_dir / "ca.key").write_bytes(
         rsa_key.private_bytes(
@@ -108,102 +116,27 @@ def test_ca_key_that_is_not_ecdsa_is_refused(tmp_path: Path) -> None:
         BrokerCA.load_or_create(ca_dir, key_password=None)
 
 
-def test_leaf_verifies_against_ca_for_dns_and_ip(tmp_path: Path) -> None:
-    """Leaf certificates verify against CA for DNS names and IP addresses."""
-    ca_dir = tmp_path / "ca"
-    ca = BrokerCA.load_or_create(ca_dir, key_password=None)
-
-    # Test DNS name
-    dns_host = "api.github.com"
-    server_ctx = ca.server_context(dns_host)
-
-    # Create client context trusting the CA
-    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    client_ctx.check_hostname = False  # We're testing cert trust, not hostname validation
-    client_ctx.verify_mode = ssl.CERT_REQUIRED
-    client_ctx.load_verify_locations(cadata=ca.cert_pem)
-
-    # Test handshake with DNS name
-    _test_handshake(server_ctx, client_ctx, server_hostname=dns_host)
-
-    # Test IP address
-    ip_host = "127.0.0.1"
-    server_ctx_ip = ca.server_context(ip_host)
-
-    # Test handshake with IP (no hostname validation for IPs)
-    _test_handshake(server_ctx_ip, client_ctx, server_hostname=None)
+def _client_context(ca: BrokerCA, *, strict: bool = False, alpn: list[str] | None = None) -> ssl.SSLContext:
+    """Return a client context trusting `ca`; it checks the certificate chain but not the host name."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False  # These tests are about certificate trust, not host name validation.
+    context.verify_mode = ssl.CERT_REQUIRED
+    if strict:
+        # Strict X.509 verification (required in Python 3.13+).
+        context.verify_flags = ssl.VERIFY_X509_STRICT
+    context.load_verify_locations(cadata=ca.cert_pem)
+    if alpn:
+        context.set_alpn_protocols(alpn)
+    return context
 
 
-def _test_handshake(
+def _handshake(
     server_ctx: ssl.SSLContext,
     client_ctx: ssl.SSLContext,
     *,
     server_hostname: str | None,
-) -> None:
-    """Perform TLS handshake over socketpair."""
-    server_sock, client_sock = socket.socketpair()
-    server_error = None
-    client_error = None
-
-    def server_side() -> None:
-        nonlocal server_error
-        try:
-            server_ssl = server_ctx.wrap_socket(server_sock, server_side=True)
-            server_ssl.close()
-        except Exception as e:
-            server_error = e
-
-    def client_side() -> None:
-        nonlocal client_error
-        try:
-            client_ssl = client_ctx.wrap_socket(
-                client_sock,
-                server_side=False,
-                server_hostname=server_hostname,
-            )
-            client_ssl.close()
-        except Exception as e:
-            client_error = e
-
-    server_thread = threading.Thread(target=server_side)
-    client_thread = threading.Thread(target=client_side)
-
-    server_thread.start()
-    client_thread.start()
-
-    server_thread.join(timeout=5)
-    client_thread.join(timeout=5)
-
-    server_sock.close()
-    client_sock.close()
-
-    if server_error:
-        raise server_error
-    if client_error:
-        raise client_error
-
-
-def test_server_context_is_cached(tmp_path: Path) -> None:
-    """server_context returns cached context for same host."""
-    ca_dir = tmp_path / "ca"
-    ca = BrokerCA.load_or_create(ca_dir, key_password=None)
-    assert ca.server_context("a.test") is ca.server_context("a.test")
-
-
-def test_alpn_is_http11_only(tmp_path: Path) -> None:
-    """Server context negotiates http/1.1 only."""
-    ca_dir = tmp_path / "ca"
-    ca = BrokerCA.load_or_create(ca_dir, key_password=None)
-    server_ctx = ca.server_context("test.example.com")
-
-    # Create client that offers h2 and http/1.1
-    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    client_ctx.check_hostname = False
-    client_ctx.verify_mode = ssl.CERT_REQUIRED
-    client_ctx.load_verify_locations(cadata=ca.cert_pem)
-    client_ctx.set_alpn_protocols(["h2", "http/1.1"])
-
-    # Perform handshake
+) -> str | None:
+    """Perform a TLS handshake over a socketpair and return the ALPN protocol the client selected."""
     server_sock, client_sock = socket.socketpair()
     server_error = None
     client_error = None
@@ -223,7 +156,7 @@ def test_alpn_is_http11_only(tmp_path: Path) -> None:
             client_ssl = client_ctx.wrap_socket(
                 client_sock,
                 server_side=False,
-                server_hostname="test.example.com",
+                server_hostname=server_hostname,
             )
             selected_protocol = client_ssl.selected_alpn_protocol()
             client_ssl.close()
@@ -246,47 +179,37 @@ def test_alpn_is_http11_only(tmp_path: Path) -> None:
         raise server_error
     if client_error:
         raise client_error
+    return selected_protocol
 
-    # Check negotiated protocol
+
+@pytest.mark.parametrize("strict", [False, True], ids=["default", "strict"])
+def test_leaf_verifies_against_ca_for_dns_and_ip(ca: BrokerCA, *, strict: bool) -> None:
+    """Leaf certificates verify against the CA for DNS names and IP addresses, also under strict X.509 checks."""
+    client_ctx = _client_context(ca, strict=strict)
+
+    # A DNS name, then an IP address (no hostname validation for IPs).
+    _handshake(ca.server_context("api.github.com"), client_ctx, server_hostname="api.github.com")
+    _handshake(ca.server_context("127.0.0.1"), client_ctx, server_hostname=None)
+
+
+def test_server_context_is_cached(ca: BrokerCA) -> None:
+    """server_context returns cached context for same host."""
+    assert ca.server_context("a.test") is ca.server_context("a.test")
+
+
+def test_alpn_is_http11_only(ca: BrokerCA) -> None:
+    """Server context negotiates http/1.1 only, even when the client offers h2 first."""
+    selected_protocol = _handshake(
+        ca.server_context("test.example.com"),
+        _client_context(ca, alpn=["h2", "http/1.1"]),
+        server_hostname="test.example.com",
+    )
+
     assert selected_protocol == "http/1.1"
 
 
-def test_strict_tls_verification_accepts_broker_certs(tmp_path: Path) -> None:
-    """Leaf certificates pass strict X.509 verification (Python 3.13+)."""
-    ca_dir = tmp_path / "ca"
-    ca = BrokerCA.load_or_create(ca_dir, key_password=None)
-
-    # Test DNS name with strict verification
-    dns_host = "api.github.com"
-    server_ctx_dns = ca.server_context(dns_host)
-
-    client_ctx_dns = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    client_ctx_dns.check_hostname = False
-    client_ctx_dns.verify_mode = ssl.CERT_REQUIRED
-    # Enable strict X.509 verification (required in Python 3.13+)
-    client_ctx_dns.verify_flags = ssl.VERIFY_X509_STRICT
-    client_ctx_dns.load_verify_locations(cadata=ca.cert_pem)
-
-    _test_handshake(server_ctx_dns, client_ctx_dns, server_hostname=dns_host)
-
-    # Test IP address with strict verification
-    ip_host = "127.0.0.1"
-    server_ctx_ip = ca.server_context(ip_host)
-
-    client_ctx_ip = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    client_ctx_ip.check_hostname = False
-    client_ctx_ip.verify_mode = ssl.CERT_REQUIRED
-    client_ctx_ip.verify_flags = ssl.VERIFY_X509_STRICT
-    client_ctx_ip.load_verify_locations(cadata=ca.cert_pem)
-
-    _test_handshake(server_ctx_ip, client_ctx_ip, server_hostname=None)
-
-
-def test_materialize_bundle_contains_system_roots_and_broker_ca(tmp_path: Path) -> None:
+def test_materialize_bundle_contains_system_roots_and_broker_ca(tmp_path: Path, ca: BrokerCA) -> None:
     """materialize_bundle creates combined bundle with system roots and broker CA."""
-    ca_dir = tmp_path / "ca"
-    ca = BrokerCA.load_or_create(ca_dir, key_password=None)
-
     bundle_dir = tmp_path / "bundles"
     bundle_dir.mkdir()
 
@@ -314,9 +237,8 @@ def test_materialize_bundle_contains_system_roots_and_broker_ca(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("which", ["combined", "broker_only"])
-def test_materialize_bundle_replaces_tampered_file(tmp_path: Path, which: str) -> None:
+def test_materialize_bundle_replaces_tampered_file(tmp_path: Path, ca: BrokerCA, which: str) -> None:
     """A pre-existing bundle file with other content is rewritten instead of trusted."""
-    ca = BrokerCA.load_or_create(tmp_path / "ca", key_password=None)
     bundle_dir = tmp_path / "bundles"
     combined, broker_only = materialize_ca_bundle(ca.cert_pem, bundle_dir)
     expected = {"combined": combined.read_text(), "broker_only": broker_only.read_text()}
@@ -331,9 +253,8 @@ def test_materialize_bundle_replaces_tampered_file(tmp_path: Path, which: str) -
     assert sorted(path.name for path in bundle_dir.iterdir()) == sorted([combined.name, broker_only.name])
 
 
-def test_materialize_bundle_replaces_symlink(tmp_path: Path) -> None:
+def test_materialize_bundle_replaces_symlink(tmp_path: Path, ca: BrokerCA) -> None:
     """A symlink planted at a bundle path is replaced by a regular file, never followed."""
-    ca = BrokerCA.load_or_create(tmp_path / "ca", key_password=None)
     bundle_dir = tmp_path / "bundles"
     combined, broker_only = materialize_ca_bundle(ca.cert_pem, bundle_dir)
     planted = tmp_path / "planted.pem"

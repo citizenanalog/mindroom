@@ -27,11 +27,17 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 
-def _manager(tmp_path: Path) -> CredentialsManager:
-    """Create a CredentialsManager with proper directory structure."""
-    # Create a credentials subdirectory so storage_root is tmp_path, not tmp_path.parent
-    creds_path = tmp_path / "credentials"
-    return CredentialsManager(creds_path)
+@pytest.fixture
+def manager(tmp_path: Path) -> CredentialsManager:
+    """Return a CredentialsManager whose storage root is `tmp_path`, not its parent."""
+    return CredentialsManager(tmp_path / "credentials")
+
+
+def _assert_nothing_stored_under(root: Path, *directories: str) -> None:
+    """Check that no `egress_github*` file exists below `root / directory` for any of `directories`."""
+    for directory in directories:
+        if (root / directory).exists():
+            assert list((root / directory).rglob("egress_github*")) == []
 
 
 def _claims(
@@ -55,9 +61,8 @@ def _claims(
     )
 
 
-def test_user_agent_secret_lands_in_primary_runtime_scope(tmp_path: Path) -> None:
+def test_user_agent_secret_lands_in_primary_runtime_scope(tmp_path: Path, manager: CredentialsManager) -> None:
     """user_agent scope secrets must go to private_oauth/<requester>/<agent>, not workers/."""
-    manager = _manager(tmp_path)
     claims = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent")
     target = claims.to_worker_target()
 
@@ -73,17 +78,18 @@ def test_user_agent_secret_lands_in_primary_runtime_scope(tmp_path: Path) -> Non
     assert egress_files[0].parts[-4] == "private_oauth"
 
     # Should NOT be in workers/
-    workers_dir = tmp_path / "workers"
-    if workers_dir.exists():
-        # No egress_github under workers/
-        assert list(workers_dir.rglob("egress_github*")) == []
+    _assert_nothing_stored_under(tmp_path, "workers")
 
 
 @pytest.mark.parametrize("name", ["x_oauth", "x_oauth_client"])
 @pytest.mark.parametrize("worker_scope", ["user_agent", "user", "shared"])
-def test_oauth_suffixed_secret_never_lands_in_worker_store(tmp_path: Path, name: str, worker_scope: str) -> None:
+def test_oauth_suffixed_secret_never_lands_in_worker_store(
+    tmp_path: Path,
+    name: str,
+    worker_scope: str,
+    manager: CredentialsManager,
+) -> None:
     """A service name ending in an OAuth suffix still keeps its secret out of workers/."""
-    manager = _manager(tmp_path)
     target = _claims(worker_scope=worker_scope).to_worker_target()
 
     save_secret(manager, target, name, "secret-value")
@@ -94,9 +100,8 @@ def test_oauth_suffixed_secret_never_lands_in_worker_store(tmp_path: Path, name:
     assert load_secret(manager, target, name) == "secret-value"
 
 
-def test_shared_secret_lands_in_agent_scope(tmp_path: Path) -> None:
+def test_shared_secret_lands_in_agent_scope(tmp_path: Path, manager: CredentialsManager) -> None:
     """Shared scope secrets must go to for_primary_runtime_agent_scope(agent)."""
-    manager = _manager(tmp_path)
     claims = _claims(worker_scope="shared", agent_name="test_agent")
     target = claims.to_worker_target()
 
@@ -111,14 +116,11 @@ def test_shared_secret_lands_in_agent_scope(tmp_path: Path) -> None:
     assert len(egress_files) == 1
 
     # Should NOT be in workers/
-    workers_dir = tmp_path / "workers"
-    if workers_dir.exists():
-        assert list(workers_dir.rglob("egress_github*")) == []
+    _assert_nothing_stored_under(tmp_path, "workers")
 
 
-def test_unscoped_secret_uses_global_store(tmp_path: Path) -> None:
+def test_unscoped_secret_uses_global_store(tmp_path: Path, manager: CredentialsManager) -> None:
     """Unscoped (None) scope secrets should go to the global store."""
-    manager = _manager(tmp_path)
     claims = _claims(worker_scope=None)
     target = claims.to_worker_target()
 
@@ -129,18 +131,11 @@ def test_unscoped_secret_uses_global_store(tmp_path: Path) -> None:
     assert expected_path.exists()
 
     # Should NOT be in private_oauth/ or workers/
-    private_oauth_dir = tmp_path / "private_oauth"
-    workers_dir = tmp_path / "workers"
-    if private_oauth_dir.exists():
-        assert list(private_oauth_dir.rglob("egress_github*")) == []
-    if workers_dir.exists():
-        assert list(workers_dir.rglob("egress_github*")) == []
+    _assert_nothing_stored_under(tmp_path, "private_oauth", "workers")
 
 
-def test_no_shared_fallback_for_user_agent(tmp_path: Path) -> None:
+def test_no_shared_fallback_for_user_agent(manager: CredentialsManager) -> None:
     """user_agent target with global secret set should return None, not fallback."""
-    manager = _manager(tmp_path)
-
     # Set a global secret
     unscoped_claims = _claims(worker_scope=None)
     unscoped_target = unscoped_claims.to_worker_target()
@@ -155,10 +150,8 @@ def test_no_shared_fallback_for_user_agent(tmp_path: Path) -> None:
     assert loaded is None
 
 
-def test_scopes_are_isolated(tmp_path: Path) -> None:
+def test_scopes_are_isolated(manager: CredentialsManager) -> None:
     """Requester A's secret should be invisible to requester B."""
-    manager = _manager(tmp_path)
-
     # Alice sets a secret
     alice_claims = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent")
     alice_target = alice_claims.to_worker_target()
@@ -171,9 +164,8 @@ def test_scopes_are_isolated(tmp_path: Path) -> None:
     assert loaded is None
 
 
-def test_status_reports_updated_at_and_never_value(tmp_path: Path) -> None:
+def test_status_reports_updated_at_and_never_value(manager: CredentialsManager) -> None:
     """secret_status should report updated_at and configured, but never the secret value."""
-    manager = _manager(tmp_path)
     claims = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent")
     target = claims.to_worker_target()
 
@@ -194,38 +186,33 @@ def test_status_reports_updated_at_and_never_value(tmp_path: Path) -> None:
     assert status.updated_at.endswith("Z")
 
 
-def test_save_rejects_blank_and_oversized(tmp_path: Path) -> None:
-    """save_secret should reject empty/whitespace and >16KiB secrets."""
-    manager = _manager(tmp_path)
-    claims = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent")
-    target = claims.to_worker_target()
+@pytest.mark.parametrize(
+    ("secret", "message"),
+    [
+        pytest.param("", "empty", id="empty"),
+        pytest.param("   \n\t  ", "empty", id="whitespace-only"),
+        pytest.param("s3cret\r\nX: y", "control character", id="header-injection"),
+        pytest.param("a\x00b", "control character", id="nul"),
+        pytest.param("test\x7f", "control character", id="delete"),
+        # 16 KiB = 16384 bytes
+        pytest.param("x" * 16385, "16 KiB", id="oversized"),
+    ],
+)
+def test_save_rejects_blank_control_and_oversized(manager: CredentialsManager, secret: str, message: str) -> None:
+    """save_secret should reject empty/whitespace, control-character, and >16KiB secrets."""
+    target = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent").to_worker_target()
 
-    # Empty string
-    with pytest.raises(ValueError, match="empty"):
-        save_secret(manager, target, "github", "")
+    with pytest.raises(ValueError, match=message):
+        save_secret(manager, target, "github", secret)
 
-    # Whitespace only
-    with pytest.raises(ValueError, match="empty"):
-        save_secret(manager, target, "github", "   \n\t  ")
 
-    # Control characters
-    with pytest.raises(ValueError, match="control character"):
-        save_secret(manager, target, "github", "s3cret\r\nX: y")
-
-    with pytest.raises(ValueError, match="control character"):
-        save_secret(manager, target, "github", "a\x00b")
-
-    with pytest.raises(ValueError, match="control character"):
-        save_secret(manager, target, "github", "test\x7f")
-
-    # Oversized (16 KiB = 16384 bytes)
-    oversized = "x" * 16385
-    with pytest.raises(ValueError, match="16 KiB"):
-        save_secret(manager, target, "github", oversized)
-
-    # Exactly 16 KiB should work
+def test_save_accepts_exactly_16_kib(manager: CredentialsManager) -> None:
+    """A secret of exactly 16 KiB is saved and loads back unchanged."""
+    target = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent").to_worker_target()
     exactly_16k = "x" * 16384
+
     save_secret(manager, target, "github", exactly_16k)
+
     assert load_secret(manager, target, "github") == exactly_16k
 
 
@@ -243,10 +230,8 @@ def test_egress_credential_service() -> None:
     assert egress_credential_service("openai") == "egress_openai"
 
 
-def test_none_target_uses_global_store(tmp_path: Path) -> None:
+def test_none_target_uses_global_store(tmp_path: Path, manager: CredentialsManager) -> None:
     """Passing None as target should use the global (unscoped) store."""
-    manager = _manager(tmp_path)
-
     # Save with None target
     save_secret(manager, None, "github", "global-secret")
 
@@ -272,12 +257,7 @@ def test_none_target_uses_global_store(tmp_path: Path) -> None:
     assert status.updated_at is None
 
     # Should NOT be in private_oauth/ or workers/
-    private_oauth_dir = tmp_path / "private_oauth"
-    workers_dir = tmp_path / "workers"
-    if private_oauth_dir.exists():
-        assert list(private_oauth_dir.rglob("egress_github*")) == []
-    if workers_dir.exists():
-        assert list(workers_dir.rglob("egress_github*")) == []
+    _assert_nothing_stored_under(tmp_path, "private_oauth", "workers")
 
 
 _RULES = [{"host": "api.github.com", "auth": {"type": "bearer"}}]
@@ -304,13 +284,12 @@ def _oauth(*, connected: bool) -> OAuthStatus:
     ],
 )
 def test_service_status_prefers_the_key_over_oauth(
-    tmp_path: Path,
     key: bool,
     oauth_connected: bool,
     active_source: str | None,
+    manager: CredentialsManager,
 ) -> None:
     """A stored key is the active source whenever it is set; a connected OAuth account is used otherwise."""
-    manager = _manager(tmp_path)
     target = _claims(worker_scope="user_agent").to_worker_target()
     saved_at = None
     if key:
@@ -343,9 +322,8 @@ def test_service_status_prefers_the_key_over_oauth(
     assert "secret-value" not in repr(status)
 
 
-def test_service_status_without_oauth_provider_skips_oauth(tmp_path: Path) -> None:
+def test_service_status_without_oauth_provider_skips_oauth(manager: CredentialsManager) -> None:
     """A service without an OAuth provider reports only its key and never asks for OAuth status."""
-    manager = _manager(tmp_path)
 
     def oauth_status(_provider_id: str, _scope: ResolvedWorkerTarget | None) -> OAuthStatus:
         pytest.fail("a service without oauth_provider has no OAuth status")

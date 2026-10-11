@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
+import pytest
+
 from mindroom.constants import resolve_runtime_paths
 from mindroom.egress_broker.env import (
     BROKER_CA_PEM_ENV,
@@ -142,68 +144,58 @@ def test_apply_runner_ca_bundle_noop_without_pem(tmp_path: Path) -> None:
     assert test_env == {"OTHER_VAR": "value"}
 
 
-def test_primary_callback_hosts_parses_urls(tmp_path: Path) -> None:
-    """primary_callback_hosts extracts hostnames from configured URLs."""
+@pytest.mark.parametrize(
+    ("process_env", "expected_hosts"),
+    [
+        pytest.param(
+            {
+                "MINDROOM_EGRESS_BROKER_URL": "http://broker.local:8768",
+                "MINDROOM_SCRIPT_GATEWAY_URL": "http://gateway.local:9000",
+                "MINDROOM_AGENT_CLI_PRIMARY_URL": "http://host.docker.internal:8766",
+                "MINDROOM_AGENT_CLI_URL": "http://api.mindroom.chat",
+            },
+            ["broker.local", "gateway.local", "host.docker.internal", "api.mindroom.chat"],
+            id="parses-urls",
+        ),
+        pytest.param(
+            {
+                "MINDROOM_EGRESS_BROKER_URL": "http://broker.local:8768",
+                "MINDROOM_SCRIPT_GATEWAY_URL": "   ",
+                "MINDROOM_AGENT_CLI_PRIMARY_URL": "not-a-url",
+                # MINDROOM_AGENT_CLI_URL unset
+            },
+            ["broker.local"],
+            id="skips-unset-blank-and-unparsable",
+        ),
+        # urlsplit raises ValueError for these, such as an unclosed IPv6 bracket; they are skipped like other bad ones.
+        pytest.param(
+            {
+                "MINDROOM_EGRESS_BROKER_URL": "http://[::1",
+                "MINDROOM_SCRIPT_GATEWAY_URL": "http://gateway.local:9000",
+            },
+            ["gateway.local"],
+            id="skips-urls-that-urlsplit-rejects",
+        ),
+        # host.docker.internal appears twice (broker and primary), other.local appears twice (gateway and cli);
+        # only the first occurrence of each stays.
+        pytest.param(
+            {
+                "MINDROOM_EGRESS_BROKER_URL": "http://host.docker.internal:8768",
+                "MINDROOM_SCRIPT_GATEWAY_URL": "http://other.local:9000",
+                "MINDROOM_AGENT_CLI_PRIMARY_URL": "http://host.docker.internal:8766",
+                "MINDROOM_AGENT_CLI_URL": "http://other.local",
+            },
+            ["host.docker.internal", "other.local"],
+            id="deduplicates-preserving-order",
+        ),
+    ],
+)
+def test_primary_callback_hosts(tmp_path: Path, process_env: dict[str, str], expected_hosts: list[str]) -> None:
+    """primary_callback_hosts extracts hostnames from the configured URLs, skipping bad ones and keeping first-seen order."""
     runtime_paths = resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
         storage_path=tmp_path,
-        process_env={
-            "MINDROOM_EGRESS_BROKER_URL": "http://broker.local:8768",
-            "MINDROOM_SCRIPT_GATEWAY_URL": "http://gateway.local:9000",
-            "MINDROOM_AGENT_CLI_PRIMARY_URL": "http://host.docker.internal:8766",
-            "MINDROOM_AGENT_CLI_URL": "http://api.mindroom.chat",
-        },
+        process_env=process_env,
     )
 
-    hosts = primary_callback_hosts(runtime_paths)
-    assert hosts == ["broker.local", "gateway.local", "host.docker.internal", "api.mindroom.chat"]
-
-
-def test_primary_callback_hosts_skips_unset_and_unparsable(tmp_path: Path) -> None:
-    """primary_callback_hosts skips unset, blank, and unparsable URLs."""
-    runtime_paths = resolve_runtime_paths(
-        config_path=tmp_path / "config.yaml",
-        storage_path=tmp_path,
-        process_env={
-            "MINDROOM_EGRESS_BROKER_URL": "http://broker.local:8768",
-            "MINDROOM_SCRIPT_GATEWAY_URL": "   ",
-            "MINDROOM_AGENT_CLI_PRIMARY_URL": "not-a-url",
-            # MINDROOM_AGENT_CLI_URL unset
-        },
-    )
-
-    hosts = primary_callback_hosts(runtime_paths)
-    assert hosts == ["broker.local"]
-
-
-def test_primary_callback_hosts_skips_urls_that_urlsplit_rejects(tmp_path: Path) -> None:
-    """A URL that urlsplit raises ValueError for, such as an unclosed IPv6 bracket, is skipped like other bad ones."""
-    runtime_paths = resolve_runtime_paths(
-        config_path=tmp_path / "config.yaml",
-        storage_path=tmp_path,
-        process_env={
-            "MINDROOM_EGRESS_BROKER_URL": "http://[::1",
-            "MINDROOM_SCRIPT_GATEWAY_URL": "http://gateway.local:9000",
-        },
-    )
-
-    assert primary_callback_hosts(runtime_paths) == ["gateway.local"]
-
-
-def test_primary_callback_hosts_deduplicates_preserving_order(tmp_path: Path) -> None:
-    """primary_callback_hosts removes duplicates while preserving first occurrence order."""
-    runtime_paths = resolve_runtime_paths(
-        config_path=tmp_path / "config.yaml",
-        storage_path=tmp_path,
-        process_env={
-            "MINDROOM_EGRESS_BROKER_URL": "http://host.docker.internal:8768",
-            "MINDROOM_SCRIPT_GATEWAY_URL": "http://other.local:9000",
-            "MINDROOM_AGENT_CLI_PRIMARY_URL": "http://host.docker.internal:8766",
-            "MINDROOM_AGENT_CLI_URL": "http://other.local",
-        },
-    )
-
-    hosts = primary_callback_hosts(runtime_paths)
-    # host.docker.internal appears twice (broker and primary), other.local appears twice (gateway and cli)
-    # Should keep first occurrence only
-    assert hosts == ["host.docker.internal", "other.local"]
+    assert primary_callback_hosts(runtime_paths) == expected_hosts

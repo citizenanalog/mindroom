@@ -7,10 +7,33 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path  # noqa: TC003 - Required at runtime for test fixtures
+from typing import TYPE_CHECKING
 
 import pytest
 
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+# The audit table as it was written before refusal codes added the `code` column.
+_OLD_AUDIT_TABLE = """
+    CREATE TABLE audit (
+        at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        agent_name TEXT,
+        requester_id TEXT,
+        method TEXT NOT NULL,
+        host TEXT NOT NULL,
+        path TEXT NOT NULL,
+        service TEXT,
+        status INTEGER NOT NULL,
+        bytes_up INTEGER NOT NULL,
+        bytes_down INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL
+    )
+"""
 
 
 @pytest.fixture
@@ -33,44 +56,93 @@ def sample_record() -> AuditRecord:
     )
 
 
-def test_record_and_query_newest_first(tmp_path: Path) -> None:
-    """Records are stored and returned newest first."""
-    db_path = tmp_path / "audit.db"
-    log = AuditLog(db_path)
+@pytest.fixture
+def log(tmp_path: Path) -> Iterator[AuditLog]:
+    """Return an audit log in ``tmp_path / "audit.db"``, closed after the test."""
+    audit_log = AuditLog(tmp_path / "audit.db")
+    yield audit_log
+    audit_log.close()
 
+
+def _record_series(
+    log: AuditLog,
+    template: AuditRecord,
+    count: int,
+    *,
+    agent_name: str,
+    path_prefix: str,
+    age: timedelta,
+) -> None:
+    """Record `count` entries for `agent_name`, each `age` plus its index seconds old, with the index as every counter."""
+    now = datetime.now(UTC)
+    for i in range(count):
+        log.record(
+            replace(
+                template,
+                at=now - age - timedelta(seconds=i),
+                agent_name=agent_name,
+                path=f"{path_prefix}_{i}",
+                service=None,
+                bytes_up=i,
+                bytes_down=i,
+                duration_ms=i,
+            ),
+        )
+
+
+def _write_log_without_code_column(path: Path, *, row_at: datetime | None = None) -> None:
+    """Create a log file in the old schema, with one denied row at `row_at` if given."""
+    old = sqlite3.connect(path)
+    old.execute(_OLD_AUDIT_TABLE)
+    if row_at is not None:
+        old.execute(
+            "INSERT INTO audit VALUES (?, 'denied', 'user', 'a', '@u:x', 'GET', 'h', '/old', 's', 403, 1, 2, 3)",
+            (row_at.isoformat(),),
+        )
+    old.commit()
+    old.close()
+
+
+def _open_connections_as(monkeypatch: pytest.MonkeyPatch, connection_class: type[sqlite3.Connection]) -> None:
+    """Make `sqlite3.connect` open connections of `connection_class`."""
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3,
+        "connect",
+        lambda *args, **kwargs: real_connect(*args, factory=connection_class, **kwargs),
+    )
+
+
+def _column_count(path: Path, column: str) -> int:
+    """Return how many times the audit table at `path` declares `column`."""
+    check = sqlite3.connect(path)
+    try:
+        return [row[1] for row in check.execute("PRAGMA table_info(audit)")].count(column)
+    finally:
+        check.close()
+
+
+def test_record_and_query_newest_first(log: AuditLog, sample_record: AuditRecord) -> None:
+    """Records are stored and returned newest first."""
     # Record three entries with different timestamps
     now = datetime.now(UTC)
-    rec1 = AuditRecord(
-        at=now - timedelta(seconds=2),
-        kind="request",
-        scope="user",
-        agent_name="agent_1",
-        requester_id="@user:example.com",
-        method="GET",
-        host="api.example.com",
-        path="/v1/data",
-        service="example_api",
-        status=200,
-        bytes_up=100,
-        bytes_down=200,
-        duration_ms=50,
-    )
-    rec2 = AuditRecord(
+    rec1 = replace(sample_record, at=now - timedelta(seconds=2))
+    rec2 = replace(
+        sample_record,
         at=now - timedelta(seconds=1),
         kind="tunnel",
         scope="user_agent",
         agent_name="agent_2",
-        requester_id="@user:example.com",
         method="CONNECT",
         host="db.example.com",
         path="",
         service=None,
-        status=200,
         bytes_up=1000,
         bytes_down=2000,
         duration_ms=5000,
     )
-    rec3 = AuditRecord(
+    rec3 = replace(
+        sample_record,
         at=now,
         kind="denied",
         scope="shared",
@@ -112,31 +184,11 @@ def test_record_and_query_newest_first(tmp_path: Path) -> None:
     assert results[0].bytes_down == 0
     assert results[0].duration_ms == 10
 
-    log.close()
 
-
-def test_query_string_is_never_stored(tmp_path: Path) -> None:
+def test_query_string_is_never_stored(tmp_path: Path, log: AuditLog, sample_record: AuditRecord) -> None:
     """Query strings are stripped from paths and not present in the database file."""
-    db_path = tmp_path / "audit.db"
-    log = AuditLog(db_path)
-
     # Record a request with a query string containing a token
-    rec = AuditRecord(
-        at=datetime.now(UTC),
-        kind="request",
-        scope="user",
-        agent_name="agent_1",
-        requester_id="@user:example.com",
-        method="GET",
-        host="api.example.com",
-        path="/v1/data?token=abc123&key=secret",
-        service="example_api",
-        status=200,
-        bytes_up=100,
-        bytes_down=200,
-        duration_ms=50,
-    )
-    log.record(rec)
+    log.record(replace(sample_record, path="/v1/data?token=abc123&key=secret"))
 
     # Verify the stored path is only the path component
     results = log.query()
@@ -146,33 +198,26 @@ def test_query_string_is_never_stored(tmp_path: Path) -> None:
     log.close()
 
     # Verify that the query string is NOT present in the raw database file bytes
-    db_bytes = db_path.read_bytes()
+    db_bytes = (tmp_path / "audit.db").read_bytes()
     assert b"abc" not in db_bytes
     assert b"token" not in db_bytes
     assert b"secret" not in db_bytes
     assert b"/v1/data" in db_bytes
 
 
-def test_filters_and_limit_clamp(tmp_path: Path) -> None:
+def test_filters_and_limit_clamp(log: AuditLog, sample_record: AuditRecord) -> None:
     """Query filters work and limit is clamped to 1..1000."""
-    db_path = tmp_path / "audit.db"
-    log = AuditLog(db_path)
-
     # Record several entries with different attributes
     now = datetime.now(UTC)
     for i in range(10):
         log.record(
-            AuditRecord(
+            replace(
+                sample_record,
                 at=now + timedelta(seconds=i),
-                kind="request",
-                scope="user",
                 agent_name=f"agent_{i % 3}",
-                requester_id="@user:example.com",
-                method="GET",
                 host=f"host_{i % 2}.example.com",
                 path=f"/path_{i}",
                 service=f"service_{i % 4}" if i % 2 == 0 else None,
-                status=200,
                 bytes_up=i,
                 bytes_down=i * 2,
                 duration_ms=i * 10,
@@ -213,27 +258,21 @@ def test_filters_and_limit_clamp(tmp_path: Path) -> None:
     results = log.query(limit=3)
     assert len(results) == 3
 
-    log.close()
 
-
-def test_requester_filter_matches_only_that_requester(tmp_path: Path) -> None:
+def test_requester_filter_matches_only_that_requester(log: AuditLog, sample_record: AuditRecord) -> None:
     """The requester filter is an exact match, combines with the other filters, and skips rows without a requester."""
-    log = AuditLog(tmp_path / "audit.db")
     now = datetime.now(UTC)
     for i, requester in enumerate(["@alice:example.org", "@bob:example.org", None, "@alice:example.org.evil"]):
         for agent in ("agent_1", "agent_2"):
             log.record(
-                AuditRecord(
+                replace(
+                    sample_record,
                     at=now + timedelta(seconds=i),
-                    kind="request",
                     scope="shared",
                     agent_name=agent,
                     requester_id=requester,
-                    method="GET",
-                    host="api.example.com",
                     path=f"/{requester}/{agent}",
                     service=None,
-                    status=200,
                     bytes_up=0,
                     bytes_down=0,
                     duration_ms=1,
@@ -249,55 +288,16 @@ def test_requester_filter_matches_only_that_requester(tmp_path: Path) -> None:
     assert len(log.query(requester_id="@alice:example.org", agent_name="agent_2")) == 1
     assert log.query(requester_id="@nobody:example.org") == []
     assert len(log.query()) == 8
-    log.close()
 
 
-def test_prune_by_age_and_max_rows(tmp_path: Path) -> None:
+def test_prune_by_age_and_max_rows(tmp_path: Path, sample_record: AuditRecord) -> None:
     """Prune deletes rows older than retention_days, then trims to max_rows."""
-    db_path = tmp_path / "audit.db"
-    log = AuditLog(db_path, retention_days=7, max_rows=100)
-
-    now = datetime.now(UTC)
+    log = AuditLog(tmp_path / "audit.db", retention_days=7, max_rows=100)
 
     # Insert 10 old records (beyond retention)
-    for i in range(10):
-        log.record(
-            AuditRecord(
-                at=now - timedelta(days=10, seconds=i),
-                kind="request",
-                scope="user",
-                agent_name="agent_old",
-                requester_id="@user:example.com",
-                method="GET",
-                host="api.example.com",
-                path=f"/old_{i}",
-                service=None,
-                status=200,
-                bytes_up=i,
-                bytes_down=i,
-                duration_ms=i,
-            ),
-        )
-
+    _record_series(log, sample_record, 10, agent_name="agent_old", path_prefix="/old", age=timedelta(days=10))
     # Insert 5 recent records (within retention)
-    for i in range(5):
-        log.record(
-            AuditRecord(
-                at=now - timedelta(days=3, seconds=i),
-                kind="request",
-                scope="user",
-                agent_name="agent_recent",
-                requester_id="@user:example.com",
-                method="GET",
-                host="api.example.com",
-                path=f"/recent_{i}",
-                service=None,
-                status=200,
-                bytes_up=i,
-                bytes_down=i,
-                duration_ms=i,
-            ),
-        )
+    _record_series(log, sample_record, 5, agent_name="agent_recent", path_prefix="/recent", age=timedelta(days=3))
 
     # Prune should delete the 10 old records
     deleted = log.prune()
@@ -310,24 +310,7 @@ def test_prune_by_age_and_max_rows(tmp_path: Path) -> None:
 
     # Now test max_rows pruning
     # Insert 200 more recent records
-    for i in range(200):
-        log.record(
-            AuditRecord(
-                at=now - timedelta(hours=1, seconds=i),
-                kind="request",
-                scope="user",
-                agent_name="agent_bulk",
-                requester_id="@user:example.com",
-                method="GET",
-                host="api.example.com",
-                path=f"/bulk_{i}",
-                service=None,
-                status=200,
-                bytes_up=i,
-                bytes_down=i,
-                duration_ms=i,
-            ),
-        )
+    _record_series(log, sample_record, 200, agent_name="agent_bulk", path_prefix="/bulk", age=timedelta(hours=1))
 
     # We now have 205 records total (5 recent + 200 bulk)
     # Prune should trim to max_rows=100
@@ -344,25 +327,18 @@ def test_prune_by_age_and_max_rows(tmp_path: Path) -> None:
     log.close()
 
 
-def test_concurrent_record_from_threads(tmp_path: Path) -> None:
+def test_concurrent_record_from_threads(log: AuditLog, sample_record: AuditRecord) -> None:
     """Concurrent writes from multiple threads all succeed."""
-    db_path = tmp_path / "audit.db"
-    log = AuditLog(db_path)
 
     def record_many(thread_id: int) -> None:
         for i in range(100):
             log.record(
-                AuditRecord(
+                replace(
+                    sample_record,
                     at=datetime.now(UTC),
-                    kind="request",
-                    scope="user",
                     agent_name=f"agent_{thread_id}",
-                    requester_id="@user:example.com",
-                    method="GET",
-                    host="api.example.com",
                     path=f"/thread_{thread_id}/record_{i}",
                     service=None,
-                    status=200,
                     bytes_up=i,
                     bytes_down=i,
                     duration_ms=i,
@@ -389,12 +365,9 @@ def test_concurrent_record_from_threads(tmp_path: Path) -> None:
     assert len(agent_names) == 8
     assert all(f"agent_{i}" in agent_names for i in range(8))
 
-    log.close()
 
-
-def test_refusal_code_is_stored_and_a_forward_has_none(tmp_path: Path, sample_record: AuditRecord) -> None:
+def test_refusal_code_is_stored_and_a_forward_has_none(log: AuditLog, sample_record: AuditRecord) -> None:
     """A refusal keeps the error code its body carried; a forwarded request reads back as None."""
-    log = AuditLog(tmp_path / "audit.db")
     now = datetime.now(UTC)
     log.record(replace(sample_record, at=now - timedelta(seconds=1), path="/ok"))
     log.record(replace(sample_record, at=now, kind="denied", status=403, path="/other", code="path_not_allowed"))
@@ -403,36 +376,12 @@ def test_refusal_code_is_stored_and_a_forward_has_none(tmp_path: Path, sample_re
 
     assert (refused.path, refused.code) == ("/other", "path_not_allowed")
     assert (forwarded.path, forwarded.code) == ("/ok", None)
-    log.close()
 
 
 def test_a_log_from_before_refusal_codes_gains_the_column(tmp_path: Path, sample_record: AuditRecord) -> None:
     """Opening a log written without the `code` column adds it, keeps old rows, and accepts new ones."""
     path = tmp_path / "old.db"
-    old = sqlite3.connect(path)
-    old.execute("""
-        CREATE TABLE audit (
-            at TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            agent_name TEXT,
-            requester_id TEXT,
-            method TEXT NOT NULL,
-            host TEXT NOT NULL,
-            path TEXT NOT NULL,
-            service TEXT,
-            status INTEGER NOT NULL,
-            bytes_up INTEGER NOT NULL,
-            bytes_down INTEGER NOT NULL,
-            duration_ms INTEGER NOT NULL
-        )
-    """)
-    old.execute(
-        "INSERT INTO audit VALUES (?, 'denied', 'user', 'a', '@u:x', 'GET', 'h', '/old', 's', 403, 1, 2, 3)",
-        ((datetime.now(UTC) - timedelta(minutes=1)).isoformat(),),
-    )
-    old.commit()
-    old.close()
+    _write_log_without_code_column(path, row_at=datetime.now(UTC) - timedelta(minutes=1))
 
     log = AuditLog(path)
     log.record(replace(sample_record, path="/new", kind="denied", status=403, code="bad_request"))
@@ -445,32 +394,7 @@ def test_a_log_from_before_refusal_codes_gains_the_column(tmp_path: Path, sample
     assert (oldest.path, oldest.code) == ("/old", None)
     assert (newest.path, newest.code) == ("/new", "bad_request")
     assert [(row.path, row.code) for row in rows] == [("/new", "bad_request"), ("/old", None)]
-    check = sqlite3.connect(path)
-    assert [row[1] for row in check.execute("PRAGMA table_info(audit)")].count("code") == 1
-    check.close()
-
-
-def _write_log_without_code_column(path: Path) -> None:
-    old = sqlite3.connect(path)
-    old.execute("""
-        CREATE TABLE audit (
-            at TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            agent_name TEXT,
-            requester_id TEXT,
-            method TEXT NOT NULL,
-            host TEXT NOT NULL,
-            path TEXT NOT NULL,
-            service TEXT,
-            status INTEGER NOT NULL,
-            bytes_up INTEGER NOT NULL,
-            bytes_down INTEGER NOT NULL,
-            duration_ms INTEGER NOT NULL
-        )
-    """)
-    old.commit()
-    old.close()
+    assert _column_count(path, "code") == 1
 
 
 def test_a_concurrent_alter_of_the_same_log_is_tolerated(
@@ -494,11 +418,7 @@ def test_a_concurrent_alter_of_the_same_log_is_tolerated(
                 other.close()
             return super().execute(sql, *args)
 
-    monkeypatch.setattr(
-        sqlite3,
-        "connect",
-        lambda *args, **kwargs: real_connect(*args, factory=RacingConnection, **kwargs),
-    )
+    _open_connections_as(monkeypatch, RacingConnection)
 
     log = AuditLog(path)
     log.record(replace(sample_record, kind="denied", status=403, code="bad_request"))
@@ -507,9 +427,7 @@ def test_a_concurrent_alter_of_the_same_log_is_tolerated(
 
     assert len(alters) == 1
     assert row.code == "bad_request"
-    check = real_connect(path)
-    assert [column[1] for column in check.execute("PRAGMA table_info(audit)")].count("code") == 1
-    check.close()
+    assert _column_count(path, "code") == 1
 
 
 def test_another_failure_while_adding_the_column_is_not_swallowed(
@@ -519,7 +437,6 @@ def test_another_failure_while_adding_the_column_is_not_swallowed(
     """Only a duplicate column is tolerated; any other error opening the log still surfaces."""
     path = tmp_path / "broken.db"
     _write_log_without_code_column(path)
-    real_connect = sqlite3.connect
 
     class FailingConnection(sqlite3.Connection):
         def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
@@ -528,11 +445,7 @@ def test_another_failure_while_adding_the_column_is_not_swallowed(
                 raise sqlite3.OperationalError(msg)
             return super().execute(sql, *args)
 
-    monkeypatch.setattr(
-        sqlite3,
-        "connect",
-        lambda *args, **kwargs: real_connect(*args, factory=FailingConnection, **kwargs),
-    )
+    _open_connections_as(monkeypatch, FailingConnection)
 
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         AuditLog(path)
