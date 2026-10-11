@@ -12,6 +12,7 @@ from agno.utils.message import filter_tool_calls
 
 from mindroom.constants import (
     AI_RUN_METADATA_KEY,
+    MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY,
     MINDROOM_COMPACTION_METADATA_KEY,
     MINDROOM_MATRIX_HISTORY_METADATA_KEY,
 )
@@ -41,6 +42,8 @@ _SUMMARY_METADATA_OMIT_KEYS = frozenset(
         AI_RUN_METADATA_KEY,
         MINDROOM_COMPACTION_METADATA_KEY,
         MINDROOM_MATRIX_HISTORY_METADATA_KEY,
+        # The run's own messages already carry its prompts.
+        MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY,
         COMPACTED_REQUESTS_METADATA_KEY,
         "model_params",
         "tools_schema",

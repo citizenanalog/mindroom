@@ -34,6 +34,7 @@ from mindroom.agents import create_agent
 from mindroom.agno_compat_model_hooks import install_request_preparation
 from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
+from mindroom.constants import MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY
 from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY as _NOTICE_KEY
 from mindroom.helper_usage import HelperUsageOwner
 from mindroom.history import agno_compat_message_builder, archive, mid_turn_compaction
@@ -668,8 +669,10 @@ async def test_a_prompt_larger_than_the_summary_input_keeps_the_first_exchange_i
     agent.tools = [probe]
     # The prompt fits the model's window but not one summary input.
     prompt = "Do the task. " + "p" * 40_000
+    # A Matrix turn also records its source prompts in the run's metadata.
+    metadata = {MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY: {"$prompt": prompt}}
 
-    output = await (_run_in_session(agent, prompt) if scoped else _run(agent, prompt))
+    output = await agent.arun(prompt, session_id="session-1" if scoped else None, metadata=metadata)
 
     assert str(output.content).endswith("done")
     assert summary_calls.inputs
