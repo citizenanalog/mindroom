@@ -350,12 +350,14 @@ def roll_back_to(
     scope_key: str,
     hit: ArchiveHit,
     live_run_ids: Collection[str],
+    keep_last: Collection[str] = (),
 ) -> None:
     """Undo compaction from the hit's generation onward, keeping everything before the hit run.
 
-    The hit run and everything after it (later archived runs and every live run)
+    The hit run and everything after it (later archived runs and the given live runs)
     is removed; the hit generation's runs archived before it return to the live
     table in their original order. Removed archived runs stay as tombstones.
+    Stored runs in ``keep_last`` move after the restored runs, since they are newer.
     """
     db = _sqlite(storage)
     compactions, compacted_runs = _table_names(db)
@@ -392,6 +394,8 @@ def roll_back_to(
         )
         for run in restored:
             agno_compat_sqlite.insert_run_row(transaction, runs, run, session_id=session_id, user_id=run.user_id)
+        for run_id in keep_last:
+            agno_compat_sqlite.move_run_to_end(transaction, runs, run_id, session_id=session_id)
 
 
 def _retire_generations(

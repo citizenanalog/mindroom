@@ -595,7 +595,8 @@ def roll_back_running_turn(
 
     A turn's exchanges fold together or not at all, so a compaction that committed only some of them is undone;
     runs archived earlier in that generation return live, earlier compactions of the same run stay, and
-    ``session`` is synced to the stored result.
+    ``session`` is synced to the stored result. Nothing was removed, so the scope's seen event ids stay, and a
+    stored row of the running run (a resumed run) moves back after the restored runs.
     """
     hit = archive.earliest_archived_run(
         storage,
@@ -605,14 +606,29 @@ def roll_back_running_turn(
     )
     if hit is None:
         return
-    archive.roll_back_to(storage, session_id=session.session_id, scope_key=scope.key, hit=hit, live_run_ids=())
-    _sync_after_history_removal(storage, session, scope)
+    origin = archive.snapshot_origin(hit.run_id) or hit.run_id
+    archive.roll_back_to(
+        storage,
+        session_id=session.session_id,
+        scope_key=scope.key,
+        hit=hit,
+        live_run_ids=(),
+        keep_last=(origin,),
+    )
+    _sync_after_history_removal(storage, session, scope, keep_seen_event_ids=True)
 
 
-def _sync_after_history_removal(storage: BaseDb, session: AgentSession | TeamSession, scope: HistoryScope) -> None:
-    """Store the archive's latest summary on the session row and drop the scope's preserved seen ids."""
+def _sync_after_history_removal(
+    storage: BaseDb,
+    session: AgentSession | TeamSession,
+    scope: HistoryScope,
+    *,
+    keep_seen_event_ids: bool = False,
+) -> None:
+    """Store the archive's latest summary on the session row and, after a removal, drop preserved seen ids."""
     target_session = _latest_persisted_session(storage, session)
-    _replace_scope_seen_event_ids(target_session, scope, set())
+    if not keep_seen_event_ids:
+        _replace_scope_seen_event_ids(target_session, scope, set())
     generation = archive.latest_generation(storage, session_id=session.session_id, scope_key=scope.key)
     if generation is not None:
         _refresh_summary(target_session, generation.summary)

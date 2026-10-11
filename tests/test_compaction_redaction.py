@@ -27,6 +27,7 @@ from mindroom.history.storage import (
     read_scope_seen_event_ids,
     reconcile_compaction_state,
     remove_runs_for_sources,
+    roll_back_running_turn,
     update_scope_seen_event_ids,
 )
 from mindroom.history.types import HistoryScope
@@ -545,6 +546,36 @@ def test_redacting_a_team_turn_that_compacted_mid_turn_removes_its_member_runs(s
     assert stored is not None
     assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
     assert stored.summary is None
+
+
+def test_rolling_back_a_running_team_turn_keeps_the_scopes_preserved_seen_ids(storage: SqliteDb) -> None:
+    """Undoing a failed mid-turn compaction removes no history, so messages the team already saw stay seen."""
+    scope = HistoryScope(kind="team", scope_id="crew")
+    live = _team_run("x")
+    session = seed_session(
+        storage,
+        TeamSession(session_id="session", team_id="crew", runs=[_team_run("r1"), _team_run("r2"), live]),
+    )
+    update_scope_seen_event_ids(session, scope, ["$team-saw"])
+    storage.upsert_session(session)
+    snapshot = _team_run("x")
+    snapshot.run_id = archive.snapshot_run_id("x")
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=scope,
+        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), snapshot],
+    )
+    assert "$team-saw" in read_scope_seen_event_ids(storage, session, scope)
+
+    roll_back_running_turn(storage, session, scope, [snapshot.run_id or ""])
+
+    stored = get_team_session(storage, "session")
+    assert stored is not None
+    assert [run.run_id for run in stored.runs or []] == ["r1", "r2", "x"]
+    assert "$team-saw" in read_scope_seen_event_ids(storage, stored, scope)
 
 
 def test_redacting_an_event_first_consumed_between_snapshots_after_the_run_was_archived(storage: SqliteDb) -> None:
