@@ -4,7 +4,7 @@ import {
   type RowAgent,
   type ServiceEditing,
   statusLabel,
-} from "./egressRowStatus";
+} from "./egressRowText";
 import type { EgressCredentialService } from "./types";
 
 /** The row's status badge and the notes about the account it uses, in the order they are shown. */

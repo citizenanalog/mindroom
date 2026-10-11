@@ -1,10 +1,10 @@
-import type { RowAgent, ServiceEditing } from "./egressRowStatus";
+import type { RowAgent, ServiceEditing } from "./egressRowText";
 import { LimitRow } from "./EgressLimitRows";
 import { EgressServiceItem, type ServicePaths } from "./EgressServiceItem";
 import { type RequestErrorMessages, requestConnection } from "./request";
 import type { EgressCredentialList, EgressCredentialService } from "./types";
 
-export type { RowAgent, ServiceEditing } from "./egressRowStatus";
+export type { RowAgent, ServiceEditing } from "./egressRowText";
 
 type AccountAction = "connect" | "disconnect";
 

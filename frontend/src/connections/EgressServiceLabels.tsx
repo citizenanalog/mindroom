@@ -6,7 +6,7 @@ import {
   type ServiceEditing,
   sentAsNote,
   unsetNote,
-} from "./egressRowStatus";
+} from "./egressRowText";
 import { LimitActions } from "./EgressLimitRows";
 import type { EgressCredentialService } from "./types";
 

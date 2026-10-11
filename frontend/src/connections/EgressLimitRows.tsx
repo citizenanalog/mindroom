@@ -3,7 +3,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { hostsNote, type ServiceEditing } from "./egressRowStatus";
+import { hostsNote, type ServiceEditing } from "./egressRowText";
 import type { EgressCredentialService } from "./types";
 
 /**

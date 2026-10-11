@@ -12,7 +12,7 @@ import {
   type ServiceEditing,
   servicesUsingAccount,
   sharesAccount,
-} from "./egressRowStatus";
+} from "./egressRowText";
 import { ServiceLabels } from "./EgressServiceLabels";
 import { ServiceStatus } from "./EgressServiceStatus";
 import { coversGithub } from "./githubLimits";
