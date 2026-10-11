@@ -390,8 +390,9 @@ function AgentSection({
     editingName: editor?.kind === "edit" ? editor.name : null,
     onEdit: requestEdit,
     onDelete: (service) => remove(service.name),
-    deleteWarning: () =>
-      deleteServiceWarning(
+    // Deleting a limit gives back what it narrowed instead.
+    deleteWarning: (service) =>
+      (service.restrict_only ? removeLimitWarning : deleteServiceWarning)(
         agent.scope,
         agent.agent_display_name,
         agent.scope_agents,
@@ -406,13 +407,6 @@ function AgentSection({
         ),
       });
     },
-    onChangeLimit: requestEdit,
-    onRemoveLimit: (limit) => remove(limit.name),
-    removeLimitWarning: removeLimitWarning(
-      agent.scope,
-      agent.agent_display_name,
-      agent.scope_agents,
-    ),
     limitDisabled: editor !== null,
   };
   const rowAgent: RowAgent = {

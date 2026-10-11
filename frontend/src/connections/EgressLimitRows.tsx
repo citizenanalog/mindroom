@@ -32,7 +32,7 @@ export function LimitActions({
     setBusy(true);
     onError(null);
     try {
-      await serviceEditing.onRemoveLimit?.(limit);
+      await serviceEditing.onDelete(limit);
     } catch (cause) {
       onError(
         cause instanceof Error && cause.message
@@ -51,7 +51,7 @@ export function LimitActions({
         variant="ghost"
         disabled={disabled || serviceEditing.editingName === limit.name}
         aria-label={`Change limit for ${label}`}
-        onClick={() => serviceEditing.onChangeLimit?.(limit)}
+        onClick={() => serviceEditing.onEdit(limit)}
       >
         Change limit
       </Button>
@@ -67,7 +67,7 @@ export function LimitActions({
       <ConfirmDialog
         open={confirming}
         title={`Remove the limit on ${label}?`}
-        description={serviceEditing.removeLimitWarning ?? ""}
+        description={serviceEditing.deleteWarning(limit)}
         confirmLabel="Remove limit"
         onCancel={() => setConfirming(false)}
         onConfirm={() => void remove()}
@@ -87,8 +87,7 @@ export function LimitRow({
   const [error, setError] = useState<string | null>(null);
   const hosts = hostsNote(service)?.replace(/^Sends to/, "Limits requests to");
   const canChange =
-    serviceEditing?.onChangeLimit !== undefined &&
-    serviceEditing.onRemoveLimit !== undefined &&
+    serviceEditing !== undefined &&
     service.source === serviceEditing.editableSource &&
     service.can_manage;
   return (

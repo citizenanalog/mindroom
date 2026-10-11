@@ -23,7 +23,10 @@ export interface RowAgent {
 
 /** Controls for the services a viewer defines themselves, and a label for the ones someone else defined. */
 export interface ServiceEditing {
-  /** Services with this `source` get Edit and Delete, when the viewer can manage them. */
+  /**
+   * Services with this `source` get Edit and Delete, when the viewer can
+   * manage them; a limit of that source gets Change limit and Remove limit.
+   */
   editableSource: EgressServiceSource;
   /** Turns Edit and Delete off while something else is being written. */
   disabled?: boolean;
@@ -40,12 +43,6 @@ export interface ServiceEditing {
    * GitHub, when the viewer can manage the agent.
    */
   onLimitToRepositories?: (service: EgressCredentialService) => void;
-  /** Opens a limit (a restrict-only service of the viewer's) to change its repositories. */
-  onChangeLimit?: (limit: EgressCredentialService) => void;
-  /** Removes a limit; rejects with an Error whose message the row shows. */
-  onRemoveLimit?: (limit: EgressCredentialService) => Promise<void>;
-  /** What removing a limit gives back, for the question before it goes. */
-  removeLimitWarning?: string;
   /** Turns Limit to repositories off while the editor is open. */
   limitDisabled?: boolean;
 }

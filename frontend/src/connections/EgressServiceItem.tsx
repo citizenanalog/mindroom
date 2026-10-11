@@ -87,8 +87,7 @@ export function EgressServiceItem({
   const limit = limitOf(service, agent.services);
   const canChangeLimit =
     limit !== null &&
-    serviceEditing?.onChangeLimit !== undefined &&
-    serviceEditing.onRemoveLimit !== undefined &&
+    limit.source === serviceEditing?.editableSource &&
     limit.can_manage;
   // A service that already has a limit changes or removes it instead of getting another.
   const canLimit =
