@@ -1204,7 +1204,7 @@ def test_key_status_is_read_off_the_event_loop(
 ) -> None:
     """Reading a key's status decrypts a credential file, so the async listing runs it in a thread."""
     portal = oauth_egress_portal
-    on_loop = calls_on_event_loop(secrets, "secret_status")
+    on_loop = calls_on_event_loop(secrets, "load_egress_document")
     assert portal["client"].get("/api/connections/egress", headers=portal["headers"]["alice"]).status_code == 200
     assert portal["client"].get("/api/connections", headers=portal["headers"]["alice"]).status_code == 200
     assert on_loop

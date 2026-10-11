@@ -16,7 +16,6 @@ from mindroom.egress_broker.secrets import (
     egress_credential_service,
     load_secret,
     save_secret,
-    secret_status,
     service_status,
 )
 from mindroom.egress_broker.tokens import WorkerClaims
@@ -164,26 +163,35 @@ def test_scopes_are_isolated(manager: CredentialsManager) -> None:
     assert loaded is None
 
 
+_RULES = [{"host": "api.github.com", "auth": {"type": "bearer"}}]
+
+
+def _key_status(manager: CredentialsManager, target: ResolvedWorkerTarget | None) -> EgressServiceStatus:
+    """Return the status of the `github` service, which has no OAuth provider, so only its key counts."""
+    return service_status(manager, target, EgressService(rules=_RULES), "github", oauth_status=lambda *_: None)
+
+
 def test_status_reports_updated_at_and_never_value(manager: CredentialsManager) -> None:
-    """secret_status should report updated_at and configured, but never the secret value."""
+    """The key status reports updated_at and whether a key is configured, but never the secret value."""
     claims = _claims(worker_scope="user_agent", requester_id="alice", agent_name="test_agent")
     target = claims.to_worker_target()
 
     # Not configured yet
-    status = secret_status(manager, target, "github")
-    assert not status.configured
-    assert status.updated_at is None
+    status = _key_status(manager, target)
+    assert not status.key_configured
+    assert status.key_updated_at is None
 
     # Save a secret
     save_secret(manager, target, "github", "secret-value")
 
     # Now configured with updated_at
-    status = secret_status(manager, target, "github")
-    assert status.configured
-    assert status.updated_at is not None
+    status = _key_status(manager, target)
+    assert status.key_configured
+    assert status.key_updated_at is not None
     # Should be ISO-8601 UTC format
-    assert "T" in status.updated_at
-    assert status.updated_at.endswith("Z")
+    assert "T" in status.key_updated_at
+    assert status.key_updated_at.endswith("Z")
+    assert "secret-value" not in repr(status)
 
 
 @pytest.mark.parametrize(
@@ -244,23 +252,20 @@ def test_none_target_uses_global_store(tmp_path: Path, manager: CredentialsManag
     assert loaded == "global-secret"
 
     # Check status with None target
-    status = secret_status(manager, None, "github")
-    assert status.configured
-    assert status.updated_at is not None
+    status = _key_status(manager, None)
+    assert status.key_configured
+    assert status.key_updated_at is not None
 
     # Delete with None target
     delete_secret(manager, None, "github")
 
     # Should no longer be configured
-    status = secret_status(manager, None, "github")
-    assert not status.configured
-    assert status.updated_at is None
+    status = _key_status(manager, None)
+    assert not status.key_configured
+    assert status.key_updated_at is None
 
     # Should NOT be in private_oauth/ or workers/
     _assert_nothing_stored_under(tmp_path, "private_oauth", "workers")
-
-
-_RULES = [{"host": "api.github.com", "auth": {"type": "bearer"}}]
 
 
 def _oauth(*, connected: bool) -> OAuthStatus:

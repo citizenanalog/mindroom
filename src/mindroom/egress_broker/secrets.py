@@ -24,7 +24,6 @@ __all__ = [
     "SecretMissing",
     "SecretNeedsReconnect",
     "SecretResult",
-    "SecretStatus",
     "SecretUnavailable",
     "delete_egress_document",
     "delete_secret",
@@ -33,7 +32,6 @@ __all__ = [
     "load_secret",
     "save_egress_document",
     "save_secret",
-    "secret_status",
     "service_status",
 ]
 
@@ -194,39 +192,6 @@ def delete_secret(
 
 
 @dataclass(frozen=True)
-class SecretStatus:
-    """Status of an egress secret."""
-
-    configured: bool
-    updated_at: str | None
-
-
-def secret_status(
-    manager: CredentialsManager,
-    target: ResolvedWorkerTarget | None,
-    name: str,
-) -> SecretStatus:
-    """Return the status of an egress secret.
-
-    Args:
-        manager: Credentials manager
-        target: Worker target, or None for the global (unscoped) store
-        name: Service name
-
-    Returns whether it is configured and when it was last updated.
-    Never returns the secret value.
-
-    """
-    credentials = load_egress_document(manager, target, egress_credential_service(name))
-    if credentials is None:
-        return SecretStatus(configured=False, updated_at=None)
-    return SecretStatus(
-        configured=True,
-        updated_at=credentials.get("_updated_at"),
-    )
-
-
-@dataclass(frozen=True)
 class Secret:
     """The secret the broker injects for one request; its value never appears in a repr."""
 
@@ -317,17 +282,17 @@ def service_status(
     `oauth_status(provider_id, target)` reports the service's OAuth provider for the same target; it is not
     called for services without one. Never returns a secret or token.
     """
-    key = secret_status(manager, target, name)
+    key = load_egress_document(manager, target, egress_credential_service(name))
     oauth = oauth_status(service.oauth_provider, target) if service.oauth_provider is not None else None
     active_source: Literal["key", "oauth"] | None = None
-    if key.configured:
+    if key is not None:
         active_source = "key"
     elif oauth is not None and oauth.connected:
         active_source = "oauth"
     return EgressServiceStatus(
         configured=active_source is not None,
         active_source=active_source,
-        key_configured=key.configured,
-        key_updated_at=key.updated_at,
+        key_configured=key is not None,
+        key_updated_at=None if key is None else key.get("_updated_at"),
         oauth=oauth,
     )
