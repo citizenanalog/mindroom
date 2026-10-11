@@ -130,6 +130,7 @@ def probe() -> str:
 class _SummaryCalls:
     inputs: list[str] = field(default_factory=list)
     fail: bool = False
+    cancel: bool = False
 
     async def __call__(
         self,
@@ -143,6 +144,8 @@ class _SummaryCalls:
         self.inputs.append(summary_input)
         if on_response is not None:
             await on_response(ModelResponse(response_usage=MessageMetrics(input_tokens=7, output_tokens=3)))
+        if self.cancel:
+            raise asyncio.CancelledError
         if self.fail:
             msg = "summary model unavailable"
             raise RuntimeError(msg)
@@ -1069,6 +1072,29 @@ async def test_mid_turn_compaction_posts_notices(tmp_path: Path, summary_calls: 
     kinds = [type(event).__name__ for event in lifecycle.events]
     assert kinds[0] == "CompactionLifecycleStart"
     assert "CompactionOutcome" in kinds
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_the_summary_call_archives_nothing_and_propagates(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    agent = _scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage)
+    lifecycle = RecordingCompactionLifecycle()
+    bind_compaction_lifecycle(agent, lifecycle)
+    summary_calls.cancel = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_in_session(agent, "Do the task")
+
+    assert summary_calls.inputs
+    assert archived_run_ids(storage) == []
+    assert [type(event).__name__ for event in lifecycle.events] == [
+        "CompactionLifecycleStart",
+        "CompactionLifecycleFailure",
+    ]
 
 
 @pytest.mark.asyncio
