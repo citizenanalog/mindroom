@@ -251,26 +251,26 @@ def test_restrict_to_rules_survives_the_authored_dump() -> None:
     assert Config(**config.authored_model_dump()).egress_broker.services["github"].restrict_to_rules is True
 
 
-def test_restrict_only_implies_restriction_and_needs_no_auth_on_its_rules() -> None:
-    """A restrict-only service limits paths like `restrict_to_rules` and has no credential, so its rules need no auth."""
+def test_restrict_only_needs_no_auth_on_its_rules() -> None:
+    """A restrict-only service has no credential, so its rules need no auth; how it limits paths is in test_rules."""
     service = EgressService.model_validate(
         {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r"}]},
     )
 
-    assert service.restricts_paths is True
     assert service.restrict_to_rules is False
     assert service.rules[0].auth is None
     assert service.authored_model_dump() == {
         "restrict_only": True,
         "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r"}],
     }
-    assert EgressService.model_validate({"preset": "github"}).restricts_paths is False
+    github = EgressService.model_validate({"preset": "github"})
+    assert (github.restrict_to_rules, github.restrict_only) == (False, False)
     assert all("restrict_only" not in preset for preset in EGRESS_PRESETS.values())
     # Setting both, as the limit editor does, is the same service.
     both = EgressService.model_validate(
         {"restrict_only": True, "restrict_to_rules": True, "rules": [{"host": "api.github.com"}]},
     )
-    assert (both.restrict_only, both.restricts_paths) == (True, True)
+    assert (both.restrict_only, both.restrict_to_rules) == (True, True)
 
 
 def test_a_service_that_sends_a_credential_needs_auth_on_every_rule() -> None:

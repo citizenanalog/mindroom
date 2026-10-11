@@ -286,12 +286,8 @@ def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> R
 
     Rules of `restrict_only` services never match here: they only limit paths and have no credential.
     """
-    return _best_match(_credential_services(config.services), host.lower(), port, path)
-
-
-def _credential_services(services: Mapping[str, EgressService]) -> dict[str, EgressService]:
-    """Return the services whose rules can choose a credential: every service but the `restrict_only` ones."""
-    return {name: service for name, service in services.items() if not service.restrict_only}
+    credential_services = {name: service for name, service in config.services.items() if not service.restrict_only}
+    return _best_match(credential_services, host.lower(), port, path)
 
 
 def _best_match(services: Mapping[str, EgressService], host: str, port: int, path: str) -> RuleMatch | None:
@@ -328,7 +324,8 @@ def _restricting_service(services: Mapping[str, EgressService], host: str, port:
         (
             name
             for name, service in services.items()
-            if service.restricts_paths and any(_rule_applies(rule, host, port) for rule in service.rules)
+            if (service.restrict_to_rules or service.restrict_only)
+            and any(_rule_applies(rule, host, port) for rule in service.rules)
         ),
         None,
     )
