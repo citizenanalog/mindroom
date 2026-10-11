@@ -573,7 +573,7 @@ def _is_queued_notice(message: Message) -> bool:
 
 
 def _snapshots(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list[RunOutput | TeamRunOutput]:
-    """Return one completed run per folded exchange, oldest first, the first led by the prompt for context.
+    """Return one completed run per folded exchange, oldest first, the first led by the prompt and the run's metadata.
 
     Separate runs let the summary chunker size the turn with the summary model's own estimator and summarize it in
     as many chunks as it needs, without truncating any exchange that fits a summary input by itself.
@@ -584,7 +584,8 @@ def _snapshots(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list
         lead = (layout.prompt,) if index == 0 and layout.prompt is not None else ()
         run_messages = [message.model_copy(deep=True) for message in (*lead, *exchange)]
         run_id = archive.snapshot_run_id(origin)
-        metadata = deepcopy(run_response.metadata)
+        # The run's metadata (provenance for redaction) is the same for every exchange, so the first snapshot holds it.
+        metadata = deepcopy(run_response.metadata) if index == 0 else None
         if isinstance(run_response, TeamRunOutput):
             snapshot: RunOutput | TeamRunOutput = TeamRunOutput(
                 run_id=run_id,

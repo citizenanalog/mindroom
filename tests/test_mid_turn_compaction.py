@@ -1106,6 +1106,22 @@ async def test_request_with_only_the_summary_to_fold_is_sent_as_is(
 
 
 @pytest.mark.asyncio
+async def test_the_turns_metadata_reaches_the_archive_and_summary_once(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    agent = _scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage)
+
+    await agent.arun("Do the task", session_id="session-1", metadata={"matrix_seen_event_ids": ["$x"]})
+
+    snapshots = [run for run in summary_calls.inputs[0].split("<run ") if ":compaction-snapshot:" in run]
+    assert len(snapshots) >= 2
+    assert sum("<run_metadata>" in run for run in snapshots) == 1
+
+
+@pytest.mark.asyncio
 async def test_next_turn_reuses_the_post_compaction_prefix(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     storage = _seeded_storage(config, paths)
