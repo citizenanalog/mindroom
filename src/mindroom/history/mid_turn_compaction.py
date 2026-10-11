@@ -360,11 +360,15 @@ def _request_tokens(
     estimate their projected request.
     """
     if policy.native_route is not None:
-        return estimate_request_messages_tokens(
-            messages,
-            replay_model=policy.replay_model,
-            native_route=policy.native_route,
-        ) + _tool_tokens(tools)
+        return (
+            estimate_request_messages_tokens(
+                messages,
+                replay_model=policy.replay_model,
+                native_route=policy.native_route,
+            )
+            + _reasoning_tokens(messages)
+            + _tool_tokens(tools)
+        )
     anchor = next(
         (
             index
@@ -382,12 +386,30 @@ def _request_tokens(
             model_id=policy.model.id,
         )
         if reported is not None:
-            return reported + estimate_request_messages_tokens(messages[anchor:], replay_model=policy.replay_model)
-    return estimate_request_messages_tokens(messages, replay_model=policy.replay_model) + _tool_tokens(tools)
+            newer = messages[anchor:]
+            return (
+                reported
+                + estimate_request_messages_tokens(newer, replay_model=policy.replay_model)
+                + _reasoning_tokens(newer)
+            )
+    return (
+        estimate_request_messages_tokens(messages, replay_model=policy.replay_model)
+        + _reasoning_tokens(messages)
+        + _tool_tokens(tools)
+    )
 
 
 def _tool_tokens(tools: list[dict[str, Any]] | None) -> int:
     return estimate_text_tokens(stable_serialize(tools)) if tools else 0
+
+
+def _reasoning_tokens(messages: Sequence[Message]) -> int:
+    """Estimate this turn's thinking, which providers resend inside a tool loop but history estimates skip."""
+    return sum(
+        estimate_text_tokens((message.reasoning_content or "") + (message.redacted_reasoning_content or ""))
+        for message in messages
+        if not message.from_history
+    )
 
 
 def _layout(messages: list[Message], run_response: RunOutput | TeamRunOutput) -> _Layout:

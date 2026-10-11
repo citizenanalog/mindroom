@@ -78,11 +78,13 @@ class _ToolLoopModel(SyntheticModel):
         tool_rounds: int,
         calls_per_round: int = 1,
         usage: Callable[[int], MessageMetrics] | None = None,
+        reasoning: str | None = None,
     ) -> None:
         super().__init__(id="test-model", name="test", provider="test")
         self.tool_rounds = tool_rounds
         self.calls_per_round = calls_per_round
         self.usage = usage
+        self.reasoning = reasoning
         self.requests: list[_Request] = []
 
     async def ainvoke(self, messages: list[Message], **_kwargs: object) -> ModelResponse:
@@ -106,6 +108,7 @@ class _ToolLoopModel(SyntheticModel):
                     }
                     for index in range(self.calls_per_round)
                 ],
+                reasoning_content=self.reasoning,
                 response_usage=metrics,
             )
         return ModelResponse(content="done", response_usage=metrics)
@@ -327,6 +330,26 @@ async def test_request_sizing_uses_the_latest_response_usage(tmp_path: Path, sum
     # The estimate alone stays far below the window; only the reported usage triggers compaction.
     assert summary_calls.inputs
     assert not any(is_compaction_summary(message) for message in model.requests[0].messages)
+    assert any(is_compaction_summary(message) for message in model.requests[1].messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_tokens", [0, 10])
+async def test_request_sizing_counts_the_turns_thinking(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    input_tokens: int,
+) -> None:
+    config, paths = _config(tmp_path, context_window=20_000)
+    model = _ToolLoopModel(
+        tool_rounds=2,
+        usage=lambda _number: MessageMetrics(input_tokens=input_tokens),
+        reasoning="t" * 100_000,
+    )
+
+    await _run(_agent(model, config, paths), "Do the task")
+
+    assert summary_calls.inputs
     assert any(is_compaction_summary(message) for message in model.requests[1].messages)
 
 
