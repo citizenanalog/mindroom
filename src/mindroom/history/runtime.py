@@ -643,7 +643,7 @@ async def summarize_run_locally(
         session_id=session_id,
         scope=scope,
     )
-    return await summarize_runs(
+    result = await summarize_runs(
         summary_model=summary_model,
         fallback_summary_model=fallback_model,
         previous_summary=previous_summary,
@@ -656,6 +656,7 @@ async def summarize_run_locally(
         timeout_seconds=execution_plan.compaction_timeout_seconds,
         on_response=on_response,
     )
+    return result.summary
 
 
 async def _run_scope_compaction(

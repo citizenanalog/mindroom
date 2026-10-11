@@ -429,8 +429,9 @@ def _remove_redacted_event_from_history(
     and compacted history is rolled back the same way. ``session`` is synced to
     the stored result. Returns whether the scope's history changed.
     """
-    # A fold a crash kept out of its run's record must not make that run look shortened.
-    _resolve_positioned_generations(storage, session, scope)
+    # A fold a crash kept out of its run's record must not make that run look shortened; covered runs stay live,
+    # so the removal still finds the run that consumed the event.
+    _resolve_positioned_generations(storage, session, scope, materialize=False)
     removed_run_ids = _remove_run_by_event_id(
         storage,
         session.session_id,
@@ -566,8 +567,9 @@ def remove_runs_for_sources(
     """
     stored = storage.get_session(session_id=session_id, session_type=session_type)
     if isinstance(stored, (AgentSession, TeamSession)):
-        # A fold a crash kept out of its run's record must not make that run look shortened.
-        _resolve_positioned_generations(storage, stored, scope)
+        # A fold a crash kept out of its run's record must not make that run look shortened; covered runs stay
+        # live, so the removal still finds the edited run.
+        _resolve_positioned_generations(storage, stored, scope, materialize=False)
     removed_run_ids: list[str] = []
     for source_event_id in source_event_ids:
         removed_run_ids += _remove_run_by_event_id(
@@ -577,19 +579,42 @@ def remove_runs_for_sources(
             session_type=session_type,
             remove_following_runs=True,
         )
-    if not removed_run_ids:
+    # An edited source already archived, such as one a resumed run's fold covered, is undone from its generation.
+    archived_hits = [
+        hit
+        for source_event_id in source_event_ids
+        if (
+            hit := archive.find_archived_event(
+                storage,
+                session_id=session_id,
+                scope_key=scope.key,
+                event_id=source_event_id,
+            )
+        )
+    ]
+    if not removed_run_ids and not archived_hits:
         return False
-    hit = archive.earliest_dependent_generation(
+    dependent = archive.earliest_dependent_generation(
         storage,
         session_id=session_id,
         scope_key=scope.key,
         run_ids=removed_run_ids,
     )
+    candidates = [candidate for candidate in (dependent, *archived_hits) if candidate is not None]
+    hit = min(candidates, key=lambda candidate: (candidate.generation_id, candidate.archived_row_id), default=None)
     session = storage.get_session(session_id=session_id, session_type=session_type)
     if hit is not None and isinstance(session, (AgentSession, TeamSession)):
-        # The removed runs were the newest, so the live runs left are older ones compaction skipped, such as a
-        # pending approval.
-        archive.roll_back_to(storage, session_id=session_id, scope_key=scope.key, hit=hit, live_run_ids=())
+        archive.roll_back_to(
+            storage,
+            session_id=session_id,
+            scope_key=scope.key,
+            hit=hit,
+            # Removed runs were the newest, so the live runs left are older ones compaction skipped, such as a
+            # pending approval; an archived hit has every live run after it.
+            live_run_ids=()
+            if hit.run_id in removed_run_ids
+            else [run.run_id for run in session.runs or [] if run.run_id],
+        )
         _sync_after_history_removal(storage, session, scope)
     return True
 
@@ -722,6 +747,8 @@ def _resolve_positioned_generations(
     storage: BaseDb,
     session: AgentSession | TeamSession,
     scope: HistoryScope,
+    *,
+    materialize: bool = True,
 ) -> None:
     """Settle every mid-turn generation against its run's stored record, then sync ``session``.
 
@@ -763,7 +790,7 @@ def _resolve_positioned_generations(
     ):
         archive.roll_back_to(storage, session_id=session.session_id, scope_key=scope.key, hit=hit, live_run_ids=())
         applied = [generation for generation in applied if generation.id < hit.generation_id]
-    for generation in applied:
+    for generation in applied if materialize else ():
         if generation.has_summary:
             _materialize(storage, target_session, scope, generation)
     if unapplied or orphaned:

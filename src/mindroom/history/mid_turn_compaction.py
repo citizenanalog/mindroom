@@ -337,7 +337,16 @@ async def _compact_scope(
     run_response.metadata = {**(run_response.metadata or {}), MID_TURN_GENERATION_METADATA_KEY: commit.generation_id}
     if binding.turn_recorder is not None:
         # A stopped or failed reply records the run from its recorder, which must still name this fold.
-        binding.turn_recorder.record_mid_turn_generation(commit.generation_id)
+        binding.turn_recorder.record_mid_turn_generation(
+            commit.generation_id,
+            folded_tool_call_ids=(
+                call["id"]
+                for exchange in layout.exchanges
+                for message in exchange
+                for call in message.tool_calls or []
+                if isinstance(call.get("id"), str)
+            ),
+        )
     session.summary = SessionSummary(summary=summary, updated_at=datetime.now(UTC))
     return compaction_summary_message(summary, run_local=False)
 

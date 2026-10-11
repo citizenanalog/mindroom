@@ -35,6 +35,7 @@ from mindroom.history.storage import (
 )
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import HistoryScope
+from mindroom.tool_system.events import ToolTraceEntry
 from tests.conftest import seed_session
 from tests.history_helpers import archived_content
 
@@ -658,8 +659,26 @@ def test_an_interrupted_record_keeps_the_fold_its_turn_applied(storage: SqliteDb
         covered_runs=[run for run in session.runs or [] if run.run_id == "r1"],
     )
     recorder = TurnRecorder(user_message="Do the task", run_metadata={})
-    recorder.record_mid_turn_generation(generation_id)
-    recorder.record_interrupted(run_metadata={}, assistant_text="partial", completed_tools=[], interrupted_tools=[])
+    recorder.record_mid_turn_generation(generation_id, folded_tool_call_ids={"call-before"})
+    recorder.record_interrupted(
+        run_metadata={},
+        assistant_text="partial",
+        completed_tools=[
+            ToolTraceEntry(
+                type="tool_call_completed",
+                tool_name="probe",
+                result_preview="BEFORE",
+                tool_call_id="call-before",
+            ),
+            ToolTraceEntry(
+                type="tool_call_completed",
+                tool_name="probe",
+                result_preview="AFTER",
+                tool_call_id="call-after",
+            ),
+        ],
+        interrupted_tools=[],
+    )
 
     persist_interrupted_replay_snapshot(
         storage=storage,
@@ -678,6 +697,10 @@ def test_an_interrupted_record_keeps_the_fold_its_turn_applied(storage: SqliteDb
     ] == [generation_id]
     assert _summary(_stored(storage)) == "folded"
     assert _live(storage) == ["x"]
+    # The fold's summary holds the earlier tool work; the interrupted record keeps only what came after it.
+    replayed = str(_stored(storage).runs[0].to_dict())
+    assert "AFTER" in replayed
+    assert "BEFORE" not in replayed
 
 
 def test_redacting_an_event_a_fold_read_undoes_the_fold_after_its_run_was_archived(storage: SqliteDb) -> None:
@@ -725,6 +748,25 @@ async def test_resuming_a_paused_run_settles_its_folds_before_the_route_reads_th
     assert archived_content(storage, "session") == {"r1": True}
     assert [run.run_id for run in paused_session.runs or []] == ["p"]
     assert _summary(paused_session) == "folded"
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_editing_a_run_an_older_resumed_run_folded_rolls_the_fold_back(
+    storage: SqliteDb,
+    *,
+    materialized: bool,
+) -> None:
+    """Regenerating an edited reply removes its obsolete content from the summary that folded it."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"), _run("b"))
+    _fold(storage, session, "p", ["r1", "b"])
+    if materialized:
+        reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$b",)) is True
+
+    assert _summary(_stored(storage)) is None
+    assert "b" not in _live(storage)
+    assert "$b" not in archive.redactable_compacted_event_ids(storage, session_id="session", scope_key=_SCOPE.key)
 
 
 def test_a_fold_a_crash_kept_out_of_its_run_is_resolved_before_redaction(storage: SqliteDb) -> None:

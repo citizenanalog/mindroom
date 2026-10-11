@@ -1893,7 +1893,8 @@ async def test_run_local_summary_switches_to_fallback_for_later_chunks() -> None
             on_response=None,
         )
 
-    assert summary == "merged summary"
+    assert summary.summary == "merged summary"
+    assert summary.served_by.name == "fallback-model"
     assert [call.kwargs["model"] for call in summary_mock.await_args_list] == [primary, fallback, fallback]
     summary_inputs = [call.kwargs["summary_input"] for call in summary_mock.await_args_list]
     assert "RUN1-MARKER" in summary_inputs[1]

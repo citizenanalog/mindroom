@@ -470,6 +470,14 @@ async def _rewrite_working_session_for_compaction(
     )
 
 
+@dataclass(frozen=True)
+class _RunsSummary:
+    """A cumulative summary and the model that wrote its last chunk, which a fallback may have replaced."""
+
+    summary: str
+    served_by: SummaryModel
+
+
 async def summarize_runs(
     *,
     summary_model: SummaryModel,
@@ -482,7 +490,7 @@ async def summarize_runs(
     summary_prompt: str,
     timeout_seconds: float,
     on_response: Callable[[Model, ModelResponse], Awaitable[None]] | None,
-) -> str:
+) -> _RunsSummary:
     """Summarize runs into one cumulative summary without touching the archive.
 
     Runs that do not fit one summary input are summarized in further chunks, each merged into the summary so far.
@@ -523,7 +531,7 @@ async def summarize_runs(
         summary = chunk.summary.summary
         remaining = remaining[len(chunk.included_runs) :]
     assert summary is not None
-    return summary
+    return _RunsSummary(summary=summary, served_by=summary_model)
 
 
 @dataclass(frozen=True)
@@ -572,7 +580,7 @@ async def compact_running_turn(
         compaction_summary=None,
     )
     requester_context = get_tool_runtime_context() or get_detached_requester_context()
-    summary = await summarize_runs(
+    result = await summarize_runs(
         summary_model=summary_model,
         fallback_summary_model=fallback_summary_model,
         previous_summary=current_summary_text(session),
@@ -589,6 +597,7 @@ async def compact_running_turn(
             requester_id=requester_context.requester_id if requester_context is not None else None,
         ),
     )
+    summary = result.summary
     generation_id = await run_blocking_until_complete(
         partial(
             record_mid_turn_generation,
@@ -596,7 +605,7 @@ async def compact_running_turn(
             session=session,
             scope=scope,
             summary=summary,
-            summary_model=_model_identifier(summary_model.model),
+            summary_model=_model_identifier(result.served_by.model),
             position_run=position_run,
             covered_runs=covered_runs,
         ),
@@ -607,7 +616,7 @@ async def compact_running_turn(
         session_id=session.session_id,
         scope=scope.key,
         summary=summary,
-        summary_model=summary_model.name,
+        summary_model=result.served_by.name,
         before_tokens=before_tokens,
         after_tokens=after_tokens,
         window_tokens=replay_window_tokens or 0,
