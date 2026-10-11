@@ -165,12 +165,18 @@ def _config(
     *,
     enabled: bool = True,
     context_window: int | None = 4000,
+    replay_window_tokens: int | None = None,
     teams: dict[str, TeamConfig] | None = None,
 ) -> tuple[Config, RuntimePaths]:
     return _make_config(
         tmp_path,
         teams=teams,
-        defaults_compaction=CompactionConfig(enabled=enabled, model="summary", reserve_tokens=500),
+        defaults_compaction=CompactionConfig(
+            enabled=enabled,
+            model="summary",
+            reserve_tokens=500,
+            replay_window_tokens=replay_window_tokens,
+        ),
         models={
             "default": ModelConfig(provider="openai", id="test-model", context_window=context_window),
             "summary": ModelConfig(provider="openai", id="summary-model", context_window=100_000),
@@ -438,6 +444,20 @@ async def test_rewritten_request_over_the_limit_raises_the_summary_budget_error(
 
     assert summary_calls.inputs
     assert "Saved conversation summary exceeds the available history budget" in str(output.content)
+
+
+@pytest.mark.asyncio
+async def test_rewritten_request_within_the_model_window_is_sent(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path, context_window=100_000, replay_window_tokens=4000)
+    model = _ToolLoopModel(tool_rounds=5)
+
+    output = await _run(_agent(model, config, paths), [Message(role="user", content="p" * 16_000)])
+
+    assert summary_calls.inputs
+    assert str(output.content).endswith("done")
 
 
 @pytest.mark.asyncio
@@ -903,6 +923,23 @@ async def test_scoped_team_compaction_keeps_the_turns_member_runs(
     stored = get_team_session(storage, "session-1")
     assert stored is not None
     assert any(run.parent_run_id == output.run_id for run in stored.runs or [])
+
+
+@pytest.mark.asyncio
+async def test_request_with_only_the_summary_to_fold_is_sent_as_is(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(storage, _session("session-1", summary=SessionSummary(summary="EARLIER-WORK")))
+    model = _ToolLoopModel(tool_rounds=0)
+
+    output = await _run_in_session(_scoped_agent(model, config, paths, storage), "p" * 16_000)
+
+    assert str(output.content) == "done"
+    assert summary_calls.inputs == []
+    assert any("EARLIER-WORK" in content for content in model.requests[0].contents)
 
 
 @pytest.mark.asyncio

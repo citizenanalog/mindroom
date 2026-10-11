@@ -83,7 +83,7 @@ A long reply, for example a tool loop that keeps reading files, can outgrow the 
 Before each model request, MindRoom checks whether the request would exceed the replay window minus `reserve_tokens`; if it would, it compacts first and the reply continues.
 After that compaction the model sees its system prompt, the summary, the user's current message, and any per-turn context; earlier conversation and the reply's own earlier tool calls and results are replaced by the summary, which records the progress made so far.
 The tool calls still appear in the reply.
-If the current message alone does not fit beside the summary, the reply fails with `Saved conversation summary exceeds the available history budget` (see [Compacted history and redaction](#compacted-history-and-redaction)).
+If the summary and the current message together exceed the model's `context_window` minus `reserve_tokens`, the reply fails with `Saved conversation summary exceeds the available history budget` (see [Compacted history and redaction](#compacted-history-and-redaction)).
 If the summary model fails, the reply continues without compacting and may then fail with a provider error.
 
 The summary is always the first message of the replayed conversation, never part of the system prompt, so a compaction leaves the system prompt and tools unchanged and later requests reuse the new conversation prefix for provider prompt caching.

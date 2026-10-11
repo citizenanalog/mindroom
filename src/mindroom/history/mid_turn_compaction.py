@@ -172,6 +172,8 @@ class _Policy:
 
     inputs: HistoryPreparationInputs
     limit: int
+    # The model's own window minus the reserve; a rewritten request over it would fail at the provider.
+    fit_limit: int
     model: Model
     replay_model: NativeCompactionModel | None
     # Set while the provider compacts natively; the hook then only falls back to text when a request cannot fit.
@@ -192,7 +194,8 @@ async def _prepare_request(
         return
     session = _scoped_session(binding, run_response)
     layout = _layout(messages, run_response, scoped=session is not None)
-    if not layout.folded:
+    if all(is_compaction_summary(message) for message in layout.folded):
+        # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
         return
     if policy.native_route is not None and policy.replay_model is not None:
         # The provider's own compaction could not keep this request within the window.
@@ -326,10 +329,12 @@ def _policy(binding: _MidTurnCompaction) -> _Policy | None:
     model = cast("Model", binding.target.model)
     replay_model = model if isinstance(model, NativeCompactionModel) else None
     native = replay_model.native_compaction if replay_model is not None else None
-    limit = context_budget_after_reserve(plan.replay_window_tokens, plan.reserve_tokens)
+    configured = binding.config.models.get(binding.model_name)
+    model_window = configured.context_window if configured is not None else None
     return _Policy(
         inputs=inputs,
-        limit=limit,
+        limit=context_budget_after_reserve(plan.replay_window_tokens, plan.reserve_tokens),
+        fit_limit=context_budget_after_reserve(model_window or plan.replay_window_tokens, plan.reserve_tokens),
         model=model,
         replay_model=replay_model,
         native_route=native.route if native is not None else None,
@@ -342,14 +347,14 @@ def _require_fit(
     tools: list[dict[str, Any]] | None,
     summary_message: Message,
 ) -> None:
-    """Refuse to send a rewritten request whose kept messages and summary still exceed the limit."""
+    """Refuse to send a rewritten request whose kept messages and summary exceed the model's own window."""
     tokens = estimate_request_messages_tokens(messages, replay_model=policy.replay_model) + _tool_tokens(tools)
-    if tokens <= policy.limit:
+    if tokens <= policy.fit_limit:
         return
     summary_tokens = estimate_text_tokens(str(summary_message.content))
     raise HistorySummaryBudgetError(
         summary_tokens=summary_tokens,
-        available_tokens=max(0, policy.limit - (tokens - summary_tokens)),
+        available_tokens=max(0, policy.fit_limit - (tokens - summary_tokens)),
     )
 
 
