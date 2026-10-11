@@ -73,7 +73,7 @@ from mindroom.history.interrupted_replay import (
     tool_execution_call_id,
 )
 from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
-from mindroom.history.native import restore_native_history
+from mindroom.history.native import restore_paused_history
 from mindroom.history.prompt_tokens import team_tool_definition_payloads_for_logging
 from mindroom.history.runtime import note_prepared_history_timing
 from mindroom.history.session_context import (
@@ -2757,7 +2757,13 @@ async def continue_paused_team_run(
         )
         if team.model is not None:
             install_approval_receipt_hooks(team.model, team.fallback_config)
-        restore_native_history(team.model, persisted_run=persisted, session=session)
+        await restore_paused_history(
+            team.model,
+            persisted_run=persisted,
+            storage=scope.storage,
+            session=session,
+            scope=scope.scope,
+        )
         requirements = apply_local_approval_decisions(
             persisted,
             decisions=decisions,

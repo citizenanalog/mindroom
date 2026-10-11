@@ -133,7 +133,7 @@ A request is scoped when its target replays persisted history (`add_history_to_c
   It archives no runs when it is written.
   While the generation is active its event ids count as compacted history, so `compacted_event_ids` and `redactable_compacted_event_ids` include them even when the running run later ends paused, cancelled, or failed and is not history-visible; a rollback or retirement removes them with the generation.
 - The commit also sets the new summary on the session object Agno loaded for the run (recorded by the builder patch), so Agno's end-of-run session write stores it and reconcile has no stale summary to repair; repairing one, as after a crash, still clears the scope's preserved seen ids as today.
-- The rewrite (section 4) then records that generation's id in the run's metadata (`mindroom_mid_turn_generation`), so the run's stored row says which fold it reflects; a cancellation after the commit still rewrites, and a failure before it leaves both the request and storage unchanged.
+- The rewrite (section 4) then records that generation's id in the run's metadata (`mindroom_mid_turn_generation`), with no await between the commit's return, the metadata, the live session's summary, and the rewrite, so the run's stored row says which fold it reflects; a cancellation or failure before that point leaves the request and the run's record unchanged, and reconcile deletes a committed generation the record does not name.
 - Nothing else in storage changes during the turn: no run moves, and the live session object keeps every run Agno loaded.
 - A second mid-turn compaction of the same run commits another positioned generation on the same position, seeded with the latest summary; it covers only stored runs no earlier generation covers, so nothing is summarized twice.
 - Reconcile (`reconcile_compaction_state`) derives each positioned generation's state from storage:
@@ -230,7 +230,7 @@ Failing-first tests at the owning seams (history modules, the builder patch, the
 - A large unseen thread context with a short current prompt is folded, not kept.
 - A resumed run sizes its first request by estimate, not by the paused response's usage.
 - A rewritten request that still exceeds the limit raises `Saved conversation summary exceeds the available history budget`.
-- A cancellation after the positioned generation committed still leaves the request rewritten; a failure in any chunk leaves the request and storage unchanged.
+- A cancellation after the positioned generation committed leaves the request and the run's record whole, and reconcile deletes the unapplied generation; a failure in any chunk leaves the request and storage unchanged.
 - After a mid-turn compaction the next reply replays the summary, the position run's prompt and tail, and nothing older, without a summary call; the session row Agno wrote at the run's end already holds the new summary, and the next reconcile archives exactly the covered runs.
 - Unseen thread context folded by a run that then stops, fails, or pauses does not return as raw context in the next reply, before and after materialization, and a redaction of such an event rolls the generation back.
 - A redaction of a covered run that a resumed older position run summarized removes that position run too, before and after materialization, after the position run was archived, and after two folds.

@@ -18,6 +18,7 @@ from agno.session.team import TeamSession
 
 from mindroom import constants
 from mindroom.agent_storage import create_state_storage, get_agent_session, get_team_session
+from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history import archive
 from mindroom.history.storage import (
     _read_scope_history_event_ids,
@@ -26,8 +27,8 @@ from mindroom.history.storage import (
     archive_compaction_chunk,
     read_scope_seen_event_ids,
     reconcile_compaction_state,
+    record_mid_turn_generation,
     remove_runs_for_sources,
-    roll_back_running_turn,
     update_scope_seen_event_ids,
 )
 from mindroom.history.types import HistoryScope
@@ -435,178 +436,207 @@ def _live_run_with(events: list[str], *, reply: str | None = None) -> RunOutput:
     return run
 
 
-def _snapshot_of(run: RunOutput, events: list[str]) -> RunOutput:
-    snapshot = _run("x")
-    snapshot.run_id = archive.snapshot_run_id("x")
-    # The reply event is attached to the live run only after it finishes.
-    metadata = {
-        key: value
-        for key, value in (run.metadata or {}).items()
-        if key != constants.MATRIX_RESPONSE_EVENT_ID_METADATA_KEY
-    }
-    snapshot.metadata = {**metadata, constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: events}
-    return snapshot
-
-
-def _seed_with_snapshots(storage: SqliteDb, *, snapshots: int) -> AgentSession:
-    """Archive r1 and r2 with one snapshot of the running x, then optionally a second snapshot of x."""
-    live = _live_run_with(["$x", "$mid", "$late"], reply="$reply")
-    session = seed_session(
-        storage,
-        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), _run("r2"), live]),
-    )
-    first = _snapshot_of(live, ["$x"])
-    archive_compaction_chunk(
-        storage=storage,
-        session=session,
-        scope=_SCOPE,
-        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
-        summary_model="summary-model",
-        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), first],
-    )
-    if snapshots == 2:
-        archive_compaction_chunk(
-            storage=storage,
-            session=session,
-            scope=_SCOPE,
-            summary=SessionSummary(summary="r1, r2, and more of x", updated_at=datetime.now(UTC)),
-            summary_model="summary-model",
-            archived_runs=[_snapshot_of(live, ["$x", "$mid"])],
-        )
-    return session
-
-
-@pytest.mark.parametrize("snapshots", [1, 2])
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("folds", [1, 2])
 @pytest.mark.parametrize("event_id", ["$x", "$mid", "$late", "$reply"])
 def test_redacting_any_event_of_a_run_that_compacted_mid_turn_rolls_back_before_it(
     storage: SqliteDb,
-    snapshots: int,
+    *,
+    materialized: bool,
+    folds: int,
     event_id: str,
 ) -> None:
-    """Events the run consumed before, between, or after its snapshots, and its reply, all reach its snapshots."""
-    session = _seed_with_snapshots(storage, snapshots=snapshots)
+    """Events the run consumed before or after its folds, and its reply, all undo the folds."""
+    session = _seed_runs(storage, _run("r1"), _run("r2"), _live_run_with(["$x", "$mid", "$late"], reply="$reply"))
+    _fold(storage, session, "x", ["r1", "r2"])
+    if folds == 2:
+        _fold(storage, session, "x", [], summary="folded twice")
+    if materialized:
+        reconcile_compaction_state(storage, session, _SCOPE)
 
-    assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id=event_id) is True
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id=event_id) is True
 
-    stored = _stored(storage)
-    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
-    assert stored.summary is None
-    assert all(archive.snapshot_origin(run.run_id or "") is None for run in stored.runs or [])
-
-
-def test_removing_an_edited_turn_rolls_back_its_mid_turn_compaction(storage: SqliteDb) -> None:
-    """Regenerating an edited turn must not replay a summary of the reply it replaces."""
-    session = _seed_with_snapshots(storage, snapshots=1)
-
-    assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
-
-    stored = _stored(storage)
-    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
-    assert stored.summary is None
+    assert _live(storage) == ["r1", "r2"]
+    assert _summary(_stored(storage)) is None
 
 
 @pytest.mark.parametrize("removal", ["edit", "redaction"])
-def test_removing_a_turn_whose_mid_turn_compaction_was_undone_keeps_earlier_runs(
+def test_removing_a_turn_whose_fold_never_applied_keeps_earlier_runs(storage: SqliteDb, removal: str) -> None:
+    """A fold a crash kept out of the run's record summarizes nothing, so removing the turn rolls nothing back."""
+    session = _seed_runs(storage, _run("r1"), _run("r2"), _live_run_with(["$x"], reply="$reply"))
+    _fold(storage, session, "x", ["r1", "r2"], applied=False)
+
+    if removal == "edit":
+        assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$x",)) is True
+    else:
+        assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$reply") is True
+
+    assert _live(storage) == ["r1", "r2"]
+    assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE.key) == []
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("removal", ["edit", "redaction"])
+def test_removing_a_turn_that_compacted_mid_turn_keeps_an_older_paused_run(
     storage: SqliteDb,
+    *,
+    materialized: bool,
     removal: str,
 ) -> None:
-    """An undone compaction of a turn leaves no summary of it, so removing the turn later rolls nothing back."""
-    live = _live_run_with(["$x"], reply="$reply")
-    session = seed_session(
-        storage,
-        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), _run("r2"), _run("r3"), live]),
-    )
-    archive_compaction_chunk(
-        storage=storage,
-        session=session,
-        scope=_SCOPE,
-        summary=SessionSummary(summary="r1", updated_at=datetime.now(UTC)),
-        summary_model="summary-model",
-        archived_runs=[run for run in session.runs or [] if run.run_id == "r1"],
-    )
-    snapshot = _snapshot_of(live, ["$x"])
-    archive_compaction_chunk(
-        storage=storage,
-        session=session,
-        scope=_SCOPE,
-        summary=SessionSummary(summary="r1, r2, r3, and early x", updated_at=datetime.now(UTC)),
-        summary_model="summary-model",
-        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r2", "r3"}), snapshot],
-    )
-    roll_back_running_turn(storage, session, _SCOPE, [snapshot.run_id or ""])
-    assert [run.run_id for run in _stored(storage).runs or []] == ["r2", "r3", "x"]
+    """A pending approval that compaction skipped survives undoing a later turn's fold, in its place."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"), _live_run_with(["$x"], reply="$reply"))
+    _fold(storage, session, "x", ["r1"])
+    if materialized:
+        reconcile_compaction_state(storage, session, _SCOPE)
+        assert _live(storage) == ["p", "x"]
 
     if removal == "edit":
-        assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
+        assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$x",)) is True
     else:
-        assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$reply") is True
+        assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$reply") is True
 
-    stored = _stored(storage)
-    assert [run.run_id for run in stored.runs or []] == ["r2", "r3"]
-    assert _summary(stored) == "r1"
+    assert _live(storage) == ["r1", "p"]
+    assert _summary(_stored(storage)) is None
 
 
-def test_redacting_a_turn_compacted_again_after_an_undone_compaction_keeps_runs_before_it(storage: SqliteDb) -> None:
-    """The turn's later archived rows, not its undone snapshot, decide which generation redaction rolls back."""
-    live = _live_run_with(["$x"], reply="$reply")
-    session = seed_session(
+def _fold(
+    storage: SqliteDb,
+    session: AgentSession | TeamSession,
+    position_run_id: str,
+    covered: list[str],
+    *,
+    applied: bool = True,
+    summary: str = "folded",
+    scope: HistoryScope = _SCOPE,
+) -> int:
+    """Commit a mid-turn generation on ``position_run_id`` and, when applied, record it on the stored run."""
+    runs = {run.run_id: run for run in session.runs or []}
+    generation_id = record_mid_turn_generation(
         storage,
-        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), _run("r2"), live]),
-    )
-    snapshot = _snapshot_of(live, ["$x"])
-    archive_compaction_chunk(
-        storage=storage,
         session=session,
-        scope=_SCOPE,
-        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
+        scope=scope,
+        summary=summary,
         summary_model="summary-model",
-        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), snapshot],
+        position_run=runs[position_run_id],
+        covered_runs=[runs[run_id] for run_id in covered],
     )
-    roll_back_running_turn(storage, session, _SCOPE, [snapshot.run_id or ""])
-    session = _stored(storage)
-    archive_compaction_chunk(
-        storage=storage,
-        session=session,
-        scope=_SCOPE,
-        summary=SessionSummary(summary="r1, r2, and x", updated_at=datetime.now(UTC)),
-        summary_model="summary-model",
-        archived_runs=list(session.runs or []),
-    )
-
-    assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$x") is True
-
-    stored = _stored(storage)
-    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
-    assert stored.summary is None
+    if applied:
+        position = runs[position_run_id]
+        position.metadata = {**(position.metadata or {}), MID_TURN_GENERATION_METADATA_KEY: generation_id}
+        storage.upsert_run(run=position, session_id=session.session_id, user_id=position.user_id)
+    return generation_id
 
 
-@pytest.mark.parametrize("removal", ["edit", "redaction"])
-def test_removing_a_turn_that_compacted_mid_turn_keeps_an_older_paused_run(storage: SqliteDb, removal: str) -> None:
-    """A pending approval that compaction skipped survives undoing the compaction of a later turn."""
-    paused = _run("p")
-    paused.status = RunStatus.paused
-    live = _live_run_with(["$x"], reply="$reply")
-    session = seed_session(
+def _paused(run_id: str) -> RunOutput:
+    run = _run(run_id)
+    run.status = RunStatus.paused
+    return run
+
+
+def _live(storage: SqliteDb) -> list[str]:
+    return [run.run_id or "" for run in _stored(storage).runs or []]
+
+
+def _seed_runs(storage: SqliteDb, *runs: RunOutput) -> AgentSession:
+    return seed_session(storage, AgentSession(session_id="session", agent_id="code", runs=list(runs)))
+
+
+def test_reconcile_archives_exactly_the_runs_an_applied_fold_covered(storage: SqliteDb) -> None:
+    """The next reply replays the fold's summary and the position run, without another summary call."""
+    session = _seed_runs(storage, _run("r1"), _run("r2"), _run("x"))
+    _fold(storage, session, "x", ["r1", "r2"])
+
+    reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert _live(storage) == ["x"]
+    assert _summary(_stored(storage)) == "folded"
+    assert archived_content(storage, "session") == {"r1": True, "r2": True}
+
+
+def test_reconcile_deletes_a_fold_its_run_never_recorded(storage: SqliteDb) -> None:
+    """A crash between the commit and the run's next save leaves the run as it was and no summary of it."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"))
+    _fold(storage, session, "p", ["r1"], applied=False)
+
+    reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert _live(storage) == ["r1", "p"]
+    assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE.key) == []
+    assert _summary(_stored(storage)) is None
+
+
+def test_reconcile_rolls_back_a_fold_whose_run_is_gone(storage: SqliteDb) -> None:
+    """A fold of a run that was never saved, or was removed, no longer summarizes anything."""
+    session = _seed_runs(storage, _run("r1"))
+    generation_id = record_mid_turn_generation(
         storage,
-        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), paused, live]),
-    )
-    archive_compaction_chunk(
-        storage=storage,
         session=session,
         scope=_SCOPE,
-        summary=SessionSummary(summary="r1 and early x", updated_at=datetime.now(UTC)),
+        summary="folded",
         summary_model="summary-model",
-        archived_runs=[*(run for run in session.runs or [] if run.run_id == "r1"), _snapshot_of(live, ["$x"])],
+        position_run=_run("gone"),
+        covered_runs=[run for run in session.runs or [] if run.run_id == "r1"],
     )
+    assert generation_id
 
-    if removal == "edit":
-        assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
-    else:
-        assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$reply") is True
+    reconcile_compaction_state(storage, session, _SCOPE)
 
-    stored = _stored(storage)
-    assert sorted(run.run_id or "" for run in stored.runs or []) == ["p", "r1"]
-    assert stored.summary is None
+    assert _live(storage) == ["r1"]
+    assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE.key) == []
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_redacting_a_covered_run_removes_the_shortened_position_run(storage: SqliteDb, *, materialized: bool) -> None:
+    """The fold's summary and the run built on it both derive from the redacted run."""
+    session = _seed_runs(storage, _run("r1"), _run("r2"), _run("x"))
+    _fold(storage, session, "x", ["r1", "r2"])
+    if materialized:
+        reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$r2") is True
+
+    assert _live(storage) == ["r1"]
+    assert _summary(_stored(storage)) is None
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_redacting_a_newer_run_an_older_resumed_run_folded_removes_that_run(
+    storage: SqliteDb,
+    *,
+    materialized: bool,
+) -> None:
+    """A resumed run whose fold covered a newer run goes with it, though it is older."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"), _run("b"))
+    _fold(storage, session, "p", ["r1", "b"])
+    if materialized:
+        reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$b") is True
+
+    assert "p" not in _live(storage)
+    assert _summary(_stored(storage)) is None
+
+
+def test_a_fold_of_a_run_that_then_stopped_keeps_its_folded_events_seen(storage: SqliteDb) -> None:
+    """Thread context a stopped run folded into the summary does not return as unseen context."""
+    stopped = _live_run_with(["$thread-context"])
+    stopped.status = RunStatus.cancelled
+    session = _seed_runs(storage, _run("r1"), stopped)
+    _fold(storage, session, "x", ["r1"])
+    reconcile_compaction_state(storage, session, _SCOPE)
+
+    assert "$thread-context" in _seen(storage, _stored(storage))
+
+
+def test_a_fold_a_crash_kept_out_of_its_run_is_resolved_before_redaction(storage: SqliteDb) -> None:
+    """Redacting a run an unapplied fold covered keeps the run that fold would have shortened."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"), _run("b"))
+    _fold(storage, session, "p", ["r1", "b"], applied=False)
+
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$b") is True
+
+    assert _live(storage) == ["r1", "p"]
+    assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE.key) == []
 
 
 def _team_run(run_id: str, *, parent_run_id: str | None = None) -> TeamRunOutput:
@@ -625,7 +655,7 @@ def _team_run(run_id: str, *, parent_run_id: str | None = None) -> TeamRunOutput
 
 
 def test_redacting_a_team_turn_that_compacted_mid_turn_removes_its_member_runs(storage: SqliteDb) -> None:
-    """A team turn's snapshots roll back with the turn, and its delegated member runs go with it."""
+    """A team turn's fold rolls back with the turn, and its delegated member runs go with it."""
     scope = HistoryScope(kind="team", scope_id="crew")
     live = _team_run("x")
     member = RunOutput(run_id="m", agent_id="helper", session_id="session", parent_run_id="x")
@@ -633,16 +663,8 @@ def test_redacting_a_team_turn_that_compacted_mid_turn_removes_its_member_runs(s
         storage,
         TeamSession(session_id="session", team_id="crew", runs=[_team_run("r1"), _team_run("r2"), live, member]),
     )
-    snapshot = _team_run("x")
-    snapshot.run_id = archive.snapshot_run_id("x")
-    archive_compaction_chunk(
-        storage=storage,
-        session=session,
-        scope=scope,
-        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
-        summary_model="summary-model",
-        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), snapshot],
-    )
+    _fold(storage, session, "x", ["r1", "r2"], scope=scope)
+    reconcile_compaction_state(storage, session, scope)
 
     assert _remove_redacted_event_from_history(storage, session, scope, event_id="$x") is True
 
@@ -652,61 +674,22 @@ def test_redacting_a_team_turn_that_compacted_mid_turn_removes_its_member_runs(s
     assert stored.summary is None
 
 
-def test_rolling_back_a_running_team_turn_keeps_the_scopes_preserved_seen_ids(storage: SqliteDb) -> None:
-    """Undoing a failed mid-turn compaction removes no history, so messages the team already saw stay seen."""
-    scope = HistoryScope(kind="team", scope_id="crew")
-    live = _team_run("x")
-    session = seed_session(
-        storage,
-        TeamSession(session_id="session", team_id="crew", runs=[_team_run("r1"), _team_run("r2"), live]),
-    )
-    update_scope_seen_event_ids(session, scope, ["$team-saw"])
-    storage.upsert_session(session)
-    snapshot = _team_run("x")
-    snapshot.run_id = archive.snapshot_run_id("x")
+def test_redacting_an_event_of_a_folded_run_a_later_compaction_archived(storage: SqliteDb) -> None:
+    """The fold, not the later archive of the whole run, decides where the rollback starts."""
+    session = _seed_runs(storage, _run("r1"), _run("r2"), _live_run_with(["$x", "$mid"], reply="$reply"))
+    _fold(storage, session, "x", ["r1", "r2"])
+    reconcile_compaction_state(storage, session, _SCOPE)
+    stored = _stored(storage)
     archive_compaction_chunk(
         storage=storage,
-        session=session,
-        scope=scope,
-        summary=SessionSummary(summary="r1, r2, and early x", updated_at=datetime.now(UTC)),
-        summary_model="summary-model",
-        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r1", "r2"}), snapshot],
-    )
-    assert "$team-saw" in read_scope_seen_event_ids(storage, session, scope)
-
-    roll_back_running_turn(storage, session, scope, [snapshot.run_id or ""])
-
-    stored = get_team_session(storage, "session")
-    assert stored is not None
-    assert [run.run_id for run in stored.runs or []] == ["r1", "r2", "x"]
-    assert "$team-saw" in read_scope_seen_event_ids(storage, stored, scope)
-
-
-def test_redacting_an_event_first_consumed_between_snapshots_after_the_run_was_archived(storage: SqliteDb) -> None:
-    """An archive hit on a later snapshot still rolls back to the run's first snapshot."""
-    session = _seed_with_snapshots(storage, snapshots=2)
-    archive_compaction_chunk(
-        storage=storage,
-        session=session,
+        session=stored,
         scope=_SCOPE,
         summary=SessionSummary(summary="everything through x", updated_at=datetime.now(UTC)),
         summary_model="summary-model",
-        archived_runs=[run for run in session.runs or [] if run.run_id == "x"],
+        archived_runs=[run for run in stored.runs or [] if run.run_id == "x"],
     )
 
-    assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$mid") is True
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$mid") is True
 
-    stored = _stored(storage)
-    assert [run.run_id for run in stored.runs or []] == ["r1", "r2"]
-    assert stored.summary is None
-
-
-def test_redacting_an_earlier_run_still_rolls_back_to_that_run(storage: SqliteDb) -> None:
-    """Runs archived before a snapshot keep their own rollback point."""
-    session = _seed_with_snapshots(storage, snapshots=2)
-
-    assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$r2") is True
-
-    stored = _stored(storage)
-    assert [run.run_id for run in stored.runs or []] == ["r1"]
-    assert stored.summary is None
+    assert _live(storage) == ["r1", "r2"]
+    assert _summary(_stored(storage)) is None

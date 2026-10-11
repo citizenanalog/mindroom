@@ -14,7 +14,7 @@ from anthropic import AsyncAnthropic, AsyncAnthropicVertex
 from anthropic.types.beta import BetaMessage
 from google.oauth2.credentials import Credentials
 
-from mindroom.history.native import restore_native_history
+from mindroom.history.native import _restore_native_history
 from mindroom.providers.anthropic_claude import MindRoomAnthropicClaude
 from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.providers.vertex_claude_compat import MindroomVertexAIClaude
@@ -105,7 +105,7 @@ def test_authored_approval_restore_requires_compatible_saved_policy(change: str)
     )
     if change == "summary":
         session.summary = SessionSummary(summary="New portable summary")
-    restore_native_history(rebuilt, persisted_run=run, session=session)
+    _restore_native_history(rebuilt, persisted_run=run, session=session)
     if change == "none":
         assert rebuilt.native_compaction is not None
         assert rebuilt.native_compaction.threshold is None

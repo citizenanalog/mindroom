@@ -42,7 +42,7 @@ from mindroom.delegation.execution import drive_delegation_stream, has_delegatio
 from mindroom.delegation.state import DelegationState
 from mindroom.error_handling import run_error_event_text
 from mindroom.helper_usage import helper_usage_context
-from mindroom.history.native import restore_native_history
+from mindroom.history.native import restore_paused_history
 from mindroom.history.session_context import ScopeSessionContext, close_agent_runtime_state_dbs
 from mindroom.history.types import HistoryScope
 from mindroom.matrix.typing import typing_indicator
@@ -486,9 +486,16 @@ class AgentApprovalExecution:
                     notice_text=config.get_prompt("QUEUED_MESSAGE_NOTICE_TEXT"),
                 )
                 install_approval_receipt_hooks(agent.model, agent.fallback_config)
-            restore_native_history(agent.model, persisted_run=persisted, session=cast("AgentSession", session))
+            history_scope = HistoryScope(kind="agent", scope_id=continuation.entity_name)
+            await restore_paused_history(
+                agent.model,
+                persisted_run=persisted,
+                storage=history_storage,
+                session=cast("AgentSession", session),
+                scope=history_scope,
+            )
             scope_context = ScopeSessionContext(
-                scope=HistoryScope(kind="agent", scope_id=continuation.entity_name),
+                scope=history_scope,
                 storage=history_storage,
                 session=cast("AgentSession", session),
                 session_id=continuation.session_id,

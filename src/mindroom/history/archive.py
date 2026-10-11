@@ -23,7 +23,6 @@ import json
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from uuid import uuid4
 
 from agno.db.sqlite import SqliteDb
 from agno.db.utils import deserialize_run, get_run_type
@@ -42,18 +41,6 @@ if TYPE_CHECKING:
     from sqlalchemy import Connection
 
 _ID_CHUNK_SIZE = 500
-_SNAPSHOT_SEPARATOR = ":compaction-snapshot:"
-
-
-def snapshot_run_id(origin_run_id: str) -> str:
-    """Return a fresh id for one archived snapshot of a run that is still in progress."""
-    return f"{origin_run_id}{_SNAPSHOT_SEPARATOR}{uuid4().hex}"
-
-
-def snapshot_origin(run_id: str) -> str | None:
-    """Return the run an archived snapshot was taken from, or None for an ordinary run."""
-    origin, separator, _suffix = run_id.partition(_SNAPSHOT_SEPARATOR)
-    return origin if separator else None
 
 
 @dataclass(frozen=True)
@@ -61,6 +48,16 @@ class _ArchivedGeneration:
     """The newest persisted compaction generation of a scope."""
 
     summary: str | None
+
+
+@dataclass(frozen=True)
+class PositionedGeneration:
+    """A generation a mid-turn compaction wrote: it covers stored runs and the folded part of one running run."""
+
+    id: int
+    through_run_id: str
+    covered_run_ids: tuple[str, ...]
+    has_summary: bool
 
 
 @dataclass(frozen=True)
@@ -82,8 +79,12 @@ def archive_runs(
     runs: Sequence[RunOutput | TeamRunOutput],
     event_ids: Mapping[str, Collection[str]],
     seen_event_ids: Mapping[str, Collection[str]],
+    generation_id: int | None = None,
 ) -> None:
     """Record one generation and move ``runs`` from the live table into the archive atomically.
+
+    With ``generation_id``, the runs join that existing generation instead, which is how a positioned
+    generation receives the stored runs it covers.
 
     ``runs`` is the complete removed subtree in stored order, member runs included.
     ``event_ids`` names every event redaction matches a run by; ``seen_event_ids`` the
@@ -97,11 +98,15 @@ def archive_runs(
     with agno_compat_sqlite.run_deletion_transaction(db) as (transaction, runs_table, sessions_table):
         connection = transaction.connection()
         _ensure_tables(connection, db)
-        compaction_id = connection.exec_driver_sql(
-            f"INSERT INTO {compactions} (session_id, scope_key, summary, summary_model, created_at) "  # noqa: S608
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, scope_key, summary, summary_model, int(time.time())),
-        ).lastrowid
+        compaction_id = (
+            generation_id
+            if generation_id is not None
+            else connection.exec_driver_sql(
+                f"INSERT INTO {compactions} (session_id, scope_key, summary, summary_model, created_at) "  # noqa: S608
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, scope_key, summary, summary_model, int(time.time())),
+            ).lastrowid
+        )
         if archived:
             indexes = (
                 agno_compat_sqlite.stored_run_indexes(
@@ -132,6 +137,80 @@ def archive_runs(
                 ],
             )
         delete_run_subtrees(transaction, runs_table, sessions_table, [run_id for run_id, _ in archived])
+
+
+def record_positioned_generation(
+    storage: BaseDb,
+    *,
+    session_id: str,
+    scope_key: str,
+    summary: str,
+    summary_model: str,
+    through_run_id: str,
+    covered_run_ids: Sequence[str],
+    event_ids: Collection[str],
+    seen_event_ids: Collection[str],
+) -> int:
+    """Record a generation whose summary covers ``covered_run_ids`` and the folded part of a running run.
+
+    No run moves: the covered runs join it when reconcile materializes it, and its event ids count as
+    compacted history meanwhile.
+    """
+    db = _sqlite(storage)
+    compactions, _ = _table_names(db)
+    with db.db_engine.begin() as connection:
+        _ensure_tables(connection, db)
+        return connection.exec_driver_sql(
+            f"INSERT INTO {compactions} (session_id, scope_key, summary, summary_model, created_at, "  # noqa: S608
+            "through_run_id, covered_run_ids, event_ids, seen_event_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                scope_key,
+                summary,
+                summary_model,
+                int(time.time()),
+                through_run_id,
+                json.dumps(list(covered_run_ids)),
+                json.dumps(sorted(event_ids)),
+                json.dumps(sorted(seen_event_ids)),
+            ),
+        ).lastrowid
+
+
+def positioned_generations(storage: BaseDb, *, session_id: str, scope_key: str) -> list[PositionedGeneration]:
+    """Return the scope's positioned generations, oldest first."""
+    db = _sqlite(storage)
+    compactions, _ = _table_names(db)
+    with db.db_engine.begin() as connection:
+        _ensure_tables(connection, db)
+        rows = connection.exec_driver_sql(
+            f"SELECT id, through_run_id, covered_run_ids, summary IS NOT NULL FROM {compactions} "  # noqa: S608
+            "WHERE session_id = ? AND scope_key = ? AND through_run_id IS NOT NULL ORDER BY id",
+            (session_id, scope_key),
+        ).fetchall()
+    return [
+        PositionedGeneration(
+            id=row[0],
+            through_run_id=row[1],
+            covered_run_ids=tuple(json.loads(row[2] or "[]")),
+            has_summary=bool(row[3]),
+        )
+        for row in rows
+    ]
+
+
+def delete_generations(storage: BaseDb, *, session_id: str, generation_ids: Collection[int]) -> None:
+    """Delete generations that never took effect, such as a fold a crash kept out of its run's record."""
+    if not generation_ids:
+        return
+    db = _sqlite(storage)
+    compactions, _ = _table_names(db)
+    with db.db_engine.begin() as connection:
+        _ensure_tables(connection, db)
+        connection.exec_driver_sql(
+            f"DELETE FROM {compactions} WHERE session_id = ? AND id IN ({', '.join('?' for _ in generation_ids)})",  # noqa: S608
+            (session_id, *generation_ids),
+        )
 
 
 # LEGACY_COMPAT: Content-free generations for history compacted before the archive existed.
@@ -206,16 +285,70 @@ def retire_summaries(storage: BaseDb, *, session_id: str, scope_key: str) -> Non
     Archived runs of retired generations no longer count as compacted history.
     """
     db = _sqlite(storage)
-    with db.db_engine.begin() as connection:
+    compactions, _ = _table_names(db)
+    with agno_compat_sqlite.run_deletion_transaction(db) as (transaction, runs_table, sessions_table):
+        connection = transaction.connection()
         _ensure_tables(connection, db)
+        # A retired fold's position run lacks the messages its summary replaced, live or archived.
+        position_run_ids = _position_run_ids(connection, compactions, session_id, scope_key, 0)
+        delete_run_subtrees(transaction, runs_table, sessions_table, position_run_ids)
+        _tombstone_archived_subtrees(connection, db, session_id=session_id, run_ids=position_run_ids)
         _clear_summaries(connection, db, session_id=session_id, scope_key=scope_key)
+
+
+_END_OF_GENERATION = 2**63 - 1
+
+
+def _position_run_ids(
+    connection: Connection,
+    compactions: str,
+    session_id: str,
+    scope_key: str,
+    from_generation_id: int,
+) -> list[str]:
+    return [
+        run_id
+        for (run_id,) in connection.exec_driver_sql(
+            f"SELECT DISTINCT through_run_id FROM {compactions} "  # noqa: S608
+            "WHERE session_id = ? AND scope_key = ? AND id >= ? AND through_run_id IS NOT NULL",
+            (session_id, scope_key, from_generation_id),
+        )
+    ]
+
+
+def _tombstone_archived_subtrees(
+    connection: Connection,
+    db: SqliteDb,
+    *,
+    session_id: str,
+    run_ids: Collection[str],
+) -> None:
+    """Clear the content of archived runs and their archived member runs, keeping them as tombstones."""
+    _, compacted_runs = _table_names(db)
+    parents: dict[str, object] = {
+        row[0]: row[1]
+        for row in connection.exec_driver_sql(
+            f"SELECT run_id, json_extract(run_data, '$.parent_run_id') FROM {compacted_runs} "  # noqa: S608
+            "WHERE session_id = ? AND run_data IS NOT NULL",
+            (session_id,),
+        )
+    }
+    doomed = {run_id for run_id in run_ids if run_id in parents}
+    while added := {run_id for run_id, parent in parents.items() if parent in doomed and run_id not in doomed}:
+        doomed |= added
+    if doomed:
+        connection.exec_driver_sql(
+            f"UPDATE {compacted_runs} SET run_type = NULL, run_data = NULL "  # noqa: S608
+            f"WHERE session_id = ? AND run_id IN ({', '.join('?' for _ in doomed)})",
+            (session_id, *doomed),
+        )
 
 
 def _clear_summaries(connection: Connection, db: SqliteDb, *, session_id: str, scope_key: str) -> None:
     compactions, _ = _table_names(db)
     connection.exec_driver_sql(
-        f"UPDATE {compactions} SET summary = NULL, legacy_event_ids = '[]' "  # noqa: S608
-        "WHERE session_id = ? AND scope_key = ?",
+        f"UPDATE {compactions} SET summary = NULL, legacy_event_ids = '[]', through_run_id = NULL, "  # noqa: S608
+        "covered_run_ids = NULL, event_ids = NULL, seen_event_ids = NULL WHERE session_id = ? AND scope_key = ?",
         (session_id, scope_key),
     )
 
@@ -289,9 +422,24 @@ def _replayed_archive_event_ids(
             f"JOIN {compactions} AS generation ON generation.id = archived.compaction_id "
             "WHERE generation.session_id = ? AND generation.scope_key = ? AND generation.id > COALESCE("
             f"(SELECT MAX(id) FROM {compactions} WHERE session_id = ? AND scope_key = ? AND summary IS NULL), 0) "
+            f"UNION SELECT value FROM {compactions} AS generation, json_each(generation.{column}) "
+            "WHERE generation.session_id = ? AND generation.scope_key = ? AND generation.through_run_id IS NOT NULL "
+            "AND generation.summary IS NOT NULL AND generation.id > COALESCE("
+            f"(SELECT MAX(id) FROM {compactions} WHERE session_id = ? AND scope_key = ? AND summary IS NULL), 0) "
             f"UNION SELECT value FROM {compactions} AS generation, json_each(generation.legacy_event_ids) "
             "WHERE generation.session_id = ? AND generation.scope_key = ? AND generation.legacy = 1",
-            (session_id, scope_key, session_id, scope_key, session_id, scope_key),
+            (
+                session_id,
+                scope_key,
+                session_id,
+                scope_key,
+                session_id,
+                scope_key,
+                session_id,
+                scope_key,
+                session_id,
+                scope_key,
+            ),
         ).fetchall()
     return {row[0] for row in rows}
 
@@ -319,43 +467,47 @@ def find_archived_event(
     return None if row is None else ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2])
 
 
-def earliest_archived_run(
+def earliest_dependent_generation(
     storage: BaseDb,
     *,
     session_id: str,
     scope_key: str,
     run_ids: Collection[str],
 ) -> ArchiveHit | None:
-    """Return the scope's first archived row that is one of ``run_ids`` or a snapshot of one.
+    """Return the scope's earliest generation that archived, covers, or is positioned on one of ``run_ids``.
 
-    Tombstones are skipped: an undone compaction moves its removed snapshots onto an older generation whose
-    summary never covered them.
+    The hit row is the earliest matching archived row of that generation, or the end of the generation when
+    only its coverage or position matches, so a rollback restores the runs archived before the removed one.
     """
-    origins = sorted({run_id for run_id in run_ids if run_id})
-    if not origins:
+    wanted = {run_id for run_id in run_ids if run_id}
+    if not wanted:
         return None
     db = _sqlite(storage)
     compactions, compacted_runs = _table_names(db)
-    best: ArchiveHit | None = None
+    candidates: list[ArchiveHit] = []
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
-        for start in range(0, len(origins), _ID_CHUNK_SIZE):
-            chunk = origins[start : start + _ID_CHUNK_SIZE]
-            matches = " OR ".join("archived.run_id = ? OR substr(archived.run_id, 1, ?) = ?" for _ in chunk)
-            parameters: list[object] = [session_id, scope_key]
-            for origin in chunk:
-                prefix = f"{origin}{_SNAPSHOT_SEPARATOR}"
-                parameters.extend([origin, len(prefix), prefix])
-            row = connection.exec_driver_sql(
-                f"SELECT archived.compaction_id, archived.id, archived.run_id FROM {compacted_runs} AS archived "  # noqa: S608
-                f"JOIN {compactions} AS generation ON generation.id = archived.compaction_id "
-                f"WHERE generation.session_id = ? AND generation.scope_key = ? AND archived.run_data IS NOT NULL "
-                f"AND ({matches}) ORDER BY archived.id LIMIT 1",
-                tuple(parameters),
-            ).first()
-            if row is not None and (best is None or row[1] < best.archived_row_id):
-                best = ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2])
-    return best
+        rows = connection.exec_driver_sql(
+            f"SELECT archived.compaction_id, archived.id, archived.run_id FROM {compacted_runs} AS archived "  # noqa: S608
+            f"JOIN {compactions} AS generation ON generation.id = archived.compaction_id "
+            "WHERE generation.session_id = ? AND generation.scope_key = ? AND archived.run_data IS NOT NULL "
+            "ORDER BY archived.id",
+            (session_id, scope_key),
+        ).fetchall()
+        candidates.extend(
+            ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2]) for row in rows if row[2] in wanted
+        )
+        for generation_id, through_run_id, covered in connection.exec_driver_sql(
+            f"SELECT id, through_run_id, covered_run_ids FROM {compactions} "  # noqa: S608
+            "WHERE session_id = ? AND scope_key = ? AND through_run_id IS NOT NULL",
+            (session_id, scope_key),
+        ):
+            matched = wanted & {through_run_id, *json.loads(covered or "[]")}
+            if matched:
+                candidates.append(
+                    ArchiveHit(generation_id=generation_id, archived_row_id=_END_OF_GENERATION, run_id=min(matched)),
+                )
+    return min(candidates, key=lambda hit: (hit.generation_id, hit.archived_row_id), default=None)
 
 
 def roll_back_to(
@@ -365,14 +517,12 @@ def roll_back_to(
     scope_key: str,
     hit: ArchiveHit,
     live_run_ids: Collection[str],
-    keep_last: Collection[str] = (),
 ) -> None:
     """Undo compaction from the hit's generation onward, keeping everything before the hit run.
 
     The hit run and everything after it (later archived runs and the given live runs)
     is removed; the hit generation's runs archived before it return to the live
     table in their original order. Removed archived runs stay as tombstones.
-    Stored runs in ``keep_last`` move after the restored runs, since they are newer.
     """
     db = _sqlite(storage)
     compactions, compacted_runs = _table_names(db)
@@ -391,9 +541,11 @@ def roll_back_to(
             indexes[run.run_id or ""] = run_index
             earlier.append(run)
         # Member runs are archived with their team run and may precede it; the hit's own
-        # members go with the hit. A snapshot of a running turn never becomes a live run.
-        restored = [run for run in runs_without(earlier, [hit.run_id]) if snapshot_origin(run.run_id or "") is None]
-        delete_run_subtrees(transaction, runs_table, sessions_table, live_run_ids)
+        # members go with the hit.
+        # A rolled-back fold's position run lacks the messages its summary replaced, so it goes wherever it is.
+        position_run_ids = _position_run_ids(connection, compactions, session_id, scope_key, hit.generation_id)
+        restored = runs_without(earlier, [hit.run_id, *position_run_ids])
+        delete_run_subtrees(transaction, runs_table, sessions_table, [*live_run_ids, *position_run_ids])
         rolled_back = [
             generation_id
             for (generation_id,) in connection.exec_driver_sql(
@@ -425,8 +577,6 @@ def roll_back_to(
                 user_id=run.user_id,
                 run_index=indexes.get(run.run_id or ""),
             )
-        for run_id in keep_last:
-            agno_compat_sqlite.move_run_to_end(transaction, runs, run_id, session_id=session_id)
 
 
 def _retire_generations(

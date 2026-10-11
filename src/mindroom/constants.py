@@ -1100,6 +1100,8 @@ MATRIX_RESPONSE_EVENT_ID_METADATA_KEY = "matrix_response_event_id"
 MATRIX_SEEN_EVENT_IDS_METADATA_KEY = "matrix_seen_event_ids"
 MATRIX_SOURCE_EVENT_IDS_METADATA_KEY = "matrix_source_event_ids"
 MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY = "matrix_source_event_prompts"
+# Run metadata key holding the id of the newest mid-turn compaction the run's stored record reflects.
+MID_TURN_GENERATION_METADATA_KEY = "mindroom_mid_turn_generation"
 MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY = "matrix_source_event_revisions"
 MINDROOM_COMPACTION_METADATA_KEY = "mindroom_compaction"
 QUEUED_MESSAGE_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"

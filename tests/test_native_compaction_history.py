@@ -25,7 +25,7 @@ from mindroom.agent_storage import get_agent_session
 from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
 from mindroom.history import archive
-from mindroom.history.native import configure_native_history, restore_native_history
+from mindroom.history.native import _restore_native_history, configure_native_history
 from mindroom.history.policy import classify_compaction_decision
 from mindroom.history.replay import compaction_summary_message, estimate_prompt_visible_history_tokens
 from mindroom.history.runtime import (
@@ -589,7 +589,7 @@ def test_restore_native_policy_requires_latest_compatible_response(change: str) 
         rebuilt.base_url = "https://other.example/v1"
     elif change == "summary":
         session.summary = SessionSummary(summary="New portable summary")
-    restore_native_history(rebuilt, persisted_run=run, session=session)
+    _restore_native_history(rebuilt, persisted_run=run, session=session)
     replay = rebuilt._format_messages(messages)
     if change == "none":
         assert rebuilt.native_compaction is not None
@@ -999,7 +999,7 @@ def test_restore_portable_policy_requires_latest_provenance(provider_data: dict[
     ]
     model = MindRoomOpenAIResponses(id="gpt-6-astra", store=True)
     model.configure_portable_replay(enabled=not portable)
-    restore_native_history(model, persisted_run=_completed_run("paused", messages=messages), session=None)
+    _restore_native_history(model, persisted_run=_completed_run("paused", messages=messages), session=None)
     request = model.get_request_params(messages=messages)
     if portable:
         assert "previous_response_id" not in request

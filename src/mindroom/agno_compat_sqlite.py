@@ -76,9 +76,7 @@ def owned_table(db: SqliteDb, table_type: Literal["runs", "sessions"]) -> Table:
 # Remove when: Agno accepts a caller-owned transaction or an in-transaction persistence hook;
 # retain the owner's independent usage retention and atomic snapshot update.
 # Coverage: tests/test_usage_storage.py::test_usage_write_failure_rolls_back_the_run,
-# tests/test_history_archive.py::test_roll_back_restores_earlier_runs_of_the_hit_generation_in_order, and
-# tests/test_compaction_redaction.py::test_rolling_back_a_running_team_turn_keeps_the_scopes_preserved_seen_ids
-# (``move_run_to_end``).
+# and tests/test_history_archive.py::test_roll_back_restores_earlier_runs_of_the_hit_generation_in_order.
 def insert_run_row(
     transaction: Session,
     runs: Table,
@@ -126,19 +124,6 @@ def stored_run_indexes(
         select(runs.c.run_id, runs.c.run_index).where(runs.c.session_id == session_id, runs.c.run_id.in_(run_ids)),
     )
     return {run_id: run_index for run_id, run_index in rows if run_index is not None}
-
-
-def move_run_to_end(transaction: Session, runs: Table, run_id: str, *, session_id: str) -> None:
-    """Give one stored run the session's next run index, so it sorts after every other run."""
-    transaction.execute(
-        runs.update()
-        .where(runs.c.session_id == session_id, runs.c.run_id == run_id)
-        .values(
-            run_index=select(func.coalesce(func.max(runs.c.run_index) + 1, 0))
-            .where(runs.c.session_id == session_id)
-            .scalar_subquery(),
-        ),
-    )
 
 
 def upsert_run_at_end(

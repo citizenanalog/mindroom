@@ -62,8 +62,8 @@ from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationChild, Del
 from mindroom.delegation.storage import freeze_delegation_storage
 from mindroom.dynamic_tool_continuation import continuation_decision_from_tools
 from mindroom.error_handling import run_error_event_text
-from mindroom.history.native import restore_native_history
-from mindroom.history.session_context import close_agent_runtime_state_dbs
+from mindroom.history.native import restore_paused_history
+from mindroom.history.session_context import close_agent_runtime_state_dbs, resolve_history_scope
 from mindroom.runtime_resolution import resolve_agent_runtime, resolve_agent_storage
 from mindroom.tool_system.context_bound_streams import callback_event_stream, closing_async_stream
 from mindroom.tool_system.output_files import (
@@ -309,7 +309,13 @@ async def _execute_child(
         if agent.model is not None:
             install_approval_receipt_hooks(agent.model, agent.fallback_config)
         session = await agent.aget_session(session_id=child.session_id, user_id=identity.requester_id)
-        restore_native_history(agent.model, persisted_run=persisted, session=cast("AgentSession | None", session))
+        await restore_paused_history(
+            agent.model,
+            persisted_run=persisted,
+            storage=storage,
+            session=cast("AgentSession | None", session),
+            scope=resolve_history_scope(agent),
+        )
         requirements = apply_local_approval_decisions(
             persisted,
             decisions=decisions,

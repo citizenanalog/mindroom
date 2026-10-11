@@ -1,9 +1,9 @@
 """Shrinkable mixed-operation coverage for the compaction archive invariants.
 
 Each example drives one conversation through appends, compaction chunks, chunks
-interrupted after the archive commit, mid-turn compactions that archive a snapshot
-of the newest run while it stays live, stale whole-row session writes, redactions,
-and reopens, starting from an empty or a pre-archive database. Summaries name the
+interrupted after the archive commit, mid-turn folds positioned on the newest run
+(some lost to a crash before the run's record named them), stale whole-row session
+writes, redactions, and reopens, starting from an empty or a pre-archive database. Summaries name the
 runs they cover, so after every step (and the reconcile the next run would do)
 the test can check exactly what replay represents.
 """
@@ -26,12 +26,14 @@ from hypothesis import strategies as st
 
 from mindroom import constants
 from mindroom.agent_storage import create_state_storage, get_agent_session
+from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history import archive
 from mindroom.history.storage import (
     _remove_redacted_event_from_history,
     archive_compaction_chunk,
     read_scope_seen_event_ids,
     reconcile_compaction_state,
+    record_mid_turn_generation,
 )
 from mindroom.history.types import HistoryScope
 from tests.conftest import seed_session
@@ -177,8 +179,11 @@ class _Runner:
             archived_runs=runs,
         )
 
-    def _midturn(self, _action: Action) -> None:
-        """Archive every earlier live run and a snapshot of the newest one, which stays live."""
+    def _midturn(self, action: Action) -> None:
+        """Fold the earlier live runs and the newest one into a generation positioned on it; it stays live.
+
+        Every third fold is lost to a crash before the run's record names it.
+        """
         session = self._load()
         reconcile_compaction_state(self._storage, session, _SCOPE)
         session = self._load()
@@ -186,24 +191,20 @@ class _Runner:
         if not live:
             return
         *prior, current = live
-        assert current.run_id is not None
-        snapshot = RunOutput(
-            run_id=archive.snapshot_run_id(current.run_id),
-            agent_id="code",
-            session_id=_SESSION,
-            status=RunStatus.completed,
-            messages=current.messages,
-            metadata=current.metadata,
-        )
-        self._ever_archived.update(run.run_id for run in prior if run.run_id)
-        archive_compaction_chunk(
-            storage=self._storage,
+        generation_id = record_mid_turn_generation(
+            self._storage,
             session=session,
             scope=_SCOPE,
-            summary=SessionSummary(summary=_summary_of(_covered(session) | {run.run_id for run in live if run.run_id})),
+            summary=_summary_of(_covered(session) | {run.run_id for run in live if run.run_id}),
             summary_model="fuzz-model",
-            archived_runs=[*prior, snapshot],
+            position_run=current,
+            covered_runs=prior,
         )
+        if action.index % 3 == 0:
+            return
+        self._ever_archived.update(run.run_id for run in prior if run.run_id)
+        current.metadata = {**(current.metadata or {}), MID_TURN_GENERATION_METADATA_KEY: generation_id}
+        self._storage.upsert_run(run=current, session_id=_SESSION, user_id=None)
 
     def _interrupt(self, action: Action) -> None:
         """Commit a chunk's archive transaction but lose the session write that follows it."""
@@ -298,7 +299,7 @@ class _Runner:
             assert not lost
         elif redacted_event_id[1:] in self._created:
             first = self._created.index(redacted_event_id[1:])
-            assert all(self._created.index(archive.snapshot_origin(run_id) or run_id) >= first for run_id in lost)
+            assert all(self._created.index(run_id) >= first for run_id in lost)
         self._present = present
         # Seen ids are exactly the events replay represents, so nothing is repeated or dropped.
         expected_seen = {_event(run_id) for run_id in live | covered}
@@ -388,13 +389,32 @@ _ACTIONS = st.builds(
     actions=[
         Action("add"),
         Action("add"),
-        Action("midturn"),
-        Action("midturn"),
+        Action("midturn", index=1),
+        Action("midturn", index=2),
         Action("add"),
         Action("compact", count=2),
         Action("redact", index=1),
     ],
     legacy=False,
+)
+@example(
+    # A fold a crash kept out of its run's record, then a redaction of a run it covered.
+    actions=[Action("add"), Action("add"), Action("midturn", index=0), Action("redact", index=0), Action("reopen")],
+    legacy=False,
+)
+@example(
+    # A materialized fold, then a later compaction of its run, then a redaction of a run it covered.
+    actions=[
+        Action("add"),
+        Action("add"),
+        Action("add"),
+        Action("midturn", index=1),
+        Action("add"),
+        Action("compact", count=2),
+        Action("redact", index=1),
+        Action("stale_write"),
+    ],
+    legacy=True,
 )
 def test_generated_compaction_histories_keep_the_archive_invariants(actions: list[Action], *, legacy: bool) -> None:
     """Interleaved compaction, interruption, stale writes, and redaction never lose or leak history."""

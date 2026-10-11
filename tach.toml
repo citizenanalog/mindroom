@@ -2380,6 +2380,9 @@ depends_on = [
     "mindroom.history.legacy_summary_system_prompt",
     "mindroom.history.message_content",
     "mindroom.history.replay",
+    "mindroom.history.session_context",
+    "mindroom.history.storage",
+    "mindroom.history.types",
 ]
 visibility = [
     "mindroom.agents",
@@ -2440,6 +2443,7 @@ depends_on = [
 path = "mindroom.history.native"
 depends_on = [
     "mindroom.history.replay",
+    "mindroom.history.storage",
     "mindroom.native_compaction",
 ]
 visibility = ["mindroom.approval.execution", "mindroom.history.runtime", "mindroom.teams", "mindroom.delegation.execution"]
@@ -7163,6 +7167,7 @@ visibility = [
     "mindroom.delegation.execution",
     "mindroom.delegation.recovery",
     "mindroom.execution_preparation",
+    "mindroom.history.agno_compat_message_builder",
     "mindroom.history.interrupted_replay",
     "mindroom.history.manual",
     "mindroom.history.mid_turn_compaction",

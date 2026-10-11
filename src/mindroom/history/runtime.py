@@ -9,7 +9,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 from mindroom.background_tasks import run_blocking_until_complete
-from mindroom.history.compaction import SummaryModel, compact_scope_history, summarize_runs
+from mindroom.history.compaction import (
+    RunningTurnCompaction,
+    SummaryModel,
+    compact_running_turn,
+    compact_scope_history,
+    summarize_runs,
+)
 from mindroom.history.native import configure_native_history, native_history_route
 from mindroom.history.policy import (
     classify_compaction_decision,
@@ -444,6 +450,13 @@ async def prepare_scope_history(
     )
 
 
+# Runs one compaction under the lifecycle wrapper, given the callback that reports its success.
+type _ScopeCompactor = Callable[
+    [Callable[[CompactionOutcome], Awaitable[CompactionOutcome]]],
+    Awaitable[CompactionOutcome | None],
+]
+
+
 async def _run_scope_compaction_with_lifecycle(
     *,
     mode: Literal["auto", "manual"],
@@ -459,7 +472,7 @@ async def _run_scope_compaction_with_lifecycle(
     runtime_paths: RuntimePaths,
     compaction_lifecycle: CompactionLifecycle | None,
     replay_model: NativeCompactionModel | None = None,
-    in_progress: Sequence[RunOutput | TeamRunOutput] = (),
+    compact: _ScopeCompactor | None = None,
 ) -> _ScopeCompactionLifecycleResult:
     execution_plan = resolved_inputs.execution_plan
     assert execution_plan.summary_input_budget_tokens is not None
@@ -512,21 +525,24 @@ async def _run_scope_compaction_with_lifecycle(
 
     progress_callback = _progress if lifecycle.enabled else None
     try:
-        outcome = await _run_scope_compaction(
-            storage=storage,
-            session=session,
-            scope=scope,
-            state=state,
-            resolved_inputs=resolved_inputs,
-            history_budget=history_budget,
-            before_tokens=current_history_tokens,
-            config=config,
-            runtime_paths=runtime_paths,
-            lifecycle_notice_event_id=notice_event_id,
-            progress_callback=progress_callback,
-            completion_callback=_complete,
-            replay_model=replay_model,
-            in_progress=in_progress,
+        outcome = (
+            await compact(_complete)
+            if compact is not None
+            else await _run_scope_compaction(
+                storage=storage,
+                session=session,
+                scope=scope,
+                state=state,
+                resolved_inputs=resolved_inputs,
+                history_budget=history_budget,
+                before_tokens=current_history_tokens,
+                config=config,
+                runtime_paths=runtime_paths,
+                lifecycle_notice_event_id=notice_event_id,
+                progress_callback=progress_callback,
+                completion_callback=_complete,
+                replay_model=replay_model,
+            )
         )
     except asyncio.CancelledError as error:
         if not completed_successfully:
@@ -657,7 +673,6 @@ async def _run_scope_compaction(
     progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None = None,
     completion_callback: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]] | None = None,
     replay_model: NativeCompactionModel | None = None,
-    in_progress: Sequence[RunOutput | TeamRunOutput] = (),
 ) -> CompactionOutcome | None:
     execution_plan = resolved_inputs.execution_plan
     summary_model, fallback_model = _load_summary_models(
@@ -685,7 +700,6 @@ async def _run_scope_compaction(
         lifecycle_notice_event_id=lifecycle_notice_event_id,
         progress_callback=progress_callback,
         completion_callback=completion_callback,
-        in_progress=in_progress,
     )
 
 
@@ -695,18 +709,52 @@ async def compact_scope_mid_turn(
     session: AgentSession | TeamSession,
     scope: HistoryScope,
     resolved_inputs: HistoryPreparationInputs,
+    position_run: RunOutput | TeamRunOutput,
+    covered_runs: Sequence[RunOutput | TeamRunOutput],
     snapshots: Sequence[RunOutput | TeamRunOutput],
     before_tokens: int,
     config: Config,
     runtime_paths: RuntimePaths,
     compaction_lifecycle: CompactionLifecycle | None,
-) -> CompactionOutcome | None:
-    """Fold the scope's visible runs and snapshots of the running turn into a new generation."""
+) -> RunningTurnCompaction | None:
+    """Fold the stored runs no summary covers and the running turn into one positioned generation."""
     # Replay limits trim history; the running turn's own tool results must all reach the summary.
     inputs = replace(
         resolved_inputs,
         history_settings=replace(resolved_inputs.history_settings, max_tool_calls_from_history=None),
     )
+    execution_plan = inputs.execution_plan
+    committed: list[RunningTurnCompaction] = []
+
+    async def compact(complete: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]]) -> CompactionOutcome:
+        summary_model, fallback_model = _load_summary_models(
+            execution_plan,
+            config=config,
+            runtime_paths=runtime_paths,
+            session_id=session.session_id,
+            scope=scope,
+        )
+        result = await compact_running_turn(
+            storage=storage,
+            session=session,
+            scope=scope,
+            position_run=position_run,
+            covered_runs=covered_runs,
+            snapshots=snapshots,
+            history_settings=inputs.history_settings,
+            summary_model=summary_model,
+            fallback_summary_model=fallback_model,
+            summary_prompt=config.get_prompt("COMPACTION_SUMMARY_PROMPT"),
+            summary_timeout_seconds=execution_plan.compaction_timeout_seconds,
+            before_tokens=before_tokens,
+            replay_window_tokens=execution_plan.replay_window_tokens,
+            threshold_tokens=execution_plan.trigger_threshold_tokens,
+            available_history_budget=execution_plan.hard_replay_budget_tokens,
+            completion_callback=complete,
+        )
+        committed.append(result)
+        return result.outcome
+
     result = await _run_scope_compaction_with_lifecycle(
         mode="auto",
         storage=storage,
@@ -715,15 +763,15 @@ async def compact_scope_mid_turn(
         # A manual request made during the turn still applies before the next reply.
         state=HistoryScopeState(),
         resolved_inputs=inputs,
-        history_budget=resolved_inputs.execution_plan.hard_replay_budget_tokens,
+        history_budget=execution_plan.hard_replay_budget_tokens,
         current_history_tokens=before_tokens,
-        runs_before=len(scope_visible_runs(session, scope)) + 1,
+        runs_before=len(covered_runs) + 1,
         config=config,
         runtime_paths=runtime_paths,
         compaction_lifecycle=compaction_lifecycle,
-        in_progress=snapshots,
+        compact=compact,
     )
-    return result.outcome
+    return committed[0] if result.outcome is not None and committed else None
 
 
 def finalize_history_preparation(

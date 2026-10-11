@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
+from agno.db.sqlite import SqliteDb
+
 from mindroom.history.replay import compaction_summary_message, current_summary_text
+from mindroom.history.storage import reconcile_compaction_state
 from mindroom.native_compaction import NativeCompactionModel, recorded_native_settings
 
 if TYPE_CHECKING:
+    from agno.db.base import BaseDb
     from agno.run.agent import RunOutput
     from agno.run.team import TeamRunOutput
     from agno.session.agent import AgentSession
     from agno.session.team import TeamSession
 
-    from mindroom.history.types import ResolvedHistoryExecutionPlan, ResolvedHistorySettings
+    from mindroom.history.types import HistoryScope, ResolvedHistoryExecutionPlan, ResolvedHistorySettings
 
 
 def configure_native_history(
@@ -50,7 +55,25 @@ def configure_native_history(
     return model
 
 
-def restore_native_history(
+async def restore_paused_history(
+    model: object,
+    *,
+    persisted_run: RunOutput | TeamRunOutput,
+    storage: BaseDb,
+    session: AgentSession | TeamSession | None,
+    scope: HistoryScope | None,
+) -> None:
+    """Settle the stored history a paused run resumes on, then restore its native policy against it.
+
+    A mid-turn compaction before the pause is settled first, so the route identity reads the current summary.
+    """
+    # The compaction archive lives in SQLite session storage only.
+    if session is not None and scope is not None and isinstance(storage, SqliteDb):
+        await asyncio.to_thread(reconcile_compaction_state, storage, session, scope)
+    _restore_native_history(model, persisted_run=persisted_run, session=session)
+
+
+def _restore_native_history(
     model: object,
     *,
     persisted_run: RunOutput | TeamRunOutput,

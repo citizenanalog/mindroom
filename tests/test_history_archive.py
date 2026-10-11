@@ -215,6 +215,101 @@ _PREVIOUS_ARCHIVE_DDL = (
 )
 
 
+def _position(storage: SqliteDb, through_run_id: str, covered: list[str], summary: str = "positioned") -> int:
+    return archive.record_positioned_generation(
+        storage,
+        session_id="session",
+        scope_key=_SCOPE,
+        summary=summary,
+        summary_model="summary-model",
+        through_run_id=through_run_id,
+        covered_run_ids=covered,
+        event_ids={f"${run_id}" for run_id in [*covered, through_run_id]},
+        seen_event_ids={f"${run_id}" for run_id in [*covered, through_run_id]},
+    )
+
+
+def _materialize(storage: SqliteDb, generation_id: int, run_ids: list[str]) -> None:
+    session = get_agent_session(storage, "session")
+    assert session is not None
+    archive.archive_runs(
+        storage,
+        session_id="session",
+        scope_key=_SCOPE,
+        summary="",
+        summary_model="",
+        runs=[run for run in session.runs or [] if run.run_id in run_ids],
+        event_ids={run_id: {f"${run_id}"} for run_id in run_ids},
+        seen_event_ids={run_id: {f"${run_id}"} for run_id in run_ids},
+        generation_id=generation_id,
+    )
+
+
+def test_positioned_generation_counts_its_events_as_compacted(storage: SqliteDb) -> None:
+    """A summary covering a running run's folded input represents those events before any run is archived."""
+    _seed(storage, ["r1", "x"])
+    _position(storage, "x", ["r1"])
+
+    assert archive.compacted_event_ids(storage, session_id="session", scope_key=_SCOPE) == {"$r1", "$x"}
+    positioned = archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE)
+    assert [(generation.through_run_id, generation.covered_run_ids) for generation in positioned] == [("x", ("r1",))]
+
+
+def test_earliest_dependent_generation_finds_covering_and_positioned_generations(storage: SqliteDb) -> None:
+    """A covered run, the position run, and an archived run all lead back to the generation that first used them."""
+    session = _seed(storage, ["r1", "r2", "x", "y"])
+    _archive(storage, session, ["r1"], "r1")
+    generation_id = _position(storage, "x", ["r2"])
+    _materialize(storage, generation_id, ["r2"])
+
+    def hit_for(run_id: str) -> int | None:
+        hit = archive.earliest_dependent_generation(
+            storage,
+            session_id="session",
+            scope_key=_SCOPE,
+            run_ids=[run_id],
+        )
+        return hit.generation_id if hit is not None else None
+
+    assert hit_for("r2") == generation_id
+    assert hit_for("x") == generation_id
+    assert hit_for("r1") == generation_id - 1
+    assert hit_for("y") is None
+
+
+def test_rolling_back_a_positioned_generation_removes_its_position_run(storage: SqliteDb) -> None:
+    """Undoing a fold drops the shortened run it produced and returns the runs it covered."""
+    _seed(storage, ["r1", "x"], children={"x-member": "x"})
+    generation_id = _position(storage, "x", ["r1"])
+    _materialize(storage, generation_id, ["r1"])
+    hit = archive.earliest_dependent_generation(storage, session_id="session", scope_key=_SCOPE, run_ids=["x"])
+    assert hit is not None
+
+    archive.roll_back_to(storage, session_id="session", scope_key=_SCOPE, hit=hit, live_run_ids=())
+
+    assert _live_run_ids(storage) == ["r1"]
+    assert archive.compacted_event_ids(storage, session_id="session", scope_key=_SCOPE) == set()
+    assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE) == []
+
+
+def test_retiring_summaries_removes_shortened_position_runs(storage: SqliteDb) -> None:
+    """A retired fold leaves no shortened run behind, live or archived, for a later rollback to restore."""
+    session = _seed(storage, ["r1", "x", "q", "w"])
+    generation_id = _position(storage, "x", ["r1"])
+    _materialize(storage, generation_id, ["r1"])
+    _archive(storage, session, ["x", "q"], "x and q")
+    _position(storage, "w", [])
+
+    archive.retire_summaries(storage, session_id="session", scope_key=_SCOPE)
+    hit = archive.find_archived_event(storage, session_id="session", scope_key=_SCOPE, event_id="$q")
+    assert hit is not None
+    archive.roll_back_to(storage, session_id="session", scope_key=_SCOPE, hit=hit, live_run_ids=())
+
+    assert "x" not in _live_run_ids(storage)
+    assert "w" not in _live_run_ids(storage)
+    assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE) == []
+
+
 def test_roll_back_drops_member_runs_archived_before_their_hit_team_run(storage: SqliteDb) -> None:
     """A member run stored ahead of the redacted run leaves with it instead of being restored."""
     session = seed_session(

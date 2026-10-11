@@ -12,6 +12,7 @@ history.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import weakref
 from collections.abc import Awaitable, Callable
@@ -19,11 +20,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from agno.agent import _messages as agent_messages
+from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.run.base import RunContext
 from agno.run.messages import RunMessages
 from agno.session.agent import AgentSession
 from agno.session.team import TeamSession
+from agno.team import Team
 from agno.team import _messages as team_messages
 from agno.team import _run as team_run
 from agno.utils.log import log_warning
@@ -31,10 +34,12 @@ from agno.utils.log import log_warning
 from mindroom.history.legacy_summary_system_prompt import system_message_embeds_summary
 from mindroom.history.message_content import project_history_media_for_replay
 from mindroom.history.replay import compaction_summary_message, current_summary_text, is_scope_summary
+from mindroom.history.session_context import resolve_history_scope
+from mindroom.history.storage import reconcile_compaction_state
+from mindroom.history.types import HistoryScope
 
 if TYPE_CHECKING:
     from agno.agent import Agent
-    from agno.team import Team
 
 # AGNO_COMPAT: Team input loses message roles.
 # Reason: Team flattens roleful Message input into a single user message.
@@ -212,10 +217,34 @@ def _prepare_history(
     return _strip_history_inline_media(run_messages)
 
 
+def _reconcile_continuation(target: object, kwargs: dict[str, object]) -> None:
+    """Settle the stored history a continuation is about to fetch, as reply preparation does for a new run.
+
+    A mid-turn compaction before the pause leaves its covered runs live until reconcile archives them.
+    """
+    session = kwargs.get("session")
+    entity = cast("Agent | Team", target)
+    # The compaction archive lives in SQLite session storage only.
+    if not isinstance(session, (AgentSession, TeamSession)) or not isinstance(entity.db, SqliteDb):
+        return
+    replays_history = kwargs.get("add_history_to_context")
+    if not (replays_history if replays_history is not None else entity.add_history_to_context):
+        return
+    scope = (
+        HistoryScope(kind="team", scope_id=entity.id or "")
+        if isinstance(entity, Team)
+        else resolve_history_scope(entity)
+    )
+    if scope is not None:
+        reconcile_compaction_state(entity.db, session, scope)
+
+
 def _with_history_policy(builder: _RunMessagesBuilder, *, continuation: bool) -> _RunMessagesBuilder:
     """Wrap one synchronous run-message builder with MindRoom's replay policy."""
 
     def build(target: object, *args: object, **kwargs: object) -> RunMessages:
+        if continuation:
+            _reconcile_continuation(target, kwargs)
         return _prepare_history(builder(target, *args, **kwargs), target, kwargs, continuation=continuation)
 
     return build
@@ -225,6 +254,9 @@ def _with_history_policy_async(builder: _AsyncRunMessagesBuilder, *, continuatio
     """Wrap one asynchronous run-message builder with MindRoom's replay policy."""
 
     async def build(target: object, *args: object, **kwargs: object) -> RunMessages:
+        if continuation:
+            # Reconcile reads and writes storage, so it stays off the event loop that serves every room.
+            await asyncio.to_thread(_reconcile_continuation, target, kwargs)
         return _prepare_history(await builder(target, *args, **kwargs), target, kwargs, continuation=continuation)
 
     return build

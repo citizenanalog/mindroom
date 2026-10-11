@@ -34,15 +34,19 @@ from mindroom.agents import create_agent
 from mindroom.agno_compat_model_hooks import install_request_preparation
 from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
-from mindroom.constants import MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY
+from mindroom.constants import MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY, MID_TURN_GENERATION_METADATA_KEY
 from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY as _NOTICE_KEY
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.helper_usage import HelperUsageOwner
 from mindroom.history import agno_compat_message_builder, archive, mid_turn_compaction
-from mindroom.history.agno_compat_message_builder import built_request_session
 from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
 from mindroom.history.replay import compaction_summary_message, estimate_request_messages_tokens, is_compaction_summary
-from mindroom.history.storage import new_scope_session, read_scope_state, set_force_compaction_state
+from mindroom.history.storage import (
+    new_scope_session,
+    read_scope_state,
+    reconcile_compaction_state,
+    set_force_compaction_state,
+)
 from mindroom.history.types import CompactionOutcome, HistoryScope, HistoryScopeState, PreparedHistoryState
 from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, HookRegistry, hook
 from mindroom.model_usage import response_context_tokens
@@ -1325,16 +1329,22 @@ async def test_long_single_turn_compacts_mid_turn_and_continues(
     assert summaries[0].from_history is True
     assert compacted.contents[-1] == "Do the task"
     assert not {"q1", "a1", "q2", "a2"} & set(compacted.contents)
-    archived = archived_run_ids(storage)
-    assert archived[:2] == ["run-1", "run-2"]
-    assert archived[2].startswith(f"{output.run_id}:compaction-snapshot:")
-    assert output.run_id not in archived
+    # Nothing moved during the turn: one generation covers the stored runs and the folded part of this run.
+    assert archived_run_ids(storage) == []
+    positioned = archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert positioned[0].through_run_id == output.run_id
+    assert positioned[0].covered_run_ids == ("run-1", "run-2")
+    assert (output.metadata or {})[MID_TURN_GENERATION_METADATA_KEY] == positioned[-1].id
     generations = compaction_generations(storage, _SCOPE.key)
     stored = get_agent_session(storage, "session-1")
     assert stored is not None
+    # The session row Agno wrote at the end of the run already holds the new summary.
     assert stored.summary is not None
     assert stored.summary.summary == generations[-1].summary
-    assert any(run.run_id == output.run_id for run in stored.runs or [])
+    # The next reply's reconcile archives exactly the covered runs and keeps this run live.
+    reconcile_compaction_state(storage, stored, _SCOPE)
+    assert archived_run_ids(storage) == ["run-1", "run-2"]
+    assert [run.run_id for run in stored.runs or []] == [output.run_id]
 
 
 @pytest.mark.asyncio
@@ -1391,10 +1401,12 @@ async def test_long_single_team_turn_compacts_mid_turn_and_continues(
     assert summaries[0].from_history is True
     assert compacted.contents[-1] == "Do the task"
     assert not any("team question" in content or "team answer" in content for content in compacted.contents)
-    archived = archived_run_ids(storage)
-    assert archived[:2] == ["run-1", "run-2"]
-    assert archived[2].startswith(f"{output.run_id}:compaction-snapshot:")
-    generations = compaction_generations(storage, HistoryScope(kind="team", scope_id="test_team").key)
+    assert archived_run_ids(storage) == []
+    team_scope = HistoryScope(kind="team", scope_id="test_team")
+    positioned = archive.positioned_generations(storage, session_id="session-1", scope_key=team_scope.key)
+    assert positioned[0].through_run_id == output.run_id
+    assert positioned[0].covered_run_ids == ("run-1", "run-2")
+    generations = compaction_generations(storage, team_scope.key)
     stored = get_team_session(storage, "session-1")
     assert stored is not None
     assert stored.summary is not None
@@ -1473,7 +1485,22 @@ async def test_request_with_only_the_summary_to_fold_is_sent_as_is(
 
 
 @pytest.mark.asyncio
-async def test_the_turns_metadata_reaches_the_archive_and_summary_once(
+async def test_a_second_fold_of_the_turn_covers_no_run_twice(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+
+    await _run_in_session(_scoped_agent(_ToolLoopModel(tool_rounds=12), config, paths, storage), "Do the task")
+
+    positioned = archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert len(positioned) >= 2
+    assert positioned[0].covered_run_ids == ("run-1", "run-2")
+    assert all(generation.covered_run_ids == () for generation in positioned[1:])
+    assert len(summary_calls.inputs) == len(positioned)
+    assert "q1" not in summary_calls.inputs[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_turns_metadata_reaches_the_summary_once(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
 ) -> None:
@@ -1483,7 +1510,7 @@ async def test_the_turns_metadata_reaches_the_archive_and_summary_once(
 
     await agent.arun("Do the task", session_id="session-1", metadata={"matrix_seen_event_ids": ["$x"]})
 
-    snapshots = [run for run in summary_calls.inputs[0].split("<run ") if ":compaction-snapshot:" in run]
+    snapshots = [run for run in summary_calls.inputs[0].split("<run ") if ":exchange:" in run]
     assert len(snapshots) >= 2
     assert sum("<run_metadata>" in run for run in snapshots) == 1
 
@@ -1519,10 +1546,11 @@ async def test_first_request_over_the_limit_from_tools_compacts_history_before_d
     assert str(output.content) == "done"
     first = model.requests[0]
     assert not any(content.startswith("q0 ") for content in first.contents)
-    # The history left the request only because it was summarized and archived.
+    # The history left the request only because a summary now covers it.
     assert summary_calls.inputs
     assert any(is_compaction_summary(message) for message in first.messages)
-    assert archived_run_ids(storage)[:4] == [f"run-{index}" for index in range(4)]
+    positioned = archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert positioned[0].covered_run_ids == tuple(f"run-{index}" for index in range(4))
 
 
 @pytest.mark.asyncio
@@ -1554,15 +1582,22 @@ async def test_next_turn_reuses_the_post_compaction_prefix(tmp_path: Path, summa
     agent = _scoped_agent(model, config, paths, storage)
     await _run_in_session(agent, "Do the task")
     last_request = model.requests[-1]
+    calls_after_first_turn = len(summary_calls.inputs)
     model.requests.clear()
     model.tool_rounds = 0
+    stored = get_agent_session(storage, "session-1")
+    assert stored is not None
+    # Reply preparation reconciles before the next reply builds its history.
+    reconcile_compaction_state(storage, stored, _SCOPE)
 
     await _run_in_session(agent, "Thanks")
 
     next_request = model.requests[0]
-    assert summary_calls.inputs
+    assert calls_after_first_turn
+    assert len(summary_calls.inputs) == calls_after_first_turn
     assert next_request.roles[: len(last_request.roles)] == last_request.roles
     assert next_request.contents[: len(last_request.contents)] == last_request.contents
+    assert not {"q1", "a1", "q2", "a2"} & set(next_request.contents)
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1731,7 @@ async def test_team_approval_resume_after_mid_turn_compaction(tmp_path: Path, su
 
 
 @pytest.mark.asyncio
-async def test_partial_commit_then_failure_leaves_the_request_unchanged(
+async def test_failure_in_a_later_chunk_leaves_request_and_storage_unchanged(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
     monkeypatch: pytest.MonkeyPatch,
@@ -1730,16 +1765,15 @@ async def test_partial_commit_then_failure_leaves_the_request_unchanged(
     assert str(output.content).endswith("done")
     assert len(summary_calls.inputs) == 2
     assert not any(is_compaction_summary(message) for request in model.requests for message in request.messages)
+    # A mid-turn compaction writes nothing until its last chunk succeeds.
     stored = get_agent_session(storage, "session-1")
     assert stored is not None
-    generations = compaction_generations(storage, _SCOPE.key)
-    assert generations
-    assert stored.summary is not None
-    assert stored.summary.summary == generations[-1].summary
+    assert compaction_generations(storage, _SCOPE.key) == []
+    assert stored.summary is None
 
 
 @pytest.mark.asyncio
-async def test_failure_after_part_of_the_turn_committed_rolls_the_turn_back(
+async def test_failure_in_a_later_chunk_of_the_turn_commits_nothing(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
     monkeypatch: pytest.MonkeyPatch,
@@ -1762,7 +1796,7 @@ async def test_failure_after_part_of_the_turn_committed_rolls_the_turn_back(
 
     assert str(output.content).endswith("done")
     assert len(summary_calls.inputs) == 2
-    # The turn's first chunk committed before the second failed; the request kept every exchange unchanged.
+    # The second chunk failed, so nothing was written and the request kept every exchange unchanged.
     assert not any(is_compaction_summary(message) for request in model.requests for message in request.messages)
     generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
     assert generation is None or generation.summary is None
@@ -1819,7 +1853,7 @@ async def test_rolling_back_a_partial_compaction_keeps_an_earlier_one(
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_part_of_the_turn_committed_rolls_the_turn_back(
+async def test_cancellation_in_a_later_chunk_commits_nothing(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
     monkeypatch: pytest.MonkeyPatch,
@@ -1839,10 +1873,8 @@ async def test_cancellation_after_part_of_the_turn_committed_rolls_the_turn_back
         await _run_in_session(_scoped_agent(_ToolLoopModel(tool_rounds=5), config, paths, storage), "Do the task")
 
     assert len(summary_calls.inputs) == 1
-    # The first chunk archived part of the turn before the cancel; the rollback retired it.
-    assert any(":compaction-snapshot:" in run_id for run_id in archived_run_ids(storage))
-    generation = archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key)
-    assert generation is None or generation.summary is None
+    assert archived_run_ids(storage) == []
+    assert archive.latest_generation(storage, session_id="session-1", scope_key=_SCOPE.key) is None
 
 
 @pytest.mark.asyncio
@@ -1936,7 +1968,7 @@ async def test_cancellation_during_the_summary_call_archives_nothing_and_propaga
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("summary_calls")
-async def test_cancellation_after_the_snapshot_commit_still_rewrites_the_request(tmp_path: Path) -> None:
+async def test_cancellation_after_the_commit_leaves_the_run_whole_and_the_fold_unapplied(tmp_path: Path) -> None:
     config, paths = _config(tmp_path)
     storage = _seeded_storage(config, paths)
     model = _ToolLoopModel(tool_rounds=5)
@@ -1961,13 +1993,15 @@ async def test_cancellation_after_the_snapshot_commit_still_rewrites_the_request
         await _run_in_session(agent, "Do the task")
 
     request = live_lists[-1]
-    assert any(is_compaction_summary(message) for message in request)
-    assert all(message.role != "tool" for message in request)
-    live_session = built_request_session(agent, run_ids[-1])
-    assert live_session is not None
-    generations = compaction_generations(storage, _SCOPE.key)
-    assert live_session.summary is not None
-    assert live_session.summary.summary == generations[-1].summary
+    assert not any(is_compaction_summary(message) for message in request)
+    assert any(message.role == "tool" for message in request)
+    assert archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key)
+    stored = get_agent_session(storage, "session-1")
+    assert stored is not None
+    # The run's record never named the fold, so the next reconcile discards it.
+    reconcile_compaction_state(storage, stored, _SCOPE)
+    assert archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key) == []
+    assert archived_run_ids(storage) == []
 
 
 async def _run_in_session(agent: Agent, prompt: str, *, stream: bool = False) -> RunOutput:
@@ -2052,7 +2086,7 @@ async def test_oversized_native_request_turns_native_off_and_compacts_as_text(
 
 
 @pytest.mark.asyncio
-async def test_oversized_native_request_in_a_stored_conversation_archives_the_turn(
+async def test_oversized_native_request_in_a_stored_conversation_covers_the_turn(
     tmp_path: Path,
     summary_calls: _SummaryCalls,
 ) -> None:
@@ -2065,9 +2099,9 @@ async def test_oversized_native_request_in_a_stored_conversation_archives_the_tu
 
     assert summary_calls.inputs
     assert model.native_compaction is None
-    archived = archived_run_ids(storage)
-    assert archived[:2] == ["run-1", "run-2"]
-    assert archived[2].startswith(f"{output.run_id}:compaction-snapshot:")
+    positioned = archive.positioned_generations(storage, session_id="session-1", scope_key=_SCOPE.key)
+    assert positioned[0].through_run_id == output.run_id
+    assert positioned[0].covered_run_ids == ("run-1", "run-2")
     stored = get_agent_session(storage, "session-1")
     assert stored is not None
     assert stored.summary is not None

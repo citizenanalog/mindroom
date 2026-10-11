@@ -65,6 +65,7 @@ from mindroom.constants import (
     MATRIX_SOURCE_EVENT_IDS_METADATA_KEY,
     MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY,
     MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY,
+    MID_TURN_GENERATION_METADATA_KEY,
     MINDROOM_COMPACTION_METADATA_KEY,
     MINDROOM_MATRIX_HISTORY_METADATA_KEY,
 )
@@ -428,6 +429,8 @@ def _remove_redacted_event_from_history(
     and compacted history is rolled back the same way. ``session`` is synced to
     the stored result. Returns whether the scope's history changed.
     """
+    # A fold a crash kept out of its run's record must not make that run look shortened.
+    _resolve_positioned_generations(storage, session, scope)
     removed_run_ids = _remove_run_by_event_id(
         storage,
         session.session_id,
@@ -538,8 +541,8 @@ def _remove_redacted_event_from_compaction(
             session_id=session.session_id,
             scope_key=scope.key,
             hit=hit,
-            # A snapshot of a removed run is undone with it; the live runs left are older ones compaction skipped.
-            live_run_ids=() if (archive.snapshot_origin(hit.run_id) or hit.run_id) in removed_run_ids else live_run_ids,
+            # A fold depending on a removed run is undone with it; the live runs left are older ones compaction skipped.
+            live_run_ids=() if hit.run_id in removed_run_ids else live_run_ids,
         )
     elif not removed_live_run:
         return False
@@ -556,11 +559,15 @@ def remove_runs_for_sources(
     scope: HistoryScope,
     source_event_ids: Sequence[str],
 ) -> bool:
-    """Remove each source's runs and every run after them, and undo compaction that archived their snapshots.
+    """Remove each source's runs and every run after them, and undo compaction that depends on them.
 
     A run that compacted while it was running left its earlier work in the archive; without the rollback, a
     regenerated reply would replay a summary of the reply it replaces. Returns whether any run went.
     """
+    stored = storage.get_session(session_id=session_id, session_type=session_type)
+    if isinstance(stored, (AgentSession, TeamSession)):
+        # A fold a crash kept out of its run's record must not make that run look shortened.
+        _resolve_positioned_generations(storage, stored, scope)
     removed_run_ids: list[str] = []
     for source_event_id in source_event_ids:
         removed_run_ids += _remove_run_by_event_id(
@@ -572,7 +579,12 @@ def remove_runs_for_sources(
         )
     if not removed_run_ids:
         return False
-    hit = archive.earliest_archived_run(storage, session_id=session_id, scope_key=scope.key, run_ids=removed_run_ids)
+    hit = archive.earliest_dependent_generation(
+        storage,
+        session_id=session_id,
+        scope_key=scope.key,
+        run_ids=removed_run_ids,
+    )
     session = storage.get_session(session_id=session_id, session_type=session_type)
     if hit is not None and isinstance(session, (AgentSession, TeamSession)):
         # The removed runs were the newest, so the live runs left are older ones compaction skipped, such as a
@@ -582,50 +594,14 @@ def remove_runs_for_sources(
     return True
 
 
-def roll_back_running_turn(
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    snapshot_run_ids: Sequence[str],
-) -> None:
-    """Undo compaction from the first of these snapshots of a still-running run, keeping everything before it.
-
-    A turn's exchanges fold together or not at all, so a compaction that committed only some of them is undone;
-    runs archived earlier in that generation return live, earlier compactions of the same run stay, and
-    ``session`` is synced to the stored result. Nothing was removed, so the scope's seen event ids stay, and a
-    stored row of the running run (a resumed run) moves back after the restored runs.
-    """
-    hit = archive.earliest_archived_run(
-        storage,
-        session_id=session.session_id,
-        scope_key=scope.key,
-        run_ids=snapshot_run_ids,
-    )
-    if hit is None:
-        return
-    origin = archive.snapshot_origin(hit.run_id) or hit.run_id
-    archive.roll_back_to(
-        storage,
-        session_id=session.session_id,
-        scope_key=scope.key,
-        hit=hit,
-        live_run_ids=(),
-        keep_last=(origin,),
-    )
-    _sync_after_history_removal(storage, session, scope, keep_seen_event_ids=True)
-
-
 def _sync_after_history_removal(
     storage: BaseDb,
     session: AgentSession | TeamSession,
     scope: HistoryScope,
-    *,
-    keep_seen_event_ids: bool = False,
 ) -> None:
     """Store the archive's latest summary on the session row and, after a removal, drop preserved seen ids."""
     target_session = _latest_persisted_session(storage, session)
-    if not keep_seen_event_ids:
-        _replace_scope_seen_event_ids(target_session, scope, set())
+    _replace_scope_seen_event_ids(target_session, scope, set())
     generation = archive.latest_generation(storage, session_id=session.session_id, scope_key=scope.key)
     if generation is not None:
         _refresh_summary(target_session, generation.summary)
@@ -641,24 +617,20 @@ def _earliest_dependent_row(
     event_id: str,
     removed_run_ids: Sequence[str],
 ) -> archive.ArchiveHit | None:
-    """Return the earliest archived row that derives from the event or from a run redaction removed.
-
-    A run that compacted while it was still running left snapshots holding its earlier work, but events it
-    consumed later and its reply belong only to the run itself, so the run and its snapshots go together.
-    """
+    """Return the earliest archived row or fold that derives from the event or from a run redaction removed."""
     hit = archive.find_archived_event(storage, session_id=session.session_id, scope_key=scope.key, event_id=event_id)
     origins = set(removed_run_ids)
     if hit is not None:
-        origins.add(archive.snapshot_origin(hit.run_id) or hit.run_id)
-    related = archive.earliest_archived_run(
+        origins.add(hit.run_id)
+    related = archive.earliest_dependent_generation(
         storage,
         session_id=session.session_id,
         scope_key=scope.key,
         run_ids=origins,
     )
-    if hit is None or (related is not None and related.archived_row_id < hit.archived_row_id):
-        return related
-    return hit
+    candidates = [candidate for candidate in (hit, related) if candidate is not None]
+    # The earliest one undoes the most, so every generation depending on a removed run goes.
+    return min(candidates, key=lambda candidate: (candidate.generation_id, candidate.archived_row_id), default=None)
 
 
 # LEGACY_COMPAT: Redaction of history compacted before the archive existed.
@@ -709,12 +681,134 @@ def _state_is_empty(state: HistoryScopeState) -> bool:
     return not state.force_compact_before_next_run
 
 
+def record_mid_turn_generation(
+    storage: BaseDb,
+    *,
+    session: AgentSession | TeamSession,
+    scope: HistoryScope,
+    summary: str,
+    summary_model: str,
+    position_run: RunOutput | TeamRunOutput,
+    covered_runs: Sequence[RunOutput | TeamRunOutput],
+) -> int:
+    """Commit a positioned generation for a fold of ``position_run`` that also summarized ``covered_runs``.
+
+    The running run's consumed events count even when it later ends paused, cancelled, or failed.
+    """
+    # A first turn's session row does not exist until Agno writes it when the run ends.
+    if storage.get_session(session_id=session.session_id, session_type=_session_type(session)) is None:
+        storage.upsert_session(
+            new_scope_session(session_id=session.session_id, scope_id=scope.scope_id, is_team=scope.kind == "team"),
+        )
+    position_ids = _run_seen_event_ids(position_run) | _run_source_event_ids(position_run)
+    return archive.record_positioned_generation(
+        storage,
+        session_id=session.session_id,
+        scope_key=scope.key,
+        summary=summary,
+        summary_model=summary_model,
+        through_run_id=position_run.run_id or "",
+        covered_run_ids=[run.run_id for run in covered_runs if run.run_id],
+        event_ids=position_ids.union(*(_run_event_ids(run) for run in covered_runs)),
+        seen_event_ids=_run_seen_event_ids(position_run).union(
+            *(_run_seen_event_ids(run) for run in covered_runs if is_model_history_visible_run(run)),
+        ),
+    )
+
+
+def _resolve_positioned_generations(
+    storage: BaseDb,
+    session: AgentSession | TeamSession,
+    scope: HistoryScope,
+) -> None:
+    """Settle every mid-turn generation against its run's stored record, then sync ``session``.
+
+    A fold the run's record does not reflect, which only a crash before the run's next save leaves, is
+    deleted and the run kept; a fold whose run was neither saved nor archived is invalidated; an applied fold
+    receives the live runs it covered.
+    """
+    positioned = archive.positioned_generations(storage, session_id=session.session_id, scope_key=scope.key)
+    if not positioned:
+        return
+    target_session = _latest_persisted_session(storage, session)
+    live = {run.run_id: run for run in target_session.runs or [] if run.run_id}
+    archived = archive.archived_run_ids(
+        storage,
+        session_id=session.session_id,
+        run_ids=[generation.through_run_id for generation in positioned],
+    )
+    unapplied: list[int] = []
+    orphaned: set[str] = set()
+    applied: list[archive.PositionedGeneration] = []
+    for generation in positioned:
+        run = live.get(generation.through_run_id)
+        if run is None and generation.through_run_id not in archived:
+            orphaned.add(generation.through_run_id)
+        elif run is not None and _recorded_generation(run) < generation.id:
+            unapplied.append(generation.id)
+        else:
+            applied.append(generation)
+    archive.delete_generations(storage, session_id=session.session_id, generation_ids=unapplied)
+    if orphaned and (
+        hit := archive.earliest_dependent_generation(
+            storage,
+            session_id=session.session_id,
+            scope_key=scope.key,
+            run_ids=orphaned,
+        )
+    ):
+        archive.roll_back_to(storage, session_id=session.session_id, scope_key=scope.key, hit=hit, live_run_ids=())
+        applied = [generation for generation in applied if generation.id < hit.generation_id]
+    for generation in applied:
+        if generation.has_summary:
+            _materialize(storage, target_session, scope, generation)
+    _adopt_session_fields(session, _latest_persisted_session(storage, target_session))
+
+
+def _session_type(session: AgentSession | TeamSession) -> SessionType:
+    return SessionType.TEAM if isinstance(session, TeamSession) else SessionType.AGENT
+
+
+def _recorded_generation(run: RunOutput | TeamRunOutput) -> int:
+    recorded = run.metadata.get(MID_TURN_GENERATION_METADATA_KEY) if isinstance(run.metadata, dict) else None
+    return recorded if isinstance(recorded, int) else 0
+
+
+def _materialize(
+    storage: BaseDb,
+    session: AgentSession | TeamSession,
+    scope: HistoryScope,
+    generation: archive.PositionedGeneration,
+) -> None:
+    """Move the live runs an applied fold covered, with their member runs, into its generation."""
+    runs = session.runs or []
+    kept = {id(run) for run in runs_without(runs, generation.covered_run_ids)}
+    covered = [run for run in runs if id(run) not in kept]
+    if not covered:
+        return
+    archive.archive_runs(
+        storage,
+        session_id=session.session_id,
+        scope_key=scope.key,
+        summary="",
+        summary_model="",
+        runs=covered,
+        event_ids={run.run_id: _run_event_ids(run) for run in covered if run.run_id},
+        seen_event_ids={
+            run.run_id: _run_seen_event_ids(run) for run in covered if run.run_id and is_model_history_visible_run(run)
+        },
+        generation_id=generation.id,
+    )
+    session.runs = [run for run in runs if id(run) in kept]
+
+
 def reconcile_compaction_state(
     storage: BaseDb,
     session: AgentSession | TeamSession,
     scope: HistoryScope,
 ) -> None:
     """Restore the archive invariants before a run uses persisted history (invariants 2 and 3)."""
+    _resolve_positioned_generations(storage, session, scope)
     live_run_ids = [run.run_id for run in session.runs or [] if run.run_id]
     resurrected = archive.archived_run_ids(storage, session_id=session.session_id, run_ids=live_run_ids)
     if resurrected:
