@@ -20,8 +20,6 @@ import {
  * the editor where to put them.
  */
 
-export const MAX_RULES = 50;
-const MAX_SERVICE_BYTES = 16 * 1024;
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 
@@ -150,6 +148,8 @@ function placeholderProblems(
   options: EditorOptions,
 ): ServiceProblem[] {
   const problems: ServiceProblem[] = [];
+  // Without the server's rules the checks that need them are left to the server.
+  const limits = options.limits?.placeholder ?? null;
   const seen = new Set<string>();
   placeholders.forEach((placeholder, index) => {
     const name = placeholder.name.trim();
@@ -159,15 +159,14 @@ function placeholderProblems(
       problems.push({ field: placeholderField(index, part), message });
     if (!PLACEHOLDER_NAME_PATTERN.test(name)) {
       // A personal user hears what the server would say, not a pattern.
-      add(
-        "name",
+      const message =
         options.context === "personal"
-          ? personalPlaceholderNameError(name)
-          : `Placeholder name ${name} must match ^[A-Z_][A-Z0-9_]*$`,
-      );
+          ? limits && personalPlaceholderNameError(name, limits)
+          : `Placeholder name ${name} must match ^[A-Z_][A-Z0-9_]*$`;
+      if (message) add("name", message);
       return;
     }
-    const reservedProblem = reservedPlaceholderError(name);
+    const reservedProblem = limits && reservedPlaceholderError(name, limits);
     if (reservedProblem) {
       add("name", reservedProblem);
       return;
@@ -175,8 +174,8 @@ function placeholderProblems(
     if (seen.has(name)) add("name", `Placeholder ${name} is listed twice`);
     seen.add(name);
     const personalProblem =
-      options.context === "personal"
-        ? personalPlaceholderError(name, placeholder.value)
+      options.context === "personal" && limits
+        ? personalPlaceholderError(name, placeholder.value, limits)
         : null;
     if (personalProblem) add(personalProblem.part, personalProblem.message);
   });
@@ -204,11 +203,8 @@ export function validateService(
         field: "rules",
         message: "Enter at least one repository, such as owner/repo",
       });
-    if (options.context === "personal" && form.rules.length > MAX_RULES)
-      problems.push({
-        field: "form",
-        message: `A service can have at most ${MAX_RULES} rules`,
-      });
+    const tooManyRules = tooManyRulesProblem(form, options);
+    if (tooManyRules) problems.push({ field: "form", message: tooManyRules });
     problems.push(...sizeProblems(form, options, problems));
     return problems;
   }
@@ -226,11 +222,8 @@ export function validateService(
   if (usesOwnRules(form)) {
     if (form.rules.length === 0)
       problems.push({ field: "rules", message: "Add at least one rule" });
-    if (options.context === "personal" && form.rules.length > MAX_RULES)
-      problems.push({
-        field: "rules",
-        message: `A service can have at most ${MAX_RULES} rules`,
-      });
+    const tooManyRules = tooManyRulesProblem(form, options);
+    if (tooManyRules) problems.push({ field: "rules", message: tooManyRules });
     form.rules.forEach((rule, index) =>
       problems.push(...ruleProblems(rule, index)),
     );
@@ -240,19 +233,34 @@ export function validateService(
   return problems;
 }
 
+/** What to say when a personal service has more rules than the server takes, or null; the dashboard has no such limit. */
+function tooManyRulesProblem(
+  form: EgressServiceForm,
+  options: EditorOptions,
+): string | null {
+  const max = options.limits?.max_rules_per_service;
+  return options.context === "personal" &&
+    max !== undefined &&
+    form.rules.length > max
+    ? `A service can have at most ${max} rules`
+    : null;
+}
+
 /** The size problem of a personal service, measured only once nothing else is wrong with it. */
 function sizeProblems(
   form: EgressServiceForm,
   options: EditorOptions,
   found: readonly ServiceProblem[],
 ): ServiceProblem[] {
+  const max = options.limits?.max_service_bytes;
   return options.context === "personal" &&
+    max !== undefined &&
     found.length === 0 &&
-    serverJsonSize(serializeService(form, options)) > MAX_SERVICE_BYTES
+    serverJsonSize(serializeService(form, options)) > max
     ? [
         {
           field: "form",
-          message: `A service can take at most ${MAX_SERVICE_BYTES / 1024} KiB`,
+          message: `A service can take at most ${max / 1024} KiB`,
         },
       ]
     : [];

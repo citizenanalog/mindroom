@@ -228,11 +228,39 @@ export interface EgressOAuthProviderOption {
   display_name: string;
 }
 
+/** The rules for the variables a service may set in the sandbox, as the server enforces them. */
+export interface EgressPlaceholderLimits {
+  /** A personal service's variable needs one of these as a word of its name; in the order the server's message lists them. */
+  credential_words: string[];
+  /** No word of a personal service's variable may be one of these; in the order the server's message lists them. */
+  refused_words: string[];
+  /** A personal service's variable may not start with this. */
+  refused_prefix: string;
+  /** Names no service may use, the broker sets them itself. */
+  reserved_names: string[];
+  /** Prefixes no service's variable may start with. */
+  reserved_prefixes: string[];
+  /** The values a personal service may set, as a regular expression source that must match the whole value. */
+  value_pattern: string;
+}
+
+/** What the server checks when a service is saved; the editor checks the same before it asks. */
+export interface EgressLimits {
+  max_services: number;
+  max_rules_per_service: number;
+  /** The most one personal service takes, as the server counts its serialized JSON. */
+  max_service_bytes: number;
+  max_document_bytes: number;
+  placeholder: EgressPlaceholderLimits;
+}
+
 /** What the presets endpoints return. */
 export interface EgressPresetCatalog {
   presets: EgressPreset[];
   /** The providers a service can sign in with. Absent in responses from before the server sent it. */
   oauth_providers?: EgressOAuthProviderOption[];
+  /** Absent in responses from before the server sent it; the editor then leaves these checks to the server. */
+  limits?: EgressLimits;
 }
 
 /** One row of the request log. */

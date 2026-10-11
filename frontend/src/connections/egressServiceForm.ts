@@ -2,6 +2,7 @@ import { type RuleAuthChoice, hasCustomTemplate } from "./egressRuleAuth";
 import type {
   AuthoredEgressService,
   EgressAuth,
+  EgressLimits,
   EgressPreset,
   EgressRule,
 } from "./types";
@@ -22,6 +23,12 @@ export interface EditorOptions {
   sharedTarget: boolean;
   /** The server's presets; `null` while they load, which a shared target treats as "may carry a login". */
   presets: readonly EgressPreset[] | null;
+  /**
+   * What the server checks when a service is saved, from the presets
+   * response; `null` while it loads and when the server does not send it, in
+   * which case the checks that need it are left to the server.
+   */
+  limits: EgressLimits | null;
 }
 
 export const BROKERED_PLACEHOLDER = "mindroom-brokered";

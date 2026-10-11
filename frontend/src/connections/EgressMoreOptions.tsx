@@ -8,7 +8,6 @@ import {
   emptyRule,
   usesOwnRules,
 } from "./egressServiceForm";
-import { MAX_RULES } from "./egressServiceValidation";
 import {
   ExtraRule,
   Field,
@@ -69,6 +68,7 @@ export function MoreOptions({
   context,
   scope,
   sharedTarget,
+  maxRules,
   preset,
   providers,
   onGithub,
@@ -87,6 +87,8 @@ export function MoreOptions({
   scope: EgressScope | undefined;
   /** Shared and unscoped agents cannot use personal accounts. */
   sharedTarget: boolean;
+  /** The most rules a personal service can have, from the server; unknown until it says. */
+  maxRules: number | undefined;
   preset: EgressPreset | undefined;
   /** The account logins a custom service can use. */
   providers: readonly EgressOAuthProviderOption[];
@@ -232,7 +234,10 @@ export function MoreOptions({
             size="sm"
             variant="outline"
             disabled={
-              disabled || (isPersonal && form.rules.length >= MAX_RULES)
+              disabled ||
+              (isPersonal &&
+                maxRules !== undefined &&
+                form.rules.length >= maxRules)
             }
             onClick={() => set({ rules: [...form.rules, emptyRule()] })}
           >

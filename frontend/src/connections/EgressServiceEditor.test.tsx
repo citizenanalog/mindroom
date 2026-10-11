@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -25,6 +26,7 @@ import type {
 // The JSON fixture types each placeholder_env by its own keys.
 const presets = egressPresets.presets as EgressPreset[];
 const providers = egressPresets.oauth_providers;
+const limits = egressPresets.limits;
 
 const bearerRule: EgressRule = {
   host: "api.example.com",
@@ -37,6 +39,7 @@ const baseProps = () => ({
   loadPresets: vi.fn(async () => ({
     presets,
     oauth_providers: providers,
+    limits,
   })),
   onSave: vi.fn(async () => undefined),
   onCancel: vi.fn(),
@@ -916,6 +919,42 @@ describe("loading the presets", () => {
       loadPresets: vi.fn(async () => ({ presets: [] })),
     });
     expect(screen.getByLabelText("Preset")).toHaveValue("retired");
+  });
+});
+
+describe("the limit on rules from the server", () => {
+  const twoRules = {
+    rules: [bearerRule, { ...bearerRule, host: "b.example.com" }],
+  };
+  const addRule = () => screen.getByRole("button", { name: "Add rule" });
+  const editWith = (catalog: EgressPresetCatalog) =>
+    renderEditor({
+      name: "svc",
+      service: twoRules,
+      loadPresets: vi.fn(async () => catalog),
+    });
+
+  it("stops adding rules at the most the server takes", async () => {
+    await editWith({
+      presets,
+      limits: { ...limits, max_rules_per_service: 2 },
+    });
+    expect(addRule()).toBeDisabled();
+  });
+
+  it("keeps adding rules below it, up to it", async () => {
+    await editWith({
+      presets,
+      limits: { ...limits, max_rules_per_service: 3 },
+    });
+    expect(addRule()).toBeEnabled();
+    fireEvent.click(addRule());
+    expect(addRule()).toBeDisabled();
+  });
+
+  it("leaves the count to the server when it sends no limits", async () => {
+    await editWith({ presets });
+    expect(addRule()).toBeEnabled();
   });
 });
 
@@ -2835,6 +2874,8 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
       initialRestrictOnly: true,
       initialName: "github-limited",
     });
+    // The limit on rules comes with the presets, which a person types after.
+    await act(async () => undefined);
     enter(Array.from({ length: 17 }, (_, i) => `o/r${i}`).join("\n"));
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(

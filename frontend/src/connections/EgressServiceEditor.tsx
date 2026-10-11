@@ -53,6 +53,7 @@ import { useServiceSubmit } from "./useServiceSubmit";
 import type {
   AuthoredEgressService,
   EgressCredentialService,
+  EgressLimits,
   EgressOAuthProviderOption,
   EgressPreset,
   EgressPresetCatalog,
@@ -165,7 +166,9 @@ export function EgressServiceEditor({
   const [presets, setPresets] = useState<EgressPreset[] | null>(null);
   const [providers, setProviders] = useState<EgressOAuthProviderOption[]>([]);
   const [presetsFailed, setPresetsFailed] = useState(false);
-  const options: EditorOptions = { context, sharedTarget, presets };
+  // What the server checks on save, sent with the presets; `null` until then, and when an older server does not send it.
+  const [limits, setLimits] = useState<EgressLimits | null>(null);
+  const options: EditorOptions = { context, sharedTarget, presets, limits };
   // Checked against the names the editor opened with: a save that is still
   // running may already have written this name into the page's own list.
   const [openedWithNames] = useState(takenNames);
@@ -279,6 +282,7 @@ export function EgressServiceEditor({
         if (controller.signal.aborted) return;
         setPresets(loaded.presets);
         setProviders(loaded.oauth_providers ?? []);
+        setLimits(loaded.limits ?? null);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
@@ -544,6 +548,7 @@ export function EgressServiceEditor({
               context={context}
               scope={scope}
               sharedTarget={sharedTarget}
+              maxRules={limits?.max_rules_per_service}
               preset={preset}
               providers={providers}
               onGithub={showGithubHelper}

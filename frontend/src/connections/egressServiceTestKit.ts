@@ -6,27 +6,37 @@ import {
   serializeService,
 } from "./egressServiceForm";
 import { validateService } from "./egressServiceValidation";
-import type { AuthoredEgressService, EgressPreset, EgressRule } from "./types";
+import type {
+  AuthoredEgressService,
+  EgressLimits,
+  EgressPreset,
+  EgressRule,
+} from "./types";
 
 /** What the editor model's tests share: the server's presets, the options of each context, and helpers that run a service through the form. */
 
 type Options = EditorOptions;
 
 export const presets = egressPresets.presets as EgressPreset[];
+// What the server sends with the presets; typing it checks the fixture has the shape the editor reads.
+export const limits: EgressLimits = egressPresets.limits;
 export const personal: Options = {
   context: "personal",
   sharedTarget: false,
   presets,
+  limits,
 };
 export const sharedPersonal: Options = {
   context: "personal",
   sharedTarget: true,
   presets,
+  limits,
 };
 export const operator: Options = {
   context: "operator",
   sharedTarget: false,
   presets,
+  limits,
 };
 export const newService = { editing: false, takenNames: [] as string[] };
 

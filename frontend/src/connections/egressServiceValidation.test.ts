@@ -11,6 +11,7 @@ import {
   newService,
   problemsFor,
   errorsFor,
+  limits,
   validRule,
 } from "./egressServiceTestKit";
 import {
@@ -21,7 +22,11 @@ import {
   validateService,
 } from "./egressServiceValidation";
 import { githubRepositoryRules } from "./githubRepositoryRules";
-import type { AuthoredEgressService } from "./types";
+import type {
+  AuthoredEgressService,
+  EgressLimits,
+  EgressPlaceholderLimits,
+} from "./types";
 
 describe("validating a service", () => {
   it("accepts a preset alone and a valid custom service", () => {
@@ -531,5 +536,189 @@ describe("which problems the basic fields show", () => {
       placeholderField(0, "name"),
     ])
       expect(isBasicField(field)).toBe(false);
+  });
+});
+
+describe("the limits the server sends", () => {
+  const optionsWith = (
+    changes: Partial<EgressLimits> = {},
+    placeholder: Partial<EgressPlaceholderLimits> = {},
+    base = personal,
+  ): typeof personal => ({
+    ...base,
+    limits: {
+      ...limits,
+      ...changes,
+      placeholder: { ...limits.placeholder, ...placeholder },
+    },
+  });
+  const withPlaceholder = (name: string, value = "mindroom-brokered") => ({
+    placeholders: [{ name, value }],
+  });
+  const noLimits = { ...personal, limits: null };
+
+  it("has a value pattern from Python that reads as a JavaScript regular expression", () => {
+    expect(
+      () => new RegExp(`^(?:${limits.placeholder.value_pattern})$`),
+    ).not.toThrow();
+  });
+
+  it("takes the most rules from the server", () => {
+    const rules = Array.from({ length: 3 }, validRule);
+    const two = optionsWith({ max_rules_per_service: 2 });
+    expect(errorsFor(null, { rules }, two)).toEqual([
+      "A service can have at most 2 rules",
+    ]);
+    expect(errorsFor(null, { rules: rules.slice(0, 2) }, two)).toEqual([]);
+    expect(
+      errorsFor(
+        null,
+        { rules },
+        optionsWith({ max_rules_per_service: 2 }, {}, operator),
+      ),
+    ).toEqual([]);
+  });
+
+  it("takes the most bytes from the server", () => {
+    const description = "x".repeat(3 * 1024);
+    expect(
+      errorsFor(
+        null,
+        { rules: [validRule()], description },
+        optionsWith({ max_service_bytes: 2048 }),
+      ),
+    ).toEqual(["A service can take at most 2 KiB"]);
+    expect(
+      errorsFor(
+        null,
+        { rules: [validRule()], description },
+        optionsWith({ max_service_bytes: 4096 }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("takes the credential and refused words from the server", () => {
+    const options = optionsWith(
+      {},
+      {
+        credential_words: ["WIDGET", "GADGET"],
+        refused_words: ["BLOB", "CLOB"],
+        refused_prefix: "ZZ_",
+      },
+    );
+    const errors = (name: string) =>
+      errorsFor({ preset: "github" }, withPlaceholder(name), options);
+    expect(errors("MY_WIDGET")).toEqual([]);
+    expect(errors("MY_API_KEY")).toEqual([
+      "MY_API_KEY is not allowed as a placeholder: name a credential, such as MY_API_KEY, with WIDGET, or GADGET as one of its words.",
+    ]);
+    expect(errors("MY_GADGET_BLOB")).toEqual([
+      "MY_GADGET_BLOB is not allowed: tools read names with BLOB, or CLOB, or starting with ZZ_, as programs or paths.",
+    ]);
+    expect(errors("ZZ_WIDGET")).toHaveLength(1);
+    // The fixture's refused words are the server's no longer.
+    expect(errors("MY_WIDGET_FILE")).toEqual([]);
+  });
+
+  it("takes the reserved names and prefixes from the server, for every context", () => {
+    const reserved = {
+      reserved_names: ["MY_RESERVED"],
+      reserved_prefixes: ["NOPE_"],
+    };
+    for (const base of [personal, operator]) {
+      const options = optionsWith({}, reserved, base);
+      const errors = (name: string) =>
+        errorsFor({ preset: "github" }, withPlaceholder(name), options);
+      expect(errors("MY_RESERVED")).toEqual([
+        "Placeholder name MY_RESERVED is reserved",
+      ]);
+      expect(errors("NOPE_TOKEN")).toEqual([
+        "Placeholder name NOPE_TOKEN starts with reserved prefix NOPE_",
+      ]);
+    }
+    // PATH is reserved only because the fixture says so.
+    expect(
+      errorsFor(
+        { preset: "github" },
+        withPlaceholder("PATH"),
+        optionsWith({}, reserved, operator),
+      ),
+    ).toEqual([]);
+  });
+
+  it("matches the value pattern against the whole value", () => {
+    const options = optionsWith({}, { value_pattern: "[a-z]{1,3}" });
+    const errors = (value: string) =>
+      errorsFor(
+        { preset: "github" },
+        withPlaceholder("MY_API_KEY", value),
+        options,
+      );
+    expect(errors("abc")).toEqual([]);
+    for (const value of ["abcd", "xabc", "abc1", "ab\n", ""])
+      expect(errors(value)).toEqual([
+        "The value of MY_API_KEY must be 1 to 256 letters, digits, or . _ : -",
+      ]);
+  });
+
+  it("leaves a value pattern it cannot read to the server", () => {
+    const options = optionsWith({}, { value_pattern: "(" });
+    expect(
+      errorsFor(
+        { preset: "github" },
+        withPlaceholder("MY_API_KEY", "any value at all"),
+        options,
+      ),
+    ).toEqual([]);
+  });
+
+  describe("from an older server that sends none", () => {
+    it("skips the limits on rules and size", () => {
+      const rules = Array.from({ length: 51 }, validRule);
+      expect(errorsFor(null, { rules }, noLimits)).toEqual([]);
+      const description = "x".repeat(17 * 1024);
+      expect(
+        errorsFor(null, { rules: [validRule()], description }, noLimits),
+      ).toEqual([]);
+      expect(
+        errorsFor(
+          null,
+          { rules: Array.from({ length: 51 }, validRule), restrictOnly: true },
+          noLimits,
+        ),
+      ).toEqual([]);
+    });
+
+    it("skips the reserved names and the personal placeholder rules", () => {
+      const errors = (name: string, value?: string) =>
+        errorsFor({ preset: "github" }, withPlaceholder(name, value), noLimits);
+      expect(errors("PATH")).toEqual([]);
+      expect(errors("MINDROOM_TOKEN")).toEqual([]);
+      expect(errors("LD_PRELOAD")).toEqual([]);
+      expect(errors("MY_API_KEY", "has space")).toEqual([]);
+      // A name no server accepts is left to the server too, since its words are not known.
+      expect(errors("lowercase")).toEqual([]);
+    });
+
+    it("still checks what needs no limits", () => {
+      expect(
+        errorsFor({ preset: "github" }, withPlaceholder("lowercase"), {
+          ...operator,
+          limits: null,
+        }),
+      ).toEqual(["Placeholder name lowercase must match ^[A-Z_][A-Z0-9_]*$"]);
+      expect(
+        errorsFor(
+          { preset: "github" },
+          {
+            placeholders: [
+              { name: "MY_API_KEY", value: "a" },
+              { name: "MY_API_KEY", value: "b" },
+            ],
+          },
+          noLimits,
+        ),
+      ).toEqual(["Placeholder MY_API_KEY is listed twice"]);
+    });
   });
 });

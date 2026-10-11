@@ -1,4 +1,56 @@
 {
+  "limits": {
+    "max_document_bytes": 262144,
+    "max_rules_per_service": 50,
+    "max_service_bytes": 16384,
+    "max_services": 50,
+    "placeholder": {
+      "credential_words": [
+        "TOKEN",
+        "KEY",
+        "SECRET",
+        "PASSWORD",
+        "PAT",
+        "AUTH",
+        "CREDENTIAL"
+      ],
+      "refused_prefix": "SSH_",
+      "refused_words": [
+        "COMMAND",
+        "CMD",
+        "FILE",
+        "DIR",
+        "PROVIDER",
+        "HELPER",
+        "OPTS",
+        "OPTIONS",
+        "EXTENSIONS"
+      ],
+      "reserved_names": [
+        "ALL_PROXY",
+        "CURL_CA_BUNDLE",
+        "GIT_SSL_CAINFO",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_USE_ENV_PROXY",
+        "NO_PROXY",
+        "PATH",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy"
+      ],
+      "reserved_prefixes": [
+        "GIT_CONFIG_",
+        "MINDROOM_"
+      ],
+      "value_pattern": "[A-Za-z0-9._:-]{1,256}"
+    }
+  },
   "oauth_providers": [
     {
       "display_name": "GitHub",
