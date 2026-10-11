@@ -618,6 +618,32 @@ def _snapshots(
     return snapshots
 
 
+def _history_snapshot(run_response: RunOutput | TeamRunOutput, layout: _Layout) -> list[RunOutput | TeamRunOutput]:
+    """Return the request's replayed history as one completed run to summarize, or nothing when there is none."""
+    if not layout.history:
+        return []
+    messages = [message.model_copy(deep=True) for message in layout.history]
+    if isinstance(run_response, TeamRunOutput):
+        return [
+            TeamRunOutput(
+                run_id=archive.snapshot_run_id(run_response.run_id or ""),
+                team_id=run_response.team_id,
+                session_id=run_response.session_id,
+                status=RunStatus.completed,
+                messages=messages,
+            ),
+        ]
+    return [
+        RunOutput(
+            run_id=archive.snapshot_run_id(run_response.run_id or ""),
+            agent_id=run_response.agent_id,
+            session_id=run_response.session_id,
+            status=RunStatus.completed,
+            messages=messages,
+        ),
+    ]
+
+
 def _prompt_context(prompt: Message, budget_tokens: int) -> Message:
     """Return a copy of the prompt for the summarizer's context, bounded so the exchange beside it always fits.
 
@@ -642,10 +668,12 @@ async def _summarize_run_locally(
         kind="team" if isinstance(run_response, TeamRunOutput) else "agent",
         scope_id=binding.target.id or "",
     )
+    # Without a stored session to archive into, replayed history is summarized together with the turn's exchanges.
+    history = _history_snapshot(run_response, layout)
     summary = await summarize_run_locally(
         resolved_inputs=inputs,
         previous_summary=layout.previous_run_local_summary,
-        snapshots=_snapshots(run_response, layout, inputs),
+        snapshots=[*history, *_snapshots(run_response, layout, inputs)],
         scope=scope,
         config=binding.config,
         runtime_paths=binding.runtime_paths,

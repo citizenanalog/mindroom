@@ -1283,6 +1283,27 @@ async def test_first_request_over_the_limit_from_tools_compacts_history_before_d
 
 
 @pytest.mark.asyncio
+async def test_run_local_compaction_summarizes_replayed_history_it_folds(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, paths = _config(tmp_path)
+    storage = _seeded_storage(config, paths)
+    model = _ToolLoopModel(tool_rounds=5)
+    agent = _scoped_agent(model, config, paths, storage)
+    # A request that replays history but cannot update its stored session compacts run-locally.
+    monkeypatch.setattr(mid_turn_compaction, "_scoped_session", lambda *_args: None)
+
+    output = await _run_in_session(agent, "Do the task")
+
+    assert str(output.content).endswith("done")
+    assert summary_calls.inputs
+    assert "q1" in summary_calls.inputs[0]
+    assert "q2" in summary_calls.inputs[0]
+
+
+@pytest.mark.asyncio
 async def test_next_turn_reuses_the_post_compaction_prefix(tmp_path: Path, summary_calls: _SummaryCalls) -> None:
     config, paths = _config(tmp_path)
     storage = _seeded_storage(config, paths)
