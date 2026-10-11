@@ -111,15 +111,40 @@ def project_usage(run: Mapping[str, object]) -> dict[str, object]:
         selected["details"] = _project_model_details(details)
     result["metrics"] = selected
     requests = project_requests(run.get("messages"))
-    carried = (
-        cast("dict[str, object]", metadata).get(COMPACTED_REQUESTS_METADATA_KEY) if isinstance(metadata, dict) else None
-    )
-    if isinstance(carried, list) and carried:
+    carried = _carried_requests(run, metadata)
+    if carried:
         # Mid-turn compaction folded these earlier requests out of the run's messages.
-        requests = [*(item for item in carried if isinstance(item, dict)), *(requests or [])]
+        requests = [*carried, *(requests or [])]
     if requests is not None:
         result["requests"] = requests
     return result
+
+
+def _carried_requests(run: Mapping[str, object], metadata: object) -> list[dict[str, object]]:
+    """Return the usage mid-turn compaction carried out of the run's messages, minus any message it still saves.
+
+    A reply that failed after a compaction can still hold some folded messages, which already count.
+    """
+    carried = (
+        cast("dict[str, object]", metadata).get(COMPACTED_REQUESTS_METADATA_KEY) if isinstance(metadata, dict) else None
+    )
+    if not isinstance(carried, list):
+        return []
+    saved = _message_ids(run.get("messages"))
+    requests: list[dict[str, object]] = []
+    for item in carried:
+        if not isinstance(item, dict):
+            continue
+        entry = cast("dict[str, object]", item)
+        if entry.get("message_id") not in saved:
+            requests.append({key: value for key, value in entry.items() if key != "message_id"})
+    return requests
+
+
+def _message_ids(messages: object) -> set[object]:
+    if not isinstance(messages, list):
+        return set()
+    return {cast("dict[str, object]", message).get("id") for message in messages if isinstance(message, dict)} - {None}
 
 
 def project_requests(messages: object) -> list[dict[str, object]] | None:

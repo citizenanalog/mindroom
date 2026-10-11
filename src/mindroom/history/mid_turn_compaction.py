@@ -745,8 +745,17 @@ def _rewrite(messages: list[Message], layout: _Layout, summary_message: Message)
 
 
 def _carry_request_usage(run_response: RunOutput | TeamRunOutput, folded: Sequence[Message]) -> None:
-    """Keep the usage of folded requests in the run, since their messages leave it."""
-    requests = project_requests([message.to_dict() for message in folded if message.role == "assistant"])
+    """Keep the usage of folded requests in the run, since their messages leave it.
+
+    Each request keeps its message id, so a run that still saves that message (a reply that failed afterwards) is not
+    counted twice.
+    """
+    requests = [
+        {**request, "message_id": message.id}
+        for message in folded
+        if message.role == "assistant"
+        for request in project_requests([message.to_dict()]) or []
+    ]
     if not requests:
         return
     metadata = dict(run_response.metadata or {})
