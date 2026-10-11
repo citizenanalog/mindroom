@@ -343,9 +343,25 @@ async def test_default_policy_blocks_loopback(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target", ["localhost", "localhost:", "localhost:0", "localhost:https", "::1:443"])
+@pytest.mark.parametrize(
+    "target",
+    [
+        "localhost",
+        "localhost:",
+        "localhost:0",
+        "localhost:65536",
+        "localhost:+443",
+        "localhost:https",
+        "::1:443",
+        "[::1]",
+        "[]:443",
+        "[a]b]:443",
+        "[::1]x:443",
+        "[::1]]:443",
+    ],
+)
 async def test_connect_without_valid_port_gets_400(broker: BrokerFactory, raw_proxy: RawProxy, target: str) -> None:
-    """A CONNECT target must name an explicit numeric port, and IPv6 literals need brackets."""
+    """A CONNECT target must name a port from 1 to 65535 in digits, and IPv6 literals need one pair of brackets."""
     started = await broker()
 
     response = await raw_proxy(started.port, connect_request(target, authorization=proxy_authorization(broker.token())))

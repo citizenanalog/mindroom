@@ -322,7 +322,14 @@ async def egress_oauth_status(
                 result,
                 can_manage=can_manage or provider.requester_scoped_credentials,
             )
-            status = OAuthStatus(provider=result.provider, display_name=result.display_name, **asdict(view))
+            status = OAuthStatus(
+                provider=result.provider,
+                display_name=result.display_name,
+                connected=view.connected,
+                account_label=view.account_label,
+                can_connect=view.can_connect,
+                reset_required=view.reset_required,
+            )
     except Exception as exc:
         # OAuth provider code, plugin providers included, can raise anything.
         logger.warning(

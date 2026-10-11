@@ -228,10 +228,10 @@ class EgressCredentialService(EgressSourceStatus):
 
     `source` is `config` for a service the administrator defines and `user` for one defined in the agent's own
     scope through the services routes. `rules` says where the service applies (host, port, path prefix), so a client
-    can tell which services overlap; it carries no auth settings. `placeholder_names` lists the variables the
-    service sets in the sandbox (a preset's included), names only, so the editor can warn when a service of
-    one's own sets the same one. `restrict_only` marks a service that only limits the paths of the other services on
-    its hosts and never has a key or account of its own.
+    can tell which services overlap, and how each rule sends the key (`auth_type` and `auth_name`, never the key).
+    `placeholder_names` lists the variables the service sets in the sandbox (a preset's included), names only, so the
+    editor can warn when a service of one's own sets the same one. `restrict_only` marks a service that only limits
+    the paths of the other services on its hosts and never has a key or account of its own.
     """
 
     name: str

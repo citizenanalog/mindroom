@@ -634,6 +634,7 @@ def test_connect_stores_the_account_and_a_key_takes_precedence(
     assert drive["active_source"] == "key"
     assert drive["key_configured"] is True
     assert drive["key_updated_at"] is not None
+    assert "updated_at" not in drive
     assert drive["oauth"]["connected"] is True
 
 
