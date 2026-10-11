@@ -15,10 +15,12 @@ from __future__ import annotations
 import threading
 import weakref
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from agno.agent import _messages as agent_messages
 from agno.models.message import Message
+from agno.run.base import RunContext
 from agno.run.messages import RunMessages
 from agno.session.agent import AgentSession
 from agno.session.team import TeamSession
@@ -66,18 +68,28 @@ if TYPE_CHECKING:
 # Reason: Agno appends session.summary to the system prompt when add_session_summary_to_context is on, so every
 # compaction rewrites the cached prompt prefix, and a string system_message (minimal agents) never shows it.
 # MindRoom turns that flag off and places the summary as the first history message in every new and continued
-# request instead. Agno also loads a run's session privately and writes that object back when the run ends, so the
-# builders record it for mid-turn compaction, which must update the object Agno will write.
+# request instead.
 # Upstream issue: Tracking gap. Related open issues https://github.com/agno-agi/agno/issues/8790 (rolling
 # compaction, still injected into the system prompt) and https://github.com/agno-agi/agno/issues/9461 (unify
 # history, summary, and compression across agents, members, and workflows) do not propose a history-positioned
-# summary or a public reference to the session a running loop persists.
+# summary.
 # Upstream PR: None identified.
-# Remove when: Agno can replay the session summary as a history message for new and continued runs and exposes the
-# session object a running loop persists; the summary must still replay exactly once and be counted once.
+# Remove when: Agno can replay the session summary as a history message for new and continued runs; the summary
+# must still replay exactly once and be counted once.
 # Coverage: tests/test_history_summary_message.py::test_summary_is_the_first_history_message_for_new_runs;
 # tests/test_history_summary_message.py::test_summary_is_reinserted_on_synchronous_continuation;
 # tests/test_history_summary_message.py::test_approval_resume_replays_the_summary_once.
+
+# AGNO_COMPAT: No public reference to the session a running loop writes when it ends.
+# Reason: Agno loads a run's session privately and writes that object back when the run ends, so mid-turn
+# compaction must update that same object; the builders record it with the run they built it for, and a model
+# request of any other run (a skill review reusing the model) is never compacted.
+# Upstream issue: Tracking gap; no issue identified for exposing the running loop's session or run.
+# Upstream PR: None identified.
+# Remove when: Agno exposes the session and run a model request belongs to, for example on a pre-request hook.
+# Coverage: tests/test_mid_turn_compaction.py::test_long_single_turn_compacts_mid_turn_and_continues;
+# tests/test_mid_turn_compaction.py::test_scoped_compaction_after_resume_keeps_the_run_local_summary;
+# tests/test_mid_turn_compaction.py::test_a_request_the_target_never_built_is_not_compacted.
 
 _PATCHED = False
 _PATCH_LOCK = threading.Lock()
@@ -124,19 +136,38 @@ def _strip_history_inline_media(run_messages: RunMessages) -> RunMessages:
     return run_messages
 
 
-_SESSIONS_BY_TARGET: dict[int, tuple[weakref.ref[object], AgentSession | TeamSession]] = {}
+@dataclass
+class _BuiltRequest:
+    target: weakref.ref[object]
+    session: AgentSession | TeamSession
+    # Continuation builders get no run id, so the first request after one claims it.
+    run_id: str | None
 
 
-def built_request_session(target: Agent | Team) -> AgentSession | TeamSession | None:
-    """Return the session object Agno built the target's latest request from, which it writes when the run ends."""
-    entry = _SESSIONS_BY_TARGET.get(id(target))
-    return entry[1] if entry is not None and entry[0]() is target else None
+_BUILT_REQUESTS: dict[int, _BuiltRequest] = {}
 
 
-def _record_request_session(target: object, session: AgentSession | TeamSession) -> None:
+def built_request_session(target: Agent | Team, run_id: str) -> AgentSession | TeamSession | None:
+    """Return the session Agno built the target's latest request of ``run_id`` from, which it writes when the run ends.
+
+    None means the target's own builders never built this run, such as a skill review reusing the target's model.
+    """
+    built = _BUILT_REQUESTS.get(id(target))
+    if built is None or built.target() is not target:
+        return None
+    if built.run_id is None:
+        built.run_id = run_id
+    return built.session if built.run_id == run_id else None
+
+
+def _record_request_session(target: object, run_id: str | None, session: AgentSession | TeamSession) -> None:
     # Agno's Agent and Team dataclasses are unhashable, so key by identity and drop the entry with the target.
     key = id(target)
-    _SESSIONS_BY_TARGET[key] = (weakref.ref(target, lambda _ref: _SESSIONS_BY_TARGET.pop(key, None)), session)
+    _BUILT_REQUESTS[key] = _BuiltRequest(
+        weakref.ref(target, lambda _ref: _BUILT_REQUESTS.pop(key, None)),
+        session,
+        run_id,
+    )
 
 
 def _insert_session_summary(run_messages: RunMessages, session: AgentSession | TeamSession) -> None:
@@ -161,7 +192,8 @@ def _prepare_history(
     """Apply MindRoom's replay policy to one built request."""
     session = kwargs.get("session")
     if isinstance(session, (AgentSession, TeamSession)):
-        _record_request_session(target, session)
+        run_context = kwargs.get("run_context")
+        _record_request_session(target, run_context.run_id if isinstance(run_context, RunContext) else None, session)
         replays_history = kwargs.get("add_history_to_context")
         if continuation and replays_history is None:
             replays_history = cast("Agent | Team", target).add_history_to_context

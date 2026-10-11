@@ -1085,9 +1085,12 @@ async def test_cancellation_after_the_snapshot_commit_still_rewrites_the_request
 
     bind_compaction_lifecycle(agent, _CancelOnSuccess())
     live_lists: list[list[Message]] = []
+    run_ids: list[str] = []
 
-    async def capture(messages: list[Message], *_args: object) -> None:
+    async def capture(messages: list[Message], _tools: object, run_response: RunOutput | None) -> None:
         live_lists.append(messages)
+        if run_response is not None and run_response.run_id:
+            run_ids.append(run_response.run_id)
 
     install_request_preparation(model, marker="_test_capture", prepare=capture)
 
@@ -1097,7 +1100,7 @@ async def test_cancellation_after_the_snapshot_commit_still_rewrites_the_request
     request = live_lists[-1]
     assert any(is_compaction_summary(message) for message in request)
     assert all(message.role != "tool" for message in request)
-    live_session = built_request_session(agent)
+    live_session = built_request_session(agent, run_ids[-1])
     assert live_session is not None
     generations = compaction_generations(storage, _SCOPE.key)
     assert live_session.summary is not None
@@ -1194,3 +1197,23 @@ async def test_failed_text_fallback_keeps_native_compaction(tmp_path: Path, summ
 
     assert summary_calls.inputs
     assert model.native_compaction is not None
+
+
+@pytest.mark.asyncio
+async def test_a_request_the_target_never_built_is_not_compacted(
+    tmp_path: Path,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(tmp_path)
+    model = _ToolLoopModel(tool_rounds=0)
+    agent = _agent(model, config, paths)
+    await _run(agent, "Say hi")
+    # A skill review reuses the agent's model for its own fork of the conversation.
+    fork = [Message(role="user", content="Review this"), Message(role="assistant", content="p" * 16_000)]
+
+    await model.aresponse(
+        messages=[*fork, Message(role="user", content="Improve a skill")],
+        run_response=RunOutput(run_id="review"),
+    )
+
+    assert summary_calls.inputs == []

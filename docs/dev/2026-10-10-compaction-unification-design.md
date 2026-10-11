@@ -136,7 +136,7 @@ A request is scoped when its target replays persisted history (`add_history_to_c
 A request without persisted replay (team members, `room_agent` workflow participants, a scheduled task with `history_limit=0`) compacts only its own turn:
 
 - The folded messages and any earlier run-local summary are summarized with the same summary model, prompt, budgets, and fallback, without touching the archive.
-- The summary call's usage is recorded as `compaction_summary` usage in the target's session storage when it has one, else under the reply's helper usage owner, else as system usage, so no summary call goes unaccounted.
+- The summary call's usage is recorded as `compaction_summary` usage under the reply's helper usage owner, else in the target's session storage (seeding the session row), else logged as a warning; every MindRoom reply binds a usage owner, so the warning only covers runs outside a reply.
 - The summary message is an ordinary message (`from_history=False`), so it is stored with the run and a member's approval resume replays it.
 - Teams: the leader's request is scoped to the team scope, with the team summary first and its in-progress snapshot a `TeamRunOutput`; member runs stay attached to the live team run.
   Members keep no history or summary of their own, and each member's tool loop compacts run-locally.

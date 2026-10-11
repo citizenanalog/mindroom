@@ -188,11 +188,14 @@ async def _prepare_request(
 ) -> None:
     if run_response is None or not run_response.run_id or not binding.compacts_run(run_response.run_id):
         return
+    built_session = built_request_session(binding.target, run_response.run_id)
+    if built_session is None:
+        return
     loaded_ids = binding.loaded_message_ids(run_response, messages)
     policy = _policy(binding)
     if policy is None or _request_tokens(binding, policy, messages, tools, loaded_ids) <= policy.limit:
         return
-    session = _scoped_session(binding, run_response)
+    session = _scoped_session(binding, built_session, run_response)
     layout = _layout(messages, run_response, scoped=session is not None)
     if all(is_compaction_summary(message) for message in layout.folded):
         # Nothing but an earlier summary would fold, so compacting again cannot shrink the request.
@@ -233,14 +236,14 @@ def _finish(
 
 def _scoped_session(
     binding: _MidTurnCompaction,
+    built_session: AgentSession | TeamSession,
     run_response: RunOutput | TeamRunOutput,
 ) -> AgentSession | TeamSession | None:
     """Return the run's own session when the request replays persisted history, else None (run-local)."""
     target = binding.target
     if not target.add_history_to_context or not isinstance(target.db, BaseDb):
         return None
-    session = built_request_session(target)
-    return session if session is not None and session.session_id == run_response.session_id else None
+    return built_session if built_session.session_id == run_response.session_id else None
 
 
 async def _compact_scope(
