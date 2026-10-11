@@ -28,8 +28,7 @@ __all__ = [
     "match_rule",
     "path_matches",
     "route_request",
-    "strip_request_headers",
-    "strip_response_headers",
+    "strip_hop_by_hop",
 ]
 
 # Hop-by-hop headers that must be stripped (case-insensitive)
@@ -446,12 +445,12 @@ def _parse_connection_header(headers: list[tuple[bytes, bytes]]) -> set[str]:
     return listed
 
 
-def strip_request_headers(
+def strip_hop_by_hop(
     headers: list[tuple[bytes, bytes]],
     *,
     keep_upgrade: bool,
 ) -> list[tuple[bytes, bytes]]:
-    """Remove hop-by-hop headers from request.
+    """Remove hop-by-hop headers and those the Connection header lists, in either direction.
 
     If keep_upgrade is True, preserve Connection and Upgrade headers
     for WebSocket handshakes.
@@ -472,43 +471,6 @@ def strip_request_headers(
 
         # Skip headers listed in Connection
         if name_lower in connection_listed:
-            continue
-
-        result.append((name, value))
-
-    return result
-
-
-def strip_response_headers(
-    headers: list[tuple[bytes, bytes]],
-    *,
-    keep_upgrade: bool,
-) -> list[tuple[bytes, bytes]]:
-    """Remove hop-by-hop headers and set-cookie from response.
-
-    If keep_upgrade is True, preserve Connection and Upgrade headers
-    for WebSocket handshakes.
-    """
-    # Parse Connection header to find additional headers to strip
-    connection_listed = _parse_connection_header(headers)
-
-    result = []
-    for name, value in headers:
-        name_lower = name.lower().decode("latin-1")
-
-        # Skip hop-by-hop headers
-        if name_lower in _HOP_BY_HOP:
-            # Keep connection and upgrade if requested
-            if keep_upgrade and name_lower in ("connection", "upgrade"):
-                result.append((name, value))
-            continue
-
-        # Skip headers listed in Connection
-        if name_lower in connection_listed:
-            continue
-
-        # Also strip set-cookie from responses
-        if name_lower == "set-cookie":
             continue
 
         result.append((name, value))

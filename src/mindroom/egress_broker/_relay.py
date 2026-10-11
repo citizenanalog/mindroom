@@ -19,7 +19,7 @@ import h11
 from mindroom.egress_broker.audit import AuditRecord
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
 from mindroom.egress_broker.messages import refusal_body
-from mindroom.egress_broker.rules import strip_request_headers, strip_response_headers
+from mindroom.egress_broker.rules import strip_hop_by_hop
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -360,7 +360,7 @@ def upstream_request_headers(received: list[tuple[bytes, bytes]], *, host: bytes
     headers = [(b"host", host)]
     headers += [
         (name, value)
-        for name, value in strip_request_headers(received, keep_upgrade=False)
+        for name, value in strip_hop_by_hop(received, keep_upgrade=False)
         if name not in {b"host", b"expect", b"content-length"}
     ]
     if chunked:
@@ -382,13 +382,12 @@ def _downstream_response_headers(
     rather than kept as the only (wrong) framing header. `X-MindRoom-Error` is dropped too, so only the broker's own
     refusals carry it and an upstream cannot pass its response off as one.
     """
-    # Hop-by-hop removal is the same in both directions; only the response variant also drops Set-Cookie.
-    strip = strip_response_headers if strip_cookies else strip_request_headers
     chunked = any(name == b"transfer-encoding" for name, _ in received)
+    dropped = {_ERROR_HEADER, b"set-cookie"} if strip_cookies else {_ERROR_HEADER}
     return [
         (name, value)
-        for name, value in strip(received, keep_upgrade=keep_upgrade)
-        if not (chunked and name == b"content-length") and name != _ERROR_HEADER
+        for name, value in strip_hop_by_hop(received, keep_upgrade=keep_upgrade)
+        if not (chunked and name == b"content-length") and name not in dropped
     ]
 
 

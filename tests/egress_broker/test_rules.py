@@ -25,8 +25,7 @@ from mindroom.egress_broker.rules import (
     match_rule,
     path_matches,
     route_request,
-    strip_request_headers,
-    strip_response_headers,
+    strip_hop_by_hop,
 )
 
 
@@ -972,8 +971,8 @@ def test_inject_replaces_client_authorization() -> None:
     assert (b"x-other", b"value") in new_headers
 
 
-def test_strip_request_headers_removes_proxy_auth_and_connection_listed() -> None:
-    """Strip request headers removes hop-by-hop headers and those in Connection."""
+def test_strip_hop_by_hop_removes_proxy_auth_and_connection_listed() -> None:
+    """Hop-by-hop stripping removes hop-by-hop headers and those in Connection."""
     headers: list[tuple[bytes, bytes]] = [
         (b"connection", b"close, X-Foo"),
         (b"x-foo", b"bar"),
@@ -981,7 +980,7 @@ def test_strip_request_headers_removes_proxy_auth_and_connection_listed() -> Non
         (b"x-keep", b"this"),
         (b"keep-alive", b"timeout=5"),
     ]
-    result = strip_request_headers(headers, keep_upgrade=False)
+    result = strip_hop_by_hop(headers, keep_upgrade=False)
 
     # Connection-listed header removed
     assert not any(h[0] == b"x-foo" for h in result)
@@ -993,20 +992,6 @@ def test_strip_request_headers_removes_proxy_auth_and_connection_listed() -> Non
     assert (b"x-keep", b"this") in result
 
 
-def test_strip_response_headers_removes_set_cookie() -> None:
-    """Strip response headers removes set-cookie in addition to hop-by-hop headers."""
-    headers: list[tuple[bytes, bytes]] = [
-        (b"set-cookie", b"session=abc"),
-        (b"connection", b"close"),
-        (b"x-keep", b"this"),
-    ]
-    result = strip_response_headers(headers, keep_upgrade=False)
-
-    assert not any(h[0] == b"set-cookie" for h in result)
-    assert not any(h[0] == b"connection" for h in result)
-    assert (b"x-keep", b"this") in result
-
-
 def test_keep_upgrade_preserves_websocket_handshake() -> None:
     """keep_upgrade=True preserves Connection and Upgrade headers."""
     headers: list[tuple[bytes, bytes]] = [
@@ -1014,7 +999,7 @@ def test_keep_upgrade_preserves_websocket_handshake() -> None:
         (b"upgrade", b"websocket"),
         (b"x-keep", b"this"),
     ]
-    result = strip_request_headers(headers, keep_upgrade=True)
+    result = strip_hop_by_hop(headers, keep_upgrade=True)
 
     assert (b"connection", b"Upgrade") in result
     assert (b"upgrade", b"websocket") in result
