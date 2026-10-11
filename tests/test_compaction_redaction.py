@@ -505,6 +505,47 @@ def test_removing_an_edited_turn_rolls_back_its_mid_turn_compaction(storage: Sql
     assert stored.summary is None
 
 
+@pytest.mark.parametrize("removal", ["edit", "redaction"])
+def test_removing_a_turn_whose_mid_turn_compaction_was_undone_keeps_earlier_runs(
+    storage: SqliteDb,
+    removal: str,
+) -> None:
+    """An undone compaction of a turn leaves no summary of it, so removing the turn later rolls nothing back."""
+    live = _live_run_with(["$x"], reply="$reply")
+    session = seed_session(
+        storage,
+        AgentSession(session_id="session", agent_id="code", runs=[_run("r1"), _run("r2"), _run("r3"), live]),
+    )
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="r1", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[run for run in session.runs or [] if run.run_id == "r1"],
+    )
+    snapshot = _snapshot_of(live, ["$x"])
+    archive_compaction_chunk(
+        storage=storage,
+        session=session,
+        scope=_SCOPE,
+        summary=SessionSummary(summary="r1, r2, r3, and early x", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[*(run for run in session.runs or [] if run.run_id in {"r2", "r3"}), snapshot],
+    )
+    roll_back_running_turn(storage, session, _SCOPE, [snapshot.run_id or ""])
+    assert [run.run_id for run in _stored(storage).runs or []] == ["r2", "r3", "x"]
+
+    if removal == "edit":
+        assert remove_runs_for_sources(storage, session.session_id, SessionType.AGENT, _SCOPE, ("$x",)) is True
+    else:
+        assert _remove_redacted_event_from_history(storage, session, _SCOPE, event_id="$reply") is True
+
+    stored = _stored(storage)
+    assert [run.run_id for run in stored.runs or []] == ["r2", "r3"]
+    assert _summary(stored) == "r1"
+
+
 def _team_run(run_id: str, *, parent_run_id: str | None = None) -> TeamRunOutput:
     return TeamRunOutput(
         run_id=run_id,

@@ -315,7 +315,11 @@ def earliest_archived_run(
     scope_key: str,
     run_ids: Collection[str],
 ) -> ArchiveHit | None:
-    """Return the scope's first archived row that is one of ``run_ids`` or a snapshot of one."""
+    """Return the scope's first archived row that is one of ``run_ids`` or a snapshot of one.
+
+    Tombstones are skipped: an undone compaction moves its removed snapshots onto an older generation whose
+    summary never covered them.
+    """
     origins = sorted({run_id for run_id in run_ids if run_id})
     if not origins:
         return None
@@ -334,8 +338,8 @@ def earliest_archived_run(
             row = connection.exec_driver_sql(
                 f"SELECT archived.compaction_id, archived.id, archived.run_id FROM {compacted_runs} AS archived "  # noqa: S608
                 f"JOIN {compactions} AS generation ON generation.id = archived.compaction_id "
-                f"WHERE generation.session_id = ? AND generation.scope_key = ? AND ({matches}) "
-                "ORDER BY archived.id LIMIT 1",
+                f"WHERE generation.session_id = ? AND generation.scope_key = ? AND archived.run_data IS NOT NULL "
+                f"AND ({matches}) ORDER BY archived.id LIMIT 1",
                 tuple(parameters),
             ).first()
             if row is not None and (best is None or row[1] < best.archived_row_id):
