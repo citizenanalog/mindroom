@@ -285,37 +285,29 @@ async def test_no_proxy_destination_dials_direct(egress: BrowserEgress, port: in
 
 
 @pytest.mark.asyncio
-async def test_loopback_destination_dials_direct_even_with_a_proxy() -> None:
-    """An operator proxy's loopback is another host, so a permitted loopback destination never goes through it."""
+@pytest.mark.parametrize(
+    ("host", "resolved", "allow_loopback"),
+    [
+        # An operator proxy's loopback is another host, so a permitted loopback destination never goes through it.
+        pytest.param("127.0.0.1", None, True, id="loopback"),
+        # An IPv4-mapped loopback address is loopback too, so it is never sent to the operator proxy.
+        pytest.param("mapped.example", ipaddress.IPv6Address("::ffff:127.0.0.1"), False, id="ipv4-mapped-loopback"),
+    ],
+)
+async def test_loopback_destination_dials_direct_even_with_a_proxy(
+    closing_listener: int,
+    host: str,
+    resolved: ipaddress.IPv6Address | None,
+    *,
+    allow_loopback: bool,
+) -> None:
+    """A loopback destination, however it is written, is dialed directly and never sent to the operator proxy."""
     operator = _OperatorProxy()
     async with operator as proxy:
-        server = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0)
-        try:
-            port = server.sockets[0].getsockname()[1]
-            policy = DialPolicy(allow_loopback=True, egress=BrowserEgress(http=proxy, https=proxy))
-            _reader, writer = await open_upstream("127.0.0.1", port, policy=policy, ssl_context=None)
-            writer.transport.abort()
-        finally:
-            server.close()
-            await server.wait_closed()
-    assert operator.heads == []
-
-
-@pytest.mark.asyncio
-async def test_ipv4_mapped_loopback_dials_direct_even_with_a_proxy() -> None:
-    """An IPv4-mapped loopback address is loopback too, so it is never sent to the operator proxy."""
-    operator = _OperatorProxy()
-    async with operator as proxy:
-        server = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0)
-        try:
-            port = server.sockets[0].getsockname()[1]
-            policy = DialPolicy(egress=BrowserEgress(http=proxy, https=proxy))
-            with _resolve_as(ipaddress.IPv6Address("::ffff:127.0.0.1")):
-                _reader, writer = await open_upstream("mapped.example", port, policy=policy, ssl_context=None)
-            writer.transport.abort()
-        finally:
-            server.close()
-            await server.wait_closed()
+        policy = DialPolicy(allow_loopback=allow_loopback, egress=BrowserEgress(http=proxy, https=proxy))
+        with _resolve_as(resolved) if resolved else contextlib.nullcontext():
+            _reader, writer = await open_upstream(host, closing_listener, policy=policy, ssl_context=None)
+        writer.transport.abort()
     assert operator.heads == []
 
 

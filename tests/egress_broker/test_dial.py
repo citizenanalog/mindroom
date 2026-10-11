@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 _PUBLIC = "93.184.216.34"
 _OTHER_PUBLIC = "93.184.216.35"
 
+# One entry per direct connection attempt: the host dialed and the keyword arguments of the call.
+type _Attempts = list[tuple[str, dict[str, object]]]
+
 # Every destination form the dial guard must refuse (spec section 13), keyed by what it tries.
 _REFUSED_DESTINATIONS = {
     "loopback": "127.0.0.1",
@@ -100,9 +103,9 @@ _ALWAYS_REFUSED = (
 
 
 @pytest.fixture
-def dialed() -> Iterator[list[tuple[str, dict[str, object]]]]:
+def dialed() -> Iterator[_Attempts]:
     """Record every direct connection attempt instead of making it; each succeeds with a fake stream."""
-    attempts: list[tuple[str, dict[str, object]]] = []
+    attempts: _Attempts = []
 
     async def open_connection(host: str, _port: int, **kwargs: object) -> tuple[AsyncMock, MagicMock]:
         attempts.append((host, kwargs))
@@ -130,7 +133,7 @@ def _answers(*rounds: list[str]) -> tuple[list[str], Callable[..., list[tuple[ob
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("host", _REFUSED_DESTINATIONS.values(), ids=list(_REFUSED_DESTINATIONS))
-async def test_blocked_destinations(host: str, dialed: list[tuple[str, dict[str, object]]]) -> None:
+async def test_blocked_destinations(host: str, dialed: _Attempts) -> None:
     """Every private, loopback, link-local, metadata, CGNAT, unspecified, and multicast form is refused undialed."""
     with pytest.raises(DestinationBlockedError):
         await open_upstream(host, 443, policy=DialPolicy(), ssl_context=None)
@@ -142,7 +145,7 @@ async def test_blocked_destinations(host: str, dialed: list[tuple[str, dict[str,
 @pytest.mark.parametrize("name", _ALWAYS_REFUSED)
 async def test_metadata_link_local_unspecified_and_multicast_refused_under_the_loosest_policy(
     name: str,
-    dialed: list[tuple[str, dict[str, object]]],
+    dialed: _Attempts,
 ) -> None:
     """Allowing private networks and loopback never opens metadata, link-local, unspecified, or multicast addresses."""
     policy = DialPolicy(allow_private_networks=True, allow_loopback=True)
@@ -154,7 +157,7 @@ async def test_metadata_link_local_unspecified_and_multicast_refused_under_the_l
 
 
 @pytest.mark.asyncio
-async def test_dns_rebinding_dials_exactly_the_checked_address(dialed: list[tuple[str, dict[str, object]]]) -> None:
+async def test_dns_rebinding_dials_exactly_the_checked_address(dialed: _Attempts) -> None:
     """A name that answers public, then loopback, is resolved once and dialed at the public address it was checked as.
 
     TLS still verifies the name: it is the SNI, while the socket goes to the checked IP.
@@ -169,7 +172,7 @@ async def test_dns_rebinding_dials_exactly_the_checked_address(dialed: list[tupl
 
 
 @pytest.mark.asyncio
-async def test_dns_rebinding_after_a_private_answer_stays_refused(dialed: list[tuple[str, dict[str, object]]]) -> None:
+async def test_dns_rebinding_after_a_private_answer_stays_refused(dialed: _Attempts) -> None:
     """A name whose checked answer is private is refused, even though asking again would answer public."""
     lookups, getaddrinfo = _answers(["127.0.0.1"], [_PUBLIC])
 
@@ -187,7 +190,7 @@ async def test_dns_rebinding_after_a_private_answer_stays_refused(dialed: list[t
 @pytest.mark.parametrize("private", ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fd00::1"])
 async def test_one_private_address_in_the_answer_refuses_the_name(
     private: str,
-    dialed: list[tuple[str, dict[str, object]]],
+    dialed: _Attempts,
 ) -> None:
     """A mixed answer is refused outright, so the dial cannot fall back from the public address to the private one."""
     _lookups, getaddrinfo = _answers([_PUBLIC, private])
@@ -268,27 +271,16 @@ async def test_broker_refuses_blocked_destinations_in_every_form(
 
 
 @pytest.mark.asyncio
-async def test_loopback_allowed_when_policy_allows() -> None:
+async def test_loopback_allowed_when_policy_allows(closing_listener: int) -> None:
     """Loopback connects when policy allows it."""
-    # Start a local test server
-    server = await asyncio.start_server(
-        lambda _r, w: w.close(),
-        "127.0.0.1",
-        0,
-    )
-    try:
-        port = server.sockets[0].getsockname()[1]
-        policy = DialPolicy(allow_loopback=True)
-        _reader, writer = await open_upstream("127.0.0.1", port, policy=policy, ssl_context=None)
-        writer.close()
-        await writer.wait_closed()
-    finally:
-        server.close()
-        await server.wait_closed()
+    policy = DialPolicy(allow_loopback=True)
+    _reader, writer = await open_upstream("127.0.0.1", closing_listener, policy=policy, ssl_context=None)
+    writer.close()
+    await writer.wait_closed()
 
 
 @pytest.mark.asyncio
-async def test_dials_validated_address_not_name() -> None:
+async def test_dials_validated_address_not_name(closing_listener: int) -> None:
     """open_upstream dials the validated IP, not the hostname."""
     # Mock validated_connect_addresses to return a specific IP
     mock_addresses = [MagicMock(compressed="127.0.0.1", version=4)]
@@ -306,30 +298,18 @@ async def test_dials_validated_address_not_name() -> None:
         # Create a real connection to localhost for the test
         return await original_open_connection("127.0.0.1", port, **_kwargs)
 
-    # Start a local test server
-    server = await asyncio.start_server(
-        lambda _r, w: w.close(),
-        "127.0.0.1",
-        0,
-    )
-    try:
-        port = server.sockets[0].getsockname()[1]
+    with (
+        patch("mindroom.egress_broker.dial.validated_connect_addresses", return_value=mock_addresses),
+        patch("mindroom.egress_broker.dial.asyncio.open_connection", side_effect=mock_open_connection),
+    ):
+        policy = DialPolicy(allow_loopback=True)
+        _reader, writer = await open_upstream("example.com", closing_listener, policy=policy, ssl_context=None)
+        writer.close()
+        await writer.wait_closed()
 
-        with (
-            patch("mindroom.egress_broker.dial.validated_connect_addresses", return_value=mock_addresses),
-            patch("mindroom.egress_broker.dial.asyncio.open_connection", side_effect=mock_open_connection),
-        ):
-            policy = DialPolicy(allow_loopback=True)
-            _reader, writer = await open_upstream("example.com", port, policy=policy, ssl_context=None)
-            writer.close()
-            await writer.wait_closed()
-
-        # Verify it connected to the IP, not the hostname
-        assert len(connection_calls) == 1
-        assert connection_calls[0]["host"] == "127.0.0.1"
-    finally:
-        server.close()
-        await server.wait_closed()
+    # Verify it connected to the IP, not the hostname
+    assert len(connection_calls) == 1
+    assert connection_calls[0]["host"] == "127.0.0.1"
 
 
 @pytest.mark.asyncio

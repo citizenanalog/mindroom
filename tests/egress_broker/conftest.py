@@ -367,6 +367,17 @@ async def upstreams(upstream_ca: UpstreamCA, tmp_path: Path) -> AsyncIterator[Up
         await server.wait_closed()
 
 
+@pytest_asyncio.fixture
+async def closing_listener() -> AsyncIterator[int]:
+    """Return the port of a loopback server that closes every connection it accepts."""
+    server = await asyncio.start_server(lambda _reader, writer: writer.close(), "127.0.0.1", 0)
+    try:
+        yield server.sockets[0].getsockname()[1]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 @pytest.fixture
 def audit(tmp_path: Path) -> Iterator[AuditLog]:
     """Return the audit log every broker built by the `broker` factory writes to."""
