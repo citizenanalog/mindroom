@@ -17,7 +17,6 @@ import ssl
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from tests.egress_broker.conftest import connect_request, proxy_authorization, read_raw_response
 
 if TYPE_CHECKING:
@@ -35,12 +34,6 @@ MAX_BODY = 1024
 
 type Action = bytes | float | Literal["close"]
 type Script = Callable[[int], Sequence[Action]]
-
-
-def rule_config() -> EgressBrokerConfig:
-    """Return the corpus config: one service whose bearer rule covers every path on ``localhost``."""
-    rule = EgressRule(host="localhost", path_prefix="/", auth=EgressAuth(type="bearer"))
-    return EgressBrokerConfig(services={"svc": EgressService(rules=[rule])})
 
 
 # A strict upstream-side parser: the "different parser" every forwarded byte must read the same way.

@@ -9,14 +9,18 @@ from typing import TYPE_CHECKING
 import pytest
 from structlog.testing import capture_logs
 
-from tests.egress_broker.conftest import connect_request, proxy_authorization, read_raw_response
+from tests.egress_broker.conftest import (
+    connect_request,
+    proxy_authorization,
+    read_raw_response,
+    single_rule_config,
+)
 from tests.egress_broker.raw_http import (
     SECRET,
     assert_contained,
     assert_listener_serves,
     open_client,
     open_tunnel,
-    rule_config,
 )
 
 if TYPE_CHECKING:
@@ -40,7 +44,7 @@ def _client_context(broker: BrokerFactory) -> ssl.SSLContext:
 @pytest.mark.asyncio
 async def test_sni_differing_from_connect_host_is_refused(broker: BrokerFactory, upstreams: UpstreamFactory) -> None:
     """A client naming another host in SNI than in CONNECT gets no tunnel to send requests through, so no secret."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=True)
     probe = await upstreams()
     client = await open_client(broker.latest.port)
@@ -71,7 +75,7 @@ async def test_sni_matching_or_absent_routes_by_connect_host(
     server_hostname: str | None,
 ) -> None:
     """A matching SNI (any case, trailing dot or not) or none gets the CONNECT host's leaf; Host still has to match."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=True)
     probe = await upstreams()
     client = await open_tunnel(broker, upstream.port, context=_client_context(broker), server_hostname=server_hostname)
@@ -111,7 +115,7 @@ async def test_alpn_selects_only_http11(
     selected: str | None,
 ) -> None:
     """The broker only speaks HTTP/1.1: it selects it when offered, and an HTTP/2 preface is refused cleanly."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=True)
     probe = await upstreams()
     context = ssl.create_default_context(cadata=broker.ca.cert_pem)
@@ -157,7 +161,7 @@ async def test_upstream_tls_failure_gets_502_without_fallback(
     failure: str,
 ) -> None:
     """An upstream the broker cannot verify gets a 502, and the broker never retries without TLS."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     probe = await upstreams()
     received: list[bytes] = []
     if failure == "plaintext":

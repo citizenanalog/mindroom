@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import h11
 import pytest
 
-from tests.egress_broker.conftest import connect_request, proxy_authorization
+from tests.egress_broker.conftest import connect_request, proxy_authorization, single_rule_config
 from tests.egress_broker.raw_http import (
     MAX_BODY,
     SECOND,
@@ -23,7 +23,6 @@ from tests.egress_broker.raw_http import (
     assert_listener_serves,
     client_for,
     open_client,
-    rule_config,
 )
 
 if TYPE_CHECKING:
@@ -354,7 +353,7 @@ REQUEST_CASES = [
 @pytest.mark.parametrize("case", REQUEST_CASES, ids=[case.id for case in REQUEST_CASES])
 async def test_request_corpus(broker: BrokerFactory, upstreams: UpstreamFactory, case: Case, tunnel: bool) -> None:
     """Each malformed or ambiguous request is refused or forwarded as exactly the requests the broker parsed."""
-    await broker(rule_config(), secrets={"svc": SECRET}, max_body_bytes=MAX_BODY)
+    await broker(single_rule_config(), secrets={"svc": SECRET}, max_body_bytes=MAX_BODY)
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
     outcome = case.tunnel if tunnel else case.plain
@@ -395,7 +394,7 @@ async def test_expect_continue_forwards_one_request_after_the_body(
     tunnel: bool,
 ) -> None:
     """A client waiting for 100 Continue gets it, then its body travels in the same single forwarded request."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
     client, target = await client_for(broker, upstream, tunnel=tunnel)
@@ -468,7 +467,7 @@ async def test_head_limit_holds_however_the_head_is_split(
     status: int,
 ) -> None:
     """A head of 64 KiB is read even when its first part alone exceeds h11's default; one over it never is."""
-    await broker(rule_config(), secrets={"svc": SECRET}, max_body_bytes=MAX_BODY)
+    await broker(single_rule_config(), secrets={"svc": SECRET}, max_body_bytes=MAX_BODY)
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
     client, target = await client_for(broker, upstream, tunnel=tunnel)
@@ -503,7 +502,7 @@ async def test_pipelined_plain_requests_reach_only_their_own_hosts(
     upstreams: UpstreamFactory,
 ) -> None:
     """Pipelined plain requests to different upstreams each reach only the host their own URL names."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     first = await upstreams()
     second = await upstreams(lambda _index: [SECOND])
     probe = await upstreams()
@@ -547,7 +546,7 @@ async def test_connect_carrying_more_than_its_head_is_refused(
     after_head: str,
 ) -> None:
     """A CONNECT to an intercepted host with a body, or plaintext bytes behind it, is refused before any TLS."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=True)
     probe = await upstreams()
     client = await open_client(broker.latest.port)

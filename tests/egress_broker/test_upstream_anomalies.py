@@ -15,6 +15,7 @@ import h11
 import pytest
 
 from mindroom.egress_broker._relay import Peer
+from tests.egress_broker.conftest import single_rule_config
 from tests.egress_broker.raw_http import (
     OK,
     SECOND,
@@ -24,7 +25,6 @@ from tests.egress_broker.raw_http import (
     assert_contained,
     assert_listener_serves,
     client_for,
-    rule_config,
 )
 
 if TYPE_CHECKING:
@@ -144,7 +144,7 @@ async def test_upstream_anomaly(
     tunnel: bool,
 ) -> None:
     """Upstream bytes outside a framed response never answer another request, and failures end the connection."""
-    await broker(rule_config(), secrets={"svc": SECRET})
+    await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(anomaly.script, tls=tunnel)
     probe = await upstreams()
     client, target = await client_for(broker, upstream, tunnel=tunnel)

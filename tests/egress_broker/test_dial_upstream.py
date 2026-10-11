@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     import httpx
 
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, UpstreamCA
+    from tests.egress_broker.conftest import BrokerFactory, RawResponse, ServeFactory, UpstreamCA
 
     RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
 
@@ -313,7 +313,7 @@ async def test_loopback_destination_dials_direct_even_with_a_proxy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("host", ["10.0.0.1", "169.254.169.254", "127.0.0.1", "::ffff:10.0.0.1"])
-async def test_blocked_destination_never_contacts_proxy(host: str) -> None:
+async def test_blocked_destination_never_contacts_proxy(serve: ServeFactory, host: str) -> None:
     """The SSRF guard runs before any tunnel, so a blocked destination never reaches the operator proxy."""
     connections = 0
 
@@ -322,16 +322,12 @@ async def test_blocked_destination_never_contacts_proxy(host: str) -> None:
         connections += 1
         writer.close()
 
-    server = await asyncio.start_server(accept, "127.0.0.1", 0)
-    try:
-        port = server.sockets[0].getsockname()[1]
-        proxy = _UpstreamProxy("127.0.0.1", port, tls=False)
-        policy = DialPolicy(egress=BrowserEgress(http=proxy, https=proxy))
-        with pytest.raises(DestinationBlockedError):
-            await open_upstream(host, 443, policy=policy, ssl_context=None)
-    finally:
-        server.close()
-        await server.wait_closed()
+    proxy = _UpstreamProxy("127.0.0.1", await serve(accept), tls=False)
+    policy = DialPolicy(egress=BrowserEgress(http=proxy, https=proxy))
+
+    with pytest.raises(DestinationBlockedError):
+        await open_upstream(host, 443, policy=policy, ssl_context=None)
+
     assert connections == 0
 
 
