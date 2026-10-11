@@ -36,6 +36,7 @@ from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, ModelConfig
 from mindroom.constants import MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY
 from mindroom.constants import QUEUED_MESSAGE_NOTICE_MARKER_KEY as _NOTICE_KEY
+from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.helper_usage import HelperUsageOwner
 from mindroom.history import agno_compat_message_builder, archive, mid_turn_compaction
 from mindroom.history.agno_compat_message_builder import built_request_session
@@ -50,7 +51,7 @@ from mindroom.providers.claude_prompt_cache import install_claude_deferred_tool_
 from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.providers.openai_tool_search import install_openai_deferred_tool_search
 from mindroom.providers.synthetic_model import SyntheticModel
-from mindroom.teams import TeamMode, _create_team_instance
+from mindroom.teams import TeamMode, _create_team_instance, prepare_materialized_team_execution
 from mindroom.usage.storage import project_usage
 from tests.conftest import FakeModel, make_turn_context, seed_session
 from tests.history_helpers import (
@@ -1150,6 +1151,67 @@ async def test_prepared_agent_reply_posts_mid_turn_compaction_notices(
         pipeline_timing=None,
     )
     await _run_in_session(agent, "Do the task")
+
+    assert summary_calls.inputs
+    assert any(isinstance(event, CompactionOutcome) for event in lifecycle.events)
+
+
+@pytest.mark.asyncio
+async def test_prepared_team_reply_posts_mid_turn_compaction_notices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary_calls: _SummaryCalls,
+) -> None:
+    config, paths = _config(
+        tmp_path,
+        teams={"test_team": TeamConfig(display_name="Test Team", role="Test team", agents=["test_agent"])},
+    )
+    storage = create_session_storage("test_agent", config, paths, execution_identity=None)
+    seed_session(
+        storage,
+        _team_session(
+            "session-1",
+            team_id="test_team",
+            runs=[_completed_team_run("run-1", team_id="test_team"), _completed_team_run("run-2", team_id="test_team")],
+        ),
+    )
+    team = Team(
+        id="test_team",
+        name="test_team",
+        model=_ToolLoopModel(tool_rounds=5),
+        members=[],
+        tools=[probe],
+        db=storage,
+        add_history_to_context=True,
+        store_history_messages=False,
+        add_session_summary_to_context=False,
+        telemetry=False,
+    )
+    install_mid_turn_compaction(team, config=config, runtime_paths=paths, entity_name="test_team", model_name="default")
+    prepared = _PreparedExecutionContext(
+        messages=(Message(role="user", content="Do the task"),),
+        unseen_event_ids=[],
+        prepared_history=PreparedHistoryState(),
+    )
+    monkeypatch.setattr("mindroom.teams.prepare_bound_team_run_context", AsyncMock(return_value=prepared))
+    lifecycle = RecordingCompactionLifecycle()
+
+    await prepare_materialized_team_execution(
+        make_turn_context("test_team", session_id="session-1"),
+        scope_context=None,
+        agents=[],
+        team=team,
+        message="Do the task",
+        thread_history=[],
+        config=config,
+        runtime_paths=paths,
+        runtime_model=config.resolve_runtime_model(entity_name="test_team"),
+        response_sender_id=None,
+        current_sender_id=None,
+        configured_team_name="test_team",
+        compaction_lifecycle=lifecycle,
+    )
+    await team.arun("Do the task", session_id="session-1")
 
     assert summary_calls.inputs
     assert any(isinstance(event, CompactionOutcome) for event in lifecycle.events)

@@ -89,7 +89,7 @@ With compaction disabled, or with a summary model too small to compact, nothing 
 
 A compaction leaves the system prompt and tools unchanged, so provider prompt caching keeps working after it.
 Agents, teams, subagents, workflow participants, and minimal-mode agents all compact the same way.
-Team members, workflow participants, and scheduled tasks with a `history_limit` of `0` compact only their own work and post no notice.
+Team members, workflow participants, and scheduled tasks with a `history_limit` of `0` compact only their own work, using their own compaction settings, and post no notice.
 Subagents and replies resuming after a tool approval compact the conversation like any other reply but post no notice.
 
 ### Compacted history and redaction
@@ -133,4 +133,4 @@ Named teams accept `num_history_runs`, `num_history_messages`, `max_tool_calls_f
 The team's shared history uses the team's own settings, never a member agent's, and the team model's `context_window` sets its replay budget.
 
 [Ad hoc teams](teams.md#ad-hoc-teams) have no `teams:` entry, so their history and compaction settings come from `defaults`, not from any participating agent.
-Team members keep no history of their own; a member whose tool loop outgrows the window compacts its own work during the reply, using its own compaction settings.
+Team members keep no history of their own.
