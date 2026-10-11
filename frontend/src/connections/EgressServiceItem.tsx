@@ -101,61 +101,45 @@ export function EgressServiceItem({
     setSecret("");
   };
 
-  const save = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!secret.trim() || busy) return;
+  /**
+   * Runs one key or account action: the row is busy and shows its error, a
+   * saved key closes the key form, and the page reloads the row after it. An
+   * action abandoned by leaving the page changes nothing.
+   */
+  const run = async (
+    kind: "save" | "remove" | "connect" | "disconnect",
+    failure: string,
+    action: (signal: AbortSignal) => Promise<unknown>,
+  ) => {
+    setConfirm(null);
     const controller = new AbortController();
     operation.current = controller;
-    setBusy("save");
+    setBusy(kind);
     setError(null);
     try {
-      await requestConnection<void>(
-        paths.secret,
-        controller.signal,
-        "PUT",
-        { secret },
-        errorMessages,
-      );
+      await action(controller.signal);
       if (controller.signal.aborted) return;
-      closeEditor();
+      if (kind === "save") closeEditor();
       onChanged();
     } catch (cause) {
       if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not save the key. Try again.",
-        );
+        setError(cause instanceof Error ? cause.message : failure);
     } finally {
       if (!controller.signal.aborted) setBusy(null);
     }
   };
+  const write =
+    (path: string, method: string, body?: object) => (signal: AbortSignal) =>
+      requestConnection<void>(path, signal, method, body, errorMessages);
 
-  const remove = async () => {
-    setConfirm(null);
-    const controller = new AbortController();
-    operation.current = controller;
-    setBusy("remove");
-    setError(null);
-    try {
-      await requestConnection<void>(
-        paths.secret,
-        controller.signal,
-        "DELETE",
-        undefined,
-        errorMessages,
-      );
-      if (!controller.signal.aborted) onChanged();
-    } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not remove the key. Try again.",
-        );
-    } finally {
-      if (!controller.signal.aborted) setBusy(null);
-    }
+  const save = (event: FormEvent) => {
+    event.preventDefault();
+    if (!secret.trim() || busy) return;
+    void run(
+      "save",
+      "Could not save the key. Try again.",
+      write(paths.secret, "PUT", { secret }),
+    );
   };
 
   const deleteService = async () => {
@@ -176,66 +160,25 @@ export function EgressServiceItem({
     }
   };
 
-  const connect = async () => {
+  const connect = () => {
     // A second click on Continue, while the first connect is under way, starts nothing.
     if (!oauth || busy !== null) return;
-    const controller = new AbortController();
-    operation.current = controller;
-    setBusy("connect");
-    setError(null);
-    try {
-      await connectWithPopup(
+    void run("connect", "Could not connect. Try again.", (signal) =>
+      connectWithPopup(
         oauth.provider,
         () =>
           requestConnection<OAuthAuthorization>(
             paths.connect,
-            controller.signal,
+            signal,
             "POST",
             {},
             errorMessages,
           ),
-        controller.signal,
+        signal,
         // A popup that closed after connecting is a connection, not a cancel.
-        () => paths.accountConnected(controller.signal),
-      );
-      if (!controller.signal.aborted) onChanged();
-    } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not connect. Try again.",
-        );
-    } finally {
-      if (!controller.signal.aborted) setBusy(null);
-    }
-  };
-
-  const disconnect = async () => {
-    setConfirm(null);
-    const controller = new AbortController();
-    operation.current = controller;
-    setBusy("disconnect");
-    setError(null);
-    try {
-      await requestConnection<void>(
-        paths.disconnect,
-        controller.signal,
-        "POST",
-        {},
-        errorMessages,
-      );
-      if (!controller.signal.aborted) onChanged();
-    } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not disconnect. Try again.",
-        );
-    } finally {
-      if (!controller.signal.aborted) setBusy(null);
-    }
+        () => paths.accountConnected(signal),
+      ),
+    );
   };
 
   return (
@@ -268,7 +211,7 @@ export function EgressServiceItem({
                 disabled={busy !== null}
                 aria-label={`Connect ${oauth.display_name} for ${service.display_name}`}
                 onClick={() =>
-                  asksAboutSharedAccount ? setConfirm("shared") : void connect()
+                  asksAboutSharedAccount ? setConfirm("shared") : connect()
                 }
               >
                 {busy === "connect"
@@ -390,7 +333,7 @@ export function EgressServiceItem({
       {canManageKey && editing && (
         <form
           className="mt-3 flex flex-wrap items-center gap-2"
-          onSubmit={(event) => void save(event)}
+          onSubmit={save}
         >
           <Input
             type="password"
@@ -441,7 +384,13 @@ export function EgressServiceItem({
         description={removeWarning(service)}
         confirmLabel="Remove"
         onCancel={() => setConfirm(null)}
-        onConfirm={() => void remove()}
+        onConfirm={() =>
+          void run(
+            "remove",
+            "Could not remove the key. Try again.",
+            write(paths.secret, "DELETE"),
+          )
+        }
       />
       {canEditService && serviceEditing && (
         <ConfirmDialog
@@ -461,7 +410,7 @@ export function EgressServiceItem({
           onCancel={() => setConfirm(null)}
           onContinue={() => {
             setConfirm(null);
-            void connect();
+            connect();
           }}
         />
       )}
@@ -476,7 +425,13 @@ export function EgressServiceItem({
           )}
           confirmLabel={oauth.connected ? "Disconnect" : "Reset connection"}
           onCancel={() => setConfirm(null)}
-          onConfirm={() => void disconnect()}
+          onConfirm={() =>
+            void run(
+              "disconnect",
+              "Could not disconnect. Try again.",
+              write(paths.disconnect, "POST"),
+            )
+          }
         />
       )}
     </li>
