@@ -8,12 +8,13 @@ import nio
 from agno.agent import Agent
 from pydantic import BaseModel, Field
 
-from mindroom import model_loading
 from mindroom.ai_runtime import cached_agent_run
 from mindroom.entity_resolution import configured_routable_entity_names_for_room
+from mindroom.helper_usage import record_system_usage
 from mindroom.logging_config import get_logger
 from mindroom.matrix import state as matrix_state
 from mindroom.matrix.room_reconciliation import RoomStateSnapshot, read_state_event
+from mindroom.providers import model_loading
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
@@ -118,6 +119,7 @@ Generate the topic:"""
     except Exception:
         logger.exception("room_topic_generation_failed", room_key=room_key, session_id=session_id)
         return None
+    await record_system_usage(response, runtime_paths=runtime_paths, kind="room_topic")
     content = response.content
     if not isinstance(content, _RoomTopic):
         logger.warning(

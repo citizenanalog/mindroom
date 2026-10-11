@@ -16,7 +16,7 @@ from mindroom.constants import (
     runtime_paths_with_config_path,
     runtime_paths_with_storage_root,
 )
-from mindroom.credentials import runtime_credentials_manager_key
+from mindroom.credentials.manager import runtime_credentials_manager_key
 from mindroom.runtime_env_policy import (
     KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY,
     SANDBOX_RUNTIME_ENV_BY_KEY,
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_WORKER_PORT",
+    "DOCKER_HOST_ALIAS",
     "DOCKER_RESERVED_EXTRA_ENV_NAMES",
     "DockerWorkerBackendConfig",
     "docker_backend_cleanup_signature",
@@ -63,6 +64,8 @@ _DEFAULT_STORAGE_MOUNT_PATH = "/app/worker"
 _DEFAULT_CONFIG_PATH = "/app/config-host/config.yaml"
 _DEFAULT_NAME_PREFIX = "mindroom-worker"
 _DEFAULT_PUBLISH_HOST = "127.0.0.1"
+# Workers reach the Docker host, where the MindRoom API usually listens, under this name.
+DOCKER_HOST_ALIAS = "host.docker.internal"
 
 _WORKER_BACKEND_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["worker_backend"]
 _IMAGE_ENV = "MINDROOM_DOCKER_WORKER_IMAGE"
@@ -95,6 +98,7 @@ _DOCKER_RESERVED_LABEL_NAMES = frozenset(
         "mindroom.ai/worker-key",
         "mindroom.ai/launch-config-hash",
         "mindroom.ai/runtime-namespace",
+        "mindroom.ai/storage-layout",
     },
 )
 
@@ -223,15 +227,6 @@ class _DockerWorkerBackendConfig:
             raise WorkerBackendError(msg)
         if computer_enabled and self.user is not None and re.fullmatch(r"root|[+-]?0+", self.user.partition(":")[0]):
             msg = f"{WORKER_COMPUTER_ENABLED_ENV}=true requires a non-root {_USER_ENV}; got {self.user!r}."
-            raise WorkerBackendError(msg)
-
-    def validate_cli_profile(self) -> None:
-        """Reject unsupported CLI settings before saving a mode or starting a worker."""
-        if self.extra_env:
-            msg = "CLI workers do not support Docker extra env."
-            raise WorkerBackendError(msg)
-        if not self.user or re.fullmatch(r"root|[+-]?0+", self.user.partition(":")[0]):
-            msg = "CLI workers require an explicit non-root Docker user."
             raise WorkerBackendError(msg)
 
     @classmethod

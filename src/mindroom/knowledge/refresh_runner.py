@@ -28,22 +28,21 @@ from mindroom.constants import (
     resolve_runtime_paths,
     runtime_env_values,
 )
-from mindroom.credentials import get_runtime_shared_credentials_manager
-from mindroom.embedder_health import (
+from mindroom.credentials.manager import get_runtime_shared_credentials_manager
+from mindroom.embeddings.embedder_health import (
     EmbedderHealthRecorder,
     capture_embedder_health_recorder,
     check_embedder_health,
     embedder_in_use,
     get_embedder_failure,
 )
-from mindroom.embedding_errors import extract_classified_embedder_detail
+from mindroom.embeddings.errors import extract_classified_embedder_detail
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.github_app_auth import (
     GitHubAppTokenBinding,
     get_runtime_github_app_token_provider,
 )
 from mindroom.knowledge.index_metadata import state_for_publication
-from mindroom.knowledge.manager import KnowledgeManager
 from mindroom.knowledge.redaction import redact_credentials_in_text
 from mindroom.knowledge.refresh_locks import (
     mark_refresh_active,
@@ -72,7 +71,7 @@ from mindroom.knowledge.registry import (
     source_root_for_published_index_key,
     source_root_for_refresh_target,
 )
-from mindroom.logging_config import get_logger
+from mindroom.logging_config import get_logger, setup_subprocess_logging, subprocess_logging_env
 from mindroom.runtime_resolution import resolve_knowledge_binding
 from mindroom.tool_system.worker_routing import (
     SerializedToolExecutionIdentity,
@@ -83,6 +82,9 @@ from mindroom.tool_system.worker_routing import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+    # Imported where a manager is built, so importing this module (the API does) does not load chromadb.
+    from mindroom.knowledge.manager import KnowledgeManager
 
 
 logger = get_logger(__name__)
@@ -331,11 +333,15 @@ async def _refresh_index_in_subprocess(  # noqa: PLR0915 - Keep process and resu
                 env = dict(runtime_env_values(runtime_paths))
                 env.setdefault("PATH", os.environ.get("PATH") or os.defpath)
                 env.update(_REFRESH_SUBPROCESS_THREAD_ENV)
+                env.update(subprocess_logging_env())
                 env["MINDROOM_KNOWLEDGE_REFRESH_SUBPROCESS"] = "1"
+                # Parent and child derive the cross-process refresh lock from their temp
+                # root, so the child shares this one whatever the runtime env names.
+                env["TMPDIR"] = tempfile.gettempdir()
                 process = await asyncio.create_subprocess_exec(
                     sys.executable,
                     "-m",
-                    "mindroom.knowledge_refresh_runner",
+                    "mindroom.knowledge.refresh_entrypoint",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=output,
                     env=env,
@@ -702,6 +708,8 @@ async def _refresh_knowledge_binding_locked(
             start_watchers=False,
             create=True,
         )
+        from mindroom.knowledge.manager import KnowledgeManager  # noqa: PLC0415
+
         manager = KnowledgeManager(
             base_id=base_id,
             config=config,
@@ -838,6 +846,8 @@ async def _publish_file_mode_source_metadata_for_resolved(
         start_watchers=False,
         create=True,
     )
+    from mindroom.knowledge.manager import KnowledgeManager  # noqa: PLC0415
+
     manager = KnowledgeManager(
         base_id=base_id,
         config=config,
@@ -864,6 +874,8 @@ async def _refresh_file_mode_binding_locked(
         start_watchers=False,
         create=True,
     )
+    from mindroom.knowledge.manager import KnowledgeManager  # noqa: PLC0415
+
     manager = KnowledgeManager(
         base_id=key.base_id,
         config=config,
@@ -1393,6 +1405,7 @@ def _parse_refresh_runner_args(argv: list[str] | None = None) -> argparse.Namesp
 def main(argv: list[str] | None = None) -> int:
     """Internal CLI used by scheduled knowledge refresh subprocesses."""
     _parse_refresh_runner_args(argv)
+    setup_subprocess_logging()
     payload = sys.stdin.buffer.read()
     # Native libraries and configured handlers can retain stdout's descriptor.
     with os.fdopen(os.dup(sys.stdout.fileno()), "wb") as output:

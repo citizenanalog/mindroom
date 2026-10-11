@@ -14,6 +14,7 @@ from mindroom.oauth.microsoft import _normalize_tenant_id, microsoft_365_oauth_p
 from mindroom.oauth.providers import OAuthClientConfig, OAuthProviderError
 from mindroom.oauth.registry import load_oauth_providers
 from tests.microsoft_graph_test_support import runtime_paths, save_client_config
+from tests.oauth_test_utils import oauth_authorization_url
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -63,7 +64,7 @@ def test_authorization_url_uses_the_configured_tenant(
     save_client_config(paths)
     provider = microsoft_365_oauth_provider()
 
-    url = asyncio.run(provider.authorization_uri_async(paths, state="opaque-state"))
+    url = asyncio.run(oauth_authorization_url(provider, paths, state="opaque-state"))
     endpoints = asyncio.run(provider.runtime_endpoints(paths))
 
     parsed = urlparse(url)

@@ -23,7 +23,7 @@ from mindroom.oauth.service import (
 if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth.credential_lifecycle import OAuthCredentialContext
     from mindroom.oauth.providers import OAuthConnectionRequired, OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget

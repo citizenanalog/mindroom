@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
@@ -16,13 +17,23 @@ if TYPE_CHECKING:
     from agno.run.agent import RunErrorEvent
     from agno.run.team import RunErrorEvent as TeamRunErrorEvent
 
+    from mindroom.constants import RuntimePaths
+
 logger = get_logger(__name__)
 
 # Shared by provider retry policy and final user-message routing. Status 200 is
-# the Claude mid-stream SSE error case: the HTTP response was already committed
-# before the provider emitted an error event.
+# the mid-stream SSE case: the HTTP response was already committed before a
+# Claude error event or an early Responses end without visible output.
 TRANSIENT_PROVIDER_STATUS_CODES = frozenset({200, 408, 409, 429, 500, 502, 503, 504, 529})
 MODEL_SAFEGUARD_REFUSAL_MESSAGE = "Claude returned stop_reason=refusal"
+
+# Errors raised before any provider request when a model has no API key at all.
+_MISSING_PROVIDER_KEY_PATTERN = re.compile(
+    r"_api_key (?:or \w+ )?not set"  # Agno provider models, e.g. "OPENROUTER_API_KEY not set."
+    r"|the api_key client option must be set"  # OpenAI SDK
+    r"|missing credentials\. please pass an `api_key`"  # Newer OpenAI SDK
+    r"|could not resolve authentication method",  # Anthropic SDK
+)
 
 
 class AvatarGenerationError(RuntimeError):
@@ -45,8 +56,10 @@ class MinimalModeUnavailableError(RuntimeError):
     """Minimal mode cannot serve a turn; the message already names its recovery command."""
 
 
-def minimal_mode_failure_message(reason: str, agent_name: str) -> str:
-    """Include the command that recovers a conversation from unavailable minimal mode."""
+def minimal_mode_failure_message(reason: str, agent_name: str, *, subagent: bool) -> str:
+    """Include how to recover from unavailable minimal mode: the mode command, or a standard subagent."""
+    if subagent:
+        return f"{reason.rstrip('.')}. Start a new subagent without minimal."
     return f"{reason.rstrip('.')}. Return to standard mode with `!mode {agent_name} standard`."
 
 
@@ -158,12 +171,27 @@ def _is_transient_provider_error(error: Exception) -> bool:
     )
 
 
-def get_user_friendly_error_message(error: Exception, agent_name: str | None = None) -> str:  # noqa: PLR0911
+def _missing_provider_key_message(runtime_paths: RuntimePaths | None) -> str:
+    dashboard_url = (runtime_paths.env_value("MINDROOM_PUBLIC_URL") or "").strip() if runtime_paths else ""
+    dashboard = f"the MindRoom dashboard ({dashboard_url.rstrip('/')})" if dashboard_url else "the MindRoom dashboard"
+    return (
+        "🔑 No AI provider key is set up yet, so I can't reply. "
+        f"Open {dashboard}, choose **Connect your AI provider**, paste your key, then send your message again."
+    )
+
+
+def get_user_friendly_error_message(  # noqa: PLR0911
+    error: Exception,
+    agent_name: str | None = None,
+    *,
+    runtime_paths: RuntimePaths | None = None,
+) -> str:
     """Return a user-friendly error message.
 
     Args:
         error: The exception that occurred
         agent_name: Optional name of the agent that encountered the error
+        runtime_paths: Runtime context used to point missing-key errors at the dashboard URL
 
     Returns:
         A user-friendly error message
@@ -189,6 +217,9 @@ def get_user_friendly_error_message(error: Exception, agent_name: str | None = N
             f"{agent_prefix}⚠️ This model's safeguards blocked the request. "
             "Choose a different model (`!model list`) or revise the prompt, then try again."
         )
+
+    if _MISSING_PROVIDER_KEY_PATTERN.search(error_str):
+        return f"{agent_prefix}{_missing_provider_key_message(runtime_paths)}"
 
     # Only distinguish the most important error types
     if any(x in error_str for x in ["401", "auth", "unauthorized", "api key", "api_key", "apikey"]):

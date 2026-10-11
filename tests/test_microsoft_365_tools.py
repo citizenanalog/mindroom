@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 AGENT_USER_ID = "@mindroom_assistant:example.org"

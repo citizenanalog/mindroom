@@ -55,6 +55,7 @@ class TestRoomCreationEncryption:
         """Encrypted creation must include the m.room.encryption state event."""
         client = AsyncMock(spec=nio.AsyncClient)
         client.user_id = "@bot:localhost"
+        client.access_token = None
         client.room_create.return_value = nio.RoomCreateResponse(room_id="!new:localhost")
 
         await create_room(client, "Secure", encrypted=True)
@@ -67,6 +68,7 @@ class TestRoomCreationEncryption:
         """Default creation must stay unencrypted."""
         client = AsyncMock(spec=nio.AsyncClient)
         client.user_id = "@bot:localhost"
+        client.access_token = None
         client.room_create.return_value = nio.RoomCreateResponse(room_id="!new:localhost")
 
         await create_room(client, "Plain")
@@ -246,7 +248,7 @@ class TestManagedRoomEncryptionReconcile:
         monkeypatch.setattr(matrix_state, "load_rooms", dict)
         monkeypatch.setattr(matrix_rooms, "_add_room", MagicMock())
         monkeypatch.setattr(matrix_rooms, "generate_room_topic_ai", AsyncMock(return_value="topic"))
-        monkeypatch.setattr(matrix_rooms, "_set_room_avatar_if_available", AsyncMock())
+        monkeypatch.setattr(matrix_rooms, "_set_room_avatar", AsyncMock())
         monkeypatch.setattr(matrix_rooms, "_configure_managed_room_access", AsyncMock(return_value=True))
         created = AsyncMock(return_value="!new:example.com")
         monkeypatch.setattr(matrix_rooms, "create_room", created)

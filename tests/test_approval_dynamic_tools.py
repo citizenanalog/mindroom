@@ -18,23 +18,23 @@ from openai import AsyncOpenAI
 
 from mindroom.agent_storage import create_session_storage, get_agent_session
 from mindroom.agents import create_agent
-from mindroom.approval_tools import toolkit_owners_for_agents
+from mindroom.approval.tool_owners import toolkit_owners_for_agents
 from mindroom.config.main import Config
 from mindroom.config.models import ToolConfigEntry
 from mindroom.constants import resolve_runtime_paths
-from mindroom.event_journal import ApprovalCall, ApprovalContinuation
+from mindroom.event_journal import ApprovalCall, approval_arguments_digest
 from mindroom.history.prompt_tokens import agent_tool_definition_payloads_for_logging
 from mindroom.history.session_context import close_agent_runtime_state_dbs
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.mcp.types import MCPDiscoveredTool, MCPServerCatalog
-from mindroom.openai_models import MindRoomOpenAIResponses
-from mindroom.response_sources import ResponseSources
-from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, paused_attempt_from_response
+from mindroom.providers.openai_models import MindRoomOpenAIResponses
+from mindroom.response_turn import CompletedApprovalRun, PausedAnswer, PausedAttempt, paused_attempt_from_response
 from mindroom.tool_system import dynamic_toolkits
 from mindroom.tool_system.catalog import TOOL_METADATA
 from mindroom.tool_system.dynamic_toolkits import get_loaded_tools_for_session, save_loaded_tools_for_session
 from mindroom.tool_system.runtime_context import ToolDispatchContext
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import bind_runtime_paths, unwrap_extracted_collaborator
 from tests.response_runner_helpers import _bot, _noop_typing
 from tests.test_openai_native_compaction import _ANSWER, _event, _response
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 
@@ -572,17 +572,13 @@ async def _exercise_saved_approval(  # noqa: C901, PLR0912, PLR0915
                 ToolConfigEntry(name=replacement_tool_name),
                 *(config.agents["general"].tools if keep_original_owner else []),
             ]
-        continuation = ApprovalContinuation(
+        continuation = approval_continuation(
             approval_id="approval-example",
             run_id=paused.run_id,
             session_id=identity.session_id,
-            entity_kind="agent",
-            entity_name="general",
             room_id=identity.room_id,
             thread_id=identity.thread_id,
             requester_id=identity.requester_id,
-            response_event_id="$waiting",
-            sources=ResponseSources(("$source",), ("$source",)),
             state="claimed",
             calls=(
                 ApprovalCall(
@@ -592,6 +588,7 @@ async def _exercise_saved_approval(  # noqa: C901, PLR0912, PLR0915
                     invoking_agent="general",
                     expires_at_ns=2**62,
                     human_approval_required=True,
+                    arguments_digest=approval_arguments_digest(arguments),
                 ),
             ),
         )
@@ -610,11 +607,12 @@ async def _exercise_saved_approval(  # noqa: C901, PLR0912, PLR0915
             "resolve_for_agent_async",
             AsyncMock(return_value=SimpleNamespace(knowledge=None)),
         )
-        monkeypatch.setattr("mindroom.approval_execution.typing_indicator", _noop_typing)
+        monkeypatch.setattr("mindroom.approval.execution.typing_indicator", _noop_typing)
 
         async def continue_saved_run() -> CompletedApprovalRun | PausedAttempt:
             return await execution.continue_run(
                 continuation,
+                paused_answer=PausedAnswer(),
                 execution_identity=identity,
                 tool_dispatch=ToolDispatchContext(execution_identity=identity),
                 decisions={

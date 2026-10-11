@@ -366,6 +366,31 @@ class TestGrep:
         assert ".hidden.txt" not in result
         assert ".hidden/inside.txt" not in result
 
+    def test_gitignore_checks_never_run_workspace_git_programs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker code writes the workspace .git, so the primary's ignore check runs Git hardened."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True, text=True)
+        marker = tmp_path / "fsmonitor-ran"
+        hook = tmp_path / "fsmonitor-hook"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        hook.chmod(0o755)
+        subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=workspace, check=True, capture_output=True)
+        (workspace / ".gitignore").write_text("ignored.txt\n")
+        (workspace / "visible.txt").write_text("match me\n")
+        (workspace / "ignored.txt").write_text("match me\n")
+        monkeypatch.setattr("mindroom.custom_tools.coding._run_ripgrep", lambda *_args, **_kwargs: None)
+
+        result = CodingTools(base_dir=str(workspace)).grep("match")
+
+        assert "visible.txt:1:match me" in result
+        assert "ignored.txt" not in result
+        assert not marker.exists()
+
     def test_grep_python_fallback_batches_gitignore_checks(
         self,
         tmp_path: Path,
@@ -387,7 +412,7 @@ class TestGrep:
         def counting_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[object]:
             nonlocal run_calls
             cmd = args[0] if args else kwargs.get("args")
-            if isinstance(cmd, list) and cmd[:2] == ["git", "check-ignore"]:
+            if isinstance(cmd, list) and "check-ignore" in cmd:
                 run_calls += 1
             return original_run(*args, **kwargs)
 
@@ -889,6 +914,21 @@ class TestFindFiles:
         assert ".hidden_file.txt" not in result
         assert ".hidden_dir" not in result
 
+    def test_find_searches_a_named_dot_directory(self, tools: CodingTools, tmp_base: Path) -> None:
+        """A dot directory named in path or in the pattern's leading directories is searched, not hidden."""
+        staging = tmp_base / ".mindroom" / "runs" / "r1" / "memory"
+        staging.mkdir(parents=True)
+        (staging / "people.md").write_text("x")
+        (staging / ".draft.md").write_text("x")
+
+        by_path = tools.find_files("*.md", path=".mindroom/runs/r1/memory")
+        by_pattern = tools.find_files(".mindroom/runs/*/memory/*.md")
+
+        for result in (by_path, by_pattern):
+            assert ".mindroom/runs/r1/memory/people.md" in result
+            assert ".draft.md" not in result
+        assert ".mindroom" not in tools.find_files("**/*.md")
+
     def test_find_batches_gitignore_checks(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """find_files should use one batched git check-ignore invocation."""
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
@@ -905,7 +945,7 @@ class TestFindFiles:
         def counting_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[object]:
             nonlocal run_calls
             cmd = args[0] if args else kwargs.get("args")
-            if isinstance(cmd, list) and cmd[:2] == ["git", "check-ignore"]:
+            if isinstance(cmd, list) and "check-ignore" in cmd:
                 run_calls += 1
             return original_run(*args, **kwargs)
 
@@ -1316,6 +1356,19 @@ class TestFileToolFileAccess:
         result = json.loads(cls(base_dir=base_dir).search_content("needle", "docs"))
 
         assert [match["file"] for match in result["files"]] == ["docs/inside.txt"]
+
+    def test_file_tool_search_content_matches_multiline_queries_in_crlf_and_cr_files(self, tmp_path: Path) -> None:
+        """Workspace content search translates line endings as Agno's search does, so multiline queries match."""
+        base_dir = tmp_path / "base"
+        base_dir.mkdir()
+        (base_dir / "crlf.txt").write_bytes(b"first line\r\nsecond line\r\n")
+        (base_dir / "cr.txt").write_bytes(b"first line\rsecond line\r")
+
+        cls = file_tools()
+        result = json.loads(cls(base_dir=base_dir).search_content("first line\nsecond line"))
+
+        assert sorted(match["file"] for match in result["files"]) == ["cr.txt", "crlf.txt"]
+        assert all("\r" not in match["snippet"] for match in result["files"])
 
     def test_file_tool_search_content_searches_outside_directories_when_unrestricted(self, tmp_path: Path) -> None:
         """Unrestricted content search reaches outside directories and reports absolute paths."""

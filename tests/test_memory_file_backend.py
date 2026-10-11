@@ -16,8 +16,8 @@ from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.file_memory_knowledge import resolve_file_memory_knowledge
 from mindroom.knowledge.availability import KnowledgeAvailability
+from mindroom.knowledge.file_memory_knowledge import resolve_file_memory_knowledge
 from mindroom.knowledge.utils import KnowledgeBaseAccessResolution
 from mindroom.memory import MemoryPromptParts
 from mindroom.memory import add_agent_memory as public_add_agent_memory
@@ -33,10 +33,10 @@ from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.timing import timing_scope
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
-    _private_instance_state_root_path,
     agent_state_root_path,
     agent_workspace_root_path,
     get_tool_execution_identity,
+    private_instance_scope_root_path,
     resolve_worker_key,
     tool_execution_identity,
 )
@@ -766,13 +766,7 @@ async def test_file_backend_worker_scope_workspace_file_memory_uses_workspace_ro
     alice_worker_key = resolve_worker_key("user", alice_identity)
     assert alice_worker_key is not None
     alice_memory_file = (
-        _private_instance_state_root_path(
-            storage_path,
-            worker_key=alice_worker_key,
-            agent_name="general",
-        )
-        / "mind_data"
-        / "MEMORY.md"
+        private_instance_scope_root_path(storage_path, alice_worker_key) / "general" / "mind_data" / "MEMORY.md"
     )
     assert alice_memory_file.exists()
     assert "Alice workspace memory" in alice_memory_file.read_text(encoding="utf-8")
@@ -1177,15 +1171,7 @@ async def test_private_template_file_memory_is_visible_on_first_prompt(
 
     worker_key = resolve_worker_key("user", identity)
     assert worker_key is not None
-    memory_file = (
-        _private_instance_state_root_path(
-            storage_path,
-            worker_key=worker_key,
-            agent_name="general",
-        )
-        / "mind_data"
-        / "MEMORY.md"
-    )
+    memory_file = private_instance_scope_root_path(storage_path, worker_key) / "general" / "mind_data" / "MEMORY.md"
     assert memory_file.exists()
     assert "First-turn memory." in prompt_parts.session_preamble
     assert any(result.get("memory") == "Private note." for result in note_results)
@@ -1293,15 +1279,7 @@ async def test_private_file_memory_crud_uses_canonical_private_instance_root(
 
     worker_key = resolve_worker_key("user", identity)
     assert worker_key is not None
-    memory_file = (
-        _private_instance_state_root_path(
-            storage_path,
-            worker_key=worker_key,
-            agent_name="general",
-        )
-        / "mind_data"
-        / "MEMORY.md"
-    )
+    memory_file = private_instance_scope_root_path(storage_path, worker_key) / "general" / "mind_data" / "MEMORY.md"
     assert memory_file.exists()
     assert "Updated private CRUD memory" not in memory_file.read_text(encoding="utf-8")
 
@@ -1631,6 +1609,72 @@ async def test_file_backend_entrypoint_reports_truncation_when_preloaded_head_is
 
     assert "[Memory entrypoint truncated - showing the first 2 of 5 lines" in prompt_parts.session_preamble
     assert str(memory_path) in prompt_parts.session_preamble
+
+
+@pytest.mark.asyncio
+async def test_file_backend_entrypoint_token_cap_keeps_whole_lines(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    """A few very long lines must not slip past the line cap: the token cap bounds the preload size."""
+    config.memory.backend = "file"
+    config.memory.file.path = str(storage_path / "memory-files")
+    config.memory.file.max_entrypoint_tokens = 250
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    workspace.mkdir(parents=True, exist_ok=True)
+    memory_path = workspace / "MEMORY.md"
+    lines = [f"fact {index} " + "x" * 392 for index in range(10)]
+    memory_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
+
+    assert lines[1] in prompt_parts.session_preamble
+    assert lines[2] not in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing the first 2 of 10 lines" in prompt_parts.session_preamble
+    assert "memory.file.max_entrypoint_tokens=250" in prompt_parts.session_preamble
+    assert str(memory_path) in prompt_parts.session_preamble
+
+
+@pytest.mark.asyncio
+async def test_file_backend_entrypoint_token_cap_counts_newlines_across_many_short_lines(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    """The cap measures the joined text, so many short lines cannot each round down past it."""
+    config.memory.backend = "file"
+    config.memory.file.path = str(storage_path / "memory-files")
+    config.memory.file.max_entrypoint_lines = 500
+    config.memory.file.max_entrypoint_tokens = 200
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "MEMORY.md").write_text("abcdef\n" * 200, encoding="utf-8")
+
+    prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
+
+    # 114 lines join to 797 characters (199 tokens); 115 would be 804 (201 tokens).
+    assert "[Memory entrypoint truncated - showing the first 114 of 200 lines" in prompt_parts.session_preamble
+
+
+@pytest.mark.asyncio
+async def test_file_backend_entrypoint_token_cap_reports_an_oversized_first_line(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    """A first line larger than the token cap is withheld and still reported, never silently cut."""
+    config.memory.backend = "file"
+    config.memory.file.path = str(storage_path / "memory-files")
+    config.memory.file.max_entrypoint_tokens = 10
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "MEMORY.md").write_text("y" * 400 + "\nshort\n", encoding="utf-8")
+
+    prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
+
+    assert "y" * 400 not in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing the first 0 of 2 lines" in prompt_parts.session_preamble
 
 
 @pytest.mark.asyncio

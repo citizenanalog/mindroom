@@ -40,6 +40,7 @@ from mindroom.matrix.journal_ingress import (
 )
 from mindroom.matrix.media import MATRIX_MEDIA_EVENT_TYPES, MatrixMediaEvent
 from mindroom.pending_event_worker import PendingEventWorker
+from mindroom.runtime_shutdown import GENERIC_SHUTDOWN
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -87,6 +88,8 @@ class JournalCallbacks:
     on_approval_continuation: _ApprovalContinuationCallback
     source_has_live_owner: Callable[[str], bool]
     turn_has_live_claim: Callable[[str], bool]
+    # Delivers what replies left waiting to replay a settled source owe Matrix.
+    replies_ended: Callable[[tuple[str, ...]], None]
     on_rtc: _RtcCallback | None = None
 
 
@@ -115,6 +118,7 @@ class JournalDispatcher:
             handle=self._run_event,
             runtime_generation=self.runtime_generation,
             deferral_is_live=self._deferral_is_live,
+            replies_ended=self.callbacks.replies_ended,
         )
 
     def start(self) -> None:
@@ -130,9 +134,9 @@ class JournalDispatcher:
         """Signal that newly admitted work is waiting."""
         self._worker.wake()
 
-    async def stop(self) -> None:
+    async def stop(self, *, shutdown_intent: RuntimeShutdownIntent = GENERIC_SHUTDOWN) -> None:
         """Stop draining, leaving unfinished work pending for the next start."""
-        await self._worker.stop()
+        await self._worker.stop(shutdown_intent=shutdown_intent)
 
     def begin_shutdown(self, *, shutdown_intent: RuntimeShutdownIntent) -> None:
         """Close semantic admission before the runtime withdraws its capabilities."""
@@ -354,7 +358,7 @@ class JournalDispatcher:
     async def settle_intentionally_ignored_turn_sources(self, event_ids: tuple[str, ...]) -> None:
         """Settle turn-backed events that produced no dispatch payload."""
         self._release_sources(event_ids)
-        await self.store.settle_many(event_ids)
+        self.callbacks.replies_ended(await self.store.settle_many(event_ids))
 
     async def settle_running_event_intentionally_ignored(self) -> None:
         """Settle the current callback's event before releasing an authorization fence."""

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import nio
 import pytest
+from agno.run.agent import RunOutput
 
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
@@ -20,7 +21,8 @@ from mindroom.entity_resolution import entity_identity_registry
 from mindroom.matrix.client_delivery import DeliveredMatrixEvent, MatrixDeliveryFailure, MatrixDeliveryFailureKind
 from mindroom.matrix.identity import MatrixID
 from mindroom.message_target import MessageTarget
-from mindroom.scheduling import (
+from mindroom.scheduling.executor import execute_scheduled_workflow, send_scheduled_failure_notice
+from mindroom.scheduling.tasks import (
     CronSchedule,
     ScheduledTaskRecord,
     ScheduledWorkflow,
@@ -31,7 +33,6 @@ from mindroom.scheduling import (
     build_edited_scheduled_workflow,
     schedule_task,
 )
-from mindroom.scheduling_executor import execute_scheduled_workflow, send_scheduled_failure_notice
 from tests.authorization_helpers import (
     make_test_scheduling_runtime,
 )
@@ -42,6 +43,7 @@ from tests.conftest import (
     test_runtime_paths,
 )
 from tests.identity_helpers import persist_entity_accounts
+from tests.scheduling_helpers import serve_task_state_events
 
 
 def _mid(name: str) -> MatrixID:
@@ -253,8 +255,8 @@ class TestScheduledWorkflow:
 class TestParseWorkflowSchedule:
     """Test parse_workflow_schedule function."""
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_research_email_workflow(
         self,
         mock_agent_class: Mock,
@@ -264,7 +266,7 @@ class TestParseWorkflowSchedule:
         """Test parsing research + email workflow."""
         # Setup mock agent response
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             cron_schedule=CronSchedule(minute="0", hour="9", weekday="1"),
@@ -288,8 +290,8 @@ class TestParseWorkflowSchedule:
         assert "@research" in result.message
         assert "@email_assistant" in result.message
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_simple_reminder(
         self,
         mock_agent_class: Mock,
@@ -298,7 +300,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """Test parsing simple reminder without agents."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -319,12 +321,12 @@ class TestParseWorkflowSchedule:
         assert result.schedule_type == "once"
         assert result.message == "Check the deployment status"
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_daily_task(self, mock_agent_class: Mock, mock_get_model: Mock, mock_config: MagicMock) -> None:  # noqa: ARG002
         """Test parsing daily recurring task."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             cron_schedule=CronSchedule(minute="0", hour="9"),
@@ -346,8 +348,8 @@ class TestParseWorkflowSchedule:
         assert result.cron_schedule.to_cron_string() == "0 9 * * *"
         assert "@finance" in result.message
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_prompt_interprets_times_in_user_timezone(
         self,
         mock_agent_class: Mock,
@@ -357,7 +359,7 @@ class TestParseWorkflowSchedule:
         """The parse prompt must carry the user's timezone and local wall-clock time."""
         mock_config.timezone = "America/Los_Angeles"
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime(2026, 7, 4, 6, 45, tzinfo=UTC),
@@ -380,8 +382,8 @@ class TestParseWorkflowSchedule:
         assert "(America/Los_Angeles): 2026-07-03T09:00:00-07:00" in prompt
         assert "Interpret times in the request as America/Los_Angeles wall-clock times" in prompt
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_prompt_includes_history_limit_instructions(
         self,
         mock_agent_class: Mock,
@@ -390,7 +392,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """The parse prompt must teach the model when to set the per-schedule history limit."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             cron_schedule=CronSchedule(minute="*/25"),
@@ -417,8 +419,8 @@ class TestParseWorkflowSchedule:
         assert isinstance(result, ScheduledWorkflow)
         assert result.history_limit == 0
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_once_without_execute_at_returns_parse_error(
         self,
         mock_agent_class: Mock,
@@ -427,7 +429,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """A one-time parse without execute_at must fail instead of silently defaulting."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             message="Check deployment",
@@ -446,8 +448,8 @@ class TestParseWorkflowSchedule:
         assert isinstance(result, _WorkflowParseError)
         assert "when to run" in result.error
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_cron_without_schedule_returns_parse_error(
         self,
         mock_agent_class: Mock,
@@ -456,7 +458,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """A recurring parse without cron_schedule must fail instead of silently defaulting."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             message="Market analysis",
@@ -475,8 +477,8 @@ class TestParseWorkflowSchedule:
         assert isinstance(result, _WorkflowParseError)
         assert "recurring schedule" in result.error
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_error_handling(
         self,
         mock_agent_class: Mock,
@@ -499,7 +501,7 @@ class TestParseWorkflowSchedule:
         assert "Error parsing schedule" in result.error
         assert result.suggestion is not None
 
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_empty_available_responders_returns_parse_error(
         self,
         mock_agent_class: Mock,
@@ -517,8 +519,8 @@ class TestParseWorkflowSchedule:
         assert result.error == "No agents or teams available for scheduling."
         mock_agent_class.assert_not_called()
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_formats_available_agents_without_double_at(
         self,
         mock_agent_class: Mock,
@@ -527,7 +529,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """Available-agent prompt rendering should never produce @@ mentions."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -554,8 +556,8 @@ class TestParseWorkflowSchedule:
         assert "Available agents and teams: @general, @research, @ops, @finance, @analyst" in prompt
         assert "@@" not in prompt
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_parse_conditional_schedule_accepts_numeric_cron(
         self,
         mock_agent_class: Mock,
@@ -564,7 +566,7 @@ class TestParseWorkflowSchedule:
     ) -> None:
         """Conditional schedules should accept numeric five-field crons because they recur."""
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="cron",
             is_conditional=True,
@@ -851,7 +853,7 @@ class TestExecuteScheduledWorkflow:
                     ],
                 ),
             ) as mock_send,
-            patch("mindroom.scheduling_executor.logger.info") as mock_info,
+            patch("mindroom.scheduling.executor.logger.info") as mock_info,
         ):
             conversation_reader = _conversation_reader(latest_thread_event_id="$latest123")
             await execute_scheduled_workflow(
@@ -967,7 +969,7 @@ class TestWorkflowSerialization:
 class TestIntegrationWithScheduling:
     """Test integration with the main scheduling module."""
 
-    @patch("mindroom.scheduling._parse_workflow_schedule")
+    @patch("mindroom.scheduling.tasks._parse_workflow_schedule")
     async def test_schedule_task_workflow_path(self, mock_parse_workflow: AsyncMock) -> None:
         """Test that schedule_task uses workflow parsing for complex requests."""
         client = AsyncMock()
@@ -1008,7 +1010,7 @@ class TestIntegrationWithScheduling:
         )
         room.members_synced = True
 
-        with patch("mindroom.scheduling._run_cron_task", new=AsyncMock()):
+        with patch("mindroom.scheduling.tasks._run_cron_task", new=AsyncMock()):
             task_id, message = await schedule_task(
                 runtime=make_test_scheduling_runtime(
                     client=client,
@@ -1027,8 +1029,8 @@ class TestIntegrationWithScheduling:
             assert "recurring task" in message
             assert "0 9 * * *" in message
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_edit_reparse_preserves_message_and_can_clear_history_limit(
         self,
         mock_agent_class: Mock,
@@ -1040,7 +1042,7 @@ class TestIntegrationWithScheduling:
         client.room_put_state = AsyncMock(return_value=nio.RoomPutStateResponse("$scheduled-state", "!room:server"))
 
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(hours=6),
@@ -1104,6 +1106,10 @@ class TestIntegrationWithScheduling:
             state_key="task123",
             room_id="!room:server",
         )
+        serve_task_state_events(
+            client,
+            sender=entity_identity_registry(config, runtime_paths_for(config)).current_id("router").full_id,
+        )
 
         task_id, message = await schedule_task(
             runtime=make_test_scheduling_runtime(
@@ -1133,8 +1139,8 @@ class TestIntegrationWithScheduling:
         assert stored_workflow.message == original_message
         assert stored_workflow.history_limit is None
 
-    @patch("mindroom.model_loading.get_model_instance")
-    @patch("mindroom.scheduling.Agent")
+    @patch("mindroom.providers.model_loading.get_model_instance")
+    @patch("mindroom.scheduling.tasks.Agent")
     async def test_edit_reparse_preserves_existing_history_limit_when_request_omits_context(
         self,
         mock_agent_class: Mock,
@@ -1146,7 +1152,7 @@ class TestIntegrationWithScheduling:
         client.room_put_state = AsyncMock(return_value=nio.RoomPutStateResponse("$scheduled-state", "!room:server"))
 
         mock_agent = AsyncMock()
-        mock_response = MagicMock()
+        mock_response = RunOutput()
         mock_response.content = ScheduledWorkflow(
             schedule_type="once",
             execute_at=datetime.now(UTC) + timedelta(hours=6),
@@ -1210,6 +1216,10 @@ class TestIntegrationWithScheduling:
             event_type="com.mindroom.scheduled.task",
             state_key="task123",
             room_id="!room:server",
+        )
+        serve_task_state_events(
+            client,
+            sender=entity_identity_registry(config, runtime_paths_for(config)).current_id("router").full_id,
         )
 
         task_id, message = await schedule_task(

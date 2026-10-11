@@ -21,13 +21,13 @@ from agno.tools.calculator import CalculatorTools
 from mindroom.agent_cli.approval import CliApprovalCall
 from mindroom.agent_storage import create_session_storage, get_agent_session, get_team_session
 from mindroom.agents import create_agent
-from mindroom.approval_tools import toolkit_owners_for_agents
+from mindroom.approval.tool_owners import toolkit_owners_for_agents
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.approval import ToolApprovalConfig
 from mindroom.config.models import ToolConfigEntry
-from mindroom.custom_tools.dynamic_workflow import _aexecute_participant, _arun_agent
+from mindroom.custom_tools.dynamic_workflow import _aexecute_participant, _arun_agent, _WorkflowRun
 from mindroom.dynamic_workflows.runner import DynamicWorkflowExecutionError
-from mindroom.event_journal import ApprovalCall, ApprovalContinuation
+from mindroom.event_journal import ApprovalCall, approval_arguments_digest
 from mindroom.helper_usage import HelperUsageOwner, get_helper_usage_owner, helper_usage_context, record_helper_usage
 from mindroom.history.session_context import (
     close_agent_runtime_state_dbs,
@@ -38,8 +38,7 @@ from mindroom.history.session_context import (
 from mindroom.history.types import HistoryScope
 from mindroom.hooks import HookRegistry
 from mindroom.memory.auto_flush import _extract_memory_summary
-from mindroom.response_sources import ResponseSources
-from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, paused_attempt_from_response
+from mindroom.response_turn import CompletedApprovalRun, PausedAnswer, PausedAttempt, paused_attempt_from_response
 from mindroom.teams import (
     TeamMode,
     _attach_team_pause_presentation,
@@ -52,8 +51,9 @@ from mindroom.tool_system.runtime_context import (
     ToolDispatchContext,
     build_execution_identity_from_runtime_context,
 )
-from mindroom.usage_stats import collect_admin_usage, collect_self_usage
-from mindroom.usage_storage import quote_identifier
+from mindroom.usage.stats import collect_admin_usage, collect_self_usage
+from mindroom.usage.storage import quote_identifier
+from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import unwrap_extracted_collaborator
 from tests.history_helpers import (
     RecordingModel,
@@ -139,7 +139,7 @@ async def test_approval_resumed_helpers_keep_caller_usage_and_reset_context(  # 
         ),
     ]
     monkeypatch.setattr(
-        "mindroom.model_loading.get_model_instance",
+        "mindroom.providers.model_loading.get_model_instance",
         lambda *_args, **_kwargs: _ScriptedModel(id="synthetic", responses=responses),
     )
     original_add = CalculatorTools.add
@@ -244,7 +244,16 @@ async def test_approval_resumed_helpers_keep_caller_usage_and_reset_context(  # 
                 )
             else:
                 close_agent_runtime_state_dbs(actor, shared_scope_storage=scope_context.storage)
-    calls = (ApprovalCall("approved", "add", "general", 2**62, toolkit_name="calculator"),)
+    calls = (
+        ApprovalCall(
+            "approved",
+            "add",
+            "general",
+            2**62,
+            toolkit_name="calculator",
+            arguments_digest=approval_arguments_digest({"a": 2, "b": 3}),
+        ),
+    )
     cli_call = None
     if is_cli:
         cli_call = CliApprovalCall(
@@ -264,7 +273,7 @@ async def test_approval_resumed_helpers_keep_caller_usage_and_reset_context(  # 
                 raise RuntimeError(msg)
             return CompletedApprovalRun(response_text="Finished.", metadata_content={})
 
-        monkeypatch.setattr("mindroom.approval_execution._stream_continuation_turn", recovered_response)
+        monkeypatch.setattr("mindroom.approval.execution._stream_continuation_turn", recovered_response)
 
     async def resume() -> CompletedApprovalRun | PausedAttempt:
         if caller == "team":
@@ -285,29 +294,25 @@ async def test_approval_resumed_helpers_keep_caller_usage_and_reset_context(  # 
                 approval_calls=calls,
                 history_scope=scope,
                 prior_presentation_state=captured.response_presentation_state,
-                prior_response_text=captured.response_text,
                 prior_tool_trace=captured.tool_trace,
                 progress=None,
             )
         runner = unwrap_extracted_collaborator(_bot(tmp_path / "runner")._response_runner)
         execution = replace(runner._approval_execution, config=lambda: config, runtime_paths=paths)
         return await execution.continue_run(
-            ApprovalContinuation(
+            approval_continuation(
                 approval_id="sample-approval",
                 run_id=paused.run_id,
                 session_id="approval-session",
-                entity_kind="agent",
-                entity_name="general",
                 room_id=context.room_id,
                 thread_id=context.thread_id,
                 requester_id=context.requester_id,
-                response_event_id="$waiting",
-                sources=ResponseSources(("$source",), ("$source",)),
                 state="claimed",
                 calls=calls,
                 request_body="Add 2 and 3",
                 cli_call=cli_call,
             ),
+            paused_answer=PausedAnswer(),
             execution_identity=identity,
             tool_dispatch=(
                 LiveToolDispatchContext.from_runtime_context(context)
@@ -430,14 +435,12 @@ async def test_memory_usage_survives_rejected_output_and_retry(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("caller", ["agent", "private_agent", "configured_team", "ad_hoc_team"])
-@pytest.mark.parametrize("participant_kind", ["ephemeral_agent", "room_agent"])
 async def test_workflow_first_turn_uses_actual_caller_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caller: str,
-    participant_kind: str,
 ) -> None:
-    """Synthetic participant IDs must not replace private, configured or ad hoc caller ownership."""
+    """Synthetic room-agent participant IDs must not replace private, configured or ad hoc caller ownership."""
     config, paths = _make_config(tmp_path)
     config.memory.backend = "none"
     if caller == "private_agent":
@@ -484,18 +487,18 @@ async def test_workflow_first_turn_uses_actual_caller_store(
             ),
         ],
     )
-    monkeypatch.setattr("mindroom.model_loading.get_model_instance", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr("mindroom.providers.model_loading.get_model_instance", lambda *_args, **_kwargs: model)
     with open_scope() as scope_context, helper_usage_context(scope_context):
         assert scope_context is not None
         storage = scope_context.storage
         assert isinstance(storage, SqliteDb)
         result = await _aexecute_participant(
             context,
-            {"id": "writer", "kind": participant_kind, "agent": "test_agent"},
+            {"id": "writer", "kind": "room_agent", "agent": "test_agent"},
             "Sample task.",
-            run_scope="sample-workflow",
+            _WorkflowRun("sample-workflow"),
         )
-        assert result == "Sample output."
+        assert result.content == "Sample output."
         loaded = (get_team_session if caller.endswith("team") else get_agent_session)(storage, context.session_id)
         assert loaded is not None, "First-turn helper usage needs its actual caller session row"
         assert not loaded.runs

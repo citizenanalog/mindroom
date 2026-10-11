@@ -22,6 +22,7 @@ from mindroom.config.access import (
     RoomJoinPolicy,
     validate_concrete_matrix_user_ids,
 )
+from mindroom.config.automations import AutomationList  # noqa: TC001
 from mindroom.config.knowledge import KnowledgeGitConfig  # noqa: TC001
 from mindroom.config.legacy_fields import reject_legacy_agent_fields
 from mindroom.config.memory import AgentMemorySearchConfig, MemoryBackend  # noqa: TC001
@@ -35,12 +36,30 @@ from mindroom.config.models import (
 )
 from mindroom.config.participation import ParticipationConfig  # noqa: TC001
 from mindroom.config.schema_hints import dashboard_hint
+from mindroom.config.skill_learning import SkillLearningConfig
 from mindroom.config.validation import duplicate_items, validate_history_limit_choice
 from mindroom.constants import OWNER_MATRIX_USER_ID_PLACEHOLDER
 from mindroom.tool_system.worker_routing import WorkerScope, agent_workspace_relative_path
 
 _PrivateWorkerScope = Literal["user", "user_agent"]
-_RESERVED_PRIVATE_ROOT_FIRST_PARTS = frozenset({"sessions", "learning", "knowledge_db", "chroma"})
+# Everything the primary writes beside a private workspace in its private state root;
+# tests/test_private_root_reservations.py enumerates the writers. Workers mount only
+# the private workspace, so it must never be, or contain, one of these.
+_RESERVED_PRIVATE_ROOT_FIRST_PARTS = frozenset(
+    {
+        ".sessions-recovery.lock",
+        "agent_modes.json",
+        "agent_modes.lock",
+        "browser",
+        "browser-profiles",
+        "calls",
+        "chroma",
+        "knowledge_db",
+        "learning",
+        "memory_files",
+        "sessions",
+    },
+)
 
 
 def _validate_safe_relative_path(
@@ -253,6 +272,14 @@ class AgentConfig(BaseModel):
         default_factory=list,
         description="Concrete Matrix user IDs allowed to manage this agent's credentials",
     )
+    mcp_gateway_shared_credentials: bool = Field(
+        default=False,
+        description=(
+            "Let users who may use this agent call its tools through the MCP gateway even though its worker scope "
+            "is shared or unset, so every caller runs them with the agent's shared credentials and worker, "
+            "without the agent's instructions; agents with per-user scopes are available without it"
+        ),
+    )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,
         description=(
@@ -359,6 +386,14 @@ class AgentConfig(BaseModel):
     allow_self_config: bool | None = Field(
         default=None,
         description="Allow this agent to modify its own configuration via a tool",
+    )
+    automations: AutomationList | None = Field(
+        default=None,
+        description="Automations for this agent, built-in such as prompt_curation or from a plugin; omitted inherits defaults.automations",
+    )
+    skill_learning: SkillLearningConfig = Field(
+        default_factory=SkillLearningConfig,
+        description="Opt-in background reviews that create and maintain learned skills in this agent's workspace",
     )
     delegate_to: list[str] = Field(
         default_factory=list,

@@ -6,7 +6,7 @@ import asyncio
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from agno.agent import Agent
@@ -24,7 +24,7 @@ from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.delegation.execution import drive_delegations
 from mindroom.delegation.records import DelegationRecordOwner
 from mindroom.delegation.state import DelegationState
-from mindroom.event_journal import ApprovalCall
+from mindroom.event_journal import ApprovalCall, approval_arguments_digest
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.identity_helpers import entity_ids
 from tests.test_delegate_tools import _delegate_runtime_context, _runtime_paths
@@ -40,11 +40,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class _InstructionRecordingModel(DelegationModel):
-    """Keep every child system prompt, including its first resumed model request."""
+    """Keep every child system prompt and offered function names, including its first resumed model request."""
 
     system_prompts: list[str] = field(default_factory=list)
 
+    offered: list[list[str]] = field(default_factory=list)
+
+    @property
+    def authored_prompts(self) -> list[str]:
+        """Each request's system message before the runtime sections that follow an authored subagent's prompt."""
+        return [prompt.split("\n\n<your_role>", 1)[0] for prompt in self.system_prompts]
+
     async def ainvoke(self, *_args: object, **kwargs: object) -> ModelResponse:
+        tools = cast("list[dict[str, Any]]", kwargs.get("tools") or [])
+        self.offered.append(sorted(str(tool.get("function", tool).get("name")) for tool in tools))
         if not self.responses:
             msg = "Child provider unavailable."
             raise RuntimeError(msg)
@@ -336,6 +345,7 @@ async def test_native_child_finishes_through_its_normal_envelope(  # noqa: PLR09
                         invoking_agent="child",
                         toolkit_name="calculator",
                         expires_at_ns=2**62,
+                        arguments_digest=approval_arguments_digest(tool["tool_args"]),
                     )
                     for tool in state.pending_tools
                 )

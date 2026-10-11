@@ -9,9 +9,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+import aiohttp
+import certifi
 import nio
 
-from mindroom.constants import RuntimePaths, encryption_keys_dir, runtime_matrix_ssl_verify
+from mindroom.constants import (
+    RuntimePaths,
+    encryption_keys_dir,
+    runtime_matrix_homeserver,
+    runtime_matrix_ssl_verify,
+)
 from mindroom.logging_config import get_logger
 from mindroom.matrix.encrypted_event_metadata import encryption_visible_metadata
 from mindroom.startup_errors import PermanentStartupError
@@ -64,6 +71,7 @@ class MindRoomAsyncClient(nio.AsyncClient):
     """Matrix client for MindRoom-specific encrypted event behavior."""
 
     _process_shutdown_transport_fenced = False
+    _transport_failure_logged = False
 
     @property
     def process_shutdown_transport_fenced(self) -> bool:
@@ -79,7 +87,25 @@ class MindRoomAsyncClient(nio.AsyncClient):
             await headers.prepare()
         if self._process_shutdown_transport_fenced:
             raise _MatrixTransportShutdownError
-        return await super().send(*args, **kwargs)
+        # nio retries connection errors while logging only "Timed out", so name the real cause here.
+        try:
+            response = await super().send(*args, **kwargs)
+        except (aiohttp.ClientConnectionError, TimeoutError) as exc:
+            self._log_transport_failure(exc)
+            raise
+        self._transport_failure_logged = False
+        return response
+
+    def _log_transport_failure(self, error: BaseException) -> None:
+        """Warn once per outage with the real cause; repeats stay at debug until the homeserver answers."""
+        log = logger.debug if self._transport_failure_logged else logger.warning
+        self._transport_failure_logged = True
+        log(
+            "matrix_request_transport_failed",
+            homeserver=self.homeserver,
+            error_type=type(error).__name__,
+            error=str(error) or type(error).__name__,
+        )
 
     def begin_process_shutdown_transport_fence(self) -> None:
         """Permanently refuse new requests before owned work is drained."""
@@ -126,18 +152,36 @@ def matrix_startup_error(
     return ValueError(message)
 
 
+def _verifying_ssl_context(runtime_paths: RuntimePaths) -> ssl_module.SSLContext:
+    """Trust the system store plus certifi's roots, which HTTPS through httpx already uses.
+
+    Some Python builds (for example uv-managed CPython on NixOS) look for CA files the host does not have,
+    so the system store alone can be empty and every Matrix login fails certificate verification.
+    An explicit SSL_CERT_FILE or SSL_CERT_DIR is the operator's trust choice and is left to OpenSSL unchanged.
+    """
+    ssl_context = ssl_module.create_default_context()
+    if not any(name in runtime_paths.process_env for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")):
+        ssl_context.load_verify_locations(cafile=certifi.where())
+    return ssl_context
+
+
 def maybe_ssl_context(
     homeserver: str,
     runtime_paths: RuntimePaths,
 ) -> ssl_module.SSLContext | None:
-    """Return the configured Matrix SSL context when HTTPS requires one."""
+    """Return the configured Matrix SSL context when HTTPS requires one.
+
+    MATRIX_SSL_VERIFY=false applies only to the configured MATRIX_HOMESERVER, so any other homeserver,
+    such as one the desktop bridge signs in to, keeps certificate verification.
+    """
     if homeserver.startswith("https://"):
-        if not runtime_matrix_ssl_verify(runtime_paths=runtime_paths):
+        configured_homeserver = homeserver.rstrip("/") == runtime_matrix_homeserver(runtime_paths).rstrip("/")
+        if configured_homeserver and not runtime_matrix_ssl_verify(runtime_paths=runtime_paths):
             ssl_context = ssl_module.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl_module.CERT_NONE
         else:
-            ssl_context = ssl_module.create_default_context()
+            ssl_context = _verifying_ssl_context(runtime_paths)
         return ssl_context
     return None
 
@@ -287,16 +331,19 @@ async def login(
         sync_storage=sync_storage,
     )
 
-    response = await client.login(password)
-    if isinstance(response, nio.LoginResponse):
-        client.user_id = response.user_id
-        client.device_id = response.device_id
-        client.access_token = response.access_token
-        logger.info("matrix_login_succeeded", user_id=response.user_id)
-        return client
-    await client.close()
-    msg = f"Failed to login {user_id}: {response}"
-    raise matrix_startup_error(msg, response=response)
+    try:
+        response = await client.login(password)
+        if not isinstance(response, nio.LoginResponse):
+            msg = f"Failed to login {user_id}: {response}"
+            raise matrix_startup_error(msg, response=response)  # noqa: TRY301 - one close covers every unreturned client
+    except BaseException:
+        await client.close()
+        raise
+    client.user_id = response.user_id
+    client.device_id = response.device_id
+    client.access_token = response.access_token
+    logger.info("matrix_login_succeeded", user_id=response.user_id)
+    return client
 
 
 async def login_flows(
@@ -340,21 +387,23 @@ async def restore_login(
     )
     client.restore_login(user_id, device_id, access_token)
 
-    response = await client.whoami()
-    if isinstance(response, nio.WhoamiResponse):
-        client.user_id = response.user_id
-        if response.device_id:
-            client.device_id = response.device_id
-        logger.info(
-            "matrix_login_restored",
-            user_id=response.user_id,
-            device_id=client.device_id,
-        )
-        return client
-
-    await client.close()
-    msg = f"Failed to restore Matrix login for {user_id}: {response}"
-    raise matrix_startup_error(msg, response=response)
+    try:
+        response = await client.whoami()
+        if not isinstance(response, nio.WhoamiResponse):
+            msg = f"Failed to restore Matrix login for {user_id}: {response}"
+            raise matrix_startup_error(msg, response=response)  # noqa: TRY301 - one close covers every unreturned client
+    except BaseException:
+        await client.close()
+        raise
+    client.user_id = response.user_id
+    if response.device_id:
+        client.device_id = response.device_id
+    logger.info(
+        "matrix_login_restored",
+        user_id=response.user_id,
+        device_id=client.device_id,
+    )
+    return client
 
 
 __all__ = [

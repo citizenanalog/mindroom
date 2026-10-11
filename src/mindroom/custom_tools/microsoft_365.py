@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 from agno.tools import Toolkit
 
 from mindroom.config.main import Config  # noqa: TC001  # resolved by tool contract introspection
-from mindroom.credentials import CredentialsManager  # noqa: TC001  # resolved by tool contract introspection
+from mindroom.credentials.manager import CredentialsManager  # noqa: TC001  # resolved by tool contract introspection
 from mindroom.custom_tools.conversation_notices import ConversationNoticeError, send_conversation_notice
 from mindroom.custom_tools.excel_workbooks import (
     apply_edits,

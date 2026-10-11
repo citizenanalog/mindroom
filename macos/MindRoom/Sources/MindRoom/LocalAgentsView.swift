@@ -2,120 +2,265 @@ import SwiftUI
 
 struct LocalAgentsView: View {
     @ObservedObject var runner: MindRoomCommandRunner
-    @State private var showSetup = false
-    @State private var pairCode = ""
+    var scrollToTop: () -> Void = {}
+    @State private var step = LocalAgentsSetupStep.install
+    @State private var choseInitialStep = false
+    @State private var showChatSetup = false
 
     private var state: MindRoomServiceState { runner.serviceStatus.state }
+    private var setup: LocalAgentsSetupSnapshot { runner.localSetup }
+    private var busy: Bool { runner.isRunningCommand || !runner.hasRefreshedStatus }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("Local agents").font(.largeTitle).fontWeight(.semibold)
-            Text("Your agents run on this Mac. A Matrix server connects them to your chat account.")
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Local agents").font(.largeTitle.bold())
+            Text("Install, configure, and run agents on this Mac. Your chat account connects you to them.")
                 .foregroundStyle(.secondary)
-            AppSectionCard {
-                HStack {
-                    Label("Background service", systemImage: "cpu").font(.headline)
-                    Spacer()
-                    Text(state.shortTitle).foregroundStyle(.secondary)
-                }
-                Text(runner.serviceStatus.message).textSelection(.enabled)
-                if state == .running {
-                    Text("The process is running. Check Chat or the dashboard to confirm your agents are ready.")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                HStack {
-                    if let action = state.primaryAction, !state.needsSetup {
-                        Button(action == .stopService ? "Stop Agents" : "Start Agents") { runner.run(action) }
-                            .disabled(runner.isRunningCommand)
-                    }
-                    if state == .running {
-                        Button("Restart") { runner.run(.restartService) }.disabled(runner.isRunningCommand)
-                    }
-                    Button("Refresh Status") { runner.refreshStatus() }
-                    Spacer()
-                    Button("View Logs") { runner.run(.openLogsFolder) }
-                }
+            summary
+            SetupStepNavigation(
+                steps: LocalAgentsSetupStep.allCases, selection: step,
+                title: { "\($0.rawValue + 1). \($0.title)" },
+                progress: {
+                    runner.hasRefreshedStatus
+                        ? setup.progress(for: $0, service: state, check: runner.setupCheck)
+                        : .idle("Checking…")
+                }, select: show
+            )
+            CommandFeedbackView(runner: runner, compact: true).id("command-feedback")
+            switch step {
+            case .install: install
+            case .configure: configure
+            case .check: check
+            case .start: start
             }
+            Text("The background service starts at login. Quitting this app leaves running agents active.")
+                .font(.callout).foregroundStyle(.secondary)
+        }
+        .task { runner.refreshStatus() }
+        .onChange(of: runner.isRefreshingStatus, initial: true) { _, refreshing in
+            guard !refreshing, runner.hasRefreshedStatus, !choseInitialStep else { return }
+            choseInitialStep = true
+            step = setup.nextStep(service: state, check: runner.setupCheck)
+            showChatSetup = !setup.configurationExists
+        }
+        .onChange(of: runner.pairingCancelled && !runner.isPairing, initial: true) { _, cancelled in
+            guard cancelled else { return }
+            show(.configure)
+            showChatSetup = true
+            runner.pairingCancelled = false
+        }
+        .onChange(of: setup.runtimeReady) { wasReady, ready in
+            guard choseInitialStep, !wasReady, ready, step == .install else { return }
+            // A fresh install continues to Configure; an update resumes the existing service's step.
+            show(state.needsSetup ? .configure : setup.nextStep(service: state, check: runner.setupCheck))
+        }
+        .onChange(of: runner.setupCheck) { _, result in
+            if result?.setupCheckPassed == true { show(.start) }
+        }
+        .onChange(of: runner.runningCommandTitle) { _, _ in scrollToTop() }
+        .alert("This Mac is already connected", isPresented: $runner.needsReconnectConfirmation) {
+            Button("Pair Again") { runner.run(.reconnectHosted) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Pairing again creates a new connection and a new agent namespace. Existing agents keep working; new agents get the new namespace.")
+        }
+    }
 
-            if !state.needsSetup {
-                HStack {
-                    Button("Open Chat") { runner.run(.openHostedChat) }.buttonStyle(.borderedProminent)
-                    Button("Configure Agents…") { runner.run(.openDashboard) }.disabled(!state.canOpenDashboard)
+    private var summary: some View {
+        AppSectionCard {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(summaryTitle, systemImage: state == .running ? "checkmark.circle.fill" : "cpu")
+                        .font(.headline)
+                    Text(summaryDetail).font(.callout).foregroundStyle(.secondary)
                 }
-                Text(state.canOpenDashboard
-                     ? "Agent and model settings open in the local web dashboard."
-                     : "Start the local service to open its configuration dashboard.")
-                    .font(.callout).foregroundStyle(.secondary)
+                Spacer()
+                Button(runner.isRefreshingStatus ? "Refreshing…" : "Refresh Status") { runner.refreshStatus() }
+                    .disabled(runner.isRefreshingStatus)
             }
+        }
+    }
 
-            DisclosureGroup("Set up or reconnect local agents", isExpanded: $showSetup) {
-                setup.padding(.top, 12)
+    private var summaryTitle: String {
+        guard runner.hasRefreshedStatus else { return "Checking this Mac…" }
+        switch state {
+        case .running: return "Local agents service running"
+        case .pairing: return "Waiting for your chat account"
+        case .stopped: return "Local agents service stopped"
+        case .notInstalled:
+            return setup.runtimeReady ? "Runtime installed · Background service not installed" : "Runtime update needed · Background service not installed"
+        case .runtimeMissing: return "Install the local-agent runtime"
+        case .unknown: return "Service status unavailable"
+        }
+    }
+
+    private var summaryDetail: String {
+        guard runner.hasRefreshedStatus else { return "Looking for the runtime, configuration, and background service." }
+        switch state {
+        case .running: return "The process is running on this Mac. Open Chat or Dashboard to check your agents."
+        case .pairing: return "The service is waiting for approval. Choose Connect Account in step 2 to approve this Mac in MindRoom Chat."
+        case .stopped: return "The service is installed. Choose Start when you want your agents to run."
+        case .notInstalled:
+            if !setup.runtimeReady { return "Update the runtime in step 1 before setup and service installation." }
+            return setup.configurationExists
+                ? "You do not need to reinstall MindRoom. Check your setup, then install and start the service in step 4."
+                : "The runtime is ready. Prepare your configuration in step 2, then check and start your agents."
+        case .runtimeMissing: return "The menu bar app and the local-agent runtime are separate installations. Begin with step 1."
+        case .unknown: return runner.serviceStatus.message
+        }
+    }
+
+    private var install: some View {
+        AppSectionCard {
+            Label(setup.runtimeReady ? "MindRoom runtime installed" : setup.runtimeInstalled ? "Update MindRoom runtime" : "Install MindRoom runtime",
+                  systemImage: setup.runtimeReady ? "checkmark.circle.fill" : "arrow.down.circle")
+                .font(.headline)
+            if let path = setup.runtimePath {
+                Text(setup.runtimeUpdateReason.map { "\($0) Update it before setup or installing the background service." }
+                     ?? "Already installed on this Mac. Continue with your existing configuration or set up a new one.")
+                Text(path).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                if setup.runtimeUpdateReason != nil {
+                    Button("Update MindRoom") { runner.run(.updateRuntime) }
+                        .buttonStyle(.borderedProminent).disabled(busy)
+                } else {
+                    Button("Continue to Configure") { show(.configure) }.buttonStyle(.borderedProminent)
+                }
+            } else {
+                Text("Install the command-line runtime that runs local agents. This does not install or start the background service.")
+                Button("Install MindRoom") { runner.run(.installRuntime) }
+                    .buttonStyle(.borderedProminent).disabled(busy)
             }
-            .onAppear { if state.needsSetup { showSetup = true } }
-            .onChange(of: state) { _, newState in if newState.needsSetup { showSetup = true } }
-
-            Text("The background service starts at login. Closing or quitting the app leaves it running.")
+            Text("Computer access uses the helper bundled with this app and does not need this runtime.")
                 .font(.callout).foregroundStyle(.secondary)
         }
     }
 
-    private var setup: some View {
-        VStack(alignment: .leading, spacing: 16) {
+    private var configure: some View {
+        VStack(alignment: .leading, spacing: 12) {
             AppSectionCard {
-                setupHeading(1, "Install MindRoom", "Install the command-line runtime for local agents. Computer access uses the helper bundled with this app.")
-                Button("Install MindRoom") { runner.run(.installRuntime) }
-                    .disabled(runner.isRunningCommand)
-            }
-            AppSectionCard {
-                setupHeading(2, "Connect your chat account", "Use hosted MindRoom Chat while your agents run locally. Existing configuration is kept.")
-                HStack {
+                Label(setup.configurationExists ? "Existing configuration found" : "Prepare your configuration",
+                      systemImage: setup.configurationExists ? "checkmark.circle.fill" : "doc.badge.plus")
+                    .font(.headline)
+                Text(setup.configurationExists
+                     ? "Your configuration is already present. Existing files are kept. Check Setup will verify configuration and connectivity."
+                     : "Prepare configuration, pair your chat account, and choose an AI provider.")
+                configurationLocation
+                if !setup.configurationExists {
                     Button("Prepare Configuration") { runner.run(.initializeHostedConfig) }
-                        .disabled(runner.isRunningCommand || state == .runtimeMissing)
-                    Button("Open MindRoom Chat") { runner.run(.openHostedChat) }
+                        .buttonStyle(.borderedProminent).disabled(busy || !setup.runtimeReady)
                 }
-                Text("Sign in, open Local MindRoom in the chat sidebar, and generate a pair code.")
-                    .font(.callout).foregroundStyle(.secondary)
-                HStack {
-                    SecureField("Pair code", text: $pairCode).textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 220)
-                        .onSubmit(pair)
-                    Button("Pair Account", action: pair)
-                        .disabled(pairCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                  || runner.isRunningCommand || state == .runtimeMissing)
+                if setup.configurationExists {
+                    DisclosureGroup("Connect or reconnect your chat account", isExpanded: $showChatSetup) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Approve this Mac in the app’s Chat tab. Check the code and signed-in account before approving. You can cancel while waiting. Skip this if this configuration is already connected.")
+                            Button("Connect Account") { runner.run(.pairHosted) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(busy || !setup.runtimeReady || !setup.configurationExists)
+                        }.padding(.top, 8)
+                    }
+                    Divider()
+                    Text("Choose an AI provider").font(.headline)
+                    Text("Add your provider credentials to .env, or configure a local model in config.yaml. Existing credentials can be kept; Check Setup verifies them.")
+                    Button("Open Config Folder") { runner.run(.openConfigFolder) }
+                }
+                DisclosureGroup("Use your own Matrix server") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Manage your Matrix server separately. Prepare configuration, then edit config.yaml and .env to connect it.")
+                        Button("Prepare Self-Hosted Configuration") { runner.run(.initializeSelfHostedConfig) }
+                            .disabled(busy || !setup.runtimeReady)
+                    }.padding(.top, 8)
                 }
             }
-            AppSectionCard {
-                setupHeading(3, "Connect an AI provider", "Add your model credentials to .env in the config folder, or configure a local model in config.yaml before starting agents.")
+            LocalInferenceView(runner: runner)
+            if !setup.runtimeReady { Text("Install or update the runtime in step 1 to prepare or pair configuration.").foregroundStyle(.secondary) }
+            Button("Continue to Check") { show(.check) }
+                .buttonStyle(.borderedProminent).disabled(!setup.runtimeReady || !setup.configurationExists)
+        }
+    }
+
+    private var check: some View {
+        AppSectionCard {
+            Label("Check your setup", systemImage: "checkmark.shield").font(.headline)
+            Text("MindRoom Doctor checks your configuration, AI providers, Matrix server, and local storage. It contacts the services you configured; checks can take several minutes.")
+            configurationLocation
+            if let result = runner.setupCheck {
+                Text(result.setupCheckPassed ? "The last setup check passed." : "The last check needs attention. Review the command output above, fix any issues, then check again.")
+                Text(result.setupCheckSummary ?? "No recognized check summary was returned. Review the command output.")
+                    .font(.callout).foregroundStyle(result.setupCheckPassed ? Color.secondary : Color.orange)
+                Text("This records the last check. Run it again after editing included files or changing external services.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                Text("Not checked in this session. Files found does not mean credentials or connections have been verified.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Check Setup") { runner.run(.checkSetup) }.buttonStyle(.borderedProminent)
+                    .disabled(busy || !setup.runtimeReady || !setup.configurationExists)
                 Button("Open Config Folder") { runner.run(.openConfigFolder) }
-                Text("Already running? Use Configure Agents above to manage providers in the dashboard.")
-                    .font(.callout).foregroundStyle(.secondary)
+                Spacer()
+                Button("Continue to Start") { show(.start) }
             }
-            AppSectionCard {
-                setupHeading(4, "Start your agents", "Install the background service after pairing and configuring a provider.")
-                Button("Install and Start Agents") { runner.run(.installService) }
-                    .disabled(runner.isRunningCommand || state == .runtimeMissing)
-            }
-            DisclosureGroup("Use your own Matrix server") {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Start and manage your Matrix server separately. Prepare configuration here, then edit config.yaml and .env in the config folder to connect to it.")
-                    Button("Prepare Self-Hosted Configuration") { runner.run(.initializeSelfHostedConfig) }
-                        .disabled(runner.isRunningCommand || state == .runtimeMissing)
-                }.padding(.top, 8)
+            if !setup.runtimeReady || !setup.configurationExists {
+                Text("Complete Install and Configure before running checks.").foregroundStyle(.secondary)
             }
         }
     }
 
-    private func setupHeading(_ number: Int, _ title: String, _ detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("\(number). \(title)").font(.headline)
-            Text(detail).foregroundStyle(.secondary)
+    private var start: some View {
+        AppSectionCard {
+            Label("Background service on this Mac", systemImage: "cpu").font(.headline)
+            Text(runner.serviceStatus.message)
+            if state == .pairing {
+                Text(MindRoomServiceState.dashboardAfterPairingHint).font(.callout).foregroundStyle(.secondary)
+                HStack {
+                    Button("Connect Account") { runner.run(.pairHosted) }.buttonStyle(.borderedProminent)
+                        .disabled(busy || !setup.runtimeReady)
+                    Spacer()
+                    Button("Stop Agents") { runner.run(.stopService) }.disabled(busy)
+                }
+            } else if state == .running {
+                HStack {
+                    Button("Open Chat") { runner.run(.openHostedChat) }.buttonStyle(.borderedProminent)
+                    Button("Open Dashboard") { runner.run(.openDashboard) }
+                    Spacer()
+                    Button("Stop Agents") { runner.run(.stopService) }.disabled(busy)
+                    Button("Restart") { runner.run(.restartService) }.disabled(busy)
+                }
+            } else {
+                if runner.setupCheck?.setupCheckPassed != true {
+                    Text("A setup check is recommended before starting. You can also start using configuration you already know works.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button(state == .notInstalled ? "Install and Start Agents" : "Start Agents") {
+                        runner.run(state == .notInstalled ? .installService : .startService)
+                    }.buttonStyle(.borderedProminent).disabled(busy || !setup.canStart(service: state))
+                    Button("Check Setup First") { show(.check) }
+                }
+                if !setup.runtimeReady && !setup.canStart(service: state) { Text("Install or update the runtime in step 1 before starting.").foregroundStyle(.secondary) }
+                else if !setup.configurationExists && state == .notInstalled { Text("Prepare configuration in step 2 before starting.").foregroundStyle(.secondary) }
+                else if state == .unknown { Text("Refresh Status to determine whether the service can be started.").foregroundStyle(.secondary) }
+                if state == .stopped {
+                    Text("Start uses the configuration saved when this service was installed, including a custom location chosen in the terminal.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            Divider()
+            Button("View Logs") { runner.run(.openLogsFolder) }
         }
     }
 
-    private func pair() {
-        let code = pairCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !code.isEmpty, !runner.isRunningCommand, state != .runtimeMissing else { return }
-        pairCode = ""
-        runner.run(.pairHosted(pairCode: code))
+    private func show(_ target: LocalAgentsSetupStep) {
+        choseInitialStep = true
+        step = target
+        scrollToTop()
+    }
+
+    @ViewBuilder
+    private var configurationLocation: some View {
+        if let path = setup.configurationDisplayPath {
+            Text("Configuration: \(path)").font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary).textSelection(.enabled)
+        }
     }
 }

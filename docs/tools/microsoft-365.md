@@ -99,7 +99,7 @@ For a local installation, the redirect URI is `http://localhost:8765/api/oauth/m
 MindRoom derives callback URLs from `MINDROOM_PUBLIC_URL` or `MINDROOM_BASE_URL`, so set one of them for a hosted installation.
 
 Store the application (client) ID and secret in the `microsoft_365_oauth_client` credential service through the dashboard credentials page.
-For non-interactive deployments, seed it at startup with a [credential seed](../configuration/index.md#credential-seeds):
+For non-interactive deployments, seed it at startup with a [credential seed](../oauth-framework.md#credential-seeds):
 
 ```json
 [

@@ -25,6 +25,7 @@ async def send_conversation_notice(
     extra_content: dict[str, object],
     *,
     operation: str,
+    formatted_body: str | None = None,
 ) -> str:
     """Post one ``m.notice`` into the tool's room or thread and return its event ID.
 
@@ -42,6 +43,7 @@ async def send_conversation_notice(
             raise ConversationNoticeError(reason="thread_fallback")
     content = build_message_content(
         body,
+        formatted_body=formatted_body,
         thread_event_id=thread_id,
         reply_to_event_id=context.reply_to_event_id if thread_id is not None else None,
         latest_thread_event_id=latest_thread_event_id if thread_id is not None else None,

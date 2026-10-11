@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import nio
 import pytest
+from agno.run.agent import RunOutput
 
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
@@ -71,7 +71,7 @@ async def test_topic_generation_rechecks_remote_state_before_writing(
             "Lobby",
             config,
             runtime_paths_for(config),
-            snapshot=RoomStateSnapshot(room_id, {}) if use_snapshot else None,
+            snapshot=RoomStateSnapshot(room_id, {}, frozenset()) if use_snapshot else None,
         )
     assert result is (final_state != "forbidden")
     if final_state in {"human_topic", "forbidden"}:
@@ -105,13 +105,13 @@ async def test_generate_room_topic_includes_team_only_room_entities(tmp_path) ->
     )
     captured_prompt: str | None = None
 
-    async def capture_run(**kwargs: object) -> SimpleNamespace:
+    async def capture_run(**kwargs: object) -> RunOutput:
         nonlocal captured_prompt
         captured_prompt = str(kwargs["run_input"])
-        return SimpleNamespace(content="Ops topic")
+        return RunOutput(content="Ops topic")
 
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=None),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=None),
         patch("mindroom.topic_generator.cached_agent_run", new=AsyncMock(side_effect=capture_run)),
     ):
         topic = await generate_room_topic_ai("ops", "Ops", config, runtime_paths_for(config))
@@ -146,13 +146,13 @@ async def test_generate_room_topic_resolves_configured_entities_for_persisted_ro
     )
     captured_prompt: str | None = None
 
-    async def capture_run(**kwargs: object) -> SimpleNamespace:
+    async def capture_run(**kwargs: object) -> RunOutput:
         nonlocal captured_prompt
         captured_prompt = str(kwargs["run_input"])
-        return SimpleNamespace(content="Ops topic")
+        return RunOutput(content="Ops topic")
 
     with (
-        patch("mindroom.model_loading.get_model_instance", return_value=None),
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=None),
         patch("mindroom.topic_generator.cached_agent_run", new=AsyncMock(side_effect=capture_run)),
     ):
         topic = await generate_room_topic_ai("ops", "Ops", config, runtime_paths_for(config))

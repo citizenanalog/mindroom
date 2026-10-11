@@ -38,7 +38,9 @@ from mindroom.api.matrix_operations import router as matrix_router
 from mindroom.api.mcp_gateway import gateway_cors_origins, gateway_lifespan, install_gateway_routes
 from mindroom.api.oauth import router as oauth_router
 from mindroom.api.openai_compat import router as openai_compat_router
+from mindroom.api.provider_setup import router as provider_setup_router
 from mindroom.api.report_publishing import public_router as report_publishing_public_router
+from mindroom.api.request_body_limit import RequestBodyLimitMiddleware
 from mindroom.api.response_activity import router as response_activity_router
 from mindroom.api.schedules import router as schedules_router
 from mindroom.api.script_gateway import bind_script_tool_broker
@@ -50,18 +52,20 @@ from mindroom.api.usage import router as usage_router
 from mindroom.api.usage_export import close_usage_export_runner
 from mindroom.api.workers import router as workers_router
 from mindroom.background_tasks import run_blocking_until_complete
-from mindroom.credentials_sync import sync_env_to_credentials
-from mindroom.embedder_health import get_embedder_failure
+from mindroom.credentials.legacy_tool_credentials import migrate_tool_credential_defaults
+from mindroom.credentials.sync import sync_env_to_credentials
+from mindroom.embeddings.embedder_health import get_embedder_failure
 from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
 from mindroom.knowledge.status import reconcile_knowledge_mode_transition_states
 from mindroom.knowledge.watch import KnowledgeSourceWatcher
-from mindroom.legacy_private_storage import migrate_private_storage
-from mindroom.legacy_usage_storage import migrate_usage_storage
+from mindroom.legacy_state_root_records import migrate_state_root_records
 from mindroom.logging_config import get_logger
 from mindroom.matrix.decrypt_failure import e2ee_stats
 from mindroom.matrix.health import get_matrix_sync_health_snapshot
 from mindroom.orchestration.runtime import matrix_ingestion_grace_seconds, matrix_sync_startup_timeout_seconds
+from mindroom.private_storage.legacy_private_storage import migrate_private_storage
 from mindroom.runtime_state import get_runtime_state
+from mindroom.usage.legacy_usage_storage import migrate_usage_storage
 from mindroom.worker_computer.auth import computer_origins
 from mindroom.workers.backend import maintain_workers
 from mindroom.workers.runtime import lease_configured_primary_worker_manager
@@ -508,11 +512,13 @@ async def _watch_config(
 
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:  # noqa: PLR0915
     """Manage application startup and shutdown."""
     runtime_paths = _app_runtime_paths(_app)
     await migrate_private_storage(runtime_paths)
+    await migrate_state_root_records(runtime_paths)
     await migrate_usage_storage(runtime_paths)
+    await migrate_tool_credential_defaults(runtime_paths)
     await asyncio.to_thread(constants.ensure_writable_config_path, create_minimal=True, runtime_paths=runtime_paths)
     app_state = config_lifecycle.app_state(_app)
     preload_snapshot = _app_context(_app)
@@ -685,6 +691,8 @@ app = FastAPI(
     openapi_url=_api_docs["openapi_url"],
 )
 initialize_api_app(app, _runtime_paths)
+# Added before CORS, so a 413 still carries the dashboard's CORS headers.
+app.add_middleware(RequestBodyLimitMiddleware)
 _add_dashboard_cors_middleware(app, _runtime_paths)
 
 
@@ -751,6 +759,7 @@ app.include_router(auth_router)
 app.include_router(connections_router)
 install_gateway_routes(app)
 app.include_router(credentials_router, dependencies=[Depends(verify_user)])
+app.include_router(provider_setup_router, dependencies=[Depends(verify_user)])
 app.include_router(homeassistant_router, dependencies=[Depends(verify_user)])
 app.include_router(integrations_router, dependencies=[Depends(verify_user)])
 app.include_router(matrix_router, dependencies=[Depends(verify_user)])

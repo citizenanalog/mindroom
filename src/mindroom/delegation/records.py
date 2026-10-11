@@ -1,4 +1,4 @@
-"""Durable workspace audit records for delegated agent runs."""
+"""Primary-owned delegation records and their write-only workspace audit exports."""
 
 from __future__ import annotations
 
@@ -6,21 +6,23 @@ import hashlib
 import json
 import os
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from functools import partial
+from itertools import islice
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
+from mindroom.atomic_file import atomic_write_bytes_at, atomic_write_file_at
 from mindroom.background_tasks import run_blocking_until_complete
-from mindroom.durable_write import (
-    create_directory_durable,
-    replace_file_durable,
-    write_json_file_durable,
-)
-from mindroom.file_locks import advisory_file_lock
+from mindroom.constants import primary_records_dir
+from mindroom.durable_write import create_directory_durable, write_json_file_durable
+from mindroom.logging_config import get_logger
+from mindroom.path_confinement import open_directory_within_root, open_regular_file_at, write_file_within_root
 from mindroom.redaction import redact_sensitive_data
 from mindroom.runtime_resolution import resolve_agent_storage
 from mindroom.tool_system.worker_routing import (
@@ -29,13 +31,16 @@ from mindroom.tool_system.worker_routing import (
     parse_tool_execution_identity_payload,
     serialize_tool_execution_identity,
 )
-from mindroom.workspaces import resolve_agent_workspace_from_state_path, resolve_workspace_relative_path
+from mindroom.workspaces import resolve_agent_workspace_from_state_path
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.delegation.state import SubagentPersona
+
+logger = get_logger(__name__)
 
 type _DelegationActiveStatus = Literal["running", "paused"]
 type DelegationTerminalStatus = Literal["completed", "failed", "cancelled", "denied"]
@@ -56,9 +61,27 @@ type _JsonValue = None | bool | int | float | str | list["_JsonValue"] | dict[st
 _SCHEMA_VERSION = 1
 _DELEGATION_DIRECTORY = Path(".mindroom/delegations")
 _RECEIPT_DIRECTORY = Path(".mindroom/delegation_receipts")
+_EVENT_LOG = "events.jsonl"
+_STATE_FILE = "state.json"
 _MAX_INLINE_VALUE_BYTES = 64 * 1024
+# Caps on what one record may hold; values above _MAX_INLINE_VALUE_BYTES move to artifacts/.
+_MAX_RUN_BYTES = 4 << 20
+_MAX_EVENT_LINE_BYTES = 1 << 20
+_MAX_EVENT_LOG_BYTES = 64 << 20
+_MAX_EVENTS = 65536
+# Other events stop this far short of the log cap, so the terminal event, four inline values at most, always fits.
+_FINISH_EVENT_HEADROOM_BYTES = 1 << 20
+# A new run.json keeps room for the three inline values and timestamps finish adds.
+_FINISH_RUN_HEADROOM_BYTES = 3 * _MAX_INLINE_VALUE_BYTES + 256
 _ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "denied"})
+# Writers of one record exclude each other in this process, without a lock file worker code could hold.
+_RECORD_LOCKS: WeakValueDictionary[Path, threading.Lock] = WeakValueDictionary()
+_RECORD_LOCKS_GUARD = threading.Lock()
+
+
+class DelegationRecordLimitError(ValueError):
+    """An event the record's size limits refuse before anything is written."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +100,7 @@ class DelegationMetadata:
     parent_delegation_id: str | None = None
     subagent_id: str | None = None
     previous_delegation_id: str | None = None
+    persona: SubagentPersona | None = None
 
 
 @dataclass(frozen=True)
@@ -152,9 +176,11 @@ class DelegationRecordHandle:
     """Resolved paths plus the restart-safe identity for one delegation record."""
 
     locator: DelegationRecordLocator
-    record_dir: Path
-    receipt_path: Path
     scoped_path: str
+    child_workspace: Path
+    caller_workspace: Path
+    # The primary-only directory holding the record's working state, of which the workspace files are exports.
+    state_dir: Path
 
     @property
     def _record_reference(self) -> str:
@@ -177,9 +203,19 @@ class DelegationEvent:
     event_id: str | None = None
 
 
+@dataclass
+class _RecordState:
+    """One record's committed state, kept beside its event log in primary-only storage."""
+
+    # The run.json document the workspace receives.
+    run: dict[str, Any]
+    log_bytes: int = 0
+    event_ids: list[str] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class DelegationRecordOwner:
-    """Resolve scoped workspaces and durably maintain delegation audit exports."""
+    """Resolve scoped workspaces, own each record's state, and export it to the workspaces."""
 
     config: Config
     runtime_paths: RuntimePaths
@@ -212,7 +248,7 @@ class DelegationRecordOwner:
         handle: DelegationRecordHandle,
         event: DelegationEvent,
     ) -> None:
-        """Append one full, redacted event and refresh readable record views."""
+        """Append one full, redacted event and refresh the record's exports."""
         await run_blocking_until_complete(self._append_event, handle, event)
 
     async def finish(
@@ -224,7 +260,7 @@ class DelegationRecordOwner:
         error: object | None = None,
         usage: object | None = None,
     ) -> None:
-        """Settle one record with its exact terminal outcome."""
+        """Settle one record; a record that is already settled keeps its first outcome."""
         await run_blocking_until_complete(
             partial(
                 self._finish,
@@ -247,98 +283,83 @@ class DelegationRecordOwner:
         _validate_metadata(metadata)
         resolved_id = _validated_id(delegation_id or uuid4().hex)
         timestamp = _utc_timestamp()
-        started_date = timestamp[:10]
         locator = DelegationRecordLocator(
             delegation_id=resolved_id,
-            started_date=started_date,
+            started_date=timestamp[:10],
             caller_agent_name=metadata.caller_agent_name,
             child_agent_name=metadata.child_agent_name,
             caller_execution_identity=caller_execution_identity,
             child_execution_identity=child_execution_identity,
         )
         handle = self._resolve_handle(locator)
-        create_directory_durable(handle.record_dir.parent, mode=0o700)
-        create_directory_durable(handle.record_dir, mode=0o700)
-        with advisory_file_lock(_lock_path(handle)):
-            run_path = _record_file(handle, "run.json")
-            if run_path.exists():
+        run = redact_sensitive_data(
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "delegation_id": resolved_id,
+                **asdict(metadata),
+                "persona": _persona_record(metadata.persona),
+                "status": "running",
+                "started_at": timestamp,
+                "updated_at": timestamp,
+                "finished_at": None,
+                "output": None,
+                "error": None,
+                "usage": None,
+                "event_count": 0,
+                "record_reference": handle._record_reference,
+            },
+        )
+        state = _RecordState(cast("dict[str, Any]", run))
+        if len(_json_bytes(state.run)) + _FINISH_RUN_HEADROOM_BYTES > _MAX_RUN_BYTES:
+            msg = "Delegation record exceeds its size limit"
+            raise DelegationRecordLimitError(msg)
+        with _record_lock(handle):
+            if (handle.state_dir / _STATE_FILE).exists():
                 msg = f"Delegation record already exists: {resolved_id}"
                 raise FileExistsError(msg)
-            run = cast(
-                "dict[str, _JsonValue]",
-                redact_sensitive_data(
-                    {
-                        "schema_version": _SCHEMA_VERSION,
-                        "delegation_id": resolved_id,
-                        **asdict(metadata),
-                        "status": "running",
-                        "started_at": timestamp,
-                        "updated_at": timestamp,
-                        "finished_at": None,
-                        "output": None,
-                        "error": None,
-                        "usage": None,
-                        "event_count": 0,
-                        "record_reference": handle._record_reference,
-                    },
+            create_directory_durable(handle.state_dir, mode=0o700)
+            line = _commit_event(
+                handle,
+                state,
+                _event_payload(
+                    sequence=1,
+                    timestamp=timestamp,
+                    kind="delegation_started",
+                    data={},
+                    status="running",
+                    event_id="delegation_started",
                 ),
             )
-            _write_run(run_path, run)
-            event = _event_payload(
-                sequence=1,
-                timestamp=timestamp,
-                kind="delegation_started",
-                data={},
-                status="running",
-                event_id="delegation_started",
-            )
-            _append_jsonl(_record_file(handle, "events.jsonl"), event)
-            run["event_count"] = 1
-            _write_run(run_path, run)
-            _write_transcript(handle, run)
-            _write_receipt(handle, run)
+            _write_exports(handle, state, line)
         return handle
 
     def _reopen(self, locator: DelegationRecordLocator) -> DelegationRecordHandle:
         handle = self._resolve_handle(locator)
-        run = _load_run(handle)
-        _validate_run_identity(run, locator)
+        with _record_lock(handle):
+            _load_state(handle)
         return handle
 
     def _append_event(self, handle: DelegationRecordHandle, event: DelegationEvent) -> None:
         handle = self._validated_handle(handle)
-        with advisory_file_lock(_lock_path(handle)):
-            run = _load_run(handle)
-            _validate_run_identity(run, handle.locator)
-            events = _load_events(_record_file(handle, "events.jsonl"))
-            _apply_event_log(run, events)
-            if event.event_id is not None and any(existing.get("event_id") == event.event_id for existing in events):
-                _write_record_views(handle, run)
+        with _record_lock(handle):
+            state = _load_state(handle)
+            if state is None:
                 return
-            _ensure_active(run)
-            sequence = _next_sequence(handle)
-            timestamp = event.timestamp or _utc_timestamp()
-            redacted_data = _redacted_event_data(
-                handle,
-                sequence=sequence,
-                data=event.data,
-            )
+            if event.event_id is not None and _event_id_digest(event.event_id) in state.event_ids:
+                _write_exports(handle, state)
+                return
+            _ensure_active(state.run)
+            sequence = state.run["event_count"] + 1
+            data, artifacts = _redacted_event_data(sequence=sequence, data=event.data)
             payload = _event_payload(
                 sequence=sequence,
-                timestamp=timestamp,
+                timestamp=event.timestamp or _utc_timestamp(),
                 kind=event.kind,
-                data=redacted_data,
+                data=data,
                 status=event.status,
                 event_id=event.event_id,
             )
-            _append_jsonl(_record_file(handle, "events.jsonl"), payload)
-            run["event_count"] = sequence
-            run["updated_at"] = timestamp
-            if event.status is not None:
-                run["status"] = event.status
-            _write_run(_record_file(handle, "run.json"), run)
-            _write_transcript(handle, run)
-            _write_receipt(handle, run)
+            _write_exports(handle, state, _commit_event(handle, state, payload), artifacts)
 
     def _finish(
         self,
@@ -353,82 +374,55 @@ class DelegationRecordOwner:
             msg = f"Invalid delegation terminal status: {status}"
             raise ValueError(msg)
         handle = self._validated_handle(handle)
-        with advisory_file_lock(_lock_path(handle)):
-            run = _load_run(handle)
-            _validate_run_identity(run, handle.locator)
-            events = _load_events(_record_file(handle, "events.jsonl"))
-            _apply_event_log(run, events)
-            if run.get("status") == status:
-                _write_record_views(handle, run)
+        with _record_lock(handle):
+            state = _load_state(handle)
+            if state is None:
                 return
-            _ensure_active(run)
-            sequence = _next_sequence(handle)
-            timestamp = _utc_timestamp()
-            terminal_data = _redacted_event_data(
-                handle,
-                sequence=sequence,
-                data={
-                    "status": status,
-                    "output": output,
-                    "error": error,
-                    "usage": usage,
-                },
-            )
-            event = _event_payload(
-                sequence=sequence,
-                timestamp=timestamp,
-                kind="delegation_finished",
-                data=terminal_data,
-                status=None,
-                event_id="delegation_finished",
-            )
-            _append_jsonl(_record_file(handle, "events.jsonl"), event)
-            run.update(
-                {
-                    "status": status,
-                    "updated_at": timestamp,
-                    "finished_at": timestamp,
-                    "output": terminal_data["output"],
-                    "error": terminal_data["error"],
-                    "usage": terminal_data["usage"],
-                    "event_count": sequence,
-                },
-            )
-            _write_run(_record_file(handle, "run.json"), run)
-            _write_transcript(handle, run)
-            _write_receipt(handle, run)
+            line = b""
+            artifacts: dict[str, bytes] = {}
+            # The first terminal outcome stands, so a later finish, even with another status, only refreshes exports.
+            if state.run["status"] not in _TERMINAL_STATUSES:
+                sequence = state.run["event_count"] + 1
+                terminal_data, artifacts = _redacted_event_data(
+                    sequence=sequence,
+                    data={"status": status, "output": output, "error": error, "usage": usage},
+                )
+                payload = _event_payload(
+                    sequence=sequence,
+                    timestamp=_utc_timestamp(),
+                    kind="delegation_finished",
+                    data=terminal_data,
+                    status=None,
+                    event_id="delegation_finished",
+                )
+                line = _commit_event(handle, state, payload, terminal=True)
+            # Every finish, a replayed one included, rewrites the exports and renders transcript.md.
+            _write_exports(handle, state, line, artifacts, final=True)
 
     def _resolve_handle(self, locator: DelegationRecordLocator) -> DelegationRecordHandle:
         delegation_id = _validated_id(locator.delegation_id)
         started_date = _validated_date(locator.started_date)
-        child_workspace = _resolve_workspace(
+        child_workspace, child_state_root = _resolve_workspace(
             locator.child_agent_name,
             config=self.config,
             runtime_paths=self.runtime_paths,
             execution_identity=locator.child_execution_identity,
         )
-        caller_workspace = _resolve_workspace(
+        caller_workspace, _caller_state_root = _resolve_workspace(
             locator.caller_agent_name,
             config=self.config,
             runtime_paths=self.runtime_paths,
             execution_identity=locator.caller_execution_identity,
         )
-        scoped_path = _DELEGATION_DIRECTORY / started_date / delegation_id
-        record_dir = resolve_workspace_relative_path(
-            child_workspace,
-            scoped_path,
-            field_name="Delegation record",
-        )
-        receipt_path = resolve_workspace_relative_path(
-            caller_workspace,
-            _RECEIPT_DIRECTORY / started_date / f"{delegation_id}.json",
-            field_name="Delegation receipt",
-        )
         return DelegationRecordHandle(
             locator=locator,
-            record_dir=record_dir,
-            receipt_path=receipt_path,
-            scoped_path=scoped_path.as_posix(),
+            scoped_path=(_DELEGATION_DIRECTORY / started_date / delegation_id).as_posix(),
+            child_workspace=child_workspace,
+            caller_workspace=caller_workspace,
+            state_dir=primary_records_dir(child_state_root, self.runtime_paths)
+            / "delegations"
+            / started_date
+            / delegation_id,
         )
 
     def _validated_handle(self, handle: DelegationRecordHandle) -> DelegationRecordHandle:
@@ -493,7 +487,8 @@ def _resolve_workspace(
     config: Config,
     runtime_paths: RuntimePaths,
     execution_identity: ToolExecutionIdentity | None,
-) -> Path:
+) -> tuple[Path, Path]:
+    """Return the agent's workspace root and the state root it belongs to."""
     resolved = resolve_agent_storage(
         agent_name,
         config,
@@ -510,111 +505,110 @@ def _resolve_workspace(
         use_state_storage_path=resolved.execution.policy.private_workspace_enabled,
     )
     if workspace is None:
-        return agent_workspace_root_path(runtime_paths.storage_root, agent_name)
-    return workspace.root
+        return agent_workspace_root_path(runtime_paths.storage_root, agent_name), resolved.state_root
+    return workspace.root, resolved.state_root
 
 
 def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _lock_path(handle: DelegationRecordHandle) -> Path:
-    return _record_file(handle, ".record.lock")
+def _receipt_relative_path(locator: DelegationRecordLocator) -> Path:
+    return _RECEIPT_DIRECTORY / _validated_date(locator.started_date) / f"{_validated_id(locator.delegation_id)}.json"
 
 
-def _record_file(handle: DelegationRecordHandle, name: str) -> Path:
-    return resolve_workspace_relative_path(
-        handle.record_dir,
-        name,
-        field_name=f"Delegation record {name}",
-    )
+@contextmanager
+def _record_lock(handle: DelegationRecordHandle) -> Iterator[None]:
+    """Serialize the writers of one record without taking a lock worker code could hold."""
+    with _RECORD_LOCKS_GUARD:
+        lock = _RECORD_LOCKS.get(handle.state_dir)
+        if lock is None:
+            lock = threading.Lock()
+            _RECORD_LOCKS[handle.state_dir] = lock
+    with lock:
+        yield
 
 
-def _write_run(path: Path, run: Mapping[str, object]) -> None:
-    write_json_file_durable(
-        path,
-        run,
-        strict_atomic_replace=True,
-        indent=2,
-        sort_keys=True,
-        trailing_newline=True,
-    )
-
-
-def _append_jsonl(path: Path, payload: Mapping[str, object]) -> None:
-    # These exports already rebuild their transcript after every event. Publish
-    # the log atomically too, so a crash cannot leave an unreadable partial line.
-    previous = path.read_text(encoding="utf-8") if path.exists() else ""
-    _write_text_file_durable(path, previous + json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-
-
-def _load_run(handle: DelegationRecordHandle) -> dict[str, _JsonValue]:
-    path = _record_file(handle, "run.json")
+def _load_state(handle: DelegationRecordHandle) -> _RecordState | None:
+    """Return the record's committed state, or None for a record that predates primary-owned state."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = (handle.state_dir / _STATE_FILE).read_bytes()
     except FileNotFoundError:
-        raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        msg = f"Delegation record is unreadable: {handle.locator.delegation_id}"
-        raise ValueError(msg) from exc
-    if not isinstance(payload, dict):
-        msg = f"Delegation record is malformed: {handle.locator.delegation_id}"
-        raise TypeError(msg)
-    return cast("dict[str, _JsonValue]", payload)
+        # LEGACY_COMPAT: Delegation records whose working state lived only in their workspace files.
+        # Legacy format: A record directory below the child workspace's .mindroom/delegations/ with no state.json below
+        # tracking/; selected when the state file is missing while that workspace directory exists.
+        # Last legacy release: v2026.10.101; replacement: the next release keeps each record's state below tracking/
+        # and writes run.json, events.jsonl, and transcript.md as exports of it.
+        # Handling: Such a record's operations return without reading or writing its workspace files, so a delegation
+        # still in flight at the upgrade settles and its record stays as it was; a record found in neither place is missing.
+        # Coverage: tests/test_delegation_records.py::test_a_record_started_before_primary_state_is_left_as_it_was.
+        with _record_directory(handle):
+            return None
+    return _RecordState(**json.loads(payload))
 
 
-def _validate_run_identity(
-    run: Mapping[str, object],
-    locator: DelegationRecordLocator,
-) -> None:
-    expected = (
-        _SCHEMA_VERSION,
-        locator.delegation_id,
-        locator.caller_agent_name,
-        locator.child_agent_name,
-        locator.started_date,
-    )
-    started_at = run.get("started_at")
-    actual = (
-        run.get("schema_version"),
-        run.get("delegation_id"),
-        run.get("caller_agent_name"),
-        run.get("child_agent_name"),
-        started_at[:10] if isinstance(started_at, str) else None,
-    )
-    if actual != expected:
-        msg = f"Delegation record identity mismatch: {locator.delegation_id}"
-        raise ValueError(msg)
+def _event_id_digest(event_id: str) -> str:
+    # Fixed-size digests keep long event IDs from growing the state file.
+    return hashlib.blake2b(event_id.encode("utf-8", "surrogatepass"), digest_size=16).hexdigest()
 
 
-def _ensure_active(run: Mapping[str, object]) -> None:
-    if run.get("status") in _TERMINAL_STATUSES:
-        msg = f"Delegation record is already terminal: {run.get('delegation_id')}"
-        raise ValueError(msg)
+@contextmanager
+def _record_directory(handle: DelegationRecordHandle, *, create: bool = False) -> Iterator[int]:
+    """Pin the workspace record directory by a no-follow walk from the child workspace."""
+    if create:
+        handle.child_workspace.mkdir(parents=True, exist_ok=True)
+    with open_directory_within_root(handle.child_workspace, handle.scoped_path, create=create, mode=0o700) as record_fd:
+        yield record_fd
 
 
-def _next_sequence(handle: DelegationRecordHandle) -> int:
-    events = _load_events(_record_file(handle, "events.jsonl"))
-    if not events:
-        return 1
-    sequence = events[-1].get("sequence")
-    if type(sequence) is not int:
-        msg = f"Delegation event sequence is malformed: {handle.locator.delegation_id}"
-        raise ValueError(msg)
-    return sequence + 1
+def _json_bytes(payload: object) -> bytes:
+    return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
 
 
-def _load_events(path: Path) -> list[dict[str, object]]:
+def _write_all(descriptor: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        remaining = remaining[os.write(descriptor, remaining) :]
+
+
+def _commit_event(
+    handle: DelegationRecordHandle,
+    state: _RecordState,
+    payload: Mapping[str, Any],
+    *,
+    terminal: bool = False,
+) -> bytes:
+    """Append one event to the primary log, then commit the state that counts it, and return the event's line."""
+    line = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    log_limit = _MAX_EVENT_LOG_BYTES if terminal else _MAX_EVENT_LOG_BYTES - _FINISH_EVENT_HEADROOM_BYTES
+    event_limit = _MAX_EVENTS if terminal else _MAX_EVENTS - 1
+    if (
+        len(line) > _MAX_EVENT_LINE_BYTES
+        or state.log_bytes + len(line) > log_limit
+        or state.run["event_count"] >= event_limit
+    ):
+        msg = "Delegation event exceeds its size limit"
+        raise DelegationRecordLimitError(msg)
+    descriptor = os.open(handle.state_dir / _EVENT_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
-        with path.open(encoding="utf-8") as stream:
-            events = [json.loads(line) for line in stream]
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        msg = f"Delegation event stream is unreadable: {path.parent.name}"
-        raise ValueError(msg) from exc
-    if not all(isinstance(event, dict) for event in events):
-        msg = f"Delegation event stream is malformed: {path.parent.name}"
+        # The state file is the commit point, so an append whose state never committed is dropped first.
+        os.ftruncate(descriptor, state.log_bytes)
+        _write_all(descriptor, line)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _apply_event(state.run, payload)
+    state.log_bytes += len(line)
+    if payload["event_id"] is not None:
+        state.event_ids.append(_event_id_digest(payload["event_id"]))
+    write_json_file_durable(handle.state_dir / _STATE_FILE, asdict(state), strict_atomic_replace=True)
+    return line
+
+
+def _ensure_active(run: Mapping[str, Any]) -> None:
+    if run["status"] in _TERMINAL_STATUSES:
+        msg = f"Delegation record is already terminal: {run['delegation_id']}"
         raise ValueError(msg)
-    return cast("list[dict[str, object]]", events)
 
 
 def _event_payload(
@@ -637,61 +631,86 @@ def _event_payload(
     }
 
 
-def _apply_event_log(
-    run: dict[str, _JsonValue],
-    events: list[dict[str, object]],
-) -> None:
-    """Fold append-first durable events into the rebuildable run view."""
-    for event in events:
-        sequence = event.get("sequence")
-        timestamp = event.get("timestamp")
-        if type(sequence) is int:
-            run["event_count"] = sequence
-        if isinstance(timestamp, str):
-            run["updated_at"] = timestamp
-        event_status = event.get("status")
-        if event_status in {"running", "paused"}:
-            run["status"] = cast("_JsonValue", event_status)
-        if event.get("kind") != "delegation_finished":
-            continue
-        data = event.get("data")
-        if not isinstance(data, dict):
-            continue
-        terminal_data = cast("dict[str, object]", data)
-        terminal_status = terminal_data.get("status")
-        if terminal_status not in _TERMINAL_STATUSES:
-            continue
-        run.update(
-            {
-                "status": cast("_JsonValue", terminal_status),
-                "finished_at": cast("_JsonValue", timestamp),
-                "output": cast("_JsonValue", terminal_data.get("output")),
-                "error": cast("_JsonValue", terminal_data.get("error")),
-                "usage": cast("_JsonValue", terminal_data.get("usage")),
-            },
-        )
+def _apply_event(run: dict[str, Any], event: Mapping[str, Any]) -> None:
+    """Fold one committed event into the run view."""
+    run["event_count"] = event["sequence"]
+    run["updated_at"] = event["timestamp"]
+    if event["status"] is not None:
+        run["status"] = event["status"]
+    if event["kind"] == "delegation_finished":
+        terminal_data = event["data"]
+        run["status"] = terminal_data["status"]
+        run["finished_at"] = event["timestamp"]
+        run["output"] = terminal_data["output"]
+        run["error"] = terminal_data["error"]
+        run["usage"] = terminal_data["usage"]
 
 
-def _write_record_views(
+def _write_exports(
     handle: DelegationRecordHandle,
-    run: Mapping[str, object],
+    state: _RecordState,
+    line: bytes = b"",
+    artifacts: Mapping[str, bytes] | None = None,
+    *,
+    final: bool = False,
 ) -> None:
-    """Rewrite the run summary and both readable projections."""
-    _write_run(_record_file(handle, "run.json"), run)
-    _write_transcript(handle, run)
-    _write_receipt(handle, run)
+    """Rewrite the workspace exports and the caller's receipt from the committed state, never reading them back.
+
+    Worker code can replace these files or their directories at will, so a failed write is only logged.
+    """
+    try:
+        with _record_directory(handle, create=True) as record_fd:
+            if artifacts:
+                with open_directory_within_root(record_fd, "artifacts", create=True, mode=0o700) as artifacts_fd:
+                    for artifact_name, encoded in artifacts.items():
+                        atomic_write_bytes_at(artifacts_fd, artifact_name, encoded)
+            atomic_write_bytes_at(record_fd, "run.json", _json_bytes(state.run))
+            if final or not _append_export(record_fd, line, size_before=state.log_bytes - len(line)):
+                with atomic_write_file_at(record_fd, _EVENT_LOG) as export:
+                    export.writelines(_committed_lines(handle, state))
+            if final:
+                _write_transcript(handle, record_fd, state)
+    except (OSError, ValueError) as exc:
+        logger.warning("delegation_record_export_failed", delegation_id=handle.locator.delegation_id, error=str(exc))
+    try:
+        _write_receipt(handle, state.run)
+    except (OSError, ValueError) as exc:
+        logger.warning("delegation_receipt_export_failed", delegation_id=handle.locator.delegation_id, error=str(exc))
+
+
+def _append_export(record_fd: int, line: bytes, *, size_before: int) -> bool:
+    """Append the newest event to the workspace log while its size still matches the events committed before it."""
+    try:
+        descriptor = open_regular_file_at(record_fd, _EVENT_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    except (OSError, ValueError):
+        # A link, FIFO, hard link, or unwritable file at the name is replaced by a rewrite instead.
+        return False
+    try:
+        if os.fstat(descriptor).st_size != size_before:
+            return False
+        _write_all(descriptor, line)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _committed_lines(handle: DelegationRecordHandle, state: _RecordState) -> Iterator[bytes]:
+    """Yield the primary log's committed events in order, one line each."""
+    with (handle.state_dir / _EVENT_LOG).open("rb") as log:
+        yield from islice(log, state.run["event_count"])
 
 
 def _redacted_event_data(
-    handle: DelegationRecordHandle,
     *,
     sequence: int,
     data: Mapping[str, object],
-) -> dict[str, _JsonValue]:
+) -> tuple[dict[str, _JsonValue], dict[str, bytes]]:
+    """Return the event's redacted data and the oversized values it references, which export as artifacts."""
     redacted = redact_sensitive_data(data)
     if not isinstance(redacted, dict):
-        return {"value": cast("_JsonValue", redacted)}
+        return {"value": cast("_JsonValue", redacted)}, {}
     materialized: dict[str, _JsonValue] = {}
+    artifacts: dict[str, bytes] = {}
     for index, (field_name, value) in enumerate(redacted.items(), start=1):
         encoded = json.dumps(value, sort_keys=True).encode("utf-8")
         if len(encoded) <= _MAX_INLINE_VALUE_BYTES:
@@ -699,18 +718,7 @@ def _redacted_event_data(
             continue
         artifact_name = f"{sequence:06d}-{index:02d}-{_safe_artifact_label(field_name)}.json"
         artifact_relative_path = Path("artifacts") / artifact_name
-        artifact_path = resolve_workspace_relative_path(
-            handle.record_dir,
-            artifact_relative_path,
-            field_name="Delegation output artifact",
-        )
-        create_directory_durable(artifact_path.parent, mode=0o700)
-        write_json_file_durable(
-            artifact_path,
-            value,
-            strict_atomic_replace=True,
-            sort_keys=True,
-        )
+        artifacts[artifact_name] = encoded
         materialized[field_name] = {
             "artifact_path": artifact_relative_path.as_posix(),
             "byte_count": len(encoded),
@@ -718,7 +726,7 @@ def _redacted_event_data(
             "oversized": True,
             "redacted": True,
         }
-    return materialized
+    return materialized, artifacts
 
 
 def _safe_artifact_label(value: str) -> str:
@@ -728,7 +736,7 @@ def _safe_artifact_label(value: str) -> str:
 
 def _write_receipt(
     handle: DelegationRecordHandle,
-    run: Mapping[str, object],
+    run: Mapping[str, Any],
 ) -> None:
     receipt = {
         "schema_version": _SCHEMA_VERSION,
@@ -741,24 +749,28 @@ def _write_receipt(
         "updated_at": run["updated_at"],
         "finished_at": run["finished_at"],
     }
-    create_directory_durable(handle.receipt_path.parent.parent, mode=0o700)
-    create_directory_durable(handle.receipt_path.parent, mode=0o700)
-    write_json_file_durable(
-        handle.receipt_path,
-        redact_sensitive_data(receipt),
-        strict_atomic_replace=True,
-        indent=2,
-        sort_keys=True,
-        trailing_newline=True,
+    write_file_within_root(
+        handle.caller_workspace,
+        _receipt_relative_path(handle.locator),
+        _json_bytes(redact_sensitive_data(receipt)),
+        dir_mode=0o700,
     )
+
+
+def _persona_record(persona: SubagentPersona | None) -> dict[str, object] | None:
+    """Describe an authored child's persona; the digest identifies the exact prompt the child received."""
+    if persona is None:
+        return None
+    return {**asdict(persona), "system_prompt_sha256": hashlib.sha256(persona.system_prompt.encode()).hexdigest()}
 
 
 def _write_transcript(
     handle: DelegationRecordHandle,
-    run: Mapping[str, object],
+    record_fd: int,
+    state: _RecordState,
 ) -> None:
-    events = _load_events(_record_file(handle, "events.jsonl"))
-    lines = [
+    run = state.run
+    header = [
         f"# Delegation {run['delegation_id']}",
         "",
         f"- Caller: {run['caller_agent_name']}",
@@ -771,46 +783,26 @@ def _write_transcript(
         "",
         "## Task",
         "",
-        str(run["task"]),
+        run["task"],
         "",
+        *(["## System prompt", "", run["persona"]["system_prompt"], ""] if run.get("persona") else []),
         "## Events",
         "",
+        "",
     ]
-    for event in events:
-        lines.extend(
-            [
+    with atomic_write_file_at(record_fd, "transcript.md") as transcript:
+        transcript.write("\n".join(header).encode("utf-8"))
+        for index, line in enumerate(_committed_lines(handle, state)):
+            event = json.loads(line)
+            section = [
                 f"### {event['sequence']}. {event['kind']}",
                 "",
                 f"Timestamp: {event['timestamp']}",
                 "",
                 "```json",
-                json.dumps(event["data"], ensure_ascii=False, indent=2, sort_keys=True),
+                json.dumps(event["data"], ensure_ascii=False, separators=(",", ":"), sort_keys=True),
                 "```",
                 "",
-            ],
-        )
-    text = "\n".join(lines)
-    if not text.endswith("\n"):
-        text += "\n"
-    _write_text_file_durable(_record_file(handle, "transcript.md"), text)
-
-
-def _write_text_file_durable(path: Path, text: str) -> None:
-    temp_path: Path | None = None
-    try:
-        with NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f"{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-            temp_file.write(text)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        replace_file_durable(temp_path, path)
-    finally:
-        if temp_path is not None and temp_path.exists():
-            temp_path.unlink()
+            ]
+            separator = "\n" if index else ""
+            transcript.write((separator + "\n".join(section)).encode("utf-8"))

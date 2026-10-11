@@ -21,7 +21,9 @@ export type GdprConsent = SuccessJson<'/my/gdpr/consent', 'post'>
 export type Instances = SuccessJson<'/my/instances', 'get'>
 export type Instance = Instances['instances'][number]
 export type Provision = SuccessJson<'/my/instances/provision', 'post'>
+export type Subscription = SuccessJson<'/my/subscription', 'get'>
 export type PricingConfig = SuccessJson<'/pricing/config', 'get'>
+export type InstanceLifecycle = SuccessJson<'/admin/instance-lifecycle', 'get'>
 
 export async function apiCall(
   endpoint: string,

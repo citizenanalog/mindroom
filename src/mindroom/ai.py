@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -25,8 +26,10 @@ from agno.run.agent import (
 from agno.run.base import RunStatus
 
 from mindroom import ai_runtime
+from mindroom.agent_cli.cli_shell_agent import CliShellAgent
 from mindroom.agent_cli.events import stream_cli_events
 from mindroom.agent_cli.lifetime import cli_control_executions
+from mindroom.agent_cli.minimal_agent import MinimalAgent
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.agents import agent_build_can_overlap_file_memory, create_agent
 from mindroom.agno_compat_session_persistence import drain_agent_cancellation
@@ -38,13 +41,14 @@ from mindroom.ai_run_metadata import (
     build_prepared_history_metadata_content,
     empty_request_metric_totals,
 )
-from mindroom.approval_tools import toolkit_owners_for_agents
+from mindroom.approval.tool_owners import toolkit_owners_for_agents
 from mindroom.background_tasks import run_coroutine_until_complete
-from mindroom.claude_prompt_cache import aclose_anthropic_async_client
 from mindroom.delegation.execution import drive_delegation_stream, drive_delegations
 from mindroom.delegation.lifecycle import (
     authorize_delegation,
     child_execution_identity,
+    child_tool_runtime_context,
+    delegation_grant,
     note_child_run_id,
     observe_child_event,
 )
@@ -80,15 +84,15 @@ from mindroom.llm_request_logging import (
 )
 from mindroom.logging_config import get_logger
 from mindroom.media_inputs import MediaInputs
-from mindroom.memory import build_memory_prompt_parts, strip_user_turn_time_prefix
+from mindroom.memory import MemoryPromptParts, build_memory_prompt_parts, strip_user_turn_time_prefix
 from mindroom.metadata_merge import deep_merge_metadata
-from mindroom.minimal_agent import MinimalAgent
 from mindroom.pre_model_preparation import (
     build_agent_off_loop,
     close_unreturned_agent,
     prepare_prompt_branches,
     prewarm_agent_model_client,
 )
+from mindroom.providers.claude_prompt_cache import aclose_anthropic_async_client
 from mindroom.response_turn import (
     AttemptResolved,
     BlockingAttemptResolution,
@@ -109,6 +113,7 @@ from mindroom.response_turn import (
     skip_unapproved_attempt,
     stream_response_turn,
 )
+from mindroom.skill_learning.capture import observe_final_request
 from mindroom.timing import DispatchPipelineTiming, emit_timing_event, timed, timed_block, timing_scope
 from mindroom.tool_system.context_bound_streams import closing_async_stream, context_bound_async_stream
 from mindroom.tool_system.events import (
@@ -899,6 +904,12 @@ async def _run_non_streaming_agent_attempts(
     try:
         with (
             participation_model(agent.model, run_context.turn.participation, run_id=attempt.attempt_run_id),
+            observe_final_request(
+                run_context.turn.skill_review_capture,
+                agent.model,
+                run_id=attempt.attempt_run_id,
+                model_name=run_context.prepared_run.runtime_model_name,
+            ),
             bind_llm_request_log_context(
                 **_attempt_request_log_context(
                     run_context.turn,
@@ -943,6 +954,7 @@ async def _run_non_streaming_agent_attempts(
 def _failed_agent_attempt(
     ctx: ResponseTurnContext,
     error: Exception,
+    runtime_paths: RuntimePaths,
     *,
     session_id: str | None = None,
     run_id: str | None = None,
@@ -954,7 +966,10 @@ def _failed_agent_attempt(
         session_id=session_id,
         run_id=run_id,
     )
-    return skipped or ExcludedAttempt(RunStatus.error, get_user_friendly_error_message(error, ctx.entity_label))
+    return skipped or ExcludedAttempt(
+        RunStatus.error,
+        get_user_friendly_error_message(error, ctx.entity_label, runtime_paths=runtime_paths),
+    )
 
 
 def _assert_agent_target(agent_name: str, config: Config) -> None:
@@ -997,6 +1012,23 @@ async def _close_agent_on_preparation_failure(
         raise
 
 
+def _standard_turn_enrichment(
+    agent: Agent,
+    ctx: ResponseTurnContext,
+    session_preamble: str,
+    transient_memory: str,
+) -> str:
+    """Put enrichment in the prompt and bind the turn for an agent whose shell can call its other tools."""
+    if isinstance(agent, CliShellAgent):
+        agent.response_context = ctx
+    _append_additional_context(agent, session_preamble)
+    if ctx.system_enrichment_items:
+        _append_additional_context(agent, _render_system_enrichment_context(ctx.system_enrichment_items))
+    return render_transient_context(
+        (transient_memory, render_enrichment_block(list(ctx.transient_enrichment_items))),
+    )
+
+
 def _minimal_turn_enrichment(
     agent: MinimalAgent,
     ctx: ResponseTurnContext,
@@ -1016,8 +1048,28 @@ def _minimal_turn_enrichment(
     return render_enrichment_block([item for item in ctx.transient_enrichment_items if item.minimal_required])
 
 
+async def _prepare_turn_memory(
+    ctx: ResponseTurnContext,
+    prompt: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    execution_identity: ToolExecutionIdentity | None,
+) -> MemoryPromptParts:
+    """Recall memories for a configured agent turn; an authored persona recalls none."""
+    if ctx.persona is not None:
+        return MemoryPromptParts()
+    return await build_memory_prompt_parts(
+        prompt,
+        ctx.entity_label,
+        runtime_paths.storage_root,
+        config,
+        runtime_paths,
+        execution_identity=execution_identity,
+    )
+
+
 @timed("system_prompt_assembly")
-async def _prepare_agent_and_prompt(  # noqa: PLR0915 - preserve standard preparation beside explicit minimal context
+async def _prepare_agent_and_prompt(
     ctx: ResponseTurnContext,
     *,
     prompt: str,
@@ -1083,6 +1135,8 @@ async def _prepare_agent_and_prompt(  # noqa: PLR0915 - preserve standard prepar
                 supports_native_tool_approval=supports_native_tool_approval,
                 eager_deferred_tools=eager_deferred_tools,
                 agent_mode=ctx.agent_mode,
+                agent_cli_in_shell=True,
+                persona=ctx.persona,
             )
             prewarm_agent_model_client(
                 agent,
@@ -1117,13 +1171,13 @@ async def _prepare_agent_and_prompt(  # noqa: PLR0915 - preserve standard prepar
         ):
             try:
                 prompt_parts, runtime_model, agent = await prepare_prompt_branches(
-                    prepare_memory=lambda: build_memory_prompt_parts(
+                    prepare_memory=partial(
+                        _prepare_turn_memory,
+                        ctx,
                         prompt,
-                        agent_name,
-                        storage_path,
                         config,
                         runtime_paths,
-                        execution_identity=execution_identity,
+                        execution_identity,
                     ),
                     build_agent=_resolve_model_and_build_agent,
                     agent_name=agent_name,
@@ -1139,14 +1193,7 @@ async def _prepare_agent_and_prompt(  # noqa: PLR0915 - preserve standard prepar
         )
     else:
         _mark_pipeline_timing(pipeline_timing, "memory_prepare_start")
-        prompt_parts = await build_memory_prompt_parts(
-            prompt,
-            agent_name,
-            storage_path,
-            config,
-            runtime_paths,
-            execution_identity=execution_identity,
-        )
+        prompt_parts = await _prepare_turn_memory(ctx, prompt, config, runtime_paths, execution_identity)
         current_turn_prompt = _compose_current_turn_prompt(
             raw_prompt=prompt,
             model_prompt=model_prompt,
@@ -1174,17 +1221,11 @@ async def _prepare_agent_and_prompt(  # noqa: PLR0915 - preserve standard prepar
                 prompt_parts.transient_turn_context,
             )
         else:
-            _append_additional_context(agent, prompt_parts.session_preamble)
-            if ctx.system_enrichment_items:
-                _append_additional_context(
-                    agent,
-                    _render_system_enrichment_context(ctx.system_enrichment_items),
-                )
-            transient_turn_context = render_transient_context(
-                (
-                    prompt_parts.transient_turn_context,
-                    render_enrichment_block(list(ctx.transient_enrichment_items)),
-                ),
+            transient_turn_context = _standard_turn_enrichment(
+                agent,
+                ctx,
+                prompt_parts.session_preamble,
+                prompt_parts.transient_turn_context,
             )
 
         prepared_execution = await prepare_agent_execution_context(
@@ -1208,7 +1249,7 @@ async def _prepare_agent_and_prompt(  # noqa: PLR0915 - preserve standard prepar
             config=config,
             resolved_runtime_model=runtime_model,
             compaction_lifecycle=compaction_lifecycle,
-            current_sender_id=None if include_openai_compat_guidance else ctx.requester_id,
+            current_sender_id=None if include_openai_compat_guidance else ctx.current_sender_id or ctx.requester_id,
             current_timestamp_ms=current_timestamp_ms,
             current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
@@ -1348,10 +1389,15 @@ async def run_delegated_child_response(
     runtime_paths: RuntimePaths,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     supports_native_tool_approval: bool,
+    approval_config: Config | None = None,
 ) -> str:
-    """Execute the normal response envelope for a prepared child owned by either adapter."""
+    """Execute the normal response envelope for a prepared child owned by either adapter.
+
+    A minimal child cannot pause for approval: approval-gated tools stay hidden from it,
+    so no adapter ever has to resume it natively.
+    """
     identity = child_execution_identity(child)
-    active_config = authorize_delegation(
+    authorized_config = authorize_delegation(
         child.caller_agent_name,
         child.child_agent_name,
         prompt,
@@ -1359,9 +1405,12 @@ async def run_delegated_child_response(
         runtime_paths=runtime_paths,
         execution_identity=replace(identity, agent_name=child.caller_agent_name),
         depth=child.depth - 1,
+        grant=delegation_grant(child),
     )
-    if isinstance(active_config, str):
-        return active_config
+    if isinstance(authorized_config, str):
+        return authorized_config
+    # A caller's pre-approval overlay replaces the live config for the child's run.
+    active_config = approval_config if approval_config is not None else authorized_config
     knowledge = await resolve_agent_knowledge_access_async(
         child.child_agent_name,
         active_config,
@@ -1370,17 +1419,10 @@ async def run_delegated_child_response(
         execution_identity=identity,
     )
     context = get_tool_runtime_context()
-    child_context = (
-        replace(
-            context,
-            agent_name=child.child_agent_name,
-            active_model_name=child.model_name,
-            target=replace(context.target, session_id=child.session_id),
-        )
-        if context is not None
-        else None
-    )
+    child_context = child_tool_runtime_context(context, child) if context is not None else None
     turn = ResponseTurnContext(
+        agent_mode=child.agent_mode,
+        persona=child.persona,
         entity_label=child.child_agent_name,
         session_id=child.session_id,
         run_id=child.run_id,
@@ -1408,7 +1450,7 @@ async def run_delegated_child_response(
             delegation_depth=child.depth,
             refresh_scheduler=refresh_scheduler,
             attempt_model_runtime=ToolRuntimeModelBinding(),
-            supports_native_tool_approval=supports_native_tool_approval,
+            supports_native_tool_approval=supports_native_tool_approval and child.agent_mode == "standard",
             collect_streamed_response=True,
             turn_recorder=TurnRecorder(user_message=prompt),
         )
@@ -1544,7 +1586,7 @@ async def ai_response(  # noqa: C901, PLR0915
     try:
         _assert_agent_target(agent_name, config)
     except ValueError as e:
-        return get_user_friendly_error_message(e, agent_name)
+        return get_user_friendly_error_message(e, agent_name, runtime_paths=runtime_paths)
 
     holder = _AgentTurnHolder()
     reusable_agent_base_context = reusable_agent.additional_context if reusable_agent is not None else None
@@ -1598,7 +1640,7 @@ async def ai_response(  # noqa: C901, PLR0915
             )
         except Exception as e:
             logger.exception("Error preparing agent", agent=agent_name)
-            return _failed_agent_attempt(ctx, e)
+            return _failed_agent_attempt(ctx, e, runtime_paths)
         prepared_run = run_context.prepared_run
         holder.agent = prepared_run.agent
         run.unseen_event_ids = prepared_run.unseen_event_ids
@@ -1625,6 +1667,7 @@ async def ai_response(  # noqa: C901, PLR0915
             return _failed_agent_attempt(
                 ctx,
                 attempt_result.user_error,
+                runtime_paths,
                 session_id=session_id,
                 run_id=attempt.attempt_run_id,
             )
@@ -1705,6 +1748,7 @@ async def ai_response(  # noqa: C901, PLR0915
                 response_text = get_user_friendly_error_message(
                     Exception(str(response.content or "Unknown agent error")),
                     agent_name,
+                    runtime_paths=runtime_paths,
                 )
             elif response.status is RunStatus.paused:
                 response_text = _extract_response_content(response, show_tool_calls=show_tool_calls)
@@ -1928,7 +1972,7 @@ async def _stream_agent_attempt_chunks(
         )
         if transform_events is not None:
             stream_generator = transform_events(stream_generator)
-        if run_context.turn.agent_mode == "minimal":
+        if run_context.turn.agent_mode == "minimal" or isinstance(agent, CliShellAgent):
             stream_generator = stream_cli_events(stream_generator)
         chunks = _process_stream_events(
             stream_generator,
@@ -2044,7 +2088,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
     try:
         _assert_agent_target(agent_name, config)
     except ValueError as e:
-        yield get_user_friendly_error_message(e, agent_name)
+        yield get_user_friendly_error_message(e, agent_name, runtime_paths=runtime_paths)
         return
 
     holder = _AgentTurnHolder(state=_StreamingAttemptState())
@@ -2114,7 +2158,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
             if skipped := skip_unapproved_attempt(ctx.participation, reason="preparation_failed"):
                 yield AttemptResolved(skipped)
                 return
-            yield get_user_friendly_error_message(e, agent_name)
+            yield get_user_friendly_error_message(e, agent_name, runtime_paths=runtime_paths)
             yield AttemptResolved(HandledAttempt())
             return
         prepared_run = run_context.prepared_run
@@ -2207,7 +2251,15 @@ async def stream_agent_response(  # noqa: C901, PLR0915
             ),
             active_model_name=prepared_run.runtime_model_name,
         )
-        with participation_model(prepared_run.agent.model, ctx.participation, run_id=attempt.attempt_run_id):
+        with (
+            participation_model(prepared_run.agent.model, ctx.participation, run_id=attempt.attempt_run_id),
+            observe_final_request(
+                ctx.skill_review_capture,
+                prepared_run.agent.model,
+                run_id=attempt.attempt_run_id,
+                model_name=prepared_run.runtime_model_name,
+            ),
+        ):
             async with drain_agent_cancellation(prepared_run.agent, attempt.attempt_run_id) as bind_owner:
                 owned_stream = context_bound_async_stream(
                     context_factory=bind_owner,
@@ -2227,8 +2279,17 @@ async def stream_agent_response(  # noqa: C901, PLR0915
             ):
                 yield AttemptResolved(skipped)
             else:
-                yield get_user_friendly_error_message(run_error, agent_name)
-                yield AttemptResolved(HandledAttempt())
+                yield get_user_friendly_error_message(run_error, agent_name, runtime_paths=runtime_paths)
+                yield AttemptResolved(
+                    HandledAttempt(
+                        metadata_content=_build_interrupted_metadata(
+                            state,
+                            RunStatus.error,
+                            attempt.attempt_run_id,
+                            session_id,
+                        ),
+                    ),
+                )
             return
 
         if state.cancelled_run_event is not None:

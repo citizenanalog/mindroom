@@ -12,7 +12,7 @@ installation, not an invented one.
 The independent handled-turn importer still preserves response identities from
 the old ledger. Initial-sync history suppression belongs to Nio and is covered
 by the durable-ingestion runtime tests; old continuity records now require
-the explicit cutover described in docs/deployment/nio-upgrade.md.
+the explicit cutover described in docs/deployment/upgrades.md.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import yaml
 
 from mindroom.config.main import load_config
 from mindroom.constants import resolve_primary_runtime_paths
-from mindroom.event_journal_open import (
+from mindroom.event_journal.opening import (
     bind_event_journal,
     event_journal_binding_path,
     open_event_journal,

@@ -13,8 +13,8 @@ import yaml
 from mindroom.cli.config import _model_template_block, _write_env_file
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.model_loading import get_model_instance
-from mindroom.vertex_claude_compat import MindroomVertexAIClaude
+from mindroom.providers.model_loading import get_model_instance
+from mindroom.providers.vertex_claude_compat import MindroomVertexAIClaude
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -64,12 +64,14 @@ def test_generated_vertex_environment_reaches_runtime_endpoint(
 
     model = get_model_instance(config, runtime_paths)
     assert isinstance(model, MindroomVertexAIClaude)
-    assert model.id == "claude-sonnet-5"
+    assert model.id == "claude-sonnet-5-5"
     assert model.region == expected_region
-    expected_project = (
-        "authored-project" if authored_region is not None and not replace_existing else "your-gcp-project-id"
-    )
-    assert model.native_compaction_endpoint() == f"{expected_endpoint}|{expected_project}|{expected_region}"
+    if authored_region is not None and not replace_existing:
+        assert model.project_id == "authored-project"
+        assert model.native_compaction_endpoint() == f"{expected_endpoint}|authored-project|{expected_region}"
+    else:
+        # The generated project ID is a starter placeholder, which counts as unset.
+        assert model.project_id is None
 
 
 @pytest.mark.parametrize(

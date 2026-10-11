@@ -15,8 +15,8 @@ import pytest
 from mcp import StdioServerParameters
 from mcp.types import CallToolResult, ListToolsResult, TextContent
 
-from mindroom import playwright_mcp_session
-from mindroom.playwright_mcp_session import PlaywrightMCPSession
+from mindroom.browser import playwright_mcp_session
+from mindroom.browser.playwright_mcp_session import PlaywrightMCPSession
 
 
 @pytest.fixture
@@ -57,8 +57,8 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         finally:
             events.append("reaped")
 
-    monkeypatch.setattr("mindroom.playwright_mcp_session.ClientSession", Session)
-    monkeypatch.setattr("mindroom.playwright_mcp_session.stdio_client", stdio)
+    monkeypatch.setattr("mindroom.browser.playwright_mcp_session.ClientSession", Session)
+    monkeypatch.setattr("mindroom.browser.playwright_mcp_session.stdio_client", stdio)
     return events
 
 
@@ -255,7 +255,7 @@ async def test_cleanup_failure_cannot_strand_queued_calls_or_replace_abandonment
         await actor.close()
         await actor.close()
         assert transport.count("cleanup") == 1
-        errors = [record for record in caplog.records if record.name == "mindroom.playwright_mcp_session"]
+        errors = [record for record in caplog.records if record.name == "mindroom.browser.playwright_mcp_session"]
         assert len(errors) == 1
         assert errors[0].getMessage() == "Playwright MCP cancelled-call cleanup failed for stuck"
         assert errors[0].exc_info is not None
@@ -275,6 +275,7 @@ async def test_cleanup_failure_cannot_strand_queued_calls_or_replace_abandonment
 @pytest.mark.parametrize("birth_delay_ms", [0, 500])
 async def test_real_stdio_child_tree_is_reaped(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     operation: str,
     detached: bool,
     birth_delay_ms: int,
@@ -283,6 +284,9 @@ async def test_real_stdio_child_tree_is_reaped(
     node = shutil.which("node")
     if node is None or sys.platform != "linux":
         pytest.skip("Linux subreaper and Node fixture required")
+    # The fixture server ignores stdin EOF, so closing a live one ends in SDK
+    # termination. Reach it without first idling through the two-second grace.
+    monkeypatch.setattr("mcp.client.stdio.PROCESS_TERMINATION_TIMEOUT", 0.1)
     script = tmp_path / "server.cjs"
     pidfile = tmp_path / "child.pid"
     script.write_text("""
@@ -315,7 +319,9 @@ setInterval(()=>{},1000);
     # fixture setup, while "startup" still stalls inside MCP initialize.
     session._actor_task = asyncio.create_task(session._run_actor())
     try:
-        async with asyncio.timeout(5):
+        # Birth spans the Python supervisor, Node, and its grandchild. Loaded CI
+        # runners have stalled it past 5 seconds, so only a hang should fail here.
+        async with asyncio.timeout(30):
             while not pidfile.exists():
                 assert not session._actor_task.done(), "Fixture actor exited before child readiness"
                 await asyncio.sleep(0.01)
@@ -379,7 +385,7 @@ require('readline').createInterface({input:process.stdin}).on('line', line => {
         sys.executable,
         "-I",
         "-m",
-        "mindroom.playwright_mcp_process",
+        "mindroom.browser.playwright_mcp_process",
         node,
         str(script),
         str(exit_code),
