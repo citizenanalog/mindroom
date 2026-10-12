@@ -57,6 +57,8 @@ _RESERVED_CA_VARS = {
 }
 # Every exact name a placeholder cannot take; the prefixes above are refused on top of these.
 RESERVED_PLACEHOLDER_NAMES = frozenset(_RESERVED_EXACT | _RESERVED_PROXY_VARS | _RESERVED_CA_VARS)
+# EgressService fields that only matter for a service that sends a credential; restrict_only services cannot set them.
+_CREDENTIAL_FIELDS = ("oauth_provider", "placeholder_env", "oauth_on_shared_workers")
 
 
 class EgressAuth(BaseModel):
@@ -270,7 +272,7 @@ class EgressService(BaseModel):
         # Deep copy so validated models never alias the shared built-in table.
         defaults = copy.deepcopy(preset)
         if authored.get("restrict_only") is True:
-            for credential_field in ("oauth_provider", "placeholder_env"):
+            for credential_field in _CREDENTIAL_FIELDS:
                 defaults.pop(credential_field, None)
         service = handler({**defaults, **authored})
         service.model_fields_set.difference_update(set(preset) - set(authored))
@@ -291,15 +293,10 @@ class EgressService(BaseModel):
             msg = "service must define at least one rule (set `rules` or choose a `preset`)"
             raise ValueError(msg)
         if self.restrict_only:
-            if self.oauth_provider is not None:
-                msg = "a restrict_only service never sends a credential, so it cannot set oauth_provider"
-                raise ValueError(msg)
-            if self.placeholder_env:
-                msg = "a restrict_only service never sends a credential, so it cannot set placeholder_env"
-                raise ValueError(msg)
-            if self.oauth_on_shared_workers:
-                msg = "a restrict_only service never sends a credential, so it cannot set oauth_on_shared_workers"
-                raise ValueError(msg)
+            for credential_field in _CREDENTIAL_FIELDS:
+                if getattr(self, credential_field):
+                    msg = f"a restrict_only service never sends a credential, so it cannot set {credential_field}"
+                    raise ValueError(msg)
         elif any(rule.auth is None for rule in self.rules):
             msg = "every rule needs auth unless the service is restrict_only"
             raise ValueError(msg)
