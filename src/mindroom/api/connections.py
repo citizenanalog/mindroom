@@ -326,9 +326,7 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
     skips the token refresh; resolving the OAuth client of an egress service's provider can still bootstrap it over
     the network once when none is stored.
     """
-    user = context.user
-    memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
-    manager = get_runtime_credentials_manager(context.runtime_paths)
+    requester_id = context.user.owner.requester_id
     agents = [
         agent.model_copy(
             update={
@@ -338,15 +336,7 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
                     )
                     for service in agent.services
                 ],
-                "egress_services": await egress_services_for_agent(
-                    request,
-                    agent.agent_name,
-                    user.owner.requester_id,
-                    user.config,
-                    context.runtime_paths,
-                    memberships,
-                    manager,
-                ),
+                "egress_services": await egress_services_for_agent(request, agent.agent_name, requester_id),
             },
         )
         for agent in context.catalog.agents

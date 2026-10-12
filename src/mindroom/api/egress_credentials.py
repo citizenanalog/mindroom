@@ -59,7 +59,6 @@ from mindroom.requester_identity import resolve_human_requester_alias
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.egress_broker import EgressBrokerConfig
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -112,11 +111,11 @@ def _require_egress_same_origin(request: Request) -> None:
 
 
 def _check_agent_eligibility(
+    request: Request,
     agent_name: str,
     requester_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
-    membership_index: AgentReplyMembershipIndex,
 ) -> tuple[bool, bool] | None:
     """Return ``(is_shared, can_manage)`` for an eligible agent, else ``None``.
 
@@ -132,7 +131,7 @@ def _check_agent_eligibility(
         None,
         config,
         runtime_paths,
-        membership_index,
+        config_lifecycle.app_state(request.app).agent_reply_memberships,
     ):
         return None
     is_shared = entity.execution_scope in {None, "shared"}
@@ -165,16 +164,9 @@ def _resolve_agent(request: Request, requester_id: str, agent_name: str) -> _Res
 
     runtime_paths = snapshot.runtime_paths
     human_requester = resolve_human_requester_alias(requester_id, config, runtime_paths)
-    memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
 
     # Check eligibility: must have shell/python AND be allowed
-    eligibility = _check_agent_eligibility(
-        agent_name,
-        human_requester,
-        config,
-        runtime_paths,
-        memberships,
-    )
+    eligibility = _check_agent_eligibility(request, agent_name, human_requester, config, runtime_paths)
     if eligibility is None:
         raise HTTPException(404, "Agent is not available", headers=CONNECTIONS_HEADERS)
 
@@ -288,10 +280,6 @@ async def egress_services_for_agent(
     request: Request,
     agent_name: str,
     requester_id: str,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    membership_index: AgentReplyMembershipIndex,
-    manager: CredentialsManager,
     *,
     eligibility: tuple[bool, bool] | None = None,
 ) -> list[EgressCredentialService] | None:
@@ -301,11 +289,16 @@ async def egress_services_for_agent(
     ``requester_id`` must already be the resolved human requester alias. A caller that already ran the
     eligibility check passes its ``(is_shared, can_manage)`` result.
     """
+    snapshot = config_lifecycle.bind_current_request_snapshot(request)
+    config, runtime_paths = snapshot.runtime_config, snapshot.runtime_paths
+    if config is None:
+        return None
     if eligibility is None:
-        eligibility = _check_agent_eligibility(agent_name, requester_id, config, runtime_paths, membership_index)
+        eligibility = _check_agent_eligibility(request, agent_name, requester_id, config, runtime_paths)
     if eligibility is None:
         return None
     is_shared, can_manage = eligibility
+    manager = get_runtime_credentials_manager(runtime_paths)
     target = build_connection_agent_target(config, runtime_paths, requester_id, agent_name)
     # Reading the scope's own services touches the credential store, so it stays off the event loop.
     services = await asyncio.to_thread(effective_services, config, manager, target)
@@ -363,12 +356,11 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
 
     runtime_paths = snapshot.runtime_paths
     human_requester = resolve_human_requester_alias(requester_id, config, runtime_paths)
-    memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
     manager = get_runtime_credentials_manager(runtime_paths)
 
     eligible: dict[str, tuple[bool, bool]] = {}
     for agent_name in config.agents:
-        eligibility = _check_agent_eligibility(agent_name, human_requester, config, runtime_paths, memberships)
+        eligibility = _check_agent_eligibility(request, agent_name, human_requester, config, runtime_paths)
         if eligibility is not None:
             eligible[agent_name] = eligibility
     # Every `user` agent of the requester reads and writes one store, so each of them names all of them.
@@ -385,16 +377,7 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
             continue
         is_shared, can_manage = eligibility
         scope = _agent_scope(config, agent_name)
-        services = await egress_services_for_agent(
-            request,
-            agent_name,
-            human_requester,
-            config,
-            runtime_paths,
-            memberships,
-            manager,
-            eligibility=eligibility,
-        )
+        services = await egress_services_for_agent(request, agent_name, human_requester, eligibility=eligibility)
         if services is None:
             continue
         target = build_connection_agent_target(config, runtime_paths, human_requester, agent_name)
@@ -702,8 +685,7 @@ def get_personal_logs(
     log_requester: str | None = requester
     log_scope = None
     if agent_name and agent_name in config.agents:
-        memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
-        eligibility = _check_agent_eligibility(agent_name, requester, config, snapshot.runtime_paths, memberships)
+        eligibility = _check_agent_eligibility(request, agent_name, requester, config, snapshot.runtime_paths)
         is_shared, can_manage = eligibility or (False, False)
         if is_shared and can_manage:
             # Rows the agent logged before it was shared were personal, so they stay with their requesters.
