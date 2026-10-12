@@ -534,7 +534,7 @@ def test_oauth_provider_is_refused_outside_personal_scopes(
         _save(manager, target, "keyed", EgressService.model_validate({"preset": "github", "oauth_provider": None}))
         assert load_user_services(manager, target)["keyed"].oauth_provider is None
 
-    _save(manager, worker_target(), "personal", _service(oauth_provider="github"))
+    _save(manager, worker_target(), "personal", _service("api.github.com", oauth_provider="github"))
     assert load_user_services(manager, worker_target())["personal"].oauth_provider == "github"
 
 
@@ -554,6 +554,85 @@ def test_stored_oauth_provider_is_ignored_outside_personal_scopes(manager: Crede
     assert effective_config(_CONFIG, manager, worker_target(scope="shared")).services["team"].oauth_provider is None
     assert [(entry["event"], entry["service"]) for entry in logs] == [
         ("egress_broker_user_service_oauth_ignored", "team"),
+    ]
+
+
+def test_an_oauth_account_is_bound_to_the_hosts_of_its_providers_presets(manager: CredentialsManager) -> None:
+    """A user service sends a connected account only to the rule hosts of the presets bound to its provider."""
+    allowed = "api.github.com, uploads.github.com, github.com"
+    for host in ("api.notes.example.com", "*.github.com", "gist.github.com"):
+        with pytest.raises(ValueError) as raised:  # noqa: PT011
+            _save(manager, worker_target(), "mine", _service(host, oauth_provider="github"))
+        assert str(raised.value) == (
+            f"oauth_provider 'github' can only be used on {allowed}, so these hosts cannot be used with it: {host}"
+        )
+    mixed = EgressService.model_validate(
+        {
+            "oauth_provider": "github",
+            "rules": [
+                {"host": "api.github.com", "auth": {"type": "bearer"}},
+                {"host": "api.notes.example.com", "auth": {"type": "bearer"}},
+                {"host": "api.notes.example.com", "port": 8443, "auth": {"type": "bearer"}},
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match=r"cannot be used with it: api\.notes\.example\.com$"):
+        _save(manager, worker_target(), "mine", mixed)
+    assert load_user_services(manager, worker_target()) == {}
+
+    own_hosts = EgressService.model_validate(
+        {
+            "oauth_provider": "github",
+            "rules": [
+                {"host": "api.github.com", "path_prefix": "/repos/alice/", "auth": {"type": "bearer"}},
+                {"host": "github.com", "port": 443, "auth": {"type": "basic", "username": "x-access-token"}},
+            ],
+        },
+    )
+    _save(manager, worker_target(), "mine", own_hosts)
+    _save(manager, worker_target(), "preset", EgressService.model_validate({"preset": "github"}))
+    loaded = load_user_services(manager, worker_target())
+    assert (loaded["mine"].oauth_provider, loaded["preset"].oauth_provider) == ("github", "github")
+
+
+def test_an_oauth_provider_without_a_preset_is_refused(manager: CredentialsManager) -> None:
+    """A registered provider that no built-in preset is bound to has no hosts a user service may send its token to."""
+    with pytest.raises(ValueError) as raised:  # noqa: PT011
+        save_user_service(
+            manager,
+            worker_target(),
+            "mine",
+            _service(oauth_provider="acme"),
+            config_services=_CONFIG.services,
+            oauth_providers={"github", "acme"},
+        )
+
+    assert str(raised.value) == (
+        "oauth_provider 'acme' has no built-in preset, so a service of your own cannot use it; use an API key"
+    )
+    assert load_user_services(manager, worker_target()) == {}
+
+
+def test_a_stored_oauth_provider_off_its_providers_hosts_is_dropped(manager: CredentialsManager) -> None:
+    """A stored personal service that sends its account elsewhere loses the account on load and keeps its rules."""
+    store = manager.for_primary_runtime_scope(_ALICE, "code")
+    elsewhere = {**_service("api.notes.example.com").authored_model_dump(), "oauth_provider": "github"}
+    on_github = {**_service("api.github.com").authored_model_dump(), "oauth_provider": "github"}
+    store.save_credentials(
+        USER_SERVICES_CREDENTIAL_SERVICE,
+        {"services": {"elsewhere": elsewhere, "on-github": on_github}},
+    )
+
+    with capture_logs() as logs:
+        loaded = load_user_services(manager, worker_target())
+
+    assert loaded["elsewhere"].oauth_provider is None
+    assert [rule.host for rule in loaded["elsewhere"].rules] == ["api.notes.example.com"]
+    assert loaded["on-github"].oauth_provider == "github"
+    effective = effective_config(_CONFIG, manager, worker_target())
+    assert effective.services["elsewhere"].oauth_provider is None
+    assert [(entry["event"], entry["service"]) for entry in logs] == [
+        ("egress_broker_user_service_oauth_ignored", "elsewhere"),
     ]
 
 
@@ -705,7 +784,7 @@ def test_oauth_provider_must_be_registered(manager: CredentialsManager) -> None:
         _save(manager, worker_target(), "mine", EgressService.model_validate({"preset": "atlassian"}))
 
     assert load_user_services(manager, worker_target()) == {}
-    _save(manager, worker_target(), "mine", _service(oauth_provider="github"))
+    _save(manager, worker_target(), "mine", _service("api.github.com", oauth_provider="github"))
     assert load_user_services(manager, worker_target())["mine"].oauth_provider == "github"
 
 

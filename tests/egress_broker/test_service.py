@@ -23,11 +23,11 @@ from mindroom.config.egress_broker import EgressService
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials.manager import CredentialsManager
-from mindroom.egress_broker import oauth_source, service
+from mindroom.egress_broker import oauth_source, service, user_services
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.dial import DialPolicy
 from mindroom.egress_broker.env import apply_runner_ca_bundle
-from mindroom.egress_broker.secrets import delete_secret, save_secret
+from mindroom.egress_broker.secrets import delete_secret, save_egress_document, save_secret
 from mindroom.egress_broker.service import (
     active_audit_log,
     active_ca_pem,
@@ -36,7 +36,11 @@ from mindroom.egress_broker.service import (
     serve_egress_broker,
 )
 from mindroom.egress_broker.tokens import TokenSigner
-from mindroom.egress_broker.user_services import delete_user_service, save_user_service
+from mindroom.egress_broker.user_services import (
+    USER_SERVICES_CREDENTIAL_SERVICE,
+    delete_user_service,
+    save_user_service,
+)
 from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.google_drive import google_drive_oauth_provider
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, resolve_worker_target
@@ -1220,8 +1224,11 @@ async def test_user_service_uses_only_its_scopes_oauth_connection(
     manager: CredentialsManager,
     tls_upstream: Upstream,
     get_through: GetThrough,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A user service naming an OAuth provider injects its owner's connected account and nobody else's."""
+    # The fake upstream is localhost, so GitHub's account is bound to it instead of to the GitHub preset's hosts.
+    monkeypatch.setattr(user_services, "_OAUTH_PROVIDER_HOSTS", {"github": ("localhost",)})
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config()
     alice, bob = _routable_target(), _routable_target("@bob:example.org")
@@ -1239,6 +1246,31 @@ async def test_user_service_uses_only_its_scopes_oauth_connection(
     assert bob_response.status_code == 403
     assert (bob_response.json()["error"], bob_response.json()["provider"]) == ("credential_not_configured", "github")
     assert tls_upstream.hits == ["/echo"]
+
+
+@pytest.mark.usefixtures("github_oauth_client")
+@pytest.mark.asyncio
+async def test_a_stored_user_service_off_its_providers_hosts_never_gets_the_account(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    tls_upstream: Upstream,
+    get_through: GetThrough,
+) -> None:
+    """A stored GitHub-login service on a host the GitHub preset does not name never injects the connected account."""
+    runtime_paths = _oauth_runtime(tmp_runtime_paths)
+    config = _config()
+    target = _routable_target()
+    save_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE, {"services": {"mine": _GITHUB_OAUTH}})
+    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
+        response = await get_through(env)
+    assert "GH_TOKEN" not in env
+    assert response.status_code == 403
+    assert response.json()["error"] == "credential_not_configured"
+    assert "provider" not in response.json()
+    assert "alice-oauth" not in response.text
+    assert tls_upstream.hits == []
 
 
 @pytest.mark.usefixtures("allow_loopback")

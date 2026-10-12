@@ -553,8 +553,9 @@ def put_user_service(
 
     The body has the fields of a config service except `oauth_on_shared_workers`. Returns 413 for a body over 16 KiB,
     409 for the name of a config service, and 422, always with a string detail, for a body that is not a JSON object,
-    an invalid service, a limit (count or size), a placeholder user services may not set, an unknown OAuth provider
-    or one on a shared or unscoped agent, or rules on hosts that `unmatched_hosts: deny` keeps closed.
+    an invalid service, a limit (count or size), a placeholder user services may not set, an unknown OAuth provider,
+    one on a shared or unscoped agent, or one whose rules leave its presets' hosts, or rules on hosts that
+    `unmatched_hosts: deny` keeps closed.
     """
     _require_egress_same_origin(request)
     agent = _resolve_service_editor(request, requester_id, agent_name)

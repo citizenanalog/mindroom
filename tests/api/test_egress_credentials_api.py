@@ -1259,6 +1259,12 @@ _NOTES = {
     "description": "Team notes",
     "rules": [{"host": "api.notes.example.com", "auth": {"type": "bearer"}}],
 }
+# A personal service that signs in with a connected GitHub account, on one of the GitHub preset's hosts.
+_MY_GITHUB = {
+    "description": "My repositories",
+    "rules": [{"host": "api.github.com", "path_prefix": "/repos/alice/", "auth": {"type": "bearer"}}],
+    "oauth_provider": "github",
+}
 
 
 def _service_url(agent: str, name: str) -> str:
@@ -1491,7 +1497,7 @@ def test_user_service_body_over_16_kib_is_413_before_validation(
 def test_oauth_provider_is_refused_in_user_services_of_shared_agents(egress_portal: dict[str, Any]) -> None:
     """A manager cannot route a shared agent's OAuth connection to hosts of their choosing; personal agents can."""
     portal = egress_portal
-    with_oauth = {**_NOTES, "oauth_provider": "github"}
+    with_oauth = _MY_GITHUB
     for body in (with_oauth, {"preset": "github"}):
         response = _put_service(portal, "bob", "shared_dev", "notes", body)
         assert response.status_code == 422, response.text
@@ -1694,8 +1700,7 @@ def test_user_service_shares_a_key_gate_with_config_services(egress_portal: dict
 def test_user_service_can_connect_its_providers_account(oauth_egress_portal: dict[str, Any]) -> None:
     """A personal service whose OAuth provider is requester-scoped connects and disconnects like a config service."""
     portal = oauth_egress_portal
-    body = {**_NOTES, "oauth_provider": "github"}
-    assert _put_service(portal, "alice", "personal", "mygh", body).status_code == 204
+    assert _put_service(portal, "alice", "personal", "mygh", _MY_GITHUB).status_code == 204
 
     _connect_account(portal, "alice", "personal", "mygh", "github")
     row = _egress_row(portal, "alice", "personal", "mygh")
@@ -1709,6 +1714,68 @@ def test_user_service_can_connect_its_providers_account(oauth_egress_portal: dic
     for action in ("connect", "disconnect"):
         response = _account_action(portal, "bob", "personal", "mygh", action)
         assert response.status_code == 404, response.text
+
+
+@pytest.mark.parametrize(
+    ("rules", "refused"),
+    [
+        ([{"host": "api.notes.example.com", "auth": {"type": "bearer"}}], "api.notes.example.com"),
+        ([{"host": "*.github.com", "auth": {"type": "bearer"}}], "*.github.com"),
+        (
+            [
+                {"host": "api.github.com", "auth": {"type": "bearer"}},
+                {"host": "github.com.notes.example.com", "auth": {"type": "bearer"}},
+            ],
+            "github.com.notes.example.com",
+        ),
+    ],
+)
+def test_a_user_service_cannot_send_its_account_off_its_providers_hosts(
+    egress_portal: dict[str, Any],
+    rules: list[dict[str, Any]],
+    refused: str,
+) -> None:
+    """A connected account goes only to its provider's preset hosts; an API key may still go to any host."""
+    portal = egress_portal
+    body = {"description": "Notes", "rules": rules, "oauth_provider": "github"}
+
+    response = _put_service(portal, "alice", "personal", "notes", body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == (
+        "oauth_provider 'github' can only be used on api.github.com, uploads.github.com, github.com, "
+        f"so these hosts cannot be used with it: {refused}"
+    )
+    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
+    keyed = {**body, "oauth_provider": None}
+    assert _put_service(portal, "alice", "personal", "notes", keyed).status_code == 204
+    assert _put_service(portal, "alice", "personal", "plain", _NOTES).status_code == 204
+
+
+def test_a_provider_without_a_preset_is_refused_for_user_services(egress_portal: dict[str, Any]) -> None:
+    """A registered provider that no preset is bound to, such as google_cloud, cannot sign in a user service."""
+    portal = egress_portal
+    response = _put_service(portal, "alice", "personal", "notes", {**_NOTES, "oauth_provider": "google_cloud"})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == (
+        "oauth_provider 'google_cloud' has no built-in preset, so a service of your own cannot use it; use an API key"
+    )
+    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
+
+
+def test_a_stored_account_off_its_providers_hosts_is_neither_reported_nor_connectable(
+    oauth_egress_portal: dict[str, Any],
+) -> None:
+    """A stored service that would send a connected account to another host loses the account when loaded."""
+    portal = oauth_egress_portal
+    _store_raw_entries(portal, {"mygh": _MY_GITHUB, "notes": {**_NOTES, "oauth_provider": "github"}})
+    _connect_account(portal, "alice", "personal", "mygh", "github")
+
+    notes = _egress_row(portal, "alice", "personal", "notes")
+    assert (notes["oauth"], notes["configured"], notes["active_source"]) == (None, False, None)
+    assert _egress_row(portal, "alice", "personal", "mygh")["oauth"]["connected"] is True
+    assert _account_action(portal, "alice", "personal", "notes", "connect").status_code == 404
 
 
 def test_the_admin_panel_shows_a_shared_agents_user_services_read_only_and_keys_them(
@@ -1837,7 +1904,7 @@ def test_user_services_are_loaded_off_the_event_loop(
 ) -> None:
     """Reading a scope's services touches the credential store, so async routes do it in a thread."""
     portal = oauth_egress_portal
-    assert _put_service(portal, "alice", "personal", "mygh", {**_NOTES, "oauth_provider": "github"}).status_code == 204
+    assert _put_service(portal, "alice", "personal", "mygh", _MY_GITHUB).status_code == 204
     on_loop = calls_on_event_loop(egress_status, "effective_config")
     client, headers = portal["client"], portal["headers"]["alice"]
     assert client.get("/api/connections/egress", headers=headers).status_code == 200

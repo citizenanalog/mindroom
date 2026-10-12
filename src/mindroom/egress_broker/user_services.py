@@ -11,6 +11,7 @@ from config only. Merged configs are cached per scope, and every save or delete 
 User services can narrow operator policy, never widen it: `rules.EgressRules` keeps them inside `deny` and inside an
 operator's `restrict_to_rules`. They never inherit a key stored under their name, and on shared or unscoped agents
 they cannot use an OAuth connection, which would let a manager route the agent's shared account to any host.
+Where they can, the connection only goes to the rule hosts of the built-in presets bound to its provider.
 Their placeholders are limited to credential-like names and plain values, since a shared agent's services set env
 in every requester's sandbox, and config placeholders win over theirs.
 """
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from mindroom.config.egress_broker import EgressService, validate_egress_service_name
+from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import config_covers_rule
 from mindroom.egress_broker.secrets import (
     PERSONAL_WORKER_SCOPES,
@@ -115,7 +117,8 @@ def load_user_services(manager: CredentialsManager, target: ResolvedWorkerTarget
 
     An entry that no longer validates is skipped with a warning naming it, so one bad entry spares the rest.
     A placeholder that user services may not set is dropped with a warning naming the service and the variable.
-    Outside a personal scope an entry's `oauth_provider` is dropped, so no OAuth token is resolved or reported for it.
+    An entry's `oauth_provider` is dropped outside a personal scope, and when a rule names a host its provider's
+    presets do not (`_oauth_hosts_error`), so no OAuth token is resolved or reported for it.
     """
     services: dict[str, EgressService] = {}
     for name, authored in _stored_services(manager, target).items():
@@ -133,7 +136,7 @@ def load_user_services(manager: CredentialsManager, target: ResolvedWorkerTarget
         if refused:
             allowed = {key: value for key, value in service.placeholder_env.items() if key not in refused}
             service = service.model_copy(update={"placeholder_env": allowed})
-        if service.oauth_provider is not None and not _personal_scope(target):
+        if service.oauth_provider is not None and (not _personal_scope(target) or _oauth_hosts_error(service)):
             logger.warning("egress_broker_user_service_oauth_ignored", service=name)
             service = service.model_copy(update={"oauth_provider": None})
         services[name] = service
@@ -185,8 +188,9 @@ def save_user_service(
 
     Raises UserServiceConflictError when `config_services` has the name, and ValueError for an invalid name, a
     service that sets `oauth_on_shared_workers`, an OAuth provider (a preset's included) that the registry does not
-    know or that a shared or unscoped agent would use, a placeholder user services may not set, a service with more
-    than 50 rules or over 16 KiB, a 51st service in the scope, or a scope document over 256 KiB.
+    know, that a shared or unscoped agent would use, or whose token a rule would send off its presets' hosts, a
+    placeholder user services may not set, a service with more than 50 rules or over 16 KiB, a 51st service in the
+    scope, or a scope document over 256 KiB.
     """
     validate_egress_service_name(name)
     if name in config_services:
@@ -195,17 +199,8 @@ def save_user_service(
     for variable, value in service.placeholder_env.items():
         if error := _placeholder_error(variable, value):
             raise ValueError(error)
-    if service.oauth_provider is not None:
-        if not _personal_scope(target):
-            msg = (
-                "oauth_provider is only available for services of user and user_agent agents; "
-                "on a shared or unscoped agent set oauth_provider to null and use an API key"
-            )
-            raise ValueError(msg)
-        if service.oauth_provider not in oauth_providers:
-            known = ", ".join(sorted(oauth_providers)) or "none"
-            msg = f"unknown oauth_provider '{service.oauth_provider}' (known providers: {known})"
-            raise ValueError(msg)
+    if error := _oauth_provider_error(service, target, oauth_providers):
+        raise ValueError(error)
     with _write_lock:
         stored = _stored_services(manager, target)
         new = name not in stored
@@ -304,6 +299,63 @@ def user_service_hosts_not_allowed(config: EgressBrokerConfig, service: EgressSe
 
 def _personal_scope(target: ResolvedWorkerTarget | None) -> bool:
     return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
+
+
+def _oauth_provider_hosts() -> dict[str, tuple[str, ...]]:
+    """Return, per OAuth provider a built-in preset is bound to, the rule hosts of those presets in preset order."""
+    hosts: dict[str, list[str]] = {}
+    for preset_name in EGRESS_PRESETS:
+        preset = EgressService.model_validate({"preset": preset_name})
+        if preset.oauth_provider is not None:
+            hosts.setdefault(preset.oauth_provider, []).extend(rule.host for rule in preset.rules)
+    return {provider: tuple(dict.fromkeys(provider_hosts)) for provider, provider_hosts in hosts.items()}
+
+
+# An OAuth token only works at its provider, so a user service may send one only to these hosts.
+_OAUTH_PROVIDER_HOSTS = _oauth_provider_hosts()
+
+
+def _oauth_provider_error(
+    service: EgressService,
+    target: ResolvedWorkerTarget | None,
+    oauth_providers: Collection[str],
+) -> str | None:
+    """Return why a user service of this scope may not save its OAuth provider; None when it may or names none."""
+    if service.oauth_provider is None:
+        return None
+    if not _personal_scope(target):
+        return (
+            "oauth_provider is only available for services of user and user_agent agents; "
+            "on a shared or unscoped agent set oauth_provider to null and use an API key"
+        )
+    if service.oauth_provider not in oauth_providers:
+        known = ", ".join(sorted(oauth_providers)) or "none"
+        return f"unknown oauth_provider '{service.oauth_provider}' (known providers: {known})"
+    return _oauth_hosts_error(service)
+
+
+def _oauth_hosts_error(service: EgressService) -> str | None:
+    """Return why a user service may not send its OAuth provider's token to its rules' hosts; None when it may.
+
+    The hosts compare exactly, so a wildcard rule passes only where a preset of the provider has the same wildcard.
+    A provider no preset is bound to has no such hosts.
+    """
+    provider = service.oauth_provider
+    if provider is None:
+        return None
+    allowed = _OAUTH_PROVIDER_HOSTS.get(provider)
+    if allowed is None:
+        return (
+            f"oauth_provider '{provider}' has no built-in preset, so a service of your own cannot use it; "
+            "use an API key"
+        )
+    outside = [rule.host for rule in service.rules if rule.host not in allowed]
+    if not outside:
+        return None
+    return (
+        f"oauth_provider '{provider}' can only be used on {', '.join(allowed)}, "
+        f"so these hosts cannot be used with it: {', '.join(dict.fromkeys(outside))}"
+    )
 
 
 def _word_list(words: tuple[str, ...]) -> str:
