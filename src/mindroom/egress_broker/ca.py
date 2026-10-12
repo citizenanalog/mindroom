@@ -33,6 +33,8 @@ _CACHE_SIZE = 1024
 _LEAF_VALIDITY_HOURS = 24
 _CA_VALIDITY_YEARS = 10
 _CACHE_REFRESH_MARGIN_SECONDS = 3600  # Replace cached context when <1h validity remains
+_CA_CERT_NAME = "ca.pem"
+_CA_KEY_NAME = "ca.key"
 
 
 class BrokerCA:
@@ -88,8 +90,8 @@ class BrokerCA:
         """
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        cert_path = directory / "ca.pem"
-        key_path = directory / "ca.key"
+        cert_path = directory / _CA_CERT_NAME
+        key_path = directory / _CA_KEY_NAME
 
         if cert_path.exists() and key_path.exists():
             cert_pem = cert_path.read_bytes()
@@ -102,7 +104,7 @@ class BrokerCA:
 
         ca_key = ec.generate_private_key(ec.SECP256R1())
         ca_cert = _issue_ca_certificate(ca_key)
-        cert_pem_bytes = _write_ca_files(cert_path, key_path, ca_cert=ca_cert, ca_key=ca_key, key_password=key_password)
+        cert_pem_bytes = _write_ca_files(directory, ca_cert=ca_cert, ca_key=ca_key, key_password=key_password)
         return BrokerCA(
             ca_cert=ca_cert,
             ca_key=ca_key,
@@ -268,8 +270,7 @@ def _issue_ca_certificate(ca_key: ec.EllipticCurvePrivateKey) -> x509.Certificat
 
 
 def _write_ca_files(
-    cert_path: Path,
-    key_path: Path,
+    directory: Path,
     *,
     ca_cert: x509.Certificate,
     ca_key: ec.EllipticCurvePrivateKey,
@@ -277,7 +278,7 @@ def _write_ca_files(
 ) -> bytes:
     """Atomically publish the certificate with mode 0644, then the PKCS8 key with mode 0600; return the certificate PEM.
 
-    Both paths name files in the same directory, which is opened once, as for the token key.
+    Both files live in `directory`, which is opened once, as for the token key.
     """
     cert_pem_bytes = ca_cert.public_bytes(serialization.Encoding.PEM)
     encryption = serialization.BestAvailableEncryption(key_password) if key_password else serialization.NoEncryption()
@@ -286,10 +287,10 @@ def _write_ca_files(
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=encryption,
     )
-    directory_fd = os.open(cert_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for path, content, mode in ((cert_path, cert_pem_bytes, 0o644), (key_path, key_pem_bytes, 0o600)):
-            atomic_write_bytes_at(directory_fd, path.name, content, file_mode=mode, temp_prefix=f".{path.name}.")
+        for name, content, mode in ((_CA_CERT_NAME, cert_pem_bytes, 0o644), (_CA_KEY_NAME, key_pem_bytes, 0o600)):
+            atomic_write_bytes_at(directory_fd, name, content, file_mode=mode, temp_prefix=f".{name}.")
     finally:
         os.close(directory_fd)
     return cert_pem_bytes

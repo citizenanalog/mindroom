@@ -152,8 +152,8 @@ def inactive_user_services(
 
     An entry is `shadowed` when `config` has a service of that name, whether or not it would still validate, and
     `invalid` when it no longer validates as a user service. Both still count toward the scope's caps, and
-    `delete_user_service` removes either. This reads the store each time and logs nothing per entry, so a listing can
-    call it.
+    `delete_user_service` removes either. This reads the credential store each time, so async callers run it in a
+    thread, and logs nothing per entry, so a listing can call it.
     """
     inactive = []
     for name, authored in sorted(_stored_services(manager, target).items()):

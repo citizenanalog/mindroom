@@ -517,7 +517,7 @@ def test_a_restrict_only_service_never_injects() -> None:
     assert alone.intercepts("api.example.com", 443)
 
 
-def test_shared_agent_refusal_names_an_administrator_for_an_operator_limit_and_managers_for_their_own() -> None:
+def test_route_names_the_restricting_service_and_whether_the_operator_defined_it() -> None:
     """The route names the restricting service, whether the operator defined it, and its label, for either party."""
     rules = _merged(
         {"op": EgressService(restrict_to_rules=True, display_name="Ops API", rules=[_rule("api.example.com", "/op")])},
