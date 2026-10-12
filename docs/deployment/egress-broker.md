@@ -57,7 +57,8 @@ Set these on the primary runtime to enable the broker:
 | `MINDROOM_EGRESS_BROKER_TOKEN_TTL_SECONDS` | No | `604800` (7 days) | How long each minted worker token remains valid |
 
 When `MINDROOM_EGRESS_BROKER_PORT` is unset, the broker does not start and workers get no broker environment.
-The service and secret management API routes still work while the broker is disabled, so you can enter secrets before cutover.
+Agent Keys then stays hidden: every Agent Keys API route and the `/connections/egress` page answer 404, and the `egress_credentials` tool is left out of the tool lists and not given to agents that list it.
+Keys and accounts can only be entered while the port is set.
 The request log and CA download routes return 409 while the broker is not running.
 
 Running MindRoom with `--no-api` disables the broker along with the API.
