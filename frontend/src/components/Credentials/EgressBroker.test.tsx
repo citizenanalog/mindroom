@@ -1277,6 +1277,14 @@ describe("egress broker service editor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add service" }));
     await presetsReady();
   };
+  /** Opens Add service and fills in the OpenAI preset as myapi, ready to save. */
+  const addMyapi = async () => {
+    await openAdd();
+    fill("Name", "myapi");
+    fill("Preset", "openai");
+  };
+  const failSave = (message = "Failed to save configuration (Error 500)") =>
+    saveConfig.mockResolvedValue({ status: "error", message, diagnostics: [] });
   const openEdit = async (name: string) => {
     render(<EgressBroker />);
     fireEvent.click(
@@ -1288,9 +1296,7 @@ describe("egress broker service editor", () => {
   it("adds a service to the config through the store, in authored form", async () => {
     await openAdd();
     fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "anthropic" },
-    });
+    fill("Preset", "anthropic");
     services = [...services, configRow("myapi", "Myapi")];
     save();
 
@@ -1337,10 +1343,7 @@ describe("egress broker service editor", () => {
   });
 
   it("offers the account logins the presets endpoint lists, by display name", async () => {
-    render(<EgressBroker />);
-    await screen.findByLabelText("GitHub");
-    fireEvent.click(screen.getByRole("button", { name: "Add service" }));
-    await presetsReady();
+    await openAdd();
     openMoreOptions();
     const login = screen.getByLabelText("Account login (optional)");
     expect(login.tagName).toBe("SELECT");
@@ -1355,10 +1358,7 @@ describe("egress broker service editor", () => {
   });
 
   it("saves a new custom service from a pasted address: its host as the display name and its path as the prefix", async () => {
-    render(<EgressBroker />);
-    await screen.findByLabelText("GitHub");
-    fireEvent.click(screen.getByRole("button", { name: "Add service" }));
-    await presetsReady();
+    await openAdd();
     fill("Website", "https://httpbin.org/anything");
     save();
 
@@ -1476,9 +1476,7 @@ describe("egress broker service editor", () => {
   it("words the help for refusing other paths for the operator", async () => {
     await openAdd();
     fill("Name", "limited");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    fill("Preset", "github");
     fill("GitHub repositories", "o/r");
     fireEvent.click(
       screen.getByRole("button", { name: "Use these repositories" }),
@@ -1521,11 +1519,7 @@ describe("egress broker service editor", () => {
         },
       ],
     });
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    await addMyapi();
     save();
 
     const alert = await screen.findByRole("alert");
@@ -1567,11 +1561,7 @@ describe("egress broker service editor", () => {
         },
       ],
     });
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    await addMyapi();
     save();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -1581,12 +1571,7 @@ describe("egress broker service editor", () => {
   });
 
   it("restores the previous service when saving an edit fails", async () => {
-    saveConfig.mockResolvedValue({
-      status: "error",
-      message:
-        "Configuration changed elsewhere. Your draft has not been saved.",
-      diagnostics: [],
-    });
+    failSave("Configuration changed elsewhere. Your draft has not been saved.");
     await openEdit("GitHub");
     openMoreOptions();
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
@@ -1602,16 +1587,8 @@ describe("egress broker service editor", () => {
 
   it("hands back the dirty state the draft had before, other roots included", async () => {
     storeState = { ...storeState, isDirty: true, dirtyRoots: ["models"] };
-    saveConfig.mockResolvedValue({
-      status: "error",
-      message: "Failed to save configuration (Error 500)",
-      diagnostics: [],
-    });
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    failSave();
+    await addMyapi();
     save();
     fireEvent.click(
       await screen.findByRole("button", { name: "Save all changes" }),
@@ -1629,11 +1606,7 @@ describe("egress broker service editor", () => {
 
   it("reports a superseded save without touching the draft again", async () => {
     saveConfig.mockResolvedValue({ status: "stale" });
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    await addMyapi();
     save();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -1645,11 +1618,7 @@ describe("egress broker service editor", () => {
 
   it("asks before a save that also writes other unsaved settings changes", async () => {
     storeState = { ...storeState, isDirty: true, dirtyRoots: ["agents"] };
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    await addMyapi();
     save();
 
     expect(screen.getByRole("alert")).toHaveTextContent(
@@ -1674,11 +1643,7 @@ describe("egress broker service editor", () => {
       isDirty: true,
       dirtyRoots: ["egress_broker"],
     };
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    await addMyapi();
     save();
 
     await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
@@ -1721,11 +1686,7 @@ describe("egress broker service editor", () => {
   });
 
   it("shows why a delete failed and restores the service in the draft", async () => {
-    saveConfig.mockResolvedValue({
-      status: "error",
-      message: "Failed to save configuration (Error 500)",
-      diagnostics: [],
-    });
+    failSave();
     render(<EgressBroker />);
     fireEvent.click(
       await screen.findByRole("button", { name: "Delete service for GitHub" }),
@@ -1844,16 +1805,8 @@ describe("egress broker service editor", () => {
   });
 
   it("reads the draft's state from the store when the write starts, not from the last render", async () => {
-    saveConfig.mockResolvedValue({
-      status: "error",
-      message: "Failed to save configuration (Error 500)",
-      diagnostics: [],
-    });
-    await openAdd();
-    fill("Name", "myapi");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    failSave();
+    await addMyapi();
     // Another edit lands in the store without this panel rendering again.
     storeState = {
       ...storeState,
@@ -1929,9 +1882,7 @@ describe("egress broker service editor", () => {
   it("refuses a name that is already used before saving", async () => {
     await openAdd();
     fill("Name", "github");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    fill("Preset", "github");
     save();
     expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
       /A service named github already exists/,
