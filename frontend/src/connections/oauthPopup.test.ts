@@ -32,48 +32,48 @@ describe("connection popup", () => {
     vi.restoreAllMocks();
   });
 
-  function complete(overrides: MessageEventInit = {}) {
+  const say = (
+    status: unknown,
+    overrides: { provider?: unknown; type?: unknown } & MessageEventInit = {},
+  ) => {
+    const { provider = "mail", type = "mindroom-oauth", ...init } = overrides;
     window.dispatchEvent(
       new MessageEvent("message", {
         origin: authorization.completion_origin,
         source: popup as unknown as Window,
-        data: {
-          type: "mindroom-oauth",
-          provider: "mail",
-          status: "connected",
-        },
-        ...overrides,
+        data: { type, provider, status },
+        ...init,
       }),
     );
-  }
-
-  it("ignores wrong origin, source, and provider before accepting completion", async () => {
+  };
+  const open = async (confirmConnected?: () => Promise<boolean>) => {
     const operation = connectWithPopup(
       "mail",
       async () => authorization,
       controller.signal,
+      confirmConnected,
     );
     await Promise.resolve();
-    complete({ origin: "https://untrusted.example.com" });
-    complete({ source: window });
-    complete({
-      data: {
-        type: "mindroom-oauth",
-        provider: "other",
-        status: "connected",
-      },
-    });
+    return { operation };
+  };
+
+  it("ignores wrong origin, source, and provider before accepting completion", async () => {
+    const { operation } = await open();
+    say("connected", { origin: "https://untrusted.example.com" });
+    say("connected", { source: window });
+    say("connected", { provider: "other" });
     for (const data of [
       null,
       "connected",
       { type: "other", provider: "mail", status: "connected" },
       { type: "mindroom-oauth", provider: "mail", status: "pending" },
+      { type: "mindroom-oauth", provider: "mail", status: undefined },
     ]) {
-      complete({ data });
+      say("connected", { data });
     }
     expect(popup.close).not.toHaveBeenCalled();
     expect(popup.location.href).toBe(authorization.auth_url);
-    complete();
+    say("connected");
     await expect(operation).resolves.toBeUndefined();
     // The page that answered closes itself.
     expect(popup.close).not.toHaveBeenCalled();
@@ -99,7 +99,7 @@ describe("connection popup", () => {
         controller.signal,
       ),
     ).rejects.toThrow("Could not start connection.");
-    complete();
+    say("connected");
     expect(popup.close).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -170,7 +170,7 @@ describe("connection popup", () => {
         "abort",
         expect.any(Function),
       );
-      complete();
+      say("connected");
       controller.abort();
       expect(popup.close).toHaveBeenCalledOnce();
       expect(settled).toHaveBeenCalledOnce();
@@ -264,7 +264,7 @@ describe("connection popup", () => {
       );
       await Promise.resolve();
       expect(popup.location.href).toBe(authUrl);
-      complete({ origin: completionOrigin });
+      say("connected", { origin: completionOrigin });
       await expect(operation).resolves.toBeUndefined();
       expect(popup.close).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
@@ -272,55 +272,21 @@ describe("connection popup", () => {
   );
 
   describe("what the popup's own page says", () => {
-    const say = (
-      status: unknown,
-      overrides: { provider?: unknown; type?: unknown } & MessageEventInit = {},
-    ) => {
-      const { provider = "mail", type = "mindroom-oauth", ...init } = overrides;
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: authorization.completion_origin,
-          source: popup as unknown as Window,
-          data: { type, provider, status },
-          ...init,
-        }),
-      );
-    };
-    const open = async () => {
-      const operation = connectWithPopup(
-        "mail",
-        async () => authorization,
-        controller.signal,
-      );
-      await Promise.resolve();
-      return { operation };
-    };
-
-    it("finishes on connected and leaves the popup to close itself", async () => {
-      const { operation } = await open();
-      say("connected");
-      await expect(operation).resolves.toBeUndefined();
-      expect(popup.close).not.toHaveBeenCalled();
-      expect(vi.getTimerCount()).toBe(0);
-    });
-
-    it("stops Connecting as soon as it says cancelled, and the popup shows its words until it closes", async () => {
-      const { operation } = await open();
-      const rejection = expect(operation).rejects.toThrow(
+    it.each([
+      [
+        "stops Connecting as soon as it says cancelled, and the popup shows its words until it closes",
+        "cancelled",
         "Authorization was cancelled.",
-      );
-      say("cancelled");
-      await rejection;
-      expect(popup.close).not.toHaveBeenCalled();
-      expect(vi.getTimerCount()).toBe(0);
-    });
-
-    it("stops Connecting on error with a message of its own", async () => {
-      const { operation } = await open();
-      const rejection = expect(operation).rejects.toThrow(
+      ],
+      [
+        "stops Connecting on error with a message of its own",
+        "error",
         "Could not connect. Try again.",
-      );
-      say("error");
+      ],
+    ])("%s", async (_title, status, message) => {
+      const { operation } = await open();
+      const rejection = expect(operation).rejects.toThrow(message);
+      say(status);
       await rejection;
       expect(popup.close).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
@@ -334,34 +300,9 @@ describe("connection popup", () => {
       await vi.advanceTimersByTimeAsync(2000);
       expect(vi.getTimerCount()).toBe(0);
     });
-
-    it("ignores a wrong origin, source, provider, status, or type", async () => {
-      const { operation } = await open();
-      say("connected", { origin: "https://untrusted.example.com" });
-      say("connected", { source: window });
-      say("connected", { provider: "other" });
-      say("pending");
-      say(undefined);
-      say("connected", { type: "something-else" });
-      expect(popup.close).not.toHaveBeenCalled();
-      expect(popup.location.href).toBe(authorization.auth_url);
-      say("connected");
-      await expect(operation).resolves.toBeUndefined();
-    });
   });
 
   describe("a popup that closes without answering", () => {
-    const open = async (confirmConnected?: () => Promise<boolean>) => {
-      const operation = connectWithPopup(
-        "mail",
-        async () => authorization,
-        controller.signal,
-        confirmConnected,
-      );
-      await Promise.resolve();
-      return { operation };
-    };
-
     it("counts it as connected when the status says so, asking once", async () => {
       const confirm = vi.fn(async () => true);
       const { operation } = await open(confirm);
@@ -399,17 +340,7 @@ describe("connection popup", () => {
     it("does not ask when the popup answered, or when nothing asks for it", async () => {
       const confirm = vi.fn(async () => true);
       const { operation } = await open(confirm);
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: authorization.completion_origin,
-          source: popup as unknown as Window,
-          data: {
-            type: "mindroom-oauth",
-            provider: "mail",
-            status: "cancelled",
-          },
-        }),
-      );
+      say("cancelled");
       await expect(operation).rejects.toThrow(/cancelled/i);
       popup.closed = true;
       await vi.advanceTimersByTimeAsync(3000);
