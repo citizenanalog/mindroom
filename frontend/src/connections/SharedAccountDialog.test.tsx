@@ -4,19 +4,21 @@ import { SharedAccountDialog } from "./SharedAccountDialog";
 
 afterEach(cleanup);
 
-const renderDialog = (open = true) => {
+const renderDialog = () => {
   const onContinue = vi.fn();
   const onCancel = vi.fn();
-  const view = render(
+  const dialog = (open: boolean) => (
     <SharedAccountDialog
       open={open}
       agent="Shared Dev"
       provider="Google"
       onContinue={onContinue}
       onCancel={onCancel}
-    />,
+    />
   );
-  return { onContinue, onCancel, view };
+  const view = render(dialog(true));
+  const setOpen = (open: boolean) => view.rerender(dialog(open));
+  return { onContinue, onCancel, setOpen };
 };
 
 describe("shared account dialog", () => {
@@ -41,26 +43,10 @@ describe("shared account dialog", () => {
   });
 
   it("goes on again when it is opened anew", () => {
-    const { onContinue, view } = renderDialog();
+    const { onContinue, setOpen } = renderDialog();
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
-    view.rerender(
-      <SharedAccountDialog
-        open={false}
-        agent="Shared Dev"
-        provider="Google"
-        onContinue={onContinue}
-        onCancel={vi.fn()}
-      />,
-    );
-    view.rerender(
-      <SharedAccountDialog
-        open
-        agent="Shared Dev"
-        provider="Google"
-        onContinue={onContinue}
-        onCancel={vi.fn()}
-      />,
-    );
+    setOpen(false);
+    setOpen(true);
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(onContinue).toHaveBeenCalledTimes(2);
   });

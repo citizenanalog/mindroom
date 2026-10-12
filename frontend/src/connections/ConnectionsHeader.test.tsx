@@ -21,9 +21,16 @@ function answerWith(response: () => Promise<Response>) {
   });
 }
 
-const renderHeader = (current: "agents" | "keys" = "agents") =>
+const renderHeader = (
+  current: "agents" | "keys" = "agents",
+  howItWorks?: string,
+) =>
   render(
-    <ConnectionsHeader current={current} title="Your title">
+    <ConnectionsHeader
+      current={current}
+      title="Your title"
+      howItWorks={howItWorks}
+    >
       The intro.
     </ConnectionsHeader>,
   );
@@ -187,11 +194,7 @@ describe("the notice after a redirect from the dashboard", () => {
 
 describe("the explanation behind How this works", () => {
   it("keeps its chevron still for someone who prefers reduced motion", () => {
-    render(
-      <ConnectionsHeader current="keys" title="Your title" howItWorks="More.">
-        The intro.
-      </ConnectionsHeader>,
-    );
+    renderHeader("keys", "More.");
     const chevron = screen
       .getByRole("button", { name: "How this works" })
       .querySelector("svg");
@@ -200,15 +203,7 @@ describe("the explanation behind How this works", () => {
   });
 
   it("is hidden until the disclosure is opened, and offered only when there is one", () => {
-    render(
-      <ConnectionsHeader
-        current="keys"
-        title="Your title"
-        howItWorks="The long explanation."
-      >
-        The intro.
-      </ConnectionsHeader>,
-    );
+    renderHeader("keys", "The long explanation.");
     const toggle = screen.getByRole("button", { name: "How this works" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     // There is nothing to point at while it is closed.
