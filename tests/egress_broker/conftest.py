@@ -705,17 +705,20 @@ class RawResponse:
         return json.loads(self.body)
 
 
+def parse_head(head: bytes) -> tuple[int, str, dict[str, str]]:
+    """Return the status, reason phrase, and headers (lowercased names) of a raw response head."""
+    lines = head.decode("latin-1").removesuffix("\r\n\r\n").split("\r\n")
+    _version, status, reason = (*lines[0].split(" ", 2), "")[:3]
+    headers = {name.strip().lower(): value.strip() for name, _, value in (line.partition(":") for line in lines[1:])}
+    return int(status), reason, headers
+
+
 async def read_raw_response(reader: asyncio.StreamReader) -> RawResponse:
     """Read one response head and its Content-Length body (none for a CONNECT 200) from a raw socket."""
     async with asyncio.timeout(10):
-        head = await reader.readuntil(b"\r\n\r\n")
-        lines = head.decode("latin-1").removesuffix("\r\n\r\n").split("\r\n")
-        headers = {
-            name.strip().lower(): value.strip() for name, _, value in (line.partition(":") for line in lines[1:])
-        }
+        status, reason, headers = parse_head(await reader.readuntil(b"\r\n\r\n"))
         body = await reader.readexactly(int(headers.get("content-length", "0")))
-    _version, status, reason = (*lines[0].split(" ", 2), "")[:3]
-    return RawResponse(status=int(status), headers=headers, body=body, reason=reason)
+    return RawResponse(status=status, headers=headers, body=body, reason=reason)
 
 
 async def _raw_proxy_request(port: int, request: bytes) -> RawResponse:

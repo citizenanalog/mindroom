@@ -37,7 +37,8 @@ _BASIC = EgressAuth(type="basic", username="x-access-token")
 _CONFIG = single_rule_config(auth=_BASIC)
 
 
-def _plain_get(target: str, *, token: str | None, method: str = "GET", git: bool = False) -> bytes:
+def _request(target: str, *, token: str | None, method: str = "GET", git: bool = False) -> bytes:
+    """Return a raw `method` request for `target` with Host localhost, optionally authenticated and as git."""
     lines = [f"{method} {target} HTTP/1.1", "Host: localhost"]
     if token is not None:
         lines.append(f"Proxy-Authorization: {proxy_authorization(token)}")
@@ -67,7 +68,7 @@ async def test_plain_refusals_carry_the_code_header_and_the_message_as_reason(
     """Clients that print only the status line show the message; scripts read the code from X-MindRoom-Error."""
     started = await broker(single_rule_config(auth=_BASIC, unmatched_hosts="deny"))
 
-    response = await raw_proxy(started.port, _plain_get(target, token=broker.token() if with_token else None))
+    response = await raw_proxy(started.port, _request(target, token=broker.token() if with_token else None))
 
     assert response.status == status
     assert response.headers["x-mindroom-error"] == code
@@ -192,8 +193,8 @@ async def test_plain_git_discovery_refusal_is_an_advertisement_but_the_proxy_cha
     started = await broker(_CONFIG)
     target = "http://localhost:1/repo.git/info/refs?service=git-upload-pack"
 
-    refused = await raw_proxy(started.port, _plain_get(target, token=broker.token(), git=True))
-    challenge = await raw_proxy(started.port, _plain_get(target, token=None, git=True))
+    refused = await raw_proxy(started.port, _request(target, token=broker.token(), git=True))
+    challenge = await raw_proxy(started.port, _request(target, token=None, git=True))
 
     assert refused.status == 200
     assert refused.headers["content-type"] == "application/x-git-upload-pack-advertisement"
@@ -226,7 +227,7 @@ async def test_other_requests_keep_the_json_refusal(
 
     response = await raw_proxy(
         started.port,
-        _plain_get(f"http://localhost:1{path}", token=broker.token(), method=method, git=True),
+        _request(f"http://localhost:1{path}", token=broker.token(), method=method, git=True),
     )
 
     assert response.status == 403
@@ -327,7 +328,7 @@ async def test_a_target_that_does_not_parse_as_a_url_keeps_the_json_refusal(
 
     response = await raw_proxy(
         started.port,
-        _plain_get("http://[::1]localhost/repo.git/info/refs?service=git-upload-pack", token=broker.token(), git=True),
+        _request("http://[::1]localhost/repo.git/info/refs?service=git-upload-pack", token=broker.token(), git=True),
     )
 
     assert response.status == 400

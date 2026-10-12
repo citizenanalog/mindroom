@@ -17,7 +17,7 @@ import ssl
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from tests.egress_broker.conftest import connect_request, proxy_authorization, read_raw_response
+from tests.egress_broker.conftest import connect_request, parse_head, proxy_authorization, read_raw_response
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -281,11 +281,7 @@ class Client:
                 if isinstance(exc, asyncio.IncompleteReadError):
                     self.received += exc.partial
                 return None
-            lines = raw_head.decode("latin-1").removesuffix("\r\n\r\n").split("\r\n")
-            status = int(lines[0].split(" ")[1])
-            headers = {
-                name.strip().lower(): value.strip() for name, _, value in (line.partition(":") for line in lines[1:])
-            }
+            status, _reason, headers = parse_head(raw_head)
             try:
                 body = await self._body(headers, head=head, status=status)
             except (asyncio.IncompleteReadError, ConnectionResetError, ssl.SSLError) as exc:
@@ -337,7 +333,6 @@ async def open_tunnel(
 class Target:
     """Where a corpus request goes: absolute-form with proxy credentials, or origin-form inside a tunnel."""
 
-    tunnel: bool
     prefix: str
     host: str
     auth: str
@@ -354,11 +349,11 @@ async def client_for(broker: BrokerFactory, upstream: RawUpstream, *, tunnel: bo
     """
     if tunnel:
         client = await open_tunnel(broker, upstream.port)
-        return client, Target(tunnel=True, prefix="", host=f"localhost:{upstream.port}", auth="")
+        return client, Target(prefix="", host=f"localhost:{upstream.port}", auth="")
     client = await open_client(broker.latest.port)
     authority = f"127.0.0.1:{upstream.port}"
     credential = f"Proxy-Authorization: {proxy_authorization(broker.token())}\r\n"
-    return client, Target(tunnel=False, prefix=f"http://{authority}", host=authority, auth=credential)
+    return client, Target(prefix=f"http://{authority}", host=authority, auth=credential)
 
 
 def assert_contained(
