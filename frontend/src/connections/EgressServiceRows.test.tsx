@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { pressInDialog } from "@/test/egressServiceTestKit";
+import { pressInDialog, ruleSummaries } from "@/test/egressServiceTestKit";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type { RowAgent, ServiceEditing } from "./egressRowText";
 import { EgressServiceRows as Rows } from "./EgressServiceRows";
@@ -1319,14 +1319,10 @@ describe("rows with an agent's wording", () => {
     });
 
     it("shows which repositories a limited service is limited to", () => {
-      const rules = githubRepositoryRules("a/b\nc/*", {
-        uploads: false,
-        graphql: false,
-      }).rules.map((rule) => ({
-        host: rule.host,
-        port: null,
-        path_prefix: rule.path_prefix ?? "/",
-      }));
+      const rules = ruleSummaries(
+        githubRepositoryRules("a/b\nc/*", { uploads: false, graphql: false })
+          .rules,
+      );
       renderRows([base({ source: "user", display_name: "Mine", rules })]);
       expect(
         within(row("Mine")).getByText("Limited to a/b, c/*"),
@@ -1339,14 +1335,9 @@ describe("rows with an agent's wording", () => {
     });
 
     it("does not repeat a description that already says it", () => {
-      const rules = githubRepositoryRules("a/b", {
-        uploads: false,
-        graphql: false,
-      }).rules.map((rule) => ({
-        host: rule.host,
-        port: null,
-        path_prefix: rule.path_prefix ?? "/",
-      }));
+      const rules = ruleSummaries(
+        githubRepositoryRules("a/b", { uploads: false, graphql: false }).rules,
+      );
       renderRows([
         base({
           source: "user",
@@ -1783,15 +1774,10 @@ describe("a limit's own row", () => {
 });
 
 describe("what a limited service says it is limited to", () => {
-  const rules = (graphql: boolean) => [
-    ...githubRepositoryRules("a/b", { uploads: false, graphql }).rules.map(
-      (rule) => ({
-        host: rule.host,
-        port: null,
-        path_prefix: rule.path_prefix ?? "/",
-      }),
-    ),
-  ];
+  const rules = (graphql: boolean) =>
+    ruleSummaries(
+      githubRepositoryRules("a/b", { uploads: false, graphql }).rules,
+    );
   const limited = (graphql: boolean): EgressCredentialService => ({
     ...github,
     name: "mine",

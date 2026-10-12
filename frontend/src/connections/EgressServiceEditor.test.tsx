@@ -10,8 +10,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
   bearerRule,
+  limitRules,
   presets,
   presetsReady,
+  storedLimit,
   validation,
 } from "@/test/egressServiceTestKit";
 import { githubRepositoryRules } from "./githubRepositoryRules";
@@ -2377,23 +2379,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     await limitSavable();
     return { onSave: merged.onSave, onClose: merged.onClose };
   };
-  // The rules of a limit send nothing, so the server keeps them without auth,
-  // and always cover uploads.github.com.
-  const limitRules = (input: string, graphql = false) =>
-    githubRepositoryRules(input, { uploads: true, graphql }).rules.map(
-      ({ auth: _auth, ...rule }) => rule,
-    );
-  const storedLimit = (
-    input: string,
-    changes: Partial<AuthoredEgressService> = {},
-  ): AuthoredEgressService => ({
-    display_name: `GitHub (${input})`,
-    description: `Limited to ${input}`,
-    rules: limitRules(input),
-    restrict_to_rules: true,
-    restrict_only: true,
-    ...changes,
-  });
 
   it("is added with its own title, no preset, website, key, or More options, and a name given", async () => {
     await renderLimit({

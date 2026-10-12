@@ -9,11 +9,13 @@ import {
   serializeService,
 } from "@/connections/egressServiceForm";
 import { validateService } from "@/connections/egressServiceValidation";
+import { githubRepositoryRules } from "@/connections/githubRepositoryRules";
 import type {
   AuthoredEgressService,
   EgressValidation,
   EgressPreset,
   EgressRule,
+  EgressRuleSummary,
 } from "@/connections/types";
 
 /** What the editor model's tests share: the server's presets, the options of each context, and helpers that run a service through the form. */
@@ -77,6 +79,33 @@ export function basicAuth(username: string) {
 export function validRule() {
   return { ...emptyRule(), host: "api.example.com" };
 }
+
+/** A limit's rules: they send nothing, so the server keeps them without auth, and they always cover uploads.github.com. */
+export const limitRules = (repositories: string, graphql = false) =>
+  githubRepositoryRules(repositories, { uploads: true, graphql }).rules.map(
+    ({ auth: _auth, ...rule }) => rule,
+  );
+
+/** A limit to these repositories as the editor writes it and the server keeps it. */
+export const storedLimit = (
+  repositories: string,
+  changes: Partial<AuthoredEgressService> = {},
+): AuthoredEgressService => ({
+  display_name: `GitHub (${repositories})`,
+  description: `Limited to ${repositories}`,
+  rules: limitRules(repositories),
+  restrict_to_rules: true,
+  restrict_only: true,
+  ...changes,
+});
+
+/** Rules as a listing sums them up: host, port, and path prefix. */
+export const ruleSummaries = (rules: EgressRule[]): EgressRuleSummary[] =>
+  rules.map((rule) => ({
+    host: rule.host,
+    port: rule.port ?? null,
+    path_prefix: rule.path_prefix ?? "/",
+  }));
 
 /** Wait until an open editor has the server's presets in its dropdown. */
 export const presetsReady = () =>

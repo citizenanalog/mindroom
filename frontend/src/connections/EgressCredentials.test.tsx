@@ -8,9 +8,14 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { pressInDialog, presetsReady } from "@/test/egressServiceTestKit";
+import {
+  limitRules,
+  pressInDialog,
+  presetsReady,
+  ruleSummaries,
+  storedLimit,
+} from "@/test/egressServiceTestKit";
 import { EgressCredentials } from "./EgressCredentials";
-import { githubRepositoryRules } from "./githubRepositoryRules";
 import type {
   AuthoredEgressService,
   EgressCredentialAgent,
@@ -2065,12 +2070,6 @@ describe("limiting a GitHub service to repositories", () => {
     { host: "api.github.com", port: null, path_prefix: "/" },
     { host: "github.com", port: null, path_prefix: "/" },
   ];
-  // A limit's rules send nothing, so the server keeps them without auth, and
-  // always cover uploads.github.com.
-  const limitRules = (repositories: string, graphql = false) =>
-    githubRepositoryRules(repositories, { uploads: true, graphql }).rules.map(
-      ({ auth: _auth, ...rule }) => rule,
-    );
   const limited = (
     name: string,
     repositories: string,
@@ -2081,23 +2080,12 @@ describe("limiting a GitHub service to repositories", () => {
     description: `Limited to ${repositories}`,
     source: "user",
     restrict_only: true,
-    rules: limitRules(repositories).map((rule) => ({
-      host: rule.host,
-      port: null,
-      path_prefix: rule.path_prefix ?? "/",
-    })),
+    rules: ruleSummaries(limitRules(repositories)),
   });
   const github = (): EgressCredentialService => ({
     ...service,
     source: "config",
     rules: githubRules,
-  });
-  const authoredLimit = (repositories: string): AuthoredEgressService => ({
-    display_name: `GitHub (${repositories})`,
-    description: `Limited to ${repositories}`,
-    rules: limitRules(repositories),
-    restrict_to_rules: true,
-    restrict_only: true,
   });
   const githubRow = () => screen.findByLabelText("GitHub");
 
@@ -2116,7 +2104,7 @@ describe("limiting a GitHub service to repositories", () => {
       if (path === "/api/connections/egress") return json({ agents: listing });
       if (path === PRESETS) return json(egressPresets);
       if (path.startsWith(SERVICES)) {
-        if (method === "GET") return json(authoredLimit("a/b"));
+        if (method === "GET") return json(storedLimit("a/b"));
         return new Response(null, { status: 204 });
       }
       throw new Error(`Unexpected request: ${method} ${path}`);
