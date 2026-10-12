@@ -658,7 +658,7 @@ def roll_back_to(
             # LEGACY_COMPAT: Archived runs without their live-table index.
             # Legacy format: A ``compacted_runs`` row with a NULL ``run_index``, written before archived rows recorded
             # the run's index in the live table.
-            # Last legacy release: v2026.10.259; replacement: the next release records ``run_index`` on every row.
+            # Last legacy release: v2026.10.261; replacement: the next release records ``run_index`` on every row.
             # Handling: The run is appended after the live runs in archive order, as before, so it can follow an
             # older live run that compaction skipped; rows with an index return to it. Removing such a run also
             # removes every live run, as before, since none can be placed after it (``storage.py``'s rollback cut).
