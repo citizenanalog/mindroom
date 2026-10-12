@@ -21,20 +21,39 @@ import type {
 
 type RowsProps =
   ComponentProps<typeof Rows> extends infer P
-    ? P extends unknown
-      ? Omit<P, "agent"> & { agent?: RowAgent }
+    ? P extends { agentName?: infer Name }
+      ? Omit<P, "agent" | "agentName" | "onChanged"> & {
+          agent?: RowAgent;
+          agentName?: Name;
+          onChanged?: () => void;
+        }
       : never
     : never;
 
-/** The rows as a page renders them: with a personal agent, unless a test passes another. */
-function EgressServiceRows(props: RowsProps) {
+/**
+ * The rows as a page renders them: for the agent "personal", whose rows say
+ * Personal Mind, unless a test passes another target or agent.
+ */
+function EgressServiceRows({ onChanged = vi.fn(), ...props }: RowsProps) {
   const agent = props.agent ?? {
     displayName: "Personal Mind",
     shared: props.services.some((service) => service.is_shared === true),
     services: props.services,
   };
-  return <Rows {...(props as ComponentProps<typeof Rows>)} agent={agent} />;
+  const target = props.secretPath ? props : { agentName: "personal", ...props };
+  return (
+    <Rows
+      {...(target as ComponentProps<typeof Rows>)}
+      onChanged={onChanged}
+      agent={agent}
+    />
+  );
 }
+const renderRows = (
+  services: EgressCredentialService[],
+  props: Omit<RowsProps, "services"> = {},
+) =>
+  render(<EgressServiceRows {...(props as RowsProps)} services={services} />);
 
 const github: EgressCredentialService = {
   name: "github",
@@ -104,13 +123,7 @@ afterEach(() => {
 
 describe("egress service rows", () => {
   it("shows name, description and the Key saved or Not set status", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github, openai]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([github, openai]);
     expect(within(row("GitHub")).getByText("Not set")).toBeInTheDocument();
     expect(
       within(row("GitHub")).getByText("GitHub API and git over HTTPS"),
@@ -128,13 +141,7 @@ describe("egress service rows", () => {
 
   it("shows the update date for a key with a known timestamp", () => {
     const updatedAt = "2026-10-05T12:00:00+00:00";
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[{ ...openai, key_updated_at: updatedAt }]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([{ ...openai, key_updated_at: updatedAt }]);
     expect(
       screen.getByText(`Key saved ${new Date(updatedAt).toLocaleDateString()}`),
     ).toBeInTheDocument();
@@ -142,13 +149,7 @@ describe("egress service rows", () => {
 
   it("saves the key, clears the input and reports the change", async () => {
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([github], { onChanged });
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     const input = screen.getByLabelText("GitHub API key");
     expect(input).toHaveAttribute("type", "password");
@@ -171,13 +172,7 @@ describe("egress service rows", () => {
   });
 
   it("encodes the agent and service names in the request path", async () => {
-    render(
-      <EgressServiceRows
-        agentName="my agent"
-        services={[{ ...github, name: "git/hub" }]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([{ ...github, name: "git/hub" }], { agentName: "my agent" });
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
@@ -190,15 +185,11 @@ describe("egress service rows", () => {
   });
 
   it("writes to a custom secret path instead of the connections API", async () => {
-    render(
-      <EgressServiceRows
-        secretPath={(name) => `/custom/${name}/secret`}
-        servicesPath="/custom/services"
-        accountPath={(name, action) => `/custom/${name}/${action}`}
-        services={[github]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([github], {
+      secretPath: (name) => `/custom/${name}/secret`,
+      servicesPath: "/custom/services",
+      accountPath: (name, action) => `/custom/${name}/${action}`,
+    });
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
@@ -209,13 +200,7 @@ describe("egress service rows", () => {
   });
 
   it("cancels without sending anything and drops the typed value", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[openai]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([openai]);
     fireEvent.click(
       screen.getByRole("button", { name: "Replace key for OpenAI" }),
     );
@@ -232,13 +217,7 @@ describe("egress service rows", () => {
   });
 
   it("keeps Save disabled until a key is typed", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([github]);
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
@@ -252,13 +231,7 @@ describe("egress service rows", () => {
     vi.mocked(fetch).mockImplementation(async () =>
       json({ detail: "Secret cannot be empty or whitespace" }, 422),
     );
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([github], { onChanged });
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
@@ -273,13 +246,7 @@ describe("egress service rows", () => {
 
   it("removes a key only after confirmation", async () => {
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[openai]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([openai], { onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
@@ -297,13 +264,7 @@ describe("egress service rows", () => {
   });
 
   it("does not remove the key when the confirmation is cancelled", async () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[openai]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([openai]);
     fireEvent.click(
       screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
@@ -312,36 +273,22 @@ describe("egress service rows", () => {
   });
 
   it("offers no Remove for a service without a key", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([github]);
     expect(screen.queryByRole("button", { name: /Remove/ })).toBeNull();
   });
 
   it("shows status only to users who cannot manage the shared key", () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[{ ...openai, is_shared: true, can_manage: false }]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([{ ...openai, is_shared: true, can_manage: false }], {
+      agentName: "shared_dev",
+    });
     expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("warns that a shared key affects everyone who relies on it", async () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[{ ...openai, is_shared: true, can_manage: true }]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([{ ...openai, is_shared: true, can_manage: true }], {
+      agentName: "shared_dev",
+    });
     fireEvent.click(
       screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
@@ -354,13 +301,7 @@ describe("egress service rows", () => {
 
   it("reports a forbidden save with the connections wording by default", async () => {
     vi.mocked(fetch).mockImplementation(async () => json({}, 403));
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([github]);
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     fireEvent.change(screen.getByLabelText("GitHub API key"), {
       target: { value: "abc" },
@@ -374,16 +315,12 @@ describe("egress service rows", () => {
   });
 
   it("uses the supplied wording for 403 and 404 responses", async () => {
-    render(
-      <EgressServiceRows
-        secretPath={(name) => `/custom/${name}/secret`}
-        servicesPath="/custom/services"
-        accountPath={(name, action) => `/custom/${name}/${action}`}
-        errorMessages={{ forbidden: "No access.", notFound: "Gone." }}
-        services={[openai]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([openai], {
+      secretPath: (name) => `/custom/${name}/secret`,
+      servicesPath: "/custom/services",
+      accountPath: (name, action) => `/custom/${name}/${action}`,
+      errorMessages: { forbidden: "No access.", notFound: "Gone." },
+    });
     fireEvent.click(
       screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
@@ -439,13 +376,7 @@ describe("connected accounts", () => {
   }
 
   it("offers Connect first and keeps the key behind a secondary toggle", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount()]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([withAccount()]);
     const github = row("GitHub");
     expect(within(github).getByText("Not set")).toBeInTheDocument();
     expect(
@@ -478,13 +409,7 @@ describe("connected accounts", () => {
   it("opens the popup, calls the connect endpoint and reports the change", async () => {
     vi.mocked(fetch).mockImplementation(async () => json(authorization));
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="my agent"
-        services={[withAccount()]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([withAccount()], { agentName: "my agent", onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     );
@@ -522,13 +447,7 @@ describe("connected accounts", () => {
       );
     const startConnect = async (onChanged = vi.fn()) => {
       vi.mocked(fetch).mockImplementation(async () => json(authorization));
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={[withAccount()]}
-          onChanged={onChanged}
-        />,
-      );
+      renderRows([withAccount()], { onChanged });
       fireEvent.click(
         screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
       );
@@ -580,15 +499,12 @@ describe("connected accounts", () => {
         : json({ status: "disconnected", provider: "github" }),
     );
     const onChanged = vi.fn();
-    const { rerender } = render(
-      <EgressServiceRows
-        secretPath={(name) => `/custom/${name}/secret`}
-        servicesPath="/custom/services"
-        accountPath={(name, action) => `/custom/${name}/${action}?agent_name=a`}
-        services={[withAccount()]}
-        onChanged={onChanged}
-      />,
-    );
+    const { rerender } = renderRows([withAccount()], {
+      secretPath: (name) => `/custom/${name}/secret`,
+      servicesPath: "/custom/services",
+      accountPath: (name, action) => `/custom/${name}/${action}?agent_name=a`,
+      onChanged,
+    });
     fireEvent.click(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     );
@@ -627,13 +543,7 @@ describe("connected accounts", () => {
   it("shows the server error and does not report a change when connecting fails", async () => {
     vi.mocked(fetch).mockImplementation(async () => json({}, 409));
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount()]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([withAccount()], { onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     );
@@ -648,13 +558,7 @@ describe("connected accounts", () => {
 
   it("tells the user when the browser blocks the popup", async () => {
     vi.mocked(window.open).mockReturnValue(null);
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount()]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([withAccount()]);
     fireEvent.click(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     );
@@ -665,13 +569,7 @@ describe("connected accounts", () => {
   });
 
   it("offers Connect only when the server says the account is connectable", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount({ can_connect: false })]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([withAccount({ can_connect: false })]);
     expect(screen.queryByRole("button", { name: /Connect/ })).toBeNull();
     expect(
       screen.getByRole("button", { name: "Use an API key instead for GitHub" }),
@@ -679,13 +577,9 @@ describe("connected accounts", () => {
   });
 
   it("lets a user without key rights connect a requester-scoped account", () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[withAccount({}, { is_shared: true, can_manage: false })]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([withAccount({}, { is_shared: true, can_manage: false })], {
+      agentName: "shared_dev",
+    });
     expect(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeEnabled();
@@ -695,17 +589,14 @@ describe("connected accounts", () => {
   });
 
   it("offers no actions to a user who can neither connect nor manage", () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[
-          withAccount(
-            { connected: true, can_connect: false },
-            { is_shared: true, can_manage: false, active_source: "oauth" },
-          ),
-        ]}
-        onChanged={vi.fn()}
-      />,
+    renderRows(
+      [
+        withAccount(
+          { connected: true, can_connect: false },
+          { is_shared: true, can_manage: false, active_source: "oauth" },
+        ),
+      ],
+      { agentName: "shared_dev" },
     );
     expect(
       within(row("GitHub")).getByText(
@@ -716,13 +607,7 @@ describe("connected accounts", () => {
   });
 
   it("shows the connected account with Disconnect", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[connectedGithub]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([connectedGithub]);
     const github = row("GitHub");
     expect(
       within(github).getByText("Connected as octocat"),
@@ -736,18 +621,12 @@ describe("connected accounts", () => {
   });
 
   it("says Connected when the provider gives no account label", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[
-          withAccount(
-            { connected: true },
-            { configured: true, active_source: "oauth" },
-          ),
-        ]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([
+      withAccount(
+        { connected: true },
+        { configured: true, active_source: "oauth" },
+      ),
+    ]);
     expect(within(row("GitHub")).getByText("Connected")).toBeInTheDocument();
   });
 
@@ -756,13 +635,7 @@ describe("connected accounts", () => {
       json({ status: "disconnected", provider: "github" }),
     );
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[connectedGithub]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([connectedGithub], { onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
     );
@@ -781,13 +654,7 @@ describe("connected accounts", () => {
   });
 
   it("does not disconnect when the confirmation is cancelled", async () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[connectedGithub]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([connectedGithub]);
     fireEvent.click(
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
     );
@@ -800,18 +667,12 @@ describe("connected accounts", () => {
   });
 
   it("says the API key is in use and keeps its controls visible", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[
-          withAccount(
-            { connected: true, account_label: "octocat" },
-            { configured: true, active_source: "key", key_configured: true },
-          ),
-        ]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([
+      withAccount(
+        { connected: true, account_label: "octocat" },
+        { configured: true, active_source: "key", key_configured: true },
+      ),
+    ]);
     const github = row("GitHub");
     expect(within(github).getByText("Using API key")).toBeInTheDocument();
     expect(within(github).queryByText(/Connected as/)).toBeNull();
@@ -829,13 +690,7 @@ describe("connected accounts", () => {
   });
 
   it("offers only Reset connection while the saved connection needs a reset", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount({ reset_required: true })]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([withAccount({ reset_required: true })]);
     const github = row("GitHub");
     expect(within(github).getByText("Reset required")).toBeInTheDocument();
     expect(
@@ -850,26 +705,23 @@ describe("connected accounts", () => {
   });
 
   it("lets a user without key rights disconnect their requester-scoped account", () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[
-          withAccount(
-            {
-              connected: true,
-              account_label: "octocat",
-              shared_worker_opt_in: true,
-            },
-            {
-              is_shared: true,
-              can_manage: false,
-              configured: true,
-              active_source: "oauth",
-            },
-          ),
-        ]}
-        onChanged={vi.fn()}
-      />,
+    renderRows(
+      [
+        withAccount(
+          {
+            connected: true,
+            account_label: "octocat",
+            shared_worker_opt_in: true,
+          },
+          {
+            is_shared: true,
+            can_manage: false,
+            configured: true,
+            active_source: "oauth",
+          },
+        ),
+      ],
+      { agentName: "shared_dev" },
     );
     expect(
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
@@ -880,17 +732,14 @@ describe("connected accounts", () => {
   });
 
   it("explains that personal accounts cannot be used by a shared agent", () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[
-          withAccount(
-            { can_connect: false, unavailable_reason: "shared_sandbox" },
-            { is_shared: true },
-          ),
-        ]}
-        onChanged={vi.fn()}
-      />,
+    renderRows(
+      [
+        withAccount(
+          { can_connect: false, unavailable_reason: "shared_sandbox" },
+          { is_shared: true },
+        ),
+      ],
+      { agentName: "shared_dev" },
     );
     const github = row("GitHub");
     expect(
@@ -909,14 +758,9 @@ describe("connected accounts", () => {
   });
 
   it("warns that everyone using a shared agent can act with an opted-in account", () => {
-    render(
-      <EgressServiceRows
-        agentName="shared_dev"
-        services={[
-          withAccount({ shared_worker_opt_in: true }, { is_shared: true }),
-        ]}
-        onChanged={vi.fn()}
-      />,
+    renderRows(
+      [withAccount({ shared_worker_opt_in: true }, { is_shared: true })],
+      { agentName: "shared_dev" },
     );
     const github = row("GitHub");
     expect(
@@ -934,13 +778,7 @@ describe("connected accounts", () => {
       json({ status: "disconnected", provider: "github" }),
     );
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount({ reset_required: true })]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([withAccount({ reset_required: true })], { onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Reset connection for GitHub" }),
     );
@@ -959,13 +797,7 @@ describe("connected accounts", () => {
   it("stops waiting for authorization when Cancel is clicked", async () => {
     vi.mocked(fetch).mockImplementation(async () => json(authorization));
     const onChanged = vi.fn();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount()]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([withAccount()], { onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     );
@@ -982,13 +814,7 @@ describe("connected accounts", () => {
   });
 
   it("explains a shared service account and offers no connect action", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount({ service_account: true, can_connect: false })]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([withAccount({ service_account: true, can_connect: false })]);
     expect(
       within(row("GitHub")).getByText("Uses a shared service account"),
     ).toBeInTheDocument();
@@ -996,13 +822,7 @@ describe("connected accounts", () => {
   });
 
   it("leaves services without an account provider as plain key rows", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[github]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([github]);
     expect(screen.queryByRole("button", { name: /Connect/ })).toBeNull();
     expect(screen.queryByText("Use an API key instead")).toBeNull();
     expect(
@@ -1036,14 +856,7 @@ describe("egress service rows with service editing", () => {
   });
 
   it("offers Edit and Delete for the editable source and labels the rest", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[mine, theirs]}
-        onChanged={vi.fn()}
-        serviceEditing={editing()}
-      />,
-    );
+    renderRows([mine, theirs], { serviceEditing: editing() });
     expect(
       within(row("Mine")).getByRole("button", {
         name: "Edit service for Mine",
@@ -1066,37 +879,17 @@ describe("egress service rows with service editing", () => {
   });
 
   it("hides Edit and Delete from someone who cannot manage the service", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[{ ...mine, can_manage: false }]}
-        onChanged={vi.fn()}
-        serviceEditing={editing()}
-      />,
-    );
+    renderRows([{ ...mine, can_manage: false }], { serviceEditing: editing() });
     expect(screen.queryByRole("button", { name: /Edit|Delete/ })).toBeNull();
   });
 
   it("offers nothing without service editing", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[mine]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([mine]);
     expect(screen.queryByRole("button", { name: /Edit|Delete/ })).toBeNull();
   });
 
   it("turns Edit and Delete off while something else is being written", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[mine]}
-        onChanged={vi.fn()}
-        serviceEditing={editing({ disabled: true })}
-      />,
-    );
+    renderRows([mine], { serviceEditing: editing({ disabled: true }) });
     expect(
       screen.getByRole("button", { name: "Edit service for Mine" }),
     ).toBeDisabled();
@@ -1111,14 +904,7 @@ describe("egress service rows with service editing", () => {
 
   it("hands the service to the Edit callback", () => {
     const serviceEditing = editing();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[mine]}
-        onChanged={vi.fn()}
-        serviceEditing={serviceEditing}
-      />,
-    );
+    renderRows([mine], { serviceEditing });
     fireEvent.click(
       screen.getByRole("button", { name: "Edit service for Mine" }),
     );
@@ -1127,14 +913,7 @@ describe("egress service rows with service editing", () => {
 
   it("deletes only after the warning is confirmed", async () => {
     const serviceEditing = editing();
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[mine]}
-        onChanged={vi.fn()}
-        serviceEditing={serviceEditing}
-      />,
-    );
+    renderRows([mine], { serviceEditing });
     fireEvent.click(
       screen.getByRole("button", { name: "Delete service for Mine" }),
     );
@@ -1164,14 +943,7 @@ describe("egress service rows with service editing", () => {
         throw new Error("Service is not a service of your own");
       }),
     });
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[mine]}
-        onChanged={vi.fn()}
-        serviceEditing={serviceEditing}
-      />,
-    );
+    renderRows([mine], { serviceEditing });
     fireEvent.click(
       screen.getByRole("button", { name: "Delete service for Mine" }),
     );
@@ -1206,20 +978,6 @@ describe("rows with an agent's wording", () => {
     key_updated_at: "2026-10-05T12:00:00+00:00",
     ...overrides,
   });
-  const renderRows = (
-    services: EgressCredentialService[],
-    rowAgent: RowAgent = agent({ services }),
-    extra: { serviceEditing?: ServiceEditing } = {},
-  ) =>
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={services}
-        onChanged={vi.fn()}
-        agent={rowAgent}
-        {...extra}
-      />,
-    );
 
   it("says Key saved with the date, and Set key, Replace key and Remove key on the buttons", () => {
     renderRows([github, keyed()]);
@@ -1287,10 +1045,9 @@ describe("rows with an agent's wording", () => {
         active_source: "oauth",
       },
     );
-    renderRows(
-      [shared],
-      agent({ displayName: "Shared Dev", services: [shared] }),
-    );
+    renderRows([shared], {
+      agent: agent({ displayName: "Shared Dev", services: [shared] }),
+    });
     expect(
       within(row("GitHub")).getByText(
         "Connected as team@example.org · shared with everyone using Shared Dev",
@@ -1303,10 +1060,9 @@ describe("rows with an agent's wording", () => {
       { connected: true, account_label: null },
       { is_shared: true, configured: true, active_source: "oauth" },
     );
-    renderRows(
-      [shared],
-      agent({ displayName: "Shared Dev", services: [shared] }),
-    );
+    renderRows([shared], {
+      agent: agent({ displayName: "Shared Dev", services: [shared] }),
+    });
     expect(
       within(row("GitHub")).getByText(
         "Connected · shared with everyone using Shared Dev",
@@ -1343,10 +1099,9 @@ describe("rows with an agent's wording", () => {
     });
 
     it("asks Connect a shared account? and only goes on after Continue", async () => {
-      renderRows(
-        [sharedGoogle],
-        agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
-      );
+      renderRows([sharedGoogle], {
+        agent: agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
+      });
       fireEvent.click(
         screen.getByRole("button", { name: "Connect Google for Gmail" }),
       );
@@ -1374,10 +1129,9 @@ describe("rows with an agent's wording", () => {
     });
 
     it("sends nothing when the question is cancelled", async () => {
-      renderRows(
-        [sharedGoogle],
-        agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
-      );
+      renderRows([sharedGoogle], {
+        agent: agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
+      });
       fireEvent.click(
         screen.getByRole("button", { name: "Connect Google for Gmail" }),
       );
@@ -1390,10 +1144,9 @@ describe("rows with an agent's wording", () => {
 
     it("starts one connection when Continue is clicked twice before the page updates", async () => {
       vi.mocked(fetch).mockImplementation(() => new Promise(() => {}));
-      renderRows(
-        [sharedGoogle],
-        agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
-      );
+      renderRows([sharedGoogle], {
+        agent: agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
+      });
       fireEvent.click(
         screen.getByRole("button", { name: "Connect Google for Gmail" }),
       );
@@ -1415,7 +1168,7 @@ describe("rows with an agent's wording", () => {
         { shared_worker_opt_in: true },
         { is_shared: true },
       );
-      renderRows([optedIn], agent({ services: [optedIn] }));
+      renderRows([optedIn], { agent: agent({ services: [optedIn] }) });
       fireEvent.click(
         screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
       );
@@ -1432,7 +1185,7 @@ describe("rows with an agent's wording", () => {
         },
         { is_shared: true, configured: true, active_source: "oauth" },
       );
-      renderRows([optedIn], agent({ services: [optedIn] }));
+      renderRows([optedIn], { agent: agent({ services: [optedIn] }) });
       expect(
         within(row("GitHub")).getByText("Connected as octocat"),
       ).toBeVisible();
@@ -1441,7 +1194,7 @@ describe("rows with an agent's wording", () => {
 
     it("does not ask on a personal agent", async () => {
       const personal = { ...sharedGoogle, is_shared: false };
-      renderRows([personal], agent({ services: [personal] }));
+      renderRows([personal], { agent: agent({ services: [personal] }) });
       fireEvent.click(
         screen.getByRole("button", { name: "Connect Google for Gmail" }),
       );
@@ -1457,13 +1210,12 @@ describe("rows with an agent's wording", () => {
     );
 
     it("tells a non-manager whom to ask", () => {
-      renderRows(
-        [refused],
-        agent({
+      renderRows([refused], {
+        agent: agent({
           managers: ["@bob:example.org", "@carol:example.org"],
           services: [refused],
         }),
-      );
+      });
       expect(
         within(row("GitHub")).getByText(
           "Personal GitHub accounts can't be used by shared agents. Ask @bob:example.org and @carol:example.org to add a team API key.",
@@ -1472,7 +1224,9 @@ describe("rows with an agent's wording", () => {
     });
 
     it("tells a non-manager to ask an administrator when there are no managers", () => {
-      renderRows([refused], agent({ managers: [], services: [refused] }));
+      renderRows([refused], {
+        agent: agent({ managers: [], services: [refused] }),
+      });
       expect(
         within(row("GitHub")).getByText(
           /Ask an administrator to add a team API key\.$/,
@@ -1482,10 +1236,9 @@ describe("rows with an agent's wording", () => {
 
     it("tells a manager to add a team key", () => {
       const asManager = { ...refused, can_manage: true };
-      renderRows(
-        [asManager],
-        agent({ managers: ["@bob:example.org"], services: [asManager] }),
-      );
+      renderRows([asManager], {
+        agent: agent({ managers: ["@bob:example.org"], services: [asManager] }),
+      });
       expect(
         within(row("GitHub")).getByText(
           "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
@@ -1503,10 +1256,9 @@ describe("rows with an agent's wording", () => {
       "Personal GitHub accounts can't be used in this sandbox, which other users' commands share. Add an API key instead.";
 
     it("says the sandbox is shared with other users, not that the agent is shared", () => {
-      renderRows(
-        [refusedForPersonal],
-        agent({ shared: false, services: [refusedForPersonal] }),
-      );
+      renderRows([refusedForPersonal], {
+        agent: agent({ shared: false, services: [refusedForPersonal] }),
+      });
       const github = row("GitHub");
       expect(within(github).getByText(SANDBOX_TEXT)).toBeVisible();
       expect(within(github).queryByText(/shared agents/)).toBeNull();
@@ -1521,24 +1273,22 @@ describe("rows with an agent's wording", () => {
     });
 
     it("does not name managers or say to ask anyone", () => {
-      renderRows(
-        [refusedForPersonal],
-        agent({
+      renderRows([refusedForPersonal], {
+        agent: agent({
           shared: false,
           managers: ["@bob:example.org"],
           services: [refusedForPersonal],
         }),
-      );
+      });
       expect(screen.queryByText(/@bob:example.org/)).toBeNull();
       expect(screen.queryByText(/Ask /)).toBeNull();
     });
 
     it("keeps the shared agent's text for a shared agent", () => {
       const refusedForShared = { ...refusedForPersonal, is_shared: true };
-      renderRows(
-        [refusedForShared],
-        agent({ shared: true, services: [refusedForShared] }),
-      );
+      renderRows([refusedForShared], {
+        agent: agent({ shared: true, services: [refusedForShared] }),
+      });
       expect(
         within(row("GitHub")).getByText(
           "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
@@ -1569,14 +1319,7 @@ describe("rows with an agent's wording", () => {
         json({ status: "disconnected", provider: "github" }),
       );
       const onChanged = vi.fn();
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={listing}
-          onChanged={onChanged}
-          agent={agent({ services: listing })}
-        />,
-      );
+      renderRows(listing, { onChanged, agent: agent({ services: listing }) });
       fireEvent.click(
         within(row("GitHub")).getByRole("button", {
           name: "Disconnect for GitHub",
@@ -1621,7 +1364,7 @@ describe("rows with an agent's wording", () => {
     it("offers it on an administrator's GitHub row to someone who can manage the agent", () => {
       const onLimitToRepositories = vi.fn();
       const service = base();
-      renderRows([service], undefined, {
+      renderRows([service], {
         serviceEditing: limiting({ onLimitToRepositories }),
       });
       const button = within(row("GitHub")).getByRole("button", {
@@ -1642,19 +1385,19 @@ describe("rows with an agent's wording", () => {
         }),
       ],
     ])("does not offer it when %s", (_why, service) => {
-      renderRows([service], undefined, { serviceEditing: limiting() });
+      renderRows([service], { serviceEditing: limiting() });
       expect(screen.queryByText("Limit to repositories")).toBeNull();
     });
 
     it("does not offer it without a handler, as on the dashboard", () => {
-      renderRows([base()], undefined, {
+      renderRows([base()], {
         serviceEditing: limiting({ onLimitToRepositories: undefined }),
       });
       expect(screen.queryByText("Limit to repositories")).toBeNull();
     });
 
     it("turns it off while the editor is open or something is being written", () => {
-      renderRows([base()], undefined, {
+      renderRows([base()], {
         serviceEditing: limiting({ limitDisabled: true }),
       });
       expect(
@@ -1663,7 +1406,7 @@ describe("rows with an agent's wording", () => {
         }),
       ).toBeDisabled();
       cleanup();
-      renderRows([base()], undefined, {
+      renderRows([base()], {
         serviceEditing: limiting({ disabled: true }),
       });
       expect(
@@ -1723,7 +1466,7 @@ describe("rows with an agent's wording", () => {
       rules: [{ host: "api.github.com", port: null, path_prefix: "/" }],
     };
     const keyed = { ...openai, name: "openai", display_name: "OpenAI" };
-    renderRows([limitable, keyed], undefined, {
+    renderRows([limitable, keyed], {
       serviceEditing: {
         editableSource: "user",
         onEdit: vi.fn(),
@@ -1773,7 +1516,7 @@ describe("rows with an agent's wording", () => {
         active_source: null,
       },
     );
-    renderRows([connected, needsReset], undefined, {
+    renderRows([connected, needsReset], {
       serviceEditing: {
         editableSource: "user",
         onEdit: vi.fn(),
@@ -1893,7 +1636,9 @@ describe("rows with an agent's wording", () => {
         is_shared: true,
         rules: [rule("api.openai.com")],
       };
-      renderRows([shared], agent({ shared: true, services: [shared] }));
+      renderRows([shared], {
+        agent: agent({ shared: true, services: [shared] }),
+      });
       expect(
         within(row("OpenAI")).getByText("Sends to api.openai.com"),
       ).toBeVisible();
@@ -1921,14 +1666,7 @@ describe("rows with an agent's wording", () => {
 
     it("leave out every way to set, remove, or connect a key or account", () => {
       const services = [connectable, keyedConnected, openai];
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={services}
-          onChanged={vi.fn()}
-          hideKeyActions
-        />,
-      );
+      renderRows(services, { hideKeyActions: true });
       expect(
         screen.queryByRole("button", {
           name: /^(Set|Replace|Remove) key for |^Connect |^Disconnect |^Use an API key/,
@@ -1939,15 +1677,10 @@ describe("rows with an agent's wording", () => {
     });
 
     it("keep what changes the service itself", () => {
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={[{ ...openai, source: "user" }]}
-          onChanged={vi.fn()}
-          serviceEditing={editing}
-          hideKeyActions
-        />,
-      );
+      renderRows([{ ...openai, source: "user" }], {
+        serviceEditing: editing,
+        hideKeyActions: true,
+      });
       expect(
         screen.getByRole("button", { name: "Edit service for OpenAI" }),
       ).toBeEnabled();
@@ -1958,26 +1691,15 @@ describe("rows with an agent's wording", () => {
     });
 
     it("also leave out Reset connection", () => {
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={[withAccount({ reset_required: true })]}
-          onChanged={vi.fn()}
-          hideKeyActions
-        />,
-      );
+      renderRows([withAccount({ reset_required: true })], {
+        hideKeyActions: true,
+      });
       expect(screen.queryByRole("button", { name: /Reset/ })).toBeNull();
       expect(within(row("GitHub")).getByText("Reset required")).toBeVisible();
     });
 
     it("keep every key action by default", () => {
-      render(
-        <EgressServiceRows
-          agentName="personal"
-          services={[connectable, openai]}
-          onChanged={vi.fn()}
-        />,
-      );
+      renderRows([connectable, openai]);
       expect(
         screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
       ).toBeEnabled();
@@ -1988,7 +1710,7 @@ describe("rows with an agent's wording", () => {
   });
 
   it("shows no administrator badge when no label is given", () => {
-    renderRows([{ ...github, source: "config" }], undefined, {
+    renderRows([{ ...github, source: "config" }], {
       serviceEditing: {
         editableSource: "user",
         onEdit: vi.fn(),
@@ -2024,14 +1746,6 @@ describe("what a row says about how the key is sent", () => {
     placeholder_names: [],
     ...changes,
   });
-  const renderRows = (services: EgressCredentialService[]) =>
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={services}
-        onChanged={vi.fn()}
-      />,
-    );
 
   it.each<[string, EgressRuleSummary, string]>([
     ["bearer", rule("a.example.com", "bearer"), "Sent as a bearer token"],
@@ -2203,17 +1917,8 @@ describe("a shared agent's key where a personal account is refused", () => {
 });
 
 describe("the other way to connect when an account is connected", () => {
-  const renderRows = (service: EgressCredentialService) =>
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[service]}
-        onChanged={vi.fn()}
-      />,
-    );
-
   it("offers an API key instead of the account once the account is connected", () => {
-    renderRows(connectedGithub);
+    renderRows([connectedGithub]);
     expect(
       within(row("GitHub")).getByRole("button", {
         name: "Use an API key instead of the account for GitHub",
@@ -2222,7 +1927,7 @@ describe("the other way to connect when an account is connected", () => {
   });
 
   it("keeps the shorter wording while no account is connected", () => {
-    renderRows(withAccount());
+    renderRows([withAccount()]);
     expect(
       within(row("GitHub")).getByRole("button", {
         name: "Use an API key instead for GitHub",
@@ -2246,13 +1951,7 @@ describe("a limit's own row", () => {
   });
 
   it("shows no empty line for a limit without a description", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[limit()]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([limit()]);
     const paragraphs = Array.from(
       row("GitHub (a/b)").querySelectorAll("p"),
     ).map((paragraph) => paragraph.textContent);
@@ -2260,13 +1959,7 @@ describe("a limit's own row", () => {
   });
 
   it("shows the description when there is one", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[limit({ description: "Limited to a/b" })]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([limit({ description: "Limited to a/b" })]);
     expect(
       within(row("GitHub (a/b)")).getByText("Limited to a/b"),
     ).toBeVisible();
@@ -2292,24 +1985,12 @@ describe("what a limited service says it is limited to", () => {
   });
 
   it("names the repositories", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[custom(false)]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([custom(false)]);
     expect(within(row("Mine")).getByText("Limited to a/b")).toBeVisible();
   });
 
   it("adds that GraphQL reaches every repository the key can reach when the limit allows it", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[custom(true)]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([custom(true)]);
     expect(
       within(row("Mine")).getByText(
         "Limited to a/b (plus GraphQL, which reaches every repository the key can reach)",
@@ -2318,21 +1999,15 @@ describe("what a limited service says it is limited to", () => {
   });
 
   it("says nothing of a limit when the rules also allow other GitHub paths", () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[
-          {
-            ...custom(false),
-            rules: [
-              ...rules(false),
-              { host: "api.github.com", port: null, path_prefix: "/user" },
-            ],
-          },
-        ]}
-        onChanged={vi.fn()}
-      />,
-    );
+    renderRows([
+      {
+        ...custom(false),
+        rules: [
+          ...rules(false),
+          { host: "api.github.com", port: null, path_prefix: "/user" },
+        ],
+      },
+    ]);
     expect(screen.queryByText(/Limited to/)).toBeNull();
   });
 });
@@ -2372,13 +2047,7 @@ describe("a popup that closes without answering", () => {
   const reads = (path: string) =>
     vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === path);
   const connectAndClose = async (onChanged = vi.fn()) => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[withAccount()]}
-        onChanged={onChanged}
-      />,
-    );
+    renderRows([withAccount()], { onChanged });
     fireEvent.click(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
     );
