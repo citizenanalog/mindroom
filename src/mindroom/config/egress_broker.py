@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from mindroom.credentials.policy import is_oauth_client_config_service, is_oauth_token_service
+from mindroom.egress_broker.env import RUNNER_CA_BUNDLE_ENV
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ _RESERVED_AUTH_HEADERS = frozenset(
     },
 )
 
+_PLACEHOLDER_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 # Reserved env names that cannot be used as placeholder names
 _RESERVED_EXACT = {"PATH", "HOME"}
 RESERVED_PLACEHOLDER_PREFIXES = frozenset({"MINDROOM_", "GIT_CONFIG_"})
@@ -48,13 +50,7 @@ _RESERVED_PROXY_VARS = {
     "no_proxy",
     "all_proxy",
 }
-_RESERVED_CA_VARS = {
-    "SSL_CERT_FILE",
-    "REQUESTS_CA_BUNDLE",
-    "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",
-    "NODE_EXTRA_CA_CERTS",
-}
+_RESERVED_CA_VARS = {*RUNNER_CA_BUNDLE_ENV, "NODE_EXTRA_CA_CERTS"}
 # Every exact name a placeholder cannot take; the prefixes above are refused on top of these.
 RESERVED_PLACEHOLDER_NAMES = frozenset(_RESERVED_EXACT | _RESERVED_PROXY_VARS | _RESERVED_CA_VARS)
 # EgressService fields that only matter for a service that sends a credential; restrict_only services cannot set them.
@@ -306,12 +302,10 @@ class EgressService(BaseModel):
     @classmethod
     def validate_placeholder_env(cls, value: dict[str, str]) -> dict[str, str]:
         """Validate placeholder env names."""
-        pattern = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-
         for name in value:
             # Must match pattern
-            if not pattern.fullmatch(name):
-                msg = f"placeholder_env name '{name}' must match ^[A-Z_][A-Z0-9_]*$"
+            if not _PLACEHOLDER_NAME_PATTERN.fullmatch(name):
+                msg = f"placeholder_env name '{name}' must match {_PLACEHOLDER_NAME_PATTERN.pattern}"
                 raise ValueError(msg)
 
             # Check exact reserved names
@@ -337,7 +331,7 @@ def validate_egress_service_name(name: str) -> None:
     A name starts with `[a-z0-9]`, so no service's secret can take a reserved `egress__*` store name.
     """
     if not _SERVICE_NAME_PATTERN.fullmatch(name):
-        msg = f"service name '{name}' must match ^[a-z0-9][a-z0-9_-]{{0,62}}$"
+        msg = f"service name '{name}' must match {_SERVICE_NAME_PATTERN.pattern}"
         raise ValueError(msg)
     # Secrets are stored as `egress_<name>`; OAuth suffixes there would read as OAuth services.
     credential_service = f"egress_{name}"

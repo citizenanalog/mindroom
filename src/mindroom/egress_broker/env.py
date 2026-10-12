@@ -12,12 +12,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BROKER_CA_PEM_ENV",
+    "RUNNER_CA_BUNDLE_ENV",
     "apply_runner_ca_bundle",
     "broker_execution_env",
     "primary_callback_hosts",
 ]
 
 BROKER_CA_PEM_ENV = "MINDROOM_EGRESS_BROKER_CA_PEM"
+# The env names the runner points at the combined CA bundle; NODE_EXTRA_CA_CERTS gets the broker-only file.
+RUNNER_CA_BUNDLE_ENV = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
 # Not a secret: the broker ignores it. Clients that drop credentials with an empty password need a value here.
 _PROXY_PASSWORD = "mindroom"  # noqa: S105
 
@@ -116,10 +119,8 @@ def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> bool:
     combined, broker_only = materialize_ca_bundle(ca_pem, directory)
 
     # Set CA env vars
-    env["SSL_CERT_FILE"] = str(combined)
-    env["REQUESTS_CA_BUNDLE"] = str(combined)
-    env["CURL_CA_BUNDLE"] = str(combined)
-    env["GIT_SSL_CAINFO"] = str(combined)
+    for name in RUNNER_CA_BUNDLE_ENV:
+        env[name] = str(combined)
     env["NODE_EXTRA_CA_CERTS"] = str(broker_only)
 
     return True
