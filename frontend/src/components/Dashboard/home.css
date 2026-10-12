@@ -111,7 +111,7 @@
 }
 .home-bar-column {
   text-align: center;
-  font-size: 10px;
+  font-size: 11px;
   color: hsl(var(--muted-foreground));
 }
 .home-bar-track {
@@ -149,7 +149,7 @@
 }
 .home-report-date {
   margin-top: 3px;
-  font-size: 10px;
+  font-size: 11px;
   color: hsl(var(--muted-foreground));
 }
 .home-link {
@@ -201,7 +201,7 @@
   width: 60px;
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
-  font-size: 10px;
+  font-size: 11px;
   color: hsl(var(--muted-foreground));
 }
 .home-schedule-time strong {
@@ -324,7 +324,7 @@
 .home-room-members > .home-member-overflow {
   margin-left: 7px;
   color: hsl(var(--muted-foreground));
-  font-size: 10px;
+  font-size: 11px;
 }
 .home-room-arrow {
   flex-shrink: 0;

@@ -377,7 +377,7 @@ function AppContent() {
               alt="MindRoom logo"
               className="h-7 w-7 shrink-0 md:hidden"
             />
-            <h1 className="truncate text-[15px] font-semibold tracking-tight">
+            <h1 className="truncate font-display text-xl font-semibold tracking-tight">
               {currentNavItem.label}
             </h1>
           </div>
