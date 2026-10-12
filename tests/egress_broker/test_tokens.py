@@ -288,34 +288,8 @@ def test_to_worker_target_roundtrip_preserves_scope_agent_requester() -> None:
     claims = WorkerClaims.from_worker_target(original_target)
     assert claims is not None
 
-    rebuilt_target = claims.to_worker_target()
-
-    # These should be preserved
-    assert rebuilt_target.worker_scope == original_target.worker_scope
-    assert rebuilt_target.routing_agent_name == original_target.routing_agent_name
-    assert rebuilt_target.tenant_id == original_target.tenant_id
-    assert rebuilt_target.account_id == original_target.account_id
-    assert rebuilt_target.worker_key == original_target.worker_key
-
-    # Execution identity fields should be preserved except room/thread/session
-    assert rebuilt_target.execution_identity is not None
-    orig_identity = original_target.execution_identity
-    assert orig_identity is not None
-    rebuilt_identity = rebuilt_target.execution_identity
-    assert rebuilt_identity.channel == orig_identity.channel
-    assert rebuilt_identity.agent_name == orig_identity.agent_name
-    assert rebuilt_identity.requester_id == orig_identity.requester_id
-    assert rebuilt_identity.tenant_id == orig_identity.tenant_id
-    assert rebuilt_identity.account_id == orig_identity.account_id
-
-    # These should be None
-    assert rebuilt_identity.room_id is None
-    assert rebuilt_identity.thread_id is None
-    assert rebuilt_identity.resolved_thread_id is None
-    assert rebuilt_identity.session_id is None
-
-    # private_agent_names should be None (per spec)
-    assert rebuilt_target.private_agent_names is None
+    # The original has no room, thread, session, or private agent names, so the rebuilt target equals it.
+    assert claims.to_worker_target() == original_target
 
 
 @pytest.mark.parametrize(("worker_scope", "label"), [("user", "user"), (None, "unscoped")])
