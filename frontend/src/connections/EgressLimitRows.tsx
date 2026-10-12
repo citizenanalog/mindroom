@@ -3,7 +3,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { hostsNote, type ServiceEditing } from "./egressRowText";
+import { canEdit, hostsNote, type ServiceEditing } from "./egressRowText";
 import { errorText } from "./request";
 import type { EgressCredentialService } from "./types";
 
@@ -83,10 +83,6 @@ export function LimitRow({
 }) {
   const [error, setError] = useState<string | null>(null);
   const hosts = hostsNote(service)?.replace(/^Sends to/, "Limits requests to");
-  const canChange =
-    serviceEditing !== undefined &&
-    service.source === serviceEditing.editableSource &&
-    service.can_manage;
   return (
     <li
       aria-label={service.display_name}
@@ -111,7 +107,7 @@ export function LimitRow({
           <Badge variant="outline" className="font-normal">
             Limit only
           </Badge>
-          {canChange && serviceEditing && (
+          {canEdit(serviceEditing, service) && (
             <LimitActions
               limit={service}
               label={service.display_name}

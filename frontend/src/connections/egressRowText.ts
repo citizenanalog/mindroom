@@ -47,6 +47,16 @@ export interface ServiceEditing {
   limitDisabled?: boolean;
 }
 
+/** Whether a service or limit gets its edit actions: it has the `editableSource` and the viewer manages it. */
+export function canEdit(
+  editing: ServiceEditing | undefined,
+  service: EgressCredentialService | null,
+): editing is ServiceEditing {
+  return (
+    service?.can_manage === true && service.source === editing?.editableSource
+  );
+}
+
 /**
  * Whether connecting this account makes everyone who uses the agent act as it.
  * Not so for a personal account (the agent is not shared), a service account,

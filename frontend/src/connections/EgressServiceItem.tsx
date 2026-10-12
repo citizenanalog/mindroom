@@ -7,6 +7,7 @@ import { disconnectDescription } from "./accountCopy";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
   agentSeesNote,
+  canEdit,
   hostsNote,
   limitedNote,
   limitOf,
@@ -83,16 +84,8 @@ export function EgressServiceItem({
     (oauth.connected || oauth.reset_required) &&
     (service.can_manage || oauth.can_connect);
 
-  const canEditService =
-    serviceEditing !== undefined &&
-    service.source === serviceEditing.editableSource &&
-    service.can_manage;
   // A limit of the viewer's that narrows this administrator's service.
   const limit = limitOf(service, agent.services);
-  const canChangeLimit =
-    limit !== null &&
-    limit.source === serviceEditing?.editableSource &&
-    limit.can_manage;
   // A service that already has a limit changes or removes it instead of getting another.
   const canLimit =
     limit === null &&
@@ -224,7 +217,7 @@ export function EgressServiceItem({
               <p className="text-xs text-muted-foreground">
                 Limited to {limitTarget(limit)}
               </p>
-              {canChangeLimit && serviceEditing && (
+              {canEdit(serviceEditing, limit) && (
                 <LimitActions
                   limit={limit}
                   label={service.display_name}
@@ -343,7 +336,7 @@ export function EgressServiceItem({
               Limit to repositories
             </Button>
           )}
-          {canEditService && serviceEditing && (
+          {canEdit(serviceEditing, service) && (
             <>
               <Button
                 size="sm"
@@ -433,7 +426,7 @@ export function EgressServiceItem({
           )
         }
       />
-      {canEditService && serviceEditing && (
+      {canEdit(serviceEditing, service) && (
         <ConfirmDialog
           open={confirm === "service"}
           title={`Delete ${service.display_name}?`}
