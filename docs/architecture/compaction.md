@@ -13,14 +13,14 @@ All paths below are relative to `src/mindroom/`.
 | `history/runtime.py` | Preparing one response, model construction, compaction notices, failure handling, and applying the final replay decision. |
 | `history/session_context.py` | Canonical agent/team scope identity, opening the correct session store, and closing owned handles. |
 | `history/replay.py` | Materializing visible persisted history, estimating its cost, and fitting replay limits. |
-| `history/compaction.py` | Selecting runs, executing summary chunks, switching fallback models, and committing chunk progress. |
+| `history/compaction.py` | Selecting runs, executing summary chunks, switching fallback models, and appending each chunk's summary row. |
 | `history/summary_input.py` | Serializing conversation and prior summary into bounded inputs; preserving a progress-making run envelope when shrinking. |
 | `history/message_content.py` | The shared text and media projection used by serialization and token estimation. |
 | `history/summary_call.py` | One cancellable summary call, a typed wall deadline, complete-output validation, and bounded retry policy. |
-| `history/storage.py` | Durable scope state, the cached replay summary, seen ids derived from live runs and the archive, archive reconciliation before each run, and generation-precise redaction. |
-| `history/archive.py` | The `<session_table>_compactions` and `<session_table>_compacted_runs` tables: summary generations and archived runs, moved in one transaction with the live run rows. |
-| `history/archive_schema.py` | The archive table layout, shared with the legacy migration. |
-| `history/legacy_compaction_state.py` | The one-time migration, run when a conversation database opens, that adopts scope state written when compaction deleted runs as content-free generations. |
+| `history/storage.py` | Durable scope state, seen ids derived from loaded runs and summary rows, compaction chunk appends, and redaction and edit cuts, including the legacy summary rules. |
+| `history/summary_rows.py` | The `<session_table>_summaries` and `<session_table>_removed_runs` tables: appending a summary row against its basis, the event sets rows fold, and cutting the log. |
+| `history/summary_rows_schema.py` | The summary-row table layout, shared with session reads, run writes, and migrations. |
+| `history/legacy_compaction_state.py` | The one-time migration, run when a conversation database opens, that gives every run a position and adopts state written when compaction deleted runs as content-free legacy summary rows. |
 | `history/native.py` | Selecting and configuring native compaction for the resolved history route. |
 | `native_compaction.py` | Provider-neutral checkpoint and native replay data. |
 
@@ -57,23 +57,20 @@ Mantle currently needs its existing HTTP transport passed explicitly when copyin
 - Summary overrides preserve effective output-cap precedence while removing thinking from typed fields, request parameters, and raw body parameters.
 - The outer retry policy disables Agno-level retries; Claude and OpenAI summary adapters also disable SDK retries while preserving caller-owned clients and transports.
 - If the saved summary alone exceeds the final history budget, replay preparation raises an explicit budget error before a reply model call; the durable summary and already committed compaction progress remain intact.
-- A chunk moves its runs, member runs included, into the archive and records its summary generation in the same transaction that deletes their live rows; nothing compaction touches is lost.
-- The session summary is a cache of the latest generation's summary, written after that transaction; before each run, reconciliation refreshes it from the archive and deletes live runs that are already archived.
-- A row whose cached summary had to be refreshed was written from an older snapshot, so reconciliation also drops its metadata seen ids; dropping ids can only re-offer messages, never hide them.
-- Seen ids are derived rather than stored: live runs supply their own, the archive supplies those of the runs the replayed summary covers, and session metadata keeps only ids no stored run carries, such as team consumption.
-- Archived runs keep the seen ids they counted while live apart from the wider set redaction matches, so compaction never changes which messages count as seen.
-- Metadata seen ids have no archive counterpart, so a stale whole-row session write can restore ids a redaction dropped; that only withholds those messages from unseen thread context.
-- Earlier committed chunks survive later failure or cancellation; compacted runs cannot silently reappear.
-- Redacting an event represented by an archived run removes that run and everything after it, returns the generation's earlier runs to replay, and replays the previous generation's summary.
-- Content-free legacy generations cannot be split: while one still replays its summary, an event it may contain (its captured seen ids or retained source ownership) clears it together with every later generation, their archived runs, and all live runs, as before the archive existed.
-- A live run removed for any other event only retires the scope's summaries, because legacy provenance may be incomplete; live runs stay, and archived runs stay stored without counting as compacted history.
-- Legacy provenance takes precedence over an archive hit, because every later generation was built on the legacy summary.
+- A scope's history is Agno's runs table in `run_index` order with summary rows between its runs, each sorting right after the newest run it covers; a session load returns the runs after the scope's latest summary row, every paused, cancelled, or errored run, and their member runs, with `session.summary` read from that row, all in one snapshot.
+- Compaction never moves or deletes a run: each chunk appends one summary row, and only after checking that the latest row and every run it covered are unchanged since it read them; otherwise the compaction stops as after a failed chunk, keeping earlier chunks.
+- New runs sort after every run and summary row; a paused or cancelled run saved visible, such as a completed approval, moves to the end; a visible run behind the latest summary row, or a member of one, is never rewritten, so a stale save cannot replay folded content or change its provenance.
+- Every visible run between the latest barrier (a row without text) and the latest summary row is covered by that row's text; runs behind the latest barrier are retired: stored, never replayed, never counted as seen.
+- Summary rows keep the event ids of what their own chunk folded, so seen ids and redaction candidates come from the rows after the latest barrier plus the loaded runs, and session metadata keeps only ids no stored run carries, such as team consumption.
+- Edits and redactions cut: they delete the earliest element holding the event (an edit matches what a run answered, a redaction also what it read) and everything after it, except barrier rows, and record the removed runs so a late save of one writes no row; deleting a summary row returns the runs it covered to replay.
+- Metadata seen ids have no summary-row counterpart, so a stale whole-row session write can restore ids a redaction dropped; that only withholds those messages from unseen thread context.
+- Content-free legacy summaries cannot be split: while one is in force, a redaction of an event it may contain (its captured seen ids or retained source ownership) cuts at it, removing every run and later summary of the scope.
+- A redaction cut that removes a loaded run holding the event while a legacy summary is in force retires every summary of the scope with a barrier row; edit cuts never consult legacy state.
 - After any redaction change, the scope's metadata seen ids are dropped and the derived ids follow the remaining history, so removed messages return as unseen thread context unless a stale whole-row write restores those metadata ids (see above).
-- Redaction keeps the archived runs it removes as content-free tombstones, so a stale save of such a run is pruned like any other archived run; only conversation deletion removes archive rows.
-- State written by releases before the archive is adopted once, when the conversation database opens and before any response loads it; the archive tables' presence marks it done.
+- State written by releases before the summary rows is adopted once, when the conversation database opens and before any response loads it; the summary-row tables' presence marks it done.
 
 - Only the affected scope is rewritten; current-turn media and current-turn reasoning retain their existing replay rules.
 
-The history, provider transport, Agno patch, import-boundary, and native compaction tests exercise these contracts, and `tests/test_compaction_fuzz.py` checks the archive invariants over generated histories with interrupted chunks, stale session writes, and redactions.
+The history, provider transport, Agno patch, import-boundary, and native compaction tests exercise these contracts, and `tests/test_compaction_fuzz.py` checks the log invariants over generated histories with raced chunks, paused and completed approvals, stale session writes, late run saves, and redactions.
 
 See [Context Window](../configuration/history.md#context-window).
