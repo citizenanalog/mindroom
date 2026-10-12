@@ -11,6 +11,7 @@ the test can check exactly what replay represents.
 from __future__ import annotations
 
 import tempfile
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -318,7 +319,8 @@ class _Runner:
         )
 
     def _snapshot(self, _action: Action) -> None:
-        self._snapshots.append(self._load())
+        # A copy, since later steps edit the stored run objects the load returns in place.
+        self._snapshots.append(deepcopy(self._load()))
 
     def _stale_write(self, action: Action) -> None:
         """Write an older snapshot's whole session row back, as a concurrent run's end would."""

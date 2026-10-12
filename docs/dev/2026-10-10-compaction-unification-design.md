@@ -180,7 +180,7 @@ A request without persisted replay (team members, `room_agent` workflow particip
 
 ### 8. What the user sees (question 7)
 
-- Mid-turn compaction posts the same `Compacting history...` notice in the thread, edits it with progress and the result, and the streamed reply continues after the summary call.
+- Mid-turn compaction posts the same `Compacting history...` notice in the thread, edits it with the result, and the streamed reply continues after the summary call.
 - The failure notice becomes `Compaction failed; continuing without compaction.` for both paths, since a mid-turn failure continues with the uncompacted request.
 - Compaction hooks (`compaction:before`, `compaction:after`) fire for scoped mid-turn compaction exactly as for pre-reply compaction, with the folded runs and exchanges as their messages; run-local compaction has no scope and emits none.
 - The notice counts the visible runs plus the running turn once.

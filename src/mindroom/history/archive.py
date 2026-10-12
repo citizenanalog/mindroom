@@ -244,15 +244,20 @@ def positioned_generations(storage: BaseDb, *, session_id: str, scope_key: str) 
 
 
 def delete_generations(storage: BaseDb, *, session_id: str, generation_ids: Collection[int]) -> None:
-    """Delete generations that never took effect, such as a fold a crash kept out of its run's record."""
+    """Delete generations that never took effect, such as a fold a crash kept out of its run's record.
+
+    A generation that already archived runs took effect, so a late save of its run's older record never deletes it
+    or the runs it holds.
+    """
     if not generation_ids:
         return
     db = _sqlite(storage)
-    compactions, _ = _table_names(db)
+    compactions, compacted_runs = _table_names(db)
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
         connection.exec_driver_sql(
-            f"DELETE FROM {compactions} WHERE session_id = ? AND id IN ({', '.join('?' for _ in generation_ids)})",  # noqa: S608
+            f"DELETE FROM {compactions} WHERE session_id = ? AND id IN ({', '.join('?' for _ in generation_ids)}) "  # noqa: S608
+            f"AND NOT EXISTS (SELECT 1 FROM {compacted_runs} WHERE compaction_id = {compactions}.id)",
             (session_id, *generation_ids),
         )
 

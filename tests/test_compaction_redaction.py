@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -867,6 +868,21 @@ def test_a_rollback_that_removes_an_older_folds_position_run_also_undoes_that_fo
 
     assert _live(storage) == ["r1"]
     assert _summary(_stored(storage)) is None
+
+
+def test_a_stale_save_of_a_folded_run_never_deletes_the_runs_its_fold_archived(storage: SqliteDb) -> None:
+    """A late copy of the run saved before its fold cannot make that fold unapplied once it archived runs."""
+    session = _seed_runs(storage, _run("r0"), _run("r1"), _run("r2"))
+    stale = deepcopy(next(run for run in session.runs or [] if run.run_id == "r2"))
+    _fold(storage, session, "r2", ["r0", "r1"])
+    reconcile_compaction_state(storage, _stored(storage), _SCOPE)
+    assert _live(storage) == ["r2"]
+
+    storage.upsert_run(run=stale, session_id="session", user_id=None)
+    reconcile_compaction_state(storage, _stored(storage), _SCOPE)
+
+    assert archived_content(storage, "session") == {"r0": True, "r1": True}
+    assert _summary(_stored(storage)) == "folded"
 
 
 def _answering(run_id: str, event_id: str) -> RunOutput:
