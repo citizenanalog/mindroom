@@ -1054,11 +1054,17 @@ def test_catalog_survives_a_service_whose_state_cannot_be_read(
     assert "internal-client-secret" not in response.text
 
 
+def _catalog_managers(portal: dict[str, Any], user: str) -> dict[str, list[str]]:
+    response = portal["client"].get("/api/connections", headers=portal["headers"][user])
+    assert response.status_code == 200, response.text
+    return {agent["agent_name"]: agent["managers"] for agent in response.json()["agents"]}
+
+
 def test_catalog_names_the_credential_managers_of_shared_agents(shared_portal: dict[str, Any]) -> None:
     """Shared and unscoped agents list their credential managers, as the egress listing does; private ones list none."""
     shared_portal["payload"]["agents"]["support"]["worker_scope"] = "user"
-    _publish_config(main.app, shared_portal["paths"], shared_portal["payload"])
-    _use_runtime_auth_settings(main.app)
+    # The Agent Keys section names them for every shared agent while the broker is on.
+    _enable_egress_broker(shared_portal)
     agents = {
         agent["agent_name"]: agent["managers"]
         for agent in shared_portal["client"]
@@ -1071,3 +1077,25 @@ def test_catalog_names_the_credential_managers_of_shared_agents(shared_portal: d
         # A shared agent that runs per user keeps its keys per requester, so nobody manages them together.
         "support": [],
     }
+
+
+def test_catalog_names_credential_managers_only_to_users_they_matter_to_while_the_broker_is_off(
+    shared_portal: dict[str, Any],
+) -> None:
+    """Without Agent Keys, managers are named only to a user with a connection on the agent that only they can change."""
+    research_managers = ["@alice:example.org", "@mallory:example.org"]
+    shared_portal["payload"]["agents"]["research"]["access"] = {"users": ["@bob:example.org"]}
+    _publish_config(main.app, shared_portal["paths"], shared_portal["payload"])
+    _use_runtime_auth_settings(main.app)
+    # Bob uses Research and cannot change its shared Drive connection; Alice manages it herself.
+    assert _catalog_managers(shared_portal, "bob")["research"] == research_managers
+    assert _catalog_managers(shared_portal, "alice")["research"] == []
+
+    shared_portal["payload"]["agents"]["research"]["tools"] = ["calculator"]
+    _publish_config(main.app, shared_portal["paths"], shared_portal["payload"])
+    _use_runtime_auth_settings(main.app)
+    assert _catalog_managers(shared_portal, "bob")["research"] == []
+
+    _enable_egress_broker(shared_portal)
+    assert _catalog_managers(shared_portal, "bob")["research"] == research_managers
+    assert _catalog_managers(shared_portal, "alice")["research"] == research_managers

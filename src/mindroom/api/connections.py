@@ -75,7 +75,9 @@ class AgentConnections(BaseModel):
     services, so the portal can link every such agent to the services page. It is null for any other agent, for
     every agent while the egress broker is off, and for an agent whose egress state cannot be read.
     `managers` is a shared or unscoped agent's credential managers as Matrix IDs, as the egress listing reports them;
-    it is empty for any other agent, and for an agent with none only administrators manage its credentials.
+    it is empty for any other agent, and for an agent with none only administrators manage its credentials. While the
+    egress broker is off, it is filled only for a user with a connection on the agent that they cannot change, whose
+    row names who can.
     """
 
     agent_name: str
@@ -127,6 +129,7 @@ class _Connections:
     user: ConnectionUserContext
     catalog: ConnectionsCatalog
     providers: dict[str, OAuthProvider]
+    egress_enabled: bool
 
 
 async def _connection_user(request: Request, response: Response) -> ConnectionUserContext:
@@ -157,12 +160,17 @@ async def _connections(request: Request, user: _ConnectionUserContext) -> _Conne
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
     providers = load_oauth_providers_for_snapshot(snapshot)
     metadata = resolved_tool_metadata_for_runtime(snapshot.runtime_paths, user.config, tolerate_plugin_load_errors=True)
-    agents = [_agent_connections(name, user, providers, metadata) for name in user.visible_agent_names]
+    egress_enabled = egress_broker_enabled(snapshot.runtime_paths)
+    agents = [
+        _agent_connections(name, user, providers, metadata, egress_enabled=egress_enabled)
+        for name in user.visible_agent_names
+    ]
     return _Connections(
         runtime_paths=snapshot.runtime_paths,
         user=user,
         catalog=ConnectionsCatalog(agents=agents),
         providers=providers,
+        egress_enabled=egress_enabled,
     )
 
 
@@ -171,6 +179,8 @@ def _agent_connections(
     user: ConnectionUserContext,
     providers: dict[str, OAuthProvider],
     metadata: dict[str, ToolMetadata],
+    *,
+    egress_enabled: bool,
 ) -> AgentConnections:
     """List assigned toolkits and group their browser connections by provider."""
     services: dict[str, ConnectionService] = {}
@@ -211,12 +221,16 @@ def _agent_connections(
             service.tools.append(tool_name)
 
     agent = config.agents[agent_name]
+    # The Agent Keys section names the managers of every shared agent; without it, only a row the user cannot change.
+    names_managers = egress_enabled or any(not service.can_manage for service in services.values())
     return AgentConnections(
         agent_name=agent_name,
         agent_display_name=agent.display_name,
         is_shared=agent.private is None,
         can_use=agent_name in user.agent_names,
-        managers=list(agent.credential_managers) if entity.execution_scope in {None, "shared"} else [],
+        managers=(
+            list(agent.credential_managers) if names_managers and entity.execution_scope in {None, "shared"} else []
+        ),
         mcp_available=agent_name in user.gateway_agent_names,
         services=list(services.values()),
         tools=tools,
@@ -347,7 +361,6 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
     service's provider can still bootstrap it over the network once when none is stored.
     """
     requester_id = context.user.owner.requester_id
-    egress_enabled = egress_broker_enabled(context.runtime_paths)
     agents = [
         agent.model_copy(
             update={
@@ -358,7 +371,7 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
                     for service in agent.services
                 ],
                 "egress_services": (
-                    await _egress_services(request, agent.agent_name, requester_id) if egress_enabled else None
+                    await _egress_services(request, agent.agent_name, requester_id) if context.egress_enabled else None
                 ),
             },
         )
