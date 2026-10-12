@@ -262,6 +262,8 @@ export interface EgressLogRecord {
   /** `denied` rows were refused by the broker. */
   kind?: string;
   agent_name: string | null;
+  /** Who made the request; `null` when it had no requester. */
+  requester_id: string | null;
   method: string;
   host: string;
   path: string;

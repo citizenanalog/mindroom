@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   PASS_THROUGH_CAPTION,
+  PASS_THROUGH_CAPTION_EVERYONE,
   PASSED_THROUGH,
   deleteServiceWarning,
   personalScopeLine,
@@ -71,8 +72,18 @@ function servicePath(agentName: string, serviceName: string): string {
   return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/services/${encodeURIComponent(serviceName)}`;
 }
 
-/** The caller's own recent brokered requests for one agent, loaded when the table is opened. */
-function RecentRequests({ agentName }: { agentName: string }) {
+/**
+ * Recent brokered requests for one agent, loaded when the table is opened: the
+ * caller's own, or with `everyone` (a shared or unscoped agent the caller
+ * manages) every requester's, with a User column.
+ */
+function RecentRequests({
+  agentName,
+  everyone,
+}: {
+  agentName: string;
+  everyone: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [log, setLog] = useState<LogState>({ kind: "loading" });
   const [showAll, setShowAll] = useState(false);
@@ -132,9 +143,10 @@ function RecentRequests({ agentName }: { agentName: string }) {
         <div id={`egress-log-${agentName}`} className="space-y-2 px-5 pb-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
-              Your last {LOG_LIMIT} requests through this agent's sandbox,
-              newest first. Only the method, host, and path are kept, never what
-              was sent.
+              {everyone
+                ? `The last ${LOG_LIMIT} requests through this agent's sandbox, from everyone who uses it, newest first.`
+                : `Your last ${LOG_LIMIT} requests through this agent's sandbox, newest first.`}{" "}
+              Only the method, host, and path are kept, never what was sent.
             </p>
             <Button
               type="button"
@@ -169,7 +181,9 @@ function RecentRequests({ agentName }: { agentName: string }) {
                 className={`w-full text-left text-sm ${STACKED.table}`}
               >
                 <caption className="px-3 py-2 text-left text-xs text-muted-foreground max-sm:block">
-                  {PASS_THROUGH_CAPTION}
+                  {everyone
+                    ? PASS_THROUGH_CAPTION_EVERYONE
+                    : PASS_THROUGH_CAPTION}
                 </caption>
                 <thead
                   className={`bg-muted/40 text-xs text-muted-foreground ${STACKED.head}`}
@@ -177,6 +191,7 @@ function RecentRequests({ agentName }: { agentName: string }) {
                   <tr>
                     {[
                       "Time",
+                      ...(everyone ? ["User"] : []),
                       "Method",
                       "Host",
                       "Path",
@@ -212,6 +227,11 @@ function RecentRequests({ agentName }: { agentName: string }) {
                         >
                           {new Date(record.at).toLocaleString()}
                         </td>
+                        {everyone && (
+                          <td data-label="User" className={`break-all ${cell}`}>
+                            {record.requester_id ?? "-"}
+                          </td>
+                        )}
                         <td
                           data-label="Method"
                           className={`font-mono text-xs ${cell}`}
@@ -513,7 +533,10 @@ function AgentSection({
         disabled={saving}
         onDelete={agent.can_manage ? remove : undefined}
       />
-      <RecentRequests agentName={agent.agent_name} />
+      <RecentRequests
+        agentName={agent.agent_name}
+        everyone={agent.shared && agent.can_manage}
+      />
     </section>
   );
 }

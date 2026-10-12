@@ -1533,6 +1533,7 @@ describe("recent requests on the personal page", () => {
     at: "2026-10-09T10:30:00+00:00",
     kind: "request",
     agent_name: "personal",
+    requester_id: "@bob:example.org",
     method: "POST",
     host: "api.github.com",
     path: "/repos/acme/app/issues",
@@ -1582,6 +1583,13 @@ describe("recent requests on the personal page", () => {
       },
     );
 
+  const OWN_HEADING =
+    "Your last 50 requests through this agent's sandbox, newest first. Only the method, host, and path are kept, never what was sent.";
+  const columns = (table: HTMLElement) =>
+    within(table)
+      .getAllByRole("columnheader")
+      .map((header) => header.textContent);
+
   it("starts collapsed and does not load anything until it is opened", async () => {
     render(<EgressCredentials />);
     expect(await toggle()).toHaveAttribute("aria-expanded", "false");
@@ -1598,11 +1606,15 @@ describe("recent requests on the personal page", () => {
     expect(logRequests()).toEqual([
       "/api/connections/egress/logs?agent_name=personal&limit=50",
     ]);
-    expect(
-      within(table)
-        .getAllByRole("columnheader")
-        .map((header) => header.textContent),
-    ).toEqual(["Time", "Method", "Host", "Path", "Service", "Status"]);
+    expect(screen.getByText(OWN_HEADING)).toBeInTheDocument();
+    expect(columns(table)).toEqual([
+      "Time",
+      "Method",
+      "Host",
+      "Path",
+      "Service",
+      "Status",
+    ]);
     const rows = within(table).getAllByRole("row");
     expect(rows).toHaveLength(4);
     const first = within(rows[1]).getAllByRole("cell");
@@ -1678,6 +1690,87 @@ describe("recent requests on the personal page", () => {
         "table",
       ),
     ).toBeNull();
+  });
+
+  it("keeps the caller's own view on a shared agent they do not manage", async () => {
+    render(<EgressCredentials />);
+    fireEvent.click(await toggle("Shared Dev"));
+    const table = await screen.findByRole("table", {
+      name: "Recent requests for shared_dev",
+    });
+    expect(screen.getByText(OWN_HEADING)).toBeInTheDocument();
+    expect(columns(table)).toEqual([
+      "Time",
+      "Method",
+      "Host",
+      "Path",
+      "Service",
+      "Status",
+    ]);
+    expect(table.querySelector("caption")).toHaveTextContent(
+      "Only your own requests are shown.",
+    );
+    expect(screen.queryByText("@bob:example.org")).toBeNull();
+  });
+
+  it("shows the managers of a shared agent everyone's requests and who made each", async () => {
+    const managed = agents.map((agent) =>
+      agent.agent_name === "shared_dev"
+        ? { ...agent, can_manage: true }
+        : agent,
+    );
+    logs = () =>
+      json({
+        records: [
+          record({
+            agent_name: "shared_dev",
+            requester_id: "@alice:example.org",
+          }),
+          record({
+            agent_name: "shared_dev",
+            at: "2026-10-09T10:00:00+00:00",
+            requester_id: null,
+          }),
+        ],
+      });
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/connections/egress") return json({ agents: managed });
+      if (path.startsWith("/api/connections/egress/logs")) return logs();
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<EgressCredentials />);
+    fireEvent.click(await toggle("Shared Dev"));
+    const table = await screen.findByRole("table", {
+      name: "Recent requests for shared_dev",
+    });
+    expect(
+      screen.getByText(
+        "The last 50 requests through this agent's sandbox, from everyone who uses it, newest first. Only the method, host, and path are kept, never what was sent.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(OWN_HEADING)).toBeNull();
+    expect(columns(table)).toEqual([
+      "Time",
+      "User",
+      "Method",
+      "Host",
+      "Path",
+      "Service",
+      "Status",
+    ]);
+    const rows = within(table).getAllByRole("row");
+    expect(within(rows[1]).getAllByRole("cell")[1]).toHaveTextContent(
+      "@alice:example.org",
+    );
+    expect(within(rows[1]).getAllByRole("cell")[2]).toHaveTextContent("POST");
+    // A request with no requester, such as one from a scheduled task, says so with a dash.
+    expect(within(rows[2]).getAllByRole("cell")[1]).toHaveTextContent("-");
+    const caption = table.querySelector("caption");
+    expect(caption).toHaveTextContent(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Requests from everyone who uses this agent are shown.",
+    );
+    expect(caption).not.toHaveTextContent("Only your own requests are shown.");
   });
 
   it("shows why the log is unavailable", async () => {

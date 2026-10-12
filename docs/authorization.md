@@ -189,7 +189,7 @@ Platform administrators may:
 - Manage any agent's credentials and the deployment-wide OAuth client configuration.
 - Talk to every responder regardless of its `access`.
 
-A credential manager may manage only the named agent's shared credentials and OAuth connections.
+A credential manager may manage only the named agent's shared credentials and OAuth connections, and sees every requester's brokered requests on that agent in its [request log](deployment/egress-broker.md#personal-request-log).
 Requesters manage their own personal OAuth connections without being listed anywhere; see [Who Can Connect An Account](oauth-framework.md#who-can-connect-an-account).
 Reading or changing an agent's shared credentials returns HTTP 403 to anyone who is neither an administrator nor that agent's credential manager.
 Connections may show users with agent access whether a shared connection exists, without revealing the connected account or granting management.

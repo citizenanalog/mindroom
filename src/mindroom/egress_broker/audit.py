@@ -139,6 +139,7 @@ class AuditLog:
         requester_id: str | None = None,
         host: str | None = None,
         service: str | None = None,
+        scope: str | None = None,
         limit: int = 200,
     ) -> list[AuditRecord]:
         """Return up to `limit` records matching every given filter exactly, newest first; callers bound `limit`."""
@@ -149,6 +150,10 @@ class AuditLog:
         if agent_name is not None:
             conditions.append("agent_name = ?")
             params.append(agent_name)
+
+        if scope is not None:
+            conditions.append("scope = ?")
+            params.append(scope)
 
         if requester_id is not None:
             conditions.append("requester_id = ?")

@@ -2,7 +2,7 @@
 
 It lists every agent the user may use with its services and the preset catalog, sets or deletes a service's key,
 reads, saves, and deletes the services a scope defines for itself, connects or disconnects a service's OAuth account,
-and shows the caller's own brokered requests.
+and shows the caller's own brokered requests, or everyone's on a shared or unscoped agent the caller manages.
 """
 
 from __future__ import annotations
@@ -693,21 +693,34 @@ def get_personal_logs(
     agent_name: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query()] = _MAX_PERSONAL_LOG_ROWS,
 ) -> AuditLogsResponse:
-    """Return the caller's own recent brokered requests, newest first, optionally for one agent.
+    """Return recent brokered requests, newest first, optionally for one agent.
 
-    The log is filtered by the canonical requester, the identity the worker tokens carry, whatever else the query
-    says, so no filter can show another user's rows, not even on an agent several users share. Returns 409 if the
-    broker is not running.
+    The rows are filtered by the canonical requester, the identity the worker tokens carry, whatever else the query
+    says, so no filter can show another user's rows, with one exception: `agent_name` naming a shared or unscoped
+    agent the caller may manage, by the rule that gates its keys and services, returns every requester's rows that
+    agent logged in its current scope. A personal agent, an unknown one, or one the caller may not use or manage
+    answers exactly as without the exception. Returns 409 if the broker is not running.
     """
     audit = active_audit_log()
     if audit is None:
         raise HTTPException(409, "Egress broker is not running", headers=CONNECTIONS_HEADERS)
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
-    if snapshot.runtime_config is None:
+    config = snapshot.runtime_config
+    if config is None:
         raise HTTPException(503, "Egress logs are unavailable", headers=CONNECTIONS_HEADERS)
+    requester = resolve_human_requester_alias(requester_id, config, snapshot.runtime_paths)
+    log_requester: str | None = requester
+    log_scope = None
+    if agent_name and agent_name in config.agents:
+        memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
+        eligibility = _check_agent_eligibility(agent_name, requester, config, snapshot.runtime_paths, memberships)
+        if eligibility == (True, True):  # (is_shared, can_manage): a shared or unscoped agent the caller manages
+            # Rows the agent logged before it was shared were personal, so they stay with their requesters.
+            log_requester, log_scope = None, _agent_scope(config, agent_name)
     records = audit.query(
-        requester_id=resolve_human_requester_alias(requester_id, snapshot.runtime_config, snapshot.runtime_paths),
+        requester_id=log_requester,
         agent_name=agent_name or None,
+        scope=log_scope,
         limit=max(1, min(limit, _MAX_PERSONAL_LOG_ROWS)),
     )
     return audit_logs_response(records)

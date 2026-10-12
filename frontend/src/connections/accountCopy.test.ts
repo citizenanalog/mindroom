@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PASS_THROUGH_CAPTION,
+  PASS_THROUGH_CAPTION_EVERYONE,
   administratorLimitNote,
   deleteServiceWarning,
   disconnectDescription,
@@ -100,9 +101,12 @@ describe("account copy", () => {
     );
   });
 
-  it("tells the viewer that administrators can see the requests too, and that only their own are shown", () => {
+  it("tells the viewer that administrators can see the requests too, and whose requests are shown", () => {
     expect(PASS_THROUGH_CAPTION).toBe(
       "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.",
+    );
+    expect(PASS_THROUGH_CAPTION_EVERYONE).toBe(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Requests from everyone who uses this agent are shown.",
     );
   });
 

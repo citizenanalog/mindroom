@@ -1942,12 +1942,13 @@ def _record_request(
     kind: Literal["request", "tunnel", "denied"] = "request",
     status: int = 200,
     code: str | None = None,
+    scope: str | None = None,
 ) -> None:
     log.record(
         AuditRecord(
             at=_LOG_START + timedelta(seconds=seconds),
             kind=kind,
-            scope="shared" if agent_name == "shared_dev" else "user_agent",
+            scope=scope or ("shared" if agent_name == "shared_dev" else "user_agent"),
             agent_name=agent_name,
             requester_id=requester_id,
             method="GET",
@@ -2021,21 +2022,89 @@ def test_personal_log_returns_only_the_callers_rows_newest_first(
 
 def test_personal_log_agent_filter_never_reveals_other_users_rows(
     egress_portal: dict[str, Any],
-    mixed_log: AuditLog,  # noqa: ARG001
+    mixed_log: AuditLog,
 ) -> None:
-    """Filtering by an agent that several users share still returns only the caller's rows."""
+    """Filtering by an agent that several users share returns only the caller's rows unless they manage it."""
     portal = egress_portal
     assert _log_paths(_get_logs(portal, "alice", "?agent_name=shared_dev")) == ["/alice/shared"]
-    assert _log_paths(_get_logs(portal, "bob", "?agent_name=shared_dev")) == ["/bob/shared"]
     assert _log_paths(_get_logs(portal, "alice", "?agent_name=personal")) == [
         "/alice/personal/new",
         "/alice/personal/old",
     ]
     assert _log_paths(_get_logs(portal, "alice", "?agent_name=no_such_agent")) == []
+    assert _log_paths(_get_logs(portal, "admin", "?agent_name=no_such_agent")) == []
     # An empty filter, as a form sends it, means no filter.
     assert _log_paths(_get_logs(portal, "alice", "?agent_name=&limit=2")) == ["/alice/personal/new", "/alice/shared"]
-    # Carol may manage shared_dev but never used it, so she has no rows on it.
-    assert _log_paths(_get_logs(portal, "carol", "?agent_name=shared_dev")) == []
+    # Carol is listed as a manager of shared_dev but may not use it, so like its keys its full log stays closed.
+    _record_request(mixed_log, "@carol:example.org", "shared_dev", 7, path="/carol/shared")
+    assert _log_paths(_get_logs(portal, "carol", "?agent_name=shared_dev")) == ["/carol/shared"]
+
+
+def test_personal_log_shows_a_shared_agents_managers_every_requesters_rows(
+    egress_portal: dict[str, Any],
+    mixed_log: AuditLog,
+) -> None:
+    """A credential manager or administrator of a shared agent sees everyone's requests through it."""
+    portal = egress_portal
+    everyone = ["/nobody/shared", "/bob/shared", "/alice/shared"]
+    bob = _get_logs(portal, "bob", "?agent_name=shared_dev")
+    assert _log_paths(bob) == everyone
+    assert [record["requester_id"] for record in bob.json()["records"]] == [
+        None,
+        "@bob:example.org",
+        "@alice:example.org",
+    ]
+    assert _log_paths(_get_logs(portal, "admin", "?agent_name=shared_dev")) == everyone
+    # Without an agent, or on their personal agent, a manager still sees only their own rows.
+    assert _log_paths(_get_logs(portal, "bob")) == ["/bob/shared", "/bob/personal"]
+    assert _log_paths(_get_logs(portal, "bob", "?agent_name=personal")) == ["/bob/personal"]
+    assert _log_paths(_get_logs(portal, "admin")) == []
+    # Rows the agent logged in another scope, before it was shared, stay with their requesters.
+    _record_request(mixed_log, "@alice:example.org", "shared_dev", 7, path="/alice/private-era", scope="user_agent")
+    assert _log_paths(_get_logs(portal, "bob", "?agent_name=shared_dev")) == everyone
+    assert _log_paths(_get_logs(portal, "alice", "?agent_name=shared_dev")) == ["/alice/private-era", "/alice/shared"]
+
+
+def test_personal_log_full_view_is_per_agent_and_covers_unscoped_agents(
+    egress_portal: dict[str, Any],
+    mixed_log: AuditLog,
+) -> None:
+    """Managing one agent opens no other agent's log, and an unscoped agent's managers see all of its rows."""
+    portal = egress_portal
+    portal["payload"]["agents"]["team_ops"] = _agent_config(
+        "Team Ops",
+        "Unscoped team agent",
+        users=("@alice:example.org", "@bob:example.org"),
+        credential_managers=["@alice:example.org"],
+    )
+    _republish(portal)
+    _record_request(mixed_log, "@alice:example.org", "team_ops", 7, path="/alice/ops", scope="unscoped")
+    _record_request(mixed_log, "@bob:example.org", "team_ops", 8, path="/bob/ops", scope="unscoped")
+
+    # Alice manages team_ops, so she sees Bob's rows there, but on shared_dev, which Bob manages, only her own.
+    assert _log_paths(_get_logs(portal, "alice", "?agent_name=team_ops")) == ["/bob/ops", "/alice/ops"]
+    assert _log_paths(_get_logs(portal, "alice", "?agent_name=shared_dev")) == ["/alice/shared"]
+    assert _log_paths(_get_logs(portal, "bob", "?agent_name=team_ops")) == ["/bob/ops"]
+    assert _log_paths(_get_logs(portal, "bob", "?agent_name=shared_dev")) == [
+        "/nobody/shared",
+        "/bob/shared",
+        "/alice/shared",
+    ]
+
+
+@pytest.mark.parametrize("agent_name", ["personal", "other_private"])
+def test_personal_log_never_shows_other_requesters_rows_on_a_personal_agent(
+    egress_portal: dict[str, Any],
+    mixed_log: AuditLog,
+    agent_name: str,
+) -> None:
+    """A personal agent's rows stay with their requester, even for an administrator, who may manage every agent."""
+    portal = egress_portal
+    _record_request(mixed_log, "@mallory:example.org", "other_private", 7, path="/mallory/private", scope="user")
+    _record_request(mixed_log, "@admin:example.org", agent_name, 8, path="/admin/own")
+
+    assert _log_paths(_get_logs(portal, "admin", f"?agent_name={agent_name}")) == ["/admin/own"]
+    assert _log_paths(_get_logs(portal, "bob", "?agent_name=personal")) == ["/bob/personal"]
 
 
 @pytest.mark.parametrize(
