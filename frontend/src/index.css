@@ -118,105 +118,45 @@
 
 @layer components {
   .app-shell {
-    background:
-      radial-gradient(
-        ellipse at 0% 10%,
-        hsl(var(--primary) / 0.08),
-        transparent 45%
-      ),
-      radial-gradient(
-        ellipse at 100% 100%,
-        hsl(38 65% 65% / 0.08),
-        transparent 45%
-      ),
-      hsl(var(--background));
+    background: hsl(var(--background));
   }
 
-  .shell-toolbar {
-    background: transparent;
-  }
-
-  .workspace-surface {
-    background: hsl(var(--card) / 0.62);
-  }
-
-  main.workspace-surface {
-    margin: 0 16px 16px 8px;
-    border: 1px solid hsl(var(--border) / 0.45);
-    border-radius: 24px;
-  }
-
-  .glass-panel,
-  .glass-control,
-  .glass-overlay,
-  .glass-input {
-    border: 1px solid hsl(var(--border) / 0.65);
-    background: hsl(var(--card) / 0.92);
-  }
-
-  /* Keep working surfaces clear; reserve glass for navigation and overlays. */
-  .shell-navigation,
-  .glass-control,
-  .glass-overlay {
-    background: hsl(var(--card) / 0.6);
-    -webkit-backdrop-filter: blur(20px) saturate(110%);
-    backdrop-filter: blur(20px) saturate(110%);
-    box-shadow: inset 0 1px 0 hsl(var(--glass-highlight));
-  }
-
-  .shell-navigation {
-    box-shadow:
-      inset 0 1px 0 hsl(var(--glass-highlight)),
-      0 8px 32px hsl(var(--glass-shadow));
+  /* Working surfaces and overlays are solid; the rail carries the brand color. */
+  .glass-panel {
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
+    box-shadow: 0 1px 2px hsl(var(--foreground) / 0.04);
   }
 
   .glass-control,
   .glass-input {
+    border: 1px solid hsl(var(--input));
     border-radius: var(--radius);
+    background: hsl(var(--card));
     transition:
       background-color 150ms ease,
       border-color 150ms ease,
       color 150ms ease;
   }
 
-  .glass-input {
-    background: hsl(var(--background) / 0.5);
-    border-color: hsl(var(--input) / 0.8);
+  .glass-control:hover {
+    background: hsl(var(--secondary));
   }
 
-  .glass-control:hover {
-    background: hsl(var(--card) / 0.9);
+  .glass-input:hover {
+    border-color: hsl(var(--muted-foreground) / 0.55);
   }
 
   .glass-overlay {
-    background: hsl(var(--popover) / 0.9);
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--popover));
     box-shadow:
-      0 18px 46px hsl(var(--glass-shadow)),
-      inset 0 1px 0 hsl(var(--glass-highlight));
+      0 18px 44px -14px hsl(247 33% 16% / 0.28),
+      0 2px 6px hsl(247 33% 16% / 0.06);
   }
-}
 
-@supports not ((backdrop-filter: blur(1px))) {
-  .shell-toolbar,
-  .workspace-surface,
-  .glass-panel,
-  .glass-control,
-  .glass-overlay,
-  .glass-input {
-    background: hsl(var(--card));
-  }
-}
-
-@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
-  .shell-toolbar,
-  .workspace-surface,
-  .glass-panel,
-  .glass-control,
-  .glass-overlay,
-  .glass-input {
-    background: hsl(var(--card));
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
+  .dark .glass-overlay {
+    box-shadow: 0 18px 44px -14px hsl(0 0% 0% / 0.7);
   }
 }
 
@@ -244,7 +184,7 @@
     outline-offset: 2px;
   }
 
-  .shell-toolbar,
+  .app-topbar,
   .workspace-surface,
   .glass-panel,
   .glass-control,
@@ -259,11 +199,6 @@
 }
 
 @media (max-width: 767px) {
-  main.workspace-surface {
-    margin: 0 8px 8px;
-    border-radius: 20px;
-  }
-
   button,
   .cursor-pointer {
     -webkit-tap-highlight-color: transparent;
