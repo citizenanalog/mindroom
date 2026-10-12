@@ -431,6 +431,7 @@ function installApi(overrides: Record<string, () => Promise<Response>> = {}) {
         matrix_user_id: "@bob:example.org",
         email: null,
         is_administrator: false,
+        egress_enabled: true,
       });
     if (path === "/api/connections/agents/personal/mail/status")
       return json(status);
@@ -1904,5 +1905,24 @@ describe("connections header", () => {
       within(nav).getByRole("link", { name: "Agent Keys" }),
     ).toHaveAttribute("href", "/connections/egress");
     expect(within(nav).queryByRole("link", { name: "Dashboard" })).toBeNull();
+  });
+
+  it("does not link Agent Keys while the egress broker is off", async () => {
+    installApi({
+      "/api/connections/me": async () =>
+        json({
+          matrix_user_id: "@bob:example.org",
+          email: null,
+          is_administrator: false,
+          egress_enabled: false,
+        }),
+    });
+    render(<Connections />);
+    expect(
+      await screen.findByText("Signed in as @bob:example.org"),
+    ).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Connections pages" });
+    expect(within(nav).getByRole("link", { name: "Agents" })).toBeVisible();
+    expect(within(nav).queryByRole("link", { name: "Agent Keys" })).toBeNull();
   });
 });

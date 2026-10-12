@@ -70,6 +70,7 @@ const identity = {
   matrix_user_id: "@bob:example.org",
   email: "bob@example.org",
   is_administrator: false,
+  egress_enabled: true,
 };
 
 beforeEach(() => {

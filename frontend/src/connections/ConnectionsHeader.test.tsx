@@ -1,4 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionsHeader } from "./ConnectionsHeader";
 import type { ConnectionsIdentity } from "./types";
@@ -11,6 +17,7 @@ const identity = (
   matrix_user_id: "@bob:example.org",
   email: "bob@example.org",
   is_administrator: false,
+  egress_enabled: true,
   ...overrides,
 });
 
@@ -100,13 +107,32 @@ describe("connections header", () => {
     );
   });
 
-  it("keeps the links when the identity cannot be loaded", async () => {
+  it("links Agent Keys only while the egress broker is on", async () => {
+    answerWith(async () => json(identity({ egress_enabled: false })));
+    renderHeader();
+    await screen.findByText("Signed in as @bob:example.org");
+    const nav = screen.getByRole("navigation", { name: "Connections pages" });
+    expect(
+      Array.from(nav.querySelectorAll("a")).map((link) => link.textContent),
+    ).toEqual(["Agents"]);
+  });
+
+  it("keeps the Agents link, and the open page's, when the identity cannot be loaded", async () => {
     answerWith(async () => json({}, 500));
     renderHeader();
     expect(await screen.findByRole("link", { name: "Agents" })).toBeVisible();
-    expect(screen.getByRole("link", { name: "Agent Keys" })).toBeVisible();
+    // Only the identity says whether the broker is on.
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("link", { name: "Agent Keys" })).toBeNull();
     expect(screen.queryByText(/Signed in as/)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+    cleanup();
+
+    // The Agent Keys page is only served while the broker is on.
+    renderHeader("keys");
+    expect(
+      await screen.findByRole("link", { name: "Agent Keys" }),
+    ).toBeVisible();
   });
 });
 

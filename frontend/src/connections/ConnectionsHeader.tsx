@@ -39,6 +39,8 @@ function noticeFromAddress(): { id: string; text: string } | null {
  *
  * The identity is a courtesy: when it cannot be loaded the header shows the
  * links without it, and the page's own requests report any real failure.
+ * It also says whether the egress broker is on. The Agent Keys page exists
+ * only then, so other pages link it only once the identity says so.
  */
 export function ConnectionsHeader({
   current,
@@ -54,6 +56,10 @@ export function ConnectionsHeader({
   const [identity, setIdentity] = useState<ConnectionsIdentity | null>(null);
   const [explaining, setExplaining] = useState(false);
   const [notice, setNotice] = useState(noticeFromAddress);
+  const links = LINKS.filter(
+    ({ page }) =>
+      page !== "keys" || current === "keys" || identity?.egress_enabled,
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -131,7 +137,7 @@ export function ConnectionsHeader({
           aria-label="Connections pages"
           className="-ml-2.5 flex flex-wrap items-center gap-1"
         >
-          {LINKS.map(({ page, href, label }) => (
+          {links.map(({ page, href, label }) => (
             <a
               key={page}
               href={href}

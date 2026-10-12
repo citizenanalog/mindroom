@@ -24,6 +24,7 @@ beforeEach(() => {
         matrix_user_id: "@bob:example.org",
         email: null,
         is_administrator: false,
+        egress_enabled: true,
       });
     if (path === "/api/connections/mcp/selection")
       return json({ enabled: false, agents: {} });

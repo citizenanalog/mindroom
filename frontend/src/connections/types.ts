@@ -49,6 +49,8 @@ export interface ConnectionsIdentity {
   email: string | null;
   /** The administrator dashboard is open to this user too. */
   is_administrator: boolean;
+  /** The egress broker is on, so the Agent Keys page exists. */
+  egress_enabled: boolean;
 }
 
 export interface ConnectionStatus {
