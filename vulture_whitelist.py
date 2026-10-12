@@ -21,7 +21,6 @@ _._save_file_to_disk  # FileGenerationTools save step overridden to write inside
 _._run_context  # Agno reads the run context bound on a prepared Function (src/mindroom/agno_compat_prepared_tools.py)
 dashboard_credentials_supported  # unused variable (src/mindroom/agent_policy.py)
 can_use  # JSON response field consumed by connections portal (src/mindroom/api/connections.py)
-mcp_available  # JSON response field consumed by connections portal (src/mindroom/api/connections.py)
 key_configured  # Egress service status field reported by the egress APIs (src/mindroom/egress_broker/secrets.py)
 key_updated_at  # Egress service status field reported by the egress APIs (src/mindroom/egress_broker/secrets.py)
 shared_worker_opt_in  # Egress OAuth status field reported by the egress APIs (src/mindroom/egress_broker/secrets.py)
