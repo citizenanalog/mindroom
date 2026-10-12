@@ -588,11 +588,10 @@ function normalizeConfigToolEntries(rawConfig: configService.RawConfig): {
  * Whether the draft had unsaved changes, and in which roots, at some moment,
  * and which draft version that was.
  */
-export interface ConfigDraftMark {
-  isDirty: boolean;
-  dirtyRoots: string[];
-  draftVersion: number;
-}
+export type ConfigDraftMark = Pick<
+  ConfigState,
+  "isDirty" | "dirtyRoots" | "draftVersion"
+>;
 
 interface ConfigState {
   // State

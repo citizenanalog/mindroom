@@ -18,10 +18,8 @@ import { errorText, type RequestErrorMessages } from "@/connections/request";
 import type {
   AuthoredEgressService,
   EgressCredentialService,
-  EgressOAuthStatus,
+  EgressLogRecord,
   EgressPresetCatalog,
-  EgressRuleSummary,
-  EgressServiceSource,
 } from "@/connections/types";
 import {
   API_ENDPOINTS,
@@ -68,35 +66,17 @@ const SECRET_ERROR_MESSAGES: RequestErrorMessages = {
     "This service is no longer configured. Reload the page to update the list.",
 };
 
-interface BrokerService {
-  name: string;
-  display_name: string | null;
-  description: string;
-  source: EgressServiceSource;
-  rules: EgressRuleSummary[];
-  /** The service only limits paths: it has no key or account. */
-  restrict_only: boolean;
-  configured: boolean;
-  active_source: "key" | "oauth" | null;
-  key_configured: boolean;
-  key_updated_at: string | null;
-  oauth: EgressOAuthStatus | null;
-}
+/** A service as the dashboard listing sends it; `load` fills in the fields it omits. */
+type BrokerService = Omit<
+  EgressCredentialService,
+  | "display_name"
+  | "is_shared"
+  | "is_global"
+  | "can_manage"
+  | "placeholder_names"
+> & { display_name: string | null };
 
-interface AuditRecord {
-  at: string;
-  agent_name: string | null;
-  /** The Matrix ID of the user whose request this was; `null` when none is known. */
-  requester_id: string | null;
-  method: string;
-  host: string;
-  path: string;
-  service: string | null;
-  status: number;
-  duration_ms: number;
-  /** The error code the broker refused with; `null` for a forwarded request. */
-  code: string | null;
-}
+type AuditRecord = EgressLogRecord & { duration_ms: number };
 
 interface LogFilters {
   user: string;

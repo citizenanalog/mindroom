@@ -84,10 +84,7 @@ export function helperSignature(input: HelperInput): string {
 }
 
 /** The labels the helper last wrote, which it may rewrite on the next apply. */
-export interface HelperLabels {
-  displayName: string;
-  description: string;
-}
+export type HelperLabels = ReturnType<typeof githubLimitLabels>;
 
 /**
  * What applying the helper changes in the form, and the labels it wrote.
