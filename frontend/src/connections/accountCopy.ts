@@ -35,16 +35,22 @@ export function disconnectDescription(
     : removed;
 }
 
-/** Who can change the keys of a shared agent, for the note under its name. */
+/**
+ * Who can change the keys of a shared agent, for the note under its name.
+ * Beside an account the user cannot change, `keysShown` false (the agent shows
+ * no keys, as while Agent Keys is off) names its accounts instead.
+ */
 export function sharedAgentNote(
   canManage: boolean,
   managers: readonly string[],
+  keysShown = true,
 ): string {
   if (canManage)
     return "You manage this shared agent's keys. Everyone who uses it shares them.";
-  return managers.length > 0
-    ? `Only ${formatList(managers)} can change keys for this shared agent.`
-    : "Only administrators can change keys for this shared agent.";
+  const who = managers.length > 0 ? formatList(managers) : "administrators";
+  return keysShown
+    ? `Only ${who} can change keys for this shared agent.`
+    : `Only ${who} can change this shared agent's accounts.`;
 }
 
 /** Who uses a personal agent's keys, for the line under its name; null for a shared agent, whose managers are named instead. */

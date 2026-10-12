@@ -1540,6 +1540,42 @@ describe("shared accounts on agent cards", () => {
       ).toBeGreaterThan(0);
     });
 
+    it("does not mention keys beside the account while the agent shows no keys", async () => {
+      await open({
+        agents: [
+          {
+            ...catalogWith(
+              { managers: ["@alice:example.org", "@mallory:example.org"] },
+              { can_manage: false },
+            ).agents[0],
+            egress_services: null,
+          },
+        ],
+      });
+      expect(
+        await screen.findByText(
+          "Only @alice:example.org and @mallory:example.org can change this shared agent's accounts.",
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText(/keys/)).toBeNull();
+    });
+
+    it("says administrators can change the accounts when no manager is named and the agent shows no keys", async () => {
+      await open({
+        agents: [
+          {
+            ...catalogWith({ managers: [] }, { can_manage: false }).agents[0],
+            egress_services: null,
+          },
+        ],
+      });
+      expect(
+        await screen.findByText(
+          "Only administrators can change this shared agent's accounts.",
+        ),
+      ).toBeVisible();
+    });
+
     it("names the managers when a personal account is refused on a shared agent", async () => {
       const refused = egressRow({
         name: "github",
@@ -1678,6 +1714,27 @@ describe("agent table summary, search, and order", () => {
     expect(agentRow("Personal assistant")).toHaveTextContent(
       "2 tools / 2 of 3 accounts and keys set",
     );
+  });
+
+  it("counts only accounts while the agent shows no keys", async () => {
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            {
+              ...withCalculator(),
+              services: [{ ...service, connected: true }],
+              egress_services: null,
+            },
+          ],
+        }),
+    });
+    render(<Connections />);
+    await screen.findByRole("button", { name: "Expand Personal assistant" });
+    expect(agentRow("Personal assistant")).toHaveTextContent(
+      "2 tools / 1 of 1 accounts set",
+    );
+    expect(agentRow("Personal assistant")).not.toHaveTextContent(/keys/);
   });
 
   it("does not count a service that only limits paths as an account or a key", async () => {

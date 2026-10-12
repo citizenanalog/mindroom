@@ -62,6 +62,15 @@ describe("account copy", () => {
     );
   });
 
+  it("speaks of a shared agent's accounts instead of keys where no keys are shown", () => {
+    expect(sharedAgentNote(false, ["@bob:x", "@carol:x"], false)).toBe(
+      "Only @bob:x and @carol:x can change this shared agent's accounts.",
+    );
+    expect(sharedAgentNote(false, [], false)).toBe(
+      "Only administrators can change this shared agent's accounts.",
+    );
+  });
+
   it("gives managers and others different advice for a refused personal account", () => {
     expect(personalAccountRefusal("GitHub", true, ["@bob:x"])).toBe(
       "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",

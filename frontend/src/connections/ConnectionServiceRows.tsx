@@ -241,7 +241,11 @@ export function ConnectionServiceRows({
                 )}
                 {!loading && status && !service.can_manage && (
                   <span className="text-xs text-muted-foreground">
-                    {sharedAgentNote(false, agent.managers)}
+                    {sharedAgentNote(
+                      false,
+                      agent.managers,
+                      Array.isArray(agent.egress_services),
+                    )}
                   </span>
                 )}
                 {!loading && status && service.can_manage && (
