@@ -15,6 +15,7 @@ from mindroom.api.auth import is_administrator, require_connections_user
 from mindroom.api.connection_agents import (
     CONNECTIONS_HEADERS,
     ConnectionUserContext,
+    masked_oauth_call,
     require_connections_same_origin,
     resolve_connection_agent,
     resolve_connection_user,
@@ -398,17 +399,12 @@ async def avatar(agent_name: str, user: _ConnectionUserContext) -> Response:
 async def status(agent_name: str, provider_id: str, request: Request, context: _ConnectionsContext) -> ConnectionStatus:
     """Load status for one authorized agent and provider."""
     service = _service(context, agent_name, provider_id)
-    try:
-        if service.can_manage:
-            result = await oauth.status(provider_id, request, agent_name=agent_name)
-        else:
-            result = await _agent_scope_status(request, context, agent_name, provider_id)
-    except HTTPException as exc:
-        raise HTTPException(
-            exc.status_code,
-            "Connection status is unavailable",
-            headers=CONNECTIONS_HEADERS,
-        ) from exc
+    call = (
+        oauth.status(provider_id, request, agent_name=agent_name)
+        if service.can_manage
+        else _agent_scope_status(request, context, agent_name, provider_id)
+    )
+    result = await masked_oauth_call(call, "Connection status is unavailable")
     view = oauth.personal_connection_view(result, can_manage=service.can_manage)
     return ConnectionStatus(
         provider=provider_id,
@@ -436,14 +432,10 @@ async def connect(
             "Personal account linking is unavailable for this service",
             headers=CONNECTIONS_HEADERS,
         )
-    try:
-        return await oauth.connect(provider_id, request, agent_name=agent_name)
-    except HTTPException as exc:
-        raise HTTPException(
-            exc.status_code,
-            "Could not start account connection",
-            headers=CONNECTIONS_HEADERS,
-        ) from exc
+    return await masked_oauth_call(
+        oauth.connect(provider_id, request, agent_name=agent_name),
+        "Could not start account connection",
+    )
 
 
 @router.post("/agents/{agent_name}/{provider_id}/disconnect")
@@ -457,11 +449,7 @@ async def disconnect(
     """Reset the authorized agent's scoped provider credentials."""
     require_connections_same_origin(request, context.runtime_paths)
     _require_management(context, agent_name, provider_id)
-    try:
-        return await oauth.disconnect(provider_id, request, agent_name=agent_name)
-    except HTTPException as exc:
-        raise HTTPException(
-            exc.status_code,
-            "Could not disconnect account",
-            headers=CONNECTIONS_HEADERS,
-        ) from exc
+    return await masked_oauth_call(
+        oauth.disconnect(provider_id, request, agent_name=agent_name),
+        "Could not disconnect account",
+    )

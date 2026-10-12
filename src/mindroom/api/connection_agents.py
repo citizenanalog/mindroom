@@ -17,6 +17,8 @@ from mindroom.requester_identity import resolve_human_requester_alias
 from mindroom.tool_system.worker_routing import build_agent_toolkit_worker_target, build_tool_execution_identity
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from fastapi import Request
 
     from mindroom.api.config_lifecycle import ApiSnapshot
@@ -48,6 +50,14 @@ def require_connections_same_origin(
         detail=detail,
         headers=CONNECTIONS_HEADERS,
     )
+
+
+async def masked_oauth_call[T](call: Awaitable[T], detail: str) -> T:
+    """Await a portal route's OAuth call; a refusal keeps its status but says only `detail`, with the portal headers."""
+    try:
+        return await call
+    except HTTPException as exc:
+        raise HTTPException(exc.status_code, detail, headers=CONNECTIONS_HEADERS) from exc
 
 
 @dataclass(frozen=True)

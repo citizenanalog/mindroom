@@ -19,6 +19,7 @@ from mindroom.api.auth import require_connections_user
 from mindroom.api.connection_agents import (
     CONNECTIONS_HEADERS,
     build_connection_agent_target,
+    masked_oauth_call,
     require_connections_same_origin,
 )
 from mindroom.api.egress_status import (
@@ -648,14 +649,10 @@ async def connect_egress_account(
 ) -> oauth.OAuthConnectResponse:
     """Start the OAuth flow of a service's provider for one agent's credential scope."""
     provider = await _account_provider(request, requester_id, agent_name, service, connecting=True)
-    try:
-        return await oauth.connect(provider.id, request, agent_name=agent_name)
-    except HTTPException as exc:
-        raise HTTPException(
-            exc.status_code,
-            "Could not start account connection",
-            headers=CONNECTIONS_HEADERS,
-        ) from exc
+    return await masked_oauth_call(
+        oauth.connect(provider.id, request, agent_name=agent_name),
+        "Could not start account connection",
+    )
 
 
 @router.post("/agents/{agent_name}/{service}/disconnect")
@@ -668,14 +665,10 @@ async def disconnect_egress_account(
 ) -> dict[str, str]:
     """Reset the OAuth connection of a service's provider for one agent's credential scope."""
     provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
-    try:
-        return await oauth.disconnect(provider.id, request, agent_name=agent_name)
-    except HTTPException as exc:
-        raise HTTPException(
-            exc.status_code,
-            "Could not disconnect account",
-            headers=CONNECTIONS_HEADERS,
-        ) from exc
+    return await masked_oauth_call(
+        oauth.disconnect(provider.id, request, agent_name=agent_name),
+        "Could not disconnect account",
+    )
 
 
 # Request log
