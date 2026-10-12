@@ -16,7 +16,6 @@ from agno.tools.calculator import CalculatorTools
 from agno.tools.function import ToolResult
 from openai import AsyncOpenAI
 
-from mindroom.agent_storage import create_session_storage, get_agent_session
 from mindroom.agents import create_agent
 from mindroom.approval.tool_owners import toolkit_owners_for_agents
 from mindroom.config.main import Config
@@ -29,6 +28,7 @@ from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.mcp.types import MCPDiscoveredTool, MCPServerCatalog
 from mindroom.providers.openai_models import MindRoomOpenAIResponses
 from mindroom.response_turn import CompletedApprovalRun, PausedAnswer, PausedAttempt, paused_attempt_from_response
+from mindroom.session_storage.agent_storage import create_session_storage, get_agent_session
 from mindroom.tool_system import dynamic_toolkits
 from mindroom.tool_system.catalog import TOOL_METADATA
 from mindroom.tool_system.dynamic_toolkits import get_loaded_tools_for_session, save_loaded_tools_for_session
@@ -121,10 +121,8 @@ class _ScopedCatalogTransport:
 @pytest.fixture(autouse=True)
 def _isolate_dynamic_caches() -> Iterator[None]:
     dynamic_toolkits._loaded_tools.clear()
-    bind_mcp_server_manager(None)
     yield
     dynamic_toolkits._loaded_tools.clear()
-    bind_mcp_server_manager(None)
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,6 @@ from mindroom.agent_cli.events import stream_cli_events
 from mindroom.agent_cli.lifetime import current_cli_lifetime, response_cli_lifetime
 from mindroom.agent_cli.session import CliAuthenticationError, CliTurnOwner, TurnToolRegistry
 from mindroom.agent_cli.turn import LiveTurnTools
-from mindroom.agent_storage import get_agent_session
 from mindroom.ai_runtime import queued_message_signal_context
 from mindroom.approval import receipt as approval_receipt
 from mindroom.approval.response import identify_approval_tools, require_ordered_pause_presentation
@@ -147,6 +146,7 @@ from mindroom.runtime_shutdown import (
     SYNC_RESTART_SHUTDOWN,
     RuntimeShutdownIntent,
 )
+from mindroom.session_storage.agent_storage import get_agent_session
 from mindroom.stop import SpanRegistry
 from mindroom.streaming import (
     INTERRUPTED_RESPONSE_NOTE,
@@ -172,6 +172,7 @@ from tests.approval_continuation_helpers import (
 )
 from tests.bot_helpers import unique_room_send_responses
 from tests.conftest import (
+    SETTLE_TIMEOUT_SECONDS,
     make_matrix_client_mock,
     make_visible_message,
     message_origin,
@@ -8920,7 +8921,7 @@ async def _respond_with_skill_learning(
         ),
     ):
         await coordinator.generate_response(request_update(_plain_request(_target())))
-        assert await wait_for_background_tasks(5, owner=coordinator.deps.runtime)
+        assert await wait_for_background_tasks(SETTLE_TIMEOUT_SECONDS, owner=coordinator.deps.runtime)
     return reviews, model, bot.client.room_send
 
 
@@ -9023,7 +9024,7 @@ async def test_a_finished_response_tells_automations_its_source_events(tmp_path:
         ),
     ):
         await coordinator.generate_response(request)
-        assert await wait_for_background_tasks(5, owner=coordinator.deps.runtime)
+        assert await wait_for_background_tasks(SETTLE_TIMEOUT_SECONDS, owner=coordinator.deps.runtime)
 
     assert automations.finished == [tuple(request.sources.logical_source_event_ids)]
 
