@@ -26,17 +26,19 @@ from mindroom.oauth.google_drive import google_drive_oauth_provider
 from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess, ToolManagedInitArg, ToolStatus
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity, resolve_worker_target
 from tests.conftest import make_conversation_reader_mock, make_relation_lookup
-from tests.oauth_test_utils import corrupt_oauth_credential_payload, publish_oauth_credentials
+from tests.egress_broker.conftest import account_store, connect_account, worker_target
+from tests.oauth_test_utils import corrupt_oauth_credential_payload
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
-    from mindroom.oauth.providers import OAuthProvider
+    from mindroom.tool_system.worker_routing import WorkerScope
 
+_ALICE = "@alice:example.org"
+_BOB = "@bob:example.org"
 _SECRET = "ghp_super_secret_token_value"  # noqa: S105
 _ACCESS_TOKEN = "gho_oauth_access_token_value"  # noqa: S105
 _CONNECT_PATH = "/api/oauth/github/authorize"
@@ -65,26 +67,11 @@ def _runtime_paths(tmp_path: Path, **env: str) -> RuntimePaths:
     )
 
 
-def _target(requester_id: str = "@alice:example.org", worker_scope: str | None = "user_agent") -> ResolvedWorkerTarget:
-    identity = ToolExecutionIdentity(
-        channel="matrix",
-        agent_name="code",
-        requester_id=requester_id,
-        room_id="!room:example.org",
-        thread_id="$thread",
-        resolved_thread_id="$thread",
-        session_id="session-1",
-        tenant_id=None,
-        account_id=None,
-    )
-    return resolve_worker_target(worker_scope, "code", identity)  # type: ignore[arg-type]
-
-
 def _context(runtime_paths: RuntimePaths, services: dict[str, object] | None = None) -> ToolRuntimeContext:
     return ToolRuntimeContext(
         agent_name="code",
         target=MessageTarget.resolve(room_id="!room:example.org", thread_id="$thread", reply_to_event_id="$request"),
-        requester_id="@alice:example.org",
+        requester_id=_ALICE,
         client=MagicMock(),
         config=Config(egress_broker={"services": _SERVICES if services is None else services}),
         runtime_paths=runtime_paths,
@@ -110,50 +97,48 @@ def _entry(payload: dict[str, object], name: str) -> dict[str, object]:
     return next(entry for entry in services if entry["name"] == name)
 
 
-def _github_store(requester_id: str) -> ResolvedWorkerTarget:
-    """Return the requester's own store, where GitHub connections live whatever the agent's scope."""
-    return resolve_worker_target(
-        "user",
-        "code",
-        ToolExecutionIdentity(
-            channel="matrix",
-            agent_name="code",
-            requester_id=requester_id,
-            room_id="!room:example.org",
-            thread_id="$thread",
-            resolved_thread_id="$thread",
-            session_id="session-1",
-            tenant_id=None,
-            account_id=None,
-        ),
+def _unconfigured(name: str, display_name: str | None = None, **changes: object) -> dict[str, object]:
+    """Return the entry of a config service with no key, no account, and no account to connect, plus `changes`."""
+    return {
+        "name": name,
+        "display_name": display_name or name,
+        "source": "config",
+        "configured": False,
+        "active_source": None,
+        "can_connect_account": False,
+        "provider": None,
+        **changes,
+    }
+
+
+def _tool(
+    runtime_paths: RuntimePaths,
+    requester_id: str = _ALICE,
+    worker_scope: WorkerScope | None = "user_agent",
+) -> EgressCredentialsTools:
+    return EgressCredentialsTools(
+        runtime_paths=runtime_paths,
+        worker_target=worker_target(requester_id, scope=worker_scope),
     )
+
+
+def _save_mine(
+    manager: CredentialsManager,
+    name: str,
+    body: dict[str, object],
+    services: dict[str, EgressService],
+) -> None:
+    """Save `body` as Alice's own service `name` on agent `code`, checked against the config's `services`."""
+    service = EgressService.model_validate(body)
+    save_user_service(manager, worker_target(), name, service, config_services=services, oauth_providers=())
 
 
 def _configure_github_client(manager: CredentialsManager) -> None:
     manager.save_credentials("github_oauth_client", {"client_id": "github-client-id", "client_secret": "gh-secret"})
 
 
-def _connect_github(manager: CredentialsManager, requester_id: str) -> None:
-    provider = github_oauth_provider()
-    publish_oauth_credentials(
-        provider,
-        {
-            "token": _ACCESS_TOKEN,
-            "refresh_token": "github-refresh",
-            "token_uri": provider.token_url,
-            "client_id": "github-client-id",
-            "scopes": list(provider.scopes),
-            "expires_at": 4_102_444_800.0,
-            "_source": "oauth",
-            "_oauth_provider": provider.id,
-        },
-        credentials_manager=manager,
-        worker_target=_github_store(requester_id),
-    )
-
-
-def _github_tool(runtime_paths: RuntimePaths, requester_id: str = "@alice:example.org") -> EgressCredentialsTools:
-    return EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target(requester_id))
+def _connect_github(manager: CredentialsManager) -> None:
+    connect_account(manager, account_store(_ALICE), _ACCESS_TOKEN)
 
 
 def _configure_drive_client(manager: CredentialsManager) -> None:
@@ -166,66 +151,35 @@ def _configure_drive_client(manager: CredentialsManager) -> None:
 def _connect_drive(
     runtime_paths: RuntimePaths,
     manager: CredentialsManager,
-    requester_id: str,
-    worker_scope: str | None,
+    worker_scope: WorkerScope | None,
 ) -> None:
-    """Store a Google Drive connection where the provider's own scope policy puts it for that call."""
-    provider: OAuthProvider = google_drive_oauth_provider()
-    store = resolve_oauth_credential_context(
-        provider,
-        runtime_paths,
+    """Store Alice's Google Drive connection where the provider's own scope policy puts it for that call."""
+    provider = google_drive_oauth_provider()
+    target = worker_target(_ALICE, scope=worker_scope)
+    store = resolve_oauth_credential_context(provider, runtime_paths, manager, target).worker_target
+    connect_account(
         manager,
-        _target(requester_id, worker_scope),
-    ).worker_target
-    publish_oauth_credentials(
-        provider,
-        {
-            "token": _ACCESS_TOKEN,
-            "refresh_token": "drive-refresh",
-            "token_uri": provider.token_url,
-            "client_id": "drive-client-id",
-            "scopes": list(provider.scopes),
-            "expires_at": 4_102_444_800.0,
-            "_source": "oauth",
-            "_oauth_provider": provider.id,
-        },
-        credentials_manager=manager,
-        worker_target=store,
+        store,
+        _ACCESS_TOKEN,
+        provider=provider,
+        client_id="drive-client-id",
+        refresh_token="drive-refresh",  # noqa: S106 - test credential
     )
-
-
-def _drive_tool(
-    runtime_paths: RuntimePaths,
-    requester_id: str = "@alice:example.org",
-    worker_scope: str | None = "user_agent",
-) -> EgressCredentialsTools:
-    return EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target(requester_id, worker_scope))
 
 
 def test_reports_configured_status_per_requester_scope(tmp_path: Path) -> None:
     """Each requester sees only the secrets in their own scope, with the service's display name."""
     runtime_paths = _runtime_paths(tmp_path)
-    save_secret(get_runtime_credentials_manager(runtime_paths), _target("@alice:example.org"), "github", _SECRET)
+    save_secret(get_runtime_credentials_manager(runtime_paths), worker_target(), "github", _SECRET)
     context = _context(runtime_paths)
 
-    alice = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target("@alice:example.org")),
-        context,
-    )
-    bob = _list(EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target("@bob:example.org")), context)
+    alice = _list(_tool(runtime_paths), context)
+    bob = _list(_tool(runtime_paths, _BOB), context)
 
     assert alice["tool"] == "egress_credentials"
     assert alice["services"] == [
         {"name": "github", "display_name": "GitHub", "source": "config", "configured": True, "active_source": "key"},
-        {
-            "name": "openai",
-            "display_name": "openai",
-            "source": "config",
-            "configured": False,
-            "active_source": None,
-            "can_connect_account": False,
-            "provider": None,
-        },
+        _unconfigured("openai"),
     ]
     assert _statuses(bob) == {"github": False, "openai": False}
 
@@ -235,21 +189,16 @@ def test_lists_the_scopes_own_services_next_to_config_services(tmp_path: Path) -
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     context = _context(runtime_paths)
-    mine = EgressService.model_validate(
-        {"display_name": "Mine", "rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]},
-    )
-    save_user_service(
+    _save_mine(
         manager,
-        _target(),
         "mine",
-        mine,
-        config_services=context.config.egress_broker.services,
-        oauth_providers=(),
+        {"display_name": "Mine", "rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]},
+        context.config.egress_broker.services,
     )
-    save_secret(manager, _target(), "mine", _SECRET)
+    save_secret(manager, worker_target(), "mine", _SECRET)
 
-    alice = _list(EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()), context)
-    bob = _list(EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target("@bob:example.org")), context)
+    alice = _list(_tool(runtime_paths), context)
+    bob = _list(_tool(runtime_paths, _BOB), context)
 
     assert _entry(alice, "mine") == {
         "name": "mine",
@@ -268,19 +217,14 @@ def test_a_restrict_only_limit_is_not_listed_as_a_missing_credential(tmp_path: P
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     context = _context(runtime_paths)
-    limit = EgressService.model_validate(
-        {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}]},
-    )
-    save_user_service(
+    _save_mine(
         manager,
-        _target(),
         "github-limited",
-        limit,
-        config_services=context.config.egress_broker.services,
-        oauth_providers=(),
+        {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}]},
+        context.config.egress_broker.services,
     )
 
-    payload = _list(EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()), context)
+    payload = _list(_tool(runtime_paths), context)
 
     assert _statuses(payload) == {"github": False, "openai": False}
 
@@ -288,14 +232,10 @@ def test_a_restrict_only_limit_is_not_listed_as_a_missing_credential(tmp_path: P
 def test_user_services_are_listed_without_config_services(tmp_path: Path) -> None:
     """With no operator services, the scope's own services are still listed instead of the no-services note."""
     runtime_paths = _runtime_paths(tmp_path)
-    mine = EgressService.model_validate({"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]})
     manager = get_runtime_credentials_manager(runtime_paths)
-    save_user_service(manager, _target(), "mine", mine, config_services={}, oauth_providers=())
+    _save_mine(manager, "mine", {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}, {})
 
-    payload = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()),
-        _context(runtime_paths, services={}),
-    )
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, services={}))
 
     assert _statuses(payload) == {"mine": False}
     assert "No egress services" not in str(payload["note"])
@@ -306,16 +246,9 @@ def test_every_entry_says_who_defined_the_service(tmp_path: Path, monkeypatch: p
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     context = _context(runtime_paths)
-    mine = EgressService.model_validate({"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]})
-    save_user_service(
-        manager,
-        _target(),
-        "mine",
-        mine,
-        config_services=context.config.egress_broker.services,
-        oauth_providers=(),
-    )
-    tool = EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target())
+    mine = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
+    _save_mine(manager, "mine", mine, context.config.egress_broker.services)
+    tool = _tool(runtime_paths)
 
     payload = _list(tool, context)
 
@@ -349,12 +282,9 @@ def test_unscoped_target_reads_the_global_store(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     save_secret(manager, None, "openai", _SECRET)
-    save_secret(manager, _target(worker_scope="user_agent"), "github", _SECRET)
+    save_secret(manager, worker_target(), "github", _SECRET)
 
-    payload = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target(worker_scope=None)),
-        _context(runtime_paths),
-    )
+    payload = _list(_tool(runtime_paths, worker_scope=None), _context(runtime_paths))
 
     assert _statuses(payload) == {"github": False, "openai": True}
 
@@ -368,14 +298,8 @@ def test_manage_url_points_at_the_dashboard_or_the_personal_page(tmp_path: Path)
         MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
     )
 
-    dashboard_payload = _list(
-        EgressCredentialsTools(runtime_paths=dashboard, worker_target=_target()),
-        _context(dashboard),
-    )
-    personal_payload = _list(
-        EgressCredentialsTools(runtime_paths=personal, worker_target=_target()),
-        _context(personal),
-    )
+    dashboard_payload = _list(_tool(dashboard), _context(dashboard))
+    personal_payload = _list(_tool(personal), _context(personal))
 
     assert dashboard_payload["manage_url"] == "https://mindroom.example/"
     assert personal_payload["manage_url"] == "https://mindroom.example/connections/egress"
@@ -386,10 +310,7 @@ def test_manage_url_is_null_without_a_public_url(tmp_path: Path) -> None:
     """Without a public URL the tool still answers and tells the agent to ask the operator."""
     runtime_paths = _runtime_paths(tmp_path)
 
-    payload = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()),
-        _context(runtime_paths),
-    )
+    payload = _list(_tool(runtime_paths), _context(runtime_paths))
 
     assert payload["manage_url"] is None
     assert "operator" in str(payload["note"])
@@ -399,9 +320,9 @@ def test_output_never_contains_secret_values(tmp_path: Path) -> None:
     """Status output carries names and flags only, never a stored secret or its timestamp."""
     runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
     manager = get_runtime_credentials_manager(runtime_paths)
-    save_secret(manager, _target(), "github", _SECRET)
-    save_secret(manager, _target(), "openai", _SECRET + "_two")
-    tool = EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target())
+    save_secret(manager, worker_target(), "github", _SECRET)
+    save_secret(manager, worker_target(), "openai", _SECRET + "_two")
+    tool = _tool(runtime_paths)
 
     with tool_runtime_context(_context(runtime_paths)):
         output = tool.list_egress_credentials()
@@ -428,7 +349,7 @@ def test_without_runtime_context_returns_empty_services(tmp_path: Path) -> None:
     """Outside a live request there is no committed config, so the tool reports nothing instead of raising."""
     runtime_paths = _runtime_paths(tmp_path)
 
-    payload = _list(EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()), None)
+    payload = _list(_tool(runtime_paths), None)
 
     assert payload["services"] == []
     assert "configuration" in str(payload["note"])
@@ -438,10 +359,7 @@ def test_no_configured_services_says_so(tmp_path: Path) -> None:
     """A config with no egress services gets a note saying none are set up."""
     runtime_paths = _runtime_paths(tmp_path)
 
-    payload = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target()),
-        _context(runtime_paths, services={}),
-    )
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, services={}))
 
     assert payload["services"] == []
     assert "No egress services" in str(payload["note"])
@@ -463,7 +381,7 @@ def test_registers_and_builds_via_metadata(tmp_path: Path) -> None:
     assert metadata.managed_init_args == (ToolManagedInitArg.RUNTIME_PATHS, ToolManagedInitArg.WORKER_TARGET)
     assert metadata.function_names == ("list_egress_credentials",)
 
-    tool = get_tool_by_name("egress_credentials", _runtime_paths(tmp_path), worker_target=_target())
+    tool = get_tool_by_name("egress_credentials", _runtime_paths(tmp_path), worker_target=worker_target())
 
     assert isinstance(tool, EgressCredentialsTools)
     assert [function.__name__ for function in tool.tools] == ["list_egress_credentials"]
@@ -474,11 +392,11 @@ def test_connected_account_is_the_active_source_without_a_key(tmp_path: Path) ->
     runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
+    _connect_github(manager)
     context = _context(runtime_paths, _PRESET_SERVICES)
 
-    alice = _list(_github_tool(runtime_paths), context)
-    bob = _list(_github_tool(runtime_paths, "@bob:example.org"), context)
+    alice = _list(_tool(runtime_paths), context)
+    bob = _list(_tool(runtime_paths, _BOB), context)
 
     assert _entry(alice, "github") == {
         "name": "github",
@@ -499,23 +417,12 @@ def test_github_account_is_not_offered_where_requesters_share_a_worker(
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
+    _connect_github(manager)
     context = _context(runtime_paths, _PRESET_SERVICES)
 
-    alice = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target("@alice:example.org", worker_scope)),
-        context,
-    )
+    alice = _list(_tool(runtime_paths, worker_scope=worker_scope), context)
 
-    assert _entry(alice, "github") == {
-        "name": "github",
-        "display_name": "GitHub",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": False,
-        "provider": None,
-    }
+    assert _entry(alice, "github") == _unconfigured("github", "GitHub")
 
 
 def test_github_account_is_not_offered_on_the_static_runner_without_the_opt_in(tmp_path: Path) -> None:
@@ -523,21 +430,13 @@ def test_github_account_is_not_offered_on_the_static_runner_without_the_opt_in(t
     runtime_paths = _runtime_paths(tmp_path, MINDROOM_WORKER_BACKEND="static_runner")
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
+    _connect_github(manager)
     opted_in = {**_PRESET_SERVICES, "github": {"preset": "github", "oauth_on_shared_workers": True}}
 
-    refused = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
-    allowed = _list(_github_tool(runtime_paths), _context(runtime_paths, opted_in))
+    refused = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    allowed = _list(_tool(runtime_paths), _context(runtime_paths, opted_in))
 
-    assert _entry(refused, "github") == {
-        "name": "github",
-        "display_name": "GitHub",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": False,
-        "provider": None,
-    }
+    assert _entry(refused, "github") == _unconfigured("github", "GitHub")
     assert _entry(allowed, "github")["active_source"] == "oauth"
 
 
@@ -546,20 +445,14 @@ def test_github_account_is_per_requester_on_a_shared_agent_with_the_opt_in(tmp_p
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
+    _connect_github(manager)
     context = _context(
         runtime_paths,
         {**_PRESET_SERVICES, "github": {"preset": "github", "oauth_on_shared_workers": True}},
     )
 
-    alice = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target("@alice:example.org", "shared")),
-        context,
-    )
-    bob = _list(
-        EgressCredentialsTools(runtime_paths=runtime_paths, worker_target=_target("@bob:example.org", "shared")),
-        context,
-    )
+    alice = _list(_tool(runtime_paths, worker_scope="shared"), context)
+    bob = _list(_tool(runtime_paths, _BOB, "shared"), context)
 
     assert _entry(alice, "github")["active_source"] == "oauth"
     assert _entry(bob, "github")["active_source"] is None
@@ -571,10 +464,10 @@ def test_explicit_key_wins_over_a_connected_account(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
-    save_secret(manager, _target(), "github", _SECRET)
+    _connect_github(manager)
+    save_secret(manager, worker_target(), "github", _SECRET)
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
     assert _entry(payload, "github") == {
         "name": "github",
@@ -590,33 +483,17 @@ def test_unconfigured_service_says_whether_an_account_can_be_connected(tmp_path:
     runtime_paths = _runtime_paths(tmp_path)
     _configure_github_client(get_runtime_credentials_manager(runtime_paths))
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
-    assert _entry(payload, "github") == {
-        "name": "github",
-        "display_name": "GitHub",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": True,
-        "provider": "github",
-    }
-    assert _entry(payload, "openai") == {
-        "name": "openai",
-        "display_name": "OpenAI",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": False,
-        "provider": None,
-    }
+    assert _entry(payload, "github") == _unconfigured("github", "GitHub", can_connect_account=True, provider="github")
+    assert _entry(payload, "openai") == _unconfigured("openai", "OpenAI")
 
 
 def test_provider_without_a_client_cannot_be_connected(tmp_path: Path) -> None:
     """A provider whose OAuth client is not configured offers no connection and is not named."""
     runtime_paths = _runtime_paths(tmp_path)
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
     entry = _entry(payload, "github")
     assert (entry["can_connect_account"], entry["provider"]) == (False, None)
@@ -627,17 +504,9 @@ def test_shared_service_account_is_not_injected_so_it_is_not_connected(tmp_path:
     runtime_paths = _runtime_paths(tmp_path, GOOGLE_SERVICE_ACCOUNT_FILE=str(tmp_path / "service-account.json"))
     _configure_drive_client(get_runtime_credentials_manager(runtime_paths))
 
-    payload = _list(_drive_tool(runtime_paths), _context(runtime_paths, _DRIVE_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _DRIVE_SERVICES))
 
-    assert _entry(payload, "drive") == {
-        "name": "drive",
-        "display_name": "Google Drive",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": False,
-        "provider": None,
-    }
+    assert _entry(payload, "drive") == _unconfigured("drive", "Google Drive")
 
 
 def test_google_account_follows_the_agent_scope_not_the_requester(tmp_path: Path) -> None:
@@ -645,12 +514,12 @@ def test_google_account_follows_the_agent_scope_not_the_requester(tmp_path: Path
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_drive_client(manager)
-    _connect_drive(runtime_paths, manager, "@alice:example.org", "shared")
+    _connect_drive(runtime_paths, manager, "shared")
     context = _context(runtime_paths, _DRIVE_SERVICES)
 
-    shared_alice = _list(_drive_tool(runtime_paths, "@alice:example.org", "shared"), context)
-    shared_bob = _list(_drive_tool(runtime_paths, "@bob:example.org", "shared"), context)
-    per_requester_alice = _list(_drive_tool(runtime_paths, "@alice:example.org", "user_agent"), context)
+    shared_alice = _list(_tool(runtime_paths, worker_scope="shared"), context)
+    shared_bob = _list(_tool(runtime_paths, _BOB, "shared"), context)
+    per_requester_alice = _list(_tool(runtime_paths), context)
 
     assert _entry(shared_alice, "drive")["active_source"] == "oauth"
     assert _entry(shared_bob, "drive")["active_source"] == "oauth"
@@ -658,9 +527,9 @@ def test_google_account_follows_the_agent_scope_not_the_requester(tmp_path: Path
     assert _entry(per_requester_alice, "drive")["can_connect_account"] is True
     assert _entry(per_requester_alice, "drive")["provider"] == "google_drive"
 
-    _connect_drive(runtime_paths, manager, "@alice:example.org", "user_agent")
-    alice = _list(_drive_tool(runtime_paths, "@alice:example.org", "user_agent"), context)
-    bob = _list(_drive_tool(runtime_paths, "@bob:example.org", "user_agent"), context)
+    _connect_drive(runtime_paths, manager, "user_agent")
+    alice = _list(_tool(runtime_paths), context)
+    bob = _list(_tool(runtime_paths, _BOB), context)
 
     assert _entry(alice, "drive")["active_source"] == "oauth"
     assert _entry(bob, "drive")["active_source"] is None
@@ -672,7 +541,7 @@ def test_one_failing_provider_does_not_fail_the_whole_listing(
 ) -> None:
     """A service whose account status cannot be read is reported as unconfigured; the others still answer."""
     runtime_paths = _runtime_paths(tmp_path)
-    save_secret(get_runtime_credentials_manager(runtime_paths), _target(), "openai", _SECRET)
+    save_secret(get_runtime_credentials_manager(runtime_paths), worker_target(), "openai", _SECRET)
 
     def failing_status(*_args: object, **_kwargs: object) -> None:
         msg = f"provider exploded with {_ACCESS_TOKEN}"
@@ -681,17 +550,9 @@ def test_one_failing_provider_does_not_fail_the_whole_listing(
     monkeypatch.setattr(egress_credentials_module, "oauth_status", failing_status)
 
     with capture_logs() as logs:
-        payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+        payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
-    assert _entry(payload, "github") == {
-        "name": "github",
-        "display_name": "GitHub",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": False,
-        "provider": None,
-    }
+    assert _entry(payload, "github") == _unconfigured("github", "GitHub")
     assert _entry(payload, "openai")["active_source"] == "key"
     failures = [log for log in logs if log["event"] == "egress_credentials_status_failed"]
     assert [(log["service"], log["error_type"]) for log in failures] == [("github", "RuntimeError")]
@@ -703,16 +564,16 @@ def test_unreadable_connection_cannot_be_connected_until_reset(tmp_path: Path) -
     runtime_paths = _runtime_paths(tmp_path)
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
+    _connect_github(manager)
     provider = github_oauth_provider()
     corrupt_oauth_credential_payload(
         _oauth_credential_database_path(
-            resolve_oauth_credential_context(provider, runtime_paths, manager, _github_store("@alice:example.org")),
+            resolve_oauth_credential_context(provider, runtime_paths, manager, account_store(_ALICE)),
         ),
         base64.b64encode(b"not a credential"),
     )
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
     entry = _entry(payload, "github")
     assert (entry["configured"], entry["can_connect_account"]) == (False, False)
@@ -723,17 +584,9 @@ def test_unknown_oauth_provider_is_ignored(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths(tmp_path)
     services = {"acme": {"oauth_provider": "acme", "rules": [{"host": "api.acme.test", "auth": {"type": "bearer"}}]}}
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, services))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, services))
 
-    assert _entry(payload, "acme") == {
-        "name": "acme",
-        "display_name": "acme",
-        "source": "config",
-        "configured": False,
-        "active_source": None,
-        "can_connect_account": False,
-        "provider": None,
-    }
+    assert _entry(payload, "acme") == _unconfigured("acme")
 
 
 def test_output_carries_no_token_or_connect_link(tmp_path: Path) -> None:
@@ -741,13 +594,13 @@ def test_output_carries_no_token_or_connect_link(tmp_path: Path) -> None:
     runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
-    _connect_github(manager, "@alice:example.org")
+    _connect_github(manager)
     context = _context(runtime_paths, _PRESET_SERVICES)
 
-    connected = _github_tool(runtime_paths)
+    connected = _tool(runtime_paths)
     with tool_runtime_context(context):
         connected_output = connected.list_egress_credentials()
-        unconnected_output = _github_tool(runtime_paths, "@bob:example.org").list_egress_credentials()
+        unconnected_output = _tool(runtime_paths, _BOB).list_egress_credentials()
 
     for output in (connected_output, unconnected_output):
         assert _ACCESS_TOKEN not in output
@@ -761,7 +614,7 @@ def test_note_points_at_connecting_an_account_or_adding_a_key(tmp_path: Path) ->
     """The note covers both fixes, where to do them, and that a key wins; it never asks for a pasted key."""
     runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
     note = str(payload["note"])
     assert "neither an API key nor a connected account" in note
@@ -778,7 +631,7 @@ def test_note_without_a_public_url_sends_the_agent_to_the_operator(tmp_path: Pat
     """With no manage link the note still names both fixes and tells the agent to ask the operator where to do them."""
     runtime_paths = _runtime_paths(tmp_path)
 
-    payload = _list(_github_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
     note = str(payload["note"])
     assert "ask the operator for it" in note
