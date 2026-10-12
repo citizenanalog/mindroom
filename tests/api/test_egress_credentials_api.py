@@ -68,6 +68,9 @@ if TYPE_CHECKING:
     from mindroom.oauth.providers import OAuthProvider
 
 
+# --- Fixtures ---
+
+
 def _trust_signed_users(monkeypatch: pytest.MonkeyPatch) -> Any:  # noqa: ANN401
     """Accept the test key's signed identities and resolve every host to a public address; return the key."""
     key = _trusted_upstream_jwt_key()
@@ -158,6 +161,88 @@ def egress_portal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce_turn_
     }
 
 
+def _oauth_services() -> dict[str, Any]:
+    """Return services on an agent-scoped (Drive), a requester-scoped (GitHub), and an unknown OAuth provider."""
+    rules = [{"host": "www.googleapis.com", "auth": {"type": "bearer"}}]
+    return {
+        "drive": {"description": "Drive", "oauth_provider": "google_drive", "rules": rules},
+        "gh": {"display_name": "GH", "oauth_provider": "github", "rules": rules},
+        "ghost": {"description": "Unknown provider", "oauth_provider": "no_such_provider", "rules": rules},
+    }
+
+
+def _use_fake_oauth_providers(monkeypatch: pytest.MonkeyPatch, paths: RuntimePaths) -> dict[str, OAuthProvider]:
+    """Register fake agent-scoped Drive and requester-scoped GitHub providers with configured clients; return them."""
+    drive = _fake_provider(provider_id="google_drive", credential_service="google_drive_oauth")
+    github = _fake_provider(
+        provider_id="github",
+        credential_service="github_oauth",
+        client_config_services=("github_oauth_client",),
+        requester_scoped_credentials=True,
+    )
+    monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (drive, github))
+    manager = get_runtime_credentials_manager(paths)
+    for client_service in ("test_drive_oauth_client", "github_oauth_client"):
+        manager.save_credentials(
+            client_service,
+            {"client_id": "test-client", "client_secret": "test-secret", "_source": "ui"},
+        )
+    return {"google_drive": drive, "github": github}
+
+
+@pytest.fixture
+def oauth_egress_portal(egress_portal: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Extend the egress portal with services backed by an agent-scoped and a requester-scoped OAuth provider."""
+    paths = egress_portal["paths"]
+    providers = _use_fake_oauth_providers(monkeypatch, paths)
+    payload = egress_portal["payload"]
+    for agent in ("personal", "shared_dev"):
+        # The Connections portal lists a provider only for agents that have a tool using it.
+        payload["agents"][agent]["tools"].append({"name": "google_drive", "defer": True})
+    payload["egress_broker"]["services"].update(_oauth_services())
+    _publish_config(main.app, paths, payload)
+    _use_runtime_auth_settings(main.app)
+    return {**egress_portal, "providers": providers}
+
+
+@pytest.fixture
+def unscoped_portal(egress_portal: dict[str, Any]) -> dict[str, Any]:
+    """Add an agent without a worker scope, which everyone using it shares like a shared agent."""
+    portal = egress_portal
+    portal["payload"]["agents"]["unscoped_dev"] = _agent_config(
+        "Unscoped Dev",
+        "Team agent without a worker scope",
+        users=("@alice:example.org", "@bob:example.org"),
+        credential_managers=["@bob:example.org"],
+    )
+    _republish(portal)
+    return portal
+
+
+@pytest.fixture
+def audit_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[AuditLog]:
+    """Serve the personal log from a real audit log, as if the broker were running."""
+    log = AuditLog(tmp_path / "audit.sqlite3")
+    monkeypatch.setattr(egress_credentials, "active_audit_log", lambda: log)
+    yield log
+    log.close()
+
+
+@pytest.fixture
+def mixed_log(audit_log: AuditLog) -> AuditLog:
+    """Alice and Bob both used the shared agent and each their own private agent; one row has no requester."""
+    _record_request(audit_log, "@alice:example.org", "personal", 1, path="/alice/personal/old")
+    _record_request(audit_log, "@bob:example.org", "personal", 2, path="/bob/personal")
+    _record_request(audit_log, "@alice:example.org", "shared_dev", 3, path="/alice/shared")
+    _record_request(audit_log, "@bob:example.org", "shared_dev", 4, path="/bob/shared")
+    _record_request(audit_log, None, "shared_dev", 5, path="/nobody/shared")
+    _record_request(audit_log, "@alice:example.org", "personal", 6, path="/alice/personal/new")
+    return audit_log
+
+
+# --- Helpers ---
+
+
 def _republish(portal: dict[str, Any]) -> None:
     """Publish the portal's edited config payload and apply it, as a dashboard save and reload do."""
     _publish_config(main.app, portal["paths"], portal["payload"])
@@ -215,6 +300,19 @@ def _listing(portal: dict[str, Any], user: str) -> Any:  # noqa: ANN401
     return response
 
 
+def _listed_agents(portal: dict[str, Any], user: str) -> dict[str, dict[str, Any]]:
+    return {agent["agent_name"]: agent for agent in _listing(portal, user).json()["agents"]}
+
+
+def _agent_rows(response: Any) -> list[str]:  # noqa: ANN401
+    assert response.status_code == 200, response.text
+    return [agent["agent_name"] for agent in response.json()["agents"]]
+
+
+def _egress_row(portal: dict[str, Any], user: str, agent: str, service: str) -> dict[str, Any]:
+    return next(item for item in _listed_agents(portal, user)[agent]["services"] if item["name"] == service)
+
+
 def _catalog_services(portal: dict[str, Any], user: str, agent: str) -> list[dict[str, Any]]:
     """Return the egress rows the Connections portal catalog lists for an agent the user may use egress for."""
     response = portal["client"].get("/api/connections", headers=portal["headers"][user])
@@ -222,6 +320,181 @@ def _catalog_services(portal: dict[str, Any], user: str, agent: str) -> list[dic
     services = next(item for item in response.json()["agents"] if item["agent_name"] == agent)["egress_services"]
     assert services is not None
     return services
+
+
+def _finish_oauth(
+    client: TestClient,
+    connect: Any,  # noqa: ANN401
+    provider: str,
+    headers: dict[str, str] | None = None,
+) -> None:
+    """Check `connect` answered with an authorize URL, then complete it through the shared callback."""
+    assert connect.status_code == 200, connect.text
+    state = parse_qs(urlparse(connect.json()["auth_url"]).query)["state"][0]
+    callback = client.get(
+        f"/api/oauth/{provider}/callback",
+        params={"code": "test-code", "state": state},
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert callback.status_code in {302, 303, 307}, callback.text
+
+
+def _connect_account(portal: dict[str, Any], user: str, agent: str, service: str, provider: str) -> None:
+    """Run the whole OAuth flow through the egress connect route and the shared callback."""
+    connect = _account_action(portal, user, agent, service, "connect")
+    _finish_oauth(portal["client"], connect, provider, portal["headers"][user])
+
+
+def _oauth_block(**changes: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Return the `oauth` block of a Drive service nobody has connected, with `changes` applied."""
+    return {
+        "provider": "google_drive",
+        "display_name": "Test Drive",
+        "connected": False,
+        "account_label": None,
+        "can_connect": True,
+        "reset_required": False,
+        "service_account": False,
+        "unavailable_reason": None,
+        "shared_worker_opt_in": False,
+        **changes,
+    }
+
+
+def _opt_in_to_shared_workers(portal: dict[str, Any]) -> None:
+    """Let the requester-scoped `gh` service use connected accounts on shared and unscoped workers."""
+    portal["payload"]["egress_broker"]["services"]["gh"]["oauth_on_shared_workers"] = True
+    _republish(portal)
+
+
+_NOTES = {
+    "description": "Team notes",
+    "rules": [{"host": "api.notes.example.com", "auth": {"type": "bearer"}}],
+}
+
+
+# A personal service that signs in with a connected GitHub account, on one of the GitHub preset's hosts.
+_MY_GITHUB = {
+    "description": "My repositories",
+    "rules": [{"host": "api.github.com", "path_prefix": "/repos/alice/", "auth": {"type": "bearer"}}],
+    "oauth_provider": "github",
+}
+
+
+def _service_url(agent: str, name: str) -> str:
+    return f"/api/connections/egress/agents/{agent}/services/{name}"
+
+
+def _put_service(
+    portal: dict[str, Any],
+    user: str,
+    agent: str,
+    name: str,
+    body: dict[str, Any] | None = None,
+) -> Any:  # noqa: ANN401
+    return portal["client"].put(
+        _service_url(agent, name),
+        json=_NOTES if body is None else body,
+        headers=portal["headers"][user],
+    )
+
+
+def _get_service(portal: dict[str, Any], user: str, agent: str, name: str) -> Any:  # noqa: ANN401
+    return portal["client"].get(_service_url(agent, name), headers=portal["headers"][user])
+
+
+def _delete_service(portal: dict[str, Any], user: str, agent: str, name: str) -> Any:  # noqa: ANN401
+    return portal["client"].delete(_service_url(agent, name), headers=portal["headers"][user])
+
+
+def _listed_services(portal: dict[str, Any], user: str, agent: str) -> list[dict[str, Any]]:
+    return _listed_agents(portal, user)[agent]["services"]
+
+
+def _listed_names(portal: dict[str, Any], user: str, agent: str) -> list[str]:
+    return [service["name"] for service in _listed_services(portal, user, agent)]
+
+
+def _scope_target(portal: dict[str, Any], agent: str = "personal", requester: str = "@alice:example.org") -> Any:  # noqa: ANN401
+    config = Config.model_validate(portal["payload"], context={"runtime_paths": portal["paths"]})
+    return build_connection_agent_target(config, portal["paths"], requester, agent)
+
+
+def _store_raw_entries(
+    portal: dict[str, Any],
+    entries: dict[str, Any],
+    agent: str = "personal",
+    requester: str = "@alice:example.org",
+) -> None:
+    """Write entries into a scope's services document as stored, without the save route's validation."""
+    secrets.save_egress_document(
+        get_runtime_credentials_manager(portal["paths"]),
+        _scope_target(portal, agent, requester),
+        "egress__services",
+        {"services": entries},
+    )
+
+
+def _stored_key(
+    portal: dict[str, Any],
+    name: str,
+    agent: str = "personal",
+    requester: str = "@alice:example.org",
+) -> Any:  # noqa: ANN401
+    return secrets.load_secret(
+        get_runtime_credentials_manager(portal["paths"]),
+        _scope_target(portal, agent, requester),
+        name,
+    )
+
+
+_LOG_START = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+
+
+def _record_request(
+    log: AuditLog,
+    requester_id: str | None,
+    agent_name: str,
+    seconds: int,
+    *,
+    host: str = "api.github.com",
+    path: str = "/user",
+    kind: Literal["request", "tunnel", "denied"] = "request",
+    status: int = 200,
+    code: str | None = None,
+    scope: str | None = None,
+) -> None:
+    log.record(
+        AuditRecord(
+            at=_LOG_START + timedelta(seconds=seconds),
+            kind=kind,
+            scope=scope or ("shared" if agent_name == "shared_dev" else "user_agent"),
+            agent_name=agent_name,
+            requester_id=requester_id,
+            method="GET",
+            host=host,
+            path=path,
+            service="github",
+            status=status,
+            bytes_up=1,
+            bytes_down=2,
+            duration_ms=3,
+            code=code,
+        ),
+    )
+
+
+def _get_logs(portal: dict[str, Any], user: str, query: str = "") -> Any:  # noqa: ANN401
+    return portal["client"].get(f"/api/connections/egress/logs{query}", headers=portal["headers"][user])
+
+
+def _log_paths(response: Any) -> list[str]:  # noqa: ANN401
+    assert response.status_code == 200, response.text
+    return [record["path"] for record in response.json()["records"]]
+
+
+# --- Agents and keys ---
 
 
 @pytest.mark.parametrize("with_connections_agent", [False, True])
@@ -247,11 +520,6 @@ def test_lists_only_usable_shell_or_python_agents(egress_portal: dict[str, Any])
     assert agent_names == {"personal", "shared_dev"}
     assert all(len(a["services"]) == 2 for a in response.json()["agents"])
     assert all(s["name"] in ("github", "openai") for a in response.json()["agents"] for s in a["services"])
-
-
-def _agent_rows(response: Any) -> list[str]:  # noqa: ANN401
-    assert response.status_code == 200, response.text
-    return [agent["agent_name"] for agent in response.json()["agents"]]
 
 
 def test_listing_reports_scope_scope_agents_and_managers(egress_portal: dict[str, Any]) -> None:
@@ -299,6 +567,39 @@ def test_scope_agents_name_only_the_requesters_agents_that_can_use_the_store(egr
     _republish(portal)
 
     assert _listed_agents(portal, "alice")["notes"]["scope_agents"] == ["Notes"]
+
+
+def test_listing_reports_whether_each_agent_is_shared_and_whether_the_caller_manages_it(
+    egress_portal: dict[str, Any],
+) -> None:
+    """Every agent says if its services are shared and if the caller may change them, as the write routes decide."""
+    portal = egress_portal
+    alice = _listed_agents(portal, "alice")
+    assert (alice["personal"]["shared"], alice["personal"]["can_manage"]) == (False, True)
+    assert (alice["shared_dev"]["shared"], alice["shared_dev"]["can_manage"]) == (True, False)
+    bob = _listed_agents(portal, "bob")
+    assert (bob["personal"]["shared"], bob["personal"]["can_manage"]) == (False, True)
+    assert (bob["shared_dev"]["shared"], bob["shared_dev"]["can_manage"]) == (True, True)
+    # The per-service flags the page already used say the same.
+    for agent in (*alice.values(), *bob.values()):
+        assert {service["can_manage"] for service in agent["services"]} == {agent["can_manage"]}
+        assert {service["is_shared"] for service in agent["services"]} == {agent["shared"]}
+    # What the flags promise is what the write routes do.
+    assert _put_service(portal, "alice", "shared_dev", "mine").status_code == 403
+    assert _put_service(portal, "bob", "shared_dev", "mine").status_code == 204
+
+
+def test_an_agent_without_services_still_reports_the_flags(egress_portal: dict[str, Any]) -> None:
+    """With no service to carry them, the agent's own flags tell the page whether Add service is allowed."""
+    portal = egress_portal
+    portal["payload"]["egress_broker"]["services"] = {}
+    _republish(portal)
+
+    alice = _listed_agents(portal, "alice")
+    assert {agent["agent_name"]: agent["services"] for agent in alice.values()} == {"personal": [], "shared_dev": []}
+    assert (alice["personal"]["shared"], alice["personal"]["can_manage"]) == (False, True)
+    assert (alice["shared_dev"]["shared"], alice["shared_dev"]["can_manage"]) == (True, False)
+    assert _listed_agents(portal, "bob")["shared_dev"]["can_manage"] is True
 
 
 def test_agents_keep_config_order(egress_portal: dict[str, Any]) -> None:
@@ -450,6 +751,26 @@ def test_unknown_agent_or_service_404(
     assert response.status_code == 404, response.text
 
 
+def test_credential_manager_without_use_access_sees_no_egress_anywhere(egress_portal: dict[str, Any]) -> None:
+    """A manager who may not use the agent is shown no egress rows and cannot mutate them."""
+    client = egress_portal["client"]
+    carol_headers = egress_portal["headers"]["carol"]
+
+    catalog = client.get("/api/connections", headers=carol_headers)
+    assert catalog.status_code == 200, catalog.text
+    shared_dev = next(agent for agent in catalog.json()["agents"] if agent["agent_name"] == "shared_dev")
+    assert shared_dev["can_use"] is False
+    assert shared_dev["egress_services"] is None
+
+    assert _listing(egress_portal, "carol").json()["agents"] == []
+
+    response = _put_key(egress_portal, "carol", "shared_dev", "github")
+    assert response.status_code == 404, response.text
+
+
+# --- Connections portal catalog ---
+
+
 def test_portal_catalog_includes_egress_services(egress_portal: dict[str, Any]) -> None:
     """When MINDROOM_CONNECTIONS_AGENT is set, the portal catalog lists the services of eligible agents only."""
     response = egress_portal["client"].get("/api/connections", headers=egress_portal["headers"]["alice"])
@@ -487,109 +808,33 @@ def test_portal_catalog_sends_an_empty_list_for_an_eligible_agent_without_servic
     assert [row["name"] for row in _catalog_services(portal, "alice", "personal")] == ["notes"]
 
 
-def test_credential_manager_without_use_access_sees_no_egress_anywhere(egress_portal: dict[str, Any]) -> None:
-    """A manager who may not use the agent is shown no egress rows and cannot mutate them."""
-    client = egress_portal["client"]
-    carol_headers = egress_portal["headers"]["carol"]
-
-    catalog = client.get("/api/connections", headers=carol_headers)
-    assert catalog.status_code == 200, catalog.text
-    shared_dev = next(agent for agent in catalog.json()["agents"] if agent["agent_name"] == "shared_dev")
-    assert shared_dev["can_use"] is False
-    assert shared_dev["egress_services"] is None
-
-    assert _listing(egress_portal, "carol").json()["agents"] == []
-
-    response = _put_key(egress_portal, "carol", "shared_dev", "github")
-    assert response.status_code == 404, response.text
+# --- Connected accounts (OAuth) ---
 
 
-def _oauth_services() -> dict[str, Any]:
-    """Return services on an agent-scoped (Drive), a requester-scoped (GitHub), and an unknown OAuth provider."""
-    rules = [{"host": "www.googleapis.com", "auth": {"type": "bearer"}}]
-    return {
-        "drive": {"description": "Drive", "oauth_provider": "google_drive", "rules": rules},
-        "gh": {"display_name": "GH", "oauth_provider": "github", "rules": rules},
-        "ghost": {"description": "Unknown provider", "oauth_provider": "no_such_provider", "rules": rules},
-    }
-
-
-def _use_fake_oauth_providers(monkeypatch: pytest.MonkeyPatch, paths: RuntimePaths) -> dict[str, OAuthProvider]:
-    """Register fake agent-scoped Drive and requester-scoped GitHub providers with configured clients; return them."""
-    drive = _fake_provider(provider_id="google_drive", credential_service="google_drive_oauth")
-    github = _fake_provider(
-        provider_id="github",
-        credential_service="github_oauth",
-        client_config_services=("github_oauth_client",),
-        requester_scoped_credentials=True,
+def _portal_oauth_view(portal: dict[str, Any], user: str, agent: str) -> dict[str, Any]:
+    """Return the Connections portal's status for the agent's Drive connection, in the egress field names."""
+    response = portal["client"].get(
+        f"/api/connections/agents/{agent}/google_drive/status",
+        headers=portal["headers"][user],
     )
-    monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (drive, github))
-    manager = get_runtime_credentials_manager(paths)
-    for client_service in ("test_drive_oauth_client", "github_oauth_client"):
-        manager.save_credentials(
-            client_service,
-            {"client_id": "test-client", "client_secret": "test-secret", "_source": "ui"},
-        )
-    return {"google_drive": drive, "github": github}
+    assert response.status_code == 200, response.text
+    body = response.json()
+    return {key: body[key] for key in ("connected", "can_connect", "reset_required", "account_label")}
 
 
-def _finish_oauth(
-    client: TestClient,
-    connect: Any,  # noqa: ANN401
-    provider: str,
-    headers: dict[str, str] | None = None,
-) -> None:
-    """Check `connect` answered with an authorize URL, then complete it through the shared callback."""
-    assert connect.status_code == 200, connect.text
-    state = parse_qs(urlparse(connect.json()["auth_url"]).query)["state"][0]
-    callback = client.get(
-        f"/api/oauth/{provider}/callback",
-        params={"code": "test-code", "state": state},
-        headers=headers,
-        follow_redirects=False,
-    )
-    assert callback.status_code in {302, 303, 307}, callback.text
+def _egress_oauth_view(portal: dict[str, Any], user: str, agent: str) -> dict[str, Any]:
+    oauth = _egress_row(portal, user, agent, "drive")["oauth"]
+    return {key: oauth[key] for key in ("connected", "can_connect", "reset_required", "account_label")}
 
 
-@pytest.fixture
-def oauth_egress_portal(egress_portal: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Extend the egress portal with services backed by an agent-scoped and a requester-scoped OAuth provider."""
-    paths = egress_portal["paths"]
-    providers = _use_fake_oauth_providers(monkeypatch, paths)
-    payload = egress_portal["payload"]
-    for agent in ("personal", "shared_dev"):
-        # The Connections portal lists a provider only for agents that have a tool using it.
-        payload["agents"][agent]["tools"].append({"name": "google_drive", "defer": True})
-    payload["egress_broker"]["services"].update(_oauth_services())
-    _publish_config(main.app, paths, payload)
-    _use_runtime_auth_settings(main.app)
-    return {**egress_portal, "providers": providers}
-
-
-def _oauth_block(**changes: Any) -> dict[str, Any]:  # noqa: ANN401
-    """Return the `oauth` block of a Drive service nobody has connected, with `changes` applied."""
-    return {
-        "provider": "google_drive",
-        "display_name": "Test Drive",
-        "connected": False,
-        "account_label": None,
-        "can_connect": True,
-        "reset_required": False,
-        "service_account": False,
-        "unavailable_reason": None,
-        "shared_worker_opt_in": False,
-        **changes,
-    }
-
-
-def _egress_row(portal: dict[str, Any], user: str, agent: str, service: str) -> dict[str, Any]:
-    return next(item for item in _listed_agents(portal, user)[agent]["services"] if item["name"] == service)
-
-
-def _connect_account(portal: dict[str, Any], user: str, agent: str, service: str, provider: str) -> None:
-    """Run the whole OAuth flow through the egress connect route and the shared callback."""
-    connect = _account_action(portal, user, agent, service, "connect")
-    _finish_oauth(portal["client"], connect, provider, portal["headers"][user])
+def _assert_portal_and_egress_agree(portal: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare every viewer of the personal and the shared agent, and return the views for further checks."""
+    views = []
+    for user, agent in (("alice", "personal"), ("bob", "personal"), ("alice", "shared_dev"), ("bob", "shared_dev")):
+        egress = _egress_oauth_view(portal, user, agent)
+        assert egress == _portal_oauth_view(portal, user, agent), (user, agent)
+        views.append(egress)
+    return views
 
 
 def test_status_shows_the_oauth_connection_and_a_stored_key_wins(oauth_egress_portal: dict[str, Any]) -> None:
@@ -857,12 +1102,6 @@ def test_github_login_lookup_failure_never_leaks_the_token(
     assert "gho-user-access" not in json.dumps(row)
 
 
-def _opt_in_to_shared_workers(portal: dict[str, Any]) -> None:
-    """Let the requester-scoped `gh` service use connected accounts on shared and unscoped workers."""
-    portal["payload"]["egress_broker"]["services"]["gh"]["oauth_on_shared_workers"] = True
-    _republish(portal)
-
-
 def test_requester_scoped_provider_on_a_shared_agent_is_unavailable_without_the_opt_in(
     oauth_egress_portal: dict[str, Any],
 ) -> None:
@@ -956,32 +1195,6 @@ def test_portal_catalog_includes_the_oauth_status(oauth_egress_portal: dict[str,
     assert drive["oauth"]["account_label"] == "alice@example.com"
     assert drive == _egress_row(portal, "alice", "personal", "drive")
     assert rows["github"]["oauth"] is None
-
-
-def _portal_oauth_view(portal: dict[str, Any], user: str, agent: str) -> dict[str, Any]:
-    """Return the Connections portal's status for the agent's Drive connection, in the egress field names."""
-    response = portal["client"].get(
-        f"/api/connections/agents/{agent}/google_drive/status",
-        headers=portal["headers"][user],
-    )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    return {key: body[key] for key in ("connected", "can_connect", "reset_required", "account_label")}
-
-
-def _egress_oauth_view(portal: dict[str, Any], user: str, agent: str) -> dict[str, Any]:
-    oauth = _egress_row(portal, user, agent, "drive")["oauth"]
-    return {key: oauth[key] for key in ("connected", "can_connect", "reset_required", "account_label")}
-
-
-def _assert_portal_and_egress_agree(portal: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compare every viewer of the personal and the shared agent, and return the views for further checks."""
-    views = []
-    for user, agent in (("alice", "personal"), ("bob", "personal"), ("alice", "shared_dev"), ("bob", "shared_dev")):
-        egress = _egress_oauth_view(portal, user, agent)
-        assert egress == _portal_oauth_view(portal, user, agent), (user, agent)
-        views.append(egress)
-    return views
 
 
 def test_egress_oauth_status_agrees_with_the_portal_status(oauth_egress_portal: dict[str, Any]) -> None:
@@ -1203,52 +1416,94 @@ def test_agent_scoped_provider_on_a_shared_agent_still_needs_management(
     assert response.status_code == 403, response.text
 
 
-# --- User-defined services (spec 11.1) ---
+@pytest.mark.parametrize("action", ["connect", "disconnect"])
+def test_connect_and_disconnect_are_refused_where_the_broker_refuses_the_account(
+    oauth_egress_portal: dict[str, Any],
+    action: str,
+) -> None:
+    """The status offers nothing in a shared sandbox, so the routes answer 409 with a readable string, not a flow."""
+    portal = oauth_egress_portal
 
-_NOTES = {
-    "description": "Team notes",
-    "rules": [{"host": "api.notes.example.com", "auth": {"type": "bearer"}}],
-}
-# A personal service that signs in with a connected GitHub account, on one of the GitHub preset's hosts.
-_MY_GITHUB = {
-    "description": "My repositories",
-    "rules": [{"host": "api.github.com", "path_prefix": "/repos/alice/", "auth": {"type": "bearer"}}],
-    "oauth_provider": "github",
-}
+    response = _account_action(portal, "bob", "shared_dev", "gh", action)
 
-
-def _service_url(agent: str, name: str) -> str:
-    return f"/api/connections/egress/agents/{agent}/services/{name}"
-
-
-def _put_service(
-    portal: dict[str, Any],
-    user: str,
-    agent: str,
-    name: str,
-    body: dict[str, Any] | None = None,
-) -> Any:  # noqa: ANN401
-    return portal["client"].put(
-        _service_url(agent, name),
-        json=_NOTES if body is None else body,
-        headers=portal["headers"][user],
-    )
+    assert response.status_code == 409, response.text
+    assert isinstance(response.json()["detail"], str)
+    assert "share" in response.json()["detail"]
+    assert "no-store" in response.headers["cache-control"]
+    assert _egress_row(portal, "bob", "shared_dev", "gh")["oauth"]["can_connect"] is False
+    # Agent-scoped providers on the same agent stay connectable, and a personal agent's own GitHub account too.
+    drive = _account_action(portal, "bob", "shared_dev", "drive", action)
+    assert drive.status_code == 200, drive.text
+    personal = _account_action(portal, "bob", "personal", "gh", action)
+    assert personal.status_code == 200, personal.text
 
 
-def _get_service(portal: dict[str, Any], user: str, agent: str, name: str) -> Any:  # noqa: ANN401
-    return portal["client"].get(_service_url(agent, name), headers=portal["headers"][user])
+@pytest.mark.parametrize("action", ["connect", "disconnect"])
+def test_connect_and_disconnect_are_refused_on_the_static_runner_until_the_service_opts_in(
+    oauth_egress_portal: dict[str, Any],
+    action: str,
+) -> None:
+    """A personal agent shares its sandbox on the static runner, so its requester-scoped account is refused there."""
+    portal = oauth_egress_portal
+    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="static_runner")
+
+    refused = _account_action(portal, "alice", "personal", "gh", action)
+    assert refused.status_code == 409, refused.text
+    assert isinstance(refused.json()["detail"], str)
+
+    _opt_in_to_shared_workers(portal)
+    allowed = _account_action(portal, "alice", "personal", "gh", action)
+    assert allowed.status_code == 200, allowed.text
 
 
-def _delete_service(portal: dict[str, Any], user: str, agent: str, name: str) -> Any:  # noqa: ANN401
-    return portal["client"].delete(_service_url(agent, name), headers=portal["headers"][user])
+@pytest.mark.parametrize("failure", ["unsupported backend", "other"])
+def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_pages(
+    oauth_egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """The shared-sandbox check can fail on its own, and that spares the listing and the catalog but that service."""
+    portal = oauth_egress_portal
+    if failure == "unsupported backend":
+        _restart_with_env(portal, MINDROOM_WORKER_BACKEND="no-such-backend")
+    else:
+        real = egress_status.shared_worker_oauth
+
+        def broken(provider: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            if provider.requester_scoped_credentials:
+                msg = "internal-backend-detail"
+                raise RuntimeError(msg)
+            return real(provider, *args, **kwargs)
+
+        monkeypatch.setattr(egress_status, "shared_worker_oauth", broken)
+
+    listing = _listing(portal, "alice")
+    catalog = portal["client"].get("/api/connections", headers=portal["headers"]["alice"])
+
+    assert catalog.status_code == 200, catalog.text
+    assert "internal-backend-detail" not in listing.text + catalog.text
+    gh = _egress_row(portal, "alice", "personal", "gh")["oauth"]
+    assert (gh["connected"], gh["can_connect"], gh["unavailable_reason"]) == (False, False, None)
+    assert _egress_row(portal, "alice", "personal", "drive")["oauth"]["can_connect"] is True
+    assert _egress_row(portal, "alice", "personal", "github")["oauth"] is None
 
 
-def _listed_services(portal: dict[str, Any], user: str, agent: str) -> list[dict[str, Any]]:
-    return _listed_agents(portal, user)[agent]["services"]
+@pytest.mark.parametrize("action", ["connect", "disconnect"])
+def test_connect_and_disconnect_answer_503_when_the_worker_backend_cannot_be_read(
+    oauth_egress_portal: dict[str, Any],
+    action: str,
+) -> None:
+    """Without the sandbox kind neither action can be judged safe, so both fail closed with a plain 503."""
+    portal = oauth_egress_portal
+    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="no-such-backend")
+
+    response = _account_action(portal, "alice", "personal", "gh", action)
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "Account connection is unavailable right now"
 
 
-def _listed_names(portal: dict[str, Any], user: str, agent: str) -> list[str]:
-    return [service["name"] for service in _listed_services(portal, user, agent)]
+# --- User-defined services ---
 
 
 def test_user_service_is_created_read_updated_and_deleted(egress_portal: dict[str, Any]) -> None:
@@ -1383,6 +1638,28 @@ def test_invalid_user_service_is_422_with_the_validators_message(
     assert _get_service(egress_portal, "alice", "personal", "notes").status_code == 404
 
 
+@pytest.mark.parametrize(
+    "body",
+    [["rules"], "rules", 3, None],
+    ids=["list", "string", "number", "null"],  # `json=None` sends the JSON text `null`.
+)
+def test_a_service_body_that_is_not_an_object_is_a_string_422_with_private_headers(
+    egress_portal: dict[str, Any],
+    body: object,
+) -> None:
+    """Like every other refusal of the save, a body of the wrong shape answers with a readable string detail."""
+    portal = egress_portal
+    response = portal["client"].put(
+        _service_url("personal", "notes"),
+        json=body,
+        headers=portal["headers"]["alice"],
+    )
+    assert response.status_code == 422, (body, response.text)
+    assert response.json()["detail"] == "A service must be a JSON object"
+    assert response.headers["cache-control"] == "private, no-store"
+    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
+
+
 def test_bad_service_names_are_422(egress_portal: dict[str, Any]) -> None:
     """Names the store reserves or the pattern forbids are refused."""
     portal = egress_portal
@@ -1495,6 +1772,28 @@ def test_non_manager_cannot_write_services_of_a_shared_agent(egress_portal: dict
     assert _get_service(portal, "carol", "shared_dev", "notes").status_code == 404
 
 
+def test_a_non_manager_cannot_write_services_or_keys_of_an_unscoped_agent(unscoped_portal: dict[str, Any]) -> None:
+    """An unscoped agent is shared by every user, so only its credential managers change services and keys."""
+    portal = unscoped_portal
+
+    agent = _listed_agents(portal, "alice")["unscoped_dev"]
+    assert (agent["shared"], agent["can_manage"]) == (True, False)
+    for response in (
+        _put_service(portal, "alice", "unscoped_dev", "notes"),
+        _delete_service(portal, "alice", "unscoped_dev", "notes"),
+        _put_key(portal, "alice", "unscoped_dev", "github", "x"),
+        _delete_key(portal, "alice", "unscoped_dev", "github"),
+    ):
+        assert response.status_code == 403, response.text
+        assert "Credential management is required" in response.text
+    assert _get_service(portal, "alice", "unscoped_dev", "notes").status_code == 404
+
+    assert _put_service(portal, "bob", "unscoped_dev", "notes").status_code == 204
+    assert _put_key(portal, "bob", "unscoped_dev", "github", "x").status_code == 204
+    assert _get_service(portal, "alice", "unscoped_dev", "notes").json() == _NOTES
+    assert _delete_service(portal, "alice", "unscoped_dev", "notes").status_code == 403
+
+
 @pytest.mark.parametrize("agent", ["no_shell", "other_private", "unknown"])
 def test_service_routes_hide_ineligible_agents(egress_portal: dict[str, Any], agent: str) -> None:
     """Unknown agents, agents without a shell or python tool, and agents the user may not use are all 404."""
@@ -1565,6 +1864,35 @@ def test_a_bridge_alias_shares_the_canonical_requesters_services(egress_portal: 
     assert _put_service(portal, "alice", "personal", "notes").status_code == 204
     assert _get_service(portal, "bob", "personal", "notes").json() == _NOTES
     assert "notes" in _listed_names(portal, "bob", "personal")
+
+
+def test_user_scope_services_and_keys_are_shared_by_the_requesters_user_scope_agents(
+    egress_portal: dict[str, Any],
+) -> None:
+    """A `user` scope is one store per requester, so a service saved on one such agent is the service of them all."""
+    portal = egress_portal
+    for name, scope in (("user_a", "user"), ("user_b", "user"), ("agent_scoped", "user_agent")):
+        portal["payload"]["agents"][name] = _agent_config(
+            name,
+            "Personal assistant",
+            private=scope,
+            users=("@alice:example.org", "@bob:example.org"),
+        )
+    _republish(portal)
+
+    assert _put_service(portal, "alice", "user_a", "notes").status_code == 204
+    assert _put_key(portal, "alice", "user_a", "notes", "k").status_code == 204
+
+    assert _get_service(portal, "alice", "user_b", "notes").json() == _NOTES
+    row = _egress_row(portal, "alice", "user_b", "notes")
+    assert (row["source"], row["key_configured"]) == ("user", True)
+    # Another requester, and an agent with its own scope per agent, have their own stores.
+    assert _get_service(portal, "bob", "user_b", "notes").status_code == 404
+    assert _get_service(portal, "alice", "agent_scoped", "notes").status_code == 404
+    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
+
+    assert _delete_service(portal, "alice", "user_b", "notes").status_code == 204
+    assert _get_service(portal, "alice", "user_a", "notes").status_code == 404
 
 
 def test_listing_marks_the_source_of_each_service(egress_portal: dict[str, Any]) -> None:
@@ -1827,73 +2155,108 @@ def test_user_services_are_loaded_off_the_event_loop(
     assert not any(on_loop)
 
 
-# --- Personal request log (spec 11.3) ---
+# --- Inactive entries ---
 
 
-@pytest.fixture
-def audit_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[AuditLog]:
-    """Serve the personal log from a real audit log, as if the broker were running."""
-    log = AuditLog(tmp_path / "audit.sqlite3")
-    monkeypatch.setattr(egress_credentials, "active_audit_log", lambda: log)
-    yield log
-    log.close()
+def test_active_services_are_not_listed_as_inactive(egress_portal: dict[str, Any]) -> None:
+    """Every agent object carries inactive_services, empty while all of the scope's entries are in use."""
+    portal = egress_portal
+    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
+    for agent in ("personal", "shared_dev"):
+        assert _listed_agents(portal, "alice")[agent]["inactive_services"] == []
 
 
-_LOG_START = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+def test_a_shadowed_entry_is_listed_with_its_reason_and_deleted_keeping_the_key(egress_portal: dict[str, Any]) -> None:
+    """An entry an administrator's service now shadows is shown as inactive; deleting it leaves the config key."""
+    portal = egress_portal
+    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
+    assert _put_key(portal, "alice", "personal", "notes", "k").status_code == 204
+    portal["payload"]["egress_broker"]["services"]["notes"] = {
+        "description": "Administrator notes",
+        "rules": [{"host": "notes.admin.example.com", "auth": {"type": "bearer"}}],
+    }
+    _republish(portal)
+
+    agent = _listed_agents(portal, "alice")["personal"]
+    assert agent["inactive_services"] == [{"name": "notes", "reason": "shadowed"}]
+    assert [(s["name"], s["source"]) for s in agent["services"] if s["name"] == "notes"] == [("notes", "config")]
+
+    deleted = _delete_service(portal, "alice", "personal", "notes")
+    assert deleted.status_code == 204, deleted.text
+    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == []
+    assert _stored_key(portal, "notes") == "k"
 
 
-def _record_request(
-    log: AuditLog,
-    requester_id: str | None,
-    agent_name: str,
-    seconds: int,
-    *,
-    host: str = "api.github.com",
-    path: str = "/user",
-    kind: Literal["request", "tunnel", "denied"] = "request",
-    status: int = 200,
-    code: str | None = None,
-    scope: str | None = None,
-) -> None:
-    log.record(
-        AuditRecord(
-            at=_LOG_START + timedelta(seconds=seconds),
-            kind=kind,
-            scope=scope or ("shared" if agent_name == "shared_dev" else "user_agent"),
-            agent_name=agent_name,
-            requester_id=requester_id,
-            method="GET",
-            host=host,
-            path=path,
-            service="github",
-            status=status,
-            bytes_up=1,
-            bytes_down=2,
-            duration_ms=3,
-            code=code,
-        ),
+def test_an_invalid_entry_is_listed_with_its_reason_and_deleted_with_its_key(egress_portal: dict[str, Any]) -> None:
+    """An entry that no longer validates is shown as inactive, never as a service, and deleting it removes its key."""
+    portal = egress_portal
+    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
+    _store_raw_entries(
+        portal,
+        {"notes": _NOTES, "stale": {"rules": []}, "odd": "not a service"},
     )
+    secrets.save_secret(get_runtime_credentials_manager(portal["paths"]), _scope_target(portal), "stale", "old-key")
+
+    agent = _listed_agents(portal, "alice")["personal"]
+    assert agent["inactive_services"] == [
+        {"name": "odd", "reason": "invalid"},
+        {"name": "stale", "reason": "invalid"},
+    ]
+    assert [s["name"] for s in agent["services"]] == ["github", "openai", "notes"]
+    assert _get_service(portal, "alice", "personal", "stale").status_code == 404
+
+    deleted = _delete_service(portal, "alice", "personal", "stale")
+    assert deleted.status_code == 204, deleted.text
+    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "odd", "reason": "invalid"}]
+    assert _stored_key(portal, "stale") is None
+    assert _delete_service(portal, "alice", "personal", "stale").status_code == 404
+    assert _delete_service(portal, "alice", "personal", "odd").status_code == 204
+    assert _get_service(portal, "alice", "personal", "notes").json() == _NOTES
+    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == []
 
 
-def _get_logs(portal: dict[str, Any], user: str, query: str = "") -> Any:  # noqa: ANN401
-    return portal["client"].get(f"/api/connections/egress/logs{query}", headers=portal["headers"][user])
+def test_inactive_entries_never_reach_another_requester(egress_portal: dict[str, Any]) -> None:
+    """Inactive entries live in one requester's scope, so another requester's listing never names them."""
+    portal = egress_portal
+    _store_raw_entries(portal, {"stale": {"rules": []}})
+
+    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "stale", "reason": "invalid"}]
+    assert _listed_agents(portal, "bob")["personal"]["inactive_services"] == []
+    assert _delete_service(portal, "bob", "personal", "stale").status_code == 404
+    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "stale", "reason": "invalid"}]
 
 
-def _log_paths(response: Any) -> list[str]:  # noqa: ANN401
-    assert response.status_code == 200, response.text
-    return [record["path"] for record in response.json()["records"]]
+def test_inactive_entries_of_a_shared_agent_are_listed_for_its_users_and_deleted_by_managers(
+    egress_portal: dict[str, Any],
+) -> None:
+    """On a shared agent everyone sees the same entries, but only a manager may delete them."""
+    portal = egress_portal
+    _store_raw_entries(portal, {"stale": {"rules": []}}, agent="shared_dev", requester="@bob:example.org")
+
+    for user in ("alice", "bob"):
+        assert _listed_agents(portal, user)["shared_dev"]["inactive_services"] == [
+            {"name": "stale", "reason": "invalid"},
+        ]
+    assert _delete_service(portal, "alice", "shared_dev", "stale").status_code == 403
+    assert _delete_service(portal, "bob", "shared_dev", "stale").status_code == 204
+    assert _listed_agents(portal, "alice")["shared_dev"]["inactive_services"] == []
 
 
-@pytest.fixture
-def mixed_log(audit_log: AuditLog) -> AuditLog:
-    """Alice and Bob both used the shared agent and each their own private agent; one row has no requester."""
-    _record_request(audit_log, "@alice:example.org", "personal", 1, path="/alice/personal/old")
-    _record_request(audit_log, "@bob:example.org", "personal", 2, path="/bob/personal")
-    _record_request(audit_log, "@alice:example.org", "shared_dev", 3, path="/alice/shared")
-    _record_request(audit_log, "@bob:example.org", "shared_dev", 4, path="/bob/shared")
-    _record_request(audit_log, None, "shared_dev", 5, path="/nobody/shared")
-    _record_request(audit_log, "@alice:example.org", "personal", 6, path="/alice/personal/new")
-    return audit_log
+def test_inactive_entries_count_toward_the_cap_until_deleted(egress_portal: dict[str, Any]) -> None:
+    """A scope full of ignored entries cannot take another service, so the user must be able to delete them."""
+    portal = egress_portal
+    _store_raw_entries(portal, {f"stale-{index}": {"rules": []} for index in range(50)})
+
+    refused = _put_service(portal, "alice", "personal", "notes")
+    assert refused.status_code == 422, refused.text
+    assert "at most 50" in refused.json()["detail"]
+
+    assert _delete_service(portal, "alice", "personal", "stale-0").status_code == 204
+    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
+    assert len(_listed_agents(portal, "alice")["personal"]["inactive_services"]) == 49
+
+
+# --- Personal request log ---
 
 
 def test_personal_log_returns_only_the_callers_rows_newest_first(
@@ -2065,6 +2428,29 @@ def test_personal_log_follows_the_canonical_requester(
     assert _log_paths(_get_logs(portal, "carol")) == []
 
 
+def test_personal_log_returns_the_refusal_code_or_null(egress_portal: dict[str, Any], audit_log: AuditLog) -> None:
+    """A refused request carries the error code its body had; a forwarded one has null."""
+    _record_request(audit_log, "@alice:example.org", "personal", 1, path="/ok")
+    _record_request(
+        audit_log,
+        "@alice:example.org",
+        "personal",
+        2,
+        path="/repos/other/secret",
+        kind="denied",
+        status=403,
+        code="path_not_allowed",
+    )
+
+    response = _get_logs(egress_portal, "alice")
+
+    assert response.status_code == 200, response.text
+    assert [(row["path"], row["status"], row["code"]) for row in response.json()["records"]] == [
+        ("/repos/other/secret", 403, "path_not_allowed"),
+        ("/ok", 200, None),
+    ]
+
+
 def test_personal_log_is_unavailable_while_the_broker_is_stopped(
     egress_portal: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -2085,44 +2471,7 @@ def test_personal_log_requires_a_signed_user(egress_portal: dict[str, Any], audi
     assert client.get("/api/connections/egress/logs?agent_name=personal").status_code == expected
 
 
-# --- Agent flags, rule summaries, presets, and refusal codes in the listing and the log ---
-
-
-def _listed_agents(portal: dict[str, Any], user: str) -> dict[str, dict[str, Any]]:
-    return {agent["agent_name"]: agent for agent in _listing(portal, user).json()["agents"]}
-
-
-def test_listing_reports_whether_each_agent_is_shared_and_whether_the_caller_manages_it(
-    egress_portal: dict[str, Any],
-) -> None:
-    """Every agent says if its services are shared and if the caller may change them, as the write routes decide."""
-    portal = egress_portal
-    alice = _listed_agents(portal, "alice")
-    assert (alice["personal"]["shared"], alice["personal"]["can_manage"]) == (False, True)
-    assert (alice["shared_dev"]["shared"], alice["shared_dev"]["can_manage"]) == (True, False)
-    bob = _listed_agents(portal, "bob")
-    assert (bob["personal"]["shared"], bob["personal"]["can_manage"]) == (False, True)
-    assert (bob["shared_dev"]["shared"], bob["shared_dev"]["can_manage"]) == (True, True)
-    # The per-service flags the page already used say the same.
-    for agent in (*alice.values(), *bob.values()):
-        assert {service["can_manage"] for service in agent["services"]} == {agent["can_manage"]}
-        assert {service["is_shared"] for service in agent["services"]} == {agent["shared"]}
-    # What the flags promise is what the write routes do.
-    assert _put_service(portal, "alice", "shared_dev", "mine").status_code == 403
-    assert _put_service(portal, "bob", "shared_dev", "mine").status_code == 204
-
-
-def test_an_agent_without_services_still_reports_the_flags(egress_portal: dict[str, Any]) -> None:
-    """With no service to carry them, the agent's own flags tell the page whether Add service is allowed."""
-    portal = egress_portal
-    portal["payload"]["egress_broker"]["services"] = {}
-    _republish(portal)
-
-    alice = _listed_agents(portal, "alice")
-    assert {agent["agent_name"]: agent["services"] for agent in alice.values()} == {"personal": [], "shared_dev": []}
-    assert (alice["personal"]["shared"], alice["personal"]["can_manage"]) == (False, True)
-    assert (alice["shared_dev"]["shared"], alice["shared_dev"]["can_manage"]) == (True, False)
-    assert _listed_agents(portal, "bob")["shared_dev"]["can_manage"] is True
+# --- Rule summaries and presets ---
 
 
 def test_listing_summarizes_where_each_service_applies_and_how_it_sends_the_key(egress_portal: dict[str, Any]) -> None:
@@ -2370,306 +2719,7 @@ def test_presets_need_a_signed_user_and_take_no_query(egress_portal: dict[str, A
     assert response.status_code == 400
 
 
-def test_personal_log_returns_the_refusal_code_or_null(egress_portal: dict[str, Any], audit_log: AuditLog) -> None:
-    """A refused request carries the error code its body had; a forwarded one has null."""
-    _record_request(audit_log, "@alice:example.org", "personal", 1, path="/ok")
-    _record_request(
-        audit_log,
-        "@alice:example.org",
-        "personal",
-        2,
-        path="/repos/other/secret",
-        kind="denied",
-        status=403,
-        code="path_not_allowed",
-    )
-
-    response = _get_logs(egress_portal, "alice")
-
-    assert response.status_code == 200, response.text
-    assert [(row["path"], row["status"], row["code"]) for row in response.json()["records"]] == [
-        ("/repos/other/secret", 403, "path_not_allowed"),
-        ("/ok", 200, None),
-    ]
-
-
-# --- Final fix wave: refused OAuth, degraded gate, inactive entries, write gates, response headers ---
-
-
-@pytest.mark.parametrize("action", ["connect", "disconnect"])
-def test_connect_and_disconnect_are_refused_where_the_broker_refuses_the_account(
-    oauth_egress_portal: dict[str, Any],
-    action: str,
-) -> None:
-    """The status offers nothing in a shared sandbox, so the routes answer 409 with a readable string, not a flow."""
-    portal = oauth_egress_portal
-
-    response = _account_action(portal, "bob", "shared_dev", "gh", action)
-
-    assert response.status_code == 409, response.text
-    assert isinstance(response.json()["detail"], str)
-    assert "share" in response.json()["detail"]
-    assert "no-store" in response.headers["cache-control"]
-    assert _egress_row(portal, "bob", "shared_dev", "gh")["oauth"]["can_connect"] is False
-    # Agent-scoped providers on the same agent stay connectable, and a personal agent's own GitHub account too.
-    drive = _account_action(portal, "bob", "shared_dev", "drive", action)
-    assert drive.status_code == 200, drive.text
-    personal = _account_action(portal, "bob", "personal", "gh", action)
-    assert personal.status_code == 200, personal.text
-
-
-@pytest.mark.parametrize("action", ["connect", "disconnect"])
-def test_connect_and_disconnect_are_refused_on_the_static_runner_until_the_service_opts_in(
-    oauth_egress_portal: dict[str, Any],
-    action: str,
-) -> None:
-    """A personal agent shares its sandbox on the static runner, so its requester-scoped account is refused there."""
-    portal = oauth_egress_portal
-    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="static_runner")
-
-    refused = _account_action(portal, "alice", "personal", "gh", action)
-    assert refused.status_code == 409, refused.text
-    assert isinstance(refused.json()["detail"], str)
-
-    _opt_in_to_shared_workers(portal)
-    allowed = _account_action(portal, "alice", "personal", "gh", action)
-    assert allowed.status_code == 200, allowed.text
-
-
-@pytest.mark.parametrize("failure", ["unsupported backend", "other"])
-def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_pages(
-    oauth_egress_portal: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-) -> None:
-    """The shared-sandbox check can fail on its own, and that spares the listing and the catalog but that service."""
-    portal = oauth_egress_portal
-    if failure == "unsupported backend":
-        _restart_with_env(portal, MINDROOM_WORKER_BACKEND="no-such-backend")
-    else:
-        real = egress_status.shared_worker_oauth
-
-        def broken(provider: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-            if provider.requester_scoped_credentials:
-                msg = "internal-backend-detail"
-                raise RuntimeError(msg)
-            return real(provider, *args, **kwargs)
-
-        monkeypatch.setattr(egress_status, "shared_worker_oauth", broken)
-
-    listing = _listing(portal, "alice")
-    catalog = portal["client"].get("/api/connections", headers=portal["headers"]["alice"])
-
-    assert catalog.status_code == 200, catalog.text
-    assert "internal-backend-detail" not in listing.text + catalog.text
-    gh = _egress_row(portal, "alice", "personal", "gh")["oauth"]
-    assert (gh["connected"], gh["can_connect"], gh["unavailable_reason"]) == (False, False, None)
-    assert _egress_row(portal, "alice", "personal", "drive")["oauth"]["can_connect"] is True
-    assert _egress_row(portal, "alice", "personal", "github")["oauth"] is None
-
-
-@pytest.mark.parametrize("action", ["connect", "disconnect"])
-def test_connect_and_disconnect_answer_503_when_the_worker_backend_cannot_be_read(
-    oauth_egress_portal: dict[str, Any],
-    action: str,
-) -> None:
-    """Without the sandbox kind neither action can be judged safe, so both fail closed with a plain 503."""
-    portal = oauth_egress_portal
-    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="no-such-backend")
-
-    response = _account_action(portal, "alice", "personal", "gh", action)
-
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"] == "Account connection is unavailable right now"
-
-
-def _scope_target(portal: dict[str, Any], agent: str = "personal", requester: str = "@alice:example.org") -> Any:  # noqa: ANN401
-    config = Config.model_validate(portal["payload"], context={"runtime_paths": portal["paths"]})
-    return build_connection_agent_target(config, portal["paths"], requester, agent)
-
-
-def _store_raw_entries(
-    portal: dict[str, Any],
-    entries: dict[str, Any],
-    agent: str = "personal",
-    requester: str = "@alice:example.org",
-) -> None:
-    """Write entries into a scope's services document as stored, without the save route's validation."""
-    secrets.save_egress_document(
-        get_runtime_credentials_manager(portal["paths"]),
-        _scope_target(portal, agent, requester),
-        "egress__services",
-        {"services": entries},
-    )
-
-
-def _stored_key(
-    portal: dict[str, Any],
-    name: str,
-    agent: str = "personal",
-    requester: str = "@alice:example.org",
-) -> Any:  # noqa: ANN401
-    return secrets.load_secret(
-        get_runtime_credentials_manager(portal["paths"]),
-        _scope_target(portal, agent, requester),
-        name,
-    )
-
-
-def test_active_services_are_not_listed_as_inactive(egress_portal: dict[str, Any]) -> None:
-    """Every agent object carries inactive_services, empty while all of the scope's entries are in use."""
-    portal = egress_portal
-    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
-    for agent in ("personal", "shared_dev"):
-        assert _listed_agents(portal, "alice")[agent]["inactive_services"] == []
-
-
-def test_a_shadowed_entry_is_listed_with_its_reason_and_deleted_keeping_the_key(egress_portal: dict[str, Any]) -> None:
-    """An entry an administrator's service now shadows is shown as inactive; deleting it leaves the config key."""
-    portal = egress_portal
-    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
-    assert _put_key(portal, "alice", "personal", "notes", "k").status_code == 204
-    portal["payload"]["egress_broker"]["services"]["notes"] = {
-        "description": "Administrator notes",
-        "rules": [{"host": "notes.admin.example.com", "auth": {"type": "bearer"}}],
-    }
-    _republish(portal)
-
-    agent = _listed_agents(portal, "alice")["personal"]
-    assert agent["inactive_services"] == [{"name": "notes", "reason": "shadowed"}]
-    assert [(s["name"], s["source"]) for s in agent["services"] if s["name"] == "notes"] == [("notes", "config")]
-
-    deleted = _delete_service(portal, "alice", "personal", "notes")
-    assert deleted.status_code == 204, deleted.text
-    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == []
-    assert _stored_key(portal, "notes") == "k"
-
-
-def test_an_invalid_entry_is_listed_with_its_reason_and_deleted_with_its_key(egress_portal: dict[str, Any]) -> None:
-    """An entry that no longer validates is shown as inactive, never as a service, and deleting it removes its key."""
-    portal = egress_portal
-    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
-    _store_raw_entries(
-        portal,
-        {"notes": _NOTES, "stale": {"rules": []}, "odd": "not a service"},
-    )
-    secrets.save_secret(get_runtime_credentials_manager(portal["paths"]), _scope_target(portal), "stale", "old-key")
-
-    agent = _listed_agents(portal, "alice")["personal"]
-    assert agent["inactive_services"] == [
-        {"name": "odd", "reason": "invalid"},
-        {"name": "stale", "reason": "invalid"},
-    ]
-    assert [s["name"] for s in agent["services"]] == ["github", "openai", "notes"]
-    assert _get_service(portal, "alice", "personal", "stale").status_code == 404
-
-    deleted = _delete_service(portal, "alice", "personal", "stale")
-    assert deleted.status_code == 204, deleted.text
-    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "odd", "reason": "invalid"}]
-    assert _stored_key(portal, "stale") is None
-    assert _delete_service(portal, "alice", "personal", "stale").status_code == 404
-    assert _delete_service(portal, "alice", "personal", "odd").status_code == 204
-    assert _get_service(portal, "alice", "personal", "notes").json() == _NOTES
-    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == []
-
-
-def test_inactive_entries_never_reach_another_requester(egress_portal: dict[str, Any]) -> None:
-    """Inactive entries live in one requester's scope, so another requester's listing never names them."""
-    portal = egress_portal
-    _store_raw_entries(portal, {"stale": {"rules": []}})
-
-    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "stale", "reason": "invalid"}]
-    assert _listed_agents(portal, "bob")["personal"]["inactive_services"] == []
-    assert _delete_service(portal, "bob", "personal", "stale").status_code == 404
-    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "stale", "reason": "invalid"}]
-
-
-def test_inactive_entries_of_a_shared_agent_are_listed_for_its_users_and_deleted_by_managers(
-    egress_portal: dict[str, Any],
-) -> None:
-    """On a shared agent everyone sees the same entries, but only a manager may delete them."""
-    portal = egress_portal
-    _store_raw_entries(portal, {"stale": {"rules": []}}, agent="shared_dev", requester="@bob:example.org")
-
-    for user in ("alice", "bob"):
-        assert _listed_agents(portal, user)["shared_dev"]["inactive_services"] == [
-            {"name": "stale", "reason": "invalid"},
-        ]
-    assert _delete_service(portal, "alice", "shared_dev", "stale").status_code == 403
-    assert _delete_service(portal, "bob", "shared_dev", "stale").status_code == 204
-    assert _listed_agents(portal, "alice")["shared_dev"]["inactive_services"] == []
-
-
-def test_inactive_entries_count_toward_the_cap_until_deleted(egress_portal: dict[str, Any]) -> None:
-    """A scope full of ignored entries cannot take another service, so the user must be able to delete them."""
-    portal = egress_portal
-    _store_raw_entries(portal, {f"stale-{index}": {"rules": []} for index in range(50)})
-
-    refused = _put_service(portal, "alice", "personal", "notes")
-    assert refused.status_code == 422, refused.text
-    assert "at most 50" in refused.json()["detail"]
-
-    assert _delete_service(portal, "alice", "personal", "stale-0").status_code == 204
-    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
-    assert len(_listed_agents(portal, "alice")["personal"]["inactive_services"]) == 49
-
-
-@pytest.fixture
-def unscoped_portal(egress_portal: dict[str, Any]) -> dict[str, Any]:
-    """Add an agent without a worker scope, which everyone using it shares like a shared agent."""
-    portal = egress_portal
-    portal["payload"]["agents"]["unscoped_dev"] = _agent_config(
-        "Unscoped Dev",
-        "Team agent without a worker scope",
-        users=("@alice:example.org", "@bob:example.org"),
-        credential_managers=["@bob:example.org"],
-    )
-    _republish(portal)
-    return portal
-
-
-def test_a_non_manager_cannot_write_services_or_keys_of_an_unscoped_agent(unscoped_portal: dict[str, Any]) -> None:
-    """An unscoped agent is shared by every user, so only its credential managers change services and keys."""
-    portal = unscoped_portal
-
-    agent = _listed_agents(portal, "alice")["unscoped_dev"]
-    assert (agent["shared"], agent["can_manage"]) == (True, False)
-    for response in (
-        _put_service(portal, "alice", "unscoped_dev", "notes"),
-        _delete_service(portal, "alice", "unscoped_dev", "notes"),
-        _put_key(portal, "alice", "unscoped_dev", "github", "x"),
-        _delete_key(portal, "alice", "unscoped_dev", "github"),
-    ):
-        assert response.status_code == 403, response.text
-        assert "Credential management is required" in response.text
-    assert _get_service(portal, "alice", "unscoped_dev", "notes").status_code == 404
-
-    assert _put_service(portal, "bob", "unscoped_dev", "notes").status_code == 204
-    assert _put_key(portal, "bob", "unscoped_dev", "github", "x").status_code == 204
-    assert _get_service(portal, "alice", "unscoped_dev", "notes").json() == _NOTES
-    assert _delete_service(portal, "alice", "unscoped_dev", "notes").status_code == 403
-
-
-@pytest.mark.parametrize(
-    "body",
-    [["rules"], "rules", 3, None],
-    ids=["list", "string", "number", "null"],  # `json=None` sends the JSON text `null`.
-)
-def test_a_service_body_that_is_not_an_object_is_a_string_422_with_private_headers(
-    egress_portal: dict[str, Any],
-    body: object,
-) -> None:
-    """Like every other refusal of the save, a body of the wrong shape answers with a readable string detail."""
-    portal = egress_portal
-    response = portal["client"].put(
-        _service_url("personal", "notes"),
-        json=body,
-        headers=portal["headers"]["alice"],
-    )
-    assert response.status_code == 422, (body, response.text)
-    assert response.json()["detail"] == "A service must be a JSON object"
-    assert response.headers["cache-control"] == "private, no-store"
-    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
+# --- Response headers ---
 
 
 def test_service_presets_and_log_responses_are_private_and_never_cached(
@@ -2723,32 +2773,3 @@ def test_service_presets_and_log_responses_are_private_and_never_cached(
     for label, response in responses.items():
         assert response.headers["cache-control"] == "private, no-store", label
         assert response.headers["referrer-policy"] == "no-referrer", label
-
-
-def test_user_scope_services_and_keys_are_shared_by_the_requesters_user_scope_agents(
-    egress_portal: dict[str, Any],
-) -> None:
-    """A `user` scope is one store per requester, so a service saved on one such agent is the service of them all."""
-    portal = egress_portal
-    for name, scope in (("user_a", "user"), ("user_b", "user"), ("agent_scoped", "user_agent")):
-        portal["payload"]["agents"][name] = _agent_config(
-            name,
-            "Personal assistant",
-            private=scope,
-            users=("@alice:example.org", "@bob:example.org"),
-        )
-    _republish(portal)
-
-    assert _put_service(portal, "alice", "user_a", "notes").status_code == 204
-    assert _put_key(portal, "alice", "user_a", "notes", "k").status_code == 204
-
-    assert _get_service(portal, "alice", "user_b", "notes").json() == _NOTES
-    row = _egress_row(portal, "alice", "user_b", "notes")
-    assert (row["source"], row["key_configured"]) == ("user", True)
-    # Another requester, and an agent with its own scope per agent, have their own stores.
-    assert _get_service(portal, "bob", "user_b", "notes").status_code == 404
-    assert _get_service(portal, "alice", "agent_scoped", "notes").status_code == 404
-    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
-
-    assert _delete_service(portal, "alice", "user_b", "notes").status_code == 204
-    assert _get_service(portal, "alice", "user_a", "notes").status_code == 404
