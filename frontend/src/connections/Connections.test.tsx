@@ -146,21 +146,16 @@ describe("brokered API keys on agent cards", () => {
     installApi({
       "/api/connections": async () => {
         catalogRequests += 1;
-        return json({
-          agents: [
+        return json(
+          withEgress([
             {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                {
-                  ...egressService,
-                  configured,
-                  key_configured: configured,
-                  active_source: configured ? "key" : null,
-                },
-              ],
+              ...egressService,
+              configured,
+              key_configured: configured,
+              active_source: configured ? "key" : null,
             },
-          ],
-        });
+          ]),
+        );
       },
       "/api/connections/egress/agents/personal/github": async () => {
         configured = true;
@@ -195,12 +190,7 @@ describe("brokered API keys on agent cards", () => {
   });
 
   it("shows no API key section when the catalog sends null for the agent", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [{ ...catalog([service]).agents[0], egress_services: null }],
-        }),
-    });
+    installEgress(null);
     render(<Connections />);
     await expandAgent();
     await screen.findByRole("button", { name: "Connect Mail" });
@@ -211,12 +201,7 @@ describe("brokered API keys on agent cards", () => {
   });
 
   it("links an eligible agent without services to the page where one can be added", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [{ ...catalog([service]).agents[0], egress_services: [] }],
-        }),
-    });
+    installEgress([]);
     render(<Connections />);
     await expandAgent();
 
@@ -239,17 +224,7 @@ describe("brokered API keys on agent cards", () => {
   });
 
   it("links the API key section to the agent's services on the personal page", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [
-            {
-              ...catalog([service]).agents[0],
-              egress_services: [egressService],
-            },
-          ],
-        }),
-    });
+    installEgress([egressService]);
     render(<Connections />);
     await expandAgent();
 
@@ -261,19 +236,7 @@ describe("brokered API keys on agent cards", () => {
   });
 
   it("says View services instead of Manage services to someone who can change none of them", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [
-            {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                { ...egressService, is_shared: true, can_manage: false },
-              ],
-            },
-          ],
-        }),
-    });
+    installEgress([{ ...egressService, is_shared: true, can_manage: false }]);
     render(<Connections />);
     await expandAgent();
 
@@ -286,20 +249,10 @@ describe("brokered API keys on agent cards", () => {
   });
 
   it("keeps Manage services when the viewer can change at least one service", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [
-            {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                { ...egressService, can_manage: false },
-                { ...egressService, name: "openai", display_name: "OpenAI" },
-              ],
-            },
-          ],
-        }),
-    });
+    installEgress([
+      { ...egressService, can_manage: false },
+      { ...egressService, name: "openai", display_name: "OpenAI" },
+    ]);
     render(<Connections />);
     await expandAgent();
     expect(
@@ -314,35 +267,25 @@ describe("brokered API keys on agent cards", () => {
       port: null,
       path_prefix,
     });
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [
-            {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                {
-                  ...egressService,
-                  source: "config",
-                  rules: [rule("api.github.com", "/"), rule("github.com", "/")],
-                },
-                {
-                  ...egressService,
-                  name: "github-limited",
-                  display_name: "GitHub (octocat/Hello-World)",
-                  source: "user",
-                  restrict_only: true,
-                  rules: [
-                    rule("api.github.com", "/repos/octocat/Hello-World"),
-                    rule("github.com", "/octocat/Hello-World"),
-                    rule("github.com", "/octocat/Hello-World.git"),
-                  ],
-                },
-              ],
-            },
-          ],
-        }),
-    });
+    installEgress([
+      {
+        ...egressService,
+        source: "config",
+        rules: [rule("api.github.com", "/"), rule("github.com", "/")],
+      },
+      {
+        ...egressService,
+        name: "github-limited",
+        display_name: "GitHub (octocat/Hello-World)",
+        source: "user",
+        restrict_only: true,
+        rules: [
+          rule("api.github.com", "/repos/octocat/Hello-World"),
+          rule("github.com", "/octocat/Hello-World"),
+          rule("github.com", "/octocat/Hello-World.git"),
+        ],
+      },
+    ]);
     render(<Connections />);
     await expandAgent();
 
@@ -358,32 +301,22 @@ describe("brokered API keys on agent cards", () => {
   });
 
   it("tells a personal agent's user that its sandbox is shared, not that the agent is", async () => {
-    installApi({
-      "/api/connections": async () =>
-        json({
-          agents: [
-            {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                {
-                  ...egressService,
-                  oauth: {
-                    provider: "github",
-                    display_name: "GitHub",
-                    connected: false,
-                    account_label: null,
-                    can_connect: false,
-                    reset_required: false,
-                    service_account: false,
-                    unavailable_reason: "shared_sandbox",
-                    shared_worker_opt_in: false,
-                  },
-                },
-              ],
-            },
-          ],
-        }),
-    });
+    installEgress([
+      {
+        ...egressService,
+        oauth: {
+          provider: "github",
+          display_name: "GitHub",
+          connected: false,
+          account_label: null,
+          can_connect: false,
+          reset_required: false,
+          service_account: false,
+          unavailable_reason: "shared_sandbox",
+          shared_worker_opt_in: false,
+        },
+      },
+    ]);
     render(<Connections />);
     await expandAgent();
 
@@ -407,31 +340,26 @@ describe("brokered API keys on agent cards", () => {
     installApi({
       "/api/connections": async () => {
         catalogRequests += 1;
-        return json({
-          agents: [
+        return json(
+          withEgress([
             {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                {
-                  ...egressService,
-                  configured: connected,
-                  active_source: connected ? "oauth" : null,
-                  oauth: {
-                    provider: "github",
-                    display_name: "GitHub",
-                    connected,
-                    account_label: connected ? "octocat" : null,
-                    can_connect: true,
-                    reset_required: false,
-                    service_account: false,
-                    unavailable_reason: null,
-                    shared_worker_opt_in: false,
-                  },
-                },
-              ],
+              ...egressService,
+              configured: connected,
+              active_source: connected ? "oauth" : null,
+              oauth: {
+                provider: "github",
+                display_name: "GitHub",
+                connected,
+                account_label: connected ? "octocat" : null,
+                can_connect: true,
+                reset_required: false,
+                service_account: false,
+                unavailable_reason: null,
+                shared_worker_opt_in: false,
+              },
             },
-          ],
-        });
+          ]),
+        );
       },
       "/api/connections/egress/agents/personal/github/connect": async () =>
         json({
@@ -506,6 +434,15 @@ it("does not explain MCP availability while the gateway is disabled", async () =
     ),
   ).not.toBeInTheDocument();
 });
+
+/** The catalog of the personal agent, with these API key services. */
+const withEgress = (egress_services: unknown[] | null) => ({
+  agents: [{ ...catalog([service]).agents[0], egress_services }],
+});
+const installEgress = (egress_services: unknown[] | null) =>
+  installApi({
+    "/api/connections": async () => json(withEgress(egress_services)),
+  });
 
 function installApi(overrides: Record<string, () => Promise<Response>> = {}) {
   vi.mocked(fetch).mockImplementation(async (input, options) => {
@@ -1699,18 +1636,13 @@ describe("shared accounts on agent cards", () => {
     });
     installApi({
       "/api/connections": async () =>
-        json({
-          agents: [
-            {
-              ...catalog([service]).agents[0],
-              egress_services: [
-                egress("mail_api", "Mail API", "mail"),
-                egress("mail_labels", "Mail labels", "mail"),
-                egress("calendar", "Calendar", "calendar"),
-              ],
-            },
-          ],
-        }),
+        json(
+          withEgress([
+            egress("mail_api", "Mail API", "mail"),
+            egress("mail_labels", "Mail labels", "mail"),
+            egress("calendar", "Calendar", "calendar"),
+          ]),
+        ),
       "/api/connections/agents/personal/mail/status": async () =>
         json({ ...status, connected: true }),
     });
