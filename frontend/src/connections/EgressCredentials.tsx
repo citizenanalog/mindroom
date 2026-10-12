@@ -4,10 +4,9 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  PASS_THROUGH_CAPTION,
-  PASS_THROUGH_CAPTION_EVERYONE,
   PASSED_THROUGH,
   deleteServiceWarning,
+  passThroughCaption,
   personalScopeLine,
   removeLimitWarning,
   sharedAgentNote,
@@ -75,13 +74,16 @@ function servicePath(agentName: string, serviceName: string): string {
 /**
  * Recent brokered requests for one agent, loaded when the table is opened: the
  * caller's own, or with `everyone` (a shared or unscoped agent the caller
- * manages) every requester's, with a User column.
+ * manages) every requester's, with a User column. `shared` marks a shared or
+ * unscoped agent, whose credential managers can see the requests too.
  */
 function RecentRequests({
   agentName,
+  shared,
   everyone,
 }: {
   agentName: string;
+  shared: boolean;
   everyone: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -181,9 +183,7 @@ function RecentRequests({
                 className={`w-full text-left text-sm ${STACKED.table}`}
               >
                 <caption className="px-3 py-2 text-left text-xs text-muted-foreground max-sm:block">
-                  {everyone
-                    ? PASS_THROUGH_CAPTION_EVERYONE
-                    : PASS_THROUGH_CAPTION}
+                  {passThroughCaption(shared, everyone)}
                 </caption>
                 <thead
                   className={`bg-muted/40 text-xs text-muted-foreground ${STACKED.head}`}
@@ -535,6 +535,7 @@ function AgentSection({
       />
       <RecentRequests
         agentName={agent.agent_name}
+        shared={agent.shared}
         everyone={agent.shared && agent.can_manage}
       />
     </section>

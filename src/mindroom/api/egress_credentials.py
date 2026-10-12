@@ -714,7 +714,8 @@ def get_personal_logs(
     if agent_name and agent_name in config.agents:
         memberships = config_lifecycle.app_state(request.app).agent_reply_memberships
         eligibility = _check_agent_eligibility(agent_name, requester, config, snapshot.runtime_paths, memberships)
-        if eligibility == (True, True):  # (is_shared, can_manage): a shared or unscoped agent the caller manages
+        is_shared, can_manage = eligibility or (False, False)
+        if is_shared and can_manage:
             # Rows the agent logged before it was shared were personal, so they stay with their requesters.
             log_requester, log_scope = None, _agent_scope(config, agent_name)
     records = audit.query(

@@ -1,13 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
-  PASS_THROUGH_CAPTION,
-  PASS_THROUGH_CAPTION_EVERYONE,
   administratorLimitNote,
   deleteServiceWarning,
   disconnectDescription,
   formatList,
   personalAccountRefusal,
   personalSandboxRefusal,
+  passThroughCaption,
   personalScopeLine,
   removeLimitWarning,
   sharedAccountBody,
@@ -101,12 +100,16 @@ describe("account copy", () => {
     );
   });
 
-  it("tells the viewer that administrators can see the requests too, and whose requests are shown", () => {
-    expect(PASS_THROUGH_CAPTION).toBe(
+  it("tells the viewer who else can see the requests, and whose requests are shown", () => {
+    expect(passThroughCaption(false, false)).toBe(
       "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.",
     );
-    expect(PASS_THROUGH_CAPTION_EVERYONE).toBe(
-      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Requests from everyone who uses this agent are shown.",
+    // A shared or unscoped agent's credential managers see everyone's requests through it.
+    expect(passThroughCaption(true, false)).toBe(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators and this agent's credential managers can also see these requests (method, host, and path). Only your own requests are shown.",
+    );
+    expect(passThroughCaption(true, true)).toBe(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators and this agent's credential managers can also see these requests (method, host, and path). Requests from everyone who uses this agent are shown.",
     );
   });
 

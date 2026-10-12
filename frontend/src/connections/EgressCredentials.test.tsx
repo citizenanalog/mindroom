@@ -1708,7 +1708,7 @@ describe("recent requests on the personal page", () => {
       "Status",
     ]);
     expect(table.querySelector("caption")).toHaveTextContent(
-      "Only your own requests are shown.",
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators and this agent's credential managers can also see these requests (method, host, and path). Only your own requests are shown.",
     );
     expect(screen.queryByText("@bob:example.org")).toBeNull();
   });
@@ -1768,7 +1768,7 @@ describe("recent requests on the personal page", () => {
     expect(within(rows[2]).getAllByRole("cell")[1]).toHaveTextContent("-");
     const caption = table.querySelector("caption");
     expect(caption).toHaveTextContent(
-      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Requests from everyone who uses this agent are shown.",
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators and this agent's credential managers can also see these requests (method, host, and path). Requests from everyone who uses this agent are shown.",
     );
     expect(caption).not.toHaveTextContent("Only your own requests are shown.");
   });
@@ -2527,9 +2527,12 @@ describe("recent requests: wording and wrapping", () => {
   it("explains in a caption that other sites pass straight through and that administrators can see the requests", async () => {
     render(<EgressCredentials />);
     const table = await openLog();
-    expect(table.querySelector("caption")).toHaveTextContent(
-      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).",
+    const caption = table.querySelector("caption");
+    expect(caption).toHaveTextContent(
+      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.",
     );
+    // A personal agent has no credential managers.
+    expect(caption).not.toHaveTextContent("credential managers");
   });
 
   it("lets a refusal code wrap after each underscore and never mid-word", async () => {

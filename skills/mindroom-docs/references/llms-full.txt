@@ -16987,7 +16987,7 @@ Users who have no dashboard access still manage their own egress on the personal
 
 - Their own services, which can narrow the administrator's egress policy but never widen it, including a GitHub "Limit to repositories" helper and a limit in place on the administrator's GitHub service (**Limit to repositories**, then **Change limit** and **Remove limit**), which limits its paths without replacing its credential. A service that sets "Refuse other paths on these hosts" also limits the administrator's services on those hosts, for the agents that share its scope only. On shared and unscoped agents only administrators and credential managers change services.
 - Their own keys, set in the same step as the service, and their Google, GitHub, and Atlassian account connections. For a shared agent's team account (the Google providers), Connect first asks for confirmation, because everyone who uses the agent acts as the account, and every user sees which account is connected.
-- Their own request log, a **Recent requests** table per agent with the latest 10 requests and **Show all** for the rest, which on a shared agent they manage holds everyone's requests.
+- Their own request log, a **Recent requests** table per agent with the latest 10 requests and **Show all** for the rest, which on a shared or unscoped agent they manage holds everyone's requests.
 
 This needs [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/) with JWT, set through `env.extra` because the runtime chart has no values for it, an HTTPS `MINDROOM_PUBLIC_URL`, and a gateway that forwards `/connections`, `/api/connections`, and `/api/oauth` to the runtime.
 `MINDROOM_CONNECTIONS_AGENT` is required whenever more than one user can sign in through the gateway; set it to a private agent (`private.per: user` or `user_agent`).
@@ -18478,7 +18478,8 @@ On the personal egress page each agent has a collapsible **Recent requests** tab
 On a shared or unscoped agent you manage, the table holds everyone's requests: its text reads "The last 50 requests through this agent's sandbox, from everyone who uses it", and a **User** column after **Time** shows each requester's Matrix ID ("-" for a request without one).
 The table shows the newest 10, with **Show all ({n})** to list every loaded row and **Show latest 10** to fold them again; the button appears only when there are more than 10.
 Codes wrap after an underscore and never clip, on this table and on the dashboard's.
-A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown." (on a managed shared agent, "Requests from everyone who uses this agent are shown." instead of the last sentence).
+A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown."
+On a shared or unscoped agent the caption says "Administrators and this agent's credential managers can also see these requests (method, host, and path).", and to its managers "Requests from everyone who uses this agent are shown." instead of the last sentence.
 While the broker is off, the table shows the server's "Egress broker is not running" message.
 
 ## Agent tool

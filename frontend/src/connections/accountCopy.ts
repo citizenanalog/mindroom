@@ -121,8 +121,18 @@ export function deleteServiceWarning(
 
 /** The `Passed through` text for a tunnel the broker only relayed. */
 export const PASSED_THROUGH = "Passed through (no key added)";
-const PASS_THROUGH_NOTE =
-  "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path).";
-export const PASS_THROUGH_CAPTION = `${PASS_THROUGH_NOTE} Only your own requests are shown.`;
-/** The caption of a shared agent's log for one of its managers, which holds everyone's requests. */
-export const PASS_THROUGH_CAPTION_EVERYONE = `${PASS_THROUGH_NOTE} Requests from everyone who uses this agent are shown.`;
+
+/**
+ * The request log's caption: who else can see the requests, which on a shared
+ * or unscoped agent includes its credential managers, and whether the table
+ * holds only the viewer's requests or, for one of those managers, everyone's.
+ */
+export function passThroughCaption(shared: boolean, everyone: boolean): string {
+  const viewers = shared
+    ? "Administrators and this agent's credential managers"
+    : "Administrators";
+  const shown = everyone
+    ? "Requests from everyone who uses this agent are shown."
+    : "Only your own requests are shown.";
+  return `Requests to sites without a service pass straight through; MindRoom sees only the host. ${viewers} can also see these requests (method, host, and path). ${shown}`;
+}

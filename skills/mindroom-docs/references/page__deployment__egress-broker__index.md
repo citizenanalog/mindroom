@@ -800,7 +800,8 @@ On the personal egress page each agent has a collapsible **Recent requests** tab
 On a shared or unscoped agent you manage, the table holds everyone's requests: its text reads "The last 50 requests through this agent's sandbox, from everyone who uses it", and a **User** column after **Time** shows each requester's Matrix ID ("-" for a request without one).
 The table shows the newest 10, with **Show all ({n})** to list every loaded row and **Show latest 10** to fold them again; the button appears only when there are more than 10.
 Codes wrap after an underscore and never clip, on this table and on the dashboard's.
-A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown." (on a managed shared agent, "Requests from everyone who uses this agent are shown." instead of the last sentence).
+A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown."
+On a shared or unscoped agent the caption says "Administrators and this agent's credential managers can also see these requests (method, host, and path).", and to its managers "Requests from everyone who uses this agent are shown." instead of the last sentence.
 While the broker is off, the table shows the server's "Egress broker is not running" message.
 
 ## Agent tool
