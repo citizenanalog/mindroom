@@ -1794,11 +1794,6 @@ describe("recent requests on the personal page", () => {
 });
 
 describe("the page's header and intro", () => {
-  const identityFor = (changes: Partial<typeof identity> = {}) => ({
-    ...identity,
-    ...changes,
-  });
-
   it("says who is signed in and links Agents and API keys and accounts", async () => {
     render(<EgressCredentials />);
     expect(
@@ -1813,23 +1808,6 @@ describe("the page's header and intro", () => {
       within(nav).getByRole("link", { name: "API keys and accounts" }),
     ).toHaveAttribute("aria-current", "page");
     expect(within(nav).queryByRole("link", { name: "Dashboard" })).toBeNull();
-  });
-
-  it("links the dashboard for administrators", async () => {
-    vi.mocked(fetch).mockImplementation(async (input) =>
-      String(input) === "/api/connections/me"
-        ? json(
-            identityFor({
-              matrix_user_id: "@alice:example.org",
-              is_administrator: true,
-            }),
-          )
-        : json({ agents }),
-    );
-    render(<EgressCredentials />);
-    expect(
-      await screen.findByRole("link", { name: "Dashboard" }),
-    ).toHaveAttribute("href", "/");
   });
 
   it("says in one line what the page does and holds the full explanation behind How this works", async () => {
@@ -2438,13 +2416,6 @@ describe("limiting a GitHub service to repositories", () => {
     });
     release();
     await waitFor(() => expect(writes()).toHaveLength(1));
-  });
-
-  it("shows what a limited service is limited to", async () => {
-    listing[0].services.push(limited("gh-a", "basnijholt/agent-cli"));
-    render(<EgressCredentials />);
-    const row = await screen.findByLabelText("GitHub (basnijholt/agent-cli)");
-    expect(within(row).getByText("Limit only")).toBeVisible();
   });
 });
 

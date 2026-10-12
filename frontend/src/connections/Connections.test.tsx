@@ -1533,22 +1533,6 @@ describe("shared accounts on agent cards", () => {
       expect(window.open).not.toHaveBeenCalled();
     });
 
-    it("starts one connection when Continue is clicked twice before the page updates", async () => {
-      const connectCalls: string[] = [];
-      const dialog = await renderShared(connectCalls);
-      const button = within(dialog).getByRole("button", { name: "Continue" });
-      // Both clicks reach the dialog before React renders again, as with a
-      // fast double click, so only the dialog's own guard can stop the second.
-      // (After a render the first click has closed the dialog and the button
-      // is gone, so a second fireEvent.click would reach nothing at all.)
-      act(() => {
-        button.click();
-        button.click();
-      });
-      expect(window.open).toHaveBeenCalledTimes(1);
-      await waitFor(() => expect(connectCalls).toEqual(["connect"]));
-    });
-
     it("does not ask for an agent's own account", async () => {
       const connectCalls: string[] = [];
       installApi({

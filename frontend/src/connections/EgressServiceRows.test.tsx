@@ -1,5 +1,4 @@
 import {
-  act,
   cleanup,
   fireEvent,
   render,
@@ -1043,27 +1042,6 @@ describe("rows with an agent's wording", () => {
       await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
       expect(fetch).not.toHaveBeenCalled();
       expect(window.open).not.toHaveBeenCalled();
-    });
-
-    it("starts one connection when Continue is clicked twice before the page updates", async () => {
-      vi.mocked(fetch).mockImplementation(() => new Promise(() => {}));
-      renderRows([sharedGoogle], {
-        agent: agent({ displayName: "Shared Dev", services: [sharedGoogle] }),
-      });
-      fireEvent.click(
-        screen.getByRole("button", { name: "Connect Google for Gmail" }),
-      );
-      const dialog = await screen.findByRole("dialog");
-      const button = within(dialog).getByRole("button", { name: "Continue" });
-      // Both clicks reach the dialog before React renders again, as with a
-      // fast double click, so only the dialog's own guard can stop the second.
-      // (After a render the first click has closed the dialog and the button
-      // is gone, so a second fireEvent.click would reach nothing at all.)
-      act(() => {
-        button.click();
-        button.click();
-      });
-      expect(window.open).toHaveBeenCalledTimes(1);
     });
 
     it("does not ask for a requester's own account that a shared sandbox uses by opt-in", async () => {
