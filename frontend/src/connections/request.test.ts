@@ -1,12 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { requestConnection } from "./request";
+import { type RequestErrorMessages, requestConnection } from "./request";
 
 const reply = (body: unknown, status: number) =>
   vi
     .mocked(fetch)
     .mockResolvedValue(new Response(JSON.stringify(body), { status }));
-const request = () =>
-  requestConnection("/api/connections/egress", new AbortController().signal);
+const request = (messages?: RequestErrorMessages) =>
+  requestConnection(
+    "/api/connections/egress",
+    new AbortController().signal,
+    "GET",
+    {},
+    messages,
+  );
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -72,52 +78,28 @@ describe("requestConnection 403 details", () => {
 
   it("keeps the caller's own wording by default", async () => {
     reply({ detail: "Credential management is required" }, 403);
-    await expect(
-      requestConnection(
-        "/x",
-        new AbortController().signal,
-        "GET",
-        {},
-        messages,
-      ),
-    ).rejects.toThrow("You may not do that.");
+    await expect(request(messages)).rejects.toThrow("You may not do that.");
   });
 
   it("shows the server's reason when asked to, with the wording as the fallback", async () => {
     reply({ detail: "Credential management is required" }, 403);
     const asked = { ...messages, forbiddenDetail: true };
-    await expect(
-      requestConnection("/x", new AbortController().signal, "GET", {}, asked),
-    ).rejects.toThrow("Credential management is required");
+    await expect(request(asked)).rejects.toThrow(
+      "Credential management is required",
+    );
     for (const body of [{}, { detail: "" }, { detail: [{ msg: "x" }] }]) {
       reply(body, 403);
-      await expect(
-        requestConnection("/x", new AbortController().signal, "GET", {}, asked),
-      ).rejects.toThrow("You may not do that.");
+      await expect(request(asked)).rejects.toThrow("You may not do that.");
     }
     vi.mocked(fetch).mockResolvedValue(new Response("<html>", { status: 403 }));
-    await expect(
-      requestConnection("/x", new AbortController().signal, "GET", {}, asked),
-    ).rejects.toThrow("You may not do that.");
+    await expect(request(asked)).rejects.toThrow("You may not do that.");
     reply({ detail: "Credential management is required" }, 403);
-    await expect(
-      requestConnection(
-        "/x",
-        new AbortController().signal,
-        "GET",
-        {},
-        { forbiddenDetail: true },
-      ),
-    ).rejects.toThrow("Credential management is required");
+    await expect(request({ forbiddenDetail: true })).rejects.toThrow(
+      "Credential management is required",
+    );
     reply({}, 403);
-    await expect(
-      requestConnection(
-        "/x",
-        new AbortController().signal,
-        "GET",
-        {},
-        { forbiddenDetail: true },
-      ),
-    ).rejects.toThrow("Connections are not available for this account.");
+    await expect(request({ forbiddenDetail: true })).rejects.toThrow(
+      "Connections are not available for this account.",
+    );
   });
 });
