@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
+import { bearerRule, presets, validation } from "@/test/egressServiceTestKit";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import {
   DiscardEditsNotice,
@@ -17,29 +18,29 @@ import {
 import type {
   AuthoredEgressService,
   EgressCredentialService,
-  EgressPreset,
   EgressPresetCatalog,
   EgressRule,
 } from "./types";
 
-// The JSON fixture types each placeholder_env by its own keys.
-const presets = egressPresets.presets as EgressPreset[];
 const providers = egressPresets.oauth_providers;
-const validation = egressPresets.validation;
 
-const bearerRule: EgressRule = {
-  host: "api.example.com",
-  auth: { type: "bearer" },
-};
+/** A loadPresets that serves the fixture's catalog, with any field changed. */
+const catalog = (changes: Partial<EgressPresetCatalog> = {}) =>
+  vi.fn(async () => ({
+    presets,
+    oauth_providers: providers,
+    validation,
+    ...changes,
+  }));
+const failingPresets = () =>
+  vi.fn(async () => {
+    throw new Error("nope");
+  });
 
 const baseProps = () => ({
   service: null,
   context: "personal" as const,
-  loadPresets: vi.fn(async () => ({
-    presets,
-    oauth_providers: providers,
-    validation,
-  })),
+  loadPresets: catalog(),
   onSave: vi.fn(async () => undefined),
   onClose: vi.fn(),
 });
@@ -55,6 +56,17 @@ async function renderEditor(props: Partial<EgressServiceEditorProps> = {}) {
 /** Open the section that holds everything but the basic fields. */
 const openMoreOptions = () =>
   fireEvent.click(screen.getByRole("button", { name: "More options" }));
+const renderGithub = (props: Partial<EgressServiceEditorProps> = {}) =>
+  renderEditor({ service: { preset: "github" }, name: "github", ...props });
+const type = (label: string, value: string) =>
+  fireEvent.change(screen.getByLabelText(label), { target: { value } });
+const save = () =>
+  fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+const enter = (value: string) => type("GitHub repositories", value);
+const apply = () =>
+  fireEvent.click(
+    screen.getByRole("button", { name: "Use these repositories" }),
+  );
 
 afterEach(() => {
   cleanup();
@@ -62,18 +74,11 @@ afterEach(() => {
 });
 
 describe("the editor form", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-
   it("saves a custom service in its authored form", async () => {
     const { onSave } = await renderEditor();
     type("Name", "example");
     type("Website", "API.example.com");
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "header" },
-    });
+    type("Send the key as", "header");
     type("Header name", "X-Api-Key");
     openMoreOptions();
     type("Display name", "Example");
@@ -116,9 +121,7 @@ describe("the editor form", () => {
       const { onSave } = await renderEditor();
       type("Name", "example");
       type("Website", "api.example.com");
-      fireEvent.change(screen.getByLabelText("Send the key as"), {
-        target: { value: choice },
-      });
+      type("Send the key as", choice);
       for (const [label, value] of Object.entries(fields)) type(label, value);
       save();
       await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
@@ -146,16 +149,12 @@ describe("the editor form", () => {
 
   it("says that an empty value template sends the key as is", async () => {
     await renderEditor();
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "template" },
-    });
+    type("Send the key as", "template");
     expect(screen.getByLabelText("Value template")).toHaveAccessibleDescription(
       "Leave empty to send the key as is.",
     );
     // A query parameter has the same optional template.
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "query" },
-    });
+    type("Send the key as", "query");
     expect(screen.getByLabelText("Value template")).toHaveAccessibleDescription(
       "Leave empty to send the key as is.",
     );
@@ -184,9 +183,7 @@ describe("the editor form", () => {
       },
     });
     expect(screen.getByLabelText("Send the key as")).toHaveValue("template");
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "header" },
-    });
+    type("Send the key as", "header");
     expect(screen.queryByLabelText("Value template")).toBeNull();
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
@@ -206,9 +203,7 @@ describe("the editor form", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
     type("Rule 2 host", "b.example.com");
-    fireEvent.change(screen.getByLabelText("Rule 2 auth type"), {
-      target: { value: "basic" },
-    });
+    type("Rule 2 auth type", "basic");
     type("Rule 2 username", "bot");
     type("Rule 3 host", "c.example.com");
     type("Rule 3 path prefix", "/v1");
@@ -228,9 +223,7 @@ describe("the editor form", () => {
   it("saves a preset alone as just the preset", async () => {
     const { onSave } = await renderEditor();
     type("Name", "github");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     expect(
       screen.getByText(
         "The GitHub preset covers api.github.com, uploads.github.com, github.com.",
@@ -247,9 +240,7 @@ describe("the editor form", () => {
   it("saves a preset with restrict_to_rules without expanding it", async () => {
     const { onSave } = await renderEditor();
     type("Name", "github");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     openMoreOptions();
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     save();
@@ -263,9 +254,7 @@ describe("the editor form", () => {
   it("lets the user replace a preset's rules with their own", async () => {
     const { onSave } = await renderEditor();
     type("Name", "ai");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    type("Preset", "openai");
     openMoreOptions();
     fireEvent.click(
       screen.getByLabelText("Replace the preset's rules with my own"),
@@ -282,9 +271,7 @@ describe("the editor form", () => {
   it("rejects a name that is already taken, beside the name", async () => {
     const { onSave } = await renderEditor({ takenNames: ["github"] });
     type("Name", "github");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     save();
     expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
       /A service named github already exists/,
@@ -298,9 +285,7 @@ describe("the editor form", () => {
     });
     await renderEditor({ onSave });
     type("Name", "x");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    type("Preset", "openai");
     save();
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "already used by your administrator",
@@ -309,7 +294,7 @@ describe("the editor form", () => {
   });
 
   it("cannot rename the service it edits", async () => {
-    await renderEditor({ name: "github", service: { preset: "github" } });
+    await renderGithub();
     expect(screen.getByLabelText("Name")).toBeDisabled();
     expect(screen.getByLabelText("Name")).toHaveValue("github");
     expect(screen.getByLabelText("Preset")).toHaveValue("github");
@@ -371,9 +356,7 @@ describe("the editor form", () => {
 
   it("builds the hint from the rules the server sends, not from a copy", async () => {
     await renderEditor({
-      loadPresets: vi.fn(async () => ({
-        presets,
-        oauth_providers: providers,
+      loadPresets: catalog({
         validation: {
           ...validation,
           placeholder: {
@@ -386,7 +369,7 @@ describe("the editor form", () => {
             value_max_length: 9,
           },
         },
-      })),
+      }),
     });
     openMoreOptions();
     const hint = screen.getByText(/one word between underscores must be/);
@@ -400,9 +383,7 @@ describe("the editor form", () => {
 
   it("gives a short hint without the lists when the presets could not be loaded", async () => {
     await renderEditor({
-      loadPresets: vi.fn(async () => {
-        throw new Error("nope");
-      }),
+      loadPresets: failingPresets(),
     });
     openMoreOptions();
     const hint = screen.getByText(/The server checks the rest when you save/);
@@ -463,9 +444,7 @@ describe("the editor form", () => {
   it("gives the operator a short hint without the prefixes when the presets could not be loaded", async () => {
     await renderEditor({
       context: "operator",
-      loadPresets: vi.fn(async () => {
-        throw new Error("nope");
-      }),
+      loadPresets: failingPresets(),
     });
     openMoreOptions();
     expect(
@@ -527,9 +506,7 @@ describe("the editor form", () => {
       ),
     ).toBeInTheDocument();
     type("Name", "github");
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     expect(
       screen.getByText(
         /Accounts cannot be connected on a shared agent, so this service uses an API key/,
@@ -577,11 +554,7 @@ describe("the editor form", () => {
       .fn<() => Promise<void>>()
       .mockRejectedValueOnce(new Error("Could not delete it"))
       .mockResolvedValue(undefined);
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-      onDelete,
-    });
+    await renderGithub({ onDelete });
     fireEvent.click(screen.getByRole("button", { name: "Delete service" }));
     expect(onDelete).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Keep" }));
@@ -613,19 +586,6 @@ describe("the editor form", () => {
 });
 
 describe("the GitHub helper in the editor", () => {
-  const renderGithub = (props: Partial<EgressServiceEditorProps> = {}) =>
-    renderEditor({ service: { preset: "github" }, name: "github", ...props });
-  const enter = (value: string) =>
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value },
-    });
-  const apply = () =>
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-
   it("replaces the preset's rules and turns on the restriction", async () => {
     const { onSave } = await renderGithub();
     enter("basnijholt/agent-cli");
@@ -729,27 +689,17 @@ describe("the GitHub helper in the editor", () => {
     // A new custom service has no host yet.
     await renderEditor({ name: undefined, service: null });
     expect(helper()).toBeNull();
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "httpbin.org" },
-    });
+    type("Website", "httpbin.org");
     expect(helper()).toBeNull();
     for (const host of ["github.com", "api.github.com", "uploads.github.com"]) {
-      fireEvent.change(screen.getByLabelText("Website"), {
-        target: { value: host },
-      });
+      type("Website", host);
       expect(helper()).toBeInTheDocument();
     }
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "" },
-    });
+    type("Website", "");
     expect(helper()).toBeNull();
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     expect(helper()).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    type("Preset", "openai");
     expect(helper()).toBeNull();
     cleanup();
     await renderEditor({ name: "code", service: { rules: [bearerRule] } });
@@ -766,9 +716,7 @@ describe("the GitHub helper in the editor", () => {
 
   it("fills the display name and the description when they are empty", async () => {
     const { onSave } = await renderGithub({ name: undefined, service: null });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     enter("o/a");
     apply();
     expect(screen.getByLabelText("Display name")).toHaveValue("GitHub (o/a)");
@@ -784,9 +732,7 @@ describe("the GitHub helper in the editor", () => {
   it("lists every repository in the labels and keeps what the user already typed", async () => {
     await renderGithub();
     openMoreOptions();
-    fireEvent.change(screen.getByLabelText("Display name"), {
-      target: { value: "Work GitHub" },
-    });
+    type("Display name", "Work GitHub");
     enter("o/a\no/b\np/*");
     apply();
     expect(screen.getByLabelText("Display name")).toHaveValue("Work GitHub");
@@ -864,9 +810,7 @@ describe("the help beside refusing other paths", () => {
     await renderEditor();
     openMoreOptions();
     expect(restrictHelp()).not.toHaveTextContent("GraphQL");
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "api.github.com" },
-    });
+    type("Website", "api.github.com");
     expect(restrictHelp()).toHaveTextContent("GraphQL");
   });
 
@@ -910,7 +854,7 @@ describe("the help beside refusing other paths", () => {
 describe("loading the presets", () => {
   it("offers what the server returns, by display name", async () => {
     await renderEditor({
-      loadPresets: vi.fn(async () => ({
+      loadPresets: catalog({
         presets: [
           {
             id: "internal",
@@ -927,18 +871,14 @@ describe("loading the presets", () => {
             placeholder_env: {},
           },
         ],
-        oauth_providers: providers,
-        validation,
-      })),
+      }),
     });
     expect(
       within(screen.getByLabelText("Preset"))
         .getAllByRole("option")
         .map((option) => option.textContent),
     ).toEqual(["Custom", "Internal API"]);
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "internal" },
-    });
+    type("Preset", "internal");
     expect(
       screen.getByText(
         "The Internal API preset covers api.internal.example.com:8443/v1/.",
@@ -966,21 +906,15 @@ describe("loading the presets", () => {
   it("falls back to a custom service when they cannot be loaded", async () => {
     const onSave = vi.fn(async () => undefined);
     await renderEditor({
-      loadPresets: vi.fn(async () => {
-        throw new Error("nope");
-      }),
+      loadPresets: failingPresets(),
       onSave,
     });
     expect(
       screen.getByText(/The preset list could not be loaded/),
     ).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "own" },
-    });
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "a.example.com" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    type("Name", "own");
+    type("Website", "a.example.com");
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("own", {
       display_name: "a.example.com",
@@ -992,11 +926,7 @@ describe("loading the presets", () => {
     await renderEditor({
       name: "old",
       service: { preset: "retired" },
-      loadPresets: vi.fn(async () => ({
-        presets: [],
-        oauth_providers: providers,
-        validation,
-      })),
+      loadPresets: catalog({ presets: [] }),
     });
     expect(screen.getByLabelText("Preset")).toHaveValue("retired");
   });
@@ -1007,17 +937,15 @@ describe("the rule cap from the server", () => {
     rules: [bearerRule, { ...bearerRule, host: "b.example.com" }],
   };
   const addRule = () => screen.getByRole("button", { name: "Add rule" });
-  const editWith = (catalog: EgressPresetCatalog) =>
+  const editWith = (changes: Partial<EgressPresetCatalog>) =>
     renderEditor({
       name: "svc",
       service: twoRules,
-      loadPresets: vi.fn(async () => catalog),
+      loadPresets: catalog(changes),
     });
 
   it("stops adding rules at the most the server takes", async () => {
     await editWith({
-      presets,
-      oauth_providers: providers,
       validation: { ...validation, max_rules_per_service: 2 },
     });
     expect(addRule()).toBeDisabled();
@@ -1025,8 +953,6 @@ describe("the rule cap from the server", () => {
 
   it("keeps adding rules below it, up to it", async () => {
     await editWith({
-      presets,
-      oauth_providers: providers,
       validation: { ...validation, max_rules_per_service: 3 },
     });
     expect(addRule()).toBeEnabled();
@@ -1038,9 +964,7 @@ describe("the rule cap from the server", () => {
     await renderEditor({
       name: "svc",
       service: twoRules,
-      loadPresets: vi.fn(async () => {
-        throw new Error("nope");
-      }),
+      loadPresets: failingPresets(),
     });
     expect(addRule()).toBeEnabled();
   });
@@ -1050,16 +974,10 @@ describe("saving with a wider effect", () => {
   const saveWarning = "This also saves your other unsaved settings changes.";
   const filled = async (props: Partial<EgressServiceEditorProps> = {}) => {
     const rendered = await renderEditor({ saveWarning, ...props });
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "svc" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    type("Name", "svc");
+    type("Preset", "openai");
     return rendered;
   };
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
 
   it("asks once before saving, then saves", async () => {
     const { onSave } = await filled();
@@ -1084,9 +1002,7 @@ describe("saving with a wider effect", () => {
     const { onSave } = await filled();
     save();
     openMoreOptions();
-    fireEvent.change(screen.getByLabelText("Description"), {
-      target: { value: "changed" },
-    });
+    type("Description", "changed");
     expect(screen.queryByText(saveWarning)).toBeNull();
     save();
     expect(screen.getByText(saveWarning)).toBeInTheDocument();
@@ -1109,12 +1025,7 @@ describe("saving with a wider effect", () => {
   });
 
   it("repeats the warning when asking to delete", async () => {
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-      onDelete: vi.fn(),
-      saveWarning,
-    });
+    await renderGithub({ onDelete: vi.fn(), saveWarning });
     fireEvent.click(screen.getByRole("button", { name: "Delete service" }));
     expect(
       screen.getByText(`Delete github? ${saveWarning}`),
@@ -1197,21 +1108,13 @@ describe("the question before deleting from inside the editor", () => {
 describe("reporting unsaved changes", () => {
   it("tells the parent when the form differs from what it opened with", async () => {
     const onDirtyChange = vi.fn();
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-      onDirtyChange,
-    });
+    await renderGithub({ onDirtyChange });
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
 
     openMoreOptions();
-    fireEvent.change(screen.getByLabelText("Description"), {
-      target: { value: "x" },
-    });
+    type("Description", "x");
     expect(onDirtyChange).toHaveBeenLastCalledWith(true);
-    fireEvent.change(screen.getByLabelText("Description"), {
-      target: { value: "" },
-    });
+    type("Description", "");
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
   });
 });
@@ -1229,7 +1132,7 @@ describe("a service with values emptied on purpose", () => {
         /This service sets none, which drops the placeholders of the GitHub preset/,
       ),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("github", {
       preset: "github",
@@ -1239,7 +1142,7 @@ describe("a service with values emptied on purpose", () => {
   });
 
   it("offers the preset's placeholders when the service has not set any", async () => {
-    await renderEditor({ name: "github", service: { preset: "github" } });
+    await renderGithub();
     openMoreOptions();
     expect(
       screen.getByText(
@@ -1260,9 +1163,7 @@ describe("choosing another preset", () => {
         placeholder_env: {},
       },
     });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     openMoreOptions();
     // The GitHub preset has placeholders of its own, so the list is not "none".
     expect(
@@ -1270,21 +1171,13 @@ describe("choosing another preset", () => {
         /Leave the list empty to use the placeholders of the GitHub preset/,
       ),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("mine", { preset: "github" });
   });
 });
 
 describe("the GitHub helper on a custom service", () => {
-  const enter = (value: string) =>
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value },
-    });
-  const apply = () =>
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
   const rulesFor = (repository: string) => [
     {
       host: "api.github.com",
@@ -1305,12 +1198,8 @@ describe("the GitHub helper on a custom service", () => {
 
   it("adds the GH_TOKEN and GITHUB_TOKEN placeholders and shows them", async () => {
     const { onSave } = await renderEditor();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "code" },
-    });
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "api.github.com" },
-    });
+    type("Name", "code");
+    type("Website", "api.github.com");
     expect(screen.queryByLabelText("Placeholder 1 name")).toBeNull();
     enter("o/r");
     apply();
@@ -1326,7 +1215,7 @@ describe("the GitHub helper on a custom service", () => {
     expect(screen.getByLabelText("Placeholder 2 value")).toHaveValue(
       "mindroom-brokered",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("code", {
       display_name: "GitHub (o/r)",
@@ -1354,7 +1243,7 @@ describe("the GitHub helper on a custom service", () => {
       "MY_GITHUB_TOKEN",
     );
     expect(screen.queryByLabelText("Placeholder 2 name")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("code", {
       display_name: "GitHub (o/r)",
@@ -1367,9 +1256,7 @@ describe("the GitHub helper on a custom service", () => {
 
   it("adds them only once when the repositories are applied again", async () => {
     await renderEditor();
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "api.github.com" },
-    });
+    type("Website", "api.github.com");
     enter("o/r");
     apply();
     enter("o/other");
@@ -1382,9 +1269,7 @@ describe("the GitHub helper on a custom service", () => {
 
   it("renames the labels it filled when applied again, but never ones the user typed", async () => {
     await renderEditor();
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "api.github.com" },
-    });
+    type("Website", "api.github.com");
     enter("o/r");
     apply();
     enter("o/other");
@@ -1395,9 +1280,7 @@ describe("the GitHub helper on a custom service", () => {
     expect(screen.getByLabelText("Description")).toHaveValue(
       "Limited to o/other",
     );
-    fireEvent.change(screen.getByLabelText("Description"), {
-      target: { value: "My own words" },
-    });
+    type("Description", "My own words");
     enter("o/third");
     apply();
     expect(screen.getByLabelText("Display name")).toHaveValue(
@@ -1407,14 +1290,11 @@ describe("the GitHub helper on a custom service", () => {
   });
 
   it("adds none to a preset service, which brings its own", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     enter("o/r");
     apply();
     expect(screen.queryByLabelText("Placeholder 1 name")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(vi.mocked(onSave).mock.calls[0][1]).not.toHaveProperty(
       "placeholder_env",
@@ -1429,13 +1309,9 @@ describe("a form after a failed save", () => {
       .mockRejectedValueOnce(new Error("The server said no"))
       .mockResolvedValue(undefined);
     await renderEditor({ onSave });
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "svc" },
-    });
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "a.example.com" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    type("Name", "svc");
+    type("Website", "a.example.com");
+    save();
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The server said no",
     );
@@ -1443,15 +1319,11 @@ describe("a form after a failed save", () => {
     expect(screen.getByLabelText("Website")).toHaveValue("a.example.com");
     expect(screen.getByRole("button", { name: "Save service" })).toBeEnabled();
 
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "b.example.com" },
-    });
+    type("Website", "b.example.com");
     openMoreOptions();
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    fireEvent.change(screen.getByLabelText("Rule 2 host"), {
-      target: { value: "c.example.com" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    type("Rule 2 host", "c.example.com");
+    save();
 
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
     expect(onSave).toHaveBeenLastCalledWith("svc", {
@@ -1469,24 +1341,18 @@ describe("a form after a failed save", () => {
       throw new Error("The server said no");
     });
     await renderEditor({ onSave });
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "svc" },
-    });
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "a.example.com" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    type("Name", "svc");
+    type("Website", "a.example.com");
+    save();
     await screen.findByText("The server said no");
 
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "a.example.com:8443" },
-    });
+    type("Website", "a.example.com:8443");
     expect(screen.getByLabelText("Website")).toHaveAccessibleDescription(
       /Host must not contain a port/,
     );
     // The server's answer gives way to what the form itself can see.
     expect(screen.queryByText("The server said no")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     expect(onSave).toHaveBeenCalledTimes(1);
   });
 });
@@ -1514,11 +1380,7 @@ describe("the account login field", () => {
         rules: [{ host: "a.example.com", auth: { type: "bearer" } }],
         oauth_provider: "retired_login",
       },
-      loadPresets: vi.fn(async () => ({
-        presets,
-        oauth_providers: [],
-        validation,
-      })),
+      loadPresets: catalog({ oauth_providers: [] }),
     });
     const login = screen.getByLabelText("Account login (optional)");
     expect(login).toHaveValue("retired_login");
@@ -1537,7 +1399,7 @@ describe("the account login field", () => {
         oauth_provider: "Git Hub",
       },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     expect(
       screen.getByLabelText("Account login (optional)"),
     ).toHaveAccessibleDescription(/Account login must be a provider id/);
@@ -1607,24 +1469,18 @@ describe("the basic form", () => {
   it("asks for a header name only when the key goes in a header", async () => {
     await renderEditor();
     expect(screen.queryByLabelText("Header name")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "header" },
-    });
+    type("Send the key as", "header");
     expect(screen.getByLabelText("Header name")).toBeInTheDocument();
   });
 
   it("explains the header name with an example and does not prefill one", async () => {
     await renderEditor();
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "header" },
-    });
+    type("Send the key as", "header");
     const field = screen.getByLabelText("Header name");
     expect(field).toHaveAccessibleDescription("For example X-Api-Key");
     expect(field).not.toHaveAttribute("placeholder");
     expect(field).toHaveValue("");
-    fireEvent.change(screen.getByLabelText("Send the key as"), {
-      target: { value: "query" },
-    });
+    type("Send the key as", "query");
     expect(screen.getByLabelText("Parameter name")).not.toHaveAttribute(
       "placeholder",
     );
@@ -1654,9 +1510,6 @@ describe("the basic form", () => {
 });
 
 describe("the name of a new service", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-
   it("follows the preset id and then the host's first label until the user types one", async () => {
     await renderEditor();
     type("Website", "httpbin.org");
@@ -1689,7 +1542,7 @@ describe("the name of a new service", () => {
   it("saves the suggested name", async () => {
     const { onSave } = await renderEditor();
     type("Website", "httpbin.org");
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("httpbin", {
       display_name: "httpbin.org",
@@ -1708,7 +1561,7 @@ describe("the name of a new service", () => {
 
   it("says Name is required, beside the name, and focuses the website first", async () => {
     const { onSave } = await renderEditor();
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
       /Name is required/,
     );
@@ -1719,11 +1572,6 @@ describe("the name of a new service", () => {
 });
 
 describe("errors beside their fields", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-
   it("shows each problem next to its field and focuses the first invalid one", async () => {
     const { onSave } = await renderEditor();
     save();
@@ -1819,10 +1667,6 @@ describe("errors beside their fields", () => {
 });
 
 describe("saving the API key with the service", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
   const fill = () => {
     type("Name", "httpbin");
     type("Website", "httpbin.org");
@@ -1953,9 +1797,7 @@ describe("saving the API key with the service", () => {
 
   it("counts a typed key as unsaved changes", async () => {
     const onDirtyChange = vi.fn();
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
+    await renderGithub({
       saveKey: vi.fn(async () => undefined),
       onDirtyChange,
     });
@@ -1967,12 +1809,7 @@ describe("saving the API key with the service", () => {
   it("can set a key while editing a service", async () => {
     const saveKey = vi.fn(async () => undefined);
     const onClose = vi.fn();
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-      saveKey,
-      onClose,
-    });
+    await renderGithub({ saveKey, onClose });
     type("API key", "ghp_x");
     save();
     await waitFor(() => expect(onClose).toHaveBeenCalled());
@@ -1984,8 +1821,6 @@ describe("a placeholder an administrator's service also sets", () => {
   const configPlaceholders = { GH_TOKEN: "GitHub" };
   const warning =
     "GH_TOKEN is also set by GitHub from your administrator; when both are set, theirs is used.";
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
 
   it("warns with the service's display name, and only for that variable", async () => {
     const { onSave } = await renderEditor({ configPlaceholders });
@@ -2001,7 +1836,7 @@ describe("a placeholder an administrator's service also sets", () => {
       screen.getByLabelText("Placeholder 1 name"),
     ).toHaveAccessibleDescription(warning);
     // It is a warning: the service still saves.
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("svc", {
       display_name: "a.example.com",
@@ -2025,12 +1860,8 @@ describe("a placeholder an administrator's service also sets", () => {
   it("warns for the placeholders the GitHub helper adds", async () => {
     await renderEditor({ configPlaceholders });
     type("Website", "api.github.com");
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value: "o/r" },
-    });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
+    enter("o/r");
+    apply();
     expect(screen.getByText(warning)).toBeInTheDocument();
   });
 
@@ -2090,8 +1921,6 @@ describe("the note on whose service this is", () => {
 });
 
 describe("a free name for a new service", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
   const nameField = () => screen.getByLabelText("Name");
 
   it("skips the names the page already lists", async () => {
@@ -2122,7 +1951,7 @@ describe("a free name for a new service", () => {
     });
     type("Preset", "github");
     expect(nameField()).toHaveValue("github");
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     expect(nameField()).toHaveAccessibleDescription(
       /A service named github already exists/,
     );
@@ -2132,7 +1961,7 @@ describe("a free name for a new service", () => {
   it("saves the free name it suggested", async () => {
     const { onSave } = await renderEditor({ takenNames: ["github"] });
     type("Preset", "github");
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("github-2", { preset: "github" });
   });
@@ -2146,15 +1975,9 @@ describe("a free name for a new service", () => {
 });
 
 describe("the name after the GitHub helper", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
   const limit = (repositories: string) => {
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value: repositories },
-    });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
+    enter(repositories);
+    apply();
   };
 
   it("keeps the name when the helper replaces the rules", async () => {
@@ -2215,9 +2038,7 @@ describe("a preset's placeholders an administrator's service also sets", () => {
   it("warns on choosing the preset without opening More options", async () => {
     await renderEditor({ configPlaceholders });
     expect(screen.queryByText(warning)).toBeNull();
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     expect(screen.queryByLabelText("Display name")).toBeNull();
     expect(screen.getByText(warning)).toBeVisible();
   });
@@ -2225,13 +2046,9 @@ describe("a preset's placeholders an administrator's service also sets", () => {
   it("follows the chosen preset", async () => {
     await renderEditor({ configPlaceholders });
     expect(screen.queryByText(warning)).toBeNull();
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     expect(screen.getByText(warning)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    type("Preset", "openai");
     expect(screen.queryByText(warning)).toBeNull();
   });
 
@@ -2255,11 +2072,7 @@ describe("a preset's placeholders an administrator's service also sets", () => {
 });
 
 describe("which section a problem opens", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
   const toggle = () => screen.getByRole("button", { name: "More options" });
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
 
   it.each<[string, string, () => void, boolean]>([
     ["the host", "Website", () => type("Website", ""), true],
@@ -2343,11 +2156,6 @@ describe("which section a problem opens", () => {
 });
 
 describe("what a collapsed or failed form keeps and shows", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-
   it("keeps a value typed under More options after the section is collapsed", async () => {
     const { onSave } = await renderEditor();
     type("Name", "svc");
@@ -2420,25 +2228,12 @@ describe("asking before discarding an open editor", () => {
 });
 
 describe("repositories typed in the helper and saved without pressing Use these repositories", () => {
-  const enter = (value: string) =>
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value },
-    });
-  const apply = () =>
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
   const octocatRules = (graphql = false) =>
     githubRepositoryRules("octocat/Hello-World", { uploads: false, graphql })
       .rules;
 
   it("applies them on Save, writing the same limited service as pressing the button", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     enter("octocat/Hello-World");
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
@@ -2455,9 +2250,7 @@ describe("repositories typed in the helper and saved without pressing Use these 
 
   it("applies them for a custom service on a GitHub host, with the options that were ticked", async () => {
     const { onSave } = await renderEditor();
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "api.github.com" },
-    });
+    type("Website", "api.github.com");
     fireEvent.click(screen.getByLabelText(/Also allow GraphQL/));
     enter("octocat/Hello-World");
     save();
@@ -2475,10 +2268,7 @@ describe("repositories typed in the helper and saved without pressing Use these 
   });
 
   it("refuses a line it cannot use instead of saving the broad service, and focuses the repositories", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     enter("not a repo");
     save();
     expect(screen.getByRole("alert")).toHaveTextContent(
@@ -2498,25 +2288,17 @@ describe("repositories typed in the helper and saved without pressing Use these 
   });
 
   it("leaves the service as it is when nothing was typed", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("github", { preset: "github" });
   });
 
   it("keeps rules edited by hand after applying", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     enter("octocat/Hello-World");
     apply();
-    fireEvent.change(screen.getByLabelText("Rule 3 path prefix"), {
-      target: { value: "/octocat/Hello-World.git/" },
-    });
+    type("Rule 3 path prefix", "/octocat/Hello-World.git/");
     save();
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(vi.mocked(onSave).mock.calls[0][1].rules?.[2].path_prefix).toBe(
@@ -2525,10 +2307,7 @@ describe("repositories typed in the helper and saved without pressing Use these 
   });
 
   it("applies again when the repositories change after applying", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     enter("octocat/Hello-World");
     apply();
     // Changing the list is a new choice, so the rules follow it.
@@ -2547,11 +2326,7 @@ describe("repositories typed in the helper and saved without pressing Use these 
 
   it("counts typed repositories as unsaved changes", async () => {
     const onDirtyChange = vi.fn();
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-      onDirtyChange,
-    });
+    await renderGithub({ onDirtyChange });
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
     enter("octocat/Hello-World");
     expect(onDirtyChange).toHaveBeenLastCalledWith(true);
@@ -2561,31 +2336,17 @@ describe("repositories typed in the helper and saved without pressing Use these 
 });
 
 describe("typed repositories after the preset changes", () => {
-  const enter = (value: string) =>
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value },
-    });
-
   it("applies them again on Save when the preset was switched away and back after applying", async () => {
-    const { onSave } = await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-    });
+    const { onSave } = await renderGithub();
     enter("octocat/Hello-World");
-    fireEvent.click(
-      screen.getByRole("button", { name: "Use these repositories" }),
-    );
+    apply();
     // The preset's own rules are back, and the repositories are still typed.
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "openai");
+    type("Preset", "github");
     expect(screen.getByLabelText("GitHub repositories")).toHaveValue(
       "octocat/Hello-World",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith(
       "github",
@@ -2602,15 +2363,11 @@ describe("typed repositories after the preset changes", () => {
   it("does not count text in a helper that is no longer shown as unsaved changes", async () => {
     const onDirtyChange = vi.fn();
     await renderEditor({ onDirtyChange });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    type("Preset", "github");
     enter("octocat/Hello-World");
     expect(onDirtyChange).toHaveBeenLastCalledWith(true);
     // Back to a custom service as the form opened: only the hidden text differs.
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "" },
-    });
+    type("Preset", "");
     expect(screen.queryByLabelText("GitHub repositories")).toBeNull();
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
   });
@@ -2632,10 +2389,6 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     await limitSavable();
     return { onSave: merged.onSave, onClose: merged.onClose };
   };
-  const enter = (value: string) =>
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value },
-    });
   // The rules of a limit send nothing, so the server keeps them without auth,
   // and always cover uploads.github.com.
   const limitRules = (input: string, graphql = false) =>
@@ -2737,9 +2490,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("can be saved once the presets fail to load", async () => {
     const { onSave } = await renderEditor({
       initialRestrictOnly: true,
-      loadPresets: vi.fn(async () => {
-        throw new Error("offline");
-      }),
+      loadPresets: failingPresets(),
     });
     enter("octocat/Hello-World");
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
@@ -2852,10 +2603,6 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
     noAuth(
       githubRepositoryRules(input, { uploads: true, graphql: false }).rules,
     );
-  const enter = (value: string) =>
-    fireEvent.change(screen.getByLabelText("GitHub repositories"), {
-      target: { value },
-    });
 
   it("opens a limit the server keeps without auth on its rules, and saves it back the same", async () => {
     const stored: AuthoredEgressService = {
@@ -2934,34 +2681,34 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
 
 describe("the Website field", () => {
   const website = () => screen.getByLabelText("Website") as HTMLInputElement;
-  const type = (value: string) =>
+  const typeWebsite = (value: string) =>
     fireEvent.change(website(), { target: { value } });
 
   it("keeps only the host of a pasted address", async () => {
     await renderEditor();
-    type("https://httpbin.org/anything?x=1#top");
+    typeWebsite("https://httpbin.org/anything?x=1#top");
     expect(website()).toHaveValue("httpbin.org");
     // The name follows the host that is left.
     expect(screen.getByLabelText("Name")).toHaveValue("httpbin");
-    type("http://api.example.com:8443/v1");
+    typeWebsite("http://api.example.com:8443/v1");
     expect(website()).toHaveValue("api.example.com:8443");
-    type("a.example.com/path");
+    typeWebsite("a.example.com/path");
     expect(website()).toHaveValue("a.example.com");
-    type("*.example.com");
+    typeWebsite("*.example.com");
     expect(website()).toHaveValue("*.example.com");
   });
 
   it("lets a person type an address letter by letter", async () => {
     await renderEditor();
     for (const typed of ["h", "https:", "https:/", "https://", "https://a.b"])
-      type(typed);
+      typeWebsite(typed);
     expect(website()).toHaveValue("a.b");
   });
 
   it("keeps the old problem for a port, which the port field is for", async () => {
     await renderEditor();
-    type("a.example.com:8443");
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    typeWebsite("a.example.com:8443");
+    save();
     expect(website()).toHaveAccessibleDescription(
       /Host must not contain a port \(use the port field\)/,
     );
@@ -2969,14 +2716,14 @@ describe("the Website field", () => {
 
   it("moves the path of a pasted address into the Path prefix and says so", async () => {
     const { onSave } = await renderEditor();
-    type("https://api.example.com/v1/items?page=2#top");
+    typeWebsite("https://api.example.com/v1/items?page=2#top");
     expect(website()).toHaveValue("api.example.com");
     expect(screen.getByRole("status")).toHaveTextContent(
       "Moved /v1/items to Path prefix",
     );
     openMoreOptions();
     expect(screen.getByLabelText("Path prefix")).toHaveValue("/v1/items");
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave).toHaveBeenCalledWith("api", {
       display_name: "api.example.com",
@@ -2992,13 +2739,13 @@ describe("the Website field", () => {
 
   it("takes the note away with the next change, and moves nothing for a bare slash", async () => {
     await renderEditor();
-    type("api.example.com/v1");
+    typeWebsite("api.example.com/v1");
     expect(screen.getByText("Moved /v1 to Path prefix")).toBeVisible();
-    type("api.example.org");
+    typeWebsite("api.example.org");
     expect(screen.queryByText(/Moved .* to Path prefix/)).toBeNull();
     cleanup();
     await renderEditor();
-    type("api.example.com/");
+    typeWebsite("api.example.com/");
     expect(screen.queryByText(/Moved .* to Path prefix/)).toBeNull();
     openMoreOptions();
     expect(screen.getByLabelText("Path prefix")).toHaveValue("");
@@ -3007,10 +2754,8 @@ describe("the Website field", () => {
   it("keeps a Path prefix that is already filled in, and drops the pasted path without a note", async () => {
     await renderEditor();
     openMoreOptions();
-    fireEvent.change(screen.getByLabelText("Path prefix"), {
-      target: { value: "/mine" },
-    });
-    type("https://api.example.com/other");
+    type("Path prefix", "/mine");
+    typeWebsite("https://api.example.com/other");
     expect(website()).toHaveValue("api.example.com");
     expect(screen.getByLabelText("Path prefix")).toHaveValue("/mine");
     expect(screen.queryByText(/Moved .* to Path prefix/)).toBeNull();
@@ -3018,12 +2763,10 @@ describe("the Website field", () => {
 
   it("moves the path of an extra rule's host into that rule's Path prefix", async () => {
     await renderEditor();
-    type("a.example.com");
+    typeWebsite("a.example.com");
     openMoreOptions();
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    fireEvent.change(screen.getByLabelText("Rule 2 host"), {
-      target: { value: "https://b.example.com/v2" },
-    });
+    type("Rule 2 host", "https://b.example.com/v2");
     expect(screen.getByLabelText("Rule 2 path prefix")).toHaveValue("/v2");
     expect(screen.getByText("Moved /v2 to Path prefix")).toBeVisible();
     expect(screen.getAllByLabelText("Path prefix")[0]).toHaveValue("");
@@ -3031,22 +2774,15 @@ describe("the Website field", () => {
 
   it("strips an extra rule's host the same way", async () => {
     await renderEditor();
-    type("a.example.com");
+    typeWebsite("a.example.com");
     openMoreOptions();
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    fireEvent.change(screen.getByLabelText("Rule 2 host"), {
-      target: { value: "https://b.example.com/x" },
-    });
+    type("Rule 2 host", "https://b.example.com/x");
     expect(screen.getByLabelText("Rule 2 host")).toHaveValue("b.example.com");
   });
 });
 
 describe("the display name of a new service", () => {
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-  const save = () =>
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-
   it("is the host, exactly as written and not title-cased, while the field is empty", async () => {
     const { onSave } = await renderEditor();
     type("Website", "Echo-Test.example.com");
@@ -3166,8 +2902,6 @@ describe("a website another service of the agent already sends a key to", () => 
   });
   const WARNING =
     " already sends a key to api.github.com for this agent. The most specific path wins, and equal paths go to the service listed first.";
-  const type = (label: string, value: string) =>
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
 
   it("warns, naming the service and the website, as soon as the website is typed", async () => {
     await renderEditor({ agentServices: [sending()] });
@@ -3201,7 +2935,7 @@ describe("a website another service of the agent already sends a key to", () => 
   it("is a warning only: the service still saves", async () => {
     const { onSave } = await renderEditor({ agentServices: [sending()] });
     type("Website", "api.github.com");
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    save();
     await waitFor(() => expect(onSave).toHaveBeenCalled());
   });
 
@@ -3227,11 +2961,7 @@ describe("a website another service of the agent already sends a key to", () => 
     type("Website", "api.github.com");
     expect(screen.queryByText(/already sends a key/)).toBeNull();
     cleanup();
-    await renderEditor({
-      name: "github",
-      service: { preset: "github" },
-      agentServices: [sending()],
-    });
+    await renderGithub({ agentServices: [sending()] });
     expect(screen.queryByText(/already sends a key/)).toBeNull();
   });
 
