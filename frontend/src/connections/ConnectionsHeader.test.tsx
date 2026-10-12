@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -121,8 +122,13 @@ describe("connections header", () => {
     answerWith(async () => json({}, 500));
     renderHeader();
     expect(await screen.findByRole("link", { name: "Agents" })).toBeVisible();
-    // Only the identity says whether the broker is on.
+    // Only the identity says whether the broker is on, so the failed request
+    // settles before the link is checked.
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await vi.mocked(fetch).mock.results[0].value;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
     expect(screen.queryByRole("link", { name: "Agent Keys" })).toBeNull();
     expect(screen.queryByText(/Signed in as/)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
