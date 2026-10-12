@@ -26,7 +26,6 @@ from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
 from mindroom import constants
-from mindroom.agent_storage import create_state_storage, get_agent_session
 from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history import archive
 from mindroom.history.storage import (
@@ -38,6 +37,7 @@ from mindroom.history.storage import (
     remove_runs_for_sources,
 )
 from mindroom.history.types import HistoryScope
+from mindroom.session_storage.agent_storage import create_state_storage, get_agent_session
 from tests.conftest import seed_session
 from tests.history_helpers import archived_content, archived_run_ids
 

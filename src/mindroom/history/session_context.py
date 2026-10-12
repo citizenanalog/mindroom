@@ -11,17 +11,17 @@ from typing import TYPE_CHECKING
 
 from agno.team import Team
 
-from mindroom.agent_storage import (
+from mindroom.constants import prompt_roles_for_history_storage, resolve_session_state_root
+from mindroom.history.storage import new_scope_session
+from mindroom.history.team_scope import ad_hoc_team_scope_id
+from mindroom.history.types import HistoryScope
+from mindroom.session_storage.agent_storage import (
     create_session_storage,
     create_state_storage,
     get_agent_runtime_state_dbs,
     get_agent_session,
     get_team_session,
 )
-from mindroom.constants import prompt_roles_for_history_storage, resolve_session_state_root
-from mindroom.history.storage import new_scope_session
-from mindroom.history.team_scope import ad_hoc_team_scope_id
-from mindroom.history.types import HistoryScope
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator

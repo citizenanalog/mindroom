@@ -26,7 +26,6 @@ from agno.run.base import RunStatus
 from agno.run.team import TeamRunOutput
 from agno.session.summary import SessionSummary
 
-from mindroom.agent_storage import run_session_storage_operation, save_compaction_usage
 from mindroom.agno_compat_model_hooks import install_request_preparation
 from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY, QUEUED_MESSAGE_NOTICE_MARKER_KEY
@@ -57,6 +56,7 @@ from mindroom.model_usage import response_context_tokens
 from mindroom.native_compaction import NativeCompactionModel, checkpoint_items, native_replay_messages
 from mindroom.providers.claude_prompt_cache import claude_deferred_tool_names, claude_loaded_tool_names
 from mindroom.providers.openai_tool_search import model_deferred_tool_names
+from mindroom.session_storage.agent_storage import run_session_storage_operation, save_compaction_usage
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
 

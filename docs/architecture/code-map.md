@@ -156,9 +156,10 @@ Matrix sync callback
 | `providers/model_stream_output.py` | Shared policy for streamed output that makes provider retries unsafe |
 | `budgets/pricing.py` | Per-model USD pricing of token counters, keyed by the provider and model ID usage records |
 | `budgets/spend.py` | Month-to-date per-requester spend derived from retained usage |
-| `budgets/monitor.py` | Background spend refresh and the per-reply decision to use the fallback model |
-| `config/budgets.py` | Opt-in per-user monthly caps and fallback model |
-| `agent_storage.py` | Agent session and learning SQLite storage helpers |
+| `budgets/caps.py` | Per-user monthly caps kept as runtime state under the storage root, written atomically and read lock-free |
+| `budgets/monitor.py` | Background spend refresh, the per-user cap store, and the per-reply decision to use the fallback model |
+| `config/budgets.py` | Opt-in budgets: default monthly cap and fallback model |
+| `session_storage/agent_storage.py` | Agent session and learning SQLite storage helpers |
 | `history/` | History replay planning, compaction, and the compaction archive; [compaction.md](compaction.md) maps its modules |
 | `history/mid_turn_compaction.py` | Compaction between the model requests of one reply: request sizing, folding, and the scoped or run-local summary |
 | `history/legacy_summary_system_prompt.py` | Approval resume of runs paused with the summary inside their saved system message |
@@ -176,7 +177,7 @@ Matrix sync callback
 | `automations/dreaming.py` | The `dreaming` automation: changed-input agenda, per-run staging of `memory/`, proposal validation, the fresh-thread review, and batch-conflict apply with progress under `tracking/automations/` |
 | `config/automations.py` | Automation entries (built-in and plugin) and their validation |
 | `custom_tools/skill_manage.py` | Chat-time `skill_manage`, like Hermes' foreground tool, for agents that list it or learn skills |
-| `session_storage_preflight.py` | Required session-column checks and retained archives for incompatible owned session stores |
+| `session_storage/preflight.py` | Required session-column checks and retained archives for incompatible owned session stores |
 | `agent_descriptions.py` | Shared agent description rendering for delegation and orchestration |
 | `delegation/personas.py` | Agent-authored subagent personas: the authored prompt and tool and skill subsets, `subagents/<name>.md` workspace profiles, and the caller tool and skill checks |
 | `delegation/direct.py` | Reserve, run, and settle one child turn inside the caller's tool call, shared by `run_subagent` and Dynamic Workflow subagent participants |
@@ -216,15 +217,15 @@ Matrix sync callback
 | `shell/supervisor.py` | Worker-local shell supervisor process owning background shell handles across sandbox request subprocesses |
 | `streaming.py` | Streaming state machine: placeholder, progressive edits, tool traces, cancellation |
 | `prompts.py` | Built-in prompt defaults and prompt override registry |
-| `attachments.py` | Attachment persistence, registration, and context-scoped resolution |
-| `attachment_ids.py` | Leaf attachment-ID helpers kept free of matrix-client imports |
-| `attachment_media.py` | Convert attachment records to Agno media objects |
+| `attachments/storage.py` | Attachment persistence, registration, and context-scoped resolution |
+| `attachments/ids.py` | Leaf attachment-ID helpers kept free of matrix-client imports |
+| `attachments/media.py` | Convert attachment records to Agno media objects |
 | `media_inputs.py` | Shared media-input container passed across bot, teams, and AI layers |
 | `api/` | FastAPI REST API (dashboard, credentials, OpenAI-compatible endpoint) |
 | `api/open_access.py` | Host allow-list and browser-origin guard for requests served without a credential (open dashboard auth, unauthenticated `/v1`) |
 | `api/request_body_limit.py` | Pure ASGI middleware answering 413 for dashboard API request bodies over 16 MiB, except knowledge uploads |
 | `api/validation_errors.py` | 422 handler for the dashboard API and sandbox runner that returns FastAPI's validation error detail without the rejected request values |
-| `api/budgets.py` | Dashboard route reporting budget settings and month-to-date spend from the runtime's budget monitor |
+| `api/budgets.py` | Dashboard and budget-service routes for budget status and setting or clearing one user's cap |
 | `api/usage_export.py` | Application-scoped usage-export preparation: one background scan, a bounded cache for daily/request-detail variants, committed-generation validation, and non-blocking shutdown cleanup |
 | `custom_tools/` | Built-in custom tool implementations (gmail, calendar, scheduler, etc.) |
 | `custom_tools/todo_state.py` | Leaf storage and actionability primitives for native per-thread todo state |
@@ -310,6 +311,7 @@ Persistent state lives under `mindroom_data/` by default (next to `config.yaml`,
 - `knowledge_db/` – Knowledge base vector stores for file-backed RAG
 - `tracking/` – Durable handled-turn ledger plus exact callback obligations and compact terminal tombstones
 - `credentials/` – JSON secrets synchronized from `.env`
+- `budgets/user_caps.json` – Per-user monthly budget caps set from the dashboard or the budget service
 - `encryption_keys/` – Matrix E2E encryption keys
 - `sync_continuity/` – Crash-atomic pending join/decrypt fences
 - `logs/` – Log files

@@ -17,7 +17,6 @@ from agno.session.summary import SessionSummary
 from agno.session.team import TeamSession
 
 from mindroom import constants
-from mindroom.agent_storage import create_state_storage, get_agent_session, get_team_session
 from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.history import archive
 from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot
@@ -35,6 +34,7 @@ from mindroom.history.storage import (
 )
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import HistoryScope
+from mindroom.session_storage.agent_storage import create_state_storage, get_agent_session, get_team_session
 from mindroom.tool_system.events import ToolTraceEntry
 from tests.conftest import seed_session
 from tests.history_helpers import archived_content
