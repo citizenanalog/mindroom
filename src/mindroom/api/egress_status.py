@@ -49,7 +49,7 @@ logger = get_logger(__name__)
 RESTRICT_ONLY_KEY_REFUSAL = "This service only limits paths and never sends a key, so it cannot store one"
 
 
-def require_egress_broker_enabled(request: Request) -> None:
+async def require_egress_broker_enabled(request: Request) -> None:
     """Answer 404 on every route of both egress APIs while the broker is off.
 
     Both routers depend on this, so with the broker off no route reads a store. The admin router is mounted behind

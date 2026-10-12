@@ -403,7 +403,9 @@ async def serve_egress_broker(
         runtime_paths,
         settings,
         config_provider=config_provider,
-        credentials_manager=credentials_manager or get_runtime_credentials_manager(runtime_paths),
+        credentials_manager=(
+            credentials_manager if credentials_manager is not None else get_runtime_credentials_manager(runtime_paths)
+        ),
     )
     try:
         # Startup finishes even if the owner is cancelled meanwhile, so the finally below can stop it.
