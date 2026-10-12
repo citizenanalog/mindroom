@@ -8,7 +8,12 @@ import {
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { pressInDialog, ruleSummaries } from "@/test/egressServiceTestKit";
+import {
+  credentialService,
+  oauthStatus,
+  pressInDialog,
+  ruleSummaries,
+} from "@/test/egressServiceTestKit";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type { RowAgent, ServiceEditing } from "./egressRowText";
 import { EgressServiceRows as Rows } from "./EgressServiceRows";
@@ -55,21 +60,7 @@ const renderRows = (
 ) =>
   render(<EgressServiceRows {...(props as RowsProps)} services={services} />);
 
-const github: EgressCredentialService = {
-  name: "github",
-  display_name: "GitHub",
-  description: "GitHub API and git over HTTPS",
-  source: "config",
-  rules: [],
-  restrict_only: false,
-  is_shared: false,
-  can_manage: true,
-  configured: false,
-  active_source: null,
-  key_configured: false,
-  key_updated_at: null,
-  oauth: null,
-};
+const github = credentialService();
 const openai: EgressCredentialService = {
   ...github,
   name: "openai",
@@ -79,17 +70,7 @@ const openai: EgressCredentialService = {
   active_source: "key",
   key_configured: true,
 };
-const githubAccount: EgressOAuthStatus = {
-  provider: "github",
-  display_name: "GitHub",
-  connected: false,
-  account_label: null,
-  can_connect: true,
-  reset_required: false,
-  service_account: false,
-  unavailable_reason: null,
-  shared_worker_opt_in: false,
-};
+const githubAccount = oauthStatus();
 const withAccount = (
   account: Partial<EgressOAuthStatus> = {},
   service: Partial<EgressCredentialService> = {},

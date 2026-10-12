@@ -17,7 +17,12 @@ import {
   vi,
 } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { pressInDialog, presetsReady } from "@/test/egressServiceTestKit";
+import {
+  credentialService,
+  oauthStatus,
+  pressInDialog,
+  presetsReady,
+} from "@/test/egressServiceTestKit";
 import { EgressBroker } from "./EgressBroker";
 
 const NOT_RUNNING =
@@ -57,19 +62,8 @@ const agent = (id: string, tools: string[], extra = {}) => ({
   ...extra,
 });
 
-const github = {
-  name: "github",
-  display_name: "GitHub",
-  description: "GitHub API and git over HTTPS",
-  source: "config",
-  rules: [],
-  restrict_only: false,
-  configured: false,
-  active_source: null,
-  key_configured: false,
-  key_updated_at: null,
-  oauth: null,
-};
+// The dashboard listing has no is_shared or can_manage; the panel sets both over these.
+const github = credentialService();
 const openai = {
   name: "openai",
   display_name: null,
@@ -83,17 +77,7 @@ const openai = {
   key_updated_at: "2026-10-05T12:00:00+00:00",
   oauth: null,
 };
-const githubAccount = {
-  provider: "github",
-  display_name: "GitHub",
-  connected: false,
-  account_label: null,
-  can_connect: true,
-  reset_required: false,
-  service_account: false,
-  unavailable_reason: null,
-  shared_worker_opt_in: false,
-};
+const githubAccount = oauthStatus();
 const connectedGithub = {
   ...github,
   configured: true,

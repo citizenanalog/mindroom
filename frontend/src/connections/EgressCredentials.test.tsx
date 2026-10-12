@@ -9,7 +9,9 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
+  credentialService,
   limitRules,
+  oauthStatus,
   pressInDialog,
   presetsReady,
   ruleSummaries,
@@ -21,35 +23,10 @@ import type {
   EgressCredentialAgent,
   EgressCredentialService,
   EgressLogRecord,
-  EgressOAuthStatus,
 } from "./types";
 
-const service = {
-  name: "github",
-  display_name: "GitHub",
-  description: "GitHub API",
-  source: "config" as const,
-  rules: [],
-  restrict_only: false,
-  is_shared: false,
-  can_manage: true,
-  configured: false,
-  active_source: null,
-  key_configured: false,
-  key_updated_at: null,
-  oauth: null,
-} satisfies EgressCredentialService;
-const account: EgressOAuthStatus = {
-  provider: "github",
-  display_name: "GitHub",
-  connected: false,
-  account_label: null,
-  can_connect: true,
-  reset_required: false,
-  service_account: false,
-  unavailable_reason: null,
-  shared_worker_opt_in: false,
-};
+const service = credentialService();
+const account = oauthStatus();
 const agents: EgressCredentialAgent[] = [
   {
     agent_name: "personal",

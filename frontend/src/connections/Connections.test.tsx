@@ -8,8 +8,9 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { credentialService, oauthStatus } from "@/test/egressServiceTestKit";
 import { Connections } from "./Connections";
-import type { ConnectionService } from "./types";
+import type { ConnectionService, EgressCredentialService } from "./types";
 
 const service: ConnectionService = {
   icon: null,
@@ -124,21 +125,7 @@ it("keeps account management available without offering MCP access to management
 });
 
 describe("brokered API keys on agent cards", () => {
-  const egressService = {
-    name: "github",
-    display_name: "GitHub",
-    description: "GitHub API",
-    source: "config",
-    rules: [],
-    restrict_only: false,
-    is_shared: false,
-    can_manage: true,
-    configured: false,
-    active_source: null,
-    key_configured: false,
-    key_updated_at: null,
-    oauth: null,
-  };
+  const egressService = credentialService();
 
   it("lists the agent's API keys and refreshes the catalog after a save", async () => {
     let configured = false;
@@ -304,17 +291,10 @@ describe("brokered API keys on agent cards", () => {
     installEgress([
       {
         ...egressService,
-        oauth: {
-          provider: "github",
-          display_name: "GitHub",
-          connected: false,
-          account_label: null,
+        oauth: oauthStatus({
           can_connect: false,
-          reset_required: false,
-          service_account: false,
           unavailable_reason: "shared_sandbox",
-          shared_worker_opt_in: false,
-        },
+        }),
       },
     ]);
     render(<Connections />);
@@ -346,17 +326,10 @@ describe("brokered API keys on agent cards", () => {
               ...egressService,
               configured: connected,
               active_source: connected ? "oauth" : null,
-              oauth: {
-                provider: "github",
-                display_name: "GitHub",
+              oauth: oauthStatus({
                 connected,
                 account_label: connected ? "octocat" : null,
-                can_connect: true,
-                reset_required: false,
-                service_account: false,
-                unavailable_reason: null,
-                shared_worker_opt_in: false,
-              },
+              }),
             },
           ]),
         );
@@ -1489,22 +1462,18 @@ describe("shared accounts on agent cards", () => {
   });
 
   describe("naming who manages a shared agent", () => {
-    const egressRow = (changes: Record<string, unknown> = {}) => ({
-      name: "openai",
-      display_name: "OpenAI",
-      description: "OpenAI API",
-      source: "config",
-      rules: [],
-      restrict_only: false,
-      is_shared: true,
-      can_manage: false,
-      configured: true,
-      active_source: "key",
-      key_configured: true,
-      key_updated_at: null,
-      oauth: null,
-      ...changes,
-    });
+    const egressRow = (changes: Partial<EgressCredentialService> = {}) =>
+      credentialService({
+        name: "openai",
+        display_name: "OpenAI",
+        description: "OpenAI API",
+        is_shared: true,
+        can_manage: false,
+        configured: true,
+        active_source: "key",
+        key_configured: true,
+        ...changes,
+      });
     const catalogWith = (
       agent: Record<string, unknown>,
       serviceChanges: Record<string, unknown> = {},
@@ -1577,17 +1546,10 @@ describe("shared accounts on agent cards", () => {
         configured: false,
         key_configured: false,
         active_source: null,
-        oauth: {
-          provider: "github",
-          display_name: "GitHub",
-          connected: false,
-          account_label: null,
+        oauth: oauthStatus({
           can_connect: false,
-          reset_required: false,
-          service_account: false,
           unavailable_reason: "shared_sandbox",
-          shared_worker_opt_in: false,
-        },
+        }),
       });
       await open({
         agents: [
@@ -1609,31 +1571,15 @@ describe("shared accounts on agent cards", () => {
   });
 
   it("lists every service of the agent that uses the provider when disconnecting", async () => {
-    const egress = (name: string, display_name: string, provider: string) => ({
-      name,
-      display_name,
-      description: "",
-      source: "config",
-      rules: [],
-      restrict_only: false,
-      is_shared: false,
-      can_manage: true,
-      configured: true,
-      active_source: "oauth",
-      key_configured: false,
-      key_updated_at: null,
-      oauth: {
-        provider,
-        display_name: "Mail",
-        connected: true,
-        account_label: null,
-        can_connect: true,
-        reset_required: false,
-        service_account: false,
-        unavailable_reason: null,
-        shared_worker_opt_in: false,
-      },
-    });
+    const egress = (name: string, display_name: string, provider: string) =>
+      credentialService({
+        name,
+        display_name,
+        description: "",
+        configured: true,
+        active_source: "oauth",
+        oauth: oauthStatus({ provider, display_name: "Mail", connected: true }),
+      });
     installApi({
       "/api/connections": async () =>
         json(
@@ -1668,23 +1614,8 @@ describe("agent table summary, search, and order", () => {
   const egress = (
     name: string,
     display_name: string,
-    overrides: Record<string, unknown> = {},
-  ) => ({
-    name,
-    display_name,
-    description: "",
-    is_shared: false,
-    can_manage: true,
-    configured: false,
-    active_source: null,
-    key_configured: false,
-    key_updated_at: null,
-    oauth: null,
-    source: "config",
-    rules: [],
-    restrict_only: false,
-    ...overrides,
-  });
+    overrides: Partial<EgressCredentialService> = {},
+  ) => credentialService({ name, display_name, description: "", ...overrides });
   const agentWith = (name: string, display_name: string, extra = {}) => ({
     ...catalog([service]).agents[0],
     agent_name: name,

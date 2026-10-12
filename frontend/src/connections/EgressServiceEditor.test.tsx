@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
   bearerRule,
+  credentialService,
   limitRules,
   presets,
   presetsReady,
@@ -2801,39 +2802,30 @@ describe("the display name of a new service", () => {
 });
 
 describe("a website another service of the agent already sends a key to", () => {
-  const sending = (
-    changes: Partial<EgressCredentialService> = {},
-  ): EgressCredentialService => ({
-    name: "github",
-    display_name: "GitHub",
-    description: "",
-    is_shared: false,
-    can_manage: true,
-    configured: true,
-    active_source: "key",
-    key_configured: true,
-    key_updated_at: null,
-    oauth: null,
-    source: "config",
-    restrict_only: false,
-    rules: [
-      {
-        host: "api.github.com",
-        port: null,
-        path_prefix: "/",
-        auth_type: "bearer",
-        auth_name: null,
-      },
-      {
-        host: "github.com",
-        port: null,
-        path_prefix: "/",
-        auth_type: "basic",
-        auth_name: null,
-      },
-    ],
-    ...changes,
-  });
+  const sending = (changes: Partial<EgressCredentialService> = {}) =>
+    credentialService({
+      description: "",
+      configured: true,
+      active_source: "key",
+      key_configured: true,
+      rules: [
+        {
+          host: "api.github.com",
+          port: null,
+          path_prefix: "/",
+          auth_type: "bearer",
+          auth_name: null,
+        },
+        {
+          host: "github.com",
+          port: null,
+          path_prefix: "/",
+          auth_type: "basic",
+          auth_name: null,
+        },
+      ],
+      ...changes,
+    });
   const WARNING =
     " already sends a key to api.github.com for this agent. The most specific path wins, and equal paths go to the service listed first.";
 

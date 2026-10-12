@@ -12,6 +12,8 @@ import { validateService } from "@/connections/egressServiceValidation";
 import { githubRepositoryRules } from "@/connections/githubRepositoryRules";
 import type {
   AuthoredEgressService,
+  EgressCredentialService,
+  EgressOAuthStatus,
   EgressValidation,
   EgressPreset,
   EgressRule,
@@ -106,6 +108,42 @@ export const ruleSummaries = (rules: EgressRule[]): EgressRuleSummary[] =>
     port: rule.port ?? null,
     path_prefix: rule.path_prefix ?? "/",
   }));
+
+/** GitHub as the egress listings send it, with no key or account yet. */
+export const credentialService = (
+  changes: Partial<EgressCredentialService> = {},
+): EgressCredentialService => ({
+  name: "github",
+  display_name: "GitHub",
+  description: "GitHub API and git over HTTPS",
+  source: "config",
+  rules: [],
+  restrict_only: false,
+  is_shared: false,
+  can_manage: true,
+  configured: false,
+  active_source: null,
+  key_configured: false,
+  key_updated_at: null,
+  oauth: null,
+  ...changes,
+});
+
+/** GitHub's account login as the listings send it: connectable, not connected. */
+export const oauthStatus = (
+  changes: Partial<EgressOAuthStatus> = {},
+): EgressOAuthStatus => ({
+  provider: "github",
+  display_name: "GitHub",
+  connected: false,
+  account_label: null,
+  can_connect: true,
+  reset_required: false,
+  service_account: false,
+  unavailable_reason: null,
+  shared_worker_opt_in: false,
+  ...changes,
+});
 
 /** Wait until an open editor has the server's presets in its dropdown. */
 export const presetsReady = () =>
