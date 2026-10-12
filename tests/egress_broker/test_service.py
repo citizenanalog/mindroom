@@ -41,22 +41,22 @@ from mindroom.egress_broker.user_services import (
     delete_user_service,
     save_user_service,
 )
-from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.google_drive import google_drive_oauth_provider
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, resolve_worker_target
 from tests.oauth_test_utils import (
     DelayedTokenEndpointOutcome,
-    publish_oauth_credentials,
     rotated_token_response,
     serve_token_endpoint,
 )
 
 from .conftest import (
+    OAUTH_REFRESH_TOKEN,
+    account_store,
     audit_records,
+    connect_account,
     connect_request,
     free_port,
     proxy_authorization,
-    tool_identity,
     worker_target,
 )
 
@@ -84,7 +84,6 @@ _OPENAI = {
 }
 _GITHUB_OAUTH = {**_GITHUB, "oauth_provider": "github"}
 _PUBLIC_URL = "https://chat.example.org"
-_OAUTH_REFRESH_TOKEN = "github-refresh"  # noqa: S105 - test credential
 # Provider ids a user service may name, as the API reads them from the registry.
 _PROVIDERS = frozenset({"github"})
 _NO_GITHUB_KEY = "No github key is set for this agent. Ask the user to add one at manage_url, then retry."
@@ -742,32 +741,6 @@ def _save_mine(
     )
 
 
-def _connect_github(
-    manager: CredentialsManager,
-    requester_id: str,
-    token: str,
-    *,
-    expires_at: float = 4_102_444_800.0,
-) -> None:
-    """Store a GitHub connection in the requester's own store, as the connect flow does for every agent scope."""
-    provider = github_oauth_provider()
-    publish_oauth_credentials(
-        provider,
-        {
-            "token": token,
-            "refresh_token": _OAUTH_REFRESH_TOKEN,
-            "token_uri": provider.token_url,
-            "client_id": "github-client-id",
-            "scopes": [],
-            "expires_at": expires_at,
-            "_source": "oauth",
-            "_oauth_provider": "github",
-        },
-        credentials_manager=manager,
-        worker_target=resolve_worker_target("user", "code", tool_identity(requester_id)),
-    )
-
-
 def _oauth_runtime(tmp_runtime_paths: Callable[..., RuntimePaths], backend: str = "docker") -> RuntimePaths:
     """Return a runtime on `backend`: personal accounts need a dedicated one (the default) to count as private."""
     return tmp_runtime_paths(
@@ -790,7 +763,7 @@ async def test_stored_key_wins_over_oauth_and_its_removal_falls_back_without_res
     config = _config(github=_GITHUB_OAUTH)
     target = _routable_target()
     save_secret(manager, target, "github", "s3cret")
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         with_key = await get_through(env)
@@ -809,7 +782,7 @@ async def test_placeholder_env_when_only_oauth_is_connected(
     """A connected OAuth account alone gives the scope its placeholders; the token itself never enters the env."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         bob_env = execution_env_for_worker(
@@ -839,7 +812,7 @@ async def test_requester_scoped_oauth_is_not_used_where_requesters_share_a_worke
     """
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     target = _routable_target(scope=scope)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
@@ -905,8 +878,8 @@ async def test_requester_scoped_oauth_on_a_shared_agent_injects_the_callers_toke
     """With `oauth_on_shared_workers`, two requesters on one shared agent each get their own GitHub token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github={**_GITHUB_OAUTH, "oauth_on_shared_workers": True})
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
-    _connect_github(manager, "@bob:example.org", "bob-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
+    connect_account(manager, account_store("@bob:example.org"), "bob-oauth")
     alice = _routable_target(scope="shared")
     bob = _routable_target("@bob:example.org", scope="shared")
     assert alice.worker_key == bob.worker_key
@@ -931,7 +904,7 @@ async def test_requester_scoped_oauth_is_not_used_on_the_static_runner_without_t
     """Every call shares the static runner's process, so even a `user_agent` call gets no GitHub account there."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths, backend="static_runner")
     config = _config(github=_GITHUB_OAUTH)
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         response = await get_through(env)
@@ -951,7 +924,7 @@ async def test_requester_scoped_oauth_is_used_on_the_static_runner_with_the_opt_
     """With `oauth_on_shared_workers`, a `user_agent` call on the static runner gets the requester's own token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths, backend="static_runner")
     config = _config(github={**_GITHUB_OAUTH, "oauth_on_shared_workers": True})
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
         response = await get_through(env)
@@ -971,7 +944,7 @@ async def test_concurrent_requests_refresh_an_expired_token_once(
     """Several tunnels hitting an expired token at once share a single refresh and all inject the new token."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
-    _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
+    connect_account(manager, account_store("@alice:example.org"), "stale-oauth", expires_at=1.0)
     presented = serve_token_endpoint(monkeypatch, [DelayedTokenEndpointOutcome(0.3, rotated_token_response())])
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
@@ -980,7 +953,7 @@ async def test_concurrent_requests_refresh_an_expired_token_once(
     assert [response.json()["headers"]["authorization"] for response in responses] == [
         ["Bearer rotated-access-token"],
     ] * 6
-    assert presented == [_OAUTH_REFRESH_TOKEN]
+    assert presented == [OAUTH_REFRESH_TOKEN]
 
 
 @pytest.mark.usefixtures("github_oauth_client")
@@ -995,7 +968,7 @@ async def test_revoked_grant_returns_oauth_connection_required(
     """A refresh the provider rejects answers 403 with a reconnect link; no token reaches the body or the logs."""
     runtime_paths = _oauth_runtime(tmp_runtime_paths)
     config = _config(github=_GITHUB_OAUTH)
-    _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
+    connect_account(manager, account_store("@alice:example.org"), "stale-oauth", expires_at=1.0)
     serve_token_endpoint(monkeypatch, [httpx.Response(400, json={"error": "invalid_grant"})])
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
@@ -1011,9 +984,9 @@ async def test_revoked_grant_returns_oauth_connection_required(
     )
     assert body["connect_url"].startswith(f"{_PUBLIC_URL}/api/oauth/github/authorize?connect_token=")
     assert tls_upstream.hits == []
-    for leaked in ("stale-oauth", _OAUTH_REFRESH_TOKEN):
+    for leaked in ("stale-oauth", OAUTH_REFRESH_TOKEN):
         assert leaked not in response.text
-    for leaked in ("stale-oauth", _OAUTH_REFRESH_TOKEN, urlsplit(body["connect_url"]).query):
+    for leaked in ("stale-oauth", OAUTH_REFRESH_TOKEN, urlsplit(body["connect_url"]).query):
         assert leaked not in repr(logs)
     assert any(entry["event"] == "egress_broker_oauth_token_unavailable" for entry in logs)
 
@@ -1067,7 +1040,7 @@ async def test_provider_outage_is_a_retryable_503_off_the_shared_executor(
     config = _config(keyed=keyed, github=github)
     target = _routable_target()
     save_secret(manager, target, "keyed", "s3cret")
-    _connect_github(manager, "@alice:example.org", "stale-oauth", expires_at=1.0)
+    connect_account(manager, account_store("@alice:example.org"), "stale-oauth", expires_at=1.0)
     grant_started = threading.Event()
     outage = httpx.Response(503, json={"error": "temporarily_unavailable"})
     presented = serve_token_endpoint(
@@ -1103,7 +1076,7 @@ async def test_provider_outage_is_a_retryable_503_off_the_shared_executor(
             "message": "github did not refresh the account token. "
             "Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url.",
         }
-    assert presented == [_OAUTH_REFRESH_TOKEN]
+    assert presented == [OAUTH_REFRESH_TOKEN]
     assert "/ok" not in tls_upstream.hits
     assert len(lookup_threads) == 3
     assert all(name.startswith("mindroom-egress-oauth") for name in lookup_threads)
@@ -1234,7 +1207,7 @@ async def test_user_service_uses_only_its_scopes_oauth_connection(
     alice, bob = _routable_target(), _routable_target("@bob:example.org")
     for target in (alice, bob):
         _save_mine(manager, target, config, _GITHUB_OAUTH)
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         alice_env = execution_env_for_worker(runtime_paths, config=config, worker_target=alice)
         bob_env = execution_env_for_worker(runtime_paths, config=config, worker_target=bob)
@@ -1261,7 +1234,7 @@ async def test_a_stored_user_service_off_its_providers_hosts_never_gets_the_acco
     config = _config()
     target = _routable_target()
     save_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE, {"services": {"mine": _GITHUB_OAUTH}})
-    _connect_github(manager, "@alice:example.org", "alice-oauth")
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         response = await get_through(env)

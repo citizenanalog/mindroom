@@ -32,15 +32,19 @@ from mindroom.egress_broker.proxy import EgressBroker
 from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import Secret, SecretMissing
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
+from mindroom.oauth.github import github_oauth_provider
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from tests.oauth_test_utils import publish_oauth_credentials
 from tests.test_helpers import make_test_ca
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
     from pathlib import Path
 
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.egress_broker.audit import AuditRecord
     from mindroom.egress_broker.secrets import SecretResult
+    from mindroom.oauth.providers import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, WorkerScope
     from tests.egress_broker.raw_http import Script, UpstreamFactory
 
@@ -85,6 +89,42 @@ def worker_target(
         agent_name,
         tool_identity(requester_id, agent_name),
         private_agent_names=frozenset(),
+    )
+
+
+OAUTH_REFRESH_TOKEN = "github-refresh"  # noqa: S105 - test credential
+
+
+def account_store(requester_id: str) -> ResolvedWorkerTarget:
+    """Return the requester's own store, where GitHub connections live whatever the agent's scope."""
+    return resolve_worker_target("user", "code", tool_identity(requester_id))
+
+
+def connect_account(
+    manager: CredentialsManager,
+    store: ResolvedWorkerTarget,
+    token: str,
+    *,
+    provider: OAuthProvider | None = None,
+    **fields: object,
+) -> None:
+    """Store a `provider` (default GitHub) connection holding `token` in `store`; `fields` override stored fields."""
+    provider = provider or github_oauth_provider()
+    publish_oauth_credentials(
+        provider,
+        {
+            "token": token,
+            "refresh_token": OAUTH_REFRESH_TOKEN,
+            "token_uri": provider.token_url,
+            "client_id": f"{provider.id}-client-id",
+            "scopes": list(provider.scopes),
+            "expires_at": 4_102_444_800.0,
+            "_source": "oauth",
+            "_oauth_provider": provider.id,
+            **fields,
+        },
+        credentials_manager=manager,
+        worker_target=store,
     )
 
 

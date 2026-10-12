@@ -32,12 +32,11 @@ from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.providers import OAuthProvider
 from mindroom.tool_system.worker_routing import resolve_worker_target
-from tests.egress_broker.conftest import tool_identity
+from tests.egress_broker.conftest import OAUTH_REFRESH_TOKEN, account_store, connect_account, tool_identity
 from tests.oauth_test_utils import (
     DelayedTokenEndpointOutcome,
     TokenEndpointOutcome,
     corrupt_oauth_credential_payload,
-    publish_oauth_credentials,
     rotated_token_response,
     serve_token_endpoint,
 )
@@ -53,8 +52,6 @@ if TYPE_CHECKING:
 
 PUBLIC_URL = "https://chat.example.org"
 GITHUB_CONNECT_PREFIX = f"{PUBLIC_URL}/api/oauth/github/authorize?"
-FUTURE = 4_102_444_800.0
-REFRESH_TOKEN = "github-refresh"  # noqa: S105 - test credential
 _DEMO = OAuthProvider(
     id="demo",
     display_name="Demo",
@@ -135,49 +132,6 @@ def _broker_target(requester_id: str | None, scope: WorkerScope | None = "user_a
     return claims.to_worker_target()
 
 
-def _github_store(requester_id: str) -> ResolvedWorkerTarget:
-    """Return the requester's own store, where GitHub connections live whatever the agent's scope."""
-    return resolve_worker_target("user", "code", tool_identity(requester_id))
-
-
-def _credentials(
-    provider: OAuthProvider,
-    token: str,
-    *,
-    expires_at: float = FUTURE,
-    **extra: object,
-) -> dict[str, object]:
-    client_id = "github-client-id" if provider.id == "github" else "demo-client-id"
-    return {
-        "token": token,
-        "refresh_token": REFRESH_TOKEN,
-        "token_uri": provider.token_url,
-        "client_id": client_id,
-        "scopes": list(provider.scopes),
-        "expires_at": expires_at,
-        "_source": "oauth",
-        "_oauth_provider": provider.id,
-        **extra,
-    }
-
-
-def _connect(
-    manager: CredentialsManager,
-    store: ResolvedWorkerTarget,
-    token: str,
-    *,
-    provider: OAuthProvider | None = None,
-    **fields: object,
-) -> None:
-    provider = provider or github_oauth_provider()
-    publish_oauth_credentials(
-        provider,
-        _credentials(provider, token, **fields),
-        credentials_manager=manager,
-        worker_target=store,
-    )
-
-
 def _store_context(
     runtime_paths: RuntimePaths,
     manager: CredentialsManager,
@@ -231,7 +185,7 @@ def test_connected_account_yields_its_token(
     manager: CredentialsManager,
 ) -> None:
     """A connected GitHub account supplies its access token, which never appears in the result's repr."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
 
     result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
@@ -251,9 +205,9 @@ def test_requester_scoped_provider_is_unavailable_on_workers_requesters_share(
     The token would sit in a sandbox another user's later command can read, so there is no token, no connect link,
     and the status says why instead of offering a connection.
     """
-    _connect(
+    connect_account(
         manager,
-        _github_store("@alice:example.org"),
+        account_store("@alice:example.org"),
         "alice-access",
         _oauth_claims={"email": "alice@example.org"},
         _oauth_claims_verified=True,
@@ -286,7 +240,7 @@ def test_requester_scoped_provider_is_unavailable_on_the_static_runner(
 
     The account is refused there exactly as on a shared worker: no token, no connect link, and the same reason.
     """
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
     static = _on_backend(runtime_paths, "static_runner")
     alice = _broker_target("@alice:example.org", scope)
 
@@ -305,7 +259,7 @@ def test_unset_worker_backend_is_the_static_runner(
     manager: CredentialsManager,
 ) -> None:
     """A runtime without `MINDROOM_WORKER_BACKEND` runs on the static runner, so personal accounts are refused."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
     env = {key: value for key, value in runtime_paths.process_env.items() if key != "MINDROOM_WORKER_BACKEND"}
 
     result = _resolve(config, replace(runtime_paths, process_env=env), manager, _broker_target("@alice:example.org"))
@@ -323,7 +277,7 @@ def test_requester_scoped_provider_is_used_on_a_dedicated_backend(
     scope: WorkerScope,
 ) -> None:
     """A Docker or Kubernetes `user` or `user_agent` worker belongs to one requester, so their account is used."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
     dedicated = _on_backend(runtime_paths, backend)
     alice = _broker_target("@alice:example.org", scope)
 
@@ -345,7 +299,7 @@ def test_opt_in_uses_the_requesters_account_on_every_backend(
     scope: WorkerScope | None,
 ) -> None:
     """`oauth_on_shared_workers` makes the account usable wherever the sandbox is shared, and changes nothing else."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
     target = _broker_target("@alice:example.org", scope)
     runtime = _on_backend(runtime_paths, backend)
 
@@ -364,7 +318,7 @@ def test_status_without_a_worker_target_treats_it_as_unscoped(
     manager: CredentialsManager,
 ) -> None:
     """The global store serves agents without a worker scope, so its status follows the shared-worker rule too."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
 
     status = oauth_status(
         "github",
@@ -385,11 +339,11 @@ def test_opt_in_uses_the_callers_account_on_a_shared_worker(
     manager: CredentialsManager,
 ) -> None:
     """With `oauth_on_shared_workers`, a shared worker gets the calling requester's own connection, never another's."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
 
     alice = _resolve(opted_in_config, runtime_paths, manager, _broker_target("@alice:example.org", "shared"))
     bob = _resolve(opted_in_config, runtime_paths, manager, _broker_target("@bob:example.org", "shared"))
-    _connect(manager, _github_store("@bob:example.org"), "bob-access")
+    connect_account(manager, account_store("@bob:example.org"), "bob-access")
     bob_connected = _resolve(opted_in_config, runtime_paths, manager, _broker_target("@bob:example.org", "shared"))
     status = _status(opted_in_config, runtime_paths, manager, _broker_target("@alice:example.org", "shared"))
 
@@ -408,7 +362,7 @@ def test_requester_scoped_status_on_a_private_worker_has_no_shared_worker_flags(
     manager: CredentialsManager,
 ) -> None:
     """The opt-in only matters on shared workers: a private worker's status carries neither flag."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
 
     status = _status(opted_in_config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
@@ -422,7 +376,7 @@ def test_requester_scoped_provider_without_requester_has_no_token(
     manager: CredentialsManager,
 ) -> None:
     """A call without a requester has no GitHub connection to use, even when another requester has one."""
-    _connect(manager, _github_store("@alice:example.org"), "alice-access")
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
 
     result = _resolve(opted_in_config, runtime_paths, manager, _broker_target(None, "shared"))
 
@@ -517,14 +471,14 @@ def test_expired_token_is_refreshed_through_the_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An expired access token is refreshed once and the rotated credential is stored for the tools too."""
-    store = _github_store("@alice:example.org")
-    _connect(manager, store, "stale-access", expires_at=1.0)
+    store = account_store("@alice:example.org")
+    connect_account(manager, store, "stale-access", expires_at=1.0)
     presented = serve_token_endpoint(monkeypatch, [rotated_token_response()])
 
     result = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"))
 
     assert result == Secret("rotated-access-token")
-    assert presented == [REFRESH_TOKEN]
+    assert presented == [OAUTH_REFRESH_TOKEN]
     stored = load_oauth_credentials_snapshot_sync(_store_context(runtime_paths, manager, store)).credentials
     assert stored is not None
     assert (stored["token"], stored["refresh_token"]) == ("rotated-access-token", "rotated-refresh-token")
@@ -537,7 +491,7 @@ def test_concurrent_lookups_refresh_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Lookups racing on several threads for an expired token share one refresh under the lifecycle's lock."""
-    _connect(manager, _github_store("@alice:example.org"), "stale-access", expires_at=1.0)
+    connect_account(manager, account_store("@alice:example.org"), "stale-access", expires_at=1.0)
     presented = serve_token_endpoint(monkeypatch, [DelayedTokenEndpointOutcome(0.3, rotated_token_response())])
     target = _broker_target("@alice:example.org")
 
@@ -545,7 +499,7 @@ def test_concurrent_lookups_refresh_once(
         results = list(executor.map(lambda _: _resolve(config, runtime_paths, manager, target), range(8)))
 
     assert results == [Secret("rotated-access-token")] * 8
-    assert presented == [REFRESH_TOKEN]
+    assert presented == [OAUTH_REFRESH_TOKEN]
 
 
 def test_revoked_grant_needs_reconnect_without_leaking(
@@ -555,7 +509,7 @@ def test_revoked_grant_needs_reconnect_without_leaking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A grant the provider rejects asks for a reconnect; logs carry only the error type."""
-    _connect(manager, _github_store("@alice:example.org"), "stale-access", expires_at=1.0)
+    connect_account(manager, account_store("@alice:example.org"), "stale-access", expires_at=1.0)
     serve_token_endpoint(monkeypatch, [httpx.Response(400, json={"error": "invalid_grant"})])
 
     with capture_logs() as logs:
@@ -572,7 +526,7 @@ def test_revoked_grant_needs_reconnect_without_leaking(
         "provider_id": "github",
         "error_type": "OAuthRefreshRejectedError",
     } in logs
-    for leaked in ("stale-access", REFRESH_TOKEN, urlsplit(result.connect_url).query):
+    for leaked in ("stale-access", OAUTH_REFRESH_TOKEN, urlsplit(result.connect_url).query):
         assert leaked not in repr(logs)
 
 
@@ -597,8 +551,8 @@ def test_transient_refresh_failure_is_retryable_and_backs_off(
     outcome: httpx.Response | Callable[[httpx.Request], Exception],
 ) -> None:
     """An outage answers `SecretUnavailable`, not a reconnect, and the scope skips the grant until the backoff ends."""
-    store = _github_store("@alice:example.org")
-    _connect(manager, store, "stale-access", expires_at=1.0)
+    store = account_store("@alice:example.org")
+    connect_account(manager, store, "stale-access", expires_at=1.0)
     outcomes: list[TokenEndpointOutcome] = [outcome]
     presented = serve_token_endpoint(monkeypatch, outcomes)
     target = _broker_target("@alice:example.org")
@@ -612,7 +566,7 @@ def test_transient_refresh_failure_is_retryable_and_backs_off(
 
     assert first == backing_off == SecretUnavailable(provider="github")
     assert recovered == Secret("rotated-access-token")
-    assert presented == [REFRESH_TOKEN, REFRESH_TOKEN]
+    assert presented == [OAUTH_REFRESH_TOKEN, OAUTH_REFRESH_TOKEN]
     unavailable = [entry for entry in logs if entry["event"] == "egress_broker_oauth_token_unavailable"]
     assert unavailable == [
         {
@@ -624,7 +578,7 @@ def test_transient_refresh_failure_is_retryable_and_backs_off(
         },
     ]
     assert "stale-access" not in repr(logs)
-    assert REFRESH_TOKEN not in repr(logs)
+    assert OAUTH_REFRESH_TOKEN not in repr(logs)
     # The stored connection survives an outage, so it is still there when the provider recovers.
     assert load_oauth_credentials_snapshot_sync(_store_context(runtime_paths, manager, store)).credentials is not None
 
@@ -636,7 +590,7 @@ def test_lookups_queued_behind_a_stalled_refresh_do_not_repeat_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Lookups waiting while a refresh stalls and then fails answer `SecretUnavailable` without another grant."""
-    _connect(manager, _github_store("@alice:example.org"), "stale-access", expires_at=1.0)
+    connect_account(manager, account_store("@alice:example.org"), "stale-access", expires_at=1.0)
     stalled_failure = DelayedTokenEndpointOutcome(0.5, httpx.Response(503, json={"error": "temporarily_unavailable"}))
     presented = serve_token_endpoint(monkeypatch, [stalled_failure])
     target = _broker_target("@alice:example.org")
@@ -645,7 +599,7 @@ def test_lookups_queued_behind_a_stalled_refresh_do_not_repeat_it(
         results = list(executor.map(lambda _: _resolve(config, runtime_paths, manager, target), range(4)))
 
     assert results == [SecretUnavailable(provider="github")] * 4
-    assert presented == [REFRESH_TOKEN]
+    assert presented == [OAUTH_REFRESH_TOKEN]
 
 
 def test_unreadable_connection_requires_reset(
@@ -654,8 +608,8 @@ def test_unreadable_connection_requires_reset(
     manager: CredentialsManager,
 ) -> None:
     """An undecodable stored credential needs a reset before reconnecting, and its status says so."""
-    store = _github_store("@alice:example.org")
-    _connect(manager, store, "alice-access")
+    store = account_store("@alice:example.org")
+    connect_account(manager, store, "alice-access")
     corrupt_oauth_credential_payload(
         _oauth_credential_database_path(_store_context(runtime_paths, manager, store)),
         base64.b64encode(b"not a credential"),
@@ -677,7 +631,7 @@ def test_agent_scoped_provider_follows_the_worker_scope(
     manager: CredentialsManager,
 ) -> None:
     """A provider without requester scoping uses the worker's scope: one shared connection for a shared agent."""
-    _connect(manager, _tool_target("@alice:example.org", "shared"), "shared-access", provider=_DEMO)
+    connect_account(manager, _tool_target("@alice:example.org", "shared"), "shared-access", provider=_DEMO)
 
     alice = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org", "shared"), provider_id="demo")
     bob = _resolve(config, runtime_paths, manager, _broker_target("@bob:example.org", "shared"), provider_id="demo")
@@ -694,7 +648,7 @@ def test_agent_scoped_provider_on_a_shared_worker_is_not_gated(
     manager: CredentialsManager,
 ) -> None:
     """The shared-worker rule is for requester-scoped providers; an agent's shared connection is its own scope."""
-    _connect(manager, _tool_target("@alice:example.org", "shared"), "shared-access", provider=_DEMO)
+    connect_account(manager, _tool_target("@alice:example.org", "shared"), "shared-access", provider=_DEMO)
 
     status = _status(config, runtime_paths, manager, _broker_target("@bob:example.org", "shared"), provider_id="demo")
 
@@ -713,7 +667,13 @@ def test_shared_scope_connect_links_are_never_handed_out(
     """A shared-scope link skips sign-in and any process in the worker can read it, so the broker offers none."""
     shared = _broker_target("@alice:example.org", "shared")
     missing = _resolve(config, runtime_paths, manager, shared, provider_id="demo")
-    _connect(manager, _tool_target("@alice:example.org", "shared"), "stale-access", provider=_DEMO, expires_at=1.0)
+    connect_account(
+        manager,
+        _tool_target("@alice:example.org", "shared"),
+        "stale-access",
+        provider=_DEMO,
+        expires_at=1.0,
+    )
     serve_token_endpoint(monkeypatch, [httpx.Response(400, json={"error": "invalid_grant"})])
     revoked = _resolve(config, runtime_paths, manager, shared, provider_id="demo")
     private = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org"), provider_id="demo")
@@ -732,7 +692,7 @@ def test_scoped_worker_never_reads_the_unscoped_store(
     manager: CredentialsManager,
 ) -> None:
     """Only unscoped targets drop their worker key: scoped targets keep it and never see the unscoped connection."""
-    _connect(manager, _tool_target("@alice:example.org", None), "unscoped-access", provider=_DEMO)
+    connect_account(manager, _tool_target("@alice:example.org", None), "unscoped-access", provider=_DEMO)
 
     results = [
         _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org", scope), provider_id="demo")
@@ -751,7 +711,7 @@ def test_unscoped_worker_reads_the_store_its_tools_use(
     """An unscoped call's token names its routed worker, but its OAuth scope is the tools' unscoped store."""
     tool_target = _tool_target("@alice:example.org", None)
     assert tool_target.worker_key is None
-    _connect(manager, tool_target, "unscoped-access", provider=_DEMO)
+    connect_account(manager, tool_target, "unscoped-access", provider=_DEMO)
     claims = WorkerClaims.from_worker_target(replace(tool_target, worker_key="v1:local:unscoped:code"))
     assert claims is not None
 
@@ -767,9 +727,9 @@ def test_status_reports_connection_without_refreshing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Status reads the stored connection without a token request; an expired but refreshable token counts."""
-    _connect(
+    connect_account(
         manager,
-        _github_store("@alice:example.org"),
+        account_store("@alice:example.org"),
         "stale-access",
         expires_at=1.0,
         _oauth_claims={"email": "alice@example.org"},
@@ -807,7 +767,7 @@ def test_status_with_a_service_account_matches_what_the_broker_injects(
 ) -> None:
     """A service account is never connectable and not a token, but a stored personal token is still used."""
     monkeypatch.setattr(oauth_source, "oauth_provider_service_account_configured", lambda *_args: True)
-    _connect(manager, _github_store("@alice:example.org"), "alice-access", expires_at=FUTURE)
+    connect_account(manager, account_store("@alice:example.org"), "alice-access")
 
     alice = _status(config, runtime_paths, manager, _broker_target("@alice:example.org"))
     bob = _status(config, runtime_paths, manager, _broker_target("@bob:example.org"))
