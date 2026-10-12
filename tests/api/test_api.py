@@ -3157,6 +3157,24 @@ def test_save_config(test_client: TestClient, temp_config_file: Path) -> None:
     assert saved_config["defaults"] == {}
 
 
+def test_save_config_writes_keys_in_alphabetical_order(test_client: TestClient, temp_config_file: Path) -> None:
+    """A save writes config.yaml with every mapping's keys sorted, whatever order the draft has them in."""
+    agent = {"display_name": "Agent", "role": "Role", "tools": [], "instructions": [], "rooms": []}
+    new_config = {
+        "router": {"model": "default"},
+        "models": {"default": {"provider": "test", "id": "test-model"}},
+        "agents": {"zeta": agent, "alpha": agent},
+    }
+
+    response = test_client.put("/api/config/save", json=new_config)
+    assert response.status_code == 200, response.text
+
+    saved_config = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    assert list(saved_config) == sorted(saved_config)
+    assert list(saved_config["agents"]) == ["alpha", "zeta"]
+    assert list(saved_config["agents"]["alpha"]) == sorted(saved_config["agents"]["alpha"])
+
+
 def test_save_config_persists_unassigned_configured_rooms(
     test_client: TestClient,
     temp_config_file: Path,

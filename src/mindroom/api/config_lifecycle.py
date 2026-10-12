@@ -368,18 +368,14 @@ def _save_config_to_file(
     *,
     committed_uses_includes: bool | None,
 ) -> str:
-    """Save config to YAML file in the payload's authored order.
-
-    Order is part of the config: it decides how agents are listed in the UI and
-    which egress service wins a tie. Only the canonical fingerprint dump sorts.
-    """
+    """Save config to YAML file with deterministic ordering."""
     _raise_when_composed_from_includes(runtime_paths, committed_uses_includes)
     config_path = runtime_paths.config_path
     tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
     source = yaml.dump(
         config,
         default_flow_style=False,
-        sort_keys=False,
+        sort_keys=True,
         allow_unicode=True,
     )
     tmp_path.write_text(source, encoding="utf-8")

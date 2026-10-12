@@ -657,8 +657,10 @@ def test_agents_keep_config_order(egress_portal: dict[str, Any]) -> None:
     assert configured == {"shared_dev": True, "personal": True}
 
 
-def test_dashboard_config_save_keeps_the_authored_order(egress_portal: dict[str, Any]) -> None:
-    """Saving the config through the dashboard keeps agent and egress service order; a rule tie follows the names."""
+def test_dashboard_config_save_sorts_services_and_agents_and_ties_follow_service_names(
+    egress_portal: dict[str, Any],
+) -> None:
+    """A dashboard save writes agents and egress services sorted by name, and a rule tie goes to the first name."""
     portal = egress_portal
     client, paths = portal["client"], portal["paths"]
     admin, alice = portal["headers"]["admin"], portal["headers"]["alice"]
@@ -666,24 +668,23 @@ def test_dashboard_config_save_keeps_the_authored_order(egress_portal: dict[str,
     agents = payload["agents"]
     payload["agents"] = {"shared_dev": agents["shared_dev"], **agents}
     clashing_rule = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
-    # Declared against the alphabet, and both match the same request: the name that sorts first wins.
+    # Declared against the alphabet, and both match the same request.
     payload["egress_broker"]["services"] = {
         "zeta": clashing_rule,
         "alpha": clashing_rule,
         **payload["egress_broker"]["services"],
     }
-    declared_services = list(payload["egress_broker"]["services"])
 
     saved = client.put("/api/config/save", json=payload, headers=admin)
     assert saved.status_code == 200, saved.text
     # Read the file back, as a restart or reload does, so the order on disk is what the pages and rules see.
     assert config_lifecycle.load_config_into_app(paths, main.app)
 
-    assert _agent_rows(_listing(portal, "alice")) == ["shared_dev", "personal"]
-    assert _agent_rows(client.get("/api/connections", headers=alice)) == ["shared_dev", "personal"]
+    assert _agent_rows(_listing(portal, "alice")) == ["personal", "shared_dev"]
+    assert _agent_rows(client.get("/api/connections", headers=alice)) == ["personal", "shared_dev"]
     on_disk = yaml.safe_load(paths.config_path.read_text(encoding="utf-8"))
-    assert list(on_disk["agents"]) == list(payload["agents"])
-    assert list(on_disk["egress_broker"]["services"]) == declared_services
+    assert list(on_disk["agents"]) == sorted(payload["agents"])
+    assert list(on_disk["egress_broker"]["services"]) == sorted(payload["egress_broker"]["services"])
     route = route_request(
         EgressRules.from_config(Config.validate_with_runtime(on_disk, paths).egress_broker),
         "api.example.com",
