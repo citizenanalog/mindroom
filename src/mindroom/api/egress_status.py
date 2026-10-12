@@ -52,7 +52,8 @@ RESTRICT_ONLY_KEY_REFUSAL = "This service only limits paths and never sends a ke
 def require_egress_broker_enabled(request: Request) -> None:
     """Answer 404 on every route of both egress APIs while the broker is off.
 
-    Both routers run this first, so with the broker off no route authenticates its caller or reads a store.
+    Both routers depend on this, so with the broker off no route reads a store. The admin router is mounted behind
+    dashboard authentication, which runs before it, so an unauthenticated dashboard call still gets 401.
     """
     if not egress_broker_enabled(config_lifecycle.bind_current_request_snapshot(request).runtime_paths):
         raise HTTPException(404, "Agent Keys are not enabled", headers=CONNECTIONS_HEADERS)
