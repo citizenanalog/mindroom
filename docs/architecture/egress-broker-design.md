@@ -1,3 +1,7 @@
+---
+icon: lucide/scale
+---
+
 # Egress Broker Design Decisions
 
 This page records the decisions behind the [brokered worker egress](../deployment/egress-broker.md) that the code does not explain on its own, and why each was made.
