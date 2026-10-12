@@ -64,6 +64,9 @@ from tests.oauth_test_utils import corrupt_oauth_credential_payload
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from mindroom.constants import RuntimePaths
+    from mindroom.oauth.providers import OAuthProvider
+
 
 def _trust_signed_users(monkeypatch: pytest.MonkeyPatch) -> Any:  # noqa: ANN401
     """Accept the test key's signed identities and resolve every host to a public address; return the key."""
@@ -553,9 +556,18 @@ def test_credential_manager_without_use_access_sees_no_egress_anywhere(egress_po
     assert response.status_code == 404, response.text
 
 
-@pytest.fixture
-def oauth_egress_portal(egress_portal: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Extend the egress portal with services backed by an agent-scoped and a requester-scoped OAuth provider."""
+def _oauth_services() -> dict[str, Any]:
+    """Return services on an agent-scoped (Drive), a requester-scoped (GitHub), and an unknown OAuth provider."""
+    rules = [{"host": "www.googleapis.com", "auth": {"type": "bearer"}}]
+    return {
+        "drive": {"description": "Drive", "oauth_provider": "google_drive", "rules": rules},
+        "gh": {"display_name": "GH", "oauth_provider": "github", "rules": rules},
+        "ghost": {"description": "Unknown provider", "oauth_provider": "no_such_provider", "rules": rules},
+    }
+
+
+def _use_fake_oauth_providers(monkeypatch: pytest.MonkeyPatch, paths: RuntimePaths) -> dict[str, OAuthProvider]:
+    """Register fake agent-scoped Drive and requester-scoped GitHub providers with configured clients; return them."""
     drive = _fake_provider(provider_id="google_drive", credential_service="google_drive_oauth")
     github = _fake_provider(
         provider_id="github",
@@ -564,28 +576,46 @@ def oauth_egress_portal(egress_portal: dict[str, Any], monkeypatch: pytest.Monke
         requester_scoped_credentials=True,
     )
     monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (drive, github))
-    paths = egress_portal["paths"]
     manager = get_runtime_credentials_manager(paths)
     for client_service in ("test_drive_oauth_client", "github_oauth_client"):
         manager.save_credentials(
             client_service,
             {"client_id": "test-client", "client_secret": "test-secret", "_source": "ui"},
         )
+    return {"google_drive": drive, "github": github}
+
+
+def _finish_oauth(
+    client: TestClient,
+    connect: Any,  # noqa: ANN401
+    provider: str,
+    headers: dict[str, str] | None = None,
+) -> None:
+    """Check `connect` answered with an authorize URL, then complete it through the shared callback."""
+    assert connect.status_code == 200, connect.text
+    state = parse_qs(urlparse(connect.json()["auth_url"]).query)["state"][0]
+    callback = client.get(
+        f"/api/oauth/{provider}/callback",
+        params={"code": "test-code", "state": state},
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert callback.status_code in {302, 303, 307}, callback.text
+
+
+@pytest.fixture
+def oauth_egress_portal(egress_portal: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Extend the egress portal with services backed by an agent-scoped and a requester-scoped OAuth provider."""
+    paths = egress_portal["paths"]
+    providers = _use_fake_oauth_providers(monkeypatch, paths)
     payload = egress_portal["payload"]
     for agent in ("personal", "shared_dev"):
         # The Connections portal lists a provider only for agents that have a tool using it.
         payload["agents"][agent]["tools"].append({"name": "google_drive", "defer": True})
-    rules = [{"host": "www.googleapis.com", "auth": {"type": "bearer"}}]
-    payload["egress_broker"]["services"].update(
-        {
-            "drive": {"description": "Drive", "oauth_provider": "google_drive", "rules": rules},
-            "gh": {"display_name": "GH", "oauth_provider": "github", "rules": rules},
-            "ghost": {"description": "Unknown provider", "oauth_provider": "no_such_provider", "rules": rules},
-        },
-    )
+    payload["egress_broker"]["services"].update(_oauth_services())
     _publish_config(main.app, paths, payload)
     _use_runtime_auth_settings(main.app)
-    return {**egress_portal, "providers": {"google_drive": drive, "github": github}}
+    return {**egress_portal, "providers": providers}
 
 
 def _oauth_block(**changes: Any) -> dict[str, Any]:  # noqa: ANN401
@@ -610,17 +640,8 @@ def _egress_row(portal: dict[str, Any], user: str, agent: str, service: str) -> 
 
 def _connect_account(portal: dict[str, Any], user: str, agent: str, service: str, provider: str) -> None:
     """Run the whole OAuth flow through the egress connect route and the shared callback."""
-    client, headers = portal["client"], portal["headers"][user]
     connect = _account_action(portal, user, agent, service, "connect")
-    assert connect.status_code == 200, connect.text
-    state = parse_qs(urlparse(connect.json()["auth_url"]).query)["state"][0]
-    callback = client.get(
-        f"/api/oauth/{provider}/callback",
-        params={"code": "test-code", "state": state},
-        headers=headers,
-        follow_redirects=False,
-    )
-    assert callback.status_code in {302, 303, 307}, callback.text
+    _finish_oauth(portal["client"], connect, provider, portal["headers"][user])
 
 
 def test_status_shows_the_oauth_connection_and_a_stored_key_wins(oauth_egress_portal: dict[str, Any]) -> None:

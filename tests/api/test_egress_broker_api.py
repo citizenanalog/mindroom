@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlparse
 
 import pytest
 import yaml
@@ -17,8 +16,12 @@ from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.user_services import save_user_service
-from mindroom.oauth import registry as oauth_registry
-from tests.api.test_oauth_api import _fake_provider
+from tests.api.test_egress_credentials_api import (
+    _finish_oauth,
+    _oauth_block,
+    _oauth_services,
+    _use_fake_oauth_providers,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -452,31 +455,14 @@ def oauth_broker_client(egress_config_file: Path, monkeypatch: pytest.MonkeyPatc
     from mindroom import constants  # noqa: PLC0415
     from mindroom.api import config_lifecycle, main  # noqa: PLC0415
 
-    drive = _fake_provider(provider_id="google_drive", credential_service="google_drive_oauth")
-    github = _fake_provider(
-        provider_id="github",
-        credential_service="github_oauth",
-        client_config_services=("github_oauth_client",),
-        requester_scoped_credentials=True,
-    )
-    monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (drive, github))
-    rules = [{"host": "www.googleapis.com", "auth": {"type": "bearer"}}]
     config = yaml.safe_load(egress_config_file.read_text(encoding="utf-8"))
-    config["egress_broker"]["services"].update(
-        {
-            "drive": {"description": "Drive", "oauth_provider": "google_drive", "rules": rules},
-            "gh": {"description": "GH", "oauth_provider": "github", "rules": rules},
-            "ghost": {"description": "Unknown provider", "oauth_provider": "no_such_provider", "rules": rules},
-        },
-    )
+    config["egress_broker"]["services"].update(_oauth_services())
     egress_config_file.write_text(yaml.dump(config), encoding="utf-8")
     runtime_paths = constants.resolve_primary_runtime_paths(
         config_path=egress_config_file,
         process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org"},
     )
-    manager = get_runtime_credentials_manager(runtime_paths)
-    for service in ("test_drive_oauth_client", "github_oauth_client"):
-        manager.save_credentials(service, {"client_id": "test-client", "client_secret": "test-secret", "_source": "ui"})
+    _use_fake_oauth_providers(monkeypatch, runtime_paths)
     main.initialize_api_app(main.app, runtime_paths)
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
     return TestClient(main.app, base_url="http://localhost")
@@ -484,16 +470,8 @@ def oauth_broker_client(egress_config_file: Path, monkeypatch: pytest.MonkeyPatc
 
 def _connect(client: TestClient, name: str, provider: str, agent_name: str | None = None) -> None:
     """Run the whole OAuth flow through the admin connect route and the shared callback."""
-    params = _scope_params(agent_name)
-    response = client.post(f"/api/egress-broker/services/{name}/connect", params=params)
-    assert response.status_code == 200, response.text
-    state = parse_qs(urlparse(response.json()["auth_url"]).query)["state"][0]
-    callback = client.get(
-        f"/api/oauth/{provider}/callback",
-        params={"code": "test-code", "state": state},
-        follow_redirects=False,
-    )
-    assert callback.status_code in {302, 303, 307}, callback.text
+    response = client.post(f"/api/egress-broker/services/{name}/connect", params=_scope_params(agent_name))
+    _finish_oauth(client, response, provider)
 
 
 def test_services_status_has_key_and_oauth_parts(oauth_broker_client: TestClient) -> None:
@@ -503,17 +481,7 @@ def test_services_status_has_key_and_oauth_parts(oauth_broker_client: TestClient
     assert github["active_source"] is None
     assert github["key_configured"] is False
     drive = _service(oauth_broker_client, "drive")
-    assert drive["oauth"] == {
-        "provider": "google_drive",
-        "display_name": "Test Drive",
-        "connected": False,
-        "account_label": None,
-        "can_connect": True,
-        "reset_required": False,
-        "service_account": False,
-        "unavailable_reason": None,
-        "shared_worker_opt_in": False,
-    }
+    assert drive["oauth"] == _oauth_block()
     assert _service(oauth_broker_client, "ghost")["oauth"] is None
 
 
