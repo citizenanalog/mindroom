@@ -78,6 +78,30 @@ function saveBodies() {
     .map(([, init]) => JSON.parse(String(init?.body)));
 }
 
+/** Refuses other paths on GitHub's hosts and saves, the edit the GitHub tests make. */
+async function restrictGithub() {
+  render(<EgressBroker />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Edit service for GitHub" }),
+  );
+  await presetsReady();
+  fireEvent.click(screen.getByRole("button", { name: "More options" }));
+  fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
+  fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+}
+
+async function deleteOpenai() {
+  render(<EgressBroker />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Delete service for OpenAI" }),
+  );
+  fireEvent.click(
+    within(await screen.findByRole("dialog")).getByRole("button", {
+      name: "Delete",
+    }),
+  );
+}
+
 beforeEach(async () => {
   saveResponse = () => json({ success: true });
   vi.mocked(fetch).mockImplementation(async (input) => {
@@ -108,14 +132,7 @@ describe("egress broker panel with the real config store", () => {
   });
 
   it("saves an edited preset service as the preset plus what changed", async () => {
-    render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Edit service for GitHub" }),
-    );
-    await presetsReady();
-    fireEvent.click(screen.getByRole("button", { name: "More options" }));
-    fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await restrictGithub();
 
     await waitFor(() => expect(saveBodies()).toHaveLength(1));
     // Other services and the rest of the config go back untouched.
@@ -155,55 +172,12 @@ describe("egress broker panel with the real config store", () => {
   });
 
   it("removes a deleted service from the saved config", async () => {
-    render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Delete service for OpenAI" }),
-    );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Delete",
-      }),
-    );
+    await deleteOpenai();
 
     await waitFor(() => expect(saveBodies()).toHaveLength(1));
     expect(saveBodies()[0].egress_broker.services).toEqual({
       github: { preset: "github" },
     });
-  });
-
-  it("shows the server's validation error and leaves no invalid draft behind", async () => {
-    saveResponse = () =>
-      json(
-        {
-          detail: [
-            {
-              loc: ["egress_broker", "services", "bad", "rules", 0, "host"],
-              msg: "Value error, host must not contain scheme",
-              type: "value_error",
-            },
-          ],
-        },
-        422,
-      );
-    render(<EgressBroker />);
-    await screen.findByLabelText("GitHub");
-    fireEvent.click(screen.getByRole("button", { name: "Add service" }));
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "bad" },
-    });
-    fireEvent.change(screen.getByLabelText("Website"), {
-      target: { value: "api.example.com" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "bad.rules.0.host: host must not contain scheme",
-    );
-    expect(storedBroker()?.services).toEqual(
-      authoredConfig.egress_broker.services,
-    );
-    expect(screen.getByLabelText("Name")).toHaveValue("bad");
   });
 
   describe("after a save that fails", () => {
@@ -233,6 +207,19 @@ describe("egress broker panel with the real config store", () => {
       });
       fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     };
+
+    it("shows the server's validation error and leaves no invalid draft behind", async () => {
+      saveResponse = failingSave;
+      await addBadService();
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "bad.rules.0.host: host must not contain scheme",
+      );
+      expect(storedBroker()?.services).toEqual(
+        authoredConfig.egress_broker.services,
+      );
+      expect(screen.getByLabelText("Name")).toHaveValue("bad");
+    });
 
     it("leaves the draft clean when the editor was the only change", async () => {
       saveResponse = failingSave;
@@ -321,17 +308,7 @@ describe("egress broker panel with the real config store", () => {
 
     it("restores a deleted service and leaves the draft clean when the delete is refused", async () => {
       saveResponse = () => json({ detail: "Failed to save" }, 500);
-      render(<EgressBroker />);
-      fireEvent.click(
-        await screen.findByRole("button", {
-          name: "Delete service for OpenAI",
-        }),
-      );
-      fireEvent.click(
-        within(await screen.findByRole("dialog")).getByRole("button", {
-          name: "Delete",
-        }),
-      );
+      await deleteOpenai();
       await screen.findByText("Failed to save");
 
       const state = useConfigStore.getState();
@@ -345,14 +322,7 @@ describe("egress broker panel with the real config store", () => {
 
   it("asks before saving when the draft holds other unsaved changes, then saves them too", async () => {
     useConfigStore.getState().updateConfigValue(["router"], { model: "other" });
-    render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Edit service for GitHub" }),
-    );
-    await presetsReady();
-    fireEvent.click(screen.getByRole("button", { name: "More options" }));
-    fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await restrictGithub();
 
     expect(screen.getByRole("alert")).toHaveTextContent(
       "This also saves your other unsaved settings changes.",
