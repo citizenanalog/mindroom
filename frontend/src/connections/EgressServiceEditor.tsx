@@ -68,7 +68,6 @@ import type {
   EgressOAuthProviderOption,
   EgressPreset,
   EgressPresetCatalog,
-  EgressRule,
   EgressRuleSummary,
   EgressScope,
 } from "./types";
@@ -233,10 +232,17 @@ export function EgressServiceEditor({
   const showGithubHelper = limiting || looksLikeGithub(form);
   const settings = { editing, takenNames: openedWithNames, service };
 
-  const applyGithubRules = (result: {
-    rules: EgressRule[];
-    repositories: string[];
-  }): EgressServiceForm => {
+  // Writes the typed repositories into the form, or shows why they cannot be.
+  const applyHelper = (): EgressServiceForm | null => {
+    // A limit always covers uploads.github.com: it narrows only the hosts it
+    // has rules for, so the administrator's uploads.github.com rule would
+    // otherwise keep reaching every repository with the user's key or account.
+    const result = githubRepositoryRules(helperInput.repositories, {
+      ...helperInput,
+      uploads: limiting || helperInput.uploads,
+    });
+    setHelperErrors(result.errors);
+    if (result.errors.length > 0) return null;
     const { changes, written } = githubHelperChanges(
       form,
       result,
@@ -259,15 +265,7 @@ export function EgressServiceEditor({
     if (!showGithubHelper || (!typed && !limiting)) return form;
     if (typed && helperSignature(helperInput) === appliedHelper.current)
       return form;
-    // A limit always covers uploads.github.com: it narrows only the hosts it
-    // has rules for, so the administrator's uploads.github.com rule would
-    // otherwise keep reaching every repository with the user's key or account.
-    const result = githubRepositoryRules(helperInput.repositories, {
-      ...helperInput,
-      uploads: limiting || helperInput.uploads,
-    });
-    setHelperErrors(result.errors);
-    return result.errors.length > 0 ? null : applyGithubRules(result);
+    return applyHelper();
   };
 
   const formRef = useRef<HTMLFormElement>(null);
@@ -404,12 +402,6 @@ export function EgressServiceEditor({
       rules: form.rules.length > 0 ? form.rules : [emptyRule()],
       explicitlyEmpty: NOT_EXPLICITLY_EMPTY,
     });
-  };
-
-  const applyTypedRepositories = () => {
-    const result = githubRepositoryRules(helperInput.repositories, helperInput);
-    setHelperErrors(result.errors);
-    if (result.errors.length === 0) applyGithubRules(result);
   };
 
   // A key never goes out for a service whose save failed. When only the key
@@ -603,7 +595,7 @@ export function EgressServiceEditor({
             setHelperInput(next);
           }}
           errors={helperErrors}
-          onApply={limiting ? undefined : applyTypedRepositories}
+          onApply={limiting ? undefined : applyHelper}
           limit={limiting}
         />
       )}
