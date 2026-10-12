@@ -19,7 +19,6 @@ import type {
   AuthoredEgressService,
   EgressCredentialService,
   EgressPresetCatalog,
-  EgressRule,
 } from "./types";
 
 const providers = egressPresets.oauth_providers;
@@ -1939,12 +1938,6 @@ describe("a free name for a new service", () => {
     expect(nameField()).toHaveValue("httpbin-2");
   });
 
-  it("takes a free name when a preset is chosen", async () => {
-    await renderEditor({ takenNames: ["github"] });
-    type("Preset", "github");
-    expect(nameField()).toHaveValue("github-2");
-  });
-
   it("names the clash when all three are taken", async () => {
     const { onSave } = await renderEditor({
       takenNames: ["github", "github-2", "github-3"],
@@ -1975,17 +1968,13 @@ describe("a free name for a new service", () => {
 });
 
 describe("the name after the GitHub helper", () => {
-  const limit = (repositories: string) => {
-    enter(repositories);
-    apply();
-  };
-
   it("keeps the name when the helper replaces the rules", async () => {
     await renderEditor();
     type("Website", "github.com");
     expect(screen.getByLabelText("Name")).toHaveValue("github");
     // The helper's first rule is on api.github.com, whose first label is "api".
-    limit("o/r");
+    enter("o/r");
+    apply();
     expect(screen.getByLabelText("Website")).toHaveValue("api.github.com");
     expect(screen.getByLabelText("Name")).toHaveValue("github");
   });
@@ -1993,7 +1982,8 @@ describe("the name after the GitHub helper", () => {
   it("keeps it after the user edits the website too, as a name the helper fixed", async () => {
     await renderEditor();
     type("Website", "github.com");
-    limit("o/r");
+    enter("o/r");
+    apply();
     type("Website", "uploads.github.com");
     expect(screen.getByLabelText("Name")).toHaveValue("github");
   });
@@ -2001,7 +1991,8 @@ describe("the name after the GitHub helper", () => {
   it("keeps the suggested name of the preset", async () => {
     await renderEditor({ takenNames: ["github"] });
     type("Preset", "github");
-    limit("o/r");
+    enter("o/r");
+    apply();
     expect(screen.getByLabelText("Name")).toHaveValue("github-2");
   });
 });
@@ -2041,13 +2032,7 @@ describe("a preset's placeholders an administrator's service also sets", () => {
     type("Preset", "github");
     expect(screen.queryByLabelText("Display name")).toBeNull();
     expect(screen.getByText(warning)).toBeVisible();
-  });
-
-  it("follows the chosen preset", async () => {
-    await renderEditor({ configPlaceholders });
-    expect(screen.queryByText(warning)).toBeNull();
-    type("Preset", "github");
-    expect(screen.getByText(warning)).toBeInTheDocument();
+    // It follows the chosen preset.
     type("Preset", "openai");
     expect(screen.queryByText(warning)).toBeNull();
   });
@@ -2381,9 +2366,7 @@ const limitSavable = () =>
 
 describe("a limit: a service that only restricts GitHub repositories", () => {
   /** The limit form has no preset, but it waits for the validation the presets bring. */
-  const renderEditor = async (
-    props: Partial<EgressServiceEditorProps> = {},
-  ) => {
+  const renderLimit = async (props: Partial<EgressServiceEditorProps> = {}) => {
     const merged = { ...baseProps(), ...props };
     render(<EgressServiceEditor {...merged} />);
     await limitSavable();
@@ -2408,7 +2391,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   });
 
   it("is added with its own title, no preset, website, key, or More options, and a name given", async () => {
-    await renderEditor({
+    await renderLimit({
       initialRestrictOnly: true,
       saveKey: vi.fn(async () => undefined),
     });
@@ -2428,12 +2411,12 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
 
   it("is not unsaved changes until the user changes something", async () => {
     const onDirtyChange = vi.fn();
-    await renderEditor({ initialRestrictOnly: true, onDirtyChange });
+    await renderLimit({ initialRestrictOnly: true, onDirtyChange });
     expect(onDirtyChange).toHaveBeenLastCalledWith(false);
   });
 
   it("takes the first github-limited name that is free", async () => {
-    await renderEditor({
+    await renderLimit({
       initialRestrictOnly: true,
       takenNames: ["github-limited", "github-limited-2"],
     });
@@ -2443,7 +2426,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   it("saves restrict-only rules for the repositories, with no key, login, or placeholders", async () => {
     const saveKey = vi.fn(async () => undefined);
     const onClose = vi.fn();
-    const { onSave } = await renderEditor({
+    const { onSave } = await renderLimit({
       initialRestrictOnly: true,
       saveKey,
       onClose,
@@ -2464,7 +2447,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   });
 
   it("asks for a repository when there is none", async () => {
-    const { onSave } = await renderEditor({
+    const { onSave } = await renderLimit({
       initialRestrictOnly: true,
     });
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
@@ -2488,7 +2471,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   });
 
   it("can be saved once the presets fail to load", async () => {
-    const { onSave } = await renderEditor({
+    const { onSave } = await renderLimit({
       initialRestrictOnly: true,
       loadPresets: failingPresets(),
     });
@@ -2498,7 +2481,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
   });
 
   it("says for whom it also limits the administrator's services", async () => {
-    await renderEditor({
+    await renderLimit({
       initialRestrictOnly: true,
       scope: "shared",
     });
@@ -2514,7 +2497,9 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
       ...storedLimit("a/b"),
       rules: limitRules("a/b\nc/*", true),
     };
-    const { onSave } = await renderEditor({
+    // The server keeps a limit's rules without auth, and they open and save back the same.
+    expect(stored.rules?.every((rule) => rule.auth === undefined)).toBe(true);
+    const { onSave } = await renderLimit({
       name: "github-limited",
       service: stored,
       saveKey: vi.fn(async () => undefined),
@@ -2542,7 +2527,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
         { host: "api.github.com", path_prefix: "/user" },
       ],
     });
-    const { onSave } = await renderEditor({
+    const { onSave } = await renderLimit({
       name: "github-limited",
       service: odd,
     });
@@ -2558,7 +2543,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
 
   it("is not unsaved changes until the repositories change", async () => {
     const onDirtyChange = vi.fn();
-    await renderEditor({
+    await renderLimit({
       name: "github-limited",
       service: storedLimit("a/b"),
       onDirtyChange,
@@ -2570,7 +2555,7 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
 
   it("is removed with Remove limit, after asking what it gives back", async () => {
     const onDelete = vi.fn(async () => undefined);
-    await renderEditor({
+    await renderLimit({
       name: "github-limited",
       service: storedLimit("a/b"),
       onDelete,
@@ -2588,52 +2573,11 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm remove" }));
     await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
   });
-});
-
-describe("a limit: relabelling, rules without auth, and long lists", () => {
-  const renderLimit = async (props: Partial<EgressServiceEditorProps> = {}) => {
-    const merged = { ...baseProps(), ...props };
-    render(<EgressServiceEditor {...merged} />);
-    await limitSavable();
-    return { onSave: merged.onSave };
-  };
-  const noAuth = (rules: EgressRule[]): EgressRule[] =>
-    rules.map(({ auth: _auth, ...rule }) => rule);
-  const rulesFor = (input: string) =>
-    noAuth(
-      githubRepositoryRules(input, { uploads: true, graphql: false }).rules,
-    );
-
-  it("opens a limit the server keeps without auth on its rules, and saves it back the same", async () => {
-    const stored: AuthoredEgressService = {
-      display_name: "GitHub (a/b)",
-      description: "Limited to a/b",
-      rules: rulesFor("a/b"),
-      restrict_to_rules: true,
-      restrict_only: true,
-    };
-    expect(stored.rules?.every((rule) => rule.auth === undefined)).toBe(true);
-    const { onSave } = await renderLimit({
-      name: "github-limited",
-      service: stored,
-    });
-    expect(screen.getByLabelText("GitHub repositories")).toHaveValue("a/b");
-    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
-    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    expect(onSave).toHaveBeenCalledWith("github-limited", stored);
-  });
 
   it("relabels the limit it wrote when a repository is added, and keeps labels the person wrote", async () => {
-    const written = (input: string): AuthoredEgressService => ({
-      display_name: `GitHub (${input})`,
-      description: `Limited to ${input}`,
-      rules: rulesFor(input),
-      restrict_to_rules: true,
-      restrict_only: true,
-    });
     const first = await renderLimit({
       name: "github-limited",
-      service: written("a/b"),
+      service: storedLimit("a/b"),
     });
     enter("a/b\nc/d");
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
@@ -2641,7 +2585,7 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
     expect(first.onSave).toHaveBeenCalledWith("github-limited", {
       display_name: "GitHub (a/b, c/d)",
       description: "Limited to a/b, c/d",
-      rules: rulesFor("a/b\nc/d"),
+      rules: limitRules("a/b\nc/d"),
       restrict_to_rules: true,
       restrict_only: true,
     });
@@ -2649,7 +2593,7 @@ describe("a limit: relabelling, rules without auth, and long lists", () => {
     const second = await renderLimit({
       name: "github-limited",
       service: {
-        ...written("a/b"),
+        ...storedLimit("a/b"),
         display_name: "Work repositories",
         description: "What the team uses",
       },
