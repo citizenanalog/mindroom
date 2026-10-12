@@ -888,6 +888,24 @@ def test_portal_catalog_survives_egress_state_that_cannot_be_read(
     assert {log["error_type"] for log in warnings} == {"OSError"}
 
 
+def test_portal_catalog_lists_the_egress_tool_only_while_the_broker_is_on(egress_portal: dict[str, Any]) -> None:
+    """An agent that lists the Egress Credentials tool shows it among its tools only while the broker is on."""
+    portal = egress_portal
+    portal["payload"]["agents"]["personal"]["tools"].append("egress_credentials")
+    _republish(portal)
+
+    def personal_tools() -> list[str]:
+        response = portal["client"].get("/api/connections", headers=portal["headers"]["alice"])
+        assert response.status_code == 200, response.text
+        personal = next(agent for agent in response.json()["agents"] if agent["agent_name"] == "personal")
+        return [tool["name"] for tool in personal["tools"]]
+
+    listed = personal_tools()
+    assert "egress_credentials" in listed
+    _restart_with_env(portal, MINDROOM_EGRESS_BROKER_PORT="")
+    assert personal_tools() == [name for name in listed if name != "egress_credentials"]
+
+
 # --- Connected accounts (OAuth) ---
 
 

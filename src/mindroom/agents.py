@@ -32,6 +32,7 @@ from mindroom.delegation.personas import (
     persona_tool_policy,
     require_built_persona_tools,
 )
+from mindroom.egress_broker.env import egress_tool_unavailable
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.error_handling import MinimalModeUnavailableError, minimal_mode_failure_message
 from mindroom.history.agno_compat_message_builder import apply_patch as install_message_builder_patch
@@ -742,13 +743,17 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
 
     Callers own runtime override resolution before invoking this builder.
     Returns ``None`` when the configured tool should be skipped, such as an
-    explicit ``delegate`` entry without valid delegation targets.
+    explicit ``delegate`` entry without valid delegation targets or the
+    ``egress_credentials`` tool while the egress broker is off.
 
     ``dynamic_tool_continuation`` is only set by callers that resume the turn
     after a load/unload (the standalone agent envelope and materialized team
     members). It stops the dynamic tools manager's provider loop so the rebuilt
     agent sees the new schema.
     """
+    if egress_tool_unavailable(tool_name, runtime_paths):
+        logger.warning("Skipping egress_credentials tool because the egress broker is not enabled", agent=agent_name)
+        return None
     agent_config = config.get_agent(agent_name)
     if agent_runtime is None:
         agent_runtime = resolve_agent_runtime(

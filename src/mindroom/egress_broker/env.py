@@ -18,6 +18,7 @@ __all__ = [
     "apply_runner_ca_bundle",
     "broker_execution_env",
     "egress_broker_enabled",
+    "egress_tool_unavailable",
     "primary_callback_hosts",
 ]
 
@@ -35,6 +36,14 @@ def egress_broker_enabled(runtime_paths: RuntimePaths) -> bool:
     nothing of the feature shows or runs. A set but invalid port counts as enabled, so startup refuses it loudly.
     """
     return bool((runtime_paths.env_value(EGRESS_BROKER_ENV_BY_KEY["port"]) or "").strip())
+
+
+def egress_tool_unavailable(tool_name: str, runtime_paths: RuntimePaths) -> bool:
+    """Return whether `tool_name` is the egress credentials tool while the broker is off.
+
+    That tool only reports the broker's services, so the tool lists leave it out and agents that list it do not get it.
+    """
+    return tool_name == "egress_credentials" and not egress_broker_enabled(runtime_paths)
 
 
 def broker_execution_env(

@@ -259,6 +259,21 @@ def test_every_route_is_a_404_while_the_broker_is_off(
     assert scopes_resolved == []
 
 
+@pytest.mark.parametrize("broker_on", [False, True])
+def test_tool_catalog_offers_the_egress_tool_only_while_the_broker_is_on(
+    egress_config_file: Path,
+    *,
+    broker_on: bool,
+) -> None:
+    """The dashboard's tool picker lists the Egress Credentials tool only while the broker is on."""
+    response = _admin_client(egress_config_file, broker_on=broker_on).get("/api/tools/")
+
+    assert response.status_code == 200, response.text
+    names = {tool["name"] for tool in response.json()["tools"]}
+    assert "shell" in names
+    assert ("egress_credentials" in names) is broker_on
+
+
 def test_logs_return_the_refusal_code(broker_test_client: TestClient, audit_log: AuditLog) -> None:
     """The administrator's log shows why a request was refused, and null for one that was forwarded."""
     audit_log.record(_audit_record(at=datetime(2026, 10, 1, tzinfo=UTC), path="/ok"))
