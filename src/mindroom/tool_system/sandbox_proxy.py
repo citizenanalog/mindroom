@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 import httpx
-import structlog
 
 from mindroom.agent_cli.shell_contract import current_agent_cli_shell_env
 from mindroom.config.worker_projection import worker_config_data
 from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, RETAINED_MEDIA_MAX_BYTES, build_execution_tool_env
+from mindroom.credentials.policy import is_egress_broker_service
+from mindroom.logging_config import get_logger
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement, declare_tool_schema_source
 from mindroom.tool_system.registry_state import TOOL_METADATA
@@ -58,7 +59,7 @@ from mindroom.workers.runtime import (
     serialized_kubernetes_worker_config_snapshot,
 )
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -269,9 +270,7 @@ def _read_proxy_tools(
     return {part.strip() for part in raw_value.split(",") if part.strip()}
 
 
-def _read_credential_policy(runtime_paths: RuntimePaths) -> dict[str, tuple[str, ...]]:  # noqa: C901
-    from mindroom.credentials.policy import is_egress_broker_service  # noqa: PLC0415
-
+def _read_credential_policy(runtime_paths: RuntimePaths) -> dict[str, tuple[str, ...]]:
     raw_policy = (
         runtime_paths.env_value(SANDBOX_RUNTIME_ENV_BY_KEY["credential_policy_json"], default="") or ""
     ).strip()
@@ -292,22 +291,15 @@ def _read_credential_policy(runtime_paths: RuntimePaths) -> dict[str, tuple[str,
             continue
         if not isinstance(services, list):
             continue
-        cleaned_services = []
-        dropped_egress = []
-        for service in services:
-            if isinstance(service, str) and service.strip():
-                stripped = service.strip()
-                if is_egress_broker_service(stripped):
-                    dropped_egress.append(stripped)
-                else:
-                    cleaned_services.append(stripped)
-        if dropped_egress:
+        cleaned = [service.strip() for service in services if isinstance(service, str) and service.strip()]
+        dropped = [service for service in cleaned if is_egress_broker_service(service)]
+        if dropped:
             logger.warning(
                 "Egress broker secrets are never leased to workers; dropping from credential policy",
                 selector=selector.strip(),
-                dropped_services=dropped_egress,
+                dropped_services=dropped,
             )
-        policy[selector.strip()] = tuple(cleaned_services)
+        policy[selector.strip()] = tuple(service for service in cleaned if not is_egress_broker_service(service))
     return policy
 
 
