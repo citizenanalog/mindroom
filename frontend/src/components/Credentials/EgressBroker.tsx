@@ -649,8 +649,36 @@ function LogSection() {
   );
 }
 
-/** The keys and accounts of the shared agents and of the agents without a scope, plus the request log. */
+/**
+ * The Agent Keys card, shown only while the egress broker is on. Every egress
+ * route answers 404 while it is off, so one listing tells, and then nothing
+ * else asks. Any other answer shows the card, which reports a failure itself.
+ */
 export function EgressBroker() {
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    let current = true;
+    void fetch(API_ENDPOINTS.egressBroker.services, {
+      credentials: "same-origin",
+    })
+      .then(
+        (response) => response.status !== 404,
+        () => true,
+      )
+      .then((on) => {
+        if (current) setEnabled(on);
+      });
+    return () => {
+      current = false;
+    };
+  }, []);
+
+  return enabled ? <AgentKeys /> : null;
+}
+
+/** The keys and accounts of the shared agents and of the agents without a scope, plus the request log. */
+function AgentKeys() {
   const agents = useConfigStore((state) => state.agents);
   const config = useConfigStore((state) => state.config);
   const defaults = config?.defaults;

@@ -156,6 +156,9 @@ function requests(pathname: string, method = "GET") {
     .map(([input]) => new URL(String(input), "http://localhost"));
 }
 
+// The panel's first listing only checks that the broker is on; the loads come after it.
+const listings = () => requests("/api/egress-broker/services").slice(1);
+
 const row = (name: string) => screen.getByRole("listitem", { name });
 const selectTarget = (value: string) =>
   fireEvent.change(screen.getByLabelText("Keys for"), {
@@ -191,6 +194,36 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+});
+
+describe("whether the panel shows", () => {
+  it("shows nothing and asks nothing more while the broker is off", async () => {
+    // Every egress route answers 404 while the broker is off.
+    vi.mocked(fetch).mockImplementation(async () =>
+      json({ detail: "Agent Keys are not enabled" }, 404),
+    );
+    const { container } = render(<EgressBroker />);
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    // Give a follow-up request, or a card, the chance to appear.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(container).toBeEmptyDOMElement();
+    expect(vi.mocked(fetch).mock.calls.map(([input]) => String(input))).toEqual(
+      ["/api/egress-broker/services"],
+    );
+  });
+
+  it("shows the panel, which reports the failure, when the check itself fails", async () => {
+    vi.mocked(fetch).mockRejectedValue(new Error("Network down"));
+    render(<EgressBroker />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent Keys" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Network down")).toBeInTheDocument();
+  });
 });
 
 describe("egress broker panel", () => {
@@ -257,7 +290,7 @@ describe("egress broker panel", () => {
         name: "Replace key for openai",
       }),
     ).toBeInTheDocument();
-    expect(requests("/api/egress-broker/services")[0].search).toBe("");
+    expect(listings()[0].search).toBe("");
   });
 
   it("shows an error when the services cannot be loaded", async () => {
@@ -315,7 +348,7 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
 
     expect(screen.getByLabelText("Keys for")).toHaveValue("team");
-    const loads = requests("/api/egress-broker/services");
+    const loads = listings();
     expect(loads).toHaveLength(1);
     expect(loads[0].searchParams.get("agent_name")).toBe("team");
   });
@@ -356,9 +389,7 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
     expect(optionsOf()).toEqual(["Agents without a scope"]);
     expect(screen.getByLabelText("Keys for")).toHaveValue("");
-    expect(
-      requests("/api/egress-broker/services")[0].searchParams.get("agent_name"),
-    ).toBeNull();
+    expect(listings()[0].searchParams.get("agent_name")).toBeNull();
   });
 
   it("follows the default worker scope for agents without their own", async () => {
@@ -492,25 +523,15 @@ describe("egress broker key target", () => {
     sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
-    expect(
-      requests("/api/egress-broker/services")[0].searchParams.get("agent_name"),
-    ).toBe("coder");
+    expect(listings()[0].searchParams.get("agent_name")).toBe("coder");
 
     selectTarget("");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
-    expect(
-      requests("/api/egress-broker/services")[1].searchParams.get("agent_name"),
-    ).toBeNull();
+    await waitFor(() => expect(listings()).toHaveLength(2));
+    expect(listings()[1].searchParams.get("agent_name")).toBeNull();
 
     selectTarget("coder");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(3),
-    );
-    expect(
-      requests("/api/egress-broker/services")[2].searchParams.get("agent_name"),
-    ).toBe("coder");
+    await waitFor(() => expect(listings()).toHaveLength(3));
+    expect(listings()[2].searchParams.get("agent_name")).toBe("coder");
   });
 
   it("saves a secret for the selected agent and clears the input", async () => {
@@ -542,9 +563,7 @@ describe("egress broker key target", () => {
     );
     expect(screen.queryByLabelText("GitHub API key")).toBeNull();
     // The list is reloaded after a save.
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
+    await waitFor(() => expect(listings()).toHaveLength(2));
     // Reopening the editor must not show the previous value.
     fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
     expect(screen.getByLabelText("GitHub API key")).toHaveValue("");
@@ -626,7 +645,7 @@ describe("egress broker key target", () => {
 
     expect(screen.getByLabelText("Keys for")).toHaveValue("coder");
     await waitFor(() => {
-      const loads = requests("/api/egress-broker/services");
+      const loads = listings();
       expect(loads).toHaveLength(3);
       expect(loads[2].searchParams.get("agent_name")).toBe("coder");
     });
@@ -778,7 +797,7 @@ describe("egress broker connected accounts", () => {
         "Connected as octocat · shared with everyone using Agent coder",
       ),
     ).toBeInTheDocument();
-    expect(requests("/api/egress-broker/services")).toHaveLength(2);
+    expect(listings()).toHaveLength(2);
   });
 
   it("reads the selected agent's services again when the popup closes without answering", async () => {
@@ -809,9 +828,9 @@ describe("egress broker connected accounts", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Authorization was cancelled.")).toBeNull();
     // The first load, the check after the popup closed, and the reload.
-    const listings = requests("/api/egress-broker/services");
-    expect(listings).toHaveLength(3);
-    expect(listings.map((url) => url.searchParams.get("agent_name"))).toEqual([
+    const loads = listings();
+    expect(loads).toHaveLength(3);
+    expect(loads.map((url) => url.searchParams.get("agent_name"))).toEqual([
       "coder",
       "coder",
       "coder",
@@ -851,9 +870,7 @@ describe("egress broker connected accounts", () => {
       requests("/api/egress-broker/services/github/disconnect", "POST")[0]
         .search,
     ).toBe("");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
+    await waitFor(() => expect(listings()).toHaveLength(2));
   });
 });
 
@@ -1020,9 +1037,7 @@ describe("egress broker request log", () => {
     await screen.findByRole("table", { name: "Request log" });
 
     selectTarget("");
-    await waitFor(() =>
-      expect(requests("/api/egress-broker/services")).toHaveLength(2),
-    );
+    await waitFor(() => expect(listings()).toHaveLength(2));
 
     expect(screen.getByLabelText("Filter by agent")).toHaveValue("");
     expect(requests("/api/egress-broker/logs")).toHaveLength(1);
@@ -1263,7 +1278,7 @@ describe("egress broker service editor", () => {
           String(input).startsWith("/api/connections"),
         ),
     ).toBe(false);
-    expect(requests("/api/egress-broker/services")).toHaveLength(2);
+    expect(listings()).toHaveLength(2);
   });
 
   it("loads the presets from the dashboard API when an editor opens, not before", async () => {

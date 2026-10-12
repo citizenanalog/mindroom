@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Credentials } from "./Credentials";
 
@@ -9,7 +15,7 @@ vi.mock("@/components/ui/use-toast", () => ({
 }));
 
 // The egress panel has its own tests and fetches on mount, which would consume
-// the ordered fetch mocks below. Only the test of the page order asks for the real one.
+// the ordered fetch mocks below. Only the tests of the whole page ask for the real one.
 const realPanel = vi.hoisted(() => ({ wanted: false }));
 vi.mock("./EgressBroker", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./EgressBroker")>();
@@ -139,6 +145,40 @@ describe("Credentials", () => {
       panel.compareDocumentPosition(raw) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.queryByText("Credentials Manager")).toBeNull();
+  });
+
+  it("shows no Agent Keys while the broker is off, and the rest of the page as before", async () => {
+    realPanel.wanted = true;
+    (global.fetch as any).mockImplementation(async (input: string) =>
+      String(input).startsWith("/api/egress-broker/")
+        ? {
+            ok: false,
+            status: 404,
+            json: async () => ({ detail: "Agent Keys are not enabled" }),
+          }
+        : { ok: true, status: 200, json: async () => [] },
+    );
+
+    const egressRequests = () =>
+      (global.fetch as any).mock.calls
+        .map(([input]: [string]) => String(input))
+        .filter((path: string) => path.startsWith("/api/egress-broker/"));
+
+    render(<Credentials />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Raw credential payloads (advanced)",
+      }),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(egressRequests()).toHaveLength(1));
+    // Give a follow-up request, or the card, the chance to appear.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(egressRequests()).toEqual(["/api/egress-broker/services"]);
+    expect(screen.queryByRole("heading", { name: "Agent Keys" })).toBeNull();
+    expect(screen.queryByText(/not enabled/)).toBeNull();
   });
 
   it("keeps the raw editor's error under the raw editor, after the panel", async () => {
