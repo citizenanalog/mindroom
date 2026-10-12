@@ -83,60 +83,56 @@ export function ConnectionServiceRows({
 
   useEffect(() => () => operation.current?.abort(), []);
 
-  const connect = async () => {
-    // A second click on Continue, while the first connect is under way, starts nothing.
-    if (busy !== null) return;
+  /** Runs connect or disconnect; one abandoned by leaving the page or by Cancel changes nothing. */
+  const run = async (
+    kind: "connect" | "disconnect",
+    failure: string,
+    action: (signal: AbortSignal) => Promise<unknown>,
+  ) => {
     const controller = new AbortController();
     operation.current = controller;
-    setBusy("connect");
+    setBusy(kind);
     setError(null);
     try {
-      await connectWithPopup(
-        service.provider,
-        () =>
-          requestConnection<OAuthAuthorization>(
-            `${basePath}/connect`,
-            controller.signal,
-            "POST",
-          ),
-        controller.signal,
-        // A popup that closed after connecting is a connection, not a cancel.
-        async () =>
-          (
-            await requestConnection<ConnectionStatus>(
-              `${basePath}/status`,
-              controller.signal,
-            )
-          ).connected,
-      );
+      await action(controller.signal);
       if (!controller.signal.aborted) onConnectionChange();
     } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(errorText(cause, "Could not connect. Try again."));
+      if (!controller.signal.aborted) setError(errorText(cause, failure));
     } finally {
       if (!controller.signal.aborted) setBusy(null);
     }
   };
 
-  const disconnect = async () => {
+  const connect = () => {
+    // A second click on Continue, while the first connect is under way, starts nothing.
+    if (busy !== null) return;
+    void run("connect", "Could not connect. Try again.", (signal) =>
+      connectWithPopup(
+        service.provider,
+        () =>
+          requestConnection<OAuthAuthorization>(
+            `${basePath}/connect`,
+            signal,
+            "POST",
+          ),
+        signal,
+        // A popup that closed after connecting is a connection, not a cancel.
+        async () =>
+          (
+            await requestConnection<ConnectionStatus>(
+              `${basePath}/status`,
+              signal,
+            )
+          ).connected,
+      ),
+    );
+  };
+
+  const disconnect = () => {
     setConfirmOpen(false);
-    setBusy("disconnect");
-    setError(null);
-    const controller = new AbortController();
-    operation.current = controller;
-    try {
-      await requestConnection(
-        `${basePath}/disconnect`,
-        controller.signal,
-        "POST",
-      );
-      if (!controller.signal.aborted) onConnectionChange();
-    } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(errorText(cause, "Could not disconnect. Try again."));
-    } finally {
-      if (!controller.signal.aborted) setBusy(null);
-    }
+    void run("disconnect", "Could not disconnect. Try again.", (signal) =>
+      requestConnection(`${basePath}/disconnect`, signal, "POST"),
+    );
   };
 
   const tools = agent.tools.filter(
@@ -277,9 +273,7 @@ export function ConnectionServiceRows({
                         disabled={busy !== null || !status.can_connect}
                         aria-label={`Connect ${service.display_name}`}
                         onClick={() =>
-                          service.is_shared
-                            ? setSharedOpen(true)
-                            : void connect()
+                          service.is_shared ? setSharedOpen(true) : connect()
                         }
                       >
                         {busy === "connect" ? "Connecting…" : "Connect"}
@@ -313,7 +307,7 @@ export function ConnectionServiceRows({
                   onCancel={() => setSharedOpen(false)}
                   onContinue={() => {
                     setSharedOpen(false);
-                    void connect();
+                    connect();
                   }}
                 />
                 <ConfirmDialog
@@ -328,7 +322,7 @@ export function ConnectionServiceRows({
                     status?.reset_required ? "Reset connection" : "Disconnect"
                   }
                   onCancel={() => setConfirmOpen(false)}
-                  onConfirm={() => void disconnect()}
+                  onConfirm={disconnect}
                 />
               </td>
             )}
