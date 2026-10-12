@@ -38,7 +38,7 @@ The [Agno compatibility inventory](agno-compatibility.md) covers the full runtim
 
 | Module | Workaround and installation point |
 | --- | --- |
-| `history/agno_compat_message_builder.py` | Preserves roleful Team inputs, strips historical inline media, inserts the compaction summary before replayed history, and records each request's session in Agent/Team message builders; installed explicitly by `agents._initialize_agent_instance` and `teams._create_team_instance`. |
+| `history/agno_compat_message_builder.py` | Preserves roleful Team inputs, strips historical inline media, inserts the compaction summary before replayed history, records each request's session, and reconciles stored history before a continuation fetches it in Agent/Team message builders; installed explicitly by `agents._initialize_agent_instance` and `teams._create_team_instance`. |
 | `agno_compat_model_hooks.py` `install_request_preparation` | Awaits the mid-turn compaction hook before every provider request of an Agent or Team model; installed by `history/mid_turn_compaction.install_mid_turn_compaction` from `create_agent` and team creation, before the model-call cap. |
 | `session_storage/agno_compat_session_persistence.py` | Guards and adapts Agno's asynchronous persistence against the owned session store; installed by `agent_storage._create_sqlite_state_storage` before filesystem work. |
 | `agno_compat_prepared_tools.py` | Shares private Agent/Team tool preparation between RTC execution and prompt inspection; temporarily supplies Team tool instructions, restoring the original list even on failure. |

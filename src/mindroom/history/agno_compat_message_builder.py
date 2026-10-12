@@ -216,6 +216,16 @@ def _prepare_history(
     return _strip_history_inline_media(run_messages)
 
 
+# AGNO_COMPAT: Continuations fetch stored history with no owner hook before the fetch.
+# Reason: Agno's continuation builders read the stored runs a resumed run replays inside their private message
+# building, so MindRoom settles that stored history, archiving the runs a mid-turn compaction before the pause
+# covered, from inside the wrapped builders; a new run gets the same settling during reply preparation.
+# Upstream issue: Tracking gap; no issue identified for a hook before a continuation fetches history.
+# Upstream PR: None identified.
+# Remove when: Agno offers an owner hook that runs before a continuation reads stored history, for agents and teams,
+# sync and async; the settling itself stays MindRoom's and must still run before that read.
+# Coverage: tests/test_mid_turn_compaction.py::test_approval_resume_after_mid_turn_compaction;
+# tests/test_mid_turn_compaction.py::test_team_approval_resume_after_mid_turn_compaction.
 def _reconcile_continuation(target: object, kwargs: dict[str, object]) -> None:
     """Settle the stored history a continuation is about to fetch, as reply preparation does for a new run.
 

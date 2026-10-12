@@ -51,7 +51,7 @@ from mindroom.response_turn import (
     ResponsePausedForApproval,
     apply_exact_approval_decisions,
 )
-from mindroom.session_storage.agent_storage import create_session_storage, create_state_storage
+from mindroom.session_storage.agent_storage import create_session_storage, create_state_storage, get_agent_session
 from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
 from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.runtime_context import (
@@ -484,6 +484,105 @@ async def test_restart_settles_outer_bash_approval_without_running_it(
     assert ("saved command was not resumed" if approved else "Denied") in follow_up.ctx.transient_enrichment_items[
         0
     ].text
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_approval_saves_no_tool_call_its_fold_already_summarized(tmp_path: Path) -> None:
+    """The paused reply's trace still lists the folded shell call and its nested tool; the saved record does not."""
+    catalog = await _catalog(tmp_path, [])
+    shell_toolkit = shell_tools()(runtime_paths=catalog.runtime_context.runtime_paths)
+    agents._set_toolkit_approval_origin(shell_toolkit, "shell")
+    catalog.agent = minimal_agent.MinimalAgent(id="helper", model=catalog.agent.model, tools=[shell_toolkit])
+    catalog.run_response.agent_id = "helper"
+    catalog.agent.db = create_state_storage("helper", tmp_path, subdir="sessions", session_table="sessions")
+    folded = ToolExecution(
+        tool_call_id="folded-bash",
+        tool_name="run_shell_command",
+        tool_args={"command": "echo folded"},
+        result="folded shell output",
+        tool_call_error=False,
+    )
+    nested = ToolExecution(
+        tool_call_id="nested-call",
+        tool_name="read_file",
+        tool_args={"path": "notes.md"},
+        result="nested tool output",
+        tool_call_error=False,
+    )
+    # The fold took the earlier shell call's messages out of the run's record.
+    catalog.run_response.tools = [folded]
+    catalog.run_response.metadata = {MID_TURN_GENERATION_METADATA_KEY: 1}
+    arguments = {"command": "touch never"}
+    requirement = RunRequirement(
+        ToolExecution(
+            tool_call_id="bash",
+            tool_name="run_shell_command",
+            tool_args=arguments,
+            requires_confirmation=True,
+        ),
+    )
+    presentation = CollectedStreamPresentation(show_tool_calls=True, track_hidden_tools=True)
+    for execution, parent in ((folded, None), (nested, "folded-bash")):
+        projected = project_cli_execution(execution, parent=parent, toolkit_name="shell")
+        presentation.start_tool(projected)
+        presentation.complete_tool(projected)
+    presentation.start_tool(project_cli_execution(requirement.tool_execution, parent="bash", toolkit_name="shell"))
+    continuation = approval_continuation(
+        run_id="run",
+        session_id="session",
+        entity_name="helper",
+        room_id="!room:test",
+        requester_id="@alice:test",
+        response_event_id="$response",
+        state="claimed",
+        calls=(
+            ApprovalCall(
+                "bash",
+                "run_shell_command",
+                "helper",
+                100,
+                decision=ApprovalDecision.DENIED,
+                toolkit_name="shell",
+                arguments_digest=approval_arguments_digest(arguments),
+            ),
+        ),
+        cli_call=CliApprovalCall(
+            toolkit="shell",
+            function="run_shell_command",
+            arguments=arguments,
+            call_id="bash",
+            parent_bash_call_id="bash",
+            requirements=(requirement,),
+            delegation_depth=0,
+        ).to_dict(),
+    )
+
+    with tool_runtime_context(catalog.runtime_context):
+        await cli_approval_recovery.continue_cli_approval(
+            catalog.agent,
+            continuation,
+            CliApprovalCall.from_dict(continuation.cli_call),
+            catalog.run_response,
+            catalog.session,
+            paused_answer=PausedAnswer(text=presentation.final_text(), tool_trace=tuple(presentation.tool_trace)),
+            runtime_context=catalog.runtime_context,
+            decisions={"bash": False},
+            denial_reasons={"bash": "Denied"},
+            tool_trace_collector=[],
+            refresh_scheduler=None,
+            authorize=AsyncMock(),
+            progress=None,
+        )
+
+    stored = get_agent_session(catalog.agent.db, "session")
+    assert stored is not None
+    saved = "\n".join(
+        str(message.content) for run in stored.runs or [] if run.run_id == "run" for message in run.messages or []
+    )
+    # The denied call is recorded, and no folded result returns beside the summary that holds it.
+    assert "Denied" in saved
+    assert "folded shell output" not in saved
+    assert "nested tool output" not in saved
 
 
 @pytest.mark.asyncio
