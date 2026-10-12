@@ -47,7 +47,7 @@ _CONNECT_LISTENER_NAME = "_set_sqlite_pragmas"
 # Upstream PR: None identified for this extension point.
 # Remove when: SqliteDb exposes configurable pragmas; preserve owner journaling and
 # foreign-key behavior without inspecting SQLAlchemy's listener registry.
-# Coverage: tests/test_agent_storage_runs.py::test_legacy_runs_blob_is_merged_into_reads_and_deletions_stick.
+# Coverage: tests/test_agent_storage_runs.py::test_agno_2_blob_runs_become_rows_once.
 def remove_default_pragmas(engine: Engine) -> None:
     """Remove exactly the Agno pragma listener before the owner installs its own."""
     connect_listeners = cast("Any", engine.pool.dispatch).connect.listeners
@@ -98,7 +98,7 @@ def _existing_table(db: SqliteDb, table_type: Literal["runs", "sessions"]) -> Ta
 # retain the owner's independent usage retention and atomic snapshot update.
 # Coverage: tests/test_usage_storage.py::test_usage_write_failure_rolls_back_the_run and
 # tests/test_usage_storage.py::test_a_refused_save_of_a_removed_run_still_records_usage.
-def insert_run_row(
+def _insert_run_row(
     transaction: Session,
     runs: Table,
     run: RunOutput | TeamRunOutput | WorkflowRunOutput | dict[str, Any],
@@ -198,7 +198,7 @@ def upsert_run_at_end(
         connection.exec_driver_sql("BEGIN IMMEDIATE")
         for statement in summary_rows_schema_sql(db.session_table_name):
             connection.exec_driver_sql(statement)
-        stored = insert_run_row(
+        stored = _insert_run_row(
             transaction,
             runs,
             run,

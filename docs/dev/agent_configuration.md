@@ -199,7 +199,7 @@ Set `enabled: false` in defaults or the agent override to disable automatic pre-
 Manual `compact_context` records a durable request that runs before the next reply in the same conversation scope.
 Manual `compact_context` remains available when a compaction model and context window are configured and the resolved summary input budget exceeds 2,000 tokens.
 Required compaction runs before the reply with a Matrix lifecycle notice that is edited in place; otherwise MindRoom leaves the session unchanged and relies on replay fitting for that reply.
-Compaction moves the oldest runs into the conversation's compaction archive and replays them through `session.summary`, while only recent raw runs remain in `session.runs`.
+Compaction keeps every run stored and appends a summary row that replays through `session.summary`, while only the runs after it load into `session.runs`.
 - **max_tool_calls_from_history**: Max tool call messages replayed from history (per-agent override)
 - **max_tool_calls_per_turn**: Max tool calls one turn may execute (per-agent override of `defaults.max_tool_calls_per_turn`, 1000); later calls return a tool error, and the turn ends with its text so far after this many plus two model requests
 - **show_tool_calls**: Whether to show tool call details inline in responses (per-agent override). When disabled, routed tools may still show generic worker warmup copy, but it never includes tool identifiers or tool-trace metadata

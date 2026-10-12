@@ -3249,7 +3249,7 @@ def enforce_turn_authorization() -> None:
 def seed_session[SessionT: "AgentSession | TeamSession"](storage: "BaseDb", session: SessionT) -> SessionT:
     """Persist a session row and every run it holds, in order, and return the session.
 
-    Production code writes runs explicitly (``save_runs``/``replace_runs``);
+    Production code writes runs explicitly (``save_runs``/``delete_runs``);
     tests seed whole histories with this instead.
     """
     storage.upsert_session(session)
