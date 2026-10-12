@@ -708,45 +708,32 @@ def _oauth_browser_error_response(
     return _oauth_browser_page(title, message, tone="error", status_code=status_code, script=script)
 
 
-def _allowed_opener_origins(provider: OAuthProvider, runtime_paths: RuntimePaths) -> frozenset[str]:
-    """Return the origins a popup's last page may post to: its completion origin and the dashboard's CORS origins.
+def _validated_opener_origin(origin: str | None, provider: OAuthProvider, runtime_paths: RuntimePaths) -> str | None:
+    """Return `origin` when a popup's last page may post to it: its completion origin or a dashboard CORS origin.
 
     The dashboard's CORS `*` allows every origin to call the API, never to receive this message, so it adds none.
     """
-    origins = {_oauth_success_origin(provider, runtime_paths)}
-    origins.update(origin for origin in dashboard_cors_origins(runtime_paths) if origin != "*")
-    return frozenset(origins)
+    allowed = {_oauth_success_origin(provider, runtime_paths), *dashboard_cors_origins(runtime_paths)} - {"*"}
+    return origin if origin in allowed else None
 
 
-def _validated_opener_origin(origin: str | None, provider: OAuthProvider, runtime_paths: RuntimePaths) -> str | None:
-    """Return `origin` when a popup's last page may post to it (`_allowed_opener_origins`), else None."""
-    return origin if origin in _allowed_opener_origins(provider, runtime_paths) else None
+def _opener_notice(request: Request, provider_id: str, *, from_state: bool = False) -> _OpenerNotice | None:
+    """Return the notice for a page answering `request`: a registered provider, at a validated opener origin.
 
-
-def _request_notice(request: Request, provider_id: str) -> _OpenerNotice | None:
-    """Return the notice for a page answering `request` itself: a registered provider, at the request's own Origin.
-
+    The origin is the request's own Origin header, or with `from_state` the one the callback's pending state recorded.
+    That state is read, never consumed, so this works before the callback is handled and for a refusal of it.
     An unknown provider gets none, so a page names only a real provider, never other URL text.
     """
     try:
         provider, runtime_paths = _load_provider(request, provider_id)
     except _UnknownOAuthProviderError:
         return None
-    origin = _validated_opener_origin(request.headers.get("origin"), provider, runtime_paths)
-    return _OpenerNotice(provider.id, origin)
-
-
-def _callback_notice(request: Request, provider_id: str) -> _OpenerNotice | None:
-    """Return the notice for a callback page: a registered provider, at the opener origin its pending state recorded.
-
-    The state is read, never consumed, so this works before the callback is handled and for a refusal of it.
-    """
-    try:
-        provider, runtime_paths = _load_provider(request, provider_id)
-    except _UnknownOAuthProviderError:
-        return None
-    recorded = pending_oauth_opener_origin(request, provider.id, request.query_params.get("state"))
-    return _OpenerNotice(provider.id, _validated_opener_origin(recorded, provider, runtime_paths))
+    origin = (
+        pending_oauth_opener_origin(request, provider.id, request.query_params.get("state"))
+        if from_state
+        else request.headers.get("origin")
+    )
+    return _OpenerNotice(provider.id, _validated_opener_origin(origin, provider, runtime_paths))
 
 
 def _oauth_flow_error_response(exc: HTTPException, *, notice: _OpenerNotice | None) -> HTMLResponse:
@@ -810,7 +797,7 @@ async def authorize(
     try:
         return await _authorize(provider_id, request, agent_name=agent_name, connect_token=connect_token)
     except HTTPException as exc:
-        return _oauth_flow_error_response(exc, notice=_request_notice(request, provider_id))
+        return _oauth_flow_error_response(exc, notice=_opener_notice(request, provider_id))
 
 
 async def _authorize(
@@ -1106,7 +1093,7 @@ async def callback(provider_id: str, request: Request) -> Response:
     can show, with the same status as the JSON error would have had.
     """
     # Read before handling, which consumes the state that recorded the opener's origin.
-    notice = _callback_notice(request, provider_id)
+    notice = _opener_notice(request, provider_id, from_state=True)
     error = request.query_params.get("error")
     if error:
         return _oauth_provider_error_response(error, notice=notice)
