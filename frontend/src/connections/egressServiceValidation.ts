@@ -23,8 +23,8 @@ import type { AuthoredEgressService } from "./types";
  * the editor where to put them.
  */
 
-const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
-const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+// Service names and account provider ids, as the server checks them.
+const ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 
 function hostError(host: string): string | null {
   const value = host.trim().toLowerCase();
@@ -136,7 +136,7 @@ function nameProblem(
   settings: { takenNames: readonly string[] },
 ): string | null {
   if (name === "") return "Name is required";
-  if (!NAME_PATTERN.test(name) || name.length > MAX_NAME_LENGTH)
+  if (!ID_PATTERN.test(name) || name.length > MAX_NAME_LENGTH)
     return `Name must start with a lowercase letter or digit and use only lowercase letters, digits, - and _ (${MAX_NAME_LENGTH} characters at most)`;
   if (/_oauth(_client)?$/.test(name))
     return "Name must not end in _oauth or _oauth_client";
@@ -222,7 +222,7 @@ export function validateService(
     form.preset === "" &&
     !options.sharedTarget &&
     form.oauthProvider.trim() &&
-    !PROVIDER_PATTERN.test(form.oauthProvider.trim())
+    !ID_PATTERN.test(form.oauthProvider.trim())
   )
     problems.push({
       field: "oauthProvider",
