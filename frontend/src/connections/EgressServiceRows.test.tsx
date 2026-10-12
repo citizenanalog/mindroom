@@ -312,6 +312,18 @@ describe("egress service rows", () => {
     ).toBeInTheDocument();
   });
 
+  it("warns that removing a personal key cuts off the agent until a key is set again", async () => {
+    renderRows([openai]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove key for OpenAI" }),
+    );
+    expect(
+      await screen.findByText(
+        "This deletes your saved key. Your agent loses access to this service until you set a key again.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("reports a forbidden save with the connections wording by default", async () => {
     vi.mocked(fetch).mockImplementation(async () => json({}, 403));
     renderRows([github]);
