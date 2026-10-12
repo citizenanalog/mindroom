@@ -58,6 +58,14 @@ def _delete(manager: CredentialsManager, target: ResolvedWorkerTarget | None, na
     return delete_user_service(manager, target, name, config_services=_CONFIG.services)
 
 
+def _store_raw(manager: CredentialsManager, services: object) -> None:
+    """Write `services` as Alice's stored document as is, without `save_user_service`'s checks."""
+    manager.for_primary_runtime_scope(_ALICE, "code").save_credentials(
+        USER_SERVICES_CREDENTIAL_SERVICE,
+        {"services": services},
+    )
+
+
 def test_saved_service_is_stored_in_authored_form_in_the_primary_only_scope_store(manager: CredentialsManager) -> None:
     """A preset service keeps its preset form, in the requester's primary-only store under the reserved name."""
     _save(
@@ -158,18 +166,15 @@ def test_rule_count_is_capped_per_service(manager: CredentialsManager) -> None:
 
 def test_invalid_stored_entry_is_skipped_by_name_only(manager: CredentialsManager) -> None:
     """One entry that no longer validates is skipped with a warning naming it; the rest of the scope still loads."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
     good = _service().authored_model_dump()
-    store.save_credentials(
-        USER_SERVICES_CREDENTIAL_SERVICE,
+    _store_raw(
+        manager,
         {
-            "services": {
-                "good": good,
-                "bad-auth": {"rules": [{"host": "x.example.com", "auth": {"type": "carrier-pigeon"}}]},
-                "opted-in": {**good, "oauth_on_shared_workers": True},
-                "Bad Name": good,
-                "not-a-dict": "rules",
-            },
+            "good": good,
+            "bad-auth": {"rules": [{"host": "x.example.com", "auth": {"type": "carrier-pigeon"}}]},
+            "opted-in": {**good, "oauth_on_shared_workers": True},
+            "Bad Name": good,
+            "not-a-dict": "rules",
         },
     )
 
@@ -186,20 +191,17 @@ def test_invalid_stored_entry_is_skipped_by_name_only(manager: CredentialsManage
 def test_inactive_entries_are_the_shadowed_and_the_invalid_ones_with_their_reason(manager: CredentialsManager) -> None:
     """The ignored entries are reported by name, shadowing first, without a log line for each listing."""
     good = _service().authored_model_dump()
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
-    store.save_credentials(
-        USER_SERVICES_CREDENTIAL_SERVICE,
+    _store_raw(
+        manager,
         {
-            "services": {
-                "good": good,
-                "github": good,
-                "bad-auth": {"rules": [{"host": "x.example.com", "auth": {"type": "carrier-pigeon"}}]},
-                "opted-in": {**good, "oauth_on_shared_workers": True},
-                "Bad Name": good,
-                "not-a-dict": "rules",
-                # Both shadowed and invalid: the operator's service is the reason it is ignored.
-                "both": "rules",
-            },
+            "good": good,
+            "github": good,
+            "bad-auth": {"rules": [{"host": "x.example.com", "auth": {"type": "carrier-pigeon"}}]},
+            "opted-in": {**good, "oauth_on_shared_workers": True},
+            "Bad Name": good,
+            "not-a-dict": "rules",
+            # Both shadowed and invalid: the operator's service is the reason it is ignored.
+            "both": "rules",
         },
     )
     config = EgressBrokerConfig.model_validate(
@@ -228,18 +230,13 @@ def test_a_scope_without_ignored_entries_has_no_inactive_ones(manager: Credentia
     assert inactive_user_services(_CONFIG, manager, worker_target()) == []
     _save(manager, worker_target(), "mine", _service())
     assert inactive_user_services(_CONFIG, manager, worker_target()) == []
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
-    store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": ["not", "a", "mapping"]})
+    _store_raw(manager, ["not", "a", "mapping"])
     assert inactive_user_services(_CONFIG, manager, worker_target()) == []
 
 
 def test_deleting_an_invalid_entry_removes_it_and_its_key(manager: CredentialsManager) -> None:
     """An entry that no longer validates is no config service's shadow, so its stored key goes with it."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
-    store.save_credentials(
-        USER_SERVICES_CREDENTIAL_SERVICE,
-        {"services": {"stale": {"rules": []}, "good": _service().authored_model_dump()}},
-    )
+    _store_raw(manager, {"stale": {"rules": []}, "good": _service().authored_model_dump()})
     save_secret(manager, worker_target(), "stale", "old-key")
 
     assert _delete(manager, worker_target(), "stale") is True
@@ -252,11 +249,7 @@ def test_deleting_an_invalid_entry_removes_it_and_its_key(manager: CredentialsMa
 
 def test_deleting_an_entry_with_a_name_the_store_rejects_still_succeeds(manager: CredentialsManager) -> None:
     """An entry written outside `save_user_service` can carry a name no key can have; deleting it still works."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
-    store.save_credentials(
-        USER_SERVICES_CREDENTIAL_SERVICE,
-        {"services": {"Bad Name": _service().authored_model_dump(), "good": _service().authored_model_dump()}},
-    )
+    _store_raw(manager, {"Bad Name": _service().authored_model_dump(), "good": _service().authored_model_dump()})
 
     assert _delete(manager, worker_target(), "Bad Name") is True
 
@@ -266,8 +259,7 @@ def test_deleting_an_entry_with_a_name_the_store_rejects_still_succeeds(manager:
 
 def test_malformed_document_reads_as_no_services(manager: CredentialsManager) -> None:
     """A document without a services mapping is ignored with a warning instead of failing the scope."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
-    store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": ["not", "a", "mapping"]})
+    _store_raw(manager, ["not", "a", "mapping"])
 
     with capture_logs() as logs:
         assert load_user_services(manager, worker_target()) == {}
@@ -615,13 +607,9 @@ def test_an_oauth_provider_without_a_preset_is_refused(manager: CredentialsManag
 
 def test_a_stored_oauth_provider_off_its_providers_hosts_is_dropped(manager: CredentialsManager) -> None:
     """A stored personal service that sends its account elsewhere loses the account on load and keeps its rules."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
     elsewhere = {**_service("api.notes.example.com").authored_model_dump(), "oauth_provider": "github"}
     on_github = {**_service("api.github.com").authored_model_dump(), "oauth_provider": "github"}
-    store.save_credentials(
-        USER_SERVICES_CREDENTIAL_SERVICE,
-        {"services": {"elsewhere": elsewhere, "on-github": on_github}},
-    )
+    _store_raw(manager, {"elsewhere": elsewhere, "on-github": on_github})
 
     with capture_logs() as logs:
         loaded = load_user_services(manager, worker_target())
@@ -736,9 +724,8 @@ def test_stored_placeholders_users_may_not_set_are_dropped(
     never_logged: list[str],
 ) -> None:
     """A stored placeholder that fails the user rules is dropped by name; the service and its other placeholders stay."""
-    store = manager.for_primary_runtime_scope(_ALICE, "code")
     authored = {**_service().authored_model_dump(), "placeholder_env": placeholders}
-    store.save_credentials(USER_SERVICES_CREDENTIAL_SERVICE, {"services": {"mine": authored}})
+    _store_raw(manager, {"mine": authored})
 
     with capture_logs() as logs:
         loaded = load_user_services(manager, worker_target())
