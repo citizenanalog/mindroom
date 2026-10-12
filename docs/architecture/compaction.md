@@ -20,7 +20,7 @@ All paths below are relative to `src/mindroom/`.
 | `history/storage.py` | Durable scope state, seen ids derived from loaded runs and summary rows, compaction chunk appends, and redaction and edit cuts, including the legacy summary rules. |
 | `history/summary_rows.py` | The `<session_table>_summaries` and `<session_table>_removed_runs` tables: appending a summary row against its basis, the event sets rows fold, and cutting the log. |
 | `history/summary_rows_schema.py` | The summary-row table layout, shared with session reads, run writes, and migrations. |
-| `history/legacy_compaction_state.py` | The one-time migration, run when a conversation database opens, that gives every run a position and adopts state written when compaction deleted runs as content-free legacy summary rows. |
+| `history/legacy_compaction_state.py` | The one-time migration, run when a conversation database opens, that gives every run a position, turns the compaction archive's generations into summary rows beside the runs they archived, and adopts state written when compaction deleted runs as content-free legacy summary rows. |
 | `history/native.py` | Selecting and configuring native compaction for the resolved history route. |
 | `native_compaction.py` | Provider-neutral checkpoint and native replay data. |
 
