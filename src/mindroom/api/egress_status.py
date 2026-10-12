@@ -1,4 +1,4 @@
-"""Egress service status and request-log responses shared by the personal and the admin egress APIs."""
+"""Egress service status, presets, request-log responses, and the account connection gate shared by both egress APIs."""
 
 from __future__ import annotations
 

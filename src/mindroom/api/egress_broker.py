@@ -83,7 +83,6 @@ async def _load_service_statuses_for_target(
     worker_target = worker_target_for_credentials_target(target)
 
     services: list[_ServiceStatus] = []
-    # Reading the scope's own services touches the credential store, so it stays off the event loop.
     scope_services = await asyncio.to_thread(effective_services, config, target.base_manager, worker_target)
     for name, service_config in scope_services.items():
         oauth_part = await egress_oauth_status(

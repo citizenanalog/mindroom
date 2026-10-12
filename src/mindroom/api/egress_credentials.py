@@ -120,7 +120,7 @@ def _check_agent_eligibility(
     """Return ``(is_shared, can_manage)`` for an eligible agent, else ``None``.
 
     Eligibility requires a ``shell`` or ``python`` tool and permission to use the agent.
-    Listing, portal catalog, and mutations all decide through this one rule.
+    Listing, portal catalog, mutations, and the request log's shared-agent rows all decide through this one rule.
     """
     entity = config.resolve_entity(agent_name)
     if not any(tool in entity.available_tools for tool in ("shell", "python")):
@@ -164,13 +164,10 @@ def _resolve_agent(request: Request, requester_id: str, agent_name: str) -> _Res
 
     runtime_paths = snapshot.runtime_paths
     human_requester = resolve_human_requester_alias(requester_id, config, runtime_paths)
-
-    # Check eligibility: must have shell/python AND be allowed
     eligibility = _check_agent_eligibility(request, agent_name, human_requester, config, runtime_paths)
     if eligibility is None:
         raise HTTPException(404, "Agent is not available", headers=CONNECTIONS_HEADERS)
 
-    # Always build target for the agent scope
     target = build_connection_agent_target(config, runtime_paths, human_requester, agent_name)
     manager = get_runtime_credentials_manager(runtime_paths)
     return _ResolvedAgent(config, runtime_paths, target, manager, can_manage=eligibility[1])
@@ -300,7 +297,6 @@ async def egress_services_for_agent(
     is_shared, can_manage = eligibility
     manager = get_runtime_credentials_manager(runtime_paths)
     target = build_connection_agent_target(config, runtime_paths, requester_id, agent_name)
-    # Reading the scope's own services touches the credential store, so it stays off the event loop.
     services = await asyncio.to_thread(effective_services, config, manager, target)
     rows = []
     for name, service in services.items():
@@ -381,7 +377,6 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
         if services is None:
             continue
         target = build_connection_agent_target(config, runtime_paths, human_requester, agent_name)
-        # Reading the scope's own services touches the credential store, so it stays off the event loop.
         inactive = await asyncio.to_thread(inactive_user_services, config.egress_broker, manager, target)
         agents.append(
             EgressCredentialAgent(
@@ -463,7 +458,7 @@ def delete_egress_secret(
 
 
 async def _limit_service_body(request: Request) -> None:
-    """Refuse a service body over 16 KiB with 413 before its fields are validated, so a huge rules list never is.
+    """Refuse a body over `MAX_SERVICE_BYTES` with 413 before its fields are validated, so a huge rules list never is.
 
     FastAPI has already read the body, so this reads Starlette's cached bytes.
     """
