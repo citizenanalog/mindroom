@@ -34,6 +34,7 @@ from mindroom.api.egress_status import (
     egress_service_status,
     oauth_provider_of_service,
     presets_response,
+    require_egress_broker_enabled,
     rule_summaries,
     service_oauth_provider,
 )
@@ -66,7 +67,11 @@ if TYPE_CHECKING:
     from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
-router = APIRouter(prefix="/api/connections/egress", tags=["egress-credentials"])
+router = APIRouter(
+    prefix="/api/connections/egress",
+    tags=["egress-credentials"],
+    dependencies=[Depends(require_egress_broker_enabled)],
+)
 
 
 # Request gates and agent resolution

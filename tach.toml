@@ -1574,6 +1574,7 @@ depends_on = [
 path = "mindroom.api.egress_status"
 depends_on = [
     "mindroom.api.config_lifecycle",
+    "mindroom.api.connection_agents",
     "mindroom.api.oauth",
     "mindroom.egress_broker.secrets",
 ]

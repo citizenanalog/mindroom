@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
@@ -27,6 +27,7 @@ from mindroom.api.egress_status import (
     egress_service_status,
     oauth_provider_of_service,
     presets_response,
+    require_egress_broker_enabled,
     rule_summaries,
 )
 from mindroom.egress_broker.secrets import delete_secret, save_secret
@@ -40,7 +41,11 @@ if TYPE_CHECKING:
     from mindroom.oauth import OAuthProvider
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
-router = APIRouter(prefix="/api/egress-broker", tags=["egress-broker"])
+router = APIRouter(
+    prefix="/api/egress-broker",
+    tags=["egress-broker"],
+    dependencies=[Depends(require_egress_broker_enabled)],
+)
 
 
 class _ServiceStatus(EgressSourceStatus):

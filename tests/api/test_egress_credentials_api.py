@@ -17,6 +17,7 @@ import jwt
 import pytest
 import yaml
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from structlog.testing import capture_logs
@@ -106,6 +107,8 @@ def egress_portal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce_turn_
         "MINDROOM_PUBLIC_URL": "https://portal.example.org",
         # A dedicated backend, where a personal agent's worker belongs to one requester.
         "MINDROOM_WORKER_BACKEND": "docker",
+        # The broker runs exactly when its port is set; the API never starts it, so any port enables the routes.
+        "MINDROOM_EGRESS_BROKER_PORT": "8768",
     }
     paths = _runtime_paths(tmp_path, env)
     payload = {
@@ -511,6 +514,31 @@ def test_works_with_and_without_connections_agent(
     assert _agent_rows(listing) == ["personal", "shared_dev"]
     # Non-admin user should be allowed (personal user gate test)
     assert "Administrator access required" not in listing.text
+
+
+def test_every_route_is_a_404_while_the_broker_is_off(
+    egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a broker port every personal route is a 404 before it authenticates the caller or reads any store."""
+    _restart_with_env(egress_portal, MINDROOM_EGRESS_BROKER_PORT="")
+    stores_opened: list[object] = []
+    monkeypatch.setattr(egress_credentials, "get_runtime_credentials_manager", stores_opened.append)
+    routes = sorted(
+        (method, route.path)
+        for route in main.app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/connections/egress")
+        for method in route.methods
+    )
+    assert {("GET", "/api/connections/egress"), ("GET", "/api/connections/egress/presets")} <= set(routes)
+
+    for method, path in routes:
+        url = path.format(agent_name="personal", service="github", name="github")
+        for headers in (egress_portal["headers"]["alice"], {}):
+            response = egress_portal["client"].request(method, url, headers=headers)
+            assert (response.status_code, response.json()) == (404, {"detail": "Agent Keys are not enabled"}), path
+            assert "no-store" in response.headers["cache-control"]
+    assert stores_opened == []
 
 
 def test_lists_only_usable_shell_or_python_agents(egress_portal: dict[str, Any]) -> None:

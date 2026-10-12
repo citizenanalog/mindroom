@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import yaml
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 
 from mindroom.api import egress_status, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
@@ -28,6 +29,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from fastapi.testclient import TestClient
+
+
+# The broker runs exactly when its port is set; the API never starts it, so any port enables the routes.
+_BROKER_ON = {"MINDROOM_EGRESS_BROKER_PORT": "8768"}
 
 
 @pytest.fixture
@@ -79,9 +84,8 @@ def egress_config_file(tmp_path: Path) -> Generator[Path, None, None]:
     temp_path.unlink(missing_ok=True)
 
 
-@pytest.fixture
-def broker_test_client(egress_config_file: Path) -> TestClient:
-    """Create a test client with egress broker configuration."""
+def _admin_client(egress_config_file: Path, *, broker_on: bool = True) -> TestClient:
+    """Serve the admin API for the config file, with the broker enabled unless `broker_on` is false."""
     from fastapi.testclient import TestClient  # noqa: PLC0415
 
     from mindroom import constants  # noqa: PLC0415
@@ -89,11 +93,17 @@ def broker_test_client(egress_config_file: Path) -> TestClient:
 
     runtime_paths = constants.resolve_primary_runtime_paths(
         config_path=egress_config_file,
-        process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org"},
+        process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org", **(_BROKER_ON if broker_on else {})},
     )
     main.initialize_api_app(main.app, runtime_paths)
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
     return TestClient(main.app, base_url="http://localhost")
+
+
+@pytest.fixture
+def broker_test_client(egress_config_file: Path) -> TestClient:
+    """Create a test client with egress broker configuration."""
+    return _admin_client(egress_config_file)
 
 
 @pytest.fixture
@@ -220,6 +230,33 @@ def test_routes_require_dashboard_auth() -> None:
     for route in routes:
         dependencies = route.dependant.dependencies  # type: ignore[attr-defined]
         assert any(dependency.call is verify_user for dependency in dependencies), route.path  # type: ignore[attr-defined]
+
+
+def test_every_route_is_a_404_while_the_broker_is_off(
+    egress_config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a broker port every admin route, presets and the CA included, is a 404 before it reads any store."""
+    from mindroom.api import main  # noqa: PLC0415
+
+    client = _admin_client(egress_config_file, broker_on=False)
+    scopes_resolved: list[object] = []
+    monkeypatch.setattr(
+        "mindroom.api.egress_broker.resolve_request_credentials_target",
+        lambda *args, **_kwargs: scopes_resolved.append(args),
+    )
+    routes = sorted(
+        (method, route.path)
+        for route in main.app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/egress-broker/")
+        for method in route.methods
+    )
+    assert {("GET", "/api/egress-broker/presets"), ("GET", "/api/egress-broker/ca.pem")} <= set(routes)
+
+    for method, path in routes:
+        response = client.request(method, path.format(name="github"))
+        assert (response.status_code, response.json()) == (404, {"detail": "Agent Keys are not enabled"}), path
+    assert scopes_resolved == []
 
 
 def test_logs_return_the_refusal_code(broker_test_client: TestClient, audit_log: AuditLog) -> None:
@@ -460,7 +497,7 @@ def oauth_broker_client(egress_config_file: Path, monkeypatch: pytest.MonkeyPatc
     egress_config_file.write_text(yaml.dump(config), encoding="utf-8")
     runtime_paths = constants.resolve_primary_runtime_paths(
         config_path=egress_config_file,
-        process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org"},
+        process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org", **_BROKER_ON},
     )
     _use_fake_oauth_providers(monkeypatch, runtime_paths)
     main.initialize_api_app(main.app, runtime_paths)

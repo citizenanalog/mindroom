@@ -6,11 +6,13 @@ import asyncio
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Literal
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import BaseModel
 
 from mindroom.api import config_lifecycle, oauth
+from mindroom.api.connection_agents import CONNECTIONS_HEADERS
 from mindroom.config.egress_broker import RESERVED_PLACEHOLDER_NAMES, RESERVED_PLACEHOLDER_PREFIXES, EgressService
+from mindroom.egress_broker.env import egress_broker_enabled
 from mindroom.egress_broker.oauth_source import oauth_status, shared_worker_oauth, shared_worker_unavailable_status
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.secrets import EgressServiceStatus, OAuthStatus, service_status
@@ -33,8 +35,6 @@ from mindroom.workers.backend import WorkerBackendError
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Mapping
 
-    from fastapi import Request
-
     from mindroom.api.config_lifecycle import ApiSnapshot
     from mindroom.config.egress_broker import EgressAuth
     from mindroom.config.main import Config
@@ -47,6 +47,15 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 RESTRICT_ONLY_KEY_REFUSAL = "This service only limits paths and never sends a key, so it cannot store one"
+
+
+def require_egress_broker_enabled(request: Request) -> None:
+    """Answer 404 on every route of both egress APIs while the broker is off.
+
+    Both routers run this first, so with the broker off no route authenticates its caller or reads a store.
+    """
+    if not egress_broker_enabled(config_lifecycle.bind_current_request_snapshot(request).runtime_paths):
+        raise HTTPException(404, "Agent Keys are not enabled", headers=CONNECTIONS_HEADERS)
 
 
 def effective_services(
