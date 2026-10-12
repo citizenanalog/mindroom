@@ -318,12 +318,13 @@ async def open_tunnel(
     broker: BrokerFactory,
     target_port: int,
     *,
+    host: str = "localhost",
     context: ssl.SSLContext | None = None,
     server_hostname: str | None = "localhost",
 ) -> Client:
-    """CONNECT to ``localhost:<target_port>`` and start TLS inside the tunnel, trusting the broker CA."""
+    """CONNECT to ``<host>:<target_port>`` and start TLS inside the tunnel, trusting the broker CA."""
     client = await open_client(broker.latest.port)
-    client.send(connect_request(f"localhost:{target_port}", authorization=proxy_authorization(broker.token())))
+    client.send(connect_request(f"{host}:{target_port}", authorization=proxy_authorization(broker.token())))
     assert (await read_raw_response(client.reader)).status == 200
     await client.writer.start_tls(
         context or ssl.create_default_context(cadata=broker.ca.cert_pem),

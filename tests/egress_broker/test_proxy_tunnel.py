@@ -34,6 +34,7 @@ from tests.egress_broker.conftest import (
     single_rule_config,
     with_user_services,
 )
+from tests.egress_broker.raw_http import open_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -889,19 +890,14 @@ async def test_close_stops_listener(broker: BrokerFactory) -> None:
     """Close drops in-flight connections, stops accepting, and is idempotent."""
     started = await broker()
     port = started.port
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
-    writer.write(b"CONNECT localhost:443 HTTP/1.1\r\n")
-    await writer.drain()
+    client = await open_client(port)
+    client.send(b"CONNECT localhost:443 HTTP/1.1\r\n")
+    await client.writer.drain()
 
     await started.close()
 
-    async with asyncio.timeout(5):
-        try:
-            remaining = await reader.read()
-        except ConnectionResetError:
-            remaining = b""
-    assert remaining == b""
-    writer.transport.abort()
+    assert await client.closed() is True
+    client.close()
     with pytest.raises(ConnectionRefusedError):
         await asyncio.open_connection("127.0.0.1", port)
     await started.close()
@@ -911,16 +907,12 @@ async def test_close_stops_listener(broker: BrokerFactory) -> None:
 async def test_close_drops_established_tunnel(broker: BrokerFactory, tls_upstream: Upstream) -> None:
     """Close also ends tunnels that are already relaying."""
     started = await broker()
-    reader, writer = await asyncio.open_connection("127.0.0.1", started.port)
-    writer.write(connect_request(f"localhost:{tls_upstream.port}", authorization=proxy_authorization(broker.token())))
-    assert (await read_raw_response(reader)).status == 200
+    client = await open_client(started.port)
+    client.send(connect_request(f"localhost:{tls_upstream.port}", authorization=proxy_authorization(broker.token())))
+    assert (await read_raw_response(client.reader)).status == 200
 
     await started.close()
 
-    async with asyncio.timeout(5):
-        try:
-            remaining = await reader.read()
-        except ConnectionResetError:
-            remaining = b""
-    writer.transport.abort()
-    assert remaining == b""
+    closed = await client.closed()
+    client.close()
+    assert closed is True

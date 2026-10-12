@@ -46,6 +46,7 @@ from tests.egress_broker.conftest import (
     single_rule_config,
     with_user_services,
 )
+from tests.egress_broker.raw_http import open_tunnel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,33 +74,16 @@ RECONNECT_MESSAGE = (
 )
 
 
-async def _open_tunnel(
-    broker: BrokerFactory,
-    target: str,
-    *,
-    verify: ssl.SSLContext | None = None,
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """CONNECT through the latest broker and start TLS for ``localhost`` inside the tunnel, as a worker would."""
-    reader, writer = await asyncio.open_connection("127.0.0.1", broker.latest.port)
-    writer.write(connect_request(target, authorization=proxy_authorization(broker.token())))
-    assert (await read_raw_response(reader)).status == 200
-    await writer.start_tls(
-        verify or ssl.create_default_context(cadata=broker.ca.cert_pem),
-        server_hostname="localhost",
-    )
-    return reader, writer
-
-
 async def _exchange(broker: BrokerFactory, port: int, *messages: bytes) -> list[RawResponse]:
     """Open a tunnel to ``localhost:<port>``, send each raw message in turn, and return the response read after each."""
-    reader, writer = await _open_tunnel(broker, f"localhost:{port}")
+    client = await open_tunnel(broker, port)
     try:
         responses = []
         for message in messages:
-            writer.write(message)
-            responses.append(await read_raw_response(reader))
+            client.send(message)
+            responses.append(await read_raw_response(client.reader))
     finally:
-        writer.transport.abort()
+        client.close()
     return responses
 
 
@@ -118,11 +102,11 @@ async def test_connect_to_rule_host_is_intercepted(broker: BrokerFactory, host: 
     await broker(single_rule_config(), secrets={"svc": SECRET})
 
     # The client trusts only the broker CA, so the handshake alone proves the broker answered.
-    _reader, writer = await _open_tunnel(broker, f"{host}:443")
+    client = await open_tunnel(broker, 443, host=host)
     try:
-        assert ("DNS", "localhost") in writer.get_extra_info("peercert")["subjectAltName"]
+        assert ("DNS", "localhost") in client.writer.get_extra_info("peercert")["subjectAltName"]
     finally:
-        writer.transport.abort()
+        client.close()
     assert broker.resolved == []
 
 
@@ -927,13 +911,13 @@ async def test_websocket_splice_ends_when_client_closes(
 ) -> None:
     """Once the client goes away the upstream is closed too, even though the upstream would keep waiting."""
     await broker(single_rule_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
-    writer.write(_websocket_handshake(tls_upstream.port))
-    switched = await read_raw_response(reader)
+    client = await open_tunnel(broker, tls_upstream.port)
+    client.send(_websocket_handshake(tls_upstream.port))
+    switched = await read_raw_response(client.reader)
 
-    writer.close()
+    client.writer.close()
     with contextlib.suppress(OSError):
-        await writer.wait_closed()
+        await client.writer.wait_closed()
 
     assert switched.status == 101
     assert switched.headers["upgrade"].lower() == "websocket"
@@ -976,14 +960,14 @@ async def test_upstream_connection_is_reused_until_upstream_closes(
 async def test_client_connection_close_ends_tunnel(broker: BrokerFactory, tls_upstream: Upstream) -> None:
     """A client's ``Connection: close`` is honored: the broker answers and then closes the tunnel."""
     await broker(single_rule_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{tls_upstream.port}")
+    client = await open_tunnel(broker, tls_upstream.port)
     try:
-        writer.write(f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\nConnection: close\r\n\r\n".encode())
-        response = await read_raw_response(reader)
+        client.send(f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\nConnection: close\r\n\r\n".encode())
+        response = await read_raw_response(client.reader)
         async with asyncio.timeout(5):
-            remaining = await reader.read()
+            remaining = await client.reader.read()
     finally:
-        writer.transport.abort()
+        client.close()
 
     assert response.status == 200
     assert response.headers["connection"] == "close"
@@ -1268,18 +1252,18 @@ async def test_chunked_body_over_limit_in_tunnel_gets_413_and_closes_upstream(
 
     port = await serve(receive, ssl_context=upstream_ca.server_context(tmp_path))
     await broker(single_rule_config(), secrets={"svc": SECRET}, max_body_bytes=1024)
-    reader, writer = await _open_tunnel(broker, f"localhost:{port}")
+    client = await open_tunnel(broker, port)
     try:
-        writer.write(
+        client.send(
             f"POST /upload HTTP/1.1\r\nHost: localhost:{port}\r\nTransfer-Encoding: chunked\r\n\r\n".encode()
             + b"".join(b"200\r\n" + b"x" * 512 + b"\r\n" for _ in range(4))
             + b"0\r\n\r\n",
         )
-        response = await read_raw_response(reader)
+        response = await read_raw_response(client.reader)
         async with asyncio.timeout(5):
             await upstream_closed.wait()
     finally:
-        writer.transport.abort()
+        client.close()
 
     assert response.status == 413
     assert response.json() == BODY_TOO_LARGE

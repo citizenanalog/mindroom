@@ -26,7 +26,8 @@ from mindroom.egress_broker.mitm import _host_header_name
 from mindroom.egress_broker.proxy import _token_from
 from mindroom.egress_broker.rules import EgressRules, is_ambiguous_path, route_request
 from mindroom.egress_broker.tokens import TokenSigner
-from tests.egress_broker.conftest import DEFAULT_CLAIMS, connect_request, proxy_authorization, read_raw_response
+from tests.egress_broker.conftest import DEFAULT_CLAIMS, connect_request, proxy_authorization
+from tests.egress_broker.raw_http import open_tunnel
 
 if TYPE_CHECKING:
     from mindroom.egress_broker.dial import DialPolicy
@@ -522,15 +523,12 @@ async def _send_in_tunnel(broker: BrokerFactory, upstream: Upstream, data: bytes
 
     TLS cannot be half-closed, so a request the broker keeps waiting on is cut off after `seconds`.
     """
-    reader, writer = await asyncio.open_connection("127.0.0.1", broker.latest.port)
+    client = await open_tunnel(broker, upstream.port)
     try:
-        writer.write(connect_request(f"localhost:{upstream.port}", authorization=proxy_authorization(broker.token())))
-        assert (await read_raw_response(reader)).status == 200
-        await writer.start_tls(ssl.create_default_context(cadata=broker.ca.cert_pem), server_hostname="localhost")
-        writer.write(data)
-        return await _read_available(reader, seconds=seconds)
+        client.send(data)
+        return await _read_available(client.reader, seconds=seconds)
     finally:
-        writer.transport.abort()
+        client.close()
 
 
 async def _wait_until_idle(broker: EgressBroker) -> None:
