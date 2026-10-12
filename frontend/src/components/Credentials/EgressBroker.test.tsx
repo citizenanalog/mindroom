@@ -63,7 +63,11 @@ const agent = (id: string, tools: string[], extra = {}) => ({
 });
 
 // The dashboard listing has no is_shared or can_manage; the panel sets both over these.
-const github = credentialService();
+const {
+  is_shared: _isShared,
+  can_manage: _canManage,
+  ...github
+} = credentialService();
 const openai = {
   name: "openai",
   display_name: null,

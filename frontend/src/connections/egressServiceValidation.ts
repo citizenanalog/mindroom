@@ -23,7 +23,7 @@ import type { AuthoredEgressService } from "./types";
  * the editor where to put them.
  */
 
-// Service names and account provider ids, as the server checks them.
+// Service names (also capped at `MAX_NAME_LENGTH`) and account provider ids.
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 
 function hostError(host: string): string | null {

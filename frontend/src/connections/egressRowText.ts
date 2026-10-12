@@ -54,7 +54,9 @@ export function canEdit(
   service: EgressCredentialService | null,
 ): editing is ServiceEditing {
   return (
-    service?.can_manage === true && service.source === editing?.editableSource
+    editing !== undefined &&
+    service?.can_manage === true &&
+    service.source === editing.editableSource
   );
 }
 
@@ -151,7 +153,10 @@ function ruleHosts(rules: readonly EgressRuleSummary[]): string[] {
 }
 
 /** "Sends to a.com, b.com:8443", or another `lead`, for the hosts a service's rules cover, each once; null without rules. */
-export function hostsNote(service: EgressCredentialService, lead = "Sends to") {
+export function hostsNote(
+  service: EgressCredentialService,
+  lead = "Sends to",
+): string | null {
   const hosts = ruleHosts(service.rules);
   return hosts.length > 0 ? `${lead} ${hosts.join(", ")}` : null;
 }

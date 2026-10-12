@@ -20,7 +20,11 @@ import type {
   EgressRuleSummary,
 } from "@/connections/types";
 
-/** What the editor model's tests share: the server's presets, the options of each context, and helpers that run a service through the form. */
+/**
+ * What the egress tests share: the server's presets, the options of each context, helpers that run a service
+ * through the form, the listing fixtures (services, rule summaries, account logins), and the helpers that wait for
+ * an open editor's presets (`presetsReady`) and press a dialog button (`pressInDialog`).
+ */
 
 export const presets = egressPresets.presets as EgressPreset[];
 // What the server sends with the presets; typing it checks the fixture has the shape the editor reads.
