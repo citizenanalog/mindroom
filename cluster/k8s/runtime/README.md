@@ -721,7 +721,7 @@ Raw secret visibility is controlled by Agent Vault vault membership.
 
 Use `worker_scope: user` or `worker_scope: user_agent` when each requester should manage and use their own credentials.
 Those requester-isolated workers can use the self-service `agent_vault_access` tool to grant the requester admin access to their own worker vault.
-On an agent that is not `private`, requesters still share one agent workspace, so one requester's files can run in another's commands with that requester's credentials; use `private` agents when requesters need isolation.
+On an agent that is not `private`, requesters still share one agent workspace, so one requester's files can run in another's commands with that requester's credentials; use `private` agents (`private.per: user` or `user_agent` in place of `worker_scope`, which cannot be set together with `private`) when requesters need isolation.
 
 Use `worker_scope: shared` when a shared agent should use a common service credential.
 In that model, all users who can invoke credential-capable tools on that shared agent may indirectly use the credentials through the worker proxy path.

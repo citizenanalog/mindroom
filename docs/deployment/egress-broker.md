@@ -386,11 +386,11 @@ Use it only where everyone who can use the agent may act with each other's accou
 
 #### Shared workspaces on non-private agents
 
-A worker of their own does not keep requesters apart on its own.
+A worker per requester does not keep requesters apart.
 On a `user` or `user_agent` agent that is not `private`, every requester works in the same agent workspace.
 A file one requester leaves there, such as `.mindroom/worker-env.sh`, can run in another requester's commands, and it then runs with that requester's broker access.
 So another requester's code can use (not read) that requester's connected accounts and personal keys.
-When requesters need to be kept apart, make the agent `private` (see [Private Instances](../configuration/agents.md#private-instances)), so that each requester gets a workspace root of their own.
+When requesters need to be kept apart, make the agent `private`, so that each requester gets a workspace root of their own. Set `private.per` to `user` or `user_agent` instead of `worker_scope`, because the two cannot both be set (see [Private Instances](../configuration/agents.md#private-instances)).
 
 ## Secret management
 
@@ -1121,12 +1121,12 @@ The broker keeps keys out of worker code.
 It cannot help where the code runs outside a worker, where the configuration or the remote host gives a key away, or where the key itself is too powerful.
 Each of these is a choice you make, so make it on purpose.
 
-- **Code in the primary process.** An agent whose code or file tools run in the primary process can read every stored key and token. That is the case with no worker backend, with `worker_tools: []`, with primary-only tools such as `duckdb`, `pandas`, `sql`, and `script`, and with `file_access: unrestricted`. Use a worker backend, and keep such tools off agents that should not see secrets.
+- **Code in the primary process.** An agent whose code runs in the primary process can read every stored key and token. That is the case when no sandbox runner or dedicated worker is configured, so tools run in the primary process (the default when `MINDROOM_SANDBOX_PROXY_URL` is unset), with `worker_tools: []`, and with primary-only tools such as `duckdb`, `pandas`, `sql`, and `script`. Path tools that run in the primary process, such as `attachments` or `gmail`, can also open any file the primary can reach under `file_access: unrestricted`. Use a dedicated worker backend or a sandbox runner, keep `file_access` at `workspace`, and keep such tools off agents that should not see secrets.
 - **Write access to the configuration.** `config_manager`, and any other way to write the `egress_broker` config, can point a service at another host, and the broker then sends that service's key there. Give config write access only to people and agents you would trust with every key.
 - **Hosts that echo requests.** A host that sends the request back to the caller, such as a debug page or an error message with the full URL, hands the injected key to the agent. The broker refuses `TRACE` and `TRACK`, which exist to do this, but it cannot see what other pages do. Prefer header or bearer auth over query-parameter keys, and add keys only for hosts you trust not to echo them.
 - **Wildcard rules on shared hosting domains.** A rule such as `*.github.io`, `*.vercel.app`, or `*.workers.dev` sends the key to every tenant on that domain, including a page that someone else publishes there. Name exact hosts instead.
 - **Keys that can create other keys.** With an admin token or a deploy-key API, the agent can ask the service for a new working key and keep it, and that key no longer needs the broker. Store the least powerful key that works.
-- **Shared workspaces.** On a `user` or `user_agent` agent that is not `private`, one requester's files can run in another requester's commands and use that requester's accounts and keys. Make such agents `private` when requesters need isolation; see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents).
+- **Shared workspaces.** On a `user` or `user_agent` agent that is not `private`, one requester's files can run in another requester's commands and use that requester's accounts and keys. Make such agents `private` when requesters need isolation (`private.per` replaces `worker_scope`); see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents).
 
 ## Limitations
 
