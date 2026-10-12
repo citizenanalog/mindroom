@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from mindroom.config.egress_broker import EgressBrokerConfig, EgressService
+from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.config.main import Config
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 
@@ -315,3 +315,149 @@ def test_restrict_only_must_be_a_real_boolean(value: object) -> None:
     """A string or number is refused, so `restrict_only: "true"` never quietly turns a service into a limit or not."""
     with pytest.raises(ValidationError, match="restrict_only\n  Input should be a valid boolean"):
         EgressService.model_validate({"restrict_only": value, "rules": [{"host": "api.github.com"}]})
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"type": "basic"},  # Missing username
+        {"type": "header"},  # Missing name
+        {"type": "header", "name": "X-Key", "template": "none"},  # Missing {secret}
+    ],
+)
+def test_invalid_auth_rejected(bad: dict) -> None:
+    """Invalid auth configurations are rejected."""
+    with pytest.raises(ValueError, match=r"(requires|must contain)"):
+        EgressAuth(**bad)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "*.*.example.com",  # Multiple wildcards
+        "https://x.com",  # Has scheme
+        "x.com:443",  # Has port
+        "x.com/path",  # Has path
+    ],
+)
+def test_invalid_host_rejected(host: str) -> None:
+    """Invalid host values are rejected."""
+    with pytest.raises(ValueError, match=r"(host|wildcard)"):
+        EgressRule(host=host, auth=EgressAuth(type="bearer"))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "HTTPS_PROXY",
+        "no_proxy",
+        "MINDROOM_X",
+        "SSL_CERT_FILE",
+        "PATH",
+        "ALL_PROXY",
+        "all_proxy",
+        "NODE_USE_ENV_PROXY",
+        "lower",  # Must start with uppercase
+        "GH_TOKEN\n",  # The whole name must match, not just up to a trailing newline
+    ],
+)
+def test_invalid_placeholder_env_rejected(name: str) -> None:
+    """Invalid placeholder env names are rejected."""
+    with pytest.raises(ValueError, match=r"(placeholder_env|match|reserved|prefix)"):
+        EgressService(
+            rules=[EgressRule(host="example.com", auth=EgressAuth(type="bearer"))],
+            placeholder_env={name: "value"},
+        )
+
+
+_EXAMPLE_SERVICE = EgressService(rules=[EgressRule(host="example.com", auth=EgressAuth(type="bearer"))])
+
+
+@pytest.mark.parametrize("name", ["GitHub", "a b"], ids=["uppercase", "space"])
+def test_invalid_service_name_rejected(name: str) -> None:
+    """Invalid service names are rejected."""
+    with pytest.raises(ValueError, match=r"service name.*must match"):
+        EgressBrokerConfig(services={name: _EXAMPLE_SERVICE})
+
+
+@pytest.mark.parametrize("name", ["x_oauth", "x_oauth_client", "oauth", "oauth_client"])
+def test_service_name_with_oauth_suffix_rejected(name: str) -> None:
+    """Names whose `egress_<name>` credential service ends like an OAuth service are rejected."""
+    with pytest.raises(ValueError, match="OAuth"):
+        EgressBrokerConfig(services={name: _EXAMPLE_SERVICE})
+
+
+@pytest.mark.parametrize("name", ["oauth_proxy", "my-oauth", "xoauth"])
+def test_service_name_mentioning_oauth_elsewhere_accepted(name: str) -> None:
+    """Only the OAuth suffixes are reserved, not the word itself."""
+    assert name in EgressBrokerConfig(services={name: _EXAMPLE_SERVICE}).services
+
+
+@pytest.mark.parametrize("name", ["", "X Key", "X-Key:", "X-Key\n", "X-Key\r\nInjected: 1", "X/Key", "Clé"])
+def test_header_auth_name_must_be_token(name: str) -> None:
+    """A header auth name must be a valid HTTP header field name."""
+    with pytest.raises(ValueError, match="header name"):
+        EgressAuth(type="header", name=name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Host",
+        "content-length",
+        "Transfer-Encoding",
+        "connection",
+        "Upgrade",
+        "TE",
+        "trailer",
+        "Proxy-Authorization",
+        "proxy-connection",
+        "Keep-Alive",
+    ],
+)
+def test_header_auth_name_rejects_framing_and_routing_headers(name: str) -> None:
+    """The broker owns framing, routing, and proxy headers, so no rule may inject into them."""
+    with pytest.raises(ValueError, match="reserved"):
+        EgressAuth(type="header", name=name)
+
+
+@pytest.mark.parametrize("name", ["Authorization", "X-Api-Key", "x-goog-api-key", "Private-Token"])
+def test_header_auth_name_accepts_common_headers(name: str) -> None:
+    """Ordinary credential headers remain allowed."""
+    assert EgressAuth(type="header", name=name).name == name
+
+
+def test_query_auth_name_must_not_be_empty() -> None:
+    """A query auth name must name a parameter."""
+    with pytest.raises(ValueError, match="query auth requires a non-empty name"):
+        EgressAuth(type="query", name="")
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536])
+def test_rule_port_out_of_range_rejected(port: int) -> None:
+    """Rule ports must be valid TCP ports."""
+    with pytest.raises(ValueError, match="port"):
+        EgressRule(host="example.com", port=port, auth=EgressAuth(type="bearer"))
+
+
+@pytest.mark.parametrize("port", [1, 443, 65535])
+def test_rule_port_in_range_accepted(port: int) -> None:
+    """Valid TCP ports are accepted."""
+    assert EgressRule(host="example.com", port=port, auth=EgressAuth(type="bearer")).port == port
+
+
+def test_host_strips_trailing_dot() -> None:
+    """Host with trailing dot (FQDN notation) should be normalized."""
+    rule = EgressRule(host="api.example.com.", auth=EgressAuth(type="bearer"))
+    assert rule.host == "api.example.com"
+
+    # A config loaded from YAML is normalized the same way.
+    config_yaml = """
+    services:
+      test:
+        rules:
+          - host: api.github.com.
+            auth: { type: bearer }
+    """
+    config = EgressBrokerConfig(**yaml.safe_load(config_yaml))
+    assert config.services["test"].rules[0].host == "api.github.com"
