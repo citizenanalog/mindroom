@@ -480,6 +480,8 @@ def test_response_never_contains_secret(egress_portal: dict[str, Any]) -> None:
         pytest.param(_put_key, "unknown", "github", id="put-unknown-agent"),
         pytest.param(_put_key, "personal", "unknown", id="put-unknown-service"),
         pytest.param(_delete_key, "personal", "unknown", id="delete-unknown-service"),
+        pytest.param(_put_key, "no_shell", "github", id="without-shell-or-python"),
+        pytest.param(_put_key, "other_private", "github", id="no-access"),
     ],
 )
 def test_unknown_agent_or_service_404(
@@ -488,7 +490,7 @@ def test_unknown_agent_or_service_404(
     agent: str,
     service: str,
 ) -> None:
-    """Unknown agent or service returns 404."""
+    """An unknown agent or service, or an agent the user may not use or that has no shell or python, is a 404."""
     response = write(egress_portal, "alice", agent, service)
     assert response.status_code == 404, response.text
 
@@ -528,13 +530,6 @@ def test_portal_catalog_sends_an_empty_list_for_an_eligible_agent_without_servic
     # The user of the agent keeps writing services, so the list fills as soon as one exists.
     assert _put_service(portal, "alice", "personal", "notes").status_code == 204
     assert [row["name"] for row in _catalog_services(portal, "alice", "personal")] == ["notes"]
-
-
-@pytest.mark.parametrize("agent", ["no_shell", "other_private"], ids=["without-shell-or-python", "no-access"])
-def test_ineligible_agents_return_404(egress_portal: dict[str, Any], agent: str) -> None:
-    """Non-usable user or agent without shell/python returns 404."""
-    response = _put_key(egress_portal, "alice", agent, "github")
-    assert response.status_code == 404, response.text
 
 
 def test_credential_manager_without_use_access_sees_no_egress_anywhere(egress_portal: dict[str, Any]) -> None:
@@ -1406,15 +1401,7 @@ def test_an_entry_shadowed_by_a_new_config_service_can_be_removed_and_keeps_the_
     assert _delete_service(portal, "alice", "personal", "notes").status_code == 409
 
 
-@pytest.mark.parametrize("value", [True, False])
-def test_oauth_on_shared_workers_is_refused_whatever_its_value(egress_portal: dict[str, Any], *, value: bool) -> None:
-    """The operator-only flag is rejected by name, so a user cannot even send it as false."""
-    portal = egress_portal
-    response = _put_service(portal, "alice", "personal", "notes", {**_NOTES, "oauth_on_shared_workers": value})
-    assert response.status_code == 422, response.text
-    assert "oauth_on_shared_workers" in response.json()["detail"]
-    assert "config.yaml" in response.json()["detail"]
-    assert _get_service(portal, "alice", "personal", "notes").status_code == 404
+_LIMIT = {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}]}
 
 
 @pytest.mark.parametrize(
@@ -1428,6 +1415,25 @@ def test_oauth_on_shared_workers_is_refused_whatever_its_value(egress_portal: di
             "host must not contain scheme",
         ),
         ({**_NOTES, "placeholder_env": {"MINDROOM_X": "v"}}, "reserved prefix"),
+        # The operator-only flag is rejected by name, so a user cannot even send it as false.
+        (
+            {**_NOTES, "oauth_on_shared_workers": True},
+            "oauth_on_shared_workers can only be set by an administrator in config.yaml",
+        ),
+        (
+            {**_NOTES, "oauth_on_shared_workers": False},
+            "oauth_on_shared_workers can only be set by an administrator in config.yaml",
+        ),
+        # User-only rules on placeholders and OAuth providers, which never quote the refused value.
+        ({**_NOTES, "placeholder_env": {"LD_PRELOAD": "evil"}}, "LD_PRELOAD is not allowed as a placeholder"),
+        (
+            {**_NOTES, "placeholder_env": {"NOTES_TOKEN": "two words"}},
+            "The value of NOTES_TOKEN must be 1 to 256 letters",
+        ),
+        ({**_NOTES, "oauth_provider": "no_such_provider"}, "unknown oauth_provider 'no_such_provider'"),
+        # A limit never sends a credential, so a login or placeholders on it are refused.
+        ({**_LIMIT, "oauth_provider": "github"}, "cannot set oauth_provider"),
+        ({**_LIMIT, "placeholder_env": {"GH_TOKEN": "mindroom-brokered"}}, "cannot set placeholder_env"),
     ],
 )
 def test_invalid_user_service_is_422_with_the_validators_message(
@@ -1435,22 +1441,17 @@ def test_invalid_user_service_is_422_with_the_validators_message(
     body: dict[str, Any],
     fragment: str,
 ) -> None:
-    """Config validation errors reach the user as a readable 422 and nothing is stored."""
+    """Config and user-only validation errors reach the user as a readable 422 and nothing is stored."""
     response = _put_service(egress_portal, "alice", "personal", "notes", body)
     assert response.status_code == 422, response.text
     assert fragment in response.json()["detail"]
+    assert "two words" not in response.json()["detail"]
     assert _get_service(egress_portal, "alice", "personal", "notes").status_code == 404
 
 
-def test_non_object_body_and_bad_names_are_422(egress_portal: dict[str, Any]) -> None:
-    """A body that is not an object and names the store reserves or the pattern forbids are refused."""
+def test_bad_service_names_are_422(egress_portal: dict[str, Any]) -> None:
+    """Names the store reserves or the pattern forbids are refused."""
     portal = egress_portal
-    not_object = portal["client"].put(
-        _service_url("personal", "notes"),
-        json=["rules"],
-        headers=portal["headers"]["alice"],
-    )
-    assert not_object.status_code == 422, not_object.text
     for name in ("_services", "Notes", "x_oauth"):
         response = _put_service(portal, "alice", "personal", name)
         assert response.status_code == 422, (name, response.text)
@@ -1472,30 +1473,6 @@ def test_user_service_caps_are_422(egress_portal: dict[str, Any]) -> None:
     assert _put_service(portal, "alice", "personal", "svc0", {**_NOTES, "description": "again"}).status_code == 204
     # Another requester's scope is unaffected by Alice's count.
     assert _put_service(portal, "bob", "personal", "svc50").status_code == 204
-
-
-@pytest.mark.parametrize(
-    ("body", "fragment"),
-    [
-        ({**_NOTES, "placeholder_env": {"LD_PRELOAD": "evil"}}, "LD_PRELOAD is not allowed as a placeholder"),
-        (
-            {**_NOTES, "placeholder_env": {"NOTES_TOKEN": "two words"}},
-            "The value of NOTES_TOKEN must be 1 to 256 letters",
-        ),
-        ({**_NOTES, "oauth_provider": "no_such_provider"}, "unknown oauth_provider 'no_such_provider'"),
-    ],
-)
-def test_user_service_placeholders_and_provider_are_422(
-    egress_portal: dict[str, Any],
-    body: dict[str, Any],
-    fragment: str,
-) -> None:
-    """User-only rules on placeholders and OAuth providers reach the user as a 422 and nothing is stored."""
-    response = _put_service(egress_portal, "alice", "personal", "notes", body)
-    assert response.status_code == 422, response.text
-    assert fragment in response.json()["detail"]
-    assert "two words" not in response.json()["detail"]
-    assert _get_service(egress_portal, "alice", "personal", "notes").status_code == 404
 
 
 def test_user_service_body_over_16_kib_is_413_before_validation(
@@ -1896,27 +1873,6 @@ def test_a_restrict_only_limit_is_saved_listed_and_never_takes_a_key(egress_port
     assert allowed.match is not None
     assert allowed.match.service == "github"
     assert route_request(rules, "api.github.com", 443, "/repos/o/b").restricted_by == "github-limited"
-
-
-@pytest.mark.parametrize(
-    ("extra", "message"),
-    [
-        ({"oauth_provider": "github"}, "cannot set oauth_provider"),
-        ({"placeholder_env": {"GH_TOKEN": "mindroom-brokered"}}, "cannot set placeholder_env"),
-    ],
-)
-def test_a_restrict_only_service_with_credential_settings_is_422(
-    egress_portal: dict[str, Any],
-    extra: dict[str, Any],
-    message: str,
-) -> None:
-    """A login or placeholders on a limit are refused with the validator's message."""
-    body = {"restrict_only": True, "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/a"}], **extra}
-
-    response = _put_service(egress_portal, "alice", "personal", "github-limited", body)
-
-    assert response.status_code == 422
-    assert message in response.json()["detail"]
 
 
 def test_user_services_are_loaded_off_the_event_loop(
