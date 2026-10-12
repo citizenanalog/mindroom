@@ -39,6 +39,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import type { ConfigPath } from "@/lib/configSchema";
+import { getConfigValidationIssues } from "@/lib/configValidation";
 import {
   type ConfigDraftMark,
   type SaveConfigResult,
@@ -139,17 +140,14 @@ function operatorServices(
 function saveFailureMessage(
   result: Exclude<SaveConfigResult, { status: "saved" | "stale" }>,
 ): string {
-  const issues = result.diagnostics.flatMap((diagnostic) => {
-    if (
-      diagnostic.kind !== "validation" ||
-      diagnostic.issue.loc[0] !== "egress_broker"
-    )
-      return [];
-    const message = diagnostic.issue.msg.replace(/^Value error, /, "");
-    // An issue on `egress_broker` itself has no field path to show.
-    const where = diagnostic.issue.loc.slice(2).join(".");
-    return [where ? `${where}: ${message}` : message];
-  });
+  const issues = getConfigValidationIssues(result.diagnostics)
+    .filter((issue) => issue.loc[0] === "egress_broker")
+    .map((issue) => {
+      const message = issue.msg.replace(/^Value error, /, "");
+      // An issue on `egress_broker` itself has no field path to show.
+      const where = issue.loc.slice(2).join(".");
+      return where ? `${where}: ${message}` : message;
+    });
   return issues.length > 0 ? issues.join("; ") : result.message;
 }
 
@@ -207,9 +205,7 @@ function ServiceSection({
   const latest = useRef(0);
   const authoredServices = operatorServices(config);
   // A save writes the whole draft, so say so when it holds more than this service.
-  const saveWarning = (dirtyRoots ?? []).some(
-    (root) => root !== "egress_broker",
-  )
+  const saveWarning = dirtyRoots.some((root) => root !== "egress_broker")
     ? OTHER_CHANGES_WARNING
     : null;
 
@@ -264,7 +260,7 @@ function ServiceSection({
     } = useConfigStore.getState();
     const before: ConfigDraftMark = {
       isDirty,
-      dirtyRoots: rootsBefore ?? [],
+      dirtyRoots: rootsBefore,
       draftVersion,
     };
     setSaving(true);

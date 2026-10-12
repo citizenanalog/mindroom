@@ -37,13 +37,17 @@ let storeState: {
   saveConfig?: () => Promise<unknown>;
 };
 
-vi.mock("@/store/configStore", () => ({
-  // The panel reads what the draft is when a write starts straight from the store.
-  useConfigStore: Object.assign(
-    (selector: (state: typeof storeState) => unknown) => selector(storeState),
-    { getState: () => storeState },
-  ),
-}));
+vi.mock("@/store/configStore", () => {
+  // The real store always has dirtyRoots, which most states here leave out.
+  const state = () => ({ dirtyRoots: [], ...storeState });
+  return {
+    // The panel reads what the draft is when a write starts straight from the store.
+    useConfigStore: Object.assign(
+      (selector: (state: typeof storeState) => unknown) => selector(state()),
+      { getState: state },
+    ),
+  };
+});
 
 const agent = (id: string, tools: string[], extra = {}) => ({
   id,
