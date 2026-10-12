@@ -18,7 +18,11 @@ import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
 import { configPlaceholderOwners } from "./egressServiceNotes";
 import type { RowAgent, ServiceEditing } from "./egressRowText";
 import { EgressServiceRows, keyPath } from "./EgressServiceRows";
-import { type RequestErrorMessages, requestConnection } from "./request";
+import {
+  errorText,
+  type RequestErrorMessages,
+  requestConnection,
+} from "./request";
 import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
 import type {
   AuthoredEgressService,
@@ -107,10 +111,10 @@ function RecentRequests({
       if (!controller.signal.aborted)
         setLog({
           kind: "error",
-          message:
-            cause instanceof Error
-              ? cause.message
-              : "Could not load your recent requests. Try again.",
+          message: errorText(
+            cause,
+            "Could not load your recent requests. Try again.",
+          ),
         });
     }
   }, [agentName]);
@@ -335,11 +339,7 @@ function AgentSection({
         setEditor({ kind: "edit", name: service.name, service: authored });
     } catch (cause) {
       if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not load the service. Try again.",
-        );
+        setError(errorText(cause, "Could not load the service. Try again."));
     }
   };
 
@@ -563,9 +563,10 @@ export function EgressCredentials() {
     } catch (cause) {
       if (!controller.signal.aborted)
         setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not load your API keys. Reload this page to try again.",
+          errorText(
+            cause,
+            "Could not load your API keys. Reload this page to try again.",
+          ),
         );
     }
   }, []);

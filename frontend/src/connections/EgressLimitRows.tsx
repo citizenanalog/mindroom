@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { hostsNote, type ServiceEditing } from "./egressRowText";
+import { errorText } from "./request";
 import type { EgressCredentialService } from "./types";
 
 /**
@@ -34,11 +35,7 @@ export function LimitActions({
     try {
       await serviceEditing.onDelete(limit);
     } catch (cause) {
-      onError(
-        cause instanceof Error && cause.message
-          ? cause.message
-          : "Could not remove the limit. Try again.",
-      );
+      onError(errorText(cause, "Could not remove the limit. Try again."));
     } finally {
       setBusy(false);
     }

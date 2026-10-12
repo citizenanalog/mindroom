@@ -14,7 +14,7 @@ import {
 } from "@/connections/EgressServiceEditor";
 import type { ServiceEditing } from "@/connections/egressRowText";
 import { EgressServiceRows } from "@/connections/EgressServiceRows";
-import type { RequestErrorMessages } from "@/connections/request";
+import { errorText, type RequestErrorMessages } from "@/connections/request";
 import type {
   AuthoredEgressService,
   EgressCredentialService,
@@ -125,10 +125,6 @@ const LOG_COLUMNS = [
 ];
 
 const NO_FILTERS: LogFilters = { user: "", agent: "", host: "", service: "" };
-
-function errorMessage(cause: unknown, fallback: string): string {
-  return cause instanceof Error && cause.message ? cause.message : fallback;
-}
 
 const STALE_SAVE_MESSAGE =
   "The configuration changed while saving. Reload the page and check the service list.";
@@ -259,7 +255,7 @@ function ServiceSection({
       setError(null);
     } catch (cause) {
       if (request !== latest.current) return;
-      setError(errorMessage(cause, "Could not load the egress services."));
+      setError(errorText(cause, "Could not load the egress services."));
     }
   }, [agentName]);
 

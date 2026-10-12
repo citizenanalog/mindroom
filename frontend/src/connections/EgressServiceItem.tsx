@@ -23,7 +23,11 @@ import { LimitActions } from "./EgressLimitRows";
 import { ServiceStatus } from "./EgressServiceStatus";
 import { coversGithub } from "./githubLimits";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
-import { type RequestErrorMessages, requestConnection } from "./request";
+import {
+  errorText,
+  type RequestErrorMessages,
+  requestConnection,
+} from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
 import type { EgressCredentialService } from "./types";
 
@@ -128,8 +132,7 @@ export function EgressServiceItem({
       if (kind === "save") closeEditor();
       onChanged();
     } catch (cause) {
-      if (!controller.signal.aborted)
-        setError(cause instanceof Error ? cause.message : failure);
+      if (!controller.signal.aborted) setError(errorText(cause, failure));
     } finally {
       if (!controller.signal.aborted) setBusy(null);
     }
@@ -155,11 +158,7 @@ export function EgressServiceItem({
     try {
       await serviceEditing?.onDelete(service);
     } catch (cause) {
-      setError(
-        cause instanceof Error && cause.message
-          ? cause.message
-          : "Could not delete the service. Try again.",
-      );
+      setError(errorText(cause, "Could not delete the service. Try again."));
     } finally {
       setBusy(null);
     }

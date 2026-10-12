@@ -3,6 +3,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { errorText } from "./request";
 import type { EgressInactiveReason, EgressInactiveService } from "./types";
 
 const REASON_TEXT: Record<EgressInactiveReason, string> = {
@@ -37,11 +38,7 @@ function InactiveServiceRow({
     try {
       await onDelete?.(service.name);
     } catch (cause) {
-      setError(
-        cause instanceof Error && cause.message
-          ? cause.message
-          : "Could not delete the entry. Try again.",
-      );
+      setError(errorText(cause, "Could not delete the entry. Try again."));
     } finally {
       setBusy(false);
     }

@@ -51,6 +51,7 @@ import {
 } from "./EgressGithubHelper";
 import type { HelperInput, HelperLabels } from "./EgressGithubHelper";
 import { MoreOptions } from "./EgressMoreOptions";
+import { errorText } from "./request";
 import {
   Field,
   RuleHostField,
@@ -71,11 +72,6 @@ import type {
   EgressRuleSummary,
   EgressScope,
 } from "./types";
-
-/** The message of a rejection, or `fallback` when it has none. */
-function reasonOf(cause: unknown, fallback: string): string {
-  return cause instanceof Error && cause.message ? cause.message : fallback;
-}
 
 /** A problem with no field to show it, or with a field the basic form does not have. */
 function needsMoreOptions(problem: ServiceProblem): boolean {
@@ -450,7 +446,9 @@ export function EgressServiceEditor({
         setSavedSignature(signature);
       }
     } catch (cause) {
-      setServerError(reasonOf(cause, "Could not save the service. Try again."));
+      setServerError(
+        errorText(cause, "Could not save the service. Try again."),
+      );
       setBusy(null);
       return;
     }
@@ -458,7 +456,7 @@ export function EgressServiceEditor({
       try {
         await saveKey(apiKey, current.name);
       } catch (cause) {
-        const reason = reasonOf(cause, "Could not save the key.");
+        const reason = errorText(cause, "Could not save the key.");
         setServerError(
           `The service was saved, but its key was not: ${reason}${reason.endsWith(".") ? "" : "."} Paste the key again and save to retry.`,
         );
@@ -476,7 +474,7 @@ export function EgressServiceEditor({
       await onDelete?.();
     } catch (cause) {
       setServerError(
-        reasonOf(cause, "Could not delete the service. Try again."),
+        errorText(cause, "Could not delete the service. Try again."),
       );
       setBusy(null);
       setConfirmingDelete(false);

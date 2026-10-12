@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ConnectedClients } from "./ConnectedClients";
 import { ConnectionsHeader } from "./ConnectionsHeader";
 import { AgentTable } from "./AgentTable";
-import { requestConnection } from "./request";
+import { errorText, requestConnection } from "./request";
 import { useMcpSelection } from "./useMcpSelection";
 import type { ConnectionList } from "./types";
 
@@ -30,9 +30,10 @@ export function Connections() {
       .catch((cause) => {
         if (!controller.signal.aborted)
           setError(
-            cause instanceof Error
-              ? cause.message
-              : "Could not load connections. Reload this page to try again.",
+            errorText(
+              cause,
+              "Could not load connections. Reload this page to try again.",
+            ),
           );
       });
     return () => controller.abort();

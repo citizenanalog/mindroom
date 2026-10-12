@@ -33,6 +33,11 @@ function detailMessage(detail: unknown): string | null {
   return messages.length ? messages.join("; ") : null;
 }
 
+/** The message of a rejection, or `fallback` when it has none. */
+export function errorText(cause: unknown, fallback: string): string {
+  return cause instanceof Error && cause.message ? cause.message : fallback;
+}
+
 async function readDetail(response: Response): Promise<unknown> {
   return response
     .json()

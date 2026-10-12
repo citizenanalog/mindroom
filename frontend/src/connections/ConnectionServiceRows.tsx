@@ -9,7 +9,7 @@ import {
 } from "./accountCopy";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
-import { requestConnection } from "./request";
+import { errorText, requestConnection } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
 import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
 import { ToolName, ToolExposure } from "./ToolRow";
@@ -112,11 +112,7 @@ export function ConnectionServiceRows({
       if (!controller.signal.aborted) onConnectionChange();
     } catch (cause) {
       if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not connect. Try again.",
-        );
+        setError(errorText(cause, "Could not connect. Try again."));
     } finally {
       if (!controller.signal.aborted) setBusy(null);
     }
@@ -137,11 +133,7 @@ export function ConnectionServiceRows({
       if (!controller.signal.aborted) onConnectionChange();
     } catch (cause) {
       if (!controller.signal.aborted)
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not disconnect. Try again.",
-        );
+        setError(errorText(cause, "Could not disconnect. Try again."));
     } finally {
       if (!controller.signal.aborted) setBusy(null);
     }
