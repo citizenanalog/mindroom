@@ -106,8 +106,8 @@ _CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time
         ),
     ],
 )
-def test_each_refusal_code_has_its_spec_text(code: str, values: dict[str, object], message: str) -> None:
-    """Every code the broker answers with carries the spec's sentence, with only the given values filled in."""
+def test_each_refusal_code_has_its_sentence(code: str, values: dict[str, object], message: str) -> None:
+    """Every code the broker answers with carries its fixed sentence, with only the given values filled in."""
     body = refusal_body(code, **values)
 
     assert body["error"] == code

@@ -11,9 +11,8 @@ from mindroom.config.main import Config
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 
 
-def test_spec_example_config_loads() -> None:
-    """Load the spec example YAML from section 5.2 and validate services."""
-    # The example from spec section 5.2
+def test_example_config_loads() -> None:
+    """An example config with GitHub and OpenAI services loads with its rules and auth intact."""
     config_yaml = """
     egress_broker:
       unmatched_hosts: passthrough

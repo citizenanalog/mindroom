@@ -1,4 +1,4 @@
-"""Raw-socket harness for the smuggling, framing, upstream-anomaly, and TLS corpora (spec section 13).
+"""Raw-socket harness for the smuggling, framing, upstream-anomaly, and TLS corpora.
 
 Requests are written as raw bytes, as plain proxy requests and inside an intercepted tunnel, because a client
 library would normalize the edge cases away. The fake upstream (`RawUpstream`, served by the `upstreams` fixture in

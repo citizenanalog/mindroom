@@ -1,4 +1,4 @@
-"""Raw-socket request corpus: smuggling, framing, pipelining, and Expect cases on both listener paths (spec 13).
+"""Raw-socket request corpus: smuggling, framing, pipelining, and Expect cases on both listener paths.
 
 Each case is written as raw bytes, as a plain proxy request and inside an intercepted tunnel; see `raw_http` for the
 strict upstream parser and the invariants every case checks.

@@ -81,7 +81,7 @@ _EXPECTED: dict[str, tuple[str | None, list[_ExpectedRule], dict[str, str]]] = {
 
 
 def test_preset_table_has_exactly_the_documented_names() -> None:
-    """The built-in table offers the spec section 10.2 presets and nothing else."""
+    """The built-in table offers exactly the expected presets and nothing else."""
     assert set(EGRESS_PRESETS) == set(_EXPECTED)
 
 

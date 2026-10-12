@@ -32,7 +32,7 @@ _OTHER_PUBLIC = "93.184.216.35"
 # One entry per direct connection attempt: the host dialed and the keyword arguments of the call.
 type _Attempts = list[tuple[str, dict[str, object]]]
 
-# Every destination form the dial guard must refuse (spec section 13), keyed by what it tries.
+# Every destination form the dial guard must refuse, keyed by what it tries.
 _REFUSED_DESTINATIONS = {
     "loopback": "127.0.0.1",
     "localhost": "localhost",

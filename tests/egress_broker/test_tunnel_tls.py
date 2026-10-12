@@ -1,4 +1,4 @@
-"""TLS edge cases inside an intercepted tunnel: SNI, ALPN, and upstream certificate failures (spec section 13)."""
+"""TLS edge cases inside an intercepted tunnel: SNI, ALPN, and upstream certificate failures."""
 
 from __future__ import annotations
 

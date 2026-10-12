@@ -1,4 +1,4 @@
-"""Upstream anomalies: extra bytes, early closes, and split heads never answer another request (spec section 13).
+"""Upstream anomalies: extra bytes, early closes, and split heads never answer another request.
 
 Each anomaly runs over a fresh upstream connection per request (plain) and a reused one (tunnel); see `raw_http`.
 """

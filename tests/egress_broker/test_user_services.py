@@ -666,13 +666,13 @@ def test_placeholder_names_must_be_credential_words(manager: CredentialsManager,
         ("GH_TOKEN", "two words", "The value of GH_TOKEN must be 1 to 256 letters, digits, or . _ : -"),
     ],
 )
-def test_placeholder_messages_follow_the_spec(
+def test_placeholder_refusals_have_fixed_messages(
     manager: CredentialsManager,
     variable: str,
     value: str,
     message: str,
 ) -> None:
-    """The three refusals read exactly as spec 12.4 words them, and never quote the value."""
+    """Each placeholder refusal reads exactly as given, and never quotes the value."""
     with pytest.raises(ValueError) as raised:  # noqa: PT011
         _save(manager, worker_target(), "mine", _service(placeholder_env={variable: value}))
 

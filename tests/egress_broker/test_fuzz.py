@@ -68,7 +68,7 @@ FULLWIDTH_PERCENT_2E = "\uff05\uff12\uff45"
 # escape such as %5C apart in the folded form while the unfolded form still decodes it.
 COMBINING_MARKS = ("\u0301", "\u0307", "\u0327")
 _UNICODE_DOTS = (ONE_DOT_LEADER, TWO_DOT_LEADER, FULLWIDTH_STOP, SMALL_STOP, IDEOGRAPHIC_STOP)
-# The brief's alphabet: path syntax, hex digits for %2e %2f %5c %25, and the unicode dots.
+# The character alphabet: path syntax, hex digits for %2e %2f %5c %25, and the unicode dots.
 _ALPHABET = st.sampled_from([*"/.%2eEfF5cC;?#ab-", *_UNICODE_DOTS])
 # Whole tokens reach the forms a character alphabet rarely spells: encoded ; ? #, overlong and UTF-8 dots, NUL.
 _TOKENS = st.sampled_from(
