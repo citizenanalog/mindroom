@@ -219,7 +219,7 @@ export function Navigation({ mode = "all", className }: NavigationProps) {
               <Menu aria-hidden="true" className="h-5 w-5" />
             </button>
           </DialogTrigger>
-          <DialogContent className="left-0 top-0 h-dvh w-[min(18rem,85vw)] max-w-none translate-x-0 translate-y-0 content-start gap-3 overflow-y-auto rounded-none border-0 border-r border-white/10 bg-rail p-3 text-rail-foreground shadow-2xl data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:rounded-none [&>button]:text-rail-foreground [&>button:hover]:bg-white/10">
+          <DialogContent className="left-0 top-0 h-dvh w-[min(18rem,85vw)] max-w-none translate-x-0 translate-y-0 content-start gap-3 overflow-y-auto rounded-none border-0 border-r border-white/10 bg-rail p-3 text-rail-foreground shadow-2xl sm:rounded-none [&>button]:text-rail-foreground [&>button:hover]:bg-white/10">
             <DialogHeader className="px-2 pb-1 pt-2 text-left">
               <DialogTitle className="font-display text-lg text-rail-foreground">
                 Navigate

@@ -319,7 +319,7 @@ function AppContent() {
                   </ul>
                   <a
                     href={`${getPlatformUrl()}/dashboard`}
-                    className="block w-full text-center px-4 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
+                    className="block w-full text-center px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
                   >
                     Go to Dashboard
                   </a>
@@ -331,7 +331,7 @@ function AppContent() {
                   </p>
                   <a
                     href={`${getPlatformUrl()}/auth/login`}
-                    className="block w-full text-center px-4 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
+                    className="block w-full text-center px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
                   >
                     Log In
                   </a>
@@ -344,7 +344,7 @@ function AppContent() {
             <div className="space-y-3">
               <button
                 onClick={() => window.location.reload()}
-                className="w-full px-4 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
+                className="w-full px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
               >
                 Retry
               </button>
@@ -389,8 +389,8 @@ function AppContent() {
                 Draft
               </span>
             )}
-            <SyncStatus status={syncStatus} compact className="sm:hidden" />
-            <SyncStatus status={syncStatus} className="hidden sm:flex" />
+            <SyncStatus status={syncStatus} compact className="md:hidden" />
+            <SyncStatus status={syncStatus} className="hidden md:flex" />
             <ThemeToggle className="h-9 w-9 max-md:border-white/15 max-md:bg-white/5 max-md:text-rail-foreground max-md:hover:bg-white/10" />
           </div>
         </header>
