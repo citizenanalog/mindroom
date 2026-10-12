@@ -168,7 +168,6 @@ if TYPE_CHECKING:
     from types import FrameType
 
     import nio
-    from fastapi import FastAPI
 
     from mindroom.config.reload_status import ConfigReloadStatus
     from mindroom.desktop.identity import DesktopControllerIdentity
@@ -2656,22 +2655,6 @@ async def _watch_skills_task(orchestrator: _MultiAgentOrchestrator) -> None:
             logger.info("Skills changed; cache cleared")
 
 
-def _committed_config_provider(app: FastAPI) -> Callable[[], Config | None]:
-    """Return a reader of the API's committed config, None while there is none or the current one is invalid.
-
-    The egress broker calls it on its own thread for every CONNECT, so service edits apply without a restart.
-    """
-    from mindroom.api import main as api_main  # noqa: PLC0415
-
-    def read() -> Config | None:
-        try:
-            return api_main.config_lifecycle.read_app_committed_runtime_config(app)[0]
-        except Exception:
-            return None
-
-    return read
-
-
 async def _run_api_server(  # noqa: PLR0915 - the primary API and its worker-facing listeners share one lifecycle
     host: str,
     port: int,
@@ -2694,7 +2677,6 @@ async def _run_api_server(  # noqa: PLR0915 - the primary API and its worker-fac
     from mindroom.api import main as api_main  # noqa: PLC0415
     from mindroom.api.agent_cli import bind_agent_cli_registry  # noqa: PLC0415
     from mindroom.api.script_gateway import serve_script_gateway_listener  # noqa: PLC0415
-    from mindroom.credentials.manager import get_runtime_credentials_manager  # noqa: PLC0415
     from mindroom.egress_broker.service import serve_egress_broker  # noqa: PLC0415
 
     api_server = _EmbeddedApiServerContext(host=host, port=port)
@@ -2736,10 +2718,12 @@ async def _run_api_server(  # noqa: PLR0915 - the primary API and its worker-fac
     try:
         try:
             async with (
+                # The broker reads the API's committed config, so service edits apply without a restart.
                 serve_egress_broker(
                     runtime_paths,
-                    config_provider=_committed_config_provider(api_main.app),
-                    credentials_manager=get_runtime_credentials_manager(runtime_paths),
+                    config_provider=lambda: api_main.config_lifecycle.read_app_committed_runtime_config(
+                        api_main.app,
+                    )[0],
                 ),
                 serve_script_gateway_listener(
                     runtime_paths,

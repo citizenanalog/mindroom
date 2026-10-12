@@ -217,6 +217,28 @@ async def test_disabled_without_port(
 
 
 @pytest.mark.asyncio
+async def test_runtime_credentials_manager_is_built_only_when_the_broker_starts(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without a port no credentials manager is built for the broker; with one it uses the runtime's own."""
+    built: list[RuntimePaths] = []
+
+    def runtime_manager(runtime_paths: RuntimePaths) -> CredentialsManager:
+        built.append(runtime_paths)
+        return CredentialsManager(tmp_path / "mindroom_data" / "credentials")
+
+    monkeypatch.setattr(service, "get_runtime_credentials_manager", runtime_manager)
+    async with serve_egress_broker(tmp_runtime_paths(), config_provider=lambda: None):
+        assert built == []
+
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: None):
+        assert built == [runtime_paths]
+
+
+@pytest.mark.asyncio
 async def test_requires_url_when_port_set(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,

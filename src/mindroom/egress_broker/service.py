@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.config.egress_broker import EgressBrokerConfig
+from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.ca import BrokerCA
 from mindroom.egress_broker.dial import DialPolicy
@@ -385,13 +386,14 @@ async def serve_egress_broker(
     runtime_paths: RuntimePaths,
     *,
     config_provider: Callable[[], Config | None],
-    credentials_manager: CredentialsManager,
+    credentials_manager: CredentialsManager | None = None,
 ) -> AsyncIterator[None]:
     """Run the egress broker on its own thread while the context is open; a no-op without a port.
 
     `config_provider` returns the primary's current config, read on the broker thread for every CONNECT, so
-    service edits apply without a restart. Raises ValueError for invalid settings and the bind error when
-    the port is unavailable.
+    service edits apply without a restart; while it returns None or raises, the broker keeps the last config it read.
+    Keys are read through `credentials_manager`, by default the runtime's, which is resolved only when the broker
+    starts. Raises ValueError for invalid settings and the bind error when the port is unavailable.
     """
     settings = _broker_settings(runtime_paths)
     if settings is None:
@@ -401,7 +403,7 @@ async def serve_egress_broker(
         runtime_paths,
         settings,
         config_provider=config_provider,
-        credentials_manager=credentials_manager,
+        credentials_manager=credentials_manager or get_runtime_credentials_manager(runtime_paths),
     )
     try:
         # Startup finishes even if the owner is cancelled meanwhile, so the finally below can stop it.
