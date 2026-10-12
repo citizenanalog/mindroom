@@ -4,7 +4,7 @@ The **egress broker** runs inside the primary runtime and intercepts outbound HT
 Use it when workers need to call APIs with credentials (GitHub, Google, Atlassian, OpenAI, cloud providers) while keeping those secrets out of worker code, environment variables, and container memory.
 Each service gets its credential from an API key you store or from an account you connect with a few clicks, and built-in presets define the common services in one line.
 Users can also add services of their own, limit GitHub access to chosen repositories in place, and see their own recent requests on a personal page, without dashboard access.
-This page covers how the broker works, how it handles requests, configuration and presets, secret sources and connected accounts, user services, per-repo control, the Connections pages, the personal request log, deployment, secret management, error codes, migration from Agent Vault, and current limitations.
+This page covers how the broker works, how it handles requests, configuration and presets, secret sources and connected accounts, user services, per-repo control, the Connections pages, the personal request log, deployment, secret management, error codes, what the broker cannot protect against, migration from Agent Vault, and current limitations.
 
 ## How it works
 
@@ -26,7 +26,7 @@ The TTL applies to new requests: an expired token gets 407 on every new request,
 ### Request handling
 
 The broker parses every client request itself (with `h11`) and forwards exactly one well-framed request per parsed request, rebuilt from what it parsed rather than copied from the client's bytes. Websocket frames after a 101 and raw tunnels to hosts without rules are the exceptions: they are relayed as they come.
-These rules keep a request that two parsers would read differently from reaching an upstream as two requests, or carrying a secret to the wrong host:
+These rules stop a request that two parsers would read differently from reaching an upstream as two requests, a secret from going to the wrong host, and an upstream from echoing a secret back:
 
 - **Head limit.** A request head (request line through the blank line) over 64 KiB gets 431 with `bad_request`, however the head is split across reads. A head that never completes is refused at the same size, and an unauthenticated client that never finishes one is dropped after 30 seconds.
 - **Conflicting lengths.** A request with both `Content-Length` and `Transfer-Encoding` is framed by `Transfer-Encoding` and forwarded chunked, without `Content-Length`. Its connection then closes after the response (RFC 9112 section 6.1), so bytes that a parser trusting the length would read as a further request are never read. Inside an intercepted tunnel, such a request that asks for a websocket upgrade is refused with 400 `bad_request` before anything is forwarded, so it never becomes a splice. Other malformed or conflicting lengths (conflicting repeated, signed, or hexadecimal `Content-Length`, an unknown transfer coding) are refused with 400, 413, or 501; repeated equal lengths are forwarded as one.
@@ -354,7 +354,7 @@ When the id is not in MindRoom's OAuth registry (for example a plugin provider t
 ### Personal accounts and shared sandboxes
 
 A requester's own GitHub or Atlassian account is safe to use only in a sandbox that belongs to that requester.
-That is an agent with worker scope `user` or `user_agent` on a dedicated worker backend (`MINDROOM_WORKER_BACKEND` set to `docker` or `kubernetes`), where each requester's commands run in their own worker.
+That is an agent with worker scope `user` or `user_agent` on a dedicated worker backend (`MINDROOM_WORKER_BACKEND` set to `docker` or `kubernetes`), where each requester's commands run in their own worker, and the agent is `private` when other requesters' files must stay out of those commands (see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents)).
 
 Every other sandbox is shared:
 
@@ -379,6 +379,14 @@ An operator who accepts the risk can set `oauth_on_shared_workers: true` on the 
 The broker then injects the calling requester's own account in shared sandboxes as well, and anyone who can run commands in such a sandbox can act with any other user's connected account until that user's proxy token expires (`MINDROOM_EGRESS_BROKER_TOKEN_TTL_SECONDS`, default 7 days).
 The status API marks those rows with `shared_worker_opt_in: true`, and the egress pages warn "Everyone using this agent can act with the connected account until its access expires".
 Use it only where everyone who can use the agent may act with each other's accounts, such as a single-user deployment.
+
+#### Shared workspaces on non-private agents
+
+A worker of their own does not keep requesters apart on its own.
+On a `user` or `user_agent` agent that is not `private`, every requester works in the same agent workspace.
+A file one requester leaves there, such as `.mindroom/worker-env.sh`, can run in another requester's commands, and it then runs with that requester's broker access.
+So another requester's code can use (not read) that requester's connected accounts and personal keys.
+When requesters need to be kept apart, make the agent `private` (see [Private Instances](https://docs.mindroom.chat/configuration/agents/#private-instances)), so that each requester gets a workspace root of their own.
 
 ## Secret management
 
@@ -1102,6 +1110,19 @@ What replaces each Agent Vault piece:
 | `approvedEgress.parentProxy.host: agent-vault`, port 14322 | Rendered automatically as the broker Service and port |
 
 Hosted instances never had Agent Vault, so they have nothing to migrate and only gain brokered credentials.
+
+## What the broker cannot protect against
+
+The broker keeps keys out of worker code.
+It cannot help where the code runs outside a worker, where the configuration or the remote host gives a key away, or where the key itself is too powerful.
+Each of these is a choice you make, so make it on purpose.
+
+- **Code in the primary process.** An agent whose code or file tools run in the primary process can read every stored key and token. That is the case with no worker backend, with `worker_tools: []`, with primary-only tools such as `duckdb`, `pandas`, `sql`, and `script`, and with `file_access: unrestricted`. Use a worker backend, and keep such tools off agents that should not see secrets.
+- **Write access to the configuration.** `config_manager`, and any other way to write the `egress_broker` config, can point a service at another host, and the broker then sends that service's key there. Give config write access only to people and agents you would trust with every key.
+- **Hosts that echo requests.** A host that sends the request back to the caller, such as a debug page or an error message with the full URL, hands the injected key to the agent. The broker refuses `TRACE` and `TRACK`, which exist to do this, but it cannot see what other pages do. Prefer header or bearer auth over query-parameter keys, and add keys only for hosts you trust not to echo them.
+- **Wildcard rules on shared hosting domains.** A rule such as `*.github.io`, `*.vercel.app`, or `*.workers.dev` sends the key to every tenant on that domain, including a page that someone else publishes there. Name exact hosts instead.
+- **Keys that can create other keys.** With an admin token or a deploy-key API, the agent can ask the service for a new working key and keep it, and that key no longer needs the broker. Store the least powerful key that works.
+- **Shared workspaces.** On a `user` or `user_agent` agent that is not `private`, one requester's files can run in another requester's commands and use that requester's accounts and keys. Make such agents `private` when requesters need isolation; see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents).
 
 ## Limitations
 

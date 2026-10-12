@@ -65,6 +65,7 @@ A user service can use a connected account only in a personal scope, and its pla
 `restrict_to_rules` is not a network boundary: under `passthrough` a worker can reach the same server by IP address through a tunnel the broker does not intercept, which carries no credential, so the real boundary stays the token's own permissions on the upstream side.
 A user can narrow an administrator's service in place with a `restrict_only` service, which limits paths without choosing a credential or storing a key, so it cannot widen anything and cannot redirect a key.
 The broker parses each request itself and forwards one re-serialized request per parsed request, with a 64 KiB head limit, a connection that closes after conflicting length headers, a reused tunnel upstream that is dropped when it sent stray bytes, and a handshake that is refused when the client's SNI differs from the CONNECT host; see [Request handling](https://docs.mindroom.chat/deployment/egress-broker/#request-handling).
+The risks the broker cannot prevent (code in the primary process, write access to the config, hosts that echo requests, wildcard rules on shared hosting domains, keys that can create other keys, and shared workspaces on `user` and `user_agent` agents that are not `private`) are listed in [What the broker cannot protect against](https://docs.mindroom.chat/deployment/egress-broker/#what-the-broker-cannot-protect-against).
 
 ### Testing and review of the egress broker
 
