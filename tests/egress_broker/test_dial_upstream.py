@@ -184,9 +184,24 @@ async def test_tunnels_validated_ip_through_operator_proxy(
 
 
 @pytest.mark.asyncio
-async def test_tls_to_the_named_host_runs_inside_the_tunnel(upstream_ca: UpstreamCA, tmp_path: Path) -> None:
-    """The handshake verifies the destination name, not the IP the tunnel was opened to."""
-    async with _OperatorProxy(inner_tls=upstream_ca.server_context(tmp_path)) as proxy:
+@pytest.mark.parametrize("outer_tls", [False, True], ids=["http-proxy", "https-proxy"])
+async def test_tls_to_the_named_host_runs_inside_the_tunnel(
+    upstream_ca: UpstreamCA,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    outer_tls: bool,
+) -> None:
+    """The handshake verifies the destination name, not the IP the tunnel was opened to.
+
+    An https:// operator proxy is verified with the default trust store, and the destination's TLS runs inside it.
+    """
+    monkeypatch.setattr(dial, "_operator_proxy_tls", upstream_ca.client_context)
+    operator = _OperatorProxy(
+        outer_tls=upstream_ca.server_context(tmp_path) if outer_tls else None,
+        inner_tls=upstream_ca.server_context(tmp_path),
+    )
+    async with operator as proxy:
         policy = DialPolicy(egress=BrowserEgress(https=proxy))
         with _resolve_as(_PUBLIC):
             reader, writer = await open_upstream(
@@ -197,6 +212,7 @@ async def test_tls_to_the_named_host_runs_inside_the_tunnel(upstream_ca: Upstrea
             )
         response = await _get(reader, writer, "localhost")
     assert response.endswith(b"ok")
+    assert operator.requests == [b"CONNECT 93.184.216.34:443 HTTP/1.1"]
 
 
 @pytest.mark.asyncio
@@ -225,32 +241,6 @@ async def test_tls_handshake_failure_inside_the_tunnel_closes_the_connection(
             await open_upstream("localhost", 443, policy=policy, ssl_context=ssl.create_default_context())
         async with asyncio.timeout(5):
             await operator.tunnel_closed.wait()
-
-
-@pytest.mark.asyncio
-async def test_https_operator_proxy_carries_tls_inside_tls(
-    upstream_ca: UpstreamCA,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An https:// operator proxy is verified with the default trust store, and the destination's TLS runs inside it."""
-    monkeypatch.setattr(dial, "_operator_proxy_tls", upstream_ca.client_context)
-    operator = _OperatorProxy(
-        outer_tls=upstream_ca.server_context(tmp_path),
-        inner_tls=upstream_ca.server_context(tmp_path),
-    )
-    async with operator as proxy:
-        policy = DialPolicy(egress=BrowserEgress(https=proxy))
-        with _resolve_as(_PUBLIC):
-            reader, writer = await open_upstream(
-                "localhost",
-                443,
-                policy=policy,
-                ssl_context=upstream_ca.client_context(),
-            )
-        response = await _get(reader, writer, "localhost")
-    assert response.endswith(b"ok")
-    assert operator.requests == [b"CONNECT 93.184.216.34:443 HTTP/1.1"]
 
 
 @pytest.mark.asyncio
