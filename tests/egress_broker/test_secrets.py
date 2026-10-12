@@ -8,12 +8,11 @@ import pytest
 
 from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import CredentialsManager, load_scoped_credentials
-from mindroom.credentials.policy import credential_service_policy
+from mindroom.credentials.policy import credential_service_policy, egress_credential_service
 from mindroom.egress_broker.secrets import (
     EgressServiceStatus,
     OAuthStatus,
     delete_secret,
-    egress_credential_service,
     load_secret,
     save_secret,
     service_status,

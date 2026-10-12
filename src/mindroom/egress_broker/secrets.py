@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from mindroom.credentials.manager import delete_scoped_credentials, load_scoped_credentials, save_scoped_credentials
+from mindroom.credentials.policy import egress_credential_service
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,7 +28,6 @@ __all__ = [
     "SecretUnavailable",
     "delete_egress_document",
     "delete_secret",
-    "egress_credential_service",
     "is_personal_target",
     "load_egress_document",
     "load_secret",
@@ -44,11 +44,6 @@ PERSONAL_WORKER_SCOPES: frozenset[str] = frozenset({"user", "user_agent"})
 def is_personal_target(target: ResolvedWorkerTarget | None) -> bool:
     """Return whether `target` has a personal worker scope; None is the global store, which is not personal."""
     return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
-
-
-def egress_credential_service(name: str) -> str:
-    """Return the credential service name for an egress service."""
-    return f"egress_{name}"
 
 
 def load_egress_document(

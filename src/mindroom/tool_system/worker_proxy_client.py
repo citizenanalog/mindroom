@@ -443,7 +443,7 @@ def _collect_credential_overrides(
 
     merged_overrides: dict[str, object] = {}
     for service in services:
-        # Never lease egress broker secrets into workers
+        # The one place that loads leased credentials, so it alone keeps egress broker secrets out of workers.
         if is_egress_broker_service(service):
             continue
 

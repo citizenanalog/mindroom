@@ -74,6 +74,11 @@ def is_egress_broker_service(service: str) -> bool:
     return service.startswith(_EGRESS_BROKER_SERVICE_PREFIX)
 
 
+def egress_credential_service(name: str) -> str:
+    """Return the credential service name that stores the key of the egress service `name`."""
+    return f"{_EGRESS_BROKER_SERVICE_PREFIX}{name}"
+
+
 @dataclass(frozen=True, slots=True)
 class _CredentialServicePolicy:
     """Credential placement decisions for one service in one worker scope."""

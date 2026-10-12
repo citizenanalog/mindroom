@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from mindroom.credentials.policy import is_oauth_client_config_service, is_oauth_token_service
+from mindroom.credentials.policy import (
+    egress_credential_service,
+    is_oauth_client_config_service,
+    is_oauth_token_service,
+)
 from mindroom.egress_broker.env import RUNNER_CA_BUNDLE_ENV
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 
@@ -334,7 +338,7 @@ def validate_egress_service_name(name: str) -> None:
         msg = f"service name '{name}' must match {_SERVICE_NAME_PATTERN.pattern}"
         raise ValueError(msg)
     # Secrets are stored as `egress_<name>`; OAuth suffixes there would read as OAuth services.
-    credential_service = f"egress_{name}"
+    credential_service = egress_credential_service(name)
     if is_oauth_token_service(credential_service) or is_oauth_client_config_service(credential_service):
         msg = f"service name '{name}' must not end in '_oauth' or '_oauth_client' (reserved for OAuth)"
         raise ValueError(msg)

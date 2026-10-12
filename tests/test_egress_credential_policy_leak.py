@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
-from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials.manager import CredentialsManager, save_scoped_credentials
 from mindroom.egress_broker.secrets import save_secret
 from mindroom.egress_broker.tokens import WorkerClaims
-from mindroom.tool_system.sandbox_proxy import _read_credential_policy
 from mindroom.tool_system.worker_proxy_client import WorkerProxyClientConfig, _collect_credential_overrides
 
 if TYPE_CHECKING:
@@ -122,51 +119,3 @@ def test_collect_credential_overrides_with_wildcard_policy(tmp_path: Path) -> No
 
     # Normal credentials should be present
     assert overrides.get("api_key") in ("openai-key", "anthropic-key")
-
-
-def test_read_credential_policy_drops_egress_services(tmp_path: Path) -> None:
-    """_read_credential_policy drops egress_* entries."""
-    # Create a credential policy JSON with egress services
-    policy_dict = {
-        "*": ["egress_github", "openai"],
-        "my_tool": ["egress_openai", "anthropic"],
-        "other_tool": ["normal_service"],
-    }
-    policy_json = json.dumps(policy_dict)
-
-    # Create runtime paths with the policy
-    runtime_paths = resolve_runtime_paths(
-        storage_path=tmp_path,
-        process_env={"MINDROOM_SANDBOX_CREDENTIAL_POLICY_JSON": policy_json},
-    )
-
-    # Parse the policy
-    parsed = _read_credential_policy(runtime_paths)
-
-    # Egress services should be dropped
-    assert "egress_github" not in parsed.get("*", ())
-    assert "egress_openai" not in parsed.get("my_tool", ())
-
-    # Normal services should remain
-    assert "openai" in parsed.get("*", ())
-    assert "anthropic" in parsed.get("my_tool", ())
-    assert "normal_service" in parsed.get("other_tool", ())
-
-
-def test_read_credential_policy_empty_after_filtering_egress(tmp_path: Path) -> None:
-    """Selector with only egress services results in empty tuple."""
-    policy_dict = {
-        "egress_only": ["egress_github", "egress_openai"],
-    }
-    policy_json = json.dumps(policy_dict)
-
-    runtime_paths = resolve_runtime_paths(
-        storage_path=tmp_path,
-        process_env={"MINDROOM_SANDBOX_CREDENTIAL_POLICY_JSON": policy_json},
-    )
-
-    parsed = _read_credential_policy(runtime_paths)
-
-    # Selector should exist but be empty
-    assert "egress_only" in parsed
-    assert parsed["egress_only"] == ()

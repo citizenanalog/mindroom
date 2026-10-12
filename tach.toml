@@ -4954,7 +4954,6 @@ depends_on = [
     "mindroom.tool_system.media_transport",
     "mindroom.tool_system.media_attachments",
     "mindroom.constants",
-    "mindroom.credentials.policy",
     "mindroom.tool_system.declarations",
     "mindroom.tool_system.registry_state",
     "mindroom.tool_system.runtime_context",
