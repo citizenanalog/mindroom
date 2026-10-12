@@ -674,11 +674,7 @@ export function EgressServiceEditor({
 
       <div className="flex flex-wrap items-center gap-2">
         {/* The presets bring the validation a save is checked against, so saving waits until they have loaded or failed. */}
-        <Button
-          type="submit"
-          size="sm"
-          disabled={busy !== null || presets === null}
-        >
+        <Button type="submit" size="sm" disabled={disabled || presets === null}>
           {busy === "save" ? (
             <>
               <Loader2
@@ -699,7 +695,7 @@ export function EgressServiceEditor({
           type="button"
           size="sm"
           variant="ghost"
-          disabled={busy !== null}
+          disabled={disabled}
           onClick={confirmingSave ? () => setConfirmingSave(false) : onClose}
         >
           {confirmingSave ? "Go back" : "Cancel"}
@@ -710,7 +706,7 @@ export function EgressServiceEditor({
             size="sm"
             variant="outline"
             className="ml-auto"
-            disabled={busy !== null}
+            disabled={disabled}
             onClick={() => setConfirmingDelete(true)}
           >
             {limiting ? "Remove limit" : "Delete service"}
@@ -725,7 +721,7 @@ export function EgressServiceEditor({
               type="button"
               size="sm"
               variant="destructive"
-              disabled={busy !== null}
+              disabled={disabled}
               onClick={() => void remove()}
             >
               {busy === "delete"
@@ -740,7 +736,7 @@ export function EgressServiceEditor({
               type="button"
               size="sm"
               variant="ghost"
-              disabled={busy !== null}
+              disabled={disabled}
               onClick={() => setConfirmingDelete(false)}
             >
               Keep

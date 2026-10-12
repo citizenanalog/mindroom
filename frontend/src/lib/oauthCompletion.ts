@@ -31,7 +31,7 @@ function readOutcome(
   popup: Window,
   provider: string,
   expectedOrigin: string | null,
-): { status: Outcome; popupClosesItself: boolean } | null {
+): Outcome | null {
   if (
     expectedOrigin === null ||
     event.origin !== expectedOrigin ||
@@ -43,7 +43,7 @@ function readOutcome(
   const data = event.data as Record<string, unknown>;
   if (data.provider !== provider) return null;
   if (data.type === OUTCOME_TYPE && OUTCOMES.includes(data.status))
-    return { status: data.status as Outcome, popupClosesItself: true };
+    return data.status as Outcome;
   return null;
 }
 
@@ -69,14 +69,14 @@ export function watchOAuthCompletion(
     );
     if (outcome === null) return;
     finish(
-      outcome.status === "connected"
+      outcome === "connected"
         ? undefined
         : new Error(
-            outcome.status === "cancelled"
+            outcome === "cancelled"
               ? options.cancellationMessage
               : (options.errorMessage ?? "Authorization failed. Try again."),
           ),
-      outcome.popupClosesItself,
+      true, // The popup's own page answered, so it closes itself.
     );
   };
   const poll = window.setInterval(() => {

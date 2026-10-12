@@ -99,6 +99,10 @@ export function EgressServiceItem({
 
   useEffect(() => () => operation.current?.abort(), []);
 
+  const openKeyForm = () => {
+    setError(null);
+    setEditing(true);
+  };
   const closeEditor = () => {
     setEditing(false);
     setSecret("");
@@ -286,10 +290,7 @@ export function EgressServiceItem({
               variant="ghost"
               disabled={busy !== null}
               aria-label={`${keyInsteadLabel} for ${service.display_name}`}
-              onClick={() => {
-                setError(null);
-                setEditing(true);
-              }}
+              onClick={openKeyForm}
             >
               {keyInsteadLabel}
             </Button>
@@ -301,10 +302,7 @@ export function EgressServiceItem({
                 variant="outline"
                 disabled={busy !== null}
                 aria-label={`${service.key_configured ? "Replace" : "Set"} key for ${service.display_name}`}
-                onClick={() => {
-                  setError(null);
-                  setEditing(true);
-                }}
+                onClick={openKeyForm}
               >
                 {service.key_configured ? "Replace key" : "Set key"}
               </Button>
