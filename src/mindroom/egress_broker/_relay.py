@@ -18,7 +18,7 @@ import h11
 
 from mindroom.egress_broker.audit import AuditRecord
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
-from mindroom.egress_broker.messages import refusal_body
+from mindroom.egress_broker.messages import git_error_text, refusal_body
 from mindroom.egress_broker.rules import route_request, strip_hop_by_hop
 from mindroom.logging_config import get_logger
 
@@ -200,20 +200,6 @@ def _git_discovery_service(request: h11.Request) -> str | None:
     return services[0]
 
 
-def _git_error_text(body: dict[str, object]) -> str:
-    """Return the message for git's ERR line, naming the body's `manage_url` itself, since git shows no other field.
-
-    The connect link is never named: it carries a one-time token. Where the message offers it, the manage link
-    stands in.
-    """
-    message = str(body["message"])
-    link = body.get("manage_url")
-    if not isinstance(link, str) or not link:
-        return message
-    message = message.replace("connect_url or manage_url", "manage_url").replace("connect_url", "manage_url")
-    return message.replace("manage_url", link)
-
-
 def _pkt_line(data: bytes) -> bytes:
     """Frame `data` as one git pkt-line: four hex digits giving the length, the prefix included, then the data."""
     return b"%04x" % (len(data) + 4) + data
@@ -247,7 +233,7 @@ async def send_json(
     else:
         status = 200
         content_type = f"application/x-{git_service}-advertisement".encode()
-        error = _printable(_git_error_text(body), limit=_GIT_ERROR_LIMIT)
+        error = _printable(git_error_text(body), limit=_GIT_ERROR_LIMIT)
         payload = _pkt_line(f"# service={git_service}\n".encode()) + b"0000" + _pkt_line(f"ERR {error}\n".encode())
     response = h11.Response(
         status_code=status,

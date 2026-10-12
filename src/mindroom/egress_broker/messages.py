@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ["ScopeInfo", "refusal_body"]
+__all__ = ["ScopeInfo", "git_error_text", "refusal_body"]
 
 # Texts from the design spec (sections 12.5 and 14). They name only a service, provider, host, path without its
 # query, or manager IDs, never a secret, token, or connect link: the links travel in their own fields, which the texts
-# name.
+# name. `git_error_text` rewrites those link names for git's ERR line, so it must follow any rewording of them.
+_PATH_OUTSIDE = "{host}{path} is outside the paths {service} allows for this agent. "
+_SHARED_MISSING = "No {service} key is set for this shared agent. "
 _MESSAGES = {
     "credential_not_configured": "No {service} key is set for this agent. Ask the user to add one at manage_url, then retry.",
     "oauth_connection_required": (
@@ -23,10 +25,7 @@ _MESSAGES = {
         "{provider} did not refresh the account token. "
         "Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url."
     ),
-    "path_not_allowed": (
-        "{host}{path} is outside the paths {service} allows for this agent. "
-        "Ask the user to add it at manage_url if the agent needs it."
-    ),
+    "path_not_allowed": _PATH_OUTSIDE + "Ask the user to add it at manage_url if the agent needs it.",
     "bad_request": (
         "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
         "Use a plain path."
@@ -49,14 +48,8 @@ _CONNECTABLE = (
     "No {service} credential is set for this agent. "
     "Ask the user to connect it at connect_url or add a key at manage_url, then retry."
 )
-_SHARED = (
-    "No {service} key is set for this shared agent. "
-    "Only its credential managers ({managers}) can add one, at manage_url."
-)
-_SHARED_WITHOUT_MANAGERS = (
-    "No {service} key is set for this shared agent. Only an administrator can add one, at manage_url."
-)
-_PATH_OUTSIDE = "{host}{path} is outside the paths {service} allows for this agent. "
+_SHARED = _SHARED_MISSING + "Only its credential managers ({managers}) can add one, at manage_url."
+_SHARED_WITHOUT_MANAGERS = _SHARED_MISSING + "Only an administrator can add one, at manage_url."
 _PATH_SHARED = _PATH_OUTSIDE + "Only its credential managers ({managers}) can change this, at manage_url."
 _PATH_ADMINISTRATOR = _PATH_OUTSIDE + "Only an administrator can change this, at manage_url."
 # The spec words `bad_request` for the ambiguous-path refusal; a request the broker cannot read at all has no path.
@@ -148,3 +141,17 @@ def refusal_body(
     if provider is not None:
         body["provider"] = provider
     return {**body, **extra, "message": message}
+
+
+def git_error_text(body: dict[str, object]) -> str:
+    """Return the message for git's ERR line, naming the body's `manage_url` itself, since git shows no other field.
+
+    The connect link is never named: it carries a one-time token. Where the message offers it, the manage link
+    stands in.
+    """
+    message = str(body["message"])
+    link = body.get("manage_url")
+    if not isinstance(link, str) or not link:
+        return message
+    message = message.replace("connect_url or manage_url", "manage_url").replace("connect_url", "manage_url")
+    return message.replace("manage_url", link)
