@@ -17,7 +17,7 @@ import {
   vi,
 } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { pressInDialog } from "@/test/egressServiceTestKit";
+import { pressInDialog, presetsReady } from "@/test/egressServiceTestKit";
 import { EgressBroker } from "./EgressBroker";
 
 const NOT_RUNNING =
@@ -1222,8 +1222,6 @@ describe("egress broker service editor", () => {
   };
   const save = () =>
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-  const presetsReady = () =>
-    waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
   const openAdd = async () => {
     render(<EgressBroker />);
     await screen.findByLabelText("GitHub");

@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { pressInDialog } from "@/test/egressServiceTestKit";
+import { pressInDialog, presetsReady } from "@/test/egressServiceTestKit";
 import { EgressCredentials } from "./EgressCredentials";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type {
@@ -281,8 +281,6 @@ const configService: EgressCredentialService = {
 const SERVICES = "/api/connections/egress/agents/personal/services";
 const KEYS = "/api/connections/egress/agents/personal";
 const PRESETS = "/api/connections/egress/presets";
-const presetsReady = () =>
-  waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
 
 describe("egress services on the personal page", () => {
   let listing: EgressCredentialAgent[];

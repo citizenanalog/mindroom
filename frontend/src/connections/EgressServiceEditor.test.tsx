@@ -8,7 +8,12 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { bearerRule, presets, validation } from "@/test/egressServiceTestKit";
+import {
+  bearerRule,
+  presets,
+  presetsReady,
+  validation,
+} from "@/test/egressServiceTestKit";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import {
   DiscardEditsNotice,
@@ -48,7 +53,7 @@ const baseProps = () => ({
 async function renderEditor(props: Partial<EgressServiceEditorProps> = {}) {
   const merged = { ...baseProps(), ...props };
   render(<EgressServiceEditor {...merged} />);
-  await waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
+  await presetsReady();
   return { onSave: merged.onSave, onClose: merged.onClose };
 }
 
@@ -897,7 +902,7 @@ describe("loading the presets", () => {
     expect(screen.getByLabelText("Preset")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Save service" })).toBeDisabled();
     resolve({ presets, oauth_providers: providers, validation });
-    await waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
+    await presetsReady();
     expect(screen.getByRole("button", { name: "Save service" })).toBeEnabled();
     expect(loadPresets).toHaveBeenCalledTimes(1);
   });

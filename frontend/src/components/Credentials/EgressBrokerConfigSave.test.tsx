@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
-import { pressInDialog } from "@/test/egressServiceTestKit";
+import { pressInDialog, presetsReady } from "@/test/egressServiceTestKit";
 import { readConfigRoot, useConfigStore } from "@/store/configStore";
 import { EgressBroker } from "./EgressBroker";
 
@@ -41,8 +41,6 @@ const authoredConfig = {
 
 const json = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), { status });
-const presetsReady = () =>
-  waitFor(() => expect(screen.getByLabelText("Preset")).toBeEnabled());
 
 const row = (name: string, display_name: string) => ({
   name,
