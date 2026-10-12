@@ -16,6 +16,7 @@ import pytest
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.env import broker_execution_env
 from mindroom.egress_broker.tokens import TokenSigner
+from mindroom.server_fetch_url import ServerFetchUrlError
 from tests.egress_broker.conftest import (
     BODY_TOO_LARGE,
     BROKER_ERROR,
@@ -376,10 +377,7 @@ async def test_unresolvable_connect_target_gets_502(broker: BrokerFactory, raw_p
     """A name that does not resolve is an upstream failure, not a policy block."""
     started = await broker()
 
-    def unresolvable(*_args: object, **_kwargs: object) -> list[object]:
-        exc = ValueError("URL is not allowed for server-side fetching")
-        exc.reason = "dns_resolution_failed"  # type: ignore[attr-defined]
-        raise exc
+    unresolvable = ServerFetchUrlError(reason="dns_resolution_failed")
 
     with patch("mindroom.egress_broker.dial.validated_connect_addresses", side_effect=unresolvable):
         response = await raw_proxy(
