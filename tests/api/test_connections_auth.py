@@ -239,7 +239,7 @@ def test_signed_nonadmin_can_enter_personal_and_oauth_completion_routes(
 
 
 @pytest.mark.parametrize("portal_setting", [None, "", "   "])
-@pytest.mark.parametrize("path", ["/connections", "/connections/nested"])
+@pytest.mark.parametrize("path", ["/connections", "/connections/nested", "/connections/assets/portal.js"])
 def test_disabled_connections_frontend_is_unavailable(
     portal_setting: str | None,
     path: str,
@@ -302,6 +302,30 @@ def test_connections_static_routes_use_only_dedicated_bundle(
     response = connections_auth_client().get(path, headers=signed_connections_headers("alice"))
     assert response.status_code == 200
     assert response.text == content
+
+
+@pytest.mark.parametrize("path", ["/connections/egress", "/connections/egress/", "/connections/egress/agents"])
+@pytest.mark.parametrize(("broker_port", "status_code"), [(None, 404), ("8768", 200)])
+def test_portal_serves_the_agent_keys_page_only_while_the_broker_is_on(
+    path: str,
+    broker_port: str | None,
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    connections_auth_client: Callable[..., TestClient],
+    signed_connections_headers: Callable[[str], dict[str, str]],
+) -> None:
+    """Without a broker port the portal's Agent Keys page is a 404, while the rest of the portal stays served."""
+    portal = tmp_path / "connections"
+    portal.mkdir()
+    (portal / "index.html").write_text("connections")
+    monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: tmp_path)
+    response = connections_auth_client(MINDROOM_EGRESS_BROKER_PORT=broker_port).get(
+        path,
+        headers=signed_connections_headers("alice"),
+    )
+    assert response.status_code == status_code
+    assert (response.text == "connections") is (status_code == 200)
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
@@ -522,7 +546,8 @@ def test_administrator_and_connections_pages_are_not_redirected(
     portal.mkdir()
     (portal / "index.html").write_text("connections")
     monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: tmp_path)
-    client = connections_auth_client()
+    # The Agent Keys page exists while the broker is on.
+    client = connections_auth_client(MINDROOM_EGRESS_BROKER_PORT="8768")
     owner = client.get("/", headers={**signed_connections_headers("owner"), **_BROWSER_ACCEPT}, follow_redirects=False)
     assert (owner.status_code, owner.text) == (200, "administrator dashboard")
     alice = {**signed_connections_headers("alice"), **_BROWSER_ACCEPT}

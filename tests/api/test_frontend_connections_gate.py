@@ -33,13 +33,15 @@ def gate_client(
     (portal / "assets" / "portal.js").write_text("portal asset")
     monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: dist)
 
-    def client(*, portal_agent: str | None, trusted_upstream: bool) -> TestClient:
+    def client(*, portal_agent: str | None, trusted_upstream: bool, broker_on: bool = True) -> TestClient:
         env = {
             "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true" if trusted_upstream else "false",
             "MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER": "X-Trusted-User",
         }
         if portal_agent is not None:
             env["MINDROOM_CONNECTIONS_AGENT"] = portal_agent
+        if broker_on:
+            env["MINDROOM_EGRESS_BROKER_PORT"] = "8768"
         runtime_paths = constants.resolve_primary_runtime_paths(
             config_path=temp_config_file,
             storage_path=tmp_path / "storage",
@@ -93,5 +95,22 @@ def test_egress_page_is_not_served_without_trusted_upstream_or_portal(
 ) -> None:
     """With neither the portal nor trusted upstream auth enabled, the egress page is a 404."""
     response = gate_client(portal_agent=None, trusted_upstream=False).get(path)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Connections are not enabled"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/connections/egress", "/connections/egress/", "/connections/egress/agents", "/connections/assets/portal.js"],
+)
+def test_trusted_upstream_serves_no_egress_page_while_the_broker_is_off(
+    path: str,
+    gate_client: Callable[..., TestClient],
+) -> None:
+    """Without a broker port the Agent Keys page and the assets that bypass the portal setting for it are 404s."""
+    response = gate_client(portal_agent=None, trusted_upstream=True, broker_on=False).get(
+        path,
+        headers=_TRUSTED_HEADERS,
+    )
     assert response.status_code == 404
     assert response.json()["detail"] == "Connections are not enabled"

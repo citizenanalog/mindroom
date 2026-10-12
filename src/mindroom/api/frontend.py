@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, Response
 
 from mindroom.api.auth import login_redirect_for_request, request_has_frontend_access, sanitize_next_path
 from mindroom.api.config_lifecycle import api_runtime_paths
+from mindroom.egress_broker.env import egress_broker_enabled
 from mindroom.frontend_assets import ensure_frontend_dist_dir
 
 if TYPE_CHECKING:
@@ -49,14 +50,20 @@ def _resolve_frontend_asset(frontend_dir: Path, request_path: str) -> Path | Non
 
 
 def _connections_frontend_enabled(runtime_paths: RuntimePaths, path: str) -> bool:
-    """Return whether the dedicated connections bundle may serve one request path."""
+    """Return whether the dedicated connections bundle may serve one request path.
+
+    The personal egress page, and the assets it loads without the portal, exist only while the broker is on.
+    """
+    segments = path.split("/")
+    page = segments[1] if len(segments) > 1 else ""
+    if page == "egress" and not egress_broker_enabled(runtime_paths):
+        return False
     if (runtime_paths.env_value("MINDROOM_CONNECTIONS_AGENT") or "").strip():
         return True
-    segments = path.split("/")
     return (
-        len(segments) > 1
-        and segments[1] in _EGRESS_PAGE_SEGMENTS
+        page in _EGRESS_PAGE_SEGMENTS
         and runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED")
+        and egress_broker_enabled(runtime_paths)
     )
 
 
