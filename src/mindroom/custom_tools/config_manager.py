@@ -36,7 +36,7 @@ from mindroom.oauth.credential_lifecycle import oauth_credentials_worker_target
 from mindroom.oauth.registry import load_oauth_providers
 from mindroom.oauth.service import oauth_connect_url
 from mindroom.redaction import REDACTED, redact_sensitive_text
-from mindroom.tool_system.catalog import ToolCategory, ToolStatus, resolved_tool_metadata_for_runtime
+from mindroom.tool_system.catalog import ToolCategory, ToolStatus, listable_tool_metadata
 from mindroom.tool_system.runtime_context import (
     build_execution_identity_from_runtime_context,
     get_tool_runtime_context,
@@ -910,20 +910,12 @@ class ConfigManagerTools(Toolkit):
         *,
         footer: str | None = None,
     ) -> tuple[Config | None, dict[str, ToolMetadata] | None, str | None]:
-        """Load config and resolve one runtime-aware tool metadata snapshot."""
+        """Load config and the tools this runtime offers, the ones every tool list and check here uses."""
         config, load_error = self._load_config_or_error(footer=footer)
         if load_error:
             return None, None, load_error
         assert config is not None
-        return (
-            config,
-            resolved_tool_metadata_for_runtime(
-                self.runtime_paths,
-                config,
-                tolerate_plugin_load_errors=True,
-            ),
-            None,
-        )
+        return config, listable_tool_metadata(self.runtime_paths, config), None
 
     def _get_available_models(self) -> str:
         """Get the list of configured models from the current configuration."""

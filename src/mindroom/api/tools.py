@@ -23,7 +23,6 @@ from mindroom.credentials.manager import (
     load_worker_grantable_shared_credentials,
 )
 from mindroom.credentials.policy import credential_service_policy
-from mindroom.egress_broker.env import egress_tool_unavailable
 from mindroom.oauth import OAuthProviderError
 from mindroom.oauth.credential_lifecycle import (
     load_oauth_credentials_snapshot,
@@ -35,7 +34,7 @@ from mindroom.oauth.service import oauth_provider_service_account_configured
 from mindroom.tool_system.catalog import (
     ensure_tool_registry_loaded,
     export_tools_metadata,
-    resolved_tool_metadata_for_runtime,
+    listable_tool_metadata,
 )
 from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import (
@@ -446,18 +445,7 @@ async def get_registered_tools(
     based on credentials (including plugin-provided tools).
     """
     config, runtime_paths = _read_tools_runtime_config(request)
-    tool_metadata = resolved_tool_metadata_for_runtime(
-        runtime_paths,
-        config,
-        tolerate_plugin_load_errors=True,
-    )
-    tools = export_tools_metadata(
-        {
-            name: metadata
-            for name, metadata in tool_metadata.items()
-            if not egress_tool_unavailable(name, runtime_paths)
-        },
-    )
+    tools = export_tools_metadata(listable_tool_metadata(runtime_paths, config))
     execution_scope_override_provided, execution_scope_override = resolve_dashboard_execution_scope_override(request)
     context = _resolve_tool_availability_context(
         request,

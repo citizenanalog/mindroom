@@ -22,14 +22,14 @@ from mindroom.api.connection_agents import (
 )
 from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
 from mindroom.credentials.manager import get_runtime_credentials_manager
-from mindroom.egress_broker.env import egress_broker_enabled, egress_tool_unavailable
+from mindroom.egress_broker.env import egress_broker_enabled
 from mindroom.logging_config import get_logger
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
 from mindroom.matrix.users import create_agent_http_client
 from mindroom.oauth.credential_lifecycle import resolve_oauth_credential_context
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.oauth.service import oauth_provider_service_account_configured
-from mindroom.tool_system.catalog import resolved_tool_metadata_for_runtime
+from mindroom.tool_system.catalog import listable_tool_metadata
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
@@ -159,15 +159,7 @@ _ConnectionUserContext = Annotated[ConnectionUserContext, Depends(_connection_us
 async def _connections(request: Request, user: _ConnectionUserContext) -> _Connections:
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
     providers = load_oauth_providers_for_snapshot(snapshot)
-    metadata = {
-        name: tool
-        for name, tool in resolved_tool_metadata_for_runtime(
-            snapshot.runtime_paths,
-            user.config,
-            tolerate_plugin_load_errors=True,
-        ).items()
-        if not egress_tool_unavailable(name, snapshot.runtime_paths)
-    }
+    metadata = listable_tool_metadata(snapshot.runtime_paths, user.config)
     egress_enabled = egress_broker_enabled(snapshot.runtime_paths)
     agents = [
         _agent_connections(name, user, providers, metadata, egress_enabled=egress_enabled)

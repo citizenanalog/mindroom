@@ -2323,8 +2323,8 @@ def test_get_tools_uses_one_runtime_snapshot(
     with (
         patch("mindroom.api.tools._read_tools_runtime_config", side_effect=_read_tools_runtime_config),
         patch(
-            "mindroom.api.tools.resolved_tool_metadata_for_runtime",
-            side_effect=lambda runtime_paths, _config, **_kwargs: (captured_runtime_paths.append(runtime_paths), {})[1],
+            "mindroom.api.tools.listable_tool_metadata",
+            side_effect=lambda runtime_paths, _config: (captured_runtime_paths.append(runtime_paths), {})[1],
         ),
         patch(
             "mindroom.api.tools.export_tools_metadata",

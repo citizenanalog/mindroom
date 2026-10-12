@@ -946,6 +946,19 @@ class TestConsolidatedConfigManager:
         result = cm.get_info(info_type="available_tools")
         assert "Available Tools by Category" in result
 
+    @pytest.mark.parametrize("broker_on", [False, True])
+    def test_get_info_offers_the_egress_tool_only_while_the_broker_is_on(self, tmp_path: Path, broker_on: bool) -> None:
+        """The tool list and tool details offer egress_credentials only while the egress broker is on."""
+        process_env = {"MINDROOM_EGRESS_BROKER_PORT": "8768"} if broker_on else {}
+        runtime_paths = resolve_runtime_paths(config_path=_minimal_config_path(tmp_path), process_env=process_env)
+        cm = ConfigManagerTools(runtime_paths)
+
+        listed = cm.get_info(info_type="available_tools")
+        details = cm.get_info(info_type="tool_details", name="egress_credentials")
+
+        assert ("**egress_credentials**" in listed) is broker_on
+        assert ("Tool: egress_credentials" in details) is broker_on
+
     def test_get_info_available_tools_includes_plugin_tools_from_current_config(self, tmp_path: Path) -> None:
         """Available tool listing should resolve plugin tools from the current config."""
         cm = _config_manager(_plugin_tool_config_path(tmp_path))
