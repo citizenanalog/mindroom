@@ -959,6 +959,35 @@ class TestConsolidatedConfigManager:
         assert ("**egress_credentials**" in listed) is broker_on
         assert ("Tool: egress_credentials" in details) is broker_on
 
+    def test_agent_checks_accept_the_egress_tool_while_the_broker_is_off(self, tmp_path: Path) -> None:
+        """Create, update, and validate accept egress_credentials while the broker is off, as the config does."""
+        config_path = tmp_path / "config.yaml"
+        write_config_yaml(
+            Config(
+                agents={"coder": AgentConfig(display_name="Coder", role="Writes code", tools=["egress_credentials"])},
+                models={"default": {"provider": "openai", "id": "gpt-5.6-terra"}},
+            ),
+            config_path,
+        )
+        cm = ConfigManagerTools(resolve_runtime_paths(config_path=config_path, process_env={}))
+
+        validated = cm.manage_agent(operation="validate", agent_name="coder")
+        created = cm.manage_agent(
+            operation="create",
+            agent_name="helper",
+            display_name="Helper",
+            role="Helps",
+            tools=["egress_credentials"],
+        )
+        updated = cm.manage_agent(operation="update", agent_name="coder", tools=["shell", "egress_credentials"])
+
+        assert "Invalid tools" not in validated
+        assert "Successfully created" in created
+        assert "Successfully updated agent" in updated
+        saved = load_config_yaml(config_path)
+        assert saved.agents["helper"].tool_names == ["egress_credentials"]
+        assert saved.agents["coder"].tool_names == ["shell", "egress_credentials"]
+
     def test_get_info_available_tools_includes_plugin_tools_from_current_config(self, tmp_path: Path) -> None:
         """Available tool listing should resolve plugin tools from the current config."""
         cm = _config_manager(_plugin_tool_config_path(tmp_path))
