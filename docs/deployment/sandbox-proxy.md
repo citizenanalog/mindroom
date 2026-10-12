@@ -406,7 +406,7 @@ Every worker-routed call leases the called tool's saved settings, because runner
 Values in a dedicated worker's own credential store apply only inside that worker and only where no lease sets a value, so clear worker credential stores if older values there should stop applying.
 
 Leases do not export API keys into shell environments, configure Git authentication, or install SSH keys.
-For shell authentication, use [environment passthrough](#shell-environment-and-path), the [workspace env hook](#workspace-env-hook-mindroomworker-envsh), or [brokered egress](#brokered-worker-egress).
+For shell authentication, use [environment passthrough](#shell-environment-and-path), the [workspace env hook](#workspace-env-hook-mindroomworker-envsh), or [Agent Keys](#agent-keys-egress-broker).
 
 ## Agent Keys (egress broker)
 
