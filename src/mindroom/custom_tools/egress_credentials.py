@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
-    from mindroom.egress_broker.user_services import ServiceSource
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 logger = get_logger(__name__)
@@ -88,16 +87,7 @@ class EgressCredentialsTools(Toolkit):
         }
         if not services:
             return self._payload([], link, _NO_SERVICES_NOTE)
-        entries = [
-            self._entry(
-                manager,
-                config,
-                name,
-                service,
-                service_source(config.egress_broker, name),
-            )
-            for name, service in services.items()
-        ]
+        entries = [self._entry(manager, config, name, service) for name, service in services.items()]
         return self._payload(entries, link, self._note(link))
 
     def _entry(
@@ -106,13 +96,17 @@ class EgressCredentialsTools(Toolkit):
         config: Config,
         name: str,
         service: EgressService,
-        source: ServiceSource,
     ) -> dict[str, str | bool | None]:
         """Describe one service's credential sources in this agent's scope, as the broker would use them.
 
         A service whose status cannot be read is reported as not configured and not connectable, so one failing
         provider or unreadable secret does not fail the listing of the others. Only the error type is logged.
         """
+        entry: dict[str, str | bool | None] = {
+            "name": name,
+            "display_name": service.display_name or name,
+            "source": service_source(config.egress_broker, name),
+        }
         try:
             status = service_status(
                 manager,
@@ -129,22 +123,8 @@ class EgressCredentialsTools(Toolkit):
             )
         except Exception as exc:
             logger.warning("egress_credentials_status_failed", service=name, error_type=type(exc).__name__)
-            return {
-                "name": name,
-                "display_name": service.display_name or name,
-                "source": source,
-                "configured": False,
-                "active_source": None,
-                "can_connect_account": False,
-                "provider": None,
-            }
-        entry: dict[str, str | bool | None] = {
-            "name": name,
-            "display_name": service.display_name or name,
-            "source": source,
-            "configured": status.configured,
-            "active_source": status.active_source,
-        }
+            return {**entry, "configured": False, "active_source": None, "can_connect_account": False, "provider": None}
+        entry |= {"configured": status.configured, "active_source": status.active_source}
         if not status.configured:
             # An unreadable stored connection must be reset before a new one can be stored, so it is not connectable.
             # Like the broker's 403 body, name the provider only when the user can connect it.
