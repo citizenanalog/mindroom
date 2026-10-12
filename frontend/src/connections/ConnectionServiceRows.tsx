@@ -8,6 +8,7 @@ import {
   sharedAgentNote,
 } from "./accountCopy";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { servicesUsingAccount } from "./egressRowText";
 import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { errorText, requestConnection } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
@@ -141,9 +142,7 @@ export function ConnectionServiceRows({
   // Everything on this agent that stops working when the account goes: its
   // services that sign in with the provider, then the tools, once each.
   const users = [
-    ...(agent.egress_services ?? [])
-      .filter((other) => other.oauth?.provider === service.provider)
-      .map((other) => other.display_name),
+    ...servicesUsingAccount(agent.egress_services ?? [], service.provider),
     ...tools.map((tool) => tool.display_name),
   ];
   // Everyone who uses a shared agent acts as its connected account, so everyone is told.

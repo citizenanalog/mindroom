@@ -455,7 +455,7 @@ export function EgressServiceItem({
           description={disconnectDescription(
             oauth.display_name,
             agent.displayName,
-            servicesUsingAccount(agent, oauth),
+            servicesUsingAccount(agent.services, oauth.provider),
           )}
           confirmLabel={oauth.connected ? "Disconnect" : "Reset connection"}
           onCancel={() => setConfirm(null)}

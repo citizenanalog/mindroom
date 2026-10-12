@@ -117,14 +117,13 @@ export function removeWarning(service: EgressCredentialService): string {
   return "This deletes your saved key. Your agent loses access to this service until you set a key again.";
 }
 
-/** The names of the agent's services that sign in with this account, for the disconnect question. */
+/** The names of the services that sign in with this provider's account, for the disconnect question. */
 export function servicesUsingAccount(
-  agent: RowAgent,
-  oauth: EgressOAuthStatus | null,
+  services: readonly EgressCredentialService[],
+  provider: string,
 ): string[] {
-  if (oauth === null) return [];
-  return agent.services
-    .filter((other) => other.oauth?.provider === oauth.provider)
+  return services
+    .filter((other) => other.oauth?.provider === provider)
     .map((other) => other.display_name);
 }
 
