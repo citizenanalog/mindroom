@@ -1494,7 +1494,7 @@ describe("rows with an agent's wording", () => {
   });
 
   describe("the hosts a service sends to", () => {
-    const rule = (
+    const hostRule = (
       host: string,
       path_prefix = "/",
       port: number | null = null,
@@ -1509,11 +1509,11 @@ describe("rows with an agent's wording", () => {
         {
           ...github,
           rules: [
-            rule("api.github.com"),
-            rule("github.com"),
-            rule("api.github.com", "/graphql"),
-            rule("localhost", "/", 8443),
-            rule("localhost", "/v2/", 8443),
+            hostRule("api.github.com"),
+            hostRule("github.com"),
+            hostRule("api.github.com", "/graphql"),
+            hostRule("localhost", "/", 8443),
+            hostRule("localhost", "/v2/", 8443),
           ],
         },
       ]);
@@ -1528,7 +1528,10 @@ describe("rows with an agent's wording", () => {
       renderRows([
         {
           ...github,
-          rules: [rule("a.example.com"), rule("a.example.com", "/", 8080)],
+          rules: [
+            hostRule("a.example.com"),
+            hostRule("a.example.com", "/", 8080),
+          ],
         },
       ]);
       expect(
@@ -1547,7 +1550,7 @@ describe("rows with an agent's wording", () => {
       const shared = {
         ...openai,
         is_shared: true,
-        rules: [rule("api.openai.com")],
+        rules: [hostRule("api.openai.com")],
       };
       renderRows([shared], {
         agent: agent({ shared: true, services: [shared] }),
@@ -1811,7 +1814,7 @@ describe("what a limited service says it is limited to", () => {
       }),
     ),
   ];
-  const custom = (graphql: boolean): EgressCredentialService => ({
+  const limited = (graphql: boolean): EgressCredentialService => ({
     ...github,
     name: "mine",
     display_name: "Mine",
@@ -1820,7 +1823,7 @@ describe("what a limited service says it is limited to", () => {
   });
 
   it("adds that GraphQL reaches every repository the key can reach when the limit allows it", () => {
-    renderRows([custom(true)]);
+    renderRows([limited(true)]);
     expect(
       within(row("Mine")).getByText(
         "Limited to a/b (plus GraphQL, which reaches every repository the key can reach)",
@@ -1831,7 +1834,7 @@ describe("what a limited service says it is limited to", () => {
   it("says nothing of a limit when the rules also allow other GitHub paths", () => {
     renderRows([
       {
-        ...custom(false),
+        ...limited(false),
         rules: [
           ...rules(false),
           { host: "api.github.com", port: null, path_prefix: "/user" },
