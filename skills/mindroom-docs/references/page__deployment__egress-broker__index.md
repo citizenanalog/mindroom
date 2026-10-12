@@ -1,6 +1,7 @@
-# Brokered Worker Egress
+# Agent Keys
 
-The **egress broker** runs inside the primary runtime and intercepts outbound HTTP(S) requests from worker code, injecting secrets the worker never sees.
+**Agent Keys** let your agents use API keys and logins without ever seeing them.
+The **egress broker** that does this runs inside the primary runtime and intercepts outbound HTTP(S) requests from worker code, injecting secrets the worker never sees; it is configured under `egress_broker`.
 Use it when workers need to call APIs with credentials (GitHub, Google, Atlassian, OpenAI, cloud providers) while keeping those secrets out of worker code, environment variables, and container memory.
 Each service gets its credential from an API key you store or from an account you connect with a few clicks, and built-in presets define the common services in one line.
 Users can also add services of their own, limit GitHub access to chosen repositories in place, and see their own recent requests on a personal page, without dashboard access.
@@ -408,7 +409,7 @@ Connected accounts live in MindRoom's OAuth credential stores under the same pri
 Agents without a worker scope do not get a store of their own: they all read the one global key per service, so setting or removing it affects every such agent.
 The dashboard panel edits it as **Agents without a scope**.
 
-Set secrets and connect accounts in the **Agent API keys and accounts** panel on the dashboard's Credentials page, or on the personal egress page at `/connections/egress` (linked as "API keys and accounts" from the Connections pages).
+Set secrets and connect accounts in the **Agent Keys** panel on the dashboard's Credentials page, or on the personal egress page at `/connections/egress` (linked as "API keys and accounts" from the Connections pages).
 The panel is the first card on the Credentials page. Below it sits the raw editor, **Raw credential payloads (advanced)**, collapsed until you click its heading (collapsing hides the payloads again), whose button reads **Save payload**.
 The panel's **Keys for** selector lists the `shared` agents that can run commands first, in config order, and then **Agents without a scope**, only when such an agent exists; it defaults to the first entry, which is **Agents without a scope** when no shared agent exists.
 When no agent uses the panel's keys at all (every agent that can run commands is `user` or `user_agent`), the panel hides its key actions and says "No agent uses these keys."
@@ -639,7 +640,7 @@ A stored entry that no longer passes these rules is skipped (or loses the offend
 One editor adds, edits, and deletes services in two places:
 
 - **Personal egress page** (`/connections/egress`): each agent has an **Add service** button where the caller may manage services (their own personal agents, and shared or unscoped agents they manage as an administrator or credential manager). A user's own services have **Edit service** and **Delete service**, and deleting also deletes the service's key. Services from `config.yaml` appear read-only under "From your administrator" and keep their key and account controls; a service that covers GitHub also offers **Limit to repositories** until the user has a limit on it, which the row then shows with **Change limit** and **Remove limit** (see [Limiting paths and repositories](#limiting-paths-and-repositories) and [The limit editor](#the-limit-editor)). [Inactive entries](#user-services) are listed under the agent with their reason, and can be deleted by anyone who may manage services there.
-- **Dashboard Credentials page**: the **Agent API keys and accounts** panel has **Add service**, and **Edit service** and **Delete service** on the services of `config.yaml`. Deleting one removes it from the configuration but keeps its saved keys, which apply again if a service with the same name is added back. A save writes `config.yaml` through the same config API as Settings, keeps the preset form you wrote (`{preset: github}` is not expanded), so later preset updates still reach the service, and keeps your order of services and agents: the file is written in the order of the draft, never sorted, so the declaration order that breaks ties between services and orders the agents on the Connections pages survives every dashboard save; because a save writes the whole configuration draft, when the Settings draft holds other unsaved changes the panel says so and asks you to confirm before it saves or deletes. When the save fails with an error, the draft goes back to what it was before the write; when the configuration changed while saving (a stale save), the panel asks you to reload the page and check the service list instead. The selected scope's user services show read-only with a "User service" badge, since users edit them on their own page. A user's limit (a `restrict_only` user service) of the selected scope shows read-only as a limit row, and the administrator's service it narrows reads "Limited to {repos}" without **Change limit** or **Remove limit**, since users change their limits on their own page. The panel's editor has no key field (keys have their own actions on each row), and its restriction help leaves out the sentence about limiting the administrator's services, because the dashboard edits the administrator's own services.
+- **Dashboard Credentials page**: the **Agent Keys** panel has **Add service**, and **Edit service** and **Delete service** on the services of `config.yaml`. Deleting one removes it from the configuration but keeps its saved keys, which apply again if a service with the same name is added back. A save writes `config.yaml` through the same config API as Settings, keeps the preset form you wrote (`{preset: github}` is not expanded), so later preset updates still reach the service, and keeps your order of services and agents: the file is written in the order of the draft, never sorted, so the declaration order that breaks ties between services and orders the agents on the Connections pages survives every dashboard save; because a save writes the whole configuration draft, when the Settings draft holds other unsaved changes the panel says so and asks you to confirm before it saves or deletes. When the save fails with an error, the draft goes back to what it was before the write; when the configuration changed while saving (a stale save), the panel asks you to reload the page and check the service list instead. The selected scope's user services show read-only with a "User service" badge, since users edit them on their own page. A user's limit (a `restrict_only` user service) of the selected scope shows read-only as a limit row, and the administrator's service it narrows reads "Limited to {repos}" without **Change limit** or **Remove limit**, since users change their limits on their own page. The panel's editor has no key field (keys have their own actions on each row), and its restriction help leaves out the sentence about limiting the administrator's services, because the dashboard edits the administrator's own services.
 
 **Basic fields.** The editor opens with the fields most services need, in this order, and saves the service and its key in one step:
 
@@ -729,10 +730,10 @@ On the personal page's rows:
 
 ## Connections pages
 
-Users see two pages: the Connections portal at `/connections` (their agents, tools, and account cards) and the personal egress page at `/connections/egress` (titled "Your agents' API keys").
+Users see two pages: the Connections portal at `/connections` (their agents, tools, and account cards) and the personal egress page at `/connections/egress` (titled "Agent Keys").
 Both need [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/) with JWT, as described under [Connecting an account](#connecting-an-account).
 
-**Identity and navigation.** Both pages show "Signed in as {matrix_user_id}" and link to each other, as "Agents" (`/connections`) and "API keys and accounts" (`/connections/egress`).
+**Identity and navigation.** Both pages show "Signed in as {matrix_user_id}" and link to each other, as "Agents" (`/connections`) and "Agent Keys" (`/connections/egress`).
 Administrators also get a "Dashboard" link to `/`.
 The identity comes from `GET /api/connections/me`; when that request fails, the links stay and the identity line is left out.
 With the portal enabled (`MINDROOM_CONNECTIONS_AGENT` set), a user who is not an administrator and opens a dashboard page is redirected to `/connections?notice=admin-only`, which says why (see [Connecting an account](#connecting-an-account)).
@@ -782,7 +783,7 @@ Rows the agent logged under another worker scope, such as before it became share
 Other users of the agent, any personal (`user` or `user_agent`) agent, even for an administrator, and a request without `agent_name` return only the caller's own rows.
 `agent_name` narrows the rows to one agent (an empty value means all), `limit` is clamped to 1 to 200 (default 200), and any other query parameter is a 400.
 Administrators keep the full log at `/api/egress-broker/logs`, with `requester` (an exact match on `requester_id`), `agent_name`, `host`, and `service` filters.
-On the dashboard, the **Request log** under the **Agent API keys and accounts** panel has these columns, in this order, and a **Filter by user** box next to the agent, host, and service filters:
+On the dashboard, the **Request log** under the **Agent Keys** panel has these columns, in this order, and a **Filter by user** box next to the agent, host, and service filters:
 
 - **Time**, with the request's duration (`duration_ms`, in ms) as the cell's title.
 - **User** (`requester_id`).
@@ -1089,7 +1090,7 @@ If you are currently using Agent Vault (the Go-based proxy fork) on the LXC host
 2. Open port 8768 on `docker0` in the host firewall configuration (such as `hosts/mindroom/networking.nix`).
 3. Rebuild the worker image from the updated checkout so workers install the broker's CA: `cd /srv/mindroom && docker build -t mindroom:dev -f local/instances/deploy/Dockerfile.mindroom .`
 4. Add the `github` service (or other services you use) to `~/.mindroom-chat/config.yaml` under `egress_broker.services`, for example `github: {preset: github}`.
-5. Set the secrets or connect accounts in the dashboard's **Agent API keys and accounts** panel on the Credentials page. The personal egress page needs trusted upstream auth with JWT, which a lab host without an upstream proxy does not have.
+5. Set the secrets or connect accounts in the dashboard's **Agent Keys** panel on the Credentials page. The personal egress page needs trusted upstream auth with JWT, which a lab host without an upstream proxy does not have.
 6. Verify the broker works by running a worker command that uses a brokered service (such as `gh pr list` or `git clone` of a private repository) and checking that the request succeeds, the audit log records it, and the worker environment and workspace contain no trace of the token.
 7. Remove the `agent-vault-bridge` plugin from config.
 8. Remove the Agent Vault CA pin from the NixOS configuration.

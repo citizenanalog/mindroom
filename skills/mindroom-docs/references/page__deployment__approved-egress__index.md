@@ -145,7 +145,7 @@ This is the intended behavior of the chain, not something that has been demonstr
 `approvedEgress.parentProxy.bypassDomains` still skips the broker for destinations such as signed URLs.
 
 The chart refuses `approvedEgress.parentProxy.enabled` with a host other than the default while the broker is enabled, so a custom parent is not dropped silently, and it refuses the broker together with `workers.kubernetes.agentVault`.
-See [Brokered Worker Egress](https://docs.mindroom.chat/deployment/egress-broker/#kubernetes) for the other Kubernetes topologies and the migration from Agent Vault.
+See [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/#kubernetes) for the other Kubernetes topologies and the migration from Agent Vault.
 
 ## Agent Vault Chaining
 

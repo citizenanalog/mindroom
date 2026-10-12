@@ -10,7 +10,7 @@ type Page = "agents" | "keys";
 
 const LINKS: readonly { page: Page; href: string; label: string }[] = [
   { page: "agents", href: "/connections", label: "Agents" },
-  { page: "keys", href: "/connections/egress", label: "API keys and accounts" },
+  { page: "keys", href: "/connections/egress", label: "Agent Keys" },
 ];
 
 /** What a non-administrator turned away from the dashboard is told on arriving, with `notice=admin-only`. */

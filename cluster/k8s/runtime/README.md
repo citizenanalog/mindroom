@@ -824,7 +824,7 @@ See [Background Python Scripts](../../../docs/tools/background-scripts.md#worker
 The egress broker lets agents call authenticated HTTP APIs from Kubernetes workers without the worker ever holding the credential.
 The primary runs the broker on its own port, workers send their traffic through it, and it injects the stored credential for the matching service.
 The primary needs no extra pod, and workers need no changes: each call carries its own token and CA certificate.
-For configuration, secret management, and error codes, see [Brokered Worker Egress](../../../docs/deployment/egress-broker.md).
+For configuration, secret management, and error codes, see [Agent Keys](../../../docs/deployment/egress-broker.md).
 
 The chart supports direct and chain modes:
 
@@ -900,7 +900,7 @@ With the broker on, each of them still gets the personal Connections page at `/c
 - Each row says how the service sends its key ("Sent as a bearer token", "Sent as header {name}", and so on), what the agent sees ("Your agent sees GH_TOKEN=mindroom-brokered"), and what happens while no key is set.
 - Their own request log, a **Recent requests** table per agent that shows the latest 10 requests, with **Show all** for the rest, which on a shared or unscoped agent they manage holds everyone's requests.
 
-Both Connections pages show "Signed in as {matrix_user_id}" and link to each other as "Agents" and "API keys and accounts"; administrators also get a "Dashboard" link.
+Both Connections pages show "Signed in as {matrix_user_id}" and link to each other as "Agents" and "Agent Keys"; administrators also get a "Dashboard" link.
 With `MINDROOM_CONNECTIONS_AGENT` set, a user outside `administrators` who opens a dashboard page in a browser is redirected (303) to `/connections?notice=admin-only`, which says the dashboard is for administrators; API calls keep the 403.
 The Connections portal links every agent the user may use for egress to its section on this page with **Manage services**, even an agent that has no services yet.
 Services from `config.yaml` appear read-only under "From your administrator".
@@ -937,7 +937,7 @@ See [Trusted Upstream Browser Auth](../../../docs/deployment/trusted-upstream-au
 Required for multi-user self-service: also set `MINDROOM_CONNECTIONS_AGENT` to a private agent (`private.per: user` or `user_agent`), as in the example.
 The egress page itself works without it, and only the portal's catalog needs it, but without it `_require_connections_route_authorized` returns early, so nothing keeps trusted users outside the administrator routes and every user the gateway admits gets full dashboard access: configuration edits, shared keys, and the full admin request log, whatever `administrators` lists.
 With it, a user outside `administrators` reaches only the Connections routes and the OAuth callback pages.
-Without trusted upstream auth with JWT, only administrators can manage keys and accounts, in the **Agent API keys and accounts** panel on the dashboard's Credentials page, and users cannot add services or see their requests.
+Without trusted upstream auth with JWT, only administrators can manage keys and accounts, in the **Agent Keys** panel on the dashboard's Credentials page, and users cannot add services or see their requests.
 
 ## Matrix Managed Account Authentication
 

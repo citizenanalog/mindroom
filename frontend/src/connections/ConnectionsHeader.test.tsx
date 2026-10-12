@@ -57,7 +57,7 @@ describe("connections header", () => {
       ]),
     ).toEqual([
       ["Agents", "/connections"],
-      ["API keys and accounts", "/connections/egress"],
+      ["Agent Keys", "/connections/egress"],
     ]);
     expect(fetch).toHaveBeenCalledWith(
       "/api/connections/me",
@@ -67,9 +67,10 @@ describe("connections header", () => {
 
   it("marks the page that is open", () => {
     renderHeader("keys");
-    expect(
-      screen.getByRole("link", { name: "API keys and accounts" }),
-    ).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("link", { name: "Agent Keys" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
     expect(screen.getByRole("link", { name: "Agents" })).not.toHaveAttribute(
       "aria-current",
     );
@@ -103,9 +104,7 @@ describe("connections header", () => {
     answerWith(async () => json({}, 500));
     renderHeader();
     expect(await screen.findByRole("link", { name: "Agents" })).toBeVisible();
-    expect(
-      screen.getByRole("link", { name: "API keys and accounts" }),
-    ).toBeVisible();
+    expect(screen.getByRole("link", { name: "Agent Keys" })).toBeVisible();
     expect(screen.queryByText(/Signed in as/)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
   });

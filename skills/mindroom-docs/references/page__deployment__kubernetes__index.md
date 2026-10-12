@@ -86,7 +86,7 @@ Optional features:
 - [Session and knowledge storage](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#session-and-knowledge-storage) (`sessionStorage`, `knowledgeStorage`) and [runtime state storage](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#runtime-state-storage) (`stateStorage`, `stateStorage.extraSubPaths`) move data to volumes of their own; on an existing install, copy the data first.
 - [Layering values files](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#layering-values-files) explains the map form of `env.extra`, `env.envFrom`, the Agent Vault server's `extraEnv` and `envFrom`, `extraVolumes`, and `extraVolumeMounts`, which Helm merges key by key across values files, and lists which env values are rendered with `tpl`.
 - [Approved Egress](https://docs.mindroom.chat/deployment/approved-egress/) gives workers human-approved temporary hostname grants.
-- [Egress broker](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#egress-broker) (`egressBroker`) injects stored credentials into workers' outbound HTTPS requests, so workers never hold the secret; see [Brokered Worker Egress](https://docs.mindroom.chat/deployment/egress-broker/#kubernetes) for the topologies.
+- [Egress broker](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#egress-broker) (`egressBroker`) injects stored credentials into workers' outbound HTTPS requests, so workers never hold the secret; see [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/#kubernetes) for the topologies.
 - [Agent Vault server NetworkPolicy](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#agent-vault-server-networkpolicy) restricts the chart-managed vault, and [`jobNaming: contentHash`](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#agent-vault-access-grants) reruns its Jobs under `kubectl apply` workflows.
 - Tuwunel [structured settings](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/tuwunel/README.md#structured-settings) (`tuwunel.settings`) merge across values files, and [upgrades and database migrations](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/tuwunel/README.md#upgrades-and-database-migrations) explains how to upgrade the homeserver without corrupting its database.
 - The client chart's [`matrixRTC` values](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/client/README.md#matrixrtc-calls) announce and proxy the MatrixRTC chart's call backend.
@@ -189,7 +189,7 @@ It runs in two modes:
 - **Chain mode** (with `approvedEgress.enabled`) keeps the approved egress proxy as the first hop, so grants still apply, and renders the broker as Squid's parent.
 
 It requires `workers.backend: kubernetes` and cannot be combined with `workers.kubernetes.agentVault`.
-[Brokered Worker Egress](https://docs.mindroom.chat/deployment/egress-broker/#kubernetes) has the topology table, what the chart renders, and the migration from Agent Vault.
+[Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/#kubernetes) has the topology table, what the chart renders, and the migration from Agent Vault.
 
 Users who have no dashboard access still manage their own egress on the personal Connections page at `/connections/egress`:
 

@@ -688,11 +688,11 @@ export function EgressBroker() {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-xl">Agent API keys and accounts</CardTitle>
+        <CardTitle className="text-xl">Agent Keys</CardTitle>
         <CardDescription>
-          API keys and connected accounts the broker injects into outbound
-          requests from agent workers. Keys are write-only and never shown
-          again.
+          API keys and connected accounts your agents use but never see. The
+          egress broker adds them to outbound requests from agent workers. Keys
+          are write-only and never shown again.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">

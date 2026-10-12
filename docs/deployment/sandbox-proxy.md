@@ -408,14 +408,14 @@ Values in a dedicated worker's own credential store apply only inside that worke
 Leases do not export API keys into shell environments, configure Git authentication, or install SSH keys.
 For shell authentication, use [environment passthrough](#shell-environment-and-path), the [workspace env hook](#workspace-env-hook-mindroomworker-envsh), or [brokered egress](#brokered-worker-egress).
 
-## Brokered worker egress
+## Agent Keys (egress broker)
 
 To let worker-routed `shell` and `python` call external APIs without ever receiving the real credential, route their egress through a proxy that injects the credential in transit.
 This works at the network layer, so it covers URLs inside scripts, package CLIs, and subprocesses.
 There are three supported shapes:
 
 - **Native egress broker** runs inside the primary runtime and injects secrets from primary-only credential stores that workers never read.
-  See [Brokered Worker Egress](egress-broker.md) for configuration, secret management, and deployment.
+  See [Agent Keys](egress-broker.md) for configuration, secret management, and deployment.
   This is the recommended option for new deployments; it works with Docker workers, the static runner, and Kubernetes workers through the runtime chart's `egressBroker` values, and the hosted instance chart can enable it for its sandbox-runner sidecar.
 - **Per-worker Agent Vault egress** (Kubernetes backend), the legacy path, which gives each worker its own vault for per-user or per-agent isolation, described below.
 - **A shared credential-injecting proxy** that you run, configured through `MINDROOM_KUBERNETES_WORKER_ENV_JSON`, the chart's `egressProxy` integration, or the worker proxy environment on other backends.

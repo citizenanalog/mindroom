@@ -1901,7 +1901,7 @@ describe("connections header", () => {
       "page",
     );
     expect(
-      within(nav).getByRole("link", { name: "API keys and accounts" }),
+      within(nav).getByRole("link", { name: "Agent Keys" }),
     ).toHaveAttribute("href", "/connections/egress");
     expect(within(nav).queryByRole("link", { name: "Dashboard" })).toBeNull();
   });

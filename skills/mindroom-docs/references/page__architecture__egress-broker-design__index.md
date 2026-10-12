@@ -1,6 +1,6 @@
 # Egress Broker Design Decisions
 
-This page records the decisions behind the [brokered worker egress](https://docs.mindroom.chat/deployment/egress-broker/) that the code does not explain on its own, and why each was made.
+This page records the decisions behind the [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) feature (the egress broker) that the code does not explain on its own, and why each was made.
 How to configure and run the broker is in the deployment guide; the trust model is in the [Security Model](https://docs.mindroom.chat/architecture/security-posture/).
 
 The guarantee everything below serves: worker code can use a credential through the broker but can never read it.

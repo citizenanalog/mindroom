@@ -114,7 +114,7 @@ describe("Credentials", () => {
     });
   });
 
-  it("puts Agent API keys and accounts before Raw credential payloads (advanced)", async () => {
+  it("puts Agent Keys before Raw credential payloads (advanced)", async () => {
     realPanel.wanted = true;
     (global.fetch as any).mockImplementation(async (input: string) => {
       const path = String(input).split("?")[0];
@@ -130,7 +130,7 @@ describe("Credentials", () => {
     render(<Credentials />);
 
     const panel = await screen.findByRole("heading", {
-      name: "Agent API keys and accounts",
+      name: "Agent Keys",
     });
     const raw = screen.getByRole("heading", {
       name: "Raw credential payloads (advanced)",

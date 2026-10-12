@@ -577,7 +577,7 @@ export function EgressCredentials() {
       <div className="mx-auto max-w-4xl space-y-6">
         <ConnectionsHeader
           current="keys"
-          title="Your agents' API keys"
+          title="Agent Keys"
           howItWorks="Connect an account or paste an API key for the services below, or add a service of your own. MindRoom stores them and adds them to your agents' requests to the matching websites. Your agents never get the keys themselves, but a website can send a key back in its response (an echo service does), so only add keys for sites you trust. Saved keys cannot be read back."
         >
           Connect accounts or add API keys; MindRoom adds them to your agents'

@@ -44,7 +44,7 @@ it.each(["/connections/egress", "/connections/egress/"])(
   async (pathname) => {
     await loadEntry(pathname);
     expect(
-      await screen.findByRole("heading", { name: "Your agents' API keys" }),
+      await screen.findByRole("heading", { name: "Agent Keys" }),
     ).toBeInTheDocument();
   },
 );

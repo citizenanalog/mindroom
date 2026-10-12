@@ -1774,7 +1774,7 @@ describe("recent requests on the personal page", () => {
 });
 
 describe("the page's header and intro", () => {
-  it("says who is signed in and links Agents and API keys and accounts", async () => {
+  it("says who is signed in and links Agents and Agent Keys", async () => {
     render(<EgressCredentials />);
     expect(
       await screen.findByText("Signed in as @bob:example.org"),
@@ -1785,7 +1785,7 @@ describe("the page's header and intro", () => {
       "/connections",
     );
     expect(
-      within(nav).getByRole("link", { name: "API keys and accounts" }),
+      within(nav).getByRole("link", { name: "Agent Keys" }),
     ).toHaveAttribute("aria-current", "page");
     expect(within(nav).queryByRole("link", { name: "Dashboard" })).toBeNull();
   });

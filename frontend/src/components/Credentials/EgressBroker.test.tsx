@@ -194,12 +194,12 @@ afterEach(() => {
 });
 
 describe("egress broker panel", () => {
-  it("is titled Agent API keys and accounts", async () => {
+  it("is titled Agent Keys", async () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
     expect(
-      screen.getByRole("heading", { name: "Agent API keys and accounts" }),
+      screen.getByRole("heading", { name: "Agent Keys" }),
     ).toBeInTheDocument();
     expect(screen.queryByText("Egress broker")).toBeNull();
   });
