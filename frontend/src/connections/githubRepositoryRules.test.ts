@@ -77,7 +77,7 @@ describe("GitHub repository rules", () => {
       githubRepositoryRules("a/b\nc/*", { uploads: true, graphql }).rules.map(
         (rule) => `${rule.host}${rule.path_prefix}`,
       );
-    expect(written(false)).toEqual([
+    const repositoryRules = [
       "api.github.com/repos/a/b",
       "github.com/a/b",
       "github.com/a/b.git",
@@ -85,8 +85,12 @@ describe("GitHub repository rules", () => {
       "api.github.com/repos/c/",
       "github.com/c/",
       "uploads.github.com/repos/c/",
+    ];
+    expect(written(false)).toEqual(repositoryRules);
+    expect(written(true)).toEqual([
+      ...repositoryRules,
+      "api.github.com/graphql",
     ]);
-    expect(written(true).slice(-1)).toEqual(["api.github.com/graphql"]);
   });
 
   it("adds /graphql once, only when ticked", () => {
@@ -105,23 +109,6 @@ describe("GitHub repository rules", () => {
     ]);
   });
 
-  it("combines several lines with both ticks", () => {
-    const { rules } = githubRepositoryRules("a/b\nc/*", {
-      uploads: true,
-      graphql: true,
-    });
-    expect(rules.map((rule) => `${rule.host}${rule.path_prefix}`)).toEqual([
-      "api.github.com/repos/a/b",
-      "github.com/a/b",
-      "github.com/a/b.git",
-      "uploads.github.com/repos/a/b",
-      "api.github.com/repos/c/",
-      "github.com/c/",
-      "uploads.github.com/repos/c/",
-      "api.github.com/graphql",
-    ]);
-  });
-
   it("ignores blank lines and repeats, trims, and drops a .git suffix", () => {
     const { rules, errors, repositories } = githubRepositoryRules(
       "\n  o/r  \r\no/r\no/r.git\n\n",
@@ -131,6 +118,9 @@ describe("GitHub repository rules", () => {
     expect(rules).toHaveLength(3);
     expect(rules[0].path_prefix).toBe("/repos/o/r");
     expect(repositories).toEqual(["o/r"]);
+    expect(
+      githubRepositoryRules("o/a\no/b.git\no/a\np/*", none).repositories,
+    ).toEqual(["o/a", "o/b", "p/*"]);
   });
 
   it("names each line that is not owner/repo or owner/*", () => {
@@ -165,14 +155,5 @@ describe("labels from the repositories a service is limited to", () => {
       displayName: "GitHub (o/a, o/b, p/*)",
       description: "Limited to o/a, o/b, p/*",
     });
-  });
-
-  it("collects each repository once, without a .git suffix", () => {
-    expect(
-      githubRepositoryRules("o/a\no/b.git\no/a\np/*", {
-        uploads: false,
-        graphql: false,
-      }).repositories,
-    ).toEqual(["o/a", "o/b", "p/*"]);
   });
 });
