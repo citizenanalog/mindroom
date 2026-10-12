@@ -181,9 +181,9 @@ def test_rules_are_optional_in_the_schema() -> None:
     assert "rules" not in schema.get("required", [])
 
 
-@pytest.mark.parametrize("provider", ["github", "google_drive", "a", "0x", "my-provider_2"])
+@pytest.mark.parametrize("provider", ["github", "google_drive", "a", "0x", "my-provider_2", "not-in-registry"])
 def test_oauth_provider_format_accepts_registry_style_ids(provider: str) -> None:
-    """Provider ids use lowercase letters, digits, underscores, and hyphens."""
+    """Provider ids use lowercase letters, digits, underscores, and hyphens; the registry is checked at runtime."""
     service = EgressService.model_validate(
         {"oauth_provider": provider, "rules": [{"host": "example.com", "auth": {"type": "bearer"}}]},
     )
@@ -200,55 +200,30 @@ def test_oauth_provider_format_rejects_other_ids(provider: str) -> None:
         )
 
 
-def test_unregistered_but_well_formed_oauth_provider_loads() -> None:
-    """The registry lookup happens at runtime, so an unknown well-formed id still validates here."""
-    service = EgressService.model_validate(
-        {"oauth_provider": "not-in-registry", "rules": [{"host": "example.com", "auth": {"type": "bearer"}}]},
-    )
-
-    assert service.oauth_provider == "not-in-registry"
-
-
 def test_preset_service_names_keep_existing_service_name_rules() -> None:
     """Presets do not bypass service-name validation."""
     with pytest.raises(ValidationError, match="_oauth"):
         EgressBrokerConfig(services={"github_oauth": {"preset": "github"}})  # type: ignore[dict-item]
 
 
-def test_oauth_on_shared_workers_defaults_off_and_no_preset_sets_it() -> None:
-    """Requester-scoped accounts stay off shared workers unless the operator opts in, never through a preset."""
+@pytest.mark.parametrize("field", ["oauth_on_shared_workers", "restrict_to_rules", "restrict_only"])
+def test_opt_in_field_defaults_off_and_no_preset_sets_it(field: str) -> None:
+    """Shared-worker accounts, path restriction, and restrict-only are the operator's choice, never a preset's."""
     service = EgressService.model_validate({"preset": "github"})
 
-    assert service.oauth_on_shared_workers is False
-    assert all("oauth_on_shared_workers" not in preset for preset in EGRESS_PRESETS.values())
+    assert getattr(service, field) is False
+    assert all(field not in preset for preset in EGRESS_PRESETS.values())
 
 
-def test_oauth_on_shared_workers_survives_the_authored_dump() -> None:
+@pytest.mark.parametrize("field", ["oauth_on_shared_workers", "restrict_to_rules"])
+def test_opt_in_field_survives_the_authored_dump(field: str) -> None:
     """The opt-in is an authored field, so saving config keeps it next to the preset reference."""
-    config = Config(egress_broker={"services": {"github": {"preset": "github", "oauth_on_shared_workers": True}}})
+    config = Config(egress_broker={"services": {"github": {"preset": "github", field: True}}})
 
     dumped = config.authored_model_dump()["egress_broker"]
 
-    assert dumped == {"services": {"github": {"preset": "github", "oauth_on_shared_workers": True}}}
-    assert Config(**config.authored_model_dump()).egress_broker.services["github"].oauth_on_shared_workers is True
-
-
-def test_restrict_to_rules_defaults_off_and_no_preset_sets_it() -> None:
-    """Unlisted paths are forwarded without credentials unless the service opts in; presets never opt in."""
-    service = EgressService.model_validate({"preset": "github"})
-
-    assert service.restrict_to_rules is False
-    assert all("restrict_to_rules" not in preset for preset in EGRESS_PRESETS.values())
-
-
-def test_restrict_to_rules_survives_the_authored_dump() -> None:
-    """The restriction is an authored field, so saving config keeps it next to the preset reference."""
-    config = Config(egress_broker={"services": {"github": {"preset": "github", "restrict_to_rules": True}}})
-
-    dumped = config.authored_model_dump()["egress_broker"]
-
-    assert dumped == {"services": {"github": {"preset": "github", "restrict_to_rules": True}}}
-    assert Config(**config.authored_model_dump()).egress_broker.services["github"].restrict_to_rules is True
+    assert dumped == {"services": {"github": {"preset": "github", field: True}}}
+    assert getattr(Config(**config.authored_model_dump()).egress_broker.services["github"], field) is True
 
 
 def test_restrict_only_needs_no_auth_on_its_rules() -> None:
@@ -263,9 +238,6 @@ def test_restrict_only_needs_no_auth_on_its_rules() -> None:
         "restrict_only": True,
         "rules": [{"host": "api.github.com", "path_prefix": "/repos/o/r"}],
     }
-    github = EgressService.model_validate({"preset": "github"})
-    assert (github.restrict_to_rules, github.restrict_only) == (False, False)
-    assert all("restrict_only" not in preset for preset in EGRESS_PRESETS.values())
     # Setting both, as the limit editor does, is the same service.
     both = EgressService.model_validate(
         {"restrict_only": True, "restrict_to_rules": True, "rules": [{"host": "api.github.com"}]},
