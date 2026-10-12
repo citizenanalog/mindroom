@@ -164,6 +164,13 @@ def _republish(portal: dict[str, Any]) -> None:
     _use_runtime_auth_settings(main.app)
 
 
+def _restart_with_env(portal: dict[str, Any], **env: str) -> None:
+    """Restart the API with `env` added to the portal's process environment, then republish its config."""
+    portal["paths"] = replace(portal["paths"], process_env={**portal["paths"].process_env, **env})
+    main.initialize_api_app(main.app, portal["paths"])
+    _republish(portal)
+
+
 def _agent_config(
     display_name: str,
     role: str,
@@ -224,54 +231,18 @@ def _catalog_services(portal: dict[str, Any], user: str, agent: str) -> list[dic
 
 @pytest.mark.parametrize("with_connections_agent", [False, True])
 def test_works_with_and_without_connections_agent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    enforce_turn_authorization: None,  # noqa: ARG001
+    egress_portal: dict[str, Any],
+    *,
     with_connections_agent: bool,
 ) -> None:
-    """The egress routes work with or without MINDROOM_CONNECTIONS_AGENT set."""
-    key = _trust_signed_users(monkeypatch)
-    env = {
-        **_trusted_upstream_strict_jwt_env(tmp_path, matrix_user_id_claim="matrix_user_id"),
-        "MINDROOM_PUBLIC_URL": "https://portal.example.org",
-    }
-    if with_connections_agent:
-        env["MINDROOM_CONNECTIONS_AGENT"] = "personal"
+    """The egress routes work with or without MINDROOM_CONNECTIONS_AGENT set; a blank value is unset."""
+    _restart_with_env(egress_portal, MINDROOM_CONNECTIONS_AGENT="personal" if with_connections_agent else "")
 
-    paths = _runtime_paths(tmp_path, env)
-    payload = {
-        "administrators": ["@admin:example.org"],
-        "models": {"default": {"provider": "ollama", "id": "test-model"}},
-        "egress_broker": {
-            "services": {
-                "github": {
-                    "display_name": "GitHub",
-                    "description": "GitHub API",
-                    "rules": [{"host": "api.github.com", "auth": {"type": "bearer"}}],
-                },
-            },
-        },
-        "agents": {
-            "personal": {
-                "display_name": "Personal",
-                "tools": ["shell"],
-                "private": {"per": "user_agent"},
-                "access": {"users": ["@alice:example.org"]},
-            },
-        },
-    }
-    main.initialize_api_app(main.app, paths)
-    _publish_config(main.app, paths, payload)
-    _use_runtime_auth_settings(main.app)
-    headers = _signed_headers(key, "alice")
-    client = TestClient(main.app, base_url="https://portal.example.org")
-    response = client.get("/api/connections/egress", headers=headers)
-    assert response.status_code == 200, response.text
-    assert len(response.json()["agents"]) == 1
-    assert response.json()["agents"][0]["agent_name"] == "personal"
+    listing = _listing(egress_portal, "alice")
 
+    assert _agent_rows(listing) == ["personal", "shared_dev"]
     # Non-admin user should be allowed (personal user gate test)
-    assert "Administrator access required" not in response.text
+    assert "Administrator access required" not in listing.text
 
 
 def test_lists_only_usable_shell_or_python_agents(egress_portal: dict[str, Any]) -> None:
@@ -927,14 +898,6 @@ def test_requester_scoped_provider_on_a_shared_agent_is_unavailable_without_the_
     assert _egress_row(portal, "bob", "shared_dev", "drive")["oauth"]["unavailable_reason"] is None
 
 
-def _use_worker_backend(portal: dict[str, Any], backend: str) -> None:
-    paths = replace(portal["paths"], process_env={**portal["paths"].process_env, "MINDROOM_WORKER_BACKEND": backend})
-    portal["paths"] = paths
-    main.initialize_api_app(main.app, paths)
-    _publish_config(main.app, paths, portal["payload"])
-    _use_runtime_auth_settings(main.app)
-
-
 def test_requester_scoped_provider_on_a_personal_agent_is_unavailable_on_the_static_runner(
     oauth_egress_portal: dict[str, Any],
 ) -> None:
@@ -943,7 +906,7 @@ def test_requester_scoped_provider_on_a_personal_agent_is_unavailable_on_the_sta
     _connect_account(portal, "bob", "personal", "gh", "github")
     assert _egress_row(portal, "bob", "personal", "gh")["oauth"]["connected"] is True
 
-    _use_worker_backend(portal, "static_runner")
+    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="static_runner")
 
     row = _egress_row(portal, "bob", "personal", "gh")
     assert row["oauth"]["unavailable_reason"] == "shared_sandbox"
@@ -972,20 +935,10 @@ def test_requester_scoped_provider_connects_the_requester(oauth_egress_portal: d
     assert _egress_row(portal, "bob", "personal", "gh")["oauth"]["shared_worker_opt_in"] is False
 
 
-def _enable_service_account(portal: dict[str, Any]) -> None:
-    paths = replace(
-        portal["paths"],
-        process_env={**portal["paths"].process_env, "GOOGLE_SERVICE_ACCOUNT_FILE": "service-account.json"},
-    )
-    main.initialize_api_app(main.app, paths)
-    _publish_config(main.app, paths, portal["payload"])
-    _use_runtime_auth_settings(main.app)
-
-
 def test_service_account_provider_cannot_be_connected(oauth_egress_portal: dict[str, Any]) -> None:
     """A shared Google service account is runtime configuration, never a personal account."""
     portal = oauth_egress_portal
-    _enable_service_account(portal)
+    _restart_with_env(portal, GOOGLE_SERVICE_ACCOUNT_FILE="service-account.json")
 
     response = _account_action(portal, "alice", "personal", "drive", "connect")
     assert response.status_code == 409, response.text
@@ -998,7 +951,7 @@ def test_personal_connection_stored_before_a_service_account_can_still_be_discon
     """The broker keeps injecting a stored personal token, so the user must be able to revoke it."""
     portal = oauth_egress_portal
     _connect_account(portal, "alice", "personal", "drive", "google_drive")
-    _enable_service_account(portal)
+    _restart_with_env(portal, GOOGLE_SERVICE_ACCOUNT_FILE="service-account.json")
     assert _egress_row(portal, "alice", "personal", "drive")["active_source"] == "oauth"
 
     response = _account_action(portal, "alice", "personal", "drive", "disconnect")
@@ -1086,7 +1039,7 @@ def test_service_account_is_reported_as_the_broker_sees_it_and_the_portal_keeps_
 ) -> None:
     """The broker cannot inject a service account, so egress shows it as such while the portal status is unchanged."""
     portal = oauth_egress_portal
-    _enable_service_account(portal)
+    _restart_with_env(portal, GOOGLE_SERVICE_ACCOUNT_FILE="service-account.json")
 
     not_connected = {"connected": False, "can_connect": False, "reset_required": False, "account_label": None}
     for user, agent in (("alice", "personal"), ("bob", "personal"), ("alice", "shared_dev"), ("bob", "shared_dev")):
@@ -1113,7 +1066,7 @@ def test_service_account_keeps_reporting_a_personal_connection_the_broker_still_
     """A stored personal token is injected whatever the service account, so the status matches the broker."""
     portal = oauth_egress_portal
     _connect_account(portal, "alice", "personal", "drive", "google_drive")
-    _enable_service_account(portal)
+    _restart_with_env(portal, GOOGLE_SERVICE_ACCOUNT_FILE="service-account.json")
 
     row = _egress_row(portal, "alice", "personal", "drive")
     assert row["oauth"] == _oauth_block(connected=True, can_connect=False, service_account=True)
@@ -2491,7 +2444,7 @@ def test_connect_and_disconnect_are_refused_on_the_static_runner_until_the_servi
 ) -> None:
     """A personal agent shares its sandbox on the static runner, so its requester-scoped account is refused there."""
     portal = oauth_egress_portal
-    _use_worker_backend(portal, "static_runner")
+    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="static_runner")
 
     refused = _account_action(portal, "alice", "personal", "gh", action)
     assert refused.status_code == 409, refused.text
@@ -2511,7 +2464,7 @@ def test_an_unreadable_worker_backend_degrades_one_service_without_failing_the_p
     """The shared-sandbox check can fail on its own, and that spares the listing and the catalog but that service."""
     portal = oauth_egress_portal
     if failure == "unsupported backend":
-        _use_worker_backend(portal, "no-such-backend")
+        _restart_with_env(portal, MINDROOM_WORKER_BACKEND="no-such-backend")
     else:
         real = egress_status.shared_worker_oauth
 
@@ -2542,7 +2495,7 @@ def test_connect_and_disconnect_answer_503_when_the_worker_backend_cannot_be_rea
 ) -> None:
     """Without the sandbox kind neither action can be judged safe, so both fail closed with a plain 503."""
     portal = oauth_egress_portal
-    _use_worker_backend(portal, "no-such-backend")
+    _restart_with_env(portal, MINDROOM_WORKER_BACKEND="no-such-backend")
 
     response = _account_action(portal, "alice", "personal", "gh", action)
 
