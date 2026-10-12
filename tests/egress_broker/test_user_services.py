@@ -799,25 +799,22 @@ def test_equal_config_copies_share_a_cache_entry(manager: CredentialsManager, mo
     assert len(reads) == 2
 
 
-def test_reordered_config_is_merged_again_so_ties_follow_the_new_order(manager: CredentialsManager) -> None:
-    """Equal services in another order break rule ties differently, so the cache never serves the old order."""
+def test_reordered_config_is_merged_again_so_listings_follow_the_new_order(manager: CredentialsManager) -> None:
+    """Equal services in another order list in that order, so the cache never serves the old order."""
     _save(manager, worker_target(), "mine", _service("mine.example.com"))
-    tied = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
-    first = EgressBrokerConfig.model_validate({"services": {"alpha": tied, "beta": tied}})
-    reordered = EgressBrokerConfig.model_validate({"services": {"beta": tied, "alpha": tied}})
+    service = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
+    first = EgressBrokerConfig.model_validate({"services": {"alpha": service, "beta": service}})
+    reordered = EgressBrokerConfig.model_validate({"services": {"beta": service, "alpha": service}})
     # Pydantic equality ignores dict order, which is what made the cache reuse the old merge.
     assert first == reordered
 
-    def picked(config: EgressBrokerConfig, target: ResolvedWorkerTarget) -> str:
-        rules = EgressRules(operator=config, effective=effective_config(config, manager, target))
-        match = route_request(rules, "api.example.com", 443, "/")
-        assert match.match is not None
-        return match.match.service
+    def listed(config: EgressBrokerConfig, target: ResolvedWorkerTarget) -> list[str]:
+        return list(effective_config(config, manager, target).services)[:2]
 
     for target in (worker_target(), worker_target(_BOB)):  # with and without services of the scope's own
-        assert picked(first, target) == "alpha"
-        assert picked(reordered, target) == "beta"
-        assert picked(first, target) == "alpha"
+        assert listed(first, target) == ["alpha", "beta"]
+        assert listed(reordered, target) == ["beta", "alpha"]
+        assert listed(first, target) == ["alpha", "beta"]
 
 
 @pytest.mark.parametrize(

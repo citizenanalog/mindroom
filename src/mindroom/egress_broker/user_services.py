@@ -430,10 +430,10 @@ def _scope_key(manager: CredentialsManager, target: ResolvedWorkerTarget | None)
 
 
 def _same_config(cached: EgressBrokerConfig, config: EgressBrokerConfig) -> bool:
-    """Return whether two configs route alike: equal, with their services in the same order.
+    """Return whether two configs list alike: equal, with their services in the same order.
 
-    Pydantic equality ignores dict order, but rule ties are broken by declaration order across services. Rules sit in
-    lists, which compare in order already.
+    Pydantic equality ignores dict order, but the egress listings show services in config order. Rules sit in lists,
+    which compare in order already.
     """
     return cached == config and list(cached.services) == list(config.services)
 

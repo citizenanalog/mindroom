@@ -658,7 +658,7 @@ def test_agents_keep_config_order(egress_portal: dict[str, Any]) -> None:
 
 
 def test_dashboard_config_save_keeps_the_authored_order(egress_portal: dict[str, Any]) -> None:
-    """Saving the config through the dashboard keeps agent and egress service order, which the pages and rules read."""
+    """Saving the config through the dashboard keeps agent and egress service order; a rule tie follows the names."""
     portal = egress_portal
     client, paths = portal["client"], portal["paths"]
     admin, alice = portal["headers"]["admin"], portal["headers"]["alice"]
@@ -666,7 +666,7 @@ def test_dashboard_config_save_keeps_the_authored_order(egress_portal: dict[str,
     agents = payload["agents"]
     payload["agents"] = {"shared_dev": agents["shared_dev"], **agents}
     clashing_rule = {"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]}
-    # Declared against the alphabet, and both match the same request: the first declared must win.
+    # Declared against the alphabet, and both match the same request: the name that sorts first wins.
     payload["egress_broker"]["services"] = {
         "zeta": clashing_rule,
         "alpha": clashing_rule,
@@ -691,7 +691,7 @@ def test_dashboard_config_save_keeps_the_authored_order(egress_portal: dict[str,
         "/anything",
     )
     assert route.match is not None
-    assert route.match.service == "zeta"
+    assert route.match.service == "alpha"
 
 
 def test_requester_sets_own_user_agent_secret(egress_portal: dict[str, Any]) -> None:

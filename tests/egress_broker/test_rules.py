@@ -105,6 +105,32 @@ def test_longest_path_prefix_wins() -> None:
     assert result.rule.path_prefix == "/repos/"
 
 
+def test_equally_specific_rules_go_to_the_service_whose_name_sorts_first() -> None:
+    """A tie goes to the service whose name sorts first, whatever order the services are written in."""
+    tied = EgressService(rules=[_rule("api.example.com")])
+    for services in ({"zeta": tied, "alpha": tied}, {"alpha": tied, "zeta": tied}):
+        result = match_rule(EgressBrokerConfig(services=services), "api.example.com", 443, "/")
+        assert result is not None
+        assert result.service == "alpha"
+
+
+def test_equally_specific_rules_of_one_service_keep_their_order() -> None:
+    """Within one service, the first of two equally specific rules wins."""
+    first = _rule("api.example.com", auth=EgressAuth(type="header", name="X-First"))
+    second = _rule("api.example.com", auth=EgressAuth(type="header", name="X-Second"))
+    result = match_rule(_config(first, second), "api.example.com", 443, "/")
+    assert result is not None
+    assert result.rule is first
+
+
+def test_config_service_wins_a_tie_with_a_user_service_whatever_their_names() -> None:
+    """On equally specific rules, the operator's service beats the requester's own, even one named earlier."""
+    tied = EgressService(rules=[_rule("api.example.com")])
+    route = route_request(_merged({"zeta": tied}, {"alpha": tied}), "api.example.com", 443, "/")
+    assert route.match is not None
+    assert route.match.service == "zeta"
+
+
 def test_no_rule_returns_none_and_host_has_rules_false() -> None:
     """No matching rule returns None and host_has_rules returns False."""
     config = _config(_rule("api.example.com"))
@@ -561,12 +587,13 @@ def test_user_restriction_cannot_open_an_operator_restricted_path() -> None:
 
 
 def test_restricted_by_names_the_first_restricting_service_of_the_failing_party() -> None:
-    """The refusal names the first restricting service in declaration order whose party's check the path fails."""
+    """The refusal names the restricting service whose name sorts first in the party whose check the path fails."""
     rules = _merged(
         {
             "op-open": EgressService(rules=[_rule("api.example.com", "/op")]),
-            "op-first": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/a")]),
+            # Written out of name order: the name decides, not the order in the file.
             "op-second": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/b")]),
+            "op-first": EgressService(restrict_to_rules=True, rules=[_rule("api.example.com", "/a")]),
         },
         {
             "mine-open": EgressService(rules=[_rule("api.example.com", "/a/open")]),

@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import re
 import unicodedata
-from collections.abc import Mapping  # noqa: TC003
+from collections.abc import Collection, Mapping  # noqa: TC003
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import quote, unquote, urlsplit
@@ -240,7 +240,14 @@ class EgressRules:
         return host_has_rules(self.effective, host, port)
 
 
-def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> RuleMatch | None:
+def match_rule(
+    config: EgressBrokerConfig,
+    host: str,
+    port: int,
+    path: str,
+    *,
+    preferred: Collection[str] = (),
+) -> RuleMatch | None:
     """Find the best matching rule for the given request.
 
     Paths match by segment (see `path_matches`). This does not refuse ambiguous paths;
@@ -250,47 +257,57 @@ def match_rule(config: EgressBrokerConfig, host: str, port: int, path: str) -> R
     1. Exact host beats wildcard
     2. Port-specific rule beats no-port rule (different port never matches)
     3. Longest path_prefix wins
-    4. Declaration order (across services and rules)
+    4. A `preferred` service beats the others (`route_request` prefers the operator's services)
+    5. The service whose name sorts first, then the service's first rule
 
-    Rules of `restrict_only` services never match here: they only limit paths and have no credential.
+    So the order services are written in never decides a match. Rules of `restrict_only` services never match here:
+    they only limit paths and have no credential.
     """
     credential_services = {name: service for name, service in config.services.items() if not service.restrict_only}
-    return _best_match(credential_services, host.lower(), port, path)
+    return _best_match(credential_services, host.lower(), port, path, preferred=preferred)
 
 
-def _best_match(services: Mapping[str, EgressService], host: str, port: int, path: str) -> RuleMatch | None:
+def _best_match(
+    services: Mapping[str, EgressService],
+    host: str,
+    port: int,
+    path: str,
+    *,
+    preferred: Collection[str] = (),
+) -> RuleMatch | None:
     """Return the most specific rule of `services` for a lowercase host, in `match_rule`'s priority order."""
-    candidates: list[tuple[str, EgressRule, tuple[int, int, int]]] = [
-        (service_name, rule, _rule_priority(rule, port))
+    candidates = [
+        (service_name, rule)
         for service_name, service in services.items()
         for rule in service.rules
         if _rule_applies(rule, host, port) and path_matches(rule.path_prefix, path)
     ]
-
     if not candidates:
         return None
 
-    # Sort by priority (descending), keeping declaration order for ties
-    # Python's sort is stable, so declaration order is preserved
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    def rank(candidate: tuple[str, EgressRule]) -> tuple[int, int, int, bool, str]:
+        service_name, rule = candidate
+        host_priority, port_priority, path_priority = _rule_priority(rule, port)
+        return (-host_priority, -port_priority, -path_priority, service_name not in preferred, service_name)
 
-    service_name, rule, _ = candidates[0]
+    # `min` keeps the first of equal candidates, so one service's rules keep their order.
+    service_name, rule = min(candidates, key=rank)
     return RuleMatch(service=service_name, rule=rule)
 
 
 def _restricting_service(services: Mapping[str, EgressService], host: str, port: int) -> str | None:
-    """Return the first service, in declaration order, that restricts paths and has a rule for the host.
+    """Return the service whose name sorts first among those that restrict paths and have a rule for the host.
 
     A service restricts paths with `restrict_to_rules` or `restrict_only`.
     """
-    return next(
+    return min(
         (
             name
             for name, service in services.items()
             if (service.restrict_to_rules or service.restrict_only)
             and any(_rule_applies(rule, host, port) for rule in service.rules)
         ),
-        None,
+        default=None,
     )
 
 
@@ -304,8 +321,8 @@ def _restriction_refusal(
 ) -> Route | None:
     """Return the `path_not_allowed` route when a service of `party` restricts the host and no rule of `party` matches.
 
-    Every rule of the party counts, `restrict_only` ones included. The refusal names the party's first restricting
-    service, and `by_operator` whether the party is the operator's.
+    Every rule of the party counts, `restrict_only` ones included. The refusal names the party's restricting service
+    whose name sorts first, and `by_operator` whether the party is the operator's.
     """
     restricted_by = _restricting_service(party, host, port)
     if restricted_by is None or _best_match(party, host, port, path) is not None:
@@ -338,12 +355,12 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     Rows 3 and 4 are each party's restriction (`_restriction_refusal`). A service with `restrict_to_rules` or
     `restrict_only` and a rule for the host restricts it; the path must then match one of that party's rules,
     `restrict_only` ones included. So a user's limit narrows the operator's services on that host for that requester
-    alone, and never opens a path the operator's limit refuses. The refusal names the party's first restricting
-    service and sets `restricted_by_operator` in row 3.
+    alone, and never opens a path the operator's limit refuses. The refusal names the party's restricting service
+    whose name sorts first and sets `restricted_by_operator` in row 3.
     Row 5 chooses the credential: the most specific applicable rule, operator's or user's, outside `restrict_only`
-    services. So a user's limit in place keeps the operator's service, with the user's connection or key, for the
-    paths it allows. With no matching rule the request goes out without credentials; `unmatched_hosts` does not
-    apply, since the host has rules.
+    services; an operator rule wins a tie with a user rule. So a user's limit in place keeps the operator's service,
+    with the user's connection or key, for the paths it allows. With no matching rule the request goes out without
+    credentials; `unmatched_hosts` does not apply, since the host has rules.
     """
     host = host.lower()
     if not rules.intercepts(host, port):
@@ -359,7 +376,7 @@ def route_request(rules: EgressRules, host: str, port: int, path: str) -> Route:
     user_refusal = _restriction_refusal(user, host, port, path, by_operator=False)
     if user_refusal is not None:
         return user_refusal
-    return Route(host_has_rules=True, match=match_rule(rules.effective, host, port, path))
+    return Route(host_has_rules=True, match=match_rule(rules.effective, host, port, path, preferred=operator))
 
 
 def _inject_query_param(target: bytes, param_name: str, template: str, secret: str) -> bytes:
