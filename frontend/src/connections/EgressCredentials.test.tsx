@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
+import { pressInDialog } from "@/test/egressServiceTestKit";
 import { EgressCredentials } from "./EgressCredentials";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type {
@@ -256,11 +257,7 @@ describe("egress credentials page", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Disconnect",
-      }),
-    );
+    await pressInDialog("Disconnect");
     expect(
       await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
     ).toBeInTheDocument();
@@ -631,11 +628,7 @@ describe("egress services on the personal page", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "Delete service for My API" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Delete",
-      }),
-    );
+    await pressInDialog("Delete");
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "no longer available",
     );
@@ -1324,11 +1317,7 @@ describe("inactive services on the personal page", () => {
         name: "Delete inactive service taken",
       }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Cancel",
-      }),
-    );
+    await pressInDialog("Cancel");
     expect(deletes()).toEqual([]);
     expect(screen.getByLabelText("Inactive service taken")).toBeInTheDocument();
   });
@@ -1342,11 +1331,7 @@ describe("inactive services on the personal page", () => {
         name: "Delete inactive service taken",
       }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Delete",
-      }),
-    );
+    await pressInDialog("Delete");
     expect(
       await within(screen.getByLabelText("Inactive service taken")).findByRole(
         "alert",
@@ -2404,11 +2389,7 @@ describe("limiting a GitHub service to repositories", () => {
         name: "Remove limit for GitHub",
       }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Remove limit",
-      }),
-    );
+    await pressInDialog("Remove limit");
     // The server says why, as it does for every change to a service.
     expect(await screen.findByRole("alert")).toHaveTextContent("Not allowed");
     expect(within(await githubRow()).getByText("Limited to a/b")).toBeVisible();
@@ -2444,11 +2425,7 @@ describe("limiting a GitHub service to repositories", () => {
         name: "Remove limit for GitHub",
       }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Remove limit",
-      }),
-    );
+    await pressInDialog("Remove limit");
     const actions = () =>
       [
         "Change limit for GitHub",

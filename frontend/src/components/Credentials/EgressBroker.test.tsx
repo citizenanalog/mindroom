@@ -17,6 +17,7 @@ import {
   vi,
 } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
+import { pressInDialog } from "@/test/egressServiceTestKit";
 import { EgressBroker } from "./EgressBroker";
 
 const NOT_RUNNING =
@@ -1729,11 +1730,7 @@ describe("egress broker service editor", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "Delete service for GitHub" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Delete",
-      }),
-    );
+    await pressInDialog("Delete");
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Failed to save configuration (Error 500)",
     );

@@ -5,10 +5,10 @@ import {
   render,
   screen,
   waitFor,
-  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import egressPresets from "@/test/fixtures/egressPresets.json";
+import { pressInDialog } from "@/test/egressServiceTestKit";
 import { readConfigRoot, useConfigStore } from "@/store/configStore";
 import { EgressBroker } from "./EgressBroker";
 
@@ -95,11 +95,7 @@ async function deleteOpenai() {
   fireEvent.click(
     await screen.findByRole("button", { name: "Delete service for OpenAI" }),
   );
-  fireEvent.click(
-    within(await screen.findByRole("dialog")).getByRole("button", {
-      name: "Delete",
-    }),
-  );
+  await pressInDialog("Delete");
 }
 
 beforeEach(async () => {
