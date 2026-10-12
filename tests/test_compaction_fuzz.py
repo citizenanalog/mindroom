@@ -1,8 +1,8 @@
 """Shrinkable mixed-operation coverage for the compaction archive invariants.
 
 Each example drives one conversation through appends, compaction chunks, chunks
-interrupted after the archive commit, mid-turn folds positioned on the newest run
-(some lost to a crash before the run's record named them), stale whole-row session
+interrupted after the archive commit, mid-turn folds positioned on the newest run or on
+an older approval's resumed run (some lost to a crash before the run's record named them), stale whole-row session
 writes, redactions, and reopens, starting from an empty or a pre-archive database. Summaries name the
 runs they cover, so after every step (and the reconcile the next run would do)
 the test can check exactly what replay represents.
@@ -39,7 +39,7 @@ from mindroom.history.storage import (
 )
 from mindroom.history.types import HistoryScope
 from tests.conftest import seed_session
-from tests.history_helpers import archived_run_ids
+from tests.history_helpers import archived_content, archived_run_ids
 
 _SCOPE = HistoryScope(kind="agent", scope_id="code")
 _SESSION = "session"
@@ -87,6 +87,10 @@ class _Runner:
         self._paused: set[str] = set()
         # Run ids whose events each run read as unseen context; reading one makes it part of what that run represents.
         self._reads: dict[str, set[str]] = {}
+        # The runs each applied fold covered; its position run depends on them, even when it is older.
+        self._folds: dict[str, set[str]] = {}
+        self._legacy = legacy
+        self._retiring = False
         seeding = self._open()
         if legacy:
             seed_session(seeding, self._legacy_session())
@@ -96,6 +100,7 @@ class _Runner:
         seeding.close()
         self._storage = self._open()
         self._present = self._present_run_ids()
+        self._replayable = {run.run_id for run in self._load().runs or [] if run.run_id}
 
     def run(self, actions: list[Action]) -> None:
         operations = {
@@ -104,6 +109,7 @@ class _Runner:
             "approve": self._approve,
             "compact": self._compact,
             "midturn": self._midturn,
+            "resume_fold": self._resume_fold,
             "interrupt": self._interrupt,
             "snapshot": self._snapshot,
             "stale_write": self._stale_write,
@@ -255,8 +261,42 @@ class _Runner:
         if action.index % 3 == 0:
             return
         self._ever_archived.update(run.run_id for run in prior if run.run_id)
+        self._folds[current.run_id or ""] = {run.run_id for run in prior if run.run_id}
         current.metadata = {**(current.metadata or {}), MID_TURN_GENERATION_METADATA_KEY: generation_id}
         self._storage.upsert_run(run=current, session_id=_SESSION, user_id=None)
+
+    def _resume_fold(self, action: Action) -> None:
+        """Approve the oldest paused run and fold, mid-turn, every live run, including newer ones, on it.
+
+        That is what an approval resumed after later turns does when its continuation compacts. Every third
+        fold is lost to a crash before the run's record names it, so the run stays paused.
+        """
+        session = self._load()
+        reconcile_compaction_state(self._storage, session, _SCOPE)
+        session = self._load()
+        runs = [run for run in session.runs or [] if isinstance(run, RunOutput) and run.run_id]
+        paused = [run for run in runs if run.run_id in self._paused]
+        covered = [run for run in runs if run.run_id not in self._paused]
+        if not paused or not covered:
+            return
+        current = paused[0]
+        generation_id = record_mid_turn_generation(
+            self._storage,
+            session=session,
+            scope=_SCOPE,
+            summary=_summary_of(_covered(session) | {run.run_id for run in [*covered, current] if run.run_id}),
+            summary_model="fuzz-model",
+            position_run=current,
+            covered_runs=covered,
+        )
+        if action.index % 3 == 0:
+            return
+        self._ever_archived.update(run.run_id for run in covered if run.run_id)
+        self._folds[current.run_id or ""] = {run.run_id for run in covered if run.run_id}
+        current.status = RunStatus.completed
+        current.metadata = {**(current.metadata or {}), MID_TURN_GENERATION_METADATA_KEY: generation_id}
+        self._storage.upsert_run(run=current, session_id=_SESSION, user_id=None)
+        self._paused.discard(current.run_id or "")
 
     def _interrupt(self, action: Action) -> None:
         """Commit a chunk's archive transaction but lose the session write that follows it."""
@@ -303,6 +343,12 @@ class _Runner:
         if not candidates:
             return None
         event_id = candidates[action.index % len(candidates)]
+        # A legacy summary's provenance cannot be split by run, so redacting under it may retire every summary.
+        self._retiring = self._legacy and archive.has_legacy_summary(
+            self._storage,
+            session_id=_SESSION,
+            scope_key=_SCOPE.key,
+        )
         if edit:
             remove_runs_for_sources(self._storage, _SESSION, SessionType.AGENT, _SCOPE, (event_id,))
         else:
@@ -331,6 +377,11 @@ class _Runner:
     def _present_run_ids(self) -> set[str]:
         return {run.run_id for run in self._load().runs or [] if run.run_id} | self._archived_content_ids()
 
+    def _depending_on(self, removed: set[str]) -> set[str]:
+        """Return ``removed`` with every fold position run that depends on it, even an older one."""
+        # A fold depends on every run it covered; retiring a legacy summary takes every fold with it.
+        return removed | {position for position, covered in self._folds.items() if covered & removed or self._retiring}
+
     def _check(self, redacted_event_id: str | None) -> None:
         session = self._load()
         reconcile_compaction_state(self._storage, session, _SCOPE)
@@ -354,15 +405,23 @@ class _Runner:
             assert event_id not in archived_event_ids
         # Nothing is lost except by redacting that run or an earlier one.
         present = live | archived
+        # Tombstones keep a removed run's id without its content.
+        replayable = live | {run_id for run_id, stored in archived_content(self._storage, _SESSION).items() if stored}
         lost = self._present - present
         if redacted_event_id is None:
             assert not lost
         elif redacted_event_id[1:] in self._created:
             # Redaction removes the first run that answered or read the event, and every run after it.
             readers = [run_id for run_id, read in self._reads.items() if redacted_event_id[1:] in read]
-            first = min(self._created.index(run_id) for run_id in [redacted_event_id[1:], *readers])
-            assert all(self._created.index(run_id) >= first for run_id in lost)
+            sources = [redacted_event_id[1:], *readers]
+            first = min(self._created.index(run_id) for run_id in sources)
+            assert lost <= self._depending_on(set(self._created[first:]))
+            # When one of them still replayed, it and every run after it are gone.
+            if remaining := [run_id for run_id in sources if run_id in self._replayable]:
+                gone = self._depending_on(set(self._created[min(map(self._created.index, remaining)) :]))
+                assert not gone & replayable
         self._present = present
+        self._replayable = replayable
         # Seen ids are exactly the events replay represents, so nothing is repeated or dropped; a paused run is
         # not history-visible, so only a summary that read it represents it.
         represented = (live - self._paused) | covered
@@ -383,6 +442,7 @@ _ACTIONS = st.builds(
             "approve",
             "compact",
             "midturn",
+            "resume_fold",
             "interrupt",
             "snapshot",
             "stale_write",
@@ -502,6 +562,49 @@ _ACTIONS = st.builds(
 @example(
     # An edit of a message whose run a later fold covered and a reconcile archived.
     actions=[Action("add"), Action("add"), Action("midturn", index=1), Action("add"), Action("edit", index=0)],
+    legacy=False,
+)
+@example(
+    # An approval resumed after later turns folds them, then a newer run it covered is redacted.
+    actions=[
+        Action("add"),
+        Action("pause"),
+        Action("add"),
+        Action("add"),
+        Action("resume_fold", index=1),
+        Action("redact", index=3),
+    ],
+    legacy=False,
+)
+@example(
+    # The same fold archived by a reconcile, then an edit of the resumed run's own message.
+    actions=[
+        Action("add"),
+        Action("pause"),
+        Action("add"),
+        Action("resume_fold", index=1),
+        Action("snapshot"),
+        Action("edit", index=1),
+    ],
+    legacy=False,
+)
+@example(
+    # A fold's own run is archived by a later compaction and redacted; the run after it replayed the fold.
+    actions=[Action("add"), Action("midturn", index=1), Action("add"), Action("compact"), Action("redact", index=0)],
+    legacy=False,
+)
+@example(
+    # A compaction archives every run, the newest is edited, and later runs follow a redacted archived run.
+    actions=[
+        Action("add"),
+        Action("add"),
+        Action("add"),
+        Action("compact", count=2),
+        Action("edit", index=2),
+        Action("add"),
+        Action("add"),
+        Action("redact", index=1),
+    ],
     legacy=False,
 )
 def test_generated_compaction_histories_keep_the_archive_invariants(actions: list[Action], *, legacy: bool) -> None:

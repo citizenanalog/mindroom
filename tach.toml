@@ -2491,7 +2491,7 @@ visibility = [
 [[modules]]
 path = "mindroom.history.archive_schema"
 depends_on = ["mindroom.usage.storage"]
-visibility = ["mindroom.history.archive", "mindroom.history.legacy_compaction_state"]
+visibility = ["mindroom.agno_compat_sqlite", "mindroom.history.archive", "mindroom.history.legacy_compaction_state"]
 
 [[modules]]
 path = "mindroom.history.storage"
@@ -7642,7 +7642,7 @@ expose = ["install_model_call_cap"]
 
 [[modules]]
 path = "mindroom.agno_compat_sqlite"
-depends_on = ["mindroom.usage.storage"]
+depends_on = ["mindroom.history.archive_schema", "mindroom.usage.storage"]
 visibility = ["mindroom.agent_storage", "mindroom.history.archive"]
 
 [[interfaces]]

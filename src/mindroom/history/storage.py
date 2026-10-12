@@ -432,6 +432,7 @@ def _remove_redacted_event_from_history(
     # A fold a crash kept out of its run's record must not make that run look shortened; covered runs stay live,
     # so the removal still finds the run that consumed the event.
     _resolve_positioned_generations(storage, session, scope, materialize=False)
+    indexes = archive.live_run_indexes(storage, session_id=session.session_id)
     removed_run_ids = _remove_run_by_event_id(
         storage,
         session.session_id,
@@ -449,6 +450,7 @@ def _remove_redacted_event_from_history(
         removed_live_run=bool(removed_run_ids),
         legacy_source_event_id=legacy_source_event_id,
         removed_run_ids=removed_run_ids,
+        removed_from_index=_first_index(indexes, removed_run_ids),
     )
     _adopt_session_fields(session, latest_session)
     return bool(removed_run_ids) or removed_compacted
@@ -499,6 +501,7 @@ def _remove_redacted_event_from_compaction(
     removed_live_run: bool,
     legacy_source_event_id: str | None = None,
     removed_run_ids: Sequence[str] = (),
+    removed_from_index: int | None = None,
 ) -> bool:
     """Remove a redacted Matrix event from compacted history, keeping everything before it.
 
@@ -512,7 +515,6 @@ def _remove_redacted_event_from_compaction(
     they covered return as unseen thread context; compacted history's ids stay
     derived from the archive. Returns whether the scope's history changed for this event.
     """
-    live_run_ids = [run.run_id for run in session.runs or [] if run.run_id]
     legacy_redaction = _legacy_redaction(
         storage,
         session,
@@ -526,28 +528,19 @@ def _remove_redacted_event_from_compaction(
             storage,
             session_id=session.session_id,
             scope_key=scope.key,
-            live_run_ids=live_run_ids,
+            live_run_ids=[run.run_id for run in session.runs or [] if run.run_id],
         )
     elif (
-        hit := _earliest_dependent_row(
+        not _roll_back_dependent_compaction(
             storage,
             session,
             scope,
-            event_id=event_id,
+            event_ids=(event_id,),
             removed_run_ids=removed_run_ids,
+            removed_from_index=removed_from_index,
         )
-    ) is not None:
-        archive.roll_back_to(
-            storage,
-            session_id=session.session_id,
-            scope_key=scope.key,
-            hit=hit,
-            # A fold depending on a removed run is undone with it; the live runs left are older ones compaction skipped.
-            live_run_ids=()
-            if hit.run_id in removed_run_ids
-            else _live_runs_after(storage, session.session_id, hit, live_run_ids),
-        )
-    elif not removed_live_run:
+        and not removed_live_run
+    ):
         return False
     if legacy_redaction == "retire":
         archive.retire_summaries(storage, session_id=session.session_id, scope_key=scope.key)
@@ -572,6 +565,7 @@ def remove_runs_for_sources(
         # A fold a crash kept out of its run's record must not make that run look shortened; covered runs stay
         # live, so the removal still finds the edited run.
         _resolve_positioned_generations(storage, stored, scope, materialize=False)
+    indexes = archive.live_run_indexes(storage, session_id=session_id)
     removed_run_ids: list[str] = []
     for source_event_id in source_event_ids:
         removed_run_ids += _remove_run_by_event_id(
@@ -581,55 +575,78 @@ def remove_runs_for_sources(
             session_type=session_type,
             remove_following_runs=True,
         )
+    session = storage.get_session(session_id=session_id, session_type=session_type)
+    if not isinstance(session, (AgentSession, TeamSession)):
+        return bool(removed_run_ids)
     # An edited source already archived, such as one a resumed run's fold covered, is undone from its generation.
-    archived_hits = [
+    if _roll_back_dependent_compaction(
+        storage,
+        session,
+        scope,
+        event_ids=source_event_ids,
+        removed_run_ids=removed_run_ids,
+        removed_from_index=_first_index(indexes, removed_run_ids),
+    ):
+        _sync_after_history_removal(storage, session, scope)
+        return True
+    return bool(removed_run_ids)
+
+
+def _first_index(indexes: dict[str, int], run_ids: Sequence[str]) -> int | None:
+    """Return where the earliest removed run stood, so a fold's runs stored after it go with it."""
+    return min((indexes[run_id] for run_id in run_ids if run_id in indexes), default=None)
+
+
+def _roll_back_dependent_compaction(
+    storage: BaseDb,
+    session: AgentSession | TeamSession,
+    scope: HistoryScope,
+    *,
+    event_ids: Sequence[str],
+    removed_run_ids: Sequence[str],
+    removed_from_index: int | None,
+) -> bool:
+    """Undo compaction from the earliest generation that holds a removed event or depends on a removed run.
+
+    ``session`` is the stored session after the removal, and ``removed_from_index`` is where the earliest
+    removed run stood. Returns whether any compaction was undone.
+    """
+    archived = [
         hit
-        for source_event_id in source_event_ids
+        for event_id in event_ids
         if (
             hit := archive.find_archived_event(
                 storage,
-                session_id=session_id,
+                session_id=session.session_id,
                 scope_key=scope.key,
-                event_id=source_event_id,
+                event_id=event_id,
             )
         )
+        is not None
     ]
-    if not removed_run_ids and not archived_hits:
-        return False
     dependent = archive.earliest_dependent_generation(
         storage,
-        session_id=session_id,
+        session_id=session.session_id,
         scope_key=scope.key,
-        run_ids=removed_run_ids,
+        run_ids={*removed_run_ids, *(hit.run_id for hit in archived)},
     )
-    candidates = [candidate for candidate in (dependent, *archived_hits) if candidate is not None]
+    candidates = [*archived, *([dependent] if dependent is not None else [])]
+    # The earliest one undoes the most, so every generation depending on a removed run goes.
     hit = min(candidates, key=lambda candidate: (candidate.generation_id, candidate.archived_row_id), default=None)
-    session = storage.get_session(session_id=session_id, session_type=session_type)
-    if hit is not None and isinstance(session, (AgentSession, TeamSession)):
-        archive.roll_back_to(
-            storage,
-            session_id=session_id,
-            scope_key=scope.key,
-            hit=hit,
-            # Removed runs were the newest, so the live runs left are older ones compaction skipped, such as a
-            # pending approval; an archived hit has every live run after it.
-            live_run_ids=()
-            if hit.run_id in removed_run_ids
-            else _live_runs_after(storage, session_id, hit, [run.run_id for run in session.runs or [] if run.run_id]),
-        )
-        _sync_after_history_removal(storage, session, scope)
+    if hit is None:
+        return False
+    # The removal already took every live run after a removed one, and a fold's position run goes with the fold;
+    # an archived run also takes the live runs stored after it, but not an older pending approval.
+    after = archive.live_runs_after(storage, session_id=session.session_id, run_id=hit.run_id)
+    archive.roll_back_to(
+        storage,
+        session_id=session.session_id,
+        scope_key=scope.key,
+        hit=hit,
+        live_run_ids=[run.run_id for run in session.runs or [] if run.run_id] if after is None else after,
+        before_index=removed_from_index,
+    )
     return True
-
-
-def _live_runs_after(
-    storage: BaseDb,
-    session_id: str,
-    hit: archive.ArchiveHit,
-    live_run_ids: list[str],
-) -> list[str]:
-    """Return the live runs an archived hit removes: those stored after it, so an older pending approval stays."""
-    after = archive.live_runs_after(storage, session_id=session_id, run_id=hit.run_id)
-    return live_run_ids if after is None else after
 
 
 def _sync_after_history_removal(
@@ -644,30 +661,6 @@ def _sync_after_history_removal(
     _refresh_summary(target_session, generation.summary if generation is not None else None)
     storage.upsert_session(target_session)
     _adopt_session_fields(session, target_session)
-
-
-def _earliest_dependent_row(
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    *,
-    event_id: str,
-    removed_run_ids: Sequence[str],
-) -> archive.ArchiveHit | None:
-    """Return the earliest archived row or fold that derives from the event or from a run redaction removed."""
-    hit = archive.find_archived_event(storage, session_id=session.session_id, scope_key=scope.key, event_id=event_id)
-    origins = set(removed_run_ids)
-    if hit is not None:
-        origins.add(hit.run_id)
-    related = archive.earliest_dependent_generation(
-        storage,
-        session_id=session.session_id,
-        scope_key=scope.key,
-        run_ids=origins,
-    )
-    candidates = [candidate for candidate in (hit, related) if candidate is not None]
-    # The earliest one undoes the most, so every generation depending on a removed run goes.
-    return min(candidates, key=lambda candidate: (candidate.generation_id, candidate.archived_row_id), default=None)
 
 
 # LEGACY_COMPAT: Redaction of history compacted before the archive existed.

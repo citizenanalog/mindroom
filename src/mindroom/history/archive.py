@@ -62,8 +62,8 @@ class PositionedGeneration:
 
 
 @dataclass(frozen=True)
-class ArchiveHit:
-    """The first archived run of a scope that represents one Matrix event."""
+class _ArchiveHit:
+    """The first archived run of a scope that represents one Matrix event, or a fold that depends on a run."""
 
     generation_id: int
     archived_row_id: int
@@ -497,8 +497,25 @@ def _replayed_archive_event_ids(
     return {row[0] for row in rows}
 
 
+def live_run_indexes(storage: BaseDb, *, session_id: str) -> dict[str, int]:
+    """Return each live run's index, so a removal can bound its rollback by where the removed runs stood."""
+    db = _sqlite(storage)
+    runs = agno_compat_sqlite.owned_table(db, "runs")
+    with db.db_engine.begin() as connection:
+        return {
+            run_id: run_index
+            for run_id, run_index in connection.execute(
+                select(runs.c.run_id, runs.c.run_index).where(runs.c.session_id == session_id),
+            )
+            if run_index is not None
+        }
+
+
 def live_runs_after(storage: BaseDb, *, session_id: str, run_id: str) -> list[str] | None:
-    """Return the live runs stored after the archived ``run_id``, or None when its index was not recorded."""
+    """Return the live runs stored after ``run_id`` if it is archived, or None when its index was not recorded.
+
+    A run that is not archived has none: it is live or already removed with the runs after it.
+    """
     db = _sqlite(storage)
     _, compacted_runs = _table_names(db)
     runs = agno_compat_sqlite.owned_table(db, "runs")
@@ -508,7 +525,9 @@ def live_runs_after(storage: BaseDb, *, session_id: str, run_id: str) -> list[st
             f"SELECT run_index FROM {compacted_runs} WHERE session_id = ? AND run_id = ?",  # noqa: S608
             (session_id, run_id),
         ).first()
-        if row is None or row[0] is None:
+        if row is None:
+            return []
+        if row[0] is None:
             return None
         return [
             live_run_id
@@ -526,7 +545,7 @@ def find_archived_event(
     session_id: str,
     scope_key: str,
     event_id: str,
-) -> ArchiveHit | None:
+) -> _ArchiveHit | None:
     """Return the first archived run of the scope that represents ``event_id``.
 
     A positioned generation that represents the event, such as one whose running run read it as unseen context,
@@ -551,9 +570,9 @@ def find_archived_event(
             (session_id, scope_key, event_id),
         ).first()
     hits = [
-        *([ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2])] if row is not None else []),
+        *([_ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2])] if row is not None else []),
         *(
-            [ArchiveHit(generation_id=positioned[0], archived_row_id=_END_OF_GENERATION, run_id=positioned[1])]
+            [_ArchiveHit(generation_id=positioned[0], archived_row_id=_END_OF_GENERATION, run_id=positioned[1])]
             if positioned is not None
             else []
         ),
@@ -567,7 +586,7 @@ def earliest_dependent_generation(
     session_id: str,
     scope_key: str,
     run_ids: Collection[str],
-) -> ArchiveHit | None:
+) -> _ArchiveHit | None:
     """Return the scope's earliest generation that archived, covers, or is positioned on one of ``run_ids``.
 
     The hit row is the earliest matching archived row of that generation, or the end of the generation when
@@ -578,7 +597,7 @@ def earliest_dependent_generation(
         return None
     db = _sqlite(storage)
     compactions, compacted_runs = _table_names(db)
-    candidates: list[ArchiveHit] = []
+    candidates: list[_ArchiveHit] = []
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
         rows = connection.exec_driver_sql(
@@ -589,17 +608,21 @@ def earliest_dependent_generation(
             (session_id, scope_key),
         ).fetchall()
         candidates.extend(
-            ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2]) for row in rows if row[2] in wanted
+            _ArchiveHit(generation_id=row[0], archived_row_id=row[1], run_id=row[2]) for row in rows if row[2] in wanted
         )
         for generation_id, through_run_id, covered in connection.exec_driver_sql(
             f"SELECT id, through_run_id, covered_run_ids FROM {compactions} "  # noqa: S608
             "WHERE session_id = ? AND scope_key = ? AND through_run_id IS NOT NULL",
             (session_id, scope_key),
         ):
-            matched = wanted & {through_run_id, *json.loads(covered or "[]")}
-            if matched:
+            # The fold's position run when it depends on it, which takes the runs after it if it is archived.
+            if through_run_id in wanted or (matched := wanted & set(json.loads(covered or "[]"))):
                 candidates.append(
-                    ArchiveHit(generation_id=generation_id, archived_row_id=_END_OF_GENERATION, run_id=min(matched)),
+                    _ArchiveHit(
+                        generation_id=generation_id,
+                        archived_row_id=_END_OF_GENERATION,
+                        run_id=through_run_id if through_run_id in wanted else min(matched),
+                    ),
                 )
     return min(candidates, key=lambda hit: (hit.generation_id, hit.archived_row_id), default=None)
 
@@ -609,14 +632,16 @@ def roll_back_to(
     *,
     session_id: str,
     scope_key: str,
-    hit: ArchiveHit,
+    hit: _ArchiveHit,
     live_run_ids: Collection[str],
+    before_index: int | None = None,
 ) -> None:
     """Undo compaction from the hit's generation onward, keeping everything before the hit run.
 
     The hit run and everything after it (later archived runs and the given live runs)
-    is removed; the hit generation's runs archived before it return to the live
-    table in their original order. Removed archived runs stay as tombstones.
+    is removed; the hit generation's runs archived before it, and stored before
+    ``before_index`` when given, return to the live table in their original order.
+    Removed archived runs stay as tombstones.
     """
     db = _sqlite(storage)
     compactions, compacted_runs = _table_names(db)
@@ -627,9 +652,10 @@ def roll_back_to(
         indexes: dict[str, int | None] = {}
         earlier = []
         for run_type, run_data, run_index in connection.exec_driver_sql(
+            # A row without an index, or a removal without a bound, compares as NULL, which keeps the row.
             f"SELECT run_type, run_data, run_index FROM {compacted_runs} "  # noqa: S608
-            "WHERE compaction_id = ? AND id < ? AND run_data IS NOT NULL ORDER BY id",
-            (hit.generation_id, hit.archived_row_id),
+            "WHERE compaction_id = ? AND id < ? AND run_data IS NOT NULL AND COALESCE(run_index < ?, 1) ORDER BY id",
+            (hit.generation_id, hit.archived_row_id, before_index),
         ):
             run = deserialize_run(run_type, run_data)
             indexes[run.run_id or ""] = run_index
@@ -669,6 +695,7 @@ def roll_back_to(
                 transaction,
                 runs,
                 run,
+                session_table=db.session_table_name,
                 session_id=session_id,
                 user_id=run.user_id,
                 run_index=indexes.get(run.run_id or ""),

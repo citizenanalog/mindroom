@@ -10,6 +10,7 @@ from agno.db.utils import build_single_run_row
 from sqlalchemy import event, func, select
 from sqlalchemy.dialects.sqlite import insert
 
+from mindroom.history.archive_schema import archived_run_index_floor
 from mindroom.usage.storage import project_usage, usage_table_sql, usage_upsert_sql
 
 if TYPE_CHECKING:
@@ -67,8 +68,9 @@ def owned_table(db: SqliteDb, table_type: Literal["runs", "sessions"]) -> Table:
 # Upstream PR: https://github.com/agno-agi/agno/pull/9938
 # Remove when: The pinned adapter appends new runs after existing indexes even when
 # given a shortened session-list position; keep owner prompt sanitization.
-# Coverage: tests/test_agent_storage_runs.py::test_runs_appended_after_deleting_leading_runs_sort_after_the_survivors and
-# tests/test_history_archive.py::test_roll_back_restores_runs_at_their_original_indexes_after_reopening.
+# Coverage: tests/test_agent_storage_runs.py::test_runs_appended_after_deleting_leading_runs_sort_after_the_survivors,
+# tests/test_history_archive.py::test_roll_back_restores_runs_at_their_original_indexes_after_reopening, and
+# tests/test_compaction_redaction.py::test_removing_an_archived_run_removes_runs_saved_after_the_newest_live_run_went.
 # AGNO_COMPAT: Run persistence has no caller-owned transaction extension point.
 # Reason: SqliteDb.upsert_run commits internally, preventing atomic application-owned usage writes.
 # Upstream issue: No matching transaction extension point identified; the run UPSERT is copied from Agno 3.0.9.
@@ -82,16 +84,25 @@ def insert_run_row(
     runs: Table,
     run: RunOutput | TeamRunOutput | WorkflowRunOutput | dict[str, Any],
     *,
+    session_table: str,
     session_id: str,
     user_id: str | None,
     run_index: int | None = None,
 ) -> Row[Any]:
-    """Upsert one run row at the end of its session, or at ``run_index``, inside the caller's transaction."""
+    """Upsert one run row at the end of its session, or at ``run_index``, inside the caller's transaction.
+
+    The end is after every live and archived run, so an index is never reused.
+    """
     row = build_single_run_row(run, session_id=session_id, user_id=user_id, run_index=None)
     row["run_index"] = (
         run_index
         if run_index is not None
-        else select(func.coalesce(func.max(runs.c.run_index) + 1, 0))
+        else select(
+            func.max(
+                func.coalesce(func.max(runs.c.run_index) + 1, 0),
+                archived_run_index_floor(transaction.connection(), session_table, session_id),
+            ),
+        )
         .where(runs.c.session_id == session_id)
         .scalar_subquery()
     )
@@ -137,7 +148,14 @@ def upsert_run_at_end(
     """Save the run and optional usage in one transaction, preserving Agno's row/index semantics."""
     runs = owned_table(db, "runs")
     with db.Session() as transaction, transaction.begin():
-        stored = insert_run_row(transaction, runs, run, session_id=session_id, user_id=user_id)
+        stored = insert_run_row(
+            transaction,
+            runs,
+            run,
+            session_table=db.session_table_name,
+            session_id=session_id,
+            user_id=user_id,
+        )
         if record_usage:
             payload = project_usage({**stored.run_data, "created_at": stored.created_at})
             connection = transaction.connection()

@@ -53,6 +53,27 @@ def upgrade_archive_schema(connection: Connection, session_table: str) -> None:
                 connection.exec_driver_sql(f"ALTER TABLE {quoted} ADD COLUMN {name} {kind}")
 
 
+def archived_run_index_floor(connection: Connection, session_table: str, session_id: str) -> int:
+    """Return one past the highest live-table index an archived run of ``session_id`` held, or 0.
+
+    New runs are indexed above it, so one order spans live and archived runs even after
+    the runs that held the highest live indexes were archived or removed.
+    """
+    _, compacted_runs = archive_table_names(session_table)
+    created = connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (compacted_runs,),
+    ).first()
+    if created is None:
+        return 0
+    upgrade_archive_schema(connection, session_table)
+    (highest,) = connection.exec_driver_sql(
+        f"SELECT MAX(run_index) FROM {quote_identifier(compacted_runs)} WHERE session_id = ?",  # noqa: S608
+        (session_id,),
+    ).one()
+    return 0 if highest is None else highest + 1
+
+
 def archive_schema_sql(session_table: str) -> tuple[str, ...]:
     """Return the idempotent DDL that creates the archive beside ``session_table``."""
     compactions, compacted_runs = (quote_identifier(name) for name in archive_table_names(session_table))
