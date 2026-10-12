@@ -18,6 +18,7 @@ from mindroom.redaction import (
     REDACTED,
     REDACTION_FAILED,
     redact_log_event,
+    redact_log_text,
     redact_sensitive_data,
     redact_sensitive_text,
 )
@@ -180,6 +181,55 @@ def test_redact_sensitive_data_redacts_bare_query_fragments_under_query_keys() -
     }
 
 
+_CONNECT_LINK = (
+    "https://mindroom.example.com/api/oauth/mcp_demo/authorize"
+    "?connect_token=ct-one-time-7f3a9c&agent_name=helper&execution_scope=user"
+)
+_CONNECT_INSTRUCTION = (
+    "Demo is not connected for this agent. "
+    f"Open this MindRoom link to connect it, then retry the request: {_CONNECT_LINK}"
+)
+
+
+def test_redact_log_event_hides_one_time_link_tokens() -> None:
+    """Logs must not keep the one-time token of a connect, reset, or SSO login link, but keep the rest."""
+    redacted = redact_log_event(
+        None,
+        "error",
+        {
+            "event": "Error during response generation",
+            "error": _CONNECT_INSTRUCTION,
+            "reset_path": "/api/oauth/mcp_demo/reset?agent_name=helper&reset_token=rt-one-time-2b81",
+            "sso_callback": "http://127.0.0.1:8765/callback?loginToken=syl_one_time_44d0",
+            "query_string": "connect_token=ct-one-time-7f3a9c&agent_name=helper",
+            "connect_token": "ct-one-time-7f3a9c",
+        },
+    )
+
+    assert redacted == {
+        "event": "Error during response generation",
+        "error": _CONNECT_INSTRUCTION.replace("ct-one-time-7f3a9c", REDACTED),
+        "reset_path": f"/api/oauth/mcp_demo/reset?agent_name=helper&reset_token={REDACTED}",
+        "sso_callback": f"http://127.0.0.1:8765/callback?loginToken={REDACTED}",
+        "query_string": f"connect_token={REDACTED}&agent_name=helper",
+        "connect_token": REDACTED,
+    }
+
+
+def test_redact_log_text_hides_one_time_link_tokens_in_tracebacks() -> None:
+    """Rendered tracebacks carry the exception message, so the link token must go there too."""
+    traceback_text = f"Traceback (most recent call last):\n  ...\nOAuthConnectionRequired: {_CONNECT_INSTRUCTION}\n"
+
+    assert redact_log_text(traceback_text) == traceback_text.replace("ct-one-time-7f3a9c", REDACTED)
+
+
+def test_user_facing_redaction_keeps_one_time_link_tokens() -> None:
+    """Replies, failure notes, and tool results hand the requester the connect link, so it must stay whole."""
+    assert redact_sensitive_text(_CONNECT_INSTRUCTION) == _CONNECT_INSTRUCTION
+    tool_result = {"error": _CONNECT_INSTRUCTION, "oauth_connection_required": True, "connect_url": _CONNECT_LINK}
+    assert redact_sensitive_data(tool_result) == tool_result
+
+
 def test_redact_sensitive_data_redacts_secret_assignments_inside_embedded_text_values() -> None:
     """Non-secret wrapper fields should not hide secret-looking text inside their values."""
     redacted = redact_sensitive_data(
@@ -247,7 +297,7 @@ def test_redact_sensitive_text_fails_closed_when_internal_redaction_raises(
 ) -> None:
     """A redaction bug must suppress output instead of escaping into application code."""
 
-    def raise_redaction_error(_value: str) -> str:
+    def raise_redaction_error(_value: str, *, link_tokens: bool) -> str:  # noqa: ARG001
         raise RuntimeError
 
     monkeypatch.setattr(redaction, "_redact_secret_assignments", raise_redaction_error)

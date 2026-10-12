@@ -6,7 +6,7 @@ import math
 import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, fields, is_dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from itertools import islice
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +24,7 @@ __all__ = [
     "nests_beyond_redaction_depth",
     "redact_config_text",
     "redact_log_event",
+    "redact_log_text",
     "redact_sensitive_data",
     "redact_sensitive_text",
     "truncate_review_text",
@@ -148,6 +149,10 @@ _SECRET_KEYS: frozenset[str] = frozenset(
     },
 )
 _OAUTH_QUERY_KEYS: frozenset[str] = frozenset({"code", "state"})
+# One-time browser link tokens: OAuth connect and reset links, and Matrix SSO login callbacks.
+# Replies and failure notes hand connect and reset links to the requester, who needs them whole,
+# so only redaction for logs hides these.
+_LINK_TOKEN_KEYS: frozenset[str] = frozenset({"connect_token", "login_token", "reset_token"})
 _URL_QUERY_SECRET_KEYS: frozenset[str] = frozenset(
     {
         "aws_access_key_id",
@@ -242,8 +247,13 @@ class _KeyClassification:
     is_secret_container_suffix: bool
     is_query_container: bool
     is_redacted_query: bool
+    is_link_token: bool
     is_context_secret_label: bool
     is_context_secret_value: bool
+
+    def hides_value(self, *, link_tokens: bool) -> bool:
+        """Return whether a value under this key is a secret, counting link tokens when ``link_tokens`` is set."""
+        return self.is_secret or (link_tokens and self.is_link_token)
 
 
 def _normalize_key_text(key: str) -> str:
@@ -289,6 +299,7 @@ def _classify_key_text(key: str) -> _KeyClassification:
         is_secret_container_suffix=is_container_suffix,
         is_query_container=normalized in _QUERY_CONTAINER_KEYS,
         is_redacted_query=is_secret or normalized in _OAUTH_QUERY_KEYS or normalized in _URL_QUERY_SECRET_KEYS,
+        is_link_token=normalized in _LINK_TOKEN_KEYS,
         is_context_secret_label=normalized in _CONTEXT_SECRET_LABEL_KEYS,
         is_context_secret_value=normalized in _CONTEXT_SECRET_VALUE_KEYS,
     )
@@ -313,8 +324,9 @@ def _is_query_container(value: str | None) -> bool:
     return value is not None and _classify_key(value).is_query_container
 
 
-def _is_redacted_query_key(value: object) -> bool:
-    return _classify_key(value).is_redacted_query
+def _is_redacted_query_key(value: object, *, link_tokens: bool) -> bool:
+    classification = _classify_key(value)
+    return classification.is_redacted_query or (link_tokens and classification.is_link_token)
 
 
 def _is_context_secret_label_key(value: object) -> bool:
@@ -334,9 +346,9 @@ def _should_force_redact_container_value(value: object) -> bool:
     return value is not None and not isinstance(value, bool | int | float)
 
 
-def _should_redact_value_for_key(key: object, value: object) -> bool:
+def _should_redact_value_for_key(key: object, value: object, *, link_tokens: bool) -> bool:
     classification = _classify_key(key)
-    if classification.is_secret:
+    if classification.hides_value(link_tokens=link_tokens):
         return True
     if classification.is_secret_container_suffix:
         return _should_force_redact_container_value(value)
@@ -428,7 +440,7 @@ def _replace_spans_with_redaction(value: str, spans: list[tuple[int, int]]) -> s
     return "".join(parts)
 
 
-def _redact_secret_assignments(value: str) -> str:
+def _redact_secret_assignments(value: str, *, link_tokens: bool) -> str:
     """Redact shallow key assignments with one forward-only scan."""
     spans: list[tuple[int, int]] = []
     literal_terminator = _forward_match_start(_ASSIGNMENT_VALUE_TERMINATOR_PATTERN, value)
@@ -441,7 +453,7 @@ def _redact_secret_assignments(value: str) -> str:
     while prefix_match := _ASSIGNMENT_PREFIX_PATTERN.search(value, search_start):
         search_start = prefix_match.end()
         classification = _classify_key(prefix_match.group("key"))
-        if not classification.is_secret:
+        if not classification.hides_value(link_tokens=link_tokens):
             continue
 
         value_span = _assignment_value_span(value, prefix_match.end(), unquoted_value_end)
@@ -463,7 +475,7 @@ def _redact_secret_assignments(value: str) -> str:
     return _replace_spans_with_redaction(value, spans)
 
 
-def _redact_url(value: str) -> str:
+def _redact_url(value: str, *, link_tokens: bool) -> str:
     try:
         parsed = urlparse(value)
     except ValueError:
@@ -483,7 +495,7 @@ def _redact_url(value: str) -> str:
         query_items: list[tuple[str, str]] = []
         query_changed = False
         for key, item in parse_qsl(query, keep_blank_values=True):
-            if _is_redacted_query_key(key):
+            if _is_redacted_query_key(key, link_tokens=link_tokens):
                 query_items.append((key, REDACTED))
                 query_changed = True
             else:
@@ -497,17 +509,17 @@ def _redact_url(value: str) -> str:
     return urlunparse(parsed._replace(netloc=netloc, query=query))
 
 
-def _redact_query_fragment(value: str, *, max_length: int | None) -> str:
+def _redact_query_fragment(value: str, *, max_length: int | None, link_tokens: bool) -> str:
     query_items: list[tuple[str, str]] = []
     changed = False
     for key, item in parse_qsl(value, keep_blank_values=True):
-        if _is_redacted_query_key(key):
+        if _is_redacted_query_key(key, link_tokens=link_tokens):
             query_items.append((key, REDACTED))
             changed = True
         else:
             query_items.append((key, item))
     if not changed:
-        return redact_sensitive_text(value, max_length=max_length)
+        return _redact_text(value, max_length=max_length, link_tokens=link_tokens)
     return _truncate_text(urlencode(query_items, doseq=True, safe="*"), max_length)
 
 
@@ -526,7 +538,7 @@ def _bounded_redaction_input(value: str, *, max_length: int | None) -> str:
     return value[:scan_length]
 
 
-def _redact_url_match(match: re.Match[str]) -> str:
+def _redact_url_match(match: re.Match[str], *, link_tokens: bool = False) -> str:
     r"""Redact one matched URL, leaving trailing backslashes untouched.
 
     In logged shell commands and JSON-encoded strings, a backslash right after
@@ -537,7 +549,10 @@ def _redact_url_match(match: re.Match[str]) -> str:
     matched_url = match.group("url")
     url = matched_url.rstrip("\\")
     trailing_backslashes = matched_url[len(url) :]
-    return match.group("prefix") + _redact_url(url) + trailing_backslashes
+    return match.group("prefix") + _redact_url(url, link_tokens=link_tokens) + trailing_backslashes
+
+
+_redact_log_url_match = partial(_redact_url_match, link_tokens=True)
 
 
 def _redact_prose_token(match: re.Match[str]) -> str:
@@ -549,7 +564,13 @@ def _redact_prose_token(match: re.Match[str]) -> str:
     return _redact_matched_token(match)
 
 
-def _redact_sensitive_text(value: str, *, max_length: int | None, prose: bool = False) -> str:
+def _redact_sensitive_text(
+    value: str,
+    *,
+    max_length: int | None,
+    prose: bool = False,
+    link_tokens: bool = False,
+) -> str:
     bounded_value = _bounded_redaction_input(value, max_length=max_length)
     has_assignment = "=" in bounded_value or ":" in bounded_value
     has_url = "://" in bounded_value
@@ -559,7 +580,8 @@ def _redact_sensitive_text(value: str, *, max_length: int | None, prose: bool = 
     has_token = any(marker in bounded_value for marker in _TOKEN_LIKE_MARKERS)
     if not any((has_assignment, has_url, has_bearer, has_api_key_message, has_token)):
         return _truncate_text(bounded_value, max_length)
-    redacted = URL_PATTERN.sub(_redact_url_match, bounded_value) if has_url else bounded_value
+    redact_url = _redact_log_url_match if link_tokens else _redact_url_match
+    redacted = URL_PATTERN.sub(redact_url, bounded_value) if has_url else bounded_value
     redact_token = _redact_prose_token if prose else _redact_matched_token
     if has_bearer:
         redacted = _BEARER_TOKEN_PATTERN.sub(redact_token, redacted)
@@ -568,22 +590,41 @@ def _redact_sensitive_text(value: str, *, max_length: int | None, prose: bool = 
     if has_token:
         redacted = _TOKEN_LIKE_PATTERN.sub(redact_token, redacted)
     if has_assignment:
-        redacted = _redact_secret_assignments(redacted)
+        redacted = _redact_secret_assignments(redacted, link_tokens=link_tokens)
     return _truncate_text(redacted, max_length)
 
 
-def _redact_sensitive_text_fail_closed(value: str, *, max_length: int | None, prose: bool = False) -> str:
+def _redact_sensitive_text_fail_closed(
+    value: str,
+    *,
+    max_length: int | None,
+    prose: bool = False,
+    link_tokens: bool = False,
+) -> str:
     try:
-        return _redact_sensitive_text(value, max_length=max_length, prose=prose)
+        return _redact_sensitive_text(value, max_length=max_length, prose=prose, link_tokens=link_tokens)
     except Exception:
         return _truncate_text(REDACTION_FAILED, max_length)
 
 
-def redact_sensitive_text(value: str, *, max_length: int | None = None) -> str:
-    """Redact common credential patterns without letting redaction break its caller."""
+def _redact_text(value: str, *, max_length: int | None, link_tokens: bool) -> str:
     if len(_bounded_redaction_input(value, max_length=max_length)) > _MAX_TEXT_INPUT_LENGTH:
         return _truncate_text(REDACTION_FAILED, max_length)
-    return _redact_sensitive_text_fail_closed(value, max_length=max_length)
+    return _redact_sensitive_text_fail_closed(value, max_length=max_length, link_tokens=link_tokens)
+
+
+def redact_sensitive_text(value: str, *, max_length: int | None = None) -> str:
+    """Redact common credential patterns without letting redaction break its caller.
+
+    One-time link tokens such as ``connect_token`` stay, because replies and failure notes
+    redacted here carry connect links the requester must open; use ``redact_log_text`` for logs.
+    """
+    return _redact_text(value, max_length=max_length, link_tokens=False)
+
+
+def redact_log_text(value: str, *, max_length: int | None = None) -> str:
+    """Redact text bound for logs: everything ``redact_sensitive_text`` hides, plus one-time link tokens."""
+    return _redact_text(value, max_length=max_length, link_tokens=True)
 
 
 def redact_config_text(value: str) -> str:
@@ -705,6 +746,7 @@ def _redact_mapping(
     max_depth: int | None,
     force_redact: bool,
     token_placeholders: dict[str, str] | None,
+    link_tokens: bool,
     ancestor_ids: frozenset[int],
 ) -> dict[str, _RedactedValue]:
     redacted: dict[str, _RedactedValue] = {}
@@ -724,7 +766,7 @@ def _redact_mapping(
         key_text = key_texts[index]
         classification = _classify_key(key)
         redact_key = (
-            _should_redact_value_for_key(key, item)
+            _should_redact_value_for_key(key, item, link_tokens=link_tokens)
             or (parent_is_query_container and classification.is_redacted_query)
             or (has_secret_context_label and classification.is_context_secret_value)
         )
@@ -761,6 +803,7 @@ def _redact_mapping(
             _force_redact=force_redact or redact_key,
             _ancestor_ids=ancestor_ids,
             token_placeholders=token_placeholders,
+            link_tokens=link_tokens,
         )
     if mapping_is_truncated:
         redacted["__truncated__"] = f"{len(value) - len(items)} more items"
@@ -777,6 +820,7 @@ def _redact_sequence(
     max_depth: int | None,
     force_redact: bool,
     token_placeholders: dict[str, str] | None,
+    link_tokens: bool,
     ancestor_ids: frozenset[int],
 ) -> list[_RedactedValue]:
     items = list(value) if max_collection_items is None else list(islice(value, max_collection_items))
@@ -791,6 +835,7 @@ def _redact_sequence(
             _force_redact=force_redact,
             _ancestor_ids=ancestor_ids,
             token_placeholders=token_placeholders,
+            link_tokens=link_tokens,
         )
         for item in items
     ]
@@ -822,8 +867,11 @@ def _redact_scalar_value(
     max_string_length: int | None,
     force_redact: bool,
     token_placeholders: dict[str, str] | None,
+    link_tokens: bool,
 ) -> _RedactedValue:
-    if force_redact or (parent_key is not None and _should_redact_value_for_key(parent_key, value)):
+    if force_redact or (
+        parent_key is not None and _should_redact_value_for_key(parent_key, value, link_tokens=link_tokens)
+    ):
         return REDACTED
     if token_placeholders is not None:
         return _review_scalar_value(value, max_length=max_string_length, placeholders=token_placeholders)
@@ -833,15 +881,23 @@ def _redact_scalar_value(
         redacted = str(value)
     elif isinstance(value, str):
         if _is_query_container(parent_key):
-            redacted = _redact_query_fragment(value, max_length=max_string_length)
+            redacted = _redact_query_fragment(value, max_length=max_string_length, link_tokens=link_tokens)
         else:
-            redacted = _redact_sensitive_text_fail_closed(value, max_length=max_string_length)
+            redacted = _redact_sensitive_text_fail_closed(
+                value,
+                max_length=max_string_length,
+                link_tokens=link_tokens,
+            )
     elif isinstance(value, float):
         redacted = value if math.isfinite(value) else None
     elif value is None or isinstance(value, bool | int):
         redacted = value
     else:
-        redacted = _redact_sensitive_text_fail_closed(_safe_repr(value), max_length=max_string_length)
+        redacted = _redact_sensitive_text_fail_closed(
+            _safe_repr(value),
+            max_length=max_string_length,
+            link_tokens=link_tokens,
+        )
     return redacted
 
 
@@ -852,6 +908,7 @@ def _redact_sensitive_data(
     max_collection_items: int | None = None,
     max_depth: int | None = None,
     token_placeholders: dict[str, str] | None = None,
+    link_tokens: bool = False,
     _parent_key: str | None = None,
     _depth: int = 0,
     _force_redact: bool = False,
@@ -875,6 +932,7 @@ def _redact_sensitive_data(
             max_string_length=max_string_length,
             force_redact=_force_redact,
             token_placeholders=token_placeholders,
+            link_tokens=link_tokens,
         )
     value_id = id(value)
     if value_id in _ancestor_ids:
@@ -892,6 +950,7 @@ def _redact_sensitive_data(
             force_redact=_force_redact,
             ancestor_ids=_ancestor_ids | {value_id},
             token_placeholders=token_placeholders,
+            link_tokens=link_tokens,
         )
     elif isinstance(value, list | tuple | set | frozenset):
         redacted = _redact_sequence(
@@ -904,6 +963,7 @@ def _redact_sensitive_data(
             force_redact=_force_redact,
             ancestor_ids=_ancestor_ids | {value_id},
             token_placeholders=token_placeholders,
+            link_tokens=link_tokens,
         )
     else:
         redacted = _redact_scalar_value(
@@ -912,6 +972,7 @@ def _redact_sensitive_data(
             max_string_length=max_string_length,
             force_redact=_force_redact,
             token_placeholders=token_placeholders,
+            link_tokens=link_tokens,
         )
     return redacted
 
@@ -955,6 +1016,7 @@ def redact_log_event(_logger: object, _method_name: str, event_dict: dict[str, A
             max_string_length=_MAX_TEXT_INPUT_LENGTH,
             max_collection_items=_MAX_LOG_COLLECTION_ITEMS,
             max_depth=_MAX_DEPTH,
+            link_tokens=True,
         )
     except Exception:
         return {"event": REDACTION_FAILED}

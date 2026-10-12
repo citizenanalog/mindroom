@@ -25,6 +25,7 @@ from mindroom.logging_config import (
     subprocess_logging_env,
 )
 from mindroom.message_target import MessageTarget
+from mindroom.oauth.providers import OAuthConnectionRequired
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -57,6 +58,10 @@ def _raise_value_error() -> NoReturn:
 def _raise_secret_value_error() -> NoReturn:
     msg = "api_key=api-secret"
     raise ValueError(msg)
+
+
+def _raise_oauth_connection_required(instruction: str, connect_url: str) -> NoReturn:
+    raise OAuthConnectionRequired(instruction, provider_id="mcp_demo", connect_url=connect_url)
 
 
 # No redaction rule recognizes this value, so only omitting frame locals keeps it out of logs.
@@ -467,6 +472,42 @@ def test_setup_logging_text_mode_redacts_exception_tracebacks_without_pretty_exc
     assert ("\x1b[" in output) is is_terminal
     if not is_terminal:
         assert "Traceback (most recent call last):" in output
+
+
+@pytest.mark.parametrize("log_format", ["json", "text"])
+def test_logged_oauth_connect_error_hides_the_link_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    log_format: str,
+) -> None:
+    """A failed response logs the connect instruction it raised without the link's one-time token."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", log_format)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+    connect_url = (
+        "https://mindroom.example.com/api/oauth/mcp_demo/authorize"
+        "?connect_token=ct-one-time-7f3a9c&agent_name=helper&execution_scope=user"
+    )
+    instruction = f"Demo is not connected for this agent. Open this MindRoom link to connect it: {connect_url}"
+
+    try:
+        _raise_oauth_connection_required(instruction, connect_url)
+    except OAuthConnectionRequired as error:
+        get_logger("mindroom.bot").exception("Error during response generation", error=str(error))
+
+    output = capsys.readouterr().err
+    redacted_instruction = instruction.replace("ct-one-time-7f3a9c", "***redacted***")
+
+    assert "ct-one-time-7f3a9c" not in output
+    if log_format == "json":
+        payload = json.loads(output.strip().splitlines()[-1])
+        assert payload["error"] == redacted_instruction
+        assert f"OAuthConnectionRequired: {redacted_instruction}" in payload["exception"]
+    else:
+        assert f"error='{redacted_instruction}'" in output
+        assert f"OAuthConnectionRequired: {redacted_instruction}" in output
 
 
 def test_setup_logging_json_mode_renders_exception_field_for_exc_info_true(

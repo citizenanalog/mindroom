@@ -21,6 +21,7 @@ from mindroom.error_handling import (
     get_user_friendly_error_message,
     run_error_event_exception,
 )
+from mindroom.oauth.providers import OAuthConnectionRequired
 
 _MOCK_RESPONSE = httpx.Response(status_code=401, request=httpx.Request("POST", "https://api.example.com"))
 
@@ -55,6 +56,24 @@ def test_provider_auth_error_redacts_secret_from_user_message() -> None:
     assert "Authentication failed" in message
     assert "***redacted***" in message
     assert "sk-test-secret" not in message
+
+
+def test_oauth_connection_required_reply_keeps_the_connect_link() -> None:
+    """The requester needs the whole one-time connect link, even though logs hide its token."""
+    connect_url = (
+        "https://mindroom.example.com/api/oauth/mcp_demo/authorize"
+        "?connect_token=ct-one-time-7f3a9c&agent_name=helper&execution_scope=user"
+    )
+    error = OAuthConnectionRequired(
+        f"Demo is not connected for this agent. Open this MindRoom link to connect it, then retry the request: "
+        f"{connect_url}",
+        provider_id="mcp_demo",
+        connect_url=connect_url,
+    )
+
+    message = get_user_friendly_error_message(error, "helper")
+
+    assert message.endswith(f"then retry the request: {connect_url}")
 
 
 def test_401_error() -> None:

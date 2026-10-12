@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 import structlog
 
-from mindroom.redaction import redact_log_event, redact_sensitive_text
+from mindroom.redaction import redact_log_event, redact_log_text
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -93,7 +93,7 @@ class _RedactingExceptionFormatter:
     def __call__(self, sio: TextIO, exc_info: ExcInfo) -> None:
         buffer = StringIO()
         self._formatter(buffer, exc_info)
-        sio.write(redact_sensitive_text(buffer.getvalue()))
+        sio.write(redact_log_text(buffer.getvalue()))
 
 
 _MISSING = object()
