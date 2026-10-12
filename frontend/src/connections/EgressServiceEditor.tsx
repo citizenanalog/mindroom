@@ -41,6 +41,7 @@ import {
   ruleField,
   validateService,
 } from "./egressServiceValidation";
+import { hostPort } from "./egressRowText";
 import { looksLikeGithub } from "./githubLimits";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import {
@@ -89,7 +90,7 @@ function limitedServiceName(taken: readonly string[]): string {
 /** A rule as a short host and path, such as `www.googleapis.com/drive/`. */
 function ruleCoverage(rule: EgressRuleSummary): string {
   const path = rule.path_prefix === "/" ? "" : rule.path_prefix;
-  return `${rule.host}${rule.port === null ? "" : `:${rule.port}`}${path}`;
+  return `${hostPort(rule)}${path}`;
 }
 
 export interface EgressServiceEditorProps {

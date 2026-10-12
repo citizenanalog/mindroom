@@ -82,7 +82,7 @@ export function LimitRow({
   serviceEditing?: ServiceEditing;
 }) {
   const [error, setError] = useState<string | null>(null);
-  const hosts = hostsNote(service)?.replace(/^Sends to/, "Limits requests to");
+  const hosts = hostsNote(service, "Limits requests to");
   return (
     <li
       aria-label={service.display_name}

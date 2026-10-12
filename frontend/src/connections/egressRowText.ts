@@ -1,6 +1,7 @@
 import { formatList, sharedAccountStatus } from "./accountCopy";
 import { BROKERED_PLACEHOLDER } from "./egressServiceForm";
 import { GRAPHQL_CAVEAT, limitedTo, parseGithubLimit } from "./githubLimits";
+import { githubLimitLabels } from "./githubRepositoryRules";
 import type {
   EgressCredentialService,
   EgressOAuthStatus,
@@ -136,25 +137,23 @@ export function limitedNote(service: EgressCredentialService): string | null {
   const limit = limitedTo(service.rules);
   if (limit === null) return null;
   const caveat = limit.graphql ? ` (${GRAPHQL_CAVEAT})` : "";
-  const text = `Limited to ${limit.repositories.join(", ")}${caveat}`;
+  const text = githubLimitLabels(limit.repositories).description + caveat;
   return service.description === text ? null : text;
 }
 
+/** A rule's host, with the port when it names one. */
+export const hostPort = (rule: EgressRuleSummary) =>
+  `${rule.host}${rule.port === null ? "" : `:${rule.port}`}`;
+
 /** The hosts a service's rules cover, each once, with the port when a rule names one. */
 function ruleHosts(rules: readonly EgressRuleSummary[]): string[] {
-  return [
-    ...new Set(
-      rules.map(
-        (rule) => `${rule.host}${rule.port === null ? "" : `:${rule.port}`}`,
-      ),
-    ),
-  ];
+  return [...new Set(rules.map(hostPort))];
 }
 
-/** "Sends to a.com, b.com:8443" for the hosts a service's rules cover, each once; null without rules. */
-export function hostsNote(service: EgressCredentialService): string | null {
+/** "Sends to a.com, b.com:8443", or another `lead`, for the hosts a service's rules cover, each once; null without rules. */
+export function hostsNote(service: EgressCredentialService, lead = "Sends to") {
   const hosts = ruleHosts(service.rules);
-  return hosts.length > 0 ? `Sends to ${hosts.join(", ")}` : null;
+  return hosts.length > 0 ? `${lead} ${hosts.join(", ")}` : null;
 }
 
 const SENT_AS: Record<string, (name: string | null | undefined) => string> = {
