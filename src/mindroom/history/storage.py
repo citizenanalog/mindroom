@@ -447,10 +447,9 @@ def _remove_redacted_event_from_history(
         latest_session,
         scope,
         event_id=event_id,
-        removed_live_run=bool(removed_run_ids),
-        legacy_source_event_id=legacy_source_event_id,
         removed_run_ids=removed_run_ids,
         run_indexes=indexes,
+        legacy_source_event_id=legacy_source_event_id,
     )
     _adopt_session_fields(session, latest_session)
     return bool(removed_run_ids) or removed_compacted
@@ -498,15 +497,14 @@ def _remove_redacted_event_from_compaction(
     scope: HistoryScope,
     *,
     event_id: str,
-    removed_live_run: bool,
+    removed_run_ids: Sequence[str],
+    run_indexes: Mapping[str, int],
     legacy_source_event_id: str | None = None,
-    removed_run_ids: Sequence[str] = (),
-    run_indexes: Mapping[str, int] | None = None,
 ) -> bool:
     """Remove a redacted Matrix event from compacted history, keeping everything before it.
 
-    Callers remove live runs that represent the event first and report whether any
-    went. When an archived run represents the event, compaction is undone from that
+    Callers remove live runs that represent the event first and pass their ids, with the
+    live and archived run indexes from before that removal. When an archived run represents the event, compaction is undone from that
     run's generation onward: the generation's earlier runs return to the live table,
     the previous generation's summary is replayed again, and the run plus everything
     after it is removed. Archived runs record every event they represent, so an
@@ -515,6 +513,7 @@ def _remove_redacted_event_from_compaction(
     they covered return as unseen thread context; compacted history's ids stay
     derived from the archive. Returns whether the scope's history changed for this event.
     """
+    removed_live_run = bool(removed_run_ids)
     legacy_redaction = _legacy_redaction(
         storage,
         session,
@@ -537,9 +536,7 @@ def _remove_redacted_event_from_compaction(
             scope,
             event_ids=(event_id,),
             removed_run_ids=removed_run_ids,
-            run_indexes=archive.run_indexes(storage, session_id=session.session_id)
-            if run_indexes is None
-            else run_indexes,
+            run_indexes=run_indexes,
         )
         and not removed_live_run
     ):
@@ -652,6 +649,8 @@ def _roll_back_dependent_compaction(
         else [run_id for run_id in live_run_ids if run_indexes.get(run_id, cut) >= cut],
         before_index=cut,
     )
+    # A run that folded on both sides of a pause can lose its record with a later fold, which orphans its earlier one.
+    _resolve_positioned_generations(storage, session, scope, materialize=False)
     return True
 
 

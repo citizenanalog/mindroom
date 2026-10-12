@@ -136,6 +136,24 @@ def _legacy_session(run_ids: list[str], summary: str, seen_event_ids: list[str])
     return session
 
 
+def _redact_compacted(
+    storage: SqliteDb,
+    session: AgentSession,
+    *,
+    event_id: str,
+    removed: tuple[str, ...] = (),
+) -> bool:
+    """Remove an event from compacted history as redaction does once it removed the ``removed`` live runs."""
+    return _remove_redacted_event_from_compaction(
+        storage,
+        session,
+        _SCOPE,
+        event_id=event_id,
+        removed_run_ids=removed,
+        run_indexes=archive.run_indexes(storage, session_id=session.session_id),
+    )
+
+
 def test_a_compacted_run_counts_as_seen_what_it_counted_while_live(storage: SqliteDb) -> None:
     """Compaction changes where seen ids come from, not which ids a run marks seen; redaction still matches all."""
     run = _run("r1")
@@ -146,13 +164,7 @@ def test_a_compacted_run_counts_as_seen_what_it_counted_while_live(storage: Sqli
     _compact(storage, session, ["r1"], "summary of r1")
 
     assert _seen(storage, _stored(storage)) == seen_while_live == {"$r1", "$r2"}
-    assert _remove_redacted_event_from_compaction(
-        storage,
-        session,
-        _SCOPE,
-        event_id="$coalesced",
-        removed_live_run=False,
-    )
+    assert _redact_compacted(storage, session, event_id="$coalesced")
     assert _summary(_stored(storage)) is None
 
 
@@ -172,7 +184,7 @@ def test_redaction_restores_the_runs_compacted_before_the_redacted_one(storage: 
     _compact(storage, session, ["r1"], "summary of r1")
     _compact(storage, session, ["r2", "r3"], "summary of r1 to r3")
 
-    changed = _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r3", removed_live_run=False)
+    changed = _redact_compacted(storage, session, event_id="$r3")
 
     assert changed is True
     stored = _stored(storage)
@@ -188,9 +200,7 @@ def test_redacting_the_first_compacted_run_clears_the_summary_for_good(storage: 
     session = _seed(storage, ["r1", "r2"])
     _compact(storage, session, ["r1"], "summary with the redacted content")
 
-    assert (
-        _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r1", removed_live_run=False) is True
-    )
+    assert _redact_compacted(storage, session, event_id="$r1") is True
     stored = _stored(storage)
     assert stored.runs == []
     assert stored.summary is None
@@ -209,7 +219,7 @@ def test_redacting_a_live_only_event_keeps_the_archive_summary(storage: SqliteDb
     update_scope_seen_event_ids(session, _SCOPE, ["$team-consumed"])
     storage.upsert_session(session)
 
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r2", removed_live_run=True)
+    assert _redact_compacted(storage, session, event_id="$r2", removed=("gone",))
 
     stored = _stored(storage)
     assert _summary(stored) == "summary of r1"
@@ -259,13 +269,7 @@ def test_redaction_without_any_matching_history_changes_nothing(storage: SqliteD
     session = _seed(storage, ["r1", "r2"])
     _compact(storage, session, ["r1"], "summary of r1")
 
-    changed = _remove_redacted_event_from_compaction(
-        storage,
-        session,
-        _SCOPE,
-        event_id="$other",
-        removed_live_run=False,
-    )
+    changed = _redact_compacted(storage, session, event_id="$other")
 
     assert changed is False
     assert _summary(_stored(storage)) == "summary of r1"
@@ -279,10 +283,7 @@ def test_redacting_legacy_provenance_clears_summary_and_archived_generations(
     session = _stored(storage)
     _compact(storage, session, ["r2"], "legacy summary and r2")
 
-    assert (
-        _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$legacy", removed_live_run=False)
-        is True
-    )
+    assert _redact_compacted(storage, session, event_id="$legacy") is True
 
     stored = _stored(storage)
     assert stored.runs == []
@@ -296,7 +297,7 @@ def test_removing_a_live_run_retires_a_legacy_summary(open_legacy: Callable[[Age
     storage = open_legacy(_legacy_session(["r2"], "legacy summary", []))
     session = _stored(storage)
 
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$gone", removed_live_run=True)
+    assert _redact_compacted(storage, session, event_id="$gone", removed=("gone",))
 
     stored = _stored(storage)
     assert [run.run_id for run in stored.runs or []] == ["r2"]
@@ -311,7 +312,7 @@ def test_removing_a_live_run_keeps_runs_archived_after_a_legacy_summary(
     session = _stored(storage)
     _compact(storage, session, ["r1"], "legacy summary and r1")
 
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$gone", removed_live_run=True)
+    assert _redact_compacted(storage, session, event_id="$gone", removed=("gone",))
 
     stored = _stored(storage)
     assert [run.run_id for run in stored.runs or []] == ["r2"]
@@ -329,7 +330,7 @@ def test_a_late_save_of_a_rolled_back_run_cannot_replay_it(storage: SqliteDb) ->
     session = _seed(storage, ["r1", "r2"])
     late_copy = next(run for run in session.runs or [] if run.run_id == "r1")
     _compact(storage, session, ["r1"], "summary of r1")
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r1", removed_live_run=False)
+    assert _redact_compacted(storage, session, event_id="$r1")
 
     storage.upsert_run(run=late_copy, session_id="session", user_id=None)
     reconcile_compaction_state(storage, _stored(storage), _SCOPE)
@@ -345,7 +346,7 @@ def test_a_late_save_after_a_legacy_clear_cannot_replay_the_cleared_run(
     session = _stored(storage)
     late_copy = next(run for run in session.runs or [] if run.run_id == "r1")
     _compact(storage, session, ["r1"], "legacy summary and r1")
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$legacy", removed_live_run=False)
+    assert _redact_compacted(storage, session, event_id="$legacy")
 
     storage.upsert_run(run=late_copy, session_id="session", user_id=None)
     reconcile_compaction_state(storage, _stored(storage), _SCOPE)
@@ -359,7 +360,7 @@ def test_team_redaction_without_compaction_keeps_unrelated_runs(storage: SqliteD
     update_scope_seen_event_ids(session, _SCOPE, ["$t1", "$t2", "$t3"])
     storage.upsert_session(session)
 
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$t3", removed_live_run=True)
+    assert _redact_compacted(storage, session, event_id="$t3", removed=("gone",))
 
     stored = _stored(storage)
     assert [run.run_id for run in stored.runs or []] == ["t1", "t2"]
@@ -374,7 +375,7 @@ def test_rollback_forgets_seen_ids_of_the_removed_runs(storage: SqliteDb) -> Non
     update_scope_seen_event_ids(session, _SCOPE, ["$r3"])
     storage.upsert_session(session)
 
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r2", removed_live_run=False)
+    assert _redact_compacted(storage, session, event_id="$r2")
 
     stored = _stored(storage)
     assert stored.runs == []
@@ -388,7 +389,7 @@ def test_legacy_provenance_wins_over_a_later_archive_hit(open_legacy: Callable[[
     session = _stored(storage)
     _compact(storage, session, ["r1"], "legacy summary quoting $r1, then r1")
 
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r1", removed_live_run=False)
+    assert _redact_compacted(storage, session, event_id="$r1")
 
     stored = _stored(storage)
     assert stored.summary is None
@@ -405,7 +406,7 @@ def test_a_rearchived_run_keeps_its_first_generation(storage: SqliteDb) -> None:
     )
     _compact(storage, resurrected, ["r1", "r2"], "summary mentioning r1 and r2")
 
-    assert _remove_redacted_event_from_compaction(storage, resurrected, _SCOPE, event_id="$r1", removed_live_run=False)
+    assert _redact_compacted(storage, resurrected, event_id="$r1")
 
     stored = _stored(storage)
     assert stored.summary is None
@@ -419,7 +420,7 @@ def test_refreshing_a_stale_summary_drops_the_stale_rows_seen_ids(storage: Sqlit
     _compact(storage, session, ["r2"], "summary of r1 and r2")
     stale = _stored(storage)
     update_scope_seen_event_ids(stale, _SCOPE, ["$r3"])
-    assert _remove_redacted_event_from_compaction(storage, session, _SCOPE, event_id="$r2", removed_live_run=False)
+    assert _redact_compacted(storage, session, event_id="$r2")
 
     storage.upsert_session(stale)
     reconciled = _stored(storage)
@@ -844,6 +845,25 @@ def test_removing_an_older_resumed_run_archived_after_its_fold_keeps_only_the_ru
         assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$p",)) is True
     else:
         assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$p") is True
+
+    assert _live(storage) == ["r1"]
+    assert _summary(_stored(storage)) is None
+
+
+def test_a_rollback_that_removes_an_older_folds_position_run_also_undoes_that_fold(storage: SqliteDb) -> None:
+    """A run that folded on both sides of its pause loses its record with the later fold, so the earlier one goes too."""
+    session = _seed_runs(storage, _run("r1"), _paused("p"))
+    _fold(storage, session, "p", ["r1"], summary="first")
+    reconcile_compaction_state(storage, session, _SCOPE)
+    storage.upsert_run(run=_run("r2"), session_id="session", user_id=None)
+    _fold(storage, _stored(storage), "r2", [], summary="second")
+    resumed = _stored(storage)
+    for run in resumed.runs or []:
+        if run.run_id == "p":
+            run.status = RunStatus.completed
+    _fold(storage, resumed, "p", ["r2"], summary="third")
+
+    assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$r2") is True
 
     assert _live(storage) == ["r1"]
     assert _summary(_stored(storage)) is None
