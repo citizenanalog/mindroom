@@ -59,6 +59,8 @@ class PositionedGeneration:
     id: int
     through_run_id: str
     covered_run_ids: tuple[str, ...]
+    # Whether reconcile already archived its covered runs, which only an applied fold does.
+    archived_runs: bool
 
 
 @dataclass(frozen=True)
@@ -225,11 +227,12 @@ def record_positioned_generation(
 def positioned_generations(storage: BaseDb, *, session_id: str, scope_key: str) -> list[PositionedGeneration]:
     """Return the scope's positioned generations, oldest first."""
     db = _sqlite(storage)
-    compactions, _ = _table_names(db)
+    compactions, compacted_runs = _table_names(db)
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
         rows = connection.exec_driver_sql(
-            f"SELECT id, through_run_id, covered_run_ids FROM {compactions} "  # noqa: S608
+            f"SELECT id, through_run_id, covered_run_ids, "  # noqa: S608
+            f"EXISTS (SELECT 1 FROM {compacted_runs} WHERE compaction_id = {compactions}.id) FROM {compactions} "
             "WHERE session_id = ? AND scope_key = ? AND through_run_id IS NOT NULL ORDER BY id",
             (session_id, scope_key),
         ).fetchall()
@@ -238,26 +241,22 @@ def positioned_generations(storage: BaseDb, *, session_id: str, scope_key: str) 
             id=row[0],
             through_run_id=row[1],
             covered_run_ids=tuple(json.loads(row[2] or "[]")),
+            archived_runs=bool(row[3]),
         )
         for row in rows
     ]
 
 
 def delete_generations(storage: BaseDb, *, session_id: str, generation_ids: Collection[int]) -> None:
-    """Delete generations that never took effect, such as a fold a crash kept out of its run's record.
-
-    A generation that already archived runs took effect, so a late save of its run's older record never deletes it
-    or the runs it holds.
-    """
+    """Delete generations that never took effect, such as a fold a crash kept out of its run's record."""
     if not generation_ids:
         return
     db = _sqlite(storage)
-    compactions, compacted_runs = _table_names(db)
+    compactions, _ = _table_names(db)
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
         connection.exec_driver_sql(
-            f"DELETE FROM {compactions} WHERE session_id = ? AND id IN ({', '.join('?' for _ in generation_ids)}) "  # noqa: S608
-            f"AND NOT EXISTS (SELECT 1 FROM {compacted_runs} WHERE compaction_id = {compactions}.id)",
+            f"DELETE FROM {compactions} WHERE session_id = ? AND id IN ({', '.join('?' for _ in generation_ids)})",  # noqa: S608
             (session_id, *generation_ids),
         )
 

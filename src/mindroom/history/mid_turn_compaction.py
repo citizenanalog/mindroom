@@ -346,16 +346,31 @@ async def _compact_scope(
         # A stopped or failed reply records the run from its recorder, which must still name this fold.
         binding.turn_recorder.record_mid_turn_generation(
             commit.generation_id,
-            folded_tool_call_ids=(
-                call["id"]
-                for exchange in layout.exchanges
-                for message in exchange
-                for call in message.tool_calls or []
-                if isinstance(call.get("id"), str)
-            ),
+            folded_tool_call_ids=_folded_tool_call_ids(layout, run_response),
         )
     session.summary = SessionSummary(summary=summary, updated_at=datetime.now(UTC))
     return compaction_summary_message(summary, run_local=False)
+
+
+def _folded_tool_call_ids(layout: _Layout, run_response: RunOutput | TeamRunOutput) -> set[str]:
+    """Return the tool calls a fold summarizes: this turn's own and, for a team, every member's so far.
+
+    The whole turn folds, so each member response already attached to the run goes with its delegation.
+    """
+    call_ids = {
+        call["id"]
+        for exchange in layout.exchanges
+        for message in exchange
+        for call in message.tool_calls or []
+        if isinstance(call.get("id"), str)
+    }
+    members = list(run_response.member_responses) if isinstance(run_response, TeamRunOutput) else []
+    while members:
+        member = members.pop()
+        call_ids.update(tool.tool_call_id for tool in member.tools or [] if tool.tool_call_id)
+        if isinstance(member, TeamRunOutput):
+            members.extend(member.member_responses)
+    return call_ids
 
 
 def _uncovered_runs(

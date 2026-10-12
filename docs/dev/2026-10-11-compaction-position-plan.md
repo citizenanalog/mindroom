@@ -17,7 +17,7 @@
 
 - AGENTS.md rules apply: `LEGACY_COMPAT` markers for old-format readers, `AGNO_COMPAT` markers for private Agno access, Tach updated with imports, tests at the owning seam, failing test first, one sentence per line in Markdown.
 - Archived rows written before this release carry no `run_index`; they restore by appending in archive order, as today (`LEGACY_COMPAT`).
-- Existing archives gain the new columns idempotently when the tables are ensured; ordinary and legacy generations stay unpositioned.
+- Existing archives gain the new columns when the conversation database opens, under the open-time migration's write lock, and replies never alter the archive; ordinary and legacy generations stay unpositioned.
 - User docs do not change: the behavior a user observes is the same as the snapshot design.
 - No production branch exists only to keep an old test passing; snapshot-design tests are rewritten or deleted.
 
@@ -34,7 +34,7 @@
 ### Task 1: Archive columns and original run order
 
 **Files:**
-- Modify: `src/mindroom/history/archive_schema.py`, `src/mindroom/history/archive.py`, `src/mindroom/agno_compat_sqlite.py`
+- Modify: `src/mindroom/history/archive_schema.py`, `src/mindroom/history/archive.py`, `src/mindroom/session_storage/agno_compat_sqlite.py`
 - Test: `tests/test_history_archive.py`
 
 **Interfaces:**
@@ -75,7 +75,7 @@
 ### Task 3: Reconcile and removal through dependencies
 
 **Files:**
-- Modify: `src/mindroom/history/storage.py`, `src/mindroom/agno_compat_sqlite.py`
+- Modify: `src/mindroom/history/storage.py`, `src/mindroom/session_storage/agno_compat_sqlite.py`
 - Test: `tests/test_compaction_redaction.py`
 
 **Interfaces:**
@@ -100,7 +100,7 @@
 - Consumes: Tasks 2 and 3; `summarize_runs` for the chunk loop; `built_request_session(target, run_id)` for Agno's live session.
 - Produces: `compact_scope_mid_turn(*, storage, session, scope, resolved_inputs, covered_runs, snapshots, through_run_id, before_tokens, config, runtime_paths, compaction_lifecycle) -> CompactionOutcome | None`, which summarizes, emits hooks and notices, records usage, and commits; the hook then sets the summary on Agno's session object, rewrites the request, and records `mindroom_mid_turn_generation`; `compact_scope_history` loses `in_progress`.
 
-- [ ] **Step 1: Update the scoped tests first**: the next reply replays `[summary, position run prompt and tail]` with no summary call and its reconcile archives exactly the covered runs; the session row Agno writes at the run's end holds the new summary; a second fold covers no run twice; a resumed older run covering newer runs; a failure in any chunk leaves request and storage unchanged; a cancellation after the commit still rewrites; folded unseen thread context of a stopped run stays seen; hooks and notice counts.
+- [ ] **Step 1: Update the scoped tests first**: the next reply replays `[summary, position run prompt and tail]` with no summary call and its reconcile archives exactly the covered runs; the session row Agno writes at the run's end holds the new summary; a second fold covers no run twice; a resumed older run covering newer runs; a failure in any chunk leaves request and storage unchanged; a cancellation after the commit leaves the request and the run's record whole, and the next reconcile discards the fold; folded unseen thread context of a stopped run stays seen; hooks and notice counts.
 - [ ] **Step 2: Run** `/work/tmp/pt.sh tests/test_mid_turn_compaction.py`.
       Expected: the updated tests FAIL.
 - [ ] **Step 3: Implement** the new commit path and delete `_turn_committed`, member-run restore, snapshot archiving, and the `in_progress` plumbing.

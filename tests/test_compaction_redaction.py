@@ -878,11 +878,17 @@ def test_a_stale_save_of_a_folded_run_never_deletes_the_runs_its_fold_archived(s
     reconcile_compaction_state(storage, _stored(storage), _SCOPE)
     assert _live(storage) == ["r2"]
 
+    preserved = _stored(storage)
+    update_scope_seen_event_ids(preserved, _SCOPE, ["$team-consumed"])
+    storage.upsert_session(preserved)
     storage.upsert_run(run=stale, session_id="session", user_id=None)
-    reconcile_compaction_state(storage, _stored(storage), _SCOPE)
+    for _ in range(2):
+        reconcile_compaction_state(storage, _stored(storage), _SCOPE)
 
     assert archived_content(storage, "session") == {"r0": True, "r1": True}
     assert _summary(_stored(storage)) == "folded"
+    # The fold took effect, so reconcile leaves the session's preserved seen ids alone.
+    assert "$team-consumed" in _seen(storage, _stored(storage))
 
 
 def _answering(run_id: str, event_id: str) -> RunOutput:

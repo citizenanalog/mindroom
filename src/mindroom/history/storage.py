@@ -786,7 +786,8 @@ def _resolve_positioned_generations(
         run = live.get(generation.through_run_id)
         if run is None and generation.through_run_id not in archived:
             orphaned.add(generation.through_run_id)
-        elif run is not None and _recorded_generation(run) < generation.id:
+        # A fold that already archived runs took effect, so a late save of its run's older record never undoes it.
+        elif run is not None and _recorded_generation(run) < generation.id and not generation.archived_runs:
             unapplied.append(generation.id)
         else:
             applied.append(generation)

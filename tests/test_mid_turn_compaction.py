@@ -20,7 +20,7 @@ from agno.media import File, Image
 from agno.metrics import MessageMetrics
 from agno.models.anthropic import Claude
 from agno.models.message import Message
-from agno.models.response import ModelResponse
+from agno.models.response import ModelResponse, ToolExecution
 from agno.run.agent import RunInput, RunOutput
 from agno.run.base import RunStatus
 from agno.run.team import TeamRunOutput
@@ -2275,3 +2275,29 @@ async def test_parallel_delegations_to_one_member_both_compact(tmp_path: Path, s
             if name == task and any(is_compaction_summary(m) for m in messages)
         ]
         assert compacted, task
+
+
+def test_a_team_fold_summarizes_the_tool_calls_of_the_members_it_delegated_to() -> None:
+    """A stopped team reply drops the member tools a fold already covered, including a nested team's."""
+    delegation = Message(
+        role="assistant",
+        tool_calls=[{"id": "delegate", "type": "function", "function": {"name": "delegate_task_to_member"}}],
+    )
+    layout = mid_turn_compaction._Layout(
+        leading=0,
+        kept=(),
+        history=(),
+        exchanges=((delegation, Message(role="tool", tool_call_id="delegate", content="done")),),
+        prompt=None,
+        previous_run_local_summary=None,
+    )
+    nested = TeamRunOutput(
+        run_id="nested",
+        member_responses=[RunOutput(run_id="deep", tools=[ToolExecution(tool_call_id="deep-call")])],
+    )
+    run_response = TeamRunOutput(
+        run_id="team",
+        member_responses=[RunOutput(run_id="member", tools=[ToolExecution(tool_call_id="member-call")]), nested],
+    )
+
+    assert mid_turn_compaction._folded_tool_call_ids(layout, run_response) == {"delegate", "member-call", "deep-call"}
