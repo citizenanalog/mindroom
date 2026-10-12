@@ -188,7 +188,7 @@ def save_user_service(
 
     Raises UserServiceConflictError when `config_services` has the name, and ValueError for an invalid name, a
     service that sets `oauth_on_shared_workers`, an OAuth provider (a preset's included) that the registry does not
-    know, that a shared or unscoped agent would use, or whose token a rule would send off its presets' hosts, a
+    know, that a shared or unscoped agent would use, or whose token a rule would send off its provider's preset hosts, a
     placeholder user services may not set, a service with more than 50 rules or over 16 KiB, a 51st service in the
     scope, or a scope document over 256 KiB.
     """

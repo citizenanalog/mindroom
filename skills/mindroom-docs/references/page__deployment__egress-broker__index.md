@@ -354,7 +354,8 @@ When the id is not in MindRoom's OAuth registry (for example a plugin provider t
 ### Personal accounts and shared sandboxes
 
 A requester's own GitHub or Atlassian account is safe to use only in a sandbox that belongs to that requester.
-That is an agent with worker scope `user` or `user_agent` on a dedicated worker backend (`MINDROOM_WORKER_BACKEND` set to `docker` or `kubernetes`), where each requester's commands run in their own worker, and the agent is `private` when other requesters' files must stay out of those commands (see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents)).
+That is an agent with worker scope `user` or `user_agent` on a dedicated worker backend (`MINDROOM_WORKER_BACKEND` set to `docker` or `kubernetes`), where each requester's commands run in their own worker.
+When other requesters' files must also stay out of those commands, the agent must be `private`; its `private.per` then sets the worker scope (see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents)).
 
 Every other sandbox is shared:
 
@@ -372,7 +373,7 @@ So in a shared sandbox the broker does not use requester-scoped accounts at all:
 - Both texts show on the personal page and in the "API keys and accounts" section of each agent on the Connections portal. The dashboard panel only lists shared and unscoped agents, so it always reads "... Add a team API key instead.", because an administrator manages every key there. None of them offers **Connect** there.
 - The [`egress_credentials` tool](#agent-tool) reports such a service as not configured and not connectable.
 
-Give those agents an API key instead, or run the agents whose users need their own account with worker scope `user` or `user_agent` on the Docker or Kubernetes worker backend.
+Give those agents an API key instead, or run the agents whose users need their own account with worker scope `user` or `user_agent` on the Docker or Kubernetes worker backend, and make them `private` if other requesters can use them (see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents)).
 The Google providers are not affected: their connection on a shared agent is the agent's own, maintained by its credential managers.
 
 An operator who accepts the risk can set `oauth_on_shared_workers: true` on the service.
@@ -385,8 +386,9 @@ Use it only where everyone who can use the agent may act with each other's accou
 A worker per requester does not keep requesters apart.
 On a `user` or `user_agent` agent that is not `private`, every requester works in the same agent workspace.
 A file one requester leaves there, such as `.mindroom/worker-env.sh`, can run in another requester's commands, and it then runs with that requester's broker access.
-So another requester's code can use (not read) that requester's connected accounts and personal keys.
+So another requester's code can use that requester's connected accounts and personal keys, but not read them, as long as none of the hosts those services reach echo requests (see [Hosts that echo requests](#what-the-broker-cannot-protect-against)).
 When requesters need to be kept apart, make the agent `private`, so that each requester gets a workspace root of their own. Set `private.per` to `user` or `user_agent` instead of `worker_scope`, because the two cannot both be set (see [Private Instances](https://docs.mindroom.chat/configuration/agents/#private-instances)).
+Connected accounts and personal keys belong to the requester, not to one agent: GitHub and Atlassian accounts are stored at scope `user` whichever agent uses them, and `user` keys are shared by all of that requester's `user` agents. So every personal (`user` or `user_agent`) agent that other requesters can use must be `private` for those accounts to stay out of other requesters' code, not only the agent that seems most sensitive.
 
 ## Secret management
 
@@ -1117,12 +1119,12 @@ The broker keeps keys out of worker code.
 It cannot help where the code runs outside a worker, where the configuration or the remote host gives a key away, or where the key itself is too powerful.
 Each of these is a choice you make, so make it on purpose.
 
-- **Code in the primary process.** An agent whose code runs in the primary process can read every stored key and token. That is the case when no sandbox runner or dedicated worker is configured, so tools run in the primary process (the default when `MINDROOM_SANDBOX_PROXY_URL` is unset), with `worker_tools: []`, and with primary-only tools such as `duckdb`, `pandas`, `sql`, and `script`. Path tools that run in the primary process, such as `attachments` or `gmail`, can also open any file the primary can reach under `file_access: unrestricted`. Use a dedicated worker backend or a sandbox runner, keep `file_access` at `workspace`, and keep such tools off agents that should not see secrets.
+- **Code in the primary process.** An agent whose code runs in the primary process can read every stored key and token. That is the case when no sandbox runner or dedicated worker is configured, so tools run in the primary process (the default when `MINDROOM_SANDBOX_PROXY_URL` is unset), with `MINDROOM_SANDBOX_EXECUTION_MODE` set to `off`, `local`, or `disabled`, with a `MINDROOM_SANDBOX_PROXY_TOOLS` list that leaves a tool out (unless the mode is `all`), with `worker_tools: []`, and with primary-only tools such as `duckdb`, `pandas`, `sql`, and `script`. Path tools that run in the primary process, such as `attachments` or `gmail`, can also open any file the primary can reach under `file_access: unrestricted`. Use a dedicated worker backend or a sandbox runner, keep `file_access` at `workspace`, and keep such tools off agents that should not see secrets.
 - **Write access to the configuration.** `config_manager`, and any other way to write the `egress_broker` config, can point a service at another host, and the broker then sends that service's key there. Give config write access only to people and agents you would trust with every key.
 - **Hosts that echo requests.** A host that sends the request back to the caller, such as a debug page or an error message with the full URL, hands the injected key to the agent. The broker refuses `TRACE` and `TRACK`, which exist to do this, but it cannot see what other pages do. Prefer header or bearer auth over query-parameter keys, and add keys only for hosts you trust not to echo them.
 - **Wildcard rules on shared hosting domains.** A rule such as `*.github.io`, `*.vercel.app`, or `*.workers.dev` sends the key to every tenant on that domain, including a page that someone else publishes there. Name exact hosts instead.
 - **Keys that can create other keys.** With an admin token or a deploy-key API, the agent can ask the service for a new working key and keep it, and that key no longer needs the broker. Store the least powerful key that works.
-- **Shared workspaces.** On a `user` or `user_agent` agent that is not `private`, one requester's files can run in another requester's commands and use that requester's accounts and keys. Make such agents `private` when requesters need isolation (`private.per` replaces `worker_scope`); see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents).
+- **Shared workspaces.** On a `user` or `user_agent` agent that is not `private`, one requester's files can run in another requester's commands and use that requester's accounts and keys. Make such agents `private` when requesters need isolation (`private.per` replaces `worker_scope`). Accounts and personal keys belong to the requester, so every personal agent that other requesters can use must be `private`, not only the most sensitive one; see [Shared workspaces on non-private agents](#shared-workspaces-on-non-private-agents).
 
 ## Limitations
 
@@ -1132,7 +1134,7 @@ The broker has these known limits in the initial release:
 - **Service accounts are not injected:** a Google provider served by `GOOGLE_SERVICE_ACCOUNT_FILE` cannot supply the broker's secret, so such a service needs an API key.
 - **No body or websocket frame substitutions:** the broker injects into headers and query parameters only; path, body, and websocket frame substitutions planned for a later release.
 - **Background-script workers not yet covered:** the broker environment reaches dedicated Docker and Kubernetes workers and the static runner; background-script workers are not yet wired.
-- **Shared static runner is not an isolation boundary:** a scoped call's token lives in a process shared with other users' calls, valid for the token TTL, so keep the TTL short where that matters and use dedicated `user` or `user_agent` workers for isolation. A dedicated `shared` or unscoped worker does not isolate requesters either. For the same reason personal GitHub and Atlassian accounts are not used on the static runner unless the service sets `oauth_on_shared_workers`.
+- **Shared static runner is not an isolation boundary:** a scoped call's token lives in a process shared with other users' calls, valid for the token TTL, so keep the TTL short where that matters and use dedicated `user` or `user_agent` workers on `private` agents for isolation. A dedicated `shared` or unscoped worker does not isolate requesters either. For the same reason personal GitHub and Atlassian accounts are not used on the static runner unless the service sets `oauth_on_shared_workers`.
 - **Streamed request bodies:** the broker forwards a valid request head to the right upstream before it has read the body, so a body that turns out to be invalid or over the limit gets 400 or 413 after the upstream has already seen the head. The upstream then sees a partial request and a reset, and the head carries the injected secret to the host the request was routed to, as any request would.
 - **Not yet independently reviewed:** the transport code was tested with a smuggling corpus and property-based fuzzing, but no human or automated adversarial review of it has been done; see [Testing and review](https://docs.mindroom.chat/architecture/security-posture/#testing-and-review-of-the-egress-broker).
 - **Broker approvals stay with Squid:** the broker does not enforce approved-egress grants itself; in the Kubernetes chain Squid does, and the broker takes Agent Vault's place as its parent.
