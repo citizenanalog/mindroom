@@ -275,20 +275,23 @@ def _write_ca_files(
     ca_key: ec.EllipticCurvePrivateKey,
     key_password: bytes | None,
 ) -> bytes:
-    """Write the certificate with mode 0644 and the PKCS8 key with mode 0600; return the certificate PEM."""
-    cert_pem_bytes = ca_cert.public_bytes(serialization.Encoding.PEM)
-    cert_path.write_bytes(cert_pem_bytes)
-    cert_path.chmod(0o644)
+    """Atomically publish the certificate with mode 0644, then the PKCS8 key with mode 0600; return the certificate PEM.
 
+    Both paths name files in the same directory, which is opened once, as for the token key.
+    """
+    cert_pem_bytes = ca_cert.public_bytes(serialization.Encoding.PEM)
     encryption = serialization.BestAvailableEncryption(key_password) if key_password else serialization.NoEncryption()
     key_pem_bytes = ca_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=encryption,
     )
-    key_path.touch(mode=0o600)
-    key_path.write_bytes(key_pem_bytes)
-    key_path.chmod(0o600)
+    directory_fd = os.open(cert_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for path, content, mode in ((cert_path, cert_pem_bytes, 0o644), (key_path, key_pem_bytes, 0o600)):
+            atomic_write_bytes_at(directory_fd, path.name, content, file_mode=mode, temp_prefix=f".{path.name}.")
+    finally:
+        os.close(directory_fd)
     return cert_pem_bytes
 
 
