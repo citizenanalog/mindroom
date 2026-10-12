@@ -333,21 +333,32 @@ describe("egress services on the personal page", () => {
 
   const personal = () => screen.findByRole("region", { name: "Personal Mind" });
   const writes = () => calls.filter((call) => call.method !== "GET");
-
-  it("adds a service and reloads the listing", async () => {
-    render(<EgressCredentials />);
+  const openAdd = async () => {
     fireEvent.click(
       within(await personal()).getByRole("button", {
         name: "Add service for Personal Mind",
       }),
     );
     await presetsReady();
+  };
+  const fill = (name: string, preset: string) => {
     fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "gh" },
+      target: { value: name },
     });
     fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
+      target: { value: preset },
     });
+  };
+  const trySaving = async () => {
+    await openAdd();
+    fill("x", "openai");
+    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+  };
+
+  it("adds a service and reloads the listing", async () => {
+    render(<EgressCredentials />);
+    await openAdd();
+    fill("gh", "github");
     listing[0].services = [
       ...listing[0].services,
       { ...userService, name: "gh", display_name: "GitHub work" },
@@ -366,21 +377,8 @@ describe("egress services on the personal page", () => {
   });
 
   describe("with the key in the same step", () => {
-    const openAdd = async () => {
-      fireEvent.click(
-        within(await personal()).getByRole("button", {
-          name: "Add service for Personal Mind",
-        }),
-      );
-      await presetsReady();
-    };
     const fillOpenAi = (key: string) => {
-      fireEvent.change(screen.getByLabelText("Name"), {
-        target: { value: "ai" },
-      });
-      fireEvent.change(screen.getByLabelText("Preset"), {
-        target: { value: "openai" },
-      });
+      fill("ai", "openai");
       if (key)
         fireEvent.change(screen.getByLabelText("API key"), {
           target: { value: key },
@@ -479,15 +477,6 @@ describe("egress services on the personal page", () => {
   });
 
   describe("the editor's notes", () => {
-    const openAdd = async () => {
-      fireEvent.click(
-        within(await personal()).getByRole("button", {
-          name: "Add service for Personal Mind",
-        }),
-      );
-      await presetsReady();
-    };
-
     it("warns about a placeholder an administrator's service also sets", async () => {
       listing[0].services = [
         {
@@ -557,18 +546,8 @@ describe("egress services on the personal page", () => {
 
   it("refuses a name that is already listed before asking the server", async () => {
     render(<EgressCredentials />);
-    fireEvent.click(
-      within(await personal()).getByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "mine" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
+    await openAdd();
+    fill("mine", "openai");
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     expect(screen.getByLabelText("Name")).toHaveAccessibleDescription(
       /A service named mine already exists/,
@@ -578,12 +557,7 @@ describe("egress services on the personal page", () => {
 
   it("closes the editor on cancel", async () => {
     render(<EgressCredentials />);
-    fireEvent.click(
-      within(await personal()).getByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
+    await openAdd();
     expect(
       screen.getByRole("form", { name: "Add service" }),
     ).toBeInTheDocument();
@@ -776,18 +750,8 @@ describe("egress services on the personal page", () => {
       },
     ];
     render(<EgressCredentials />);
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "gh" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    await openAdd();
+    fill("gh", "github");
     fireEvent.click(screen.getByRole("button", { name: "Save service" }));
     await waitFor(() => expect(writes()).toHaveLength(1));
     expect(writes()[0].body).toEqual({
@@ -797,18 +761,8 @@ describe("egress services on the personal page", () => {
   });
 
   const limitToRepository = async () => {
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "limited" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
+    await openAdd();
+    fill("limited", "github");
     fireEvent.change(screen.getByLabelText("GitHub repositories"), {
       target: { value: "o/r" },
     });
@@ -855,12 +809,7 @@ describe("egress services on the personal page", () => {
     async (change, audience) => {
       listing[0] = { ...listing[0], ...change };
       render(<EgressCredentials />);
-      fireEvent.click(
-        await screen.findByRole("button", {
-          name: "Add service for Personal Mind",
-        }),
-      );
-      await presetsReady();
+      await openAdd();
       fireEvent.click(screen.getByRole("button", { name: "More options" }));
       expect(
         screen
@@ -872,75 +821,47 @@ describe("egress services on the personal page", () => {
     },
   );
 
-  it("shows a name conflict from the server", async () => {
-    mutation = () =>
-      json(
-        {
-          detail:
-            "service name 'gh' is already used by a service your administrator configured",
-        },
-        409,
-      );
-    render(<EgressCredentials />);
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "gh" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "github" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+  it.each([
+    [
+      "shows a name conflict from the server",
+      409,
+      {
+        detail:
+          "service name 'x' is already used by a service your administrator configured",
+      },
       "already used by a service your administrator configured",
-    );
-    // The editor stays open with the user's input.
-    expect(screen.getByLabelText("Name")).toHaveValue("gh");
-  });
-
-  it("shows the size cap from the server", async () => {
-    mutation = () => json({ detail: "A service can take at most 16 KiB" }, 413);
-    render(<EgressCredentials />);
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "big" },
-    });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    ],
+    [
+      "shows the size cap from the server",
+      413,
+      { detail: "A service can take at most 16 KiB" },
       "A service can take at most 16 KiB",
-    );
-  });
-
-  it("shows a validation message sent as a string", async () => {
-    mutation = () =>
-      json({ detail: "rules.0.host: host must not contain scheme" }, 422);
-    render(<EgressCredentials />);
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "x" } });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    ],
+    [
+      "shows a validation message sent as a string",
+      422,
+      { detail: "rules.0.host: host must not contain scheme" },
       "rules.0.host: host must not contain scheme",
-    );
+    ],
+    [
+      "shows why the server refused a write",
+      403,
+      { detail: "Credential management is required" },
+      "Credential management is required",
+    ],
+    [
+      "falls back to a general message for a refusal without a reason",
+      403,
+      {},
+      "You are not allowed to change the services of this agent.",
+    ],
+  ])("%s", async (_title, status, body, alert) => {
+    mutation = () => json(body, status);
+    render(<EgressCredentials />);
+    await trySaving();
+    expect(await screen.findByRole("alert")).toHaveTextContent(alert);
+    // The editor stays open with the user's input.
+    expect(screen.getByLabelText("Name")).toHaveValue("x");
   });
 
   it("shows a validation message sent as FastAPI's list without echoing the input", async () => {
@@ -960,54 +881,12 @@ describe("egress services on the personal page", () => {
         422,
       );
     render(<EgressCredentials />);
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "x" } });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
+    await trySaving();
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
       "rules.0.host: Input should be a valid string; Field required",
     );
     expect(alert).not.toHaveTextContent("SECRET-INPUT");
-  });
-
-  const trySaving = async () => {
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Add service for Personal Mind",
-      }),
-    );
-    await presetsReady();
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "x" } });
-    fireEvent.change(screen.getByLabelText("Preset"), {
-      target: { value: "openai" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save service" }));
-  };
-
-  it("shows why the server refused a write", async () => {
-    mutation = () => json({ detail: "Credential management is required" }, 403);
-    render(<EgressCredentials />);
-    await trySaving();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Credential management is required",
-    );
-  });
-
-  it("falls back to a general message for a refusal without a reason", async () => {
-    mutation = () => json({}, 403);
-    render(<EgressCredentials />);
-    await trySaving();
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "You are not allowed to change the services of this agent.",
-    );
   });
 
   it("explains when a service to edit cannot be loaded", async () => {
