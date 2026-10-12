@@ -878,11 +878,11 @@ Leave `approvedEgress.parentProxy.host` at its default in this setup, because th
 
 `egressBroker.enabled` requires `workers.backend=kubernetes`, and `egressBroker.port` must differ from `runtime.apiPort` and `scriptGateway.port`.
 It cannot be combined with `workers.kubernetes.agentVault`.
-To migrate from Agent Vault:
+To migrate from Agent Vault, switch in one upgrade and have users enter their keys afterwards, because keys can only be entered once the broker is on and Agent Vault's secrets do not carry over:
 
 1. Add the services to the deployment's `config.yaml` under `egress_broker.services`.
-2. Have users and credential managers enter secrets on `/connections/egress` or the dashboard while Agent Vault still serves traffic. The personal page needs trusted upstream auth with JWT; without it only the dashboard can manage secrets.
-3. Run one `helm upgrade` with `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`. If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in that upgrade.
+2. Run one `helm upgrade` with `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`. If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in that upgrade.
+3. Have users and credential managers enter secrets on `/connections/egress` or the dashboard. Until they do, brokered calls answer 403 `credential_not_configured` with a message that says where to add the key. The personal page needs trusted upstream auth with JWT; without it only the dashboard can manage secrets.
 4. Verify with brokered calls from real workers, then delete the Agent Vault bootstrap Secret and PVC after a grace period.
 The broker connects directly from the primary pod, unless the primary's `HTTPS_PROXY`/`NO_PROXY` routes it through an operator proxy.
 If `networkPolicy.extraEgress` restricts the primary, allow TCP 80 and 443 to public addresses yourself, because the chart cannot infer that rule.

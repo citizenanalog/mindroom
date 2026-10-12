@@ -224,7 +224,7 @@ Two parties can restrict a host, and a path must pass every party's restriction:
 - **The requester.** When one of the requester's own [user services](#user-services) that has a rule for the host and port sets `restrict_to_rules`, the path must match a rule of one of their user services on that host and port.
 
 A rule bound to another port never restricts this one.
-A path that passes both checks picks its credential by the most specific rule over the config and user services, in the matching order given above (exact host, specific port, longest path prefix, then service name), and a path that matches no rule is forwarded without credentials.
+A path that passes both checks picks its credential by the most specific rule over the config and user services, in the matching order given above (exact host, specific port, longest path prefix, then config services before user services, then service name), and a path that matches no rule is forwarded without credentials.
 Rules of `restrict_only` services take part in the checks but are never considered for the credential (see [Limiting in place](#limiting-in-place)).
 The 403 body names the restricting service in `service` (the restricting service whose name sorts first, of the party whose check failed) and the place to change it in `manage_url`, and its message names that service by its display name and says who can change it; see [Error responses](#error-responses).
 
@@ -564,14 +564,15 @@ The routes that name an agent answer 404 for an unknown agent and for one the ca
 | `/api/connections/egress/agents/<agent>/services/<name>` | PUT | Create or replace one of the scope's own services; the body has the fields of a [config service](#custom-services) except `oauth_on_shared_workers`. 204; 403 for a user who cannot manage services there; 409 when a config service has the name; 413 for a body over 16 KiB; 422 with a string detail for a body that is not a JSON object, an invalid service, or one of the caps and rules in [User services](#user-services) |
 | `/api/connections/egress/agents/<agent>/services/<name>` | DELETE | Delete one of the scope's own services together with its key, or an [inactive entry](#user-services) of either reason (a shadowed entry keeps the key, which the config service uses). 204; 403 as for PUT; 404 when the scope has no such entry; 409 for the name of a config service that has no entry of its own |
 
-**The Connections identity route.** `GET /api/connections/me` returns `{"matrix_user_id": "...", "email": "..." or null, "is_administrator": true or false}` for the signed-in user.
+**The Connections identity route.** `GET /api/connections/me` returns `{"matrix_user_id": "...", "email": "..." or null, "is_administrator": true or false, "egress_enabled": true or false}` for the signed-in user, where `egress_enabled` says whether the broker is on, so the pages link the Agent Keys page only then.
 It works for any signed user, with or without agents, and with or without `MINDROOM_CONNECTIONS_AGENT`, because both Connections pages use it for their header.
 It needs the same signed Matrix identity as the other personal routes, rejects any query parameter with 400, and sends no-store headers.
 
 The portal's catalog, `/api/connections`, lists the same egress rows as the personal listing, so each row there has `source`, `rules`, and `placeholder_names` too.
-An agent's `egress_services` there is a list, empty when the agent has no services, for every agent the user may use for egress, and `null` for any other agent, so the portal links **Manage services** exactly for the first kind.
+While the broker is on, an agent's `egress_services` there is a list, empty when the agent has no services, for every agent the user may use for egress, and `null` for any other agent, so the portal links **Manage services** exactly for the first kind.
+While the broker is off, `egress_services` is `null` for every agent.
 Agents in the catalog follow config declaration order, with no agent placed first.
-Each agent in the catalog carries `managers` (the same list as the personal listing: a shared or unscoped agent's credential managers, `[]` otherwise), and each service in its `services` carries `connected`: what the status route would report to the viewer, read without refreshing the token, and `false` when the state cannot be read. The Connections summary uses it to count accounts before an agent is opened.
+Each agent in the catalog carries `managers` (the same list as the personal listing: a shared or unscoped agent's credential managers, `[]` otherwise; while the broker is off, it is filled only when the agent has an account the user cannot change), and each service in its `services` carries `connected`: what the status route would report to the viewer, read without refreshing the token, and `false` when the state cannot be read. The Connections summary uses it to count accounts before an agent is opened.
 
 ## User services
 
@@ -736,7 +737,7 @@ Both need [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-
 
 **Identity and navigation.** Both pages show "Signed in as {matrix_user_id}" and link to each other, as "Agents" (`/connections`) and "Agent Keys" (`/connections/egress`).
 Administrators also get a "Dashboard" link to `/`.
-The identity comes from `GET /api/connections/me`; when that request fails, the links stay and the identity line is left out.
+The identity comes from `GET /api/connections/me`; when that request fails, the identity line and the "Dashboard" link are left out, and the portal also leaves out the "Agent Keys" link.
 With the portal enabled (`MINDROOM_CONNECTIONS_AGENT` set), a user who is not an administrator and opens a dashboard page is redirected to `/connections?notice=admin-only`, which says why (see [Connecting an account](#connecting-an-account)).
 
 **Intro.** The personal page opens with one line: "Connect accounts or add API keys; MindRoom adds them to your agents' requests and your agents never get the keys themselves." A **How this works** disclosure under it (a button that expands in place) holds the full text: "Connect an account or paste an API key for the services below, or add a service of your own. MindRoom stores them and adds them to your agents' requests to the matching websites. Your agents never get the keys themselves, but a website can send a key back in its response (an echo service does), so only add keys for sites you trust. Saved keys cannot be read back."
@@ -805,7 +806,7 @@ The table shows the newest 10, with **Show all ({n})** to list every loaded row 
 Codes wrap after an underscore and never clip, on this table and on the dashboard's.
 A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)" in its service cell, and the table's caption says "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown."
 On a shared or unscoped agent the caption says "Administrators and this agent's credential managers can also see these requests (method, host, and path).", and to its managers "Requests from everyone who uses this agent are shown." instead of the last sentence.
-While the broker is off, the table shows the server's "Egress broker is not running" message.
+While the broker is not running, the table shows the server's "Egress broker is not running" message.
 
 ## Agent tool
 
@@ -1084,26 +1085,29 @@ The following are tested and intentional:
 ## Migrating from Agent Vault
 
 If you are currently using Agent Vault (the Go-based proxy fork) on the LXC host or in a Kubernetes deployment, follow these steps to migrate to the native broker.
+A deployment uses either Agent Vault or Agent Keys, never both, so the switch is one change that turns the broker on and Agent Vault off.
+Keys can only be entered once the broker is on, and the secrets stored in Agent Vault do not carry over, so users enter their keys after the switch.
+Until they do, a brokered call answers 403 `credential_not_configured`, and its message says where to add the key.
 
 ### LXC (Docker workers)
+
+Apply steps 1 to 5 as one change, so Agent Vault stops serving when the broker starts:
 
 1. Add the egress broker environment variables to the MindRoom service configuration (such as `optional/mindroom-runtime-services.nix`), set `MINDROOM_EGRESS_BROKER_PORT=8768`, `MINDROOM_EGRESS_BROKER_HOST=0.0.0.0`, `MINDROOM_EGRESS_BROKER_URL=http://host.docker.internal:8768`.
 2. Open port 8768 on `docker0` in the host firewall configuration (such as `hosts/mindroom/networking.nix`).
 3. Rebuild the worker image from the updated checkout so workers install the broker's CA: `cd /srv/mindroom && docker build -t mindroom:dev -f local/instances/deploy/Dockerfile.mindroom .`
 4. Add the `github` service (or other services you use) to `~/.mindroom-chat/config.yaml` under `egress_broker.services`, for example `github: {preset: github}`.
-5. Set the secrets or connect accounts in the dashboard's **Agent Keys** panel on the Credentials page. The personal egress page needs trusted upstream auth with JWT, which a lab host without an upstream proxy does not have.
-6. Verify the broker works by running a worker command that uses a brokered service (such as `gh pr list` or `git clone` of a private repository) and checking that the request succeeds, the audit log records it, and the worker environment and workspace contain no trace of the token.
-7. Remove the `agent-vault-bridge` plugin from config.
+5. Remove the `agent-vault-bridge` plugin from config.
+6. Set the secrets or connect accounts in the dashboard's **Agent Keys** panel on the Credentials page. The personal egress page needs trusted upstream auth with JWT, which a lab host without an upstream proxy does not have.
+7. Verify the broker works by running a worker command that uses a brokered service (such as `gh pr list` or `git clone` of a private repository) and checking that the request succeeds, the audit log records it, and the worker environment and workspace contain no trace of the token.
 8. Remove the Agent Vault CA pin from the NixOS configuration.
 9. Stop the `agent-vault` compose stack on the `nas` host after a grace period.
 
 ### Kubernetes
 
-Services config and secret management work while the broker is disabled, so move secrets over before the cutover:
-
 1. Add the services to the deployment's `config.yaml` under `egress_broker.services`.
-2. Have users and credential managers enter their secrets on `/connections/egress` or the dashboard while Agent Vault still serves traffic.
-3. Run one `helm upgrade` that sets `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`. The chart refuses both being on at once. If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in the same upgrade.
+2. Run one `helm upgrade` that sets `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`. The chart refuses both being on at once. If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in the same upgrade.
+3. Have users and credential managers enter their keys or connect their accounts on `/connections/egress` or the dashboard.
 4. Verify against real workers: a brokered call succeeds, the audit log records it, and `env` and `/proc/self/environ` hold only the placeholder values and the per-call proxy token, never a secret. Replaying the proxy URL after the token TTL returns 407.
 5. Delete the Agent Vault bootstrap Secret and PVC after a grace period.
 
