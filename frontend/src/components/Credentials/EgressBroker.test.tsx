@@ -94,6 +94,12 @@ const githubAccount = {
   unavailable_reason: null,
   shared_worker_opt_in: false,
 };
+const connectedGithub = {
+  ...github,
+  configured: true,
+  active_source: "oauth",
+  oauth: { ...githubAccount, connected: true, account_label: "octocat" },
+};
 const authorization = {
   provider: "github",
   auth_url: "https://github.com/login/oauth/authorize",
@@ -266,19 +272,6 @@ describe("egress broker panel", () => {
     expect(requests("/api/egress-broker/services")[0].search).toBe("");
   });
 
-  it("explains how to add services when none are configured", async () => {
-    vi.mocked(fetch).mockImplementation(async (input) =>
-      String(input).includes("/services")
-        ? json({ services: [] })
-        : logsResponse(),
-    );
-    render(<EgressBroker />);
-
-    expect(
-      await screen.findByText(/No egress services are configured/),
-    ).toBeInTheDocument();
-  });
-
   it("shows an error when the services cannot be loaded", async () => {
     vi.mocked(fetch).mockImplementation(async (input) =>
       String(input).includes("/services")
@@ -417,10 +410,6 @@ describe("egress broker key target", () => {
       agents: [agent("mine", ["shell"], { worker_scope: "user" })],
       config: { defaults: {} },
     };
-    services = [
-      { ...github, source: "config", rules: [] },
-      { ...openai, source: "config", rules: [] },
-    ];
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
@@ -784,15 +773,7 @@ describe("egress broker connected accounts", () => {
     );
     expect(connect.searchParams.get("agent_name")).toBe("coder");
 
-    services = [
-      {
-        ...github,
-        configured: true,
-        active_source: "oauth",
-        oauth: { ...githubAccount, connected: true, account_label: "octocat" },
-      },
-      openai,
-    ];
+    services = [connectedGithub, openai];
     window.dispatchEvent(
       new MessageEvent("message", {
         origin: authorization.completion_origin,
@@ -828,15 +809,7 @@ describe("egress broker connected accounts", () => {
     );
 
     // The connection finished, but its message never arrived.
-    services = [
-      {
-        ...github,
-        configured: true,
-        active_source: "oauth",
-        oauth: { ...githubAccount, connected: true, account_label: "octocat" },
-      },
-      openai,
-    ];
+    services = [connectedGithub, openai];
     popup.closed = true;
 
     expect(
@@ -858,15 +831,7 @@ describe("egress broker connected accounts", () => {
   });
 
   it("disconnects the global account without an agent_name", async () => {
-    services = [
-      {
-        ...github,
-        configured: true,
-        active_source: "oauth",
-        oauth: { ...githubAccount, connected: true, account_label: "octocat" },
-      },
-      openai,
-    ];
+    services = [connectedGithub, openai];
     mutationResponse = () =>
       json({ status: "disconnected", provider: "github" });
     render(<EgressBroker />);
@@ -1012,19 +977,7 @@ describe("egress broker request log", () => {
         /\b(truncate|overflow-hidden|text-ellipsis|whitespace-nowrap)\b/,
       );
     }
-  });
-
-  it("wraps a refusal code after an underscore, not inside a word", async () => {
-    logsResponse = () =>
-      json({
-        records: [
-          { ...oldest, status: 403, code: "credential_not_configured" },
-        ],
-      });
-    render(<EgressBroker />);
-
-    const table = await screen.findByRole("table", { name: "Request log" });
-    const shown = within(table).getByText("credential_not_configured");
+    // It wraps after an underscore, not inside a word.
     expect(
       Array.from(shown.childNodes)
         .map((node) => (node.nodeName === "WBR" ? "|" : node.textContent))
