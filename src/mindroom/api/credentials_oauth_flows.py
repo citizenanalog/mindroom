@@ -34,7 +34,6 @@ class _PendingOAuthState:
     payload: dict[str, str] | None
     code_verifier: str | None
     token_url: str | None
-    opener_origin: str | None = None
 
 
 def issue_pending_oauth_state(
