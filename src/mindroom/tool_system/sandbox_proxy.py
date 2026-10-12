@@ -13,7 +13,7 @@ import os
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -22,6 +22,7 @@ import httpx
 from mindroom.agent_cli.shell_contract import current_agent_cli_shell_env
 from mindroom.config.worker_projection import worker_config_data
 from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, RETAINED_MEDIA_MAX_BYTES, build_execution_tool_env
+from mindroom.egress_broker.env import egress_broker_enabled
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement, declare_tool_schema_source
 from mindroom.tool_system.registry_state import TOOL_METADATA
@@ -921,47 +922,6 @@ def primary_owns_tool_settings(tool_name: str, *, runtime_paths: RuntimePaths) -
     return tool_name in TOOL_METADATA and not sandbox_proxy_config(runtime_paths).runner_mode
 
 
-def _egress_broker_env(
-    runtime_paths: RuntimePaths,
-    *,
-    config: Config | None,
-    worker_target: ResolvedWorkerTarget | None,
-    routed_worker_key: object,
-    call_env: dict[str, str] | None,
-) -> dict[str, str]:
-    """Return the egress broker env for one shell or python call routed to a worker.
-
-    An unscoped target has no worker key of its own. Its token names the dedicated worker this call was routed
-    to, or on the shared static runner the unscoped key a dedicated backend would give the agent.
-    """
-    # Deferred: the broker loads h11 and its TLS stack, which the slim tool registry must not import.
-    from mindroom.egress_broker.service import execution_env_for_worker  # noqa: PLC0415
-
-    if worker_target is not None and worker_target.worker_scope is None and worker_target.worker_key is None:
-        worker_key = routed_worker_key if isinstance(routed_worker_key, str) else _unscoped_worker_key(worker_target)
-        if worker_key is not None:
-            worker_target = replace(worker_target, worker_key=worker_key)
-    return execution_env_for_worker(
-        runtime_paths,
-        config=config,
-        worker_target=worker_target,
-        call_env=call_env,
-    )
-
-
-def _unscoped_worker_key(worker_target: ResolvedWorkerTarget) -> str | None:
-    identity = worker_target.execution_identity
-    agent_name = worker_target.routing_agent_name or (identity.agent_name if identity is not None else None)
-    if agent_name is None:
-        return None
-    return resolve_unscoped_worker_key(
-        agent_name=agent_name,
-        execution_identity=identity,
-        tenant_id=worker_target.tenant_id,
-        account_id=worker_target.account_id,
-    )
-
-
 def _call_proxy_sync(
     *,
     runtime_paths: RuntimePaths,
@@ -1028,16 +988,20 @@ def _call_proxy_sync(
         if tool_name == "shell" and (cli_env := current_agent_cli_shell_env()) is not None:
             # A minimal response's grant travels with each command to the agent's own worker.
             execution_env = {**(execution_env or {}), **cli_env.env()}
-        if tool_name in EXECUTION_ENV_TOOL_NAMES and (
-            broker_env := _egress_broker_env(
-                runtime_paths,
-                config=manager_context.runtime_config,
-                worker_target=worker_target,
-                routed_worker_key=worker_payload.get("worker_key"),
-                call_env=execution_env,
-            )
-        ):
-            execution_env = {**(execution_env or {}), **broker_env}
+        if tool_name in EXECUTION_ENV_TOOL_NAMES and egress_broker_enabled(runtime_paths):
+            # Deferred: the broker loads h11 and its TLS stack, which the slim tool registry must not import.
+            from mindroom.egress_broker.service import execution_env_for_worker  # noqa: PLC0415
+
+            execution_env = {
+                **(execution_env or {}),
+                **execution_env_for_worker(
+                    runtime_paths,
+                    config=manager_context.runtime_config,
+                    worker_target=worker_target,
+                    routed_worker_key=worker_payload.get("worker_key"),
+                    call_env=execution_env,
+                ),
+            }
         if execution_env:
             payload["execution_env"] = execution_env
         if extra_env_passthrough is not None:

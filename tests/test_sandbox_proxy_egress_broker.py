@@ -1,14 +1,17 @@
-"""Tests that worker-routed shell and python calls carry the running egress broker's env."""
+"""Tests that worker-routed shell and python calls carry the running egress broker's env, and no broker code while it is off."""
 
 from __future__ import annotations
 
+import pkgutil
 import socket
+import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import unquote, urlsplit
 
 import pytest
 
+import mindroom.egress_broker
 import mindroom.tool_system.sandbox_proxy as sandbox_proxy_module
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
@@ -162,6 +165,46 @@ def _token_worker_key(runtime_paths: RuntimePaths, execution_env: dict[str, str]
     claims = signer.verify(unquote(username))
     assert claims is not None
     return claims.worker_key
+
+
+# The config schema loads these two at import time, with or without the broker; every other module is broker code.
+_CONFIG_LEVEL_BROKER_MODULES = frozenset({"env", "presets"})
+
+
+@pytest.mark.usefixtures("dedicated_routing")
+@pytest.mark.parametrize("tool_name", ["shell", "python"])
+def test_calls_with_the_broker_off_import_no_broker_code(
+    tmp_path: Path,
+    payloads: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """Without a broker port, a worker-routed shell or python call never imports broker code and adds no broker env."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("router:\n  model: default\n", encoding="utf-8")
+    runtime_paths = resolve_runtime_paths(
+        config_path=config_path,
+        storage_path=tmp_path / "mindroom_data",
+        process_env={
+            "MINDROOM_NAMESPACE": "",
+            "MINDROOM_SANDBOX_PROXY_URL": "http://sandbox-runner:8765",
+            "MINDROOM_SANDBOX_PROXY_TOKEN": "proxy-token",
+            "MINDROOM_SANDBOX_EXECUTION_MODE": "all",
+        },
+    )
+    for module in pkgutil.iter_modules(mindroom.egress_broker.__path__):
+        if module.name not in _CONFIG_LEVEL_BROKER_MODULES:
+            # A None entry makes any import of that module raise.
+            monkeypatch.setitem(sys.modules, f"mindroom.egress_broker.{module.name}", None)
+    config = Config(egress_broker={"services": {"github": _GITHUB}})
+    manager = CredentialsManager(runtime_paths.storage_root / "credentials")
+    target = resolve_worker_target("user_agent", "code", _identity(), private_agent_names=frozenset())
+
+    with worker_runtime_context(WorkerRuntimeContext(runtime_paths=runtime_paths, config=config)):
+        _call(runtime_paths, tool_name, target, manager, {"KEEP": "me"})
+
+    [payload] = payloads
+    assert payload["execution_env"] == {"KEEP": "me"}
 
 
 @pytest.mark.usefixtures("dedicated_routing")
