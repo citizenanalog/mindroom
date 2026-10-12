@@ -143,9 +143,7 @@ class TurnRecorder:
             user_message=self.user_message,
             user_message_is_structured=self.user_message_is_structured,
             partial_text=self.assistant_text,
-            completed_tools=[
-                tool for tool in self.completed_tools if tool.tool_call_id not in self.mid_turn_folded_tool_call_ids
-            ],
+            completed_tools=self.completed_tools,
             interrupted_tools=self.interrupted_tools,
             run_metadata=(
                 {**(self.run_metadata or {}), MID_TURN_GENERATION_METADATA_KEY: self.mid_turn_generation}
@@ -154,6 +152,7 @@ class TurnRecorder:
             ),
             response_event_id=self.response_event_id,
             original_status=self.original_status or RunStatus.cancelled,
+            folded_tool_call_ids=self.mid_turn_folded_tool_call_ids,
         )
 
     def claim_interrupted_persistence(self) -> bool:

@@ -1102,8 +1102,8 @@ async def test_a_cli_wait_fails_an_approval_whose_final_matrix_refused(*, perman
         responses.request_failure.assert_not_awaited()
 
 
-def test_a_folded_run_replays_only_the_tool_calls_its_record_still_holds() -> None:
-    """A fold summarized the earlier calls, so the recovered record names it and does not repeat them as tools."""
+def test_a_folded_run_names_only_the_provider_calls_its_record_no_longer_holds() -> None:
+    """The fold summarized the calls whose messages left the run; the calls it still holds are not folded."""
     folded = ToolExecution(tool_call_id="call-folded", tool_name="run_shell_command", result="folded")
     kept = ToolExecution(tool_call_id="call-kept", tool_name="run_shell_command", result="kept")
     persisted = RunOutput(
@@ -1116,6 +1116,6 @@ def test_a_folded_run_replays_only_the_tool_calls_its_record_still_holds() -> No
         metadata={MID_TURN_GENERATION_METADATA_KEY: 3},
     )
 
-    assert cli_approval_recovery._replayed_tools(persisted) == [kept]
+    assert cli_approval_recovery._folded_tool_call_ids(persisted) == {"call-folded"}
     persisted.metadata = {}
-    assert cli_approval_recovery._replayed_tools(persisted) == [folded, kept]
+    assert cli_approval_recovery._folded_tool_call_ids(persisted) == set()
