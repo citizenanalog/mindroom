@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { pressInDialog } from "@/test/egressServiceTestKit";
 import { githubRepositoryRules } from "./githubRepositoryRules";
 import type { RowAgent, ServiceEditing } from "./egressRowText";
 import { EgressServiceRows as Rows } from "./EgressServiceRows";
@@ -112,6 +113,46 @@ const noContent = () => new Response(null, { status: 204 });
 const json = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), { status });
 const row = (name: string) => screen.getByRole("listitem", { name });
+
+/** Service editing for the viewer's own services, which says nothing on delete unless a test passes a warning. */
+const editing = (overrides: Partial<ServiceEditing> = {}): ServiceEditing => ({
+  editableSource: "user",
+  onEdit: vi.fn(),
+  onDelete: vi.fn(async () => undefined),
+  deleteWarning: () => "",
+  ...overrides,
+});
+
+type FakePopup = {
+  closed: boolean;
+  close: ReturnType<typeof vi.fn>;
+  location: { href: string };
+};
+/** The window a connection opens, faked so a test can read and close it. */
+let popup: FakePopup;
+function fakePopup() {
+  popup = { closed: false, close: vi.fn(), location: { href: "about:blank" } };
+  vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+}
+/** What the popup's own page posts back when the provider is done. */
+const answer = (status: string) =>
+  window.dispatchEvent(
+    new MessageEvent("message", {
+      origin: authorization.completion_origin,
+      source: popup as unknown as Window,
+      data: { type: "mindroom-oauth", provider: "github", status },
+    }),
+  );
+/** Render a GitHub row that can connect, press Connect, and wait until the popup shows the provider's page. */
+async function startConnect(onChanged = vi.fn()) {
+  renderRows([withAccount()], { onChanged });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
+  );
+  await waitFor(() => expect(popup.location.href).toBe(authorization.auth_url));
+  expect(screen.getByText("Connecting…")).toBeVisible();
+  return onChanged;
+}
 
 beforeEach(() => {
   vi.mocked(fetch).mockImplementation(async () => noContent());
@@ -317,55 +358,20 @@ describe("egress service rows", () => {
       screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
     vi.mocked(fetch).mockImplementation(async () => json({}, 404));
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Remove",
-      }),
-    );
+    await pressInDialog("Remove");
     expect(await screen.findByText("Gone.")).toBeInTheDocument();
 
     vi.mocked(fetch).mockImplementation(async () => json({}, 403));
     fireEvent.click(
       screen.getByRole("button", { name: "Remove key for OpenAI" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Remove",
-      }),
-    );
+    await pressInDialog("Remove");
     expect(await screen.findByText("No access.")).toBeInTheDocument();
   });
 });
 
 describe("connected accounts", () => {
-  let popup: {
-    closed: boolean;
-    close: ReturnType<typeof vi.fn>;
-    location: { href: string };
-  };
-
-  beforeEach(() => {
-    popup = {
-      closed: false,
-      close: vi.fn(),
-      location: { href: "about:blank" },
-    };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-  });
-
-  function finishAuthorization(provider = "github") {
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        origin: authorization.completion_origin,
-        source: popup as unknown as Window,
-        data: {
-          type: "mindroom-oauth",
-          provider,
-          status: "connected",
-        },
-      }),
-    );
-  }
+  beforeEach(fakePopup);
 
   it("offers Connect first and keeps the key behind a secondary toggle", () => {
     renderRows([withAccount()]);
@@ -419,7 +425,7 @@ describe("connected accounts", () => {
     ).toBeDisabled();
     expect(onChanged).not.toHaveBeenCalled();
 
-    finishAuthorization();
+    answer("connected");
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     // The page that answered closes itself.
     expect(popup.close).not.toHaveBeenCalled();
@@ -429,26 +435,9 @@ describe("connected accounts", () => {
   });
 
   describe("when the popup's own page answers", () => {
-    const answer = (status: string) =>
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: authorization.completion_origin,
-          source: popup as unknown as Window,
-          data: { type: "mindroom-oauth", provider: "github", status },
-        }),
-      );
-    const startConnect = async (onChanged = vi.fn()) => {
+    beforeEach(() => {
       vi.mocked(fetch).mockImplementation(async () => json(authorization));
-      renderRows([withAccount()], { onChanged });
-      fireEvent.click(
-        screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
-      );
-      await waitFor(() =>
-        expect(popup.location.href).toBe(authorization.auth_url),
-      );
-      expect(screen.getByText("Connecting…")).toBeVisible();
-      return onChanged;
-    };
+    });
 
     it("stops Connecting when the user cancelled, without waiting for the popup to close", async () => {
       const onChanged = await startConnect();
@@ -506,7 +495,7 @@ describe("connected accounts", () => {
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
       "/custom/github/connect?agent_name=a",
     );
-    finishAuthorization();
+    answer("connected");
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
 
     rerender(
@@ -521,11 +510,7 @@ describe("connected accounts", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Disconnect",
-      }),
-    );
+    await pressInDialog("Disconnect");
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(2));
     expect(vi.mocked(fetch).mock.calls[1][0]).toBe(
       "/custom/github/disconnect?agent_name=a",
@@ -631,11 +616,7 @@ describe("connected accounts", () => {
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
     );
     expect(fetch).not.toHaveBeenCalled();
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Disconnect",
-      }),
-    );
+    await pressInDialog("Disconnect");
 
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     expect(fetch).toHaveBeenCalledWith(
@@ -649,11 +630,7 @@ describe("connected accounts", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Disconnect for GitHub" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Cancel",
-      }),
-    );
+    await pressInDialog("Cancel");
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -780,11 +757,7 @@ describe("connected accounts", () => {
       screen.getByRole("button", { name: "Reset connection for GitHub" }),
     );
     expect(fetch).not.toHaveBeenCalled();
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Reset connection",
-      }),
-    );
+    await pressInDialog("Reset connection");
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
       "/api/connections/egress/agents/personal/github/disconnect",
@@ -793,14 +766,7 @@ describe("connected accounts", () => {
 
   it("stops waiting for authorization when Cancel is clicked", async () => {
     vi.mocked(fetch).mockImplementation(async () => json(authorization));
-    const onChanged = vi.fn();
-    renderRows([withAccount()], { onChanged });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
-    );
-    await waitFor(() =>
-      expect(popup.location.href).toBe(authorization.auth_url),
-    );
+    const onChanged = await startConnect();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(
       screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
@@ -841,19 +807,13 @@ describe("egress service rows with service editing", () => {
     display_name: "Theirs",
     source: "config",
   };
-  const editing = (
-    overrides: Partial<ServiceEditing> = {},
-  ): ServiceEditing => ({
-    editableSource: "user",
-    onEdit: vi.fn(),
-    onDelete: vi.fn(async () => undefined),
-    deleteWarning: (service) => `Deleting ${service.name} cannot be undone.`,
-    labels: { config: "Added by your administrator" },
-    ...overrides,
-  });
 
   it("offers Edit and Delete for the editable source and labels the rest", () => {
-    renderRows([mine, theirs], { serviceEditing: editing() });
+    renderRows([mine, theirs], {
+      serviceEditing: editing({
+        labels: { config: "Added by your administrator" },
+      }),
+    });
     expect(
       within(row("Mine")).getByRole("button", {
         name: "Edit service for Mine",
@@ -909,7 +869,9 @@ describe("egress service rows with service editing", () => {
   });
 
   it("deletes only after the warning is confirmed", async () => {
-    const serviceEditing = editing();
+    const serviceEditing = editing({
+      deleteWarning: (service) => `Deleting ${service.name} cannot be undone.`,
+    });
     renderRows([mine], { serviceEditing });
     fireEvent.click(
       screen.getByRole("button", { name: "Delete service for Mine" }),
@@ -923,11 +885,7 @@ describe("egress service rows with service editing", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Delete service for Mine" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Delete",
-      }),
-    );
+    await pressInDialog("Delete");
     await waitFor(() =>
       expect(serviceEditing.onDelete).toHaveBeenCalledWith(mine),
     );
@@ -944,11 +902,7 @@ describe("egress service rows with service editing", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Delete service for Mine" }),
     );
-    fireEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", {
-        name: "Delete",
-      }),
-    );
+    await pressInDialog("Delete");
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Service is not a service of your own",
     );
@@ -1037,11 +991,7 @@ describe("rows with an agent's wording", () => {
       { is_shared: true, name: "gmail", display_name: "Gmail" },
     );
     beforeEach(() => {
-      vi.spyOn(window, "open").mockReturnValue({
-        closed: false,
-        close: vi.fn(),
-        location: { href: "about:blank" },
-      } as unknown as Window);
+      fakePopup();
       vi.mocked(fetch).mockImplementation(async () =>
         json({
           provider: "google",
@@ -1326,22 +1276,12 @@ describe("rows with an agent's wording", () => {
       ],
       ...overrides,
     });
-    const limiting = (
-      overrides: Partial<ServiceEditing> = {},
-    ): ServiceEditing => ({
-      editableSource: "user",
-      onEdit: vi.fn(),
-      onDelete: vi.fn(async () => undefined),
-      deleteWarning: () => "",
-      onLimitToRepositories: vi.fn(),
-      ...overrides,
-    });
 
     it("offers it on an administrator's GitHub row to someone who can manage the agent", () => {
       const onLimitToRepositories = vi.fn();
       const service = base();
       renderRows([service], {
-        serviceEditing: limiting({ onLimitToRepositories }),
+        serviceEditing: editing({ onLimitToRepositories }),
       });
       const button = within(row("GitHub")).getByRole("button", {
         name: "Limit to repositories for GitHub",
@@ -1361,20 +1301,25 @@ describe("rows with an agent's wording", () => {
         }),
       ],
     ])("does not offer it when %s", (_why, service) => {
-      renderRows([service], { serviceEditing: limiting() });
+      renderRows([service], {
+        serviceEditing: editing({ onLimitToRepositories: vi.fn() }),
+      });
       expect(screen.queryByText("Limit to repositories")).toBeNull();
     });
 
     it("does not offer it without a handler, as on the dashboard", () => {
       renderRows([base()], {
-        serviceEditing: limiting({ onLimitToRepositories: undefined }),
+        serviceEditing: editing(),
       });
       expect(screen.queryByText("Limit to repositories")).toBeNull();
     });
 
     it("turns it off while the editor is open or something is being written", () => {
       renderRows([base()], {
-        serviceEditing: limiting({ limitDisabled: true }),
+        serviceEditing: editing({
+          onLimitToRepositories: vi.fn(),
+          limitDisabled: true,
+        }),
       });
       expect(
         screen.getByRole("button", {
@@ -1383,7 +1328,10 @@ describe("rows with an agent's wording", () => {
       ).toBeDisabled();
       cleanup();
       renderRows([base()], {
-        serviceEditing: limiting({ disabled: true }),
+        serviceEditing: editing({
+          onLimitToRepositories: vi.fn(),
+          disabled: true,
+        }),
       });
       expect(
         screen.getByRole("button", {
@@ -1443,13 +1391,7 @@ describe("rows with an agent's wording", () => {
     };
     const keyed = { ...openai, name: "openai", display_name: "OpenAI" };
     renderRows([limitable, keyed], {
-      serviceEditing: {
-        editableSource: "user",
-        onEdit: vi.fn(),
-        onDelete: vi.fn(async () => undefined),
-        deleteWarning: () => "",
-        onLimitToRepositories: vi.fn(),
-      },
+      serviceEditing: editing({ onLimitToRepositories: vi.fn() }),
     });
     const labels = [
       "Set key",
@@ -1493,12 +1435,7 @@ describe("rows with an agent's wording", () => {
       },
     );
     renderRows([connected, needsReset], {
-      serviceEditing: {
-        editableSource: "user",
-        onEdit: vi.fn(),
-        onDelete: vi.fn(async () => undefined),
-        deleteWarning: () => "",
-      },
+      serviceEditing: editing(),
     });
     const visible = [
       "Disconnect",
@@ -1633,12 +1570,6 @@ describe("rows with an agent's wording", () => {
         source: "user" as const,
       },
     );
-    const editing: ServiceEditing = {
-      editableSource: "user",
-      onEdit: vi.fn(),
-      onDelete: vi.fn(async () => undefined),
-      deleteWarning: () => "",
-    };
 
     it("leave out every way to set, remove, or connect a key or account", () => {
       const services = [connectable, keyedConnected, openai];
@@ -1654,7 +1585,7 @@ describe("rows with an agent's wording", () => {
 
     it("keep what changes the service itself", () => {
       renderRows([{ ...openai, source: "user" }], {
-        serviceEditing: editing,
+        serviceEditing: editing(),
         hideKeyActions: true,
       });
       expect(
@@ -1687,12 +1618,7 @@ describe("rows with an agent's wording", () => {
 
   it("shows no administrator badge when no label is given", () => {
     renderRows([{ ...github, source: "config" }], {
-      serviceEditing: {
-        editableSource: "user",
-        onEdit: vi.fn(),
-        onDelete: vi.fn(async () => undefined),
-        deleteWarning: () => "",
-      },
+      serviceEditing: editing(),
     });
     expect(screen.queryByText(/administrator/)).toBeNull();
   });
@@ -1917,11 +1843,6 @@ describe("what a limited service says it is limited to", () => {
 });
 
 describe("a popup that closes without answering", () => {
-  let popup: {
-    closed: boolean;
-    close: ReturnType<typeof vi.fn>;
-    location: { href: string };
-  };
   const listingPath = "/api/connections/egress";
   // The provider's status route is for tool rows; this agent has no tool for
   // the provider, so the route answers 404 and is never the one asked.
@@ -1950,26 +1871,13 @@ describe("a popup that closes without answering", () => {
     });
   const reads = (path: string) =>
     vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === path);
-  const connectAndClose = async (onChanged = vi.fn()) => {
-    renderRows([withAccount()], { onChanged });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Connect GitHub for GitHub" }),
-    );
-    await waitFor(() =>
-      expect(popup.location.href).toBe(authorization.auth_url),
-    );
+  const connectAndClose = async () => {
+    const onChanged = await startConnect();
     popup.closed = true;
     return onChanged;
   };
 
-  beforeEach(() => {
-    popup = {
-      closed: false,
-      close: vi.fn(),
-      location: { href: "about:blank" },
-    };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-  });
+  beforeEach(fakePopup);
 
   it("counts a connection that completed before the answer was read, once the listing says so", async () => {
     answerWith(true);

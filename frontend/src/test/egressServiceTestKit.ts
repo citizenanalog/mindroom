@@ -1,3 +1,4 @@
+import { fireEvent, screen, within } from "@testing-library/react";
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
   type EditorOptions,
@@ -74,4 +75,11 @@ export function basicAuth(username: string) {
 
 export function validRule() {
   return { ...emptyRule(), host: "api.example.com" };
+}
+
+/** Press a button of the open dialog, such as its confirm or Cancel button. */
+export async function pressInDialog(name: string) {
+  fireEvent.click(
+    within(await screen.findByRole("dialog")).getByRole("button", { name }),
+  );
 }
