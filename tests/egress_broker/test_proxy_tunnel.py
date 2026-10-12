@@ -71,27 +71,15 @@ def _plain_get(upstream: Upstream, path: str, token: str) -> bytes:
 
 
 @pytest.mark.asyncio
-async def test_missing_token_gets_407(broker: BrokerFactory, raw_proxy: RawProxy) -> None:
-    """A CONNECT without Proxy-Authorization is challenged with Basic auth."""
-    started = await broker()
-
-    response = await raw_proxy(started.port, connect_request("localhost:443"))
-
-    assert response.status == 407
-    assert response.headers["proxy-authenticate"] == 'Basic realm="mindroom-egress-broker"'
-    assert response.headers["connection"] == "close"
-    assert response.json() == PROXY_AUTHENTICATION_REQUIRED
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "credential",
-    ["garbage", "foreign-key", "expired", "bearer-garbage", "not-base64"],
+    ["missing", "garbage", "foreign-key", "expired", "bearer-garbage", "not-base64"],
 )
-async def test_bad_token_gets_407(broker: BrokerFactory, raw_proxy: RawProxy, credential: str) -> None:
-    """Unparseable, foreign-signed, and expired tokens are all challenged like a missing one."""
+async def test_missing_or_bad_token_gets_407(broker: BrokerFactory, raw_proxy: RawProxy, credential: str) -> None:
+    """A missing, unparseable, foreign-signed, or expired token is challenged with Basic auth and the connection closes."""
     started = await broker()
     authorization = {
+        "missing": None,
         "garbage": proxy_authorization("mrb1.not.valid"),
         "foreign-key": proxy_authorization(TokenSigner(b"x" * 32).mint(DEFAULT_CLAIMS)),
         "expired": proxy_authorization(broker.signer.mint(DEFAULT_CLAIMS, now=time.time() - 10 * 604800)),
@@ -102,7 +90,8 @@ async def test_bad_token_gets_407(broker: BrokerFactory, raw_proxy: RawProxy, cr
     response = await raw_proxy(started.port, connect_request("localhost:443", authorization=authorization))
 
     assert response.status == 407
-    assert "proxy-authenticate" in response.headers
+    assert response.headers["proxy-authenticate"] == 'Basic realm="mindroom-egress-broker"'
+    assert response.headers["connection"] == "close"
     assert response.json() == PROXY_AUTHENTICATION_REQUIRED
 
 
