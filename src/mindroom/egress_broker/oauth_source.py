@@ -15,13 +15,13 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from mindroom.egress_broker.secrets import (
-    PERSONAL_WORKER_SCOPES,
     OAuthStatus,
     Secret,
     SecretMissing,
     SecretNeedsReconnect,
     SecretResult,
     SecretUnavailable,
+    is_personal_target,
 )
 from mindroom.logging_config import get_logger
 from mindroom.oauth.credential_lifecycle import (
@@ -201,11 +201,7 @@ def shared_worker_oauth(
     """
     if not provider.requester_scoped_credentials:
         return None
-    if (
-        worker_target is not None
-        and worker_target.worker_scope in PERSONAL_WORKER_SCOPES
-        and primary_worker_backend_is_dedicated(runtime_paths)
-    ):
+    if is_personal_target(worker_target) and primary_worker_backend_is_dedicated(runtime_paths):
         return None
     return "allowed" if opted_in else "refused"
 

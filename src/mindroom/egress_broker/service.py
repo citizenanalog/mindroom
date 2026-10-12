@@ -22,7 +22,14 @@ from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.oauth_source import oauth_status, resolve_oauth_token
 from mindroom.egress_broker.proxy import EgressBroker
 from mindroom.egress_broker.rules import EgressRules
-from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretResult, load_secret, service_status
+from mindroom.egress_broker.secrets import (
+    PERSONAL_WORKER_SCOPES,
+    Secret,
+    SecretMissing,
+    SecretResult,
+    load_secret,
+    service_status,
+)
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 from mindroom.egress_broker.user_services import effective_config
 from mindroom.logging_config import get_logger
@@ -217,7 +224,7 @@ class _LastGoodConfig:
         config = self.current()
         agent = None if config is None else config.agents.get(claims.agent_name)
         managers = () if agent is None else tuple(agent.credential_managers)
-        return ScopeInfo(shared=claims.worker_scope not in {"user", "user_agent"}, managers=managers)
+        return ScopeInfo(shared=claims.worker_scope not in PERSONAL_WORKER_SCOPES, managers=managers)
 
 
 async def _resolve_secret(

@@ -29,9 +29,9 @@ from mindroom.config.egress_broker import EgressService, validate_egress_service
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import config_covers_rule
 from mindroom.egress_broker.secrets import (
-    PERSONAL_WORKER_SCOPES,
     delete_egress_document,
     delete_secret,
+    is_personal_target,
     load_egress_document,
     save_egress_document,
 )
@@ -136,7 +136,7 @@ def load_user_services(manager: CredentialsManager, target: ResolvedWorkerTarget
         if refused:
             allowed = {key: value for key, value in service.placeholder_env.items() if key not in refused}
             service = service.model_copy(update={"placeholder_env": allowed})
-        if service.oauth_provider is not None and (not _personal_scope(target) or _oauth_hosts_error(service)):
+        if service.oauth_provider is not None and (not is_personal_target(target) or _oauth_hosts_error(service)):
             logger.warning("egress_broker_user_service_oauth_ignored", service=name)
             service = service.model_copy(update={"oauth_provider": None})
         services[name] = service
@@ -297,10 +297,6 @@ def user_service_hosts_not_allowed(config: EgressBrokerConfig, service: EgressSe
     return list(dict.fromkeys(hosts))
 
 
-def _personal_scope(target: ResolvedWorkerTarget | None) -> bool:
-    return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
-
-
 def _oauth_provider_hosts() -> dict[str, tuple[str, ...]]:
     """Return, per OAuth provider a built-in preset is bound to, the rule hosts of those presets in preset order."""
     hosts: dict[str, list[str]] = {}
@@ -323,7 +319,7 @@ def _oauth_provider_error(
     """Return why a user service of this scope may not save its OAuth provider; None when it may or names none."""
     if service.oauth_provider is None:
         return None
-    if not _personal_scope(target):
+    if not is_personal_target(target):
         return (
             "oauth_provider is only available for services of user and user_agent agents; "
             "on a shared or unscoped agent set oauth_provider to null and use an API key"

@@ -28,6 +28,7 @@ __all__ = [
     "delete_egress_document",
     "delete_secret",
     "egress_credential_service",
+    "is_personal_target",
     "load_egress_document",
     "load_secret",
     "save_egress_document",
@@ -38,6 +39,11 @@ __all__ = [
 _MAX_SECRET_SIZE = 16 * 1024  # 16 KiB
 # Worker scopes whose sandbox and egress store belong to one requester.
 PERSONAL_WORKER_SCOPES: frozenset[str] = frozenset({"user", "user_agent"})
+
+
+def is_personal_target(target: ResolvedWorkerTarget | None) -> bool:
+    """Return whether `target` has a personal worker scope; None is the global store, which is not personal."""
+    return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
 
 
 def egress_credential_service(name: str) -> str:
@@ -60,7 +66,7 @@ def load_egress_document(
         return manager.load_credentials(credential_service)
 
     # For requester-scoped targets, disable shared fallback
-    allowed_shared = frozenset() if target.worker_scope in PERSONAL_WORKER_SCOPES else None
+    allowed_shared = frozenset() if is_personal_target(target) else None
 
     return load_scoped_credentials(
         credential_service,
