@@ -94,6 +94,7 @@ nav = [
     { "Connect Google Accounts" = "deployment/google-services-user-oauth.md" },
     { "Google OAuth Apps & Scopes" = "deployment/google-services-oauth.md" },
     { "Security Model" = "architecture/security-posture.md" },
+    { "Egress Broker Design" = "architecture/egress-broker-design.md" },
   ] },
   { "Extend & Integrate" = [
     { "Plugins" = "plugins.md" },

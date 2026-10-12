@@ -44,6 +44,7 @@ MindRoom's architecture consists of several key components working together.
 - [Agent Orchestration](orchestration.md) - How agents are managed
 - [Bot Runtime](bot-runtime.md) - The inbound turn pipeline and its module boundaries
 - [Reply Messages](reply-messages.md) - The durable records that own every AI reply, and the rules that change them
+- [Egress Broker Design](egress-broker-design.md) - Why the credential-injecting egress broker is built the way it is
 - [Code Map](code-map.md) - The inbound turn pipeline at module level, key modules and their purpose, and where persistent state lives
 - [Migration and Compatibility Boundaries](migrations.md) - Current owners for historical formats, dependency migrations, and retained compatibility
 - [Matrix Event-Journal Security](matrix-event-journal-security.md) - Which decrypted plaintext is durable, who owns it, and what removes it

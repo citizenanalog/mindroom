@@ -77,6 +77,7 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 | Security & Access | Connect Google Accounts | `deployment/google-services-user-oauth.md` | `deployment/google-services-user-oauth/index.md` | `page__deployment__google-services-user-oauth__index.md` |
 | Security & Access | Google OAuth Apps & Scopes | `deployment/google-services-oauth.md` | `deployment/google-services-oauth/index.md` | `page__deployment__google-services-oauth__index.md` |
 | Security & Access | Security Model | `architecture/security-posture.md` | `architecture/security-posture/index.md` | `page__architecture__security-posture__index.md` |
+| Security & Access | Egress Broker Design | `architecture/egress-broker-design.md` | `architecture/egress-broker-design/index.md` | `page__architecture__egress-broker-design__index.md` |
 | Extend & Integrate | Plugins | `plugins.md` | `plugins/index.md` | `page__plugins__index.md` |
 | Extend & Integrate | Hooks | `hooks.md` | `hooks/index.md` | `page__hooks__index.md` |
 | Extend & Integrate | External Triggers | `external-triggers.md` | `external-triggers/index.md` | `page__external-triggers__index.md` |

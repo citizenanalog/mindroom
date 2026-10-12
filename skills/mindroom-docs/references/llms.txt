@@ -70,6 +70,7 @@
 - [Connect Google Accounts](https://docs.mindroom.chat/deployment/google-services-user-oauth/)
 - [Google OAuth Apps & Scopes](https://docs.mindroom.chat/deployment/google-services-oauth/)
 - [Security Model](https://docs.mindroom.chat/architecture/security-posture/)
+- [Egress Broker Design](https://docs.mindroom.chat/architecture/egress-broker-design/)
 - [Plugins](https://docs.mindroom.chat/plugins/)
 - [Hooks](https://docs.mindroom.chat/hooks/)
 - [External Triggers](https://docs.mindroom.chat/external-triggers/)

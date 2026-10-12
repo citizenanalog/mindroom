@@ -5,6 +5,7 @@ Use it when workers need to call APIs with credentials (GitHub, Google, Atlassia
 Each service gets its credential from an API key you store or from an account you connect with a few clicks, and built-in presets define the common services in one line.
 Users can also add services of their own, limit GitHub access to chosen repositories in place, and see their own recent requests on a personal page, without dashboard access.
 This page covers how the broker works, how it handles requests, configuration and presets, secret sources and connected accounts, user services, per-repo control, the Connections pages, the personal request log, deployment, secret management, error codes, what the broker cannot protect against, migration from Agent Vault, and current limitations.
+Why the broker is built this way is in [Egress Broker Design](https://docs.mindroom.chat/architecture/egress-broker-design/).
 
 ## How it works
 
