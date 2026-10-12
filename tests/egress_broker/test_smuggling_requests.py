@@ -7,13 +7,14 @@ strict upstream parser and the invariants every case checks.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import h11
 import pytest
 
-from tests.egress_broker.conftest import connect_request, proxy_authorization, single_rule_config
+from tests.egress_broker.conftest import MALFORMED, connect_request, proxy_authorization, single_rule_config
 from tests.egress_broker.raw_http import (
     MAX_BODY,
     SECOND,
@@ -134,6 +135,12 @@ REQUEST_CASES = [
         _POST + "Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n8\r\nSMUGGLED\r\n0\r\n\r\n" + _SMUGGLED,
         **_CLOSES_AFTER_BOTH_LENGTHS,
         check=_body(b"SMUGGLED", chunked=True),
+    ),
+    Case(
+        "cl-te-with-body",
+        _POST + "Content-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        **_CLOSES_AFTER_BOTH_LENGTHS,
+        check=_body(b"hello", chunked=True),
     ),
     *(
         Case(f"te-te-{name}", _POST + _REJECTED_TE.format(value=value), **_same((501,), 0))
@@ -537,15 +544,20 @@ async def test_pipelined_plain_requests_reach_only_their_own_hosts(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "after_head",
-    ["Content-Length: 5\r\n\r\nhello", "\r\nGET /a HTTP/1.1\r\nHost: localhost\r\n\r\n"],
-    ids=["connect-with-body", "request-pipelined-after-connect"],
+    [
+        "Content-Length: 5\r\n\r\nhello",
+        "\r\nGET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        # The start of a TLS record sent before the broker answered the CONNECT, which TLS can no longer read.
+        "\r\n\x16\x03\x01\x00\x05early",
+    ],
+    ids=["connect-with-body", "request-pipelined-after-connect", "tls-record-before-connect-answer"],
 )
 async def test_connect_carrying_more_than_its_head_is_refused(
     broker: BrokerFactory,
     upstreams: UpstreamFactory,
     after_head: str,
 ) -> None:
-    """A CONNECT to an intercepted host with a body, or plaintext bytes behind it, is refused before any TLS."""
+    """A CONNECT to an intercepted host with a body, or bytes behind it, is refused as malformed before any TLS."""
     await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=True)
     probe = await upstreams()
@@ -560,6 +572,7 @@ async def test_connect_carrying_more_than_its_head_is_refused(
 
     assert reply is not None
     assert (reply.status, closed) == (400, True)
+    assert json.loads(reply.body) == MALFORMED
     assert upstream.raw == b""
     assert broker.resolved == []
     await assert_listener_serves(broker, probe)

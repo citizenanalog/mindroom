@@ -81,6 +81,13 @@ UPSTREAM_ANOMALIES = [
         ((200, b"hello"), (200, b"second")),
         2,
     ),
+    # An upstream that closes an idle connection after a full response is redialed for the next request.
+    Anomaly(
+        "close-after-complete-response",
+        _first_then_second(OK, "close"),
+        ((200, b"ok"), (200, b"second")),
+        2,
+    ),
     Anomaly(
         "read-until-close",
         _first_then_second(b"HTTP/1.1 200 OK\r\n\r\nuntil-close", "close"),

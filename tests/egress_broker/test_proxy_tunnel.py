@@ -676,33 +676,6 @@ async def test_plain_http_blocked_destination(
 
 
 @pytest.mark.asyncio
-async def test_plain_http_drops_request_content_length_beside_chunked(
-    broker: BrokerFactory,
-    http_upstream: Upstream,
-    raw_proxy: RawProxy,
-) -> None:
-    """A client sending both Content-Length and chunked framing never gets both forwarded upstream."""
-    started = await broker()
-    request = (
-        f"POST {http_upstream.url('/echo')} HTTP/1.1\r\n"
-        f"Host: localhost:{http_upstream.port}\r\n"
-        f"Proxy-Authorization: {proxy_authorization(broker.token())}\r\n"
-        "Content-Length: 3\r\n"
-        "Transfer-Encoding: chunked\r\n"
-        "Connection: close\r\n\r\n"
-        "5\r\nhello\r\n0\r\n\r\n"
-    ).encode()
-
-    response = await raw_proxy(started.port, request)
-
-    # The upstream refuses a request carrying both headers, so a 200 alone proves they were not both sent.
-    assert response.status == 200
-    headers = response.json()["headers"]
-    assert "content-length" not in headers
-    assert headers["transfer-encoding"] == ["chunked"]
-
-
-@pytest.mark.asyncio
 async def test_plain_http_response_content_length_beside_chunked_is_reframed(
     broker: BrokerFactory,
     proxy_client: ProxyClient,

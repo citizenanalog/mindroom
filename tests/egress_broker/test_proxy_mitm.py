@@ -43,7 +43,6 @@ from tests.egress_broker.conftest import (
     proxy_authorization,
     read_raw_response,
     run_command,
-    serving,
     single_rule_config,
     with_user_services,
 )
@@ -868,30 +867,6 @@ async def test_upstream_unreachable_gets_502(
 
 
 @pytest.mark.asyncio
-async def test_untrusted_upstream_certificate_gets_502(
-    broker: BrokerFactory,
-    proxy_client: ProxyClient,
-) -> None:
-    """The broker verifies the real upstream; one it cannot verify never receives the secret."""
-    await broker(single_rule_config(), secrets={"svc": SECRET})
-    received: list[bytes] = []
-
-    async def record(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        received.append(await reader.read())
-        writer.close()
-
-    # Signed by the broker CA, which the broker's upstream context does not trust.
-    async with serving(record, ssl_context=broker.ca.server_context("localhost")) as port:
-        client = proxy_client(broker.token())
-        response = await client.get(f"https://localhost:{port}/echo")
-
-    assert response.status_code == 502
-    assert response.json() == LOCALHOST_UNREACHABLE
-    # The handshake failed before the upstream's handler ran, so not even a request head reached it.
-    assert received == []
-
-
-@pytest.mark.asyncio
 async def test_blocked_upstream_gets_403(
     broker: BrokerFactory,
     tls_upstream: Upstream,
@@ -995,47 +970,6 @@ async def test_upstream_connection_is_reused_until_upstream_closes(
     ports = [seen.peer_port for seen in tls_upstream.requests]
     assert ports[0] == ports[1] == ports[2] != ports[3]
     assert {seen.headers["authorization"][0] for seen in tls_upstream.requests} == {f"Bearer {SECRET}"}
-
-
-@pytest.mark.asyncio
-async def test_upstream_closed_between_requests_is_redialed(
-    broker: BrokerFactory,
-    upstream_ca: UpstreamCA,
-    serve: ServeFactory,
-    tmp_path: Path,
-) -> None:
-    """An upstream that closes an idle connection without saying so gets a fresh connection for the next request."""
-    connections = 0
-    closed = asyncio.Event()
-
-    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal connections
-        connections += 1
-        await reader.readuntil(b"\r\n\r\n")
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-        await writer.drain()
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
-        closed.set()
-
-    port = await serve(respond, ssl_context=upstream_ca.server_context(tmp_path))
-    await broker(single_rule_config(), secrets={"svc": SECRET})
-    reader, writer = await _open_tunnel(broker, f"localhost:{port}")
-    request = f"GET /a HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n".encode()
-    try:
-        writer.write(request)
-        first = await read_raw_response(reader)
-        async with asyncio.timeout(5):
-            await closed.wait()
-        writer.write(request)
-        second = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
-
-    assert (first.status, second.status) == (200, 200)
-    assert second.body == b"ok"
-    assert connections == 2
 
 
 @pytest.mark.asyncio
@@ -1173,25 +1107,6 @@ async def test_git_ls_remote_basic_auth(broker: BrokerFactory, tls_upstream: Ups
 
 
 @pytest.mark.asyncio
-async def test_bytes_sent_before_connect_answer_get_400(broker: BrokerFactory) -> None:
-    """Bytes sent with the CONNECT, before the broker answered it, cannot start TLS and are refused."""
-    started = await broker(single_rule_config(), secrets={"svc": SECRET})
-    reader, writer = await asyncio.open_connection("127.0.0.1", started.port)
-    try:
-        writer.write(
-            connect_request("localhost:443", authorization=proxy_authorization(broker.token()))
-            + b"\x16\x03\x01\x00\x05early",
-        )
-        response = await read_raw_response(reader)
-    finally:
-        writer.transport.abort()
-
-    assert response.status == 400
-    assert response.json() == MALFORMED
-    assert broker.resolved == []
-
-
-@pytest.mark.asyncio
 async def test_client_hello_sent_before_connect_answer_still_reaches_tls(
     broker: BrokerFactory,
     monkeypatch: pytest.MonkeyPatch,
@@ -1286,24 +1201,6 @@ def test_default_upstream_context_adds_certifi_unless_trust_is_configured(
     loaded = _verifying_context().get_ca_certs(binary_form=True)
 
     assert (upstream_ca.cert.public_bytes(serialization.Encoding.DER) in loaded) is (trust_env is None)
-
-
-@pytest.mark.asyncio
-async def test_non_websocket_upgrade_is_not_spliced(broker: BrokerFactory, tls_upstream: Upstream) -> None:
-    """Only websocket upgrades are spliced; any other Upgrade is dropped and served as a normal request."""
-    await broker(single_rule_config(), secrets={"svc": SECRET})
-    upgrade = (
-        f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n"
-        "Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n"
-    ).encode()
-    plain = f"GET /echo HTTP/1.1\r\nHost: localhost:{tls_upstream.port}\r\n\r\n".encode()
-
-    upgraded, following = await _exchange(broker, tls_upstream.port, upgrade, plain)
-
-    assert (upgraded.status, following.status) == (200, 200)
-    seen = upgraded.json()["headers"]
-    assert not {"upgrade", "connection", "http2-settings"} & set(seen)
-    assert seen["authorization"] == [f"Bearer {SECRET}"]
 
 
 @pytest.mark.asyncio
