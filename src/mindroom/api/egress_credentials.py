@@ -152,6 +152,7 @@ class _ResolvedAgent:
     config: Config
     runtime_paths: RuntimePaths
     target: ResolvedWorkerTarget
+    manager: CredentialsManager
     can_manage: bool
 
 
@@ -179,7 +180,8 @@ def _resolve_agent(request: Request, requester_id: str, agent_name: str) -> _Res
 
     # Always build target for the agent scope
     target = build_connection_agent_target(config, runtime_paths, human_requester, agent_name)
-    return _ResolvedAgent(config, runtime_paths, target, can_manage=eligibility[1])
+    manager = get_runtime_credentials_manager(runtime_paths)
+    return _ResolvedAgent(config, runtime_paths, target, manager, can_manage=eligibility[1])
 
 
 def _resolve_agent_and_service(
@@ -198,8 +200,7 @@ def _resolve_agent_and_service(
     provider's connection belongs to the requester, so any user of the agent may manage it.
     """
     agent = _resolve_agent(request, requester_id, agent_name)
-    manager = get_runtime_credentials_manager(agent.runtime_paths)
-    service = effective_services(agent.config, manager, agent.target).get(service_name)
+    service = effective_services(agent.config, agent.manager, agent.target).get(service_name)
     if service is None:
         raise HTTPException(404, "Service is not configured", headers=CONNECTIONS_HEADERS)
 
@@ -455,9 +456,8 @@ def put_egress_secret(
     if egress_service.restrict_only:
         raise _unprocessable(RESTRICT_ONLY_KEY_REFUSAL)
 
-    manager = get_runtime_credentials_manager(agent.runtime_paths)
     try:
-        save_secret(manager, agent.target, service, body.secret)
+        save_secret(agent.manager, agent.target, service, body.secret)
     except ValueError as exc:
         raise _unprocessable(str(exc)) from exc
 
@@ -473,9 +473,7 @@ def delete_egress_secret(
     _require_egress_same_origin(request)
 
     agent, _service = _resolve_agent_and_service(request, requester_id, agent_name, service)
-
-    manager = get_runtime_credentials_manager(agent.runtime_paths)
-    delete_secret(manager, agent.target, service)
+    delete_secret(agent.manager, agent.target, service)
 
 
 # User services
@@ -534,8 +532,9 @@ def get_user_service(
     """Return one of the scope's own services as authored, so a preset stays a preset."""
     agent = _resolve_agent(request, requester_id, agent_name)
     operator = agent.config.egress_broker
-    manager = get_runtime_credentials_manager(agent.runtime_paths)
-    service = None if name in operator.services else effective_services(agent.config, manager, agent.target).get(name)
+    service = (
+        None if name in operator.services else effective_services(agent.config, agent.manager, agent.target).get(name)
+    )
     if service is None:
         raise HTTPException(404, "Service is not a service of your own", headers=CONNECTIONS_HEADERS)
     return service.authored_model_dump()
@@ -565,10 +564,9 @@ def put_user_service(
         raise HTTPException(409, str(UserServiceConflictError(name)), headers=CONNECTIONS_HEADERS)
     service = _parse_user_service(body)
     _require_hosts_within_operator_policy(operator, service)
-    manager = get_runtime_credentials_manager(agent.runtime_paths)
     try:
         save_user_service(
-            manager,
+            agent.manager,
             agent.target,
             name,
             service,
@@ -596,8 +594,7 @@ def delete_user_service_route(
     _require_egress_same_origin(request)
     agent = _resolve_service_editor(request, requester_id, agent_name)
     operator = agent.config.egress_broker
-    manager = get_runtime_credentials_manager(agent.runtime_paths)
-    if delete_user_service(manager, agent.target, name, config_services=operator.services):
+    if delete_user_service(agent.manager, agent.target, name, config_services=operator.services):
         return
     if name in operator.services:
         detail = f"Service '{name}' is configured by your administrator and cannot be deleted here"
