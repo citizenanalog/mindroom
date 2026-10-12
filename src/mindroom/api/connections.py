@@ -235,6 +235,27 @@ def _require_management(context: _Connections, agent_name: str, provider_id: str
     return context.providers[provider_id]
 
 
+async def _agent_scope_status(
+    request: Request,
+    context: _Connections,
+    agent_name: str,
+    provider_id: str,
+    *,
+    listing: bool = False,
+) -> oauth.OAuthStatusResponse:
+    """Read a non-manager's connection for the status route and the catalog; `listing` skips refresh and bootstrap."""
+    agent = resolve_connection_agent(context.user, agent_name)
+    credential_context = resolve_oauth_credential_context(
+        context.providers[provider_id],
+        context.runtime_paths,
+        get_runtime_credentials_manager(context.runtime_paths),
+        agent.worker_target,
+        execution_identity=agent.execution_identity,
+        config=agent.config,
+    )
+    return await oauth.connection_status(request, credential_context, refresh=not listing, bootstrap_client=not listing)
+
+
 async def _service_connected(
     request: Request,
     context: _Connections,
@@ -248,7 +269,6 @@ async def _service_connected(
     a provider with no stored client reads as not connected. Any failure also reads as not connected: one
     unreadable service must not fail the catalog.
     """
-    provider = context.providers[service.provider]
     try:
         if service.can_manage:
             result = await oauth.authenticated_connection_status(
@@ -259,21 +279,7 @@ async def _service_connected(
                 bootstrap_client=False,
             )
         else:
-            agent = resolve_connection_agent(context.user, agent_name)
-            credential_context = resolve_oauth_credential_context(
-                provider,
-                context.runtime_paths,
-                get_runtime_credentials_manager(context.runtime_paths),
-                agent.worker_target,
-                execution_identity=agent.execution_identity,
-                config=agent.config,
-            )
-            result = await oauth.connection_status(
-                request,
-                credential_context,
-                refresh=False,
-                bootstrap_client=False,
-            )
+            result = await _agent_scope_status(request, context, agent_name, service.provider, listing=True)
     except Exception as exc:
         logger.warning(
             "connection_catalog_status_unavailable",
@@ -392,21 +398,11 @@ async def avatar(agent_name: str, user: _ConnectionUserContext) -> Response:
 async def status(agent_name: str, provider_id: str, request: Request, context: _ConnectionsContext) -> ConnectionStatus:
     """Load status for one authorized agent and provider."""
     service = _service(context, agent_name, provider_id)
-    provider = context.providers[provider_id]
     try:
         if service.can_manage:
             result = await oauth.status(provider_id, request, agent_name=agent_name)
         else:
-            agent = resolve_connection_agent(context.user, agent_name)
-            credential_context = resolve_oauth_credential_context(
-                provider,
-                context.runtime_paths,
-                get_runtime_credentials_manager(context.runtime_paths),
-                agent.worker_target,
-                execution_identity=agent.execution_identity,
-                config=agent.config,
-            )
-            result = await oauth.connection_status(request, credential_context)
+            result = await _agent_scope_status(request, context, agent_name, provider_id)
     except HTTPException as exc:
         raise HTTPException(
             exc.status_code,
