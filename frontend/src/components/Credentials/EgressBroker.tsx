@@ -23,6 +23,7 @@ import type {
 } from "@/connections/types";
 import {
   API_ENDPOINTS,
+  apiErrorMessageFromPayload,
   fetchJSON,
   withAgentName,
   withQueryParams,
@@ -54,7 +55,9 @@ import {
 const NOT_RUNNING_MESSAGE =
   "Egress broker is not running. Set MINDROOM_EGRESS_BROKER_PORT and MINDROOM_EGRESS_BROKER_URL.";
 const LOG_ERROR_MESSAGE = "Could not load the request log. Try again.";
-const LOG_TIMEOUT_MS = 30_000;
+const LISTING_ERROR_MESSAGE = "Could not load the egress services.";
+// The same limit as `fetchJSON`'s.
+const REQUEST_TIMEOUT_MS = 30_000;
 const UNSCOPED_OPTION = "Agents without a scope";
 const UNSCOPED_AGENTS = "the agents without a scope";
 // The target that uses the one set of keys all agents without a worker scope share.
@@ -76,6 +79,25 @@ type BrokerService = Omit<
   | "can_manage"
   | "placeholder_names"
 > & { display_name: string | null };
+
+/** The unscoped listing as the check that the broker is on read it: its services, or the error to show. */
+type Listing = { services: BrokerService[] } | { error: string };
+
+// The dashboard operator manages every service. Only shared agents and the
+// global store are offered, so every key here is shared, and the global one is
+// the one that agents without a worker scope share.
+function panelRows(
+  services: BrokerService[],
+  agentName: string | null,
+): EgressCredentialService[] {
+  return services.map((service) => ({
+    ...service,
+    display_name: service.display_name ?? service.name,
+    is_shared: true,
+    is_global: agentName === null,
+    can_manage: true,
+  }));
+}
 
 type AuditRecord = EgressLogRecord & { duration_ms: number };
 
@@ -180,12 +202,15 @@ function ServiceSection({
   agentName,
   agentLabel,
   keysUnused,
+  initial,
 }: {
   agentName: string | null;
   /** How the agent, or the agents without a scope, reads in a sentence. */
   agentLabel: string;
   /** No agent uses these keys, so there is nothing to set or connect them for. */
   keysUnused: boolean;
+  /** The listing already read for this section, which it then does not read again on mount. */
+  initial?: Listing;
 }) {
   const config = useConfigStore((state) => state.config);
   const dirtyRoots = useConfigStore((state) => state.dirtyRoots);
@@ -195,9 +220,15 @@ function ServiceSection({
   );
   const saveConfig = useConfigStore((state) => state.saveConfig);
   const [services, setServices] = useState<EgressCredentialService[] | null>(
-    null,
+    () =>
+      initial && "services" in initial
+        ? panelRows(initial.services, agentName)
+        : null,
   );
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(() =>
+    initial && "error" in initial ? initial.error : null,
+  );
+  const [preloaded] = useState(initial !== undefined);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -216,31 +247,20 @@ function ServiceSection({
         withAgentName(API_ENDPOINTS.egressBroker.services, agentName),
       );
       if (request !== latest.current) return;
-      // The dashboard operator manages every service. Only shared agents and
-      // the global store are offered, so every key here is shared, and the
-      // global one is the one that agents without a worker scope share.
-      setServices(
-        payload.services.map((service) => ({
-          ...service,
-          display_name: service.display_name ?? service.name,
-          is_shared: true,
-          is_global: agentName === null,
-          can_manage: true,
-        })),
-      );
+      setServices(panelRows(payload.services, agentName));
       setError(null);
     } catch (cause) {
       if (request !== latest.current) return;
-      setError(errorText(cause, "Could not load the egress services."));
+      setError(errorText(cause, LISTING_ERROR_MESSAGE));
     }
   }, [agentName]);
 
   useEffect(() => {
-    void load();
+    if (!preloaded) void load();
     return () => {
       latest.current += 1;
     };
-  }, [load]);
+  }, [load, preloaded]);
 
   // Writes one config service through the store, as Settings does. When the
   // save fails the value goes back to what it was before this write. So does
@@ -538,7 +558,7 @@ function LogSection() {
     // A newer request or an unmount replaces `operation.current`; a timeout
     // only aborts the controller, so it still reaches the error state.
     const superseded = () => operation.current !== controller;
-    const timeout = setTimeout(() => controller.abort(), LOG_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     setLog({ kind: "loading" });
     try {
       const response = await fetch(
@@ -650,39 +670,83 @@ function LogSection() {
 }
 
 /**
- * The Agent Keys card, shown only while the egress broker is on. Every egress
- * route answers 404 while it is off, so one listing tells, and then nothing
- * else asks. Any other answer shows the card, which reports a failure itself.
+ * Read the unscoped listing to tell whether the broker is on: every egress
+ * route answers 404 while it is off. Any other answer is the listing, or the
+ * error the card shows for it, in `fetchJSON`'s words, an aborted read being
+ * its timeout.
+ */
+async function checkListing(signal: AbortSignal): Promise<Listing | "off"> {
+  try {
+    const response = await fetch(API_ENDPOINTS.egressBroker.services, {
+      credentials: "same-origin",
+      signal,
+    });
+    if (response.status === 404) return "off";
+    if (!response.ok) {
+      const payload: unknown = await response.json().catch(() => null);
+      return {
+        error: apiErrorMessageFromPayload(
+          payload,
+          `API call failed: ${response.status} ${response.statusText}`,
+        ),
+      };
+    }
+    const payload = (await response.json()) as { services: BrokerService[] };
+    return { services: payload.services };
+  } catch (cause) {
+    return {
+      error: signal.aborted
+        ? "API call timed out"
+        : errorText(cause, LISTING_ERROR_MESSAGE),
+    };
+  }
+}
+
+/**
+ * The Agent Keys card, shown only while the egress broker is on. One listing
+ * tells, and then nothing else asks while it is off. Any other answer shows
+ * the card, which starts from that listing or reports its failure. The check
+ * times out like the card's own requests and stops when the panel goes away.
  */
 export function EgressBroker() {
-  const [enabled, setEnabled] = useState(false);
+  const [check, setCheck] = useState<Listing | "off" | null>(null);
 
   useEffect(() => {
-    let current = true;
-    void fetch(API_ENDPOINTS.egressBroker.services, {
-      credentials: "same-origin",
-    })
-      .then(
-        (response) => response.status !== 404,
-        () => true,
-      )
-      .then((on) => {
-        if (current) setEnabled(on);
-      });
+    const controller = new AbortController();
+    let mounted = true;
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    void checkListing(controller.signal).then((result) => {
+      clearTimeout(timeout);
+      if (mounted) setCheck(result);
+    });
     return () => {
-      current = false;
+      mounted = false;
+      clearTimeout(timeout);
+      controller.abort();
     };
   }, []);
 
-  return enabled ? <AgentKeys /> : null;
+  return check === null || check === "off" ? null : (
+    <AgentKeys checked={check} />
+  );
 }
 
-/** The keys and accounts of the shared agents and of the agents without a scope, plus the request log. */
-function AgentKeys() {
+/**
+ * The keys and accounts of the shared agents and of the agents without a
+ * scope, plus the request log. `checked` is the unscoped listing the broker
+ * check read.
+ */
+function AgentKeys({ checked }: { checked: Listing }) {
   const agents = useConfigStore((state) => state.agents);
   const config = useConfigStore((state) => state.config);
   const defaults = config?.defaults;
   const [selected, setSelected] = useState<string | null>(null);
+  // Only the section shown first starts from the check's listing, when it is
+  // the unscoped one; a section shown later reads its own.
+  const [checkedListing, setCheckedListing] = useState<Listing | undefined>(
+    checked,
+  );
+  useEffect(() => setCheckedListing(undefined), []);
 
   // Brokered traffic only exists for agents that can run commands. Shared
   // agents come first, each with keys of its own. All agents without a worker
@@ -750,6 +814,7 @@ function AgentKeys() {
             agentName === null ? UNSCOPED_AGENTS : (target?.label ?? agentName)
           }
           keysUnused={target === undefined && config !== null}
+          initial={agentName === null ? checkedListing : undefined}
         />
         <LogSection />
       </CardContent>

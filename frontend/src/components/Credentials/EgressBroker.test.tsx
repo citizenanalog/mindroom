@@ -156,7 +156,8 @@ function requests(pathname: string, method = "GET") {
     .map(([input]) => new URL(String(input), "http://localhost"));
 }
 
-// The panel's first listing only checks that the broker is on; the loads come after it.
+// The panel's first listing checks that the broker is on, and the agents
+// without a scope start from it when they are shown first; the loads come after it.
 const listings = () => requests("/api/egress-broker/services").slice(1);
 
 const row = (name: string) => screen.getByRole("listitem", { name });
@@ -224,6 +225,73 @@ describe("whether the panel shows", () => {
     ).toBeInTheDocument();
     expect(await screen.findByText("Network down")).toBeInTheDocument();
   });
+
+  it("starts the keys of the agents without a scope from the check's listing, without reading it again", async () => {
+    render(<EgressBroker />);
+    expect(await screen.findByText("GitHub")).toBeInTheDocument();
+    // Give a second listing the chance to go out.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(
+      requests("/api/egress-broker/services").map((url) => url.search),
+    ).toEqual([""]);
+  });
+
+  it("gives up on a hung check and shows the panel with the timeout error", async () => {
+    // Testing Library's async helpers wait on real timers, so capture the
+    // 30 second timeouts instead of faking time.
+    const realSetTimeout = globalThis.setTimeout;
+    const timeouts: Array<() => void> = [];
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      callback: () => void,
+      delay?: number,
+    ) => {
+      if (delay !== 30_000) return realSetTimeout(callback, delay);
+      timeouts.push(callback);
+      return 0;
+    }) as unknown as typeof setTimeout);
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (
+        new URL(String(input), "http://localhost").pathname !==
+        "/api/egress-broker/services"
+      )
+        return logsResponse();
+      return new Promise<Response>((_, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("Aborted", "AbortError")),
+        );
+      });
+    });
+    const { container } = render(<EgressBroker />);
+    await waitFor(() => expect(timeouts).toHaveLength(1));
+    expect(container).toBeEmptyDOMElement();
+
+    await act(async () => {
+      timeouts.forEach((fire) => fire());
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent Keys" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("API call timed out")).toBeInTheDocument();
+  });
+
+  it("cancels the check when the panel goes away", async () => {
+    let signal: AbortSignal | undefined;
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      signal = init?.signal ?? undefined;
+      return new Promise<Response>(() => undefined);
+    });
+    const { unmount } = render(<EgressBroker />);
+    await waitFor(() => expect(signal).toBeDefined());
+    expect(signal?.aborted).toBe(false);
+
+    unmount();
+
+    expect(signal?.aborted).toBe(true);
+  });
 });
 
 describe("egress broker panel", () => {
@@ -290,7 +358,9 @@ describe("egress broker panel", () => {
         name: "Replace key for openai",
       }),
     ).toBeInTheDocument();
-    expect(listings()[0].search).toBe("");
+    expect(
+      requests("/api/egress-broker/services").map((url) => url.search),
+    ).toEqual([""]);
   });
 
   it("shows an error when the services cannot be loaded", async () => {
@@ -389,7 +459,11 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
     expect(optionsOf()).toEqual(["Agents without a scope"]);
     expect(screen.getByLabelText("Keys for")).toHaveValue("");
-    expect(listings()[0].searchParams.get("agent_name")).toBeNull();
+    expect(
+      requests("/api/egress-broker/services").map((url) =>
+        url.searchParams.get("agent_name"),
+      ),
+    ).toEqual([null]);
   });
 
   it("follows the default worker scope for agents without their own", async () => {
@@ -870,7 +944,7 @@ describe("egress broker connected accounts", () => {
       requests("/api/egress-broker/services/github/disconnect", "POST")[0]
         .search,
     ).toBe("");
-    await waitFor(() => expect(listings()).toHaveLength(2));
+    await waitFor(() => expect(listings()).toHaveLength(1));
   });
 });
 
@@ -1278,7 +1352,8 @@ describe("egress broker service editor", () => {
           String(input).startsWith("/api/connections"),
         ),
     ).toBe(false);
-    expect(listings()).toHaveLength(2);
+    // The reload after the save.
+    expect(listings()).toHaveLength(1);
   });
 
   it("loads the presets from the dashboard API when an editor opens, not before", async () => {
