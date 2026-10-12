@@ -191,7 +191,7 @@ function AgentEgress({
   // An array, even an empty one, marks an agent that can use egress credentials.
   if (!Array.isArray(services)) return null;
   // The catalog gives the agent's scope only through its services, which all share it.
-  const shared = services.some((service) => service.is_shared === true);
+  const shared = services.some((service) => service.is_shared);
   // Nobody who can change none of an agent's services manages it; with no services there is no telling.
   const viewOnly =
     services.length > 0 && services.every((service) => !service.can_manage);

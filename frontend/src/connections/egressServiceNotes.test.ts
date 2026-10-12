@@ -78,9 +78,6 @@ describe("the note on whose service this is", () => {
     expect(scopeNote("user", "Code", ["Code", "Research", "Notes"])).toBe(
       "All your agents that share your personal workspace use this service and its key: Code, Research, Notes.",
     );
-    expect(scopeNote("user", "Code", [])).toBe(
-      "All your agents that share your personal workspace use this service and its key: Code.",
-    );
   });
 
   it("says nothing for shared, unscoped, or unknown scopes", () => {

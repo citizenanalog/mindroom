@@ -94,7 +94,7 @@ export function removeLimitWarning(
 ): string {
   const who = {
     user_agent: `Your ${agent}`,
-    user: `All your agents that share your personal workspace (${(agents.length > 0 ? agents : [agent]).join(", ")})`,
+    user: `All your agents that share your personal workspace (${agents.join(", ")})`,
     shared: `Everyone using ${agent}`,
     unscoped: "Every agent without a scope",
   }[scope];
@@ -113,7 +113,7 @@ export function deleteServiceWarning(
   if (scope === "user_agent")
     return `This deletes the service and its saved key. Your ${agent} loses access through it.`;
   if (scope === "user")
-    return `This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: ${(agents.length > 0 ? agents : [agent]).join(", ")}.`;
+    return `This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: ${agents.join(", ")}.`;
   if (scope === "unscoped")
     return "This deletes the service and its shared key. Every agent without a scope loses access through it.";
   return `This deletes the service and its shared key. Everyone using ${agent} loses access through it.`;

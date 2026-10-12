@@ -89,9 +89,6 @@ describe("account copy", () => {
     ).toBe(
       "This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Coder, Writer, Scripter.",
     );
-    expect(deleteServiceWarning("user", "Coder", [])).toBe(
-      "This deletes the service and its saved key. All your agents that share your personal workspace lose access through it: Coder.",
-    );
     expect(deleteServiceWarning("shared", "Team Bot", [])).toBe(
       "This deletes the service and its shared key. Everyone using Team Bot loses access through it.",
     );

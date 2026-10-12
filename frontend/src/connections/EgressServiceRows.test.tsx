@@ -352,24 +352,6 @@ describe("egress service rows", () => {
     ).toBeInTheDocument();
   });
 
-  it("says the key is not shared when the scope is unknown", async () => {
-    render(
-      <EgressServiceRows
-        agentName="personal"
-        services={[{ ...openai, is_shared: null }]}
-        onChanged={vi.fn()}
-      />,
-    );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Remove key for OpenAI" }),
-    );
-    expect(
-      await screen.findByText(
-        "This deletes the saved key. The agent loses access to this service until a key is set again.",
-      ),
-    ).toBeInTheDocument();
-  });
-
   it("reports a forbidden save with the connections wording by default", async () => {
     vi.mocked(fetch).mockImplementation(async () => json({}, 403));
     render(
@@ -1426,22 +1408,6 @@ describe("rows with an agent's wording", () => {
         button.click();
       });
       expect(window.open).toHaveBeenCalledTimes(1);
-    });
-
-    it("asks when the agent is shared even if the service cannot tell, as on the dashboard", async () => {
-      const unknown = { ...sharedGoogle, is_shared: null };
-      renderRows(
-        [unknown],
-        agent({ shared: true, displayName: "Shared Dev", services: [unknown] }),
-      );
-      fireEvent.click(
-        screen.getByRole("button", { name: "Connect Google for Gmail" }),
-      );
-      expect(
-        await screen.findByRole("dialog", {
-          name: "Connect a shared account?",
-        }),
-      ).toBeVisible();
     });
 
     it("does not ask for a requester's own account that a shared sandbox uses by opt-in", async () => {

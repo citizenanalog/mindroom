@@ -111,9 +111,7 @@ export function scopeNote(
 ): string | null {
   if (scope === "user_agent")
     return `Only your ${agent} uses this service and its key.`;
-  if (scope === "user") {
-    const agents = scopeAgents.length > 0 ? scopeAgents : [agent];
-    return `All your agents that share your personal workspace use this service and its key: ${agents.join(", ")}.`;
-  }
+  if (scope === "user")
+    return `All your agents that share your personal workspace use this service and its key: ${scopeAgents.join(", ")}.`;
   return null;
 }

@@ -100,8 +100,6 @@ export function statusLabel(
 export function removeWarning(service: EgressCredentialService): string {
   if (service.is_global)
     return "This deletes the global key, which every agent without a worker scope shares. Those agents lose access to this service until a key is set again.";
-  if (service.is_shared === null)
-    return "This deletes the saved key. The agent loses access to this service until a key is set again.";
   // A shared agent's key, or for an agent without a worker scope the global
   // key, so other agents may rely on it too.
   if (service.is_shared)
