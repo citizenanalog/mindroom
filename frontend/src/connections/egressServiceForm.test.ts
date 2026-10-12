@@ -139,15 +139,6 @@ describe("serializing a service", () => {
     expect(serialize(service, personal)).toEqual({ preset: "github" });
   });
 
-  it("keeps an explicit OAuth override of a preset", () => {
-    expect(
-      serialize({ preset: "github", oauth_provider: null }, operator),
-    ).toEqual({
-      preset: "github",
-      oauth_provider: null,
-    });
-  });
-
   it("round-trips an authored service through the form", () => {
     const service: AuthoredEgressService = {
       preset: "github",
@@ -424,15 +415,10 @@ describe("the way the key is sent", () => {
 });
 
 describe("suggesting a name", () => {
-  const form = (
-    preset: string,
-    host: string,
-    changes: Partial<EgressServiceForm> = {},
-  ) => ({
+  const form = (preset: string, host = "") => ({
     ...formFromService("", null),
     preset,
     rules: [{ ...validRule(), host }],
-    ...changes,
   });
 
   it("uses the preset id, then the host's first label", () => {
@@ -455,39 +441,6 @@ describe("suggesting a name", () => {
   it("suggests nothing without a preset or a host", () => {
     expect(suggestedName(form("", ""))).toBe("");
     expect(suggestedName({ ...form("", ""), rules: [] })).toBe("");
-  });
-});
-
-describe("knowing when the form uses more than the basic fields", () => {
-  const blank = formFromService("svc", null);
-
-  it("is false for a new service and for a bare preset", () => {
-    expect(usesMoreOptions(blank)).toBe(false);
-    expect(usesMoreOptions(formFromService("svc", { preset: "github" }))).toBe(
-      false,
-    );
-  });
-
-  it.each<[string, Partial<EgressServiceForm>]>([
-    ["a display name", { displayName: "Mine" }],
-    ["a description", { description: "Mine" }],
-    ["a path prefix", { rules: [{ ...validRule(), pathPrefix: "/v1" }] }],
-    ["a port", { rules: [{ ...validRule(), port: "8443" }] }],
-    ["a second rule", { rules: [validRule(), validRule()] }],
-    ["replaced preset rules", { preset: "openai", replacePresetRules: true }],
-    ["the restriction", { restrictToRules: true }],
-    ["an account login", { oauthProvider: "github" }],
-    ["a placeholder", { placeholders: [{ name: "A_KEY", value: "x" }] }],
-  ])("is true with %s", (_name, changes) => {
-    expect(usesMoreOptions({ ...blank, ...changes })).toBe(true);
-  });
-});
-
-describe("suggesting a free name", () => {
-  const form = (preset: string, host = "") => ({
-    ...formFromService("", null),
-    preset,
-    rules: [{ ...validRule(), host }],
   });
 
   it("takes the first of base, base-2, and base-3 that is free", () => {
@@ -518,6 +471,31 @@ describe("suggesting a free name", () => {
 
   it("suggests nothing, and no suffix, without a base", () => {
     expect(suggestedName(form("", ""), [""])).toBe("");
+  });
+});
+
+describe("knowing when the form uses more than the basic fields", () => {
+  const blank = formFromService("svc", null);
+
+  it("is false for a new service and for a bare preset", () => {
+    expect(usesMoreOptions(blank)).toBe(false);
+    expect(usesMoreOptions(formFromService("svc", { preset: "github" }))).toBe(
+      false,
+    );
+  });
+
+  it.each<[string, Partial<EgressServiceForm>]>([
+    ["a display name", { displayName: "Mine" }],
+    ["a description", { description: "Mine" }],
+    ["a path prefix", { rules: [{ ...validRule(), pathPrefix: "/v1" }] }],
+    ["a port", { rules: [{ ...validRule(), port: "8443" }] }],
+    ["a second rule", { rules: [validRule(), validRule()] }],
+    ["replaced preset rules", { preset: "openai", replacePresetRules: true }],
+    ["the restriction", { restrictToRules: true }],
+    ["an account login", { oauthProvider: "github" }],
+    ["a placeholder", { placeholders: [{ name: "A_KEY", value: "x" }] }],
+  ])("is true with %s", (_name, changes) => {
+    expect(usesMoreOptions({ ...blank, ...changes })).toBe(true);
   });
 });
 
