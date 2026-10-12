@@ -7808,6 +7808,7 @@
       "icon": "KeyRound",
       "icon_color": "text-amber-600",
       "name": "egress_credentials",
+      "requires_conversation": false,
       "requires_primary_runtime": true,
       "requires_room_context": false,
       "setup_type": "none",
