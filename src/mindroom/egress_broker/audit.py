@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path  # noqa: TC003 - Required at runtime for AuditLog.__init__ parameter
 from typing import Literal
@@ -29,6 +29,12 @@ class AuditRecord:
     duration_ms: int
     code: str | None = None
     """The `error` code of the JSON body a refusal answered with; None for a forwarded request."""
+
+
+# AuditRecord's fields, in order, so INSERT and SELECT follow the dataclass.
+_FIELDS = [field.name for field in fields(AuditRecord)]
+_COLUMNS = ", ".join(_FIELDS)
+_INSERT = f"INSERT INTO audit ({_COLUMNS}) VALUES ({', '.join(f':{name}' for name in _FIELDS)})"  # noqa: S608
 
 
 class AuditLog:
@@ -96,34 +102,9 @@ class AuditLog:
 
     def record(self, rec: AuditRecord) -> None:
         """Store `rec` without the path's query string; every 1000th insert prunes old records."""
-        # Strip query string from path
-        path_without_query = rec.path.split("?", 1)[0]
-
+        row = {**asdict(rec), "at": rec.at.isoformat(), "path": rec.path.split("?", 1)[0]}
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO audit (
-                    at, kind, scope, agent_name, requester_id, method,
-                    host, path, service, status, bytes_up, bytes_down, duration_ms, code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    rec.at.isoformat(),
-                    rec.kind,
-                    rec.scope,
-                    rec.agent_name,
-                    rec.requester_id,
-                    rec.method,
-                    rec.host,
-                    path_without_query,
-                    rec.service,
-                    rec.status,
-                    rec.bytes_up,
-                    rec.bytes_down,
-                    rec.duration_ms,
-                    rec.code,
-                ),
-            )
+            self._conn.execute(_INSERT, row)
             self._conn.commit()
 
             # Prune every 1000 inserts
@@ -143,46 +124,19 @@ class AuditLog:
         limit: int = 200,
     ) -> list[AuditRecord]:
         """Return up to `limit` records matching every given filter exactly, newest first; callers bound `limit`."""
-        # Build query with filters
-        conditions = []
-        params = []
-
-        if agent_name is not None:
-            conditions.append("agent_name = ?")
-            params.append(agent_name)
-
-        if scope is not None:
-            conditions.append("scope = ?")
-            params.append(scope)
-
-        if requester_id is not None:
-            conditions.append("requester_id = ?")
-            params.append(requester_id)
-
-        if host is not None:
-            conditions.append("host = ?")
-            params.append(host)
-
-        if service is not None:
-            conditions.append("service = ?")
-            params.append(service)
-
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        query = f"""
-            SELECT at, kind, scope, agent_name, requester_id, method,
-                   host, path, service, status, bytes_up, bytes_down, duration_ms, code
-            FROM audit
-            WHERE {where_clause}
-            ORDER BY at DESC
-            LIMIT ?
-        """  # noqa: S608 - where_clause is constructed from hardcoded conditions only
-        params.append(limit)
-
+        filters = {
+            "agent_name": agent_name,
+            "scope": scope,
+            "requester_id": requester_id,
+            "host": host,
+            "service": service,
+        }
+        params = {name: value for name, value in filters.items() if value is not None}
+        where = " AND ".join(f"{name} = :{name}" for name in params) or "1=1"
+        # Column names come only from AuditRecord and the literal keys above.
+        query = f"SELECT {_COLUMNS} FROM audit WHERE {where} ORDER BY at DESC LIMIT :limit"  # noqa: S608
         with self._lock:
-            cursor = self._conn.execute(query, params)
-            rows = cursor.fetchall()
-
-        # The SELECT lists the columns in AuditRecord's field order.
+            rows = self._conn.execute(query, {**params, "limit": limit}).fetchall()
         return [AuditRecord(datetime.fromisoformat(row[0]).replace(tzinfo=UTC), *row[1:]) for row in rows]
 
     def prune(self) -> int:
