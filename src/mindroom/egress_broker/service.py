@@ -17,7 +17,7 @@ from mindroom.config.egress_broker import EgressBrokerConfig
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.ca import BrokerCA
 from mindroom.egress_broker.dial import DialPolicy
-from mindroom.egress_broker.env import broker_execution_env, primary_callback_hosts
+from mindroom.egress_broker.env import broker_execution_env, egress_broker_enabled, primary_callback_hosts
 from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.oauth_source import oauth_status, resolve_oauth_token
 from mindroom.egress_broker.proxy import EgressBroker
@@ -123,9 +123,9 @@ def _broker_settings(runtime_paths: RuntimePaths) -> _BrokerSettings | None:
     def env(key: str) -> str:
         return (runtime_paths.env_value(EGRESS_BROKER_ENV_BY_KEY[key]) or "").strip()
 
-    if not (raw_port := env("port")):
+    if not egress_broker_enabled(runtime_paths):
         return None
-    port = _positive_int(EGRESS_BROKER_ENV_BY_KEY["port"], raw_port, maximum=65535)
+    port = _positive_int(EGRESS_BROKER_ENV_BY_KEY["port"], env("port"), maximum=65535)
     if not (url := env("url")):
         msg = f"{EGRESS_BROKER_ENV_BY_KEY['url']} is required when {EGRESS_BROKER_ENV_BY_KEY['port']} is set"
         raise ValueError(msg)

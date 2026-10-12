@@ -32,6 +32,7 @@ from mindroom.constants import ROUTER_AGENT_NAME, tracking_dir
 from mindroom.credentials.legacy_tool_credentials import migrate_tool_credential_defaults
 from mindroom.delegation.recovery import cancel_approval_delegations
 from mindroom.desktop.identity import controller_identity_for_live_bot
+from mindroom.egress_broker.env import egress_broker_enabled
 from mindroom.embeddings.embedder_health import check_embedder_health, handle_embedder_config_reload
 from mindroom.entity_resolution import (
     DuplicateManagedEntityIdentityError,
@@ -87,7 +88,6 @@ from mindroom.memory import MemoryAutoFlushWorker, auto_flush_enabled
 from mindroom.private_storage.legacy_private_storage import migrate_private_storage
 from mindroom.response_activity import ResponseIdentity
 from mindroom.response_admission import ResponseAdmissionGate
-from mindroom.runtime_env_policy import EGRESS_BROKER_ENV_BY_KEY
 from mindroom.runtime_shutdown import (
     ENTITY_REMOVED_SHUTDOWN,
     ORDERLY_SHUTDOWN,
@@ -3199,7 +3199,7 @@ async def _run_runtime(  # noqa: PLR0915
                 ),
                 name="api_server",
             )
-        elif (runtime_paths.env_value(EGRESS_BROKER_ENV_BY_KEY["port"]) or "").strip():
+        elif egress_broker_enabled(runtime_paths):
             logger.warning(
                 "egress_broker_not_started",
                 reason="the egress broker runs with the embedded API server, which is disabled",

@@ -1,4 +1,4 @@
-"""Worker execution env overlay and runner CA bundle materialization."""
+"""Whether the broker is enabled, the worker execution env overlay, and runner CA bundle materialization."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from collections.abc import Iterable, Mapping  # noqa: TC003
 from pathlib import Path  # noqa: TC003
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+
+from mindroom.runtime_env_policy import EGRESS_BROKER_ENV_BY_KEY
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
@@ -15,6 +17,7 @@ __all__ = [
     "RUNNER_CA_BUNDLE_ENV",
     "apply_runner_ca_bundle",
     "broker_execution_env",
+    "egress_broker_enabled",
     "primary_callback_hosts",
 ]
 
@@ -23,6 +26,15 @@ BROKER_CA_PEM_ENV = "MINDROOM_EGRESS_BROKER_CA_PEM"
 RUNNER_CA_BUNDLE_ENV = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
 # Not a secret: the broker ignores it. Clients that drop credentials with an empty password need a value here.
 _PROXY_PASSWORD = "mindroom"  # noqa: S105
+
+
+def egress_broker_enabled(runtime_paths: RuntimePaths) -> bool:
+    """Return whether this deployment runs the egress broker, which its port setting decides.
+
+    Every Agent Keys surface (its API routes, pages, catalog fields, and tool) follows this, so with the port unset
+    nothing of the feature shows or runs. A set but invalid port counts as enabled, so startup refuses it loudly.
+    """
+    return bool((runtime_paths.env_value(EGRESS_BROKER_ENV_BY_KEY["port"]) or "").strip())
 
 
 def broker_execution_env(

@@ -12,6 +12,7 @@ from mindroom.egress_broker.env import (
     BROKER_CA_PEM_ENV,
     apply_runner_ca_bundle,
     broker_execution_env,
+    egress_broker_enabled,
     primary_callback_hosts,
 )
 
@@ -199,3 +200,31 @@ def test_primary_callback_hosts(tmp_path: Path, process_env: dict[str, str], exp
     )
 
     assert primary_callback_hosts(runtime_paths) == expected_hosts
+
+
+@pytest.mark.parametrize(
+    ("process_env", "enabled"),
+    [
+        pytest.param({}, False, id="unset"),
+        pytest.param({"MINDROOM_EGRESS_BROKER_PORT": "   "}, False, id="blank"),
+        pytest.param({"MINDROOM_EGRESS_BROKER_PORT": "8768"}, True, id="set"),
+        # An invalid port still counts, so startup refuses it instead of the feature silently disappearing.
+        pytest.param({"MINDROOM_EGRESS_BROKER_PORT": "http"}, True, id="invalid"),
+        # The worker-facing URL alone does not start the broker.
+        pytest.param({"MINDROOM_EGRESS_BROKER_URL": "http://broker.local:8768"}, False, id="url-only"),
+    ],
+)
+def test_egress_broker_enabled_follows_the_port_setting(
+    tmp_path: Path,
+    process_env: dict[str, str],
+    *,
+    enabled: bool,
+) -> None:
+    """The broker, and with it every Agent Keys surface, is enabled exactly when its port setting is set."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env=process_env,
+    )
+
+    assert egress_broker_enabled(runtime_paths) is enabled
