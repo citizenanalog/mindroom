@@ -58,40 +58,22 @@ export function githubRepositoryRules(
   if (errors.length > 0) return { rules: [], errors, repositories: [] };
   const rules: EgressRule[] = [];
   for (const { owner, repo } of targets.values()) {
-    if (repo === "*") {
-      rules.push(
-        {
-          host: GITHUB_API_HOST,
-          path_prefix: `/repos/${owner}/`,
-          auth: bearer,
-        },
-        { host: GITHUB_WEB_HOST, path_prefix: `/${owner}/`, auth: git },
-      );
-      if (options.uploads)
-        rules.push({
-          host: GITHUB_UPLOADS_HOST,
-          path_prefix: `/repos/${owner}/`,
-          auth: bearer,
-        });
-      continue;
-    }
+    // An owner's prefix ends in a slash, which matches every path below it.
+    const target = repo === "*" ? `${owner}/` : `${owner}/${repo}`;
     rules.push(
-      {
-        host: GITHUB_API_HOST,
-        path_prefix: `/repos/${owner}/${repo}`,
-        auth: bearer,
-      },
-      { host: GITHUB_WEB_HOST, path_prefix: `/${owner}/${repo}`, auth: git },
-      {
-        host: GITHUB_WEB_HOST,
-        path_prefix: `/${owner}/${repo}.git`,
-        auth: git,
-      },
+      { host: GITHUB_API_HOST, path_prefix: `/repos/${target}`, auth: bearer },
+      { host: GITHUB_WEB_HOST, path_prefix: `/${target}`, auth: git },
     );
+    if (repo !== "*")
+      rules.push({
+        host: GITHUB_WEB_HOST,
+        path_prefix: `/${target}.git`,
+        auth: git,
+      });
     if (options.uploads)
       rules.push({
         host: GITHUB_UPLOADS_HOST,
-        path_prefix: `/repos/${owner}/${repo}`,
+        path_prefix: `/repos/${target}`,
         auth: bearer,
       });
   }
