@@ -28,10 +28,15 @@ from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.mitm import _verifying_context
 from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretNeedsReconnect, SecretUnavailable
 from tests.egress_broker.conftest import (
+    AMBIGUOUS_PATH,
     BODY_TOO_LARGE,
     BROKER_ERROR,
+    CONNECT_URL,
     DEFAULT_CLAIMS,
+    LOCALHOST_BLOCKED,
+    LOCALHOST_UNREACHABLE,
     MALFORMED,
+    MANAGE_URL,
     METHOD_NOT_ALLOWED,
     PROXY_AUTHENTICATION_REQUIRED,
     assert_audited,
@@ -40,6 +45,7 @@ from tests.egress_broker.conftest import (
     env_without_proxies,
     free_port,
     git_ls_remote,
+    host_not_allowed,
     proxy_authorization,
     read_raw_response,
     run_command,
@@ -52,23 +58,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    import httpx
-
     from mindroom.egress_broker.audit import AuditLog
     from mindroom.egress_broker.tokens import WorkerClaims
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, ServeFactory, Upstream, UpstreamCA
+    from tests.egress_broker.conftest import BrokerFactory, ProxyClient, RawResponse, ServeFactory, Upstream, UpstreamCA
 
-    ProxyClient = Callable[..., httpx.AsyncClient]
-
-MANAGE_URL = "https://m.test/connections/egress"
-CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
 SECRET = "s3cret"  # noqa: S105 - test credential the fake upstream expects
-AMBIGUOUS_PATH = {
-    "error": "bad_request",
-    "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
-    "Use a plain path.",
-}
-LOCALHOST_UNREACHABLE = {"error": "upstream_unreachable", "message": "localhost could not be reached."}
 RECONNECT_MESSAGE = (
     "The github account for svc must be connected again. Ask the user to reconnect at connect_url or manage_url."
 )
@@ -864,10 +858,7 @@ async def test_blocked_upstream_gets_403(
     response = await client.get(tls_upstream.url("/echo"))
 
     assert response.status_code == 403
-    assert response.json() == {
-        "error": "destination_blocked",
-        "message": "localhost resolves to a private or internal address, which agents may not reach.",
-    }
+    assert response.json() == LOCALHOST_BLOCKED
     assert tls_upstream.hits == []
     await assert_audited(audit, kind="denied", status=403, code="destination_blocked")
 
@@ -991,11 +982,7 @@ async def test_open_tunnel_follows_config_changes(
 
     assert first.json()["headers"]["authorization"] == [f"Bearer {SECRET}"]
     assert second.status_code == 403
-    assert second.json() == {
-        "error": "host_not_allowed",
-        "services": ["svc"],
-        "message": "localhost is not allowed by the administrator's egress policy.",
-    }
+    assert second.json() == host_not_allowed("svc")
     assert tls_upstream.hits == ["/echo"]
 
 

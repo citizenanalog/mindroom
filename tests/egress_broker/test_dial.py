@@ -20,12 +20,10 @@ from mindroom.server_fetch_url import ServerFetchUrlError
 from tests.egress_broker.conftest import connect_request, plain_request, proxy_authorization
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Callable, Iterator
 
     from mindroom.egress_broker.proxy import EgressBroker
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse
-
-    RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
+    from tests.egress_broker.conftest import BrokerFactory, RawProxy
 
 _PUBLIC = "93.184.216.34"
 _OTHER_PUBLIC = "93.184.216.35"

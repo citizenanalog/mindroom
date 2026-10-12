@@ -56,6 +56,7 @@ from .conftest import (
     connect_account,
     connect_request,
     free_port,
+    host_not_allowed,
     proxy_authorization,
     worker_target,
 )
@@ -88,11 +89,6 @@ _PUBLIC_URL = "https://chat.example.org"
 _PROVIDERS = frozenset({"github"})
 _NO_GITHUB_KEY = "No github key is set for this agent. Ask the user to add one at manage_url, then retry."
 _NO_SHARED_GITHUB_KEY = "No github key is set for this shared agent. Only an administrator can add one, at manage_url."
-_OPENAI_ONLY = {
-    "error": "host_not_allowed",
-    "services": ["openai"],
-    "message": "localhost is not allowed by the administrator's egress policy.",
-}
 
 
 @pytest.fixture
@@ -375,7 +371,7 @@ async def test_last_good_config_survives_unreadable_config(
             state["mode"] = mode
             responses.append(await raw_proxy(port, connect))
     assert [(response.status, response.json()) for response in responses] == [
-        (403, _OPENAI_ONLY),
+        (403, host_not_allowed("openai")),
     ] * 3
     assert tls_upstream.hits == []
 
@@ -1265,7 +1261,7 @@ async def test_user_service_cannot_open_a_host_under_deny(
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
         connect = connect_request(f"localhost:{tls_upstream.port}", authorization=proxy_authorization(_token(env)))
         response = await raw_proxy(port, connect)
-    assert (response.status, response.json()) == (403, _OPENAI_ONLY)
+    assert (response.status, response.json()) == (403, host_not_allowed("openai"))
     assert tls_upstream.hits == []
 
 

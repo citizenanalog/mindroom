@@ -18,9 +18,12 @@ from mindroom.egress_broker.env import broker_execution_env
 from mindroom.egress_broker.tokens import TokenSigner
 from mindroom.server_fetch_url import ServerFetchUrlError
 from tests.egress_broker.conftest import (
+    AMBIGUOUS_PATH,
     BODY_TOO_LARGE,
     BROKER_ERROR,
     DEFAULT_CLAIMS,
+    LOCALHOST_BLOCKED,
+    LOCALHOST_UNREACHABLE,
     MALFORMED,
     METHOD_NOT_ALLOWED,
     PROXY_AUTHENTICATION_REQUIRED,
@@ -28,6 +31,7 @@ from tests.egress_broker.conftest import (
     audit_records,
     connect_request,
     free_port,
+    host_not_allowed,
     plain_request,
     proxy_authorization,
     read_raw_response,
@@ -37,32 +41,13 @@ from tests.egress_broker.conftest import (
 from tests.egress_broker.raw_http import open_client
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator
     from pathlib import Path
-
-    import httpx
 
     from mindroom.egress_broker.audit import AuditLog
     from mindroom.egress_broker.proxy import EgressBroker
     from mindroom.egress_broker.tokens import WorkerClaims
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, ServeFactory, Upstream, UpstreamCA
-
-    RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
-    ProxyClient = Callable[..., httpx.AsyncClient]
-
-
-LOCALHOST_BLOCKED = {
-    "error": "destination_blocked",
-    "message": "localhost resolves to a private or internal address, which agents may not reach.",
-}
-
-
-def _host_not_allowed(*services: str) -> dict[str, object]:
-    return {
-        "error": "host_not_allowed",
-        "services": list(services),
-        "message": "localhost is not allowed by the administrator's egress policy.",
-    }
+    from tests.egress_broker.conftest import BrokerFactory, ProxyClient, RawProxy, ServeFactory, Upstream, UpstreamCA
 
 
 def _plain_get(upstream: Upstream, path: str, token: str) -> bytes:
@@ -209,7 +194,7 @@ async def test_deny_ignores_user_rules_on_hosts_the_operator_does_not_name(
     )
     plain = await raw_proxy(started.port, _plain_get(http_upstream, "/echo", token))
 
-    denied = _host_not_allowed("svc")
+    denied = host_not_allowed("svc")
     assert (connect.status, connect.json()) == (403, denied)
     assert (plain.status, plain.json()) == (403, denied)
     assert broker.resolved == []
@@ -305,7 +290,7 @@ async def test_unmatched_host_denied_under_deny_policy(
     assert response.status == 403
     assert response.headers["content-type"] == "application/json"
     assert response.headers["connection"] == "close"
-    assert response.json() == _host_not_allowed("github", "openai")
+    assert response.json() == host_not_allowed("github", "openai")
     await assert_audited(audit, kind="denied", status=403, host="localhost", method="CONNECT", code="host_not_allowed")
 
 
@@ -469,11 +454,7 @@ async def test_plain_http_ambiguous_path_on_rule_host_gets_400(
     response = await raw_proxy(started.port, _plain_get(http_upstream, f"{target}?page=2", broker.token()))
 
     assert response.status == 400
-    assert response.json() == {
-        "error": "bad_request",
-        "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) "
-        "and was refused. Use a plain path.",
-    }
+    assert response.json() == AMBIGUOUS_PATH
     assert http_upstream.hits == []
     assert broker.resolved == []
     await assert_audited(audit, kind="denied", status=400, path=target, service=None, code="bad_request")
@@ -643,7 +624,7 @@ async def test_plain_http_denied_under_deny_policy(
     response = await client.get(http_upstream.url("/echo"))
 
     assert response.status_code == 403
-    assert response.json() == _host_not_allowed("svc")
+    assert response.json() == host_not_allowed("svc")
     assert http_upstream.hits == []
 
 
@@ -829,7 +810,7 @@ async def test_plain_http_unreachable_upstream_gets_502(
     response = await client.get(f"http://localhost:{free_port()}/echo")
 
     assert response.status_code == 502
-    assert response.json() == {"error": "upstream_unreachable", "message": "localhost could not be reached."}
+    assert response.json() == LOCALHOST_UNREACHABLE
     await assert_audited(audit, kind="request", status=502, path="/echo", code="upstream_unreachable")
 
 

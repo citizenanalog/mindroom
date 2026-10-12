@@ -24,9 +24,7 @@ if TYPE_CHECKING:
 
     import httpx
 
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, UpstreamCA
-
-    RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
+    from tests.egress_broker.conftest import BrokerFactory, RawProxy, UpstreamCA
 
 _PUBLIC = ipaddress.IPv4Address("93.184.216.34")
 _RESPONSE = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"

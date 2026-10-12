@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mindroom.egress_broker.messages import refusal_body
-
-_CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
+from tests.egress_broker.conftest import CONNECT_URL
 
 
 @pytest.mark.parametrize(
@@ -208,7 +207,7 @@ def test_body_keeps_its_fields_and_adds_only_service_and_provider() -> None:
         provider="github",
         connectable=True,
         manage_url="https://m.test/connections/egress",
-        connect_url=_CONNECT_URL,
+        connect_url=CONNECT_URL,
     )
 
     assert body == {
@@ -216,7 +215,7 @@ def test_body_keeps_its_fields_and_adds_only_service_and_provider() -> None:
         "service": "github",
         "provider": "github",
         "manage_url": "https://m.test/connections/egress",
-        "connect_url": _CONNECT_URL,
+        "connect_url": CONNECT_URL,
         "message": "No github credential is set for this agent. "
         "Ask the user to connect it at connect_url or add a key at manage_url, then retry.",
     }

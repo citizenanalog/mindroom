@@ -10,6 +10,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from tests.egress_broker.conftest import (
+    LOCALHOST_UNREACHABLE,
     connect_request,
     proxy_authorization,
     read_raw_response,
@@ -191,7 +192,7 @@ async def test_upstream_tls_failure_gets_502_without_fallback(
 
     assert reply is not None
     assert reply.status == 502
-    assert json.loads(reply.body) == {"error": "upstream_unreachable", "message": "localhost could not be reached."}
+    assert json.loads(reply.body) == LOCALHOST_UNREACHABLE
     assert closed is True
     if upstream is not None:
         # The handshake failed before the upstream read anything.

@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     from tests.egress_broker.raw_http import Script, UpstreamFactory
 
 type ServeFactory = Callable[..., Awaitable[int]]
+type RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
+type ProxyClient = Callable[..., httpx.AsyncClient]
 
 DEFAULT_CLAIMS = WorkerClaims(
     worker_key="worker-alice-code",
@@ -265,7 +267,8 @@ async def _upload(request: web.Request) -> web.Response:
     return web.json_response({"length": length})
 
 
-def _pkt_line(payload: bytes) -> bytes:
+def pkt_line(payload: bytes) -> bytes:
+    """Frame one pkt-line the way git reads it: the length, prefix included, as four lowercase hex digits."""
     return f"{len(payload) + 4:04x}".encode() + payload
 
 
@@ -276,10 +279,10 @@ async def _git_info_refs(request: web.Request) -> web.Response:
         return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="git"'})
     sha = b"1" * 40
     body = (
-        _pkt_line(b"# service=git-upload-pack\n")
+        pkt_line(b"# service=git-upload-pack\n")
         + b"0000"
-        + _pkt_line(sha + b" HEAD\0agent=egress-broker-test\n")
-        + _pkt_line(sha + b" refs/heads/main\n")
+        + pkt_line(sha + b" HEAD\0agent=egress-broker-test\n")
+        + pkt_line(sha + b" refs/heads/main\n")
         + b"0000"
     )
     return web.Response(body=body, content_type="application/x-git-upload-pack-advertisement")
@@ -599,6 +602,28 @@ METHOD_NOT_ALLOWED = {
     "message": "TRACE and TRACK requests are refused because the server would echo the request, "
     "injected credential included, back to the agent.",
 }
+AMBIGUOUS_PATH = {
+    "error": "bad_request",
+    "message": "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
+    "Use a plain path.",
+}
+LOCALHOST_UNREACHABLE = {"error": "upstream_unreachable", "message": "localhost could not be reached."}
+LOCALHOST_BLOCKED = {
+    "error": "destination_blocked",
+    "message": "localhost resolves to a private or internal address, which agents may not reach.",
+}
+# The links a broker started with `manage_url=MANAGE_URL`, or a lookup returning `CONNECT_URL`, puts in refusals.
+MANAGE_URL = "https://m.test/connections/egress"
+CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
+
+
+def host_not_allowed(*services: str) -> dict[str, object]:
+    """Return the refusal body for ``localhost`` under a deny policy whose operator services are `services`."""
+    return {
+        "error": "host_not_allowed",
+        "services": list(services),
+        "message": "localhost is not allowed by the administrator's egress policy.",
+    }
 
 
 def single_rule_config(

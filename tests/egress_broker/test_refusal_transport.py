@@ -10,25 +10,24 @@ import pytest
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import SecretMissing, SecretNeedsReconnect
-from tests.egress_broker.conftest import audit_records, git_ls_remote, proxy_authorization
+from tests.egress_broker.conftest import (
+    CONNECT_URL,
+    MANAGE_URL,
+    audit_records,
+    git_ls_remote,
+    pkt_line,
+    proxy_authorization,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
     from pathlib import Path
-
-    import httpx
 
     from mindroom.egress_broker.audit import AuditLog
     from mindroom.egress_broker.secrets import SecretResult
-    from tests.egress_broker.conftest import BrokerFactory, RawResponse, Upstream
-
-    ProxyClient = Callable[..., httpx.AsyncClient]
-    RawProxy = Callable[[int, bytes], Awaitable[RawResponse]]
+    from tests.egress_broker.conftest import BrokerFactory, ProxyClient, RawProxy, Upstream
 
 MISSING_KEY = "No svc key is set for this agent. Ask the user to add one at manage_url, then retry."
 TLS_REQUIRED = "Credentials are only added over HTTPS. Use https:// for localhost."
-MANAGE_URL = "https://m.test/connections/egress"
-CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time-token"
 GIT_USER_AGENT = {"User-Agent": "git/2.55.0"}
 
 
@@ -46,12 +45,6 @@ def _plain_get(target: str, *, token: str | None, method: str = "GET", git: bool
     if git:
         lines.append(f"User-Agent: {GIT_USER_AGENT['User-Agent']}")
     return ("\r\n".join(lines) + "\r\n\r\n").encode()
-
-
-def _pkt_line(text: str) -> bytes:
-    """Frame one pkt-line the way git reads it: the length, prefix included, as four lowercase hex digits."""
-    data = text.encode()
-    return f"{len(data) + 4:04x}".encode() + data
 
 
 @pytest.mark.asyncio
@@ -181,7 +174,7 @@ async def test_git_discovery_refusal_in_a_tunnel_is_an_advertisement_ending_in_e
     assert response.headers["content-type"] == f"application/x-{service}-advertisement"
     assert response.headers["x-mindroom-error"] == "credential_not_configured"
     assert response.reason_phrase == MISSING_KEY
-    assert response.content == first_line + b"0000" + _pkt_line(f"ERR {MISSING_KEY}\n")
+    assert response.content == first_line + b"0000" + pkt_line(f"ERR {MISSING_KEY}\n".encode())
     assert tls_upstream.hits == []
     [record] = await audit_records(audit, 1)
     assert (record.kind, record.status, record.code, record.path) == (
@@ -207,7 +200,7 @@ async def test_plain_git_discovery_refusal_is_an_advertisement_but_the_proxy_cha
     assert refused.status == 200
     assert refused.headers["content-type"] == "application/x-git-upload-pack-advertisement"
     assert refused.headers["x-mindroom-error"] == "tls_required"
-    assert refused.body == b"001e# service=git-upload-pack\n0000" + _pkt_line(f"ERR {TLS_REQUIRED}\n")
+    assert refused.body == b"001e# service=git-upload-pack\n0000" + pkt_line(f"ERR {TLS_REQUIRED}\n".encode())
     assert challenge.status == 407
     assert challenge.headers["content-type"] == "application/json"
     assert challenge.headers["proxy-authenticate"] == 'Basic realm="mindroom-egress-broker"'
@@ -318,7 +311,7 @@ async def test_git_error_line_names_the_manage_link_but_never_the_connect_link(
     git = await client.get(url, headers=GIT_USER_AGENT)
     other = await client.get(url)
 
-    assert git.content.endswith(_pkt_line(f"ERR {error_line}\n"))
+    assert git.content.endswith(pkt_line(f"ERR {error_line}\n".encode()))
     assert b"one-time-token" not in git.content
     # The JSON body and the reason phrase keep the field names: their clients read the links from the fields.
     assert git.reason_phrase == json_message[:200]
