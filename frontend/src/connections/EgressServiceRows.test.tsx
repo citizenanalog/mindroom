@@ -139,14 +139,6 @@ describe("egress service rows", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the update date for a key with a known timestamp", () => {
-    const updatedAt = "2026-10-05T12:00:00+00:00";
-    renderRows([{ ...openai, key_updated_at: updatedAt }]);
-    expect(
-      screen.getByText(`Key saved ${new Date(updatedAt).toLocaleDateString()}`),
-    ).toBeInTheDocument();
-  });
-
   it("saves the key, clears the input and reports the change", async () => {
     const onChanged = vi.fn();
     renderRows([github], { onChanged });
@@ -602,16 +594,15 @@ describe("connected accounts", () => {
       within(row("GitHub")).getByText(
         "Connected · shared with everyone using Personal Mind",
       ),
-    ).toBeInTheDocument();
+    ).toBeVisible();
     expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("shows the connected account with Disconnect", () => {
     renderRows([connectedGithub]);
     const github = row("GitHub");
-    expect(
-      within(github).getByText("Connected as octocat"),
-    ).toBeInTheDocument();
+    expect(within(github).getByText("Connected as octocat")).toBeVisible();
+    expect(screen.queryByText(/shared with everyone/)).toBeNull();
     expect(
       within(github).getByRole("button", { name: "Disconnect for GitHub" }),
     ).toBeInTheDocument();
@@ -676,6 +667,11 @@ describe("connected accounts", () => {
     const github = row("GitHub");
     expect(within(github).getByText("Using API key")).toBeInTheDocument();
     expect(within(github).queryByText(/Connected as/)).toBeNull();
+    expect(
+      within(github).getByText(
+        "Your connected GitHub account is kept for other services.",
+      ),
+    ).toBeVisible();
     expect(
       within(github).getByRole("button", { name: "Replace key for GitHub" }),
     ).toBeInTheDocument();
@@ -747,6 +743,7 @@ describe("connected accounts", () => {
         "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
       ),
     ).toBeVisible();
+    expect(screen.queryByText(/can't be used in this sandbox/)).toBeNull();
     expect(
       within(github).queryByRole("button", { name: /Connect/ }),
     ).toBeNull();
@@ -1001,27 +998,6 @@ describe("rows with an agent's wording", () => {
     ).toHaveTextContent(/^Remove key$/);
   });
 
-  it("says Key saved without a date when the server sends none", () => {
-    renderRows([keyed({ key_updated_at: null })]);
-    expect(within(row("OpenAI")).getByText("Key saved")).toBeInTheDocument();
-  });
-
-  it("notes that a connected account is kept while an API key is in use", () => {
-    renderRows([
-      withAccount(
-        { connected: true, account_label: "octocat" },
-        { configured: true, active_source: "key", key_configured: true },
-      ),
-    ]);
-    const github = row("GitHub");
-    expect(within(github).getByText("Using API key")).toBeInTheDocument();
-    expect(
-      within(github).getByText(
-        "Your connected GitHub account is kept for other services.",
-      ),
-    ).toBeVisible();
-  });
-
   it("adds no kept-account note when no account is connected or the account is the one in use", () => {
     renderRows([
       withAccount(
@@ -1053,29 +1029,6 @@ describe("rows with an agent's wording", () => {
         "Connected as team@example.org · shared with everyone using Shared Dev",
       ),
     ).toBeVisible();
-  });
-
-  it("names a shared account without a label as Connected, shared with everyone", () => {
-    const shared = withAccount(
-      { connected: true, account_label: null },
-      { is_shared: true, configured: true, active_source: "oauth" },
-    );
-    renderRows([shared], {
-      agent: agent({ displayName: "Shared Dev", services: [shared] }),
-    });
-    expect(
-      within(row("GitHub")).getByText(
-        "Connected · shared with everyone using Shared Dev",
-      ),
-    ).toBeVisible();
-  });
-
-  it("does not call a personal agent's account shared", () => {
-    renderRows([connectedGithub]);
-    expect(
-      within(row("GitHub")).getByText("Connected as octocat"),
-    ).toBeVisible();
-    expect(screen.queryByText(/shared with everyone/)).toBeNull();
   });
 
   describe("Connect on a shared agent", () => {
@@ -1221,6 +1174,7 @@ describe("rows with an agent's wording", () => {
           "Personal GitHub accounts can't be used by shared agents. Ask @bob:example.org and @carol:example.org to add a team API key.",
         ),
       ).toBeVisible();
+      expect(within(row("GitHub")).getByText("Not set")).toBeVisible();
     });
 
     it("tells a non-manager to ask an administrator when there are no managers", () => {
@@ -1244,6 +1198,41 @@ describe("rows with an agent's wording", () => {
           "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
         ),
       ).toBeVisible();
+    });
+
+    it("drops the hint and says Key saved with the date once a team key is saved", () => {
+      const keyed = {
+        ...refused,
+        can_manage: true,
+        configured: true,
+        active_source: "key" as const,
+        key_configured: true,
+        key_updated_at: "2026-10-05T12:00:00+00:00",
+      };
+      renderRows([keyed], {
+        agent: agent({ managers: ["@alice:example.org"], services: [keyed] }),
+      });
+      expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
+      expect(
+        within(row("GitHub")).getByText(
+          `Key saved ${new Date("2026-10-05T12:00:00+00:00").toLocaleDateString()}`,
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText("Using API key")).toBeNull();
+    });
+
+    it("drops the hint for someone who cannot change the key too", () => {
+      const keyed = {
+        ...refused,
+        configured: true,
+        active_source: "key" as const,
+        key_configured: true,
+        key_updated_at: "2026-10-05T12:00:00+00:00",
+      };
+      renderRows([keyed], {
+        agent: agent({ managers: ["@alice:example.org"], services: [keyed] }),
+      });
+      expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
     });
   });
 
@@ -1282,19 +1271,6 @@ describe("rows with an agent's wording", () => {
       });
       expect(screen.queryByText(/@bob:example.org/)).toBeNull();
       expect(screen.queryByText(/Ask /)).toBeNull();
-    });
-
-    it("keeps the shared agent's text for a shared agent", () => {
-      const refusedForShared = { ...refusedForPersonal, is_shared: true };
-      renderRows([refusedForShared], {
-        agent: agent({ shared: true, services: [refusedForShared] }),
-      });
-      expect(
-        within(row("GitHub")).getByText(
-          "Personal GitHub accounts can't be used by shared agents. Add a team API key instead.",
-        ),
-      ).toBeVisible();
-      expect(screen.queryByText(SANDBOX_TEXT)).toBeNull();
     });
   });
 
@@ -1849,73 +1825,6 @@ describe("what a row says about how the key is sent", () => {
   });
 });
 
-describe("a shared agent's key where a personal account is refused", () => {
-  const refused = (changes: Partial<EgressCredentialService> = {}) => ({
-    ...github,
-    is_shared: true,
-    oauth: {
-      ...githubAccount,
-      can_connect: false,
-      unavailable_reason: "shared_sandbox" as const,
-    },
-    ...changes,
-  });
-  const sharedAgent = (services: EgressCredentialService[]): RowAgent => ({
-    displayName: "Shared Dev",
-    shared: true,
-    managers: ["@alice:example.org"],
-    services,
-  });
-  const renderRows = (service: EgressCredentialService) =>
-    render(
-      <Rows
-        agentName="shared"
-        services={[service]}
-        onChanged={vi.fn()}
-        agent={sharedAgent([service])}
-      />,
-    );
-
-  it("gives the hint while no key is saved", () => {
-    renderRows(refused({ can_manage: false }));
-    const hint =
-      "Personal GitHub accounts can't be used by shared agents. Ask @alice:example.org to add a team API key.";
-    expect(within(row("GitHub")).getByText(hint)).toBeVisible();
-    expect(within(row("GitHub")).getByText("Not set")).toBeVisible();
-  });
-
-  it("drops the hint and says Key saved with the date once a team key is saved", () => {
-    renderRows(
-      refused({
-        configured: true,
-        active_source: "key",
-        key_configured: true,
-        key_updated_at: "2026-10-05T12:00:00+00:00",
-      }),
-    );
-    expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
-    expect(
-      within(row("GitHub")).getByText(
-        `Key saved ${new Date("2026-10-05T12:00:00+00:00").toLocaleDateString()}`,
-      ),
-    ).toBeVisible();
-    expect(screen.queryByText("Using API key")).toBeNull();
-  });
-
-  it("drops the hint for someone who cannot change the key too", () => {
-    renderRows(
-      refused({
-        can_manage: false,
-        configured: true,
-        active_source: "key",
-        key_configured: true,
-        key_updated_at: "2026-10-05T12:00:00+00:00",
-      }),
-    );
-    expect(screen.queryByText(/can't be used by shared agents/)).toBeNull();
-  });
-});
-
 describe("the other way to connect when an account is connected", () => {
   it("offers an API key instead of the account once the account is connected", () => {
     renderRows([connectedGithub]);
@@ -1982,11 +1891,6 @@ describe("what a limited service says it is limited to", () => {
     display_name: "Mine",
     description: "",
     rules: rules(graphql),
-  });
-
-  it("names the repositories", () => {
-    renderRows([custom(false)]);
-    expect(within(row("Mine")).getByText("Limited to a/b")).toBeVisible();
   });
 
   it("adds that GraphQL reaches every repository the key can reach when the limit allows it", () => {
