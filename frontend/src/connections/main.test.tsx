@@ -40,17 +40,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it.each(["/connections/egress", "/connections/egress/"])(
-  "renders the egress page on %s",
-  async (pathname) => {
-    await loadEntry(pathname);
-    expect(
-      await screen.findByRole("heading", { name: "Agent Keys" }),
-    ).toBeInTheDocument();
-  },
-);
+it.each([
+  "/connections/egress",
+  "/connections/egress/",
+  "/connections/egress/x",
+])("renders the egress page on %s", async (pathname) => {
+  await loadEntry(pathname);
+  expect(
+    await screen.findByRole("heading", { name: "Agent Keys" }),
+  ).toBeInTheDocument();
+});
 
-it.each(["/connections", "/connections/"])(
+// The server serves the egress page for its own path segment only, so a
+// longer segment gets the portal.
+it.each(["/connections", "/connections/", "/connections/egressx"])(
   "renders the connections portal on %s",
   async (pathname) => {
     await loadEntry(pathname);
