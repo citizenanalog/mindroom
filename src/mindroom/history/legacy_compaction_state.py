@@ -1,4 +1,4 @@
-"""One-time migration of compaction state written before compacted runs were archived."""
+"""One-time migrations of compaction state written before compacted runs were archived, and of older archives."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from mindroom.constants import MINDROOM_COMPACTION_METADATA_KEY, MINDROOM_MATRIX_HISTORY_METADATA_KEY
-from mindroom.history.archive_schema import archive_schema_sql, archive_table_names, archive_upgrade_sql
+from mindroom.history.archive_schema import (
+    ADDED_ARCHIVED_RUN_COLUMNS,
+    ADDED_GENERATION_COLUMNS,
+    archive_schema_sql,
+    archive_table_names,
+)
 from mindroom.history.types import HistoryScope
 from mindroom.session_storage.legacy_session_storage import decode_persisted_session_json
 from mindroom.usage.storage import quote_identifier
@@ -54,7 +59,7 @@ def migrate_compaction_database(path: Path, session_table: str) -> None:
             for statement in archive_schema_sql(session_table):
                 connection.execute(statement)
             _adopt_legacy_sessions(connection, session_table)
-        for statement in archive_upgrade_sql(connection, session_table):
+        for statement in _archive_upgrade_sql(connection, session_table):
             connection.execute(statement)
         connection.commit()
     finally:
@@ -63,7 +68,7 @@ def migrate_compaction_database(path: Path, session_table: str) -> None:
 
 
 def _needs_migration(connection: sqlite3.Connection, session_table: str) -> bool:
-    return _lacks_archive(connection, session_table) or bool(archive_upgrade_sql(connection, session_table))
+    return _lacks_archive(connection, session_table) or bool(_archive_upgrade_sql(connection, session_table))
 
 
 def _lacks_archive(connection: sqlite3.Connection, session_table: str) -> bool:
@@ -192,3 +197,30 @@ def _decoded_mapping(raw_value: object) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
+
+
+# LEGACY_COMPAT: Compaction archives without positioned-generation and run-index columns.
+# Legacy format: ``<session_table>_compactions`` without ``through_run_id``, ``covered_run_ids``, ``event_ids``, and
+# ``seen_event_ids``, and ``<session_table>_compacted_runs`` without ``run_index``, as every earlier archive was created.
+# Last legacy release: v2026.10.258; replacement: the next release creates and upgrades archives with those columns.
+# Handling: Opening the conversation database adds the missing columns in place as nullable columns, under the
+# open-time migration's write lock, so earlier generations read as unpositioned and earlier archived runs as having
+# no recorded index; replies never alter the archive, so rooms sharing the database cannot race on the upgrade.
+# Coverage: tests/test_history_archive.py::test_an_existing_archive_gains_the_new_columns;
+# tests/test_history_archive.py::test_opening_the_database_upgrades_an_existing_archive_before_any_reply_uses_it.
+def _archive_upgrade_sql(connection: sqlite3.Connection, session_table: str) -> list[str]:
+    """Return the statements that add the columns an archive created by an earlier release lacks."""
+    statements: list[str] = []
+    for table, columns in zip(
+        archive_table_names(session_table),
+        (ADDED_GENERATION_COLUMNS, ADDED_ARCHIVED_RUN_COLUMNS),
+        strict=True,
+    ):
+        quoted = quote_identifier(table)
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({quoted})")}
+        statements += [
+            f"ALTER TABLE {quoted} ADD COLUMN {name} {kind}"
+            for name, kind in columns
+            if existing and name not in existing
+        ]
+    return statements
