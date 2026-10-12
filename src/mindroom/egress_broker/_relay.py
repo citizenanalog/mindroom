@@ -19,7 +19,7 @@ import h11
 from mindroom.egress_broker.audit import AuditRecord
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
 from mindroom.egress_broker.messages import refusal_body
-from mindroom.egress_broker.rules import host_not_allowed, route_request, strip_hop_by_hop
+from mindroom.egress_broker.rules import route_request, strip_hop_by_hop
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -36,6 +36,7 @@ __all__ = [
     "Peer",
     "Relay",
     "close_stream",
+    "host_not_allowed",
     "normalize_host",
     "send_json",
     "send_proxy_challenge",
@@ -265,6 +266,11 @@ async def send_json(
     await client.send(*events, h11.EndOfMessage())
 
 
+def host_not_allowed(rules: EgressRules, host: str) -> dict[str, object]:
+    """Return the 403 body for a host `deny` refuses; it lists the operator's services, whose hosts are reachable."""
+    return refusal_body("host_not_allowed", host=host, services=list(rules.operator.services))
+
+
 async def send_proxy_challenge(client: Peer) -> None:
     """Answer 407 with a Basic challenge: the proxy token is missing, invalid, or expired."""
     await send_json(client, 407, refusal_body("proxy_authentication_required"), headers=(_PROXY_AUTHENTICATE,))
@@ -458,8 +464,21 @@ class Relay:
             logger.warning("egress_broker_refusal_context_failed", error_type=type(exc).__name__)
             await self.reject(client, entry, 502, refusal_body("broker_error"))
             return None
-        body = route.refusal_body(host=entry.host, path=entry.path, manage_url=self.manage_url, scope=scope)
-        await self.deny(client, entry, body, status=route.refusal_status)
+        if route.refusal == "bad_request":
+            await self.deny(client, entry, refusal_body("bad_request", path=entry.path), status=400)
+        else:
+            body = refusal_body(
+                "path_not_allowed",
+                host=entry.host,
+                path=entry.path,
+                service=route.restricted_by,
+                service_label=route.restricted_by_label,
+                shared=scope.shared,
+                managers=scope.managers,
+                by_operator=route.restricted_by_operator,
+                manage_url=self.manage_url,
+            )
+            await self.deny(client, entry, body)
         return None
 
     async def open_upstream(

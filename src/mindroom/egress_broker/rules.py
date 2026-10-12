@@ -7,14 +7,10 @@ import re
 import unicodedata
 from collections.abc import Mapping  # noqa: TC003
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 from urllib.parse import quote, unquote, urlsplit
 
 from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService  # noqa: TC001
-from mindroom.egress_broker.messages import refusal_body
-
-if TYPE_CHECKING:
-    from mindroom.egress_broker.messages import ScopeInfo
 
 __all__ = [
     "EgressRules",
@@ -22,7 +18,6 @@ __all__ = [
     "RuleMatch",
     "config_covers_rule",
     "host_has_rules",
-    "host_not_allowed",
     "inject_credentials",
     "is_ambiguous_path",
     "match_rule",
@@ -86,32 +81,6 @@ class Route:
     restricted_by: str | None = None
     restricted_by_label: str | None = None
     restricted_by_operator: bool = False
-
-    @property
-    def refusal_status(self) -> int:
-        """Return the HTTP status that goes with `refusal`, for a refused route."""
-        return 400 if self.refusal == "bad_request" else 403
-
-    def refusal_body(self, *, host: str, path: str, manage_url: str | None, scope: ScopeInfo) -> dict[str, object]:
-        """Return the JSON body for `refusal`; `path_not_allowed` names the restricting service and where to change it.
-
-        Its message names who can change the limit: an administrator for the operator's service, whatever the scope,
-        and for one of the scope's own services the user on a personal agent, or on a shared or unscoped agent
-        (`scope`) its credential managers.
-        """
-        if self.refusal == "bad_request":
-            return refusal_body("bad_request", path=path)
-        return refusal_body(
-            "path_not_allowed",
-            host=host,
-            path=path,
-            service=self.restricted_by,
-            service_label=self.restricted_by_label,
-            shared=scope.shared,
-            managers=scope.managers,
-            by_operator=self.restricted_by_operator,
-            manage_url=manage_url,
-        )
 
 
 def _host_matches(rule_host: str, request_host: str) -> bool:
@@ -307,11 +276,6 @@ def _best_match(services: Mapping[str, EgressService], host: str, port: int, pat
 
     service_name, rule, _ = candidates[0]
     return RuleMatch(service=service_name, rule=rule)
-
-
-def host_not_allowed(rules: EgressRules, host: str) -> dict[str, object]:
-    """Return the 403 body for a host `deny` refuses; it lists the operator's services, whose hosts are reachable."""
-    return refusal_body("host_not_allowed", host=host, services=list(rules.operator.services))
 
 
 def _restricting_service(services: Mapping[str, EgressService], host: str, port: int) -> str | None:

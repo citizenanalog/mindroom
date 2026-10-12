@@ -16,6 +16,7 @@ from mindroom.egress_broker._relay import (
     Peer,
     Relay,
     close_stream,
+    host_not_allowed,
     normalize_host,
     send_json,
     send_proxy_challenge,
@@ -25,7 +26,6 @@ from mindroom.egress_broker._relay import (
 )
 from mindroom.egress_broker.messages import refusal_body
 from mindroom.egress_broker.mitm import TlsInterceptor
-from mindroom.egress_broker.rules import host_not_allowed
 
 if TYPE_CHECKING:
     import ssl
