@@ -105,6 +105,15 @@ def portal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce_turn_authori
     }
 
 
+def _enable_egress_broker(portal: dict[str, Any]) -> None:
+    """Restart the API with an egress broker port, which turns Agent Keys on, and republish the portal's config."""
+    paths = replace(portal["paths"], process_env={**portal["paths"].process_env, "MINDROOM_EGRESS_BROKER_PORT": "8768"})
+    portal["paths"] = paths
+    main.initialize_api_app(main.app, paths)
+    _publish_config(main.app, paths, portal["payload"])
+    _use_runtime_auth_settings(main.app)
+
+
 def test_catalog_includes_deferred_oauth_tools_without_status_calls(
     portal: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -316,8 +325,20 @@ def test_me_returns_identity_and_admin_flag(portal: dict[str, Any], user: str, i
         "matrix_user_id": f"@{user}:example.org",
         "email": f"{user}@example.org",
         "is_administrator": is_administrator,
+        "egress_enabled": False,
     }
     assert "no-store" in response.headers["cache-control"]
+
+
+@pytest.mark.parametrize("broker_on", [False, True])
+def test_me_says_whether_agent_keys_are_enabled(portal: dict[str, Any], *, broker_on: bool) -> None:
+    """The Connections header learns whether the egress broker is on, so it links the Agent Keys page only then."""
+    if broker_on:
+        _enable_egress_broker(portal)
+    for user in ("admin", "bob", "mallory"):
+        response = portal["client"].get("/api/connections/me", headers=portal["headers"][user])
+        assert response.status_code == 200, response.text
+        assert response.json()["egress_enabled"] is broker_on
 
 
 def test_me_needs_a_signed_identity_and_takes_no_target(portal: dict[str, Any]) -> None:

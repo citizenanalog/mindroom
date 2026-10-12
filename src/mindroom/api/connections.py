@@ -106,11 +106,15 @@ class ConnectionStatus(BaseModel):
 
 
 class ConnectionsIdentity(BaseModel):
-    """Who the Connections pages are open for, and whether the administrator dashboard is open to them too."""
+    """Who the Connections pages are open for, and whether the administrator dashboard is open to them too.
+
+    `egress_enabled` says whether the egress broker is on, so the pages link the Agent Keys page only then.
+    """
 
     matrix_user_id: str
     email: str | None
     is_administrator: bool
+    egress_enabled: bool
 
 
 class _EmptyMutation(BaseModel):
@@ -311,7 +315,7 @@ async def me(request: Request, response: Response) -> ConnectionsIdentity:
     """Return the signed-in identity for the Connections pages' header.
 
     Any signed user gets an answer, with or without agents or the portal agent setting, so both pages can show
-    "Signed in as" and link the dashboard to administrators.
+    "Signed in as", link the dashboard to administrators, and link the Agent Keys page while the broker is on.
     """
     response.headers.update(CONNECTIONS_HEADERS)
     auth_user = await require_connections_user(request)
@@ -324,6 +328,7 @@ async def me(request: Request, response: Response) -> ConnectionsIdentity:
         matrix_user_id=matrix_user_id,
         email=email if isinstance(email, str) and email else None,
         is_administrator=is_administrator(matrix_user_id, snapshot),
+        egress_enabled=egress_broker_enabled(snapshot.runtime_paths),
     )
 
 
