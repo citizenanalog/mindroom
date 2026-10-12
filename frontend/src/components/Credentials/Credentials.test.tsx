@@ -33,6 +33,33 @@ function renderOpen() {
   );
 }
 
+/** The raw editor's list is empty; the panel is mocked, so nothing else fetches. */
+const serveNoServices = () =>
+  (global.fetch as any).mockResolvedValue({ ok: true, json: async () => [] });
+
+/** One service, github_private, holding a token: the list, its status, then its credentials. */
+const serveGithubToken = () =>
+  (global.fetch as any)
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ["github_private"],
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        service: "github_private",
+        has_credentials: true,
+        key_names: ["token"],
+      }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        service: "github_private",
+        credentials: { token: "ghp_test" },
+      }),
+    });
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => {
@@ -87,18 +114,6 @@ describe("Credentials", () => {
     });
   });
 
-  it("renders the egress broker panel", async () => {
-    (global.fetch as any).mockResolvedValue({
-      ok: true,
-      json: async () => [],
-    });
-
-    renderOpen();
-
-    await screen.findByText(/No services found yet/);
-    expect(screen.getByTestId("egress-broker")).toBeInTheDocument();
-  });
-
   it("puts Agent API keys and accounts before Raw credential payloads (advanced)", async () => {
     realPanel.wanted = true;
     (global.fetch as any).mockImplementation(async (input: string) => {
@@ -145,10 +160,7 @@ describe("Credentials", () => {
   });
 
   it("collapses the raw payloads until the heading is opened", async () => {
-    (global.fetch as any).mockResolvedValue({
-      ok: true,
-      json: async () => [],
-    });
+    serveNoServices();
 
     render(<Credentials />);
 
@@ -168,26 +180,7 @@ describe("Credentials", () => {
   });
 
   it("hides the credentials again when the raw payloads are collapsed", async () => {
-    (global.fetch as any)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ["github_private"],
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          has_credentials: true,
-          key_names: ["token"],
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          credentials: { token: "ghp_test" },
-        }),
-      });
+    serveGithubToken();
 
     renderOpen();
     const editor = (await screen.findByPlaceholderText(
@@ -211,10 +204,7 @@ describe("Credentials", () => {
   });
 
   it("keeps the heading's chevron still for someone who prefers reduced motion", () => {
-    (global.fetch as any).mockResolvedValue({
-      ok: true,
-      json: async () => [],
-    });
+    serveNoServices();
     render(<Credentials />);
     const chevron = screen
       .getByRole("button", { name: "Raw credential payloads (advanced)" })
@@ -223,10 +213,7 @@ describe("Credentials", () => {
   });
 
   it("points the heading at the payloads only while they are shown", async () => {
-    (global.fetch as any).mockResolvedValue({
-      ok: true,
-      json: async () => [],
-    });
+    serveNoServices();
     render(<Credentials />);
     const toggle = screen.getByRole("button", {
       name: "Raw credential payloads (advanced)",
@@ -241,10 +228,7 @@ describe("Credentials", () => {
   });
 
   it("names the raw editor's save button Save payload", async () => {
-    (global.fetch as any).mockResolvedValue({
-      ok: true,
-      json: async () => [],
-    });
+    serveNoServices();
 
     renderOpen();
 
@@ -256,26 +240,7 @@ describe("Credentials", () => {
   });
 
   it("hides credentials by default and reveals them on demand", async () => {
-    (global.fetch as any)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ["github_private"],
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          has_credentials: true,
-          key_names: ["token"],
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          credentials: { token: "ghp_test" },
-        }),
-      });
+    serveGithubToken();
 
     renderOpen();
 
@@ -490,32 +455,12 @@ describe("Credentials", () => {
   it("deletes selected service credentials", async () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
 
-    (global.fetch as any)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ["github_private"],
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          has_credentials: true,
-          key_names: ["token"],
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          credentials: { token: "ghp_test" },
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          status: "success",
-        }),
-      });
+    serveGithubToken().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        status: "success",
+      }),
+    });
 
     renderOpen();
 
@@ -543,32 +488,12 @@ describe("Credentials", () => {
   });
 
   it("tests credentials for selected service", async () => {
-    (global.fetch as any)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ["github_private"],
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          has_credentials: true,
-          key_names: ["token"],
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          service: "github_private",
-          credentials: { token: "ghp_test" },
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          message: "Credentials exist (validation not implemented)",
-        }),
-      });
+    serveGithubToken().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        message: "Credentials exist (validation not implemented)",
+      }),
+    });
 
     renderOpen();
 
