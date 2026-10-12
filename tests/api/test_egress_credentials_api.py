@@ -901,6 +901,26 @@ def test_connect_returns_an_authorize_url_for_an_eligible_manager(oauth_egress_p
         assert "no-store" in response.headers["cache-control"]
 
 
+@pytest.mark.parametrize(
+    ("action", "masked"),
+    [("connect", "Could not start account connection"), ("disconnect", "Could not disconnect account")],
+)
+def test_connect_and_disconnect_mask_an_internal_oauth_error(
+    oauth_egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    masked: str,
+) -> None:
+    """A refusal from the OAuth flow keeps its status, but the route says only its own text and never the detail."""
+    portal = oauth_egress_portal
+    monkeypatch.setattr(oauth, action, AsyncMock(side_effect=HTTPException(503, "internal-client-secret")))
+    response = _account_action(portal, "alice", "personal", "drive", action)
+    assert response.status_code == 503
+    assert response.json() == {"detail": masked}
+    assert "internal-client-secret" not in response.text
+    assert "no-store" in response.headers["cache-control"]
+
+
 @pytest.mark.parametrize("action", ["connect", "disconnect"])
 @pytest.mark.parametrize(
     ("user", "agent", "service", "expected"),
