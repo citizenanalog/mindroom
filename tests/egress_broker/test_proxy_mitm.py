@@ -32,6 +32,7 @@ from tests.egress_broker.conftest import (
     BROKER_ERROR,
     DEFAULT_CLAIMS,
     MALFORMED,
+    METHOD_NOT_ALLOWED,
     PROXY_AUTHENTICATION_REQUIRED,
     assert_audited,
     audit_records,
@@ -311,6 +312,62 @@ async def test_ambiguous_path_on_rule_host_is_refused(
     assert tls_upstream.hits == []
     assert broker.resolved == []
     await assert_audited(audit, kind="denied", status=400, path=target, service=None, code="bad_request")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["TRACE", "TRACK", "trace"])
+async def test_trace_and_track_on_rule_host_are_refused_before_any_secret_or_dial(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    audit: AuditLog,
+    method: str,
+) -> None:
+    """TRACE and TRACK would make the upstream echo the injected credential, so the broker refuses them first."""
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+
+    [response] = await _exchange(
+        broker,
+        tls_upstream.port,
+        f"{method} /echo?page=2 HTTP/1.1\r\nHost: localhost\r\n\r\n".encode(),
+    )
+
+    assert response.status == 405
+    assert response.headers["x-mindroom-error"] == "method_not_allowed"
+    assert response.headers["connection"] == "close"
+    assert response.json() == METHOD_NOT_ALLOWED
+    assert tls_upstream.hits == []
+    assert broker.resolved == []
+    await assert_audited(
+        audit,
+        kind="denied",
+        method=method,
+        status=405,
+        path="/echo",
+        service=None,
+        code="method_not_allowed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_other_methods_on_rule_host_still_get_the_credential(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+) -> None:
+    """Only TRACE and TRACK are refused: other methods, OPTIONS and DELETE included, are forwarded with the key."""
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+
+    options, delete = await _exchange(
+        broker,
+        tls_upstream.port,
+        b"OPTIONS /echo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"DELETE /echo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+
+    for response, method in ((options, "OPTIONS"), (delete, "DELETE")):
+        assert response.status == 200
+        echoed = response.json()
+        assert echoed["method"] == method
+        assert echoed["headers"]["authorization"] == [f"Bearer {SECRET}"]
 
 
 @pytest.mark.asyncio

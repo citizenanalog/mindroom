@@ -57,6 +57,8 @@ _REASON_LIMIT = 200
 # The git ERR line has room for the whole message; this only bounds a message that quotes a huge path.
 _GIT_ERROR_LIMIT = 4096
 _GIT_DISCOVERY_SERVICES = frozenset({"git-upload-pack", "git-receive-pack"})
+# Methods that ask a server to echo the request back, which would return an injected credential.
+_ECHO_METHODS = frozenset({"TRACE", "TRACK"})
 # Names a broker refusal's code; h11 lowercases header names, so upstream copies compare equal.
 _ERROR_HEADER = b"x-mindroom-error"
 
@@ -430,9 +432,11 @@ class Relay:
     async def route(self, client: Peer, entry: AuditEntry, port: int) -> Route | None:
         """Return the route for the entry's host, `port`, and path; otherwise answer, audit a refusal, and return None.
 
-        A host without rules is denied under `unmatched_hosts: deny`. A path the route refuses (ambiguous, or unlisted
-        on a restricted host) is refused, and the audit row names the restricting service of a `path_not_allowed`
-        refusal, as a matched rule's row does. A failing rules provider or scope callback is a 502.
+        A host without rules is denied under `unmatched_hosts: deny`. On a host with rules, `TRACE` and `TRACK` (in any
+        letter case) get 405 `method_not_allowed`, since the upstream would echo the injected credential back. A path
+        the route refuses (ambiguous, or unlisted on a restricted host) is refused, and the audit row names the
+        restricting service of a `path_not_allowed` refusal, as a matched rule's row does. A failing rules provider or
+        scope callback is a 502.
         """
         rules = await self.read_rules(client, entry)
         if rules is None:
@@ -440,6 +444,9 @@ class Relay:
         route = route_request(rules, entry.host, port, entry.path)
         if not route.host_has_rules and rules.unmatched_hosts == "deny":
             await self.deny(client, entry, host_not_allowed(rules, entry.host))
+            return None
+        if route.host_has_rules and entry.method.upper() in _ECHO_METHODS:
+            await self.deny(client, entry, refusal_body("method_not_allowed"), status=405)
             return None
         if route.refusal is None:
             return route

@@ -589,6 +589,11 @@ BROKER_ERROR = {
     "message": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
 }
 BODY_TOO_LARGE = {"error": "request_body_too_large", "message": "The request body is larger than the broker accepts."}
+METHOD_NOT_ALLOWED = {
+    "error": "method_not_allowed",
+    "message": "TRACE and TRACK requests are refused because the server would echo the request, "
+    "injected credential included, back to the agent.",
+}
 
 
 def single_rule_config(
@@ -620,10 +625,10 @@ def proxy_authorization(token: str) -> str:
     return "Basic " + base64.b64encode(f"{token}:".encode()).decode()
 
 
-def plain_request(target: str, *, authorization: str, path: str = "/") -> bytes:
-    """Return a raw absolute-form GET for `path` on `target` (host:port), as a worker's plain HTTP client sends it."""
+def plain_request(target: str, *, authorization: str, path: str = "/", method: str = "GET") -> bytes:
+    """Return a raw absolute-form `method` request for `path` on `target` (host:port), as a worker's plain client sends."""
     return (
-        f"GET http://{target}{path} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {authorization}\r\n\r\n"
+        f"{method} http://{target}{path} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {authorization}\r\n\r\n"
     ).encode()
 
 

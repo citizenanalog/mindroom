@@ -54,6 +54,12 @@ _CONNECT_URL = "https://m.test/api/oauth/github/authorize?connect_token=one-time
             "Use a plain path.",
         ),
         (
+            "method_not_allowed",
+            {},
+            "TRACE and TRACK requests are refused because the server would echo the request, "
+            "injected credential included, back to the agent.",
+        ),
+        (
             "tls_required",
             {"host": "api.github.com", "service": "github"},
             "Credentials are only added over HTTPS. Use https:// for api.github.com.",

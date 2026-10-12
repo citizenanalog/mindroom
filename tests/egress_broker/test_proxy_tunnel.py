@@ -21,6 +21,7 @@ from tests.egress_broker.conftest import (
     BROKER_ERROR,
     DEFAULT_CLAIMS,
     MALFORMED,
+    METHOD_NOT_ALLOWED,
     PROXY_AUTHENTICATION_REQUIRED,
     assert_audited,
     audit_records,
@@ -507,6 +508,86 @@ async def test_plain_http_ambiguous_path_on_host_without_rules_is_forwarded(
     assert http_upstream.hits == ["/private/../echo"]
     # The upstream's own 404 is a forwarded answer, not a refusal.
     await assert_audited(audit, kind="request", status=404, path="/private/../echo", code=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["TRACE", "TRACK", "trace"])
+async def test_plain_http_trace_and_track_on_rule_host_are_refused(
+    broker: BrokerFactory,
+    http_upstream: Upstream,
+    raw_proxy: RawProxy,
+    audit: AuditLog,
+    method: str,
+) -> None:
+    """TRACE and TRACK get 405 on a rule host before the rule match, any secret lookup, or an upstream dial."""
+    started = await broker(single_rule_config("localhost"), secrets={"svc": "s3cret"})
+    request = plain_request(
+        f"localhost:{http_upstream.port}",
+        path="/echo",
+        method=method,
+        authorization=proxy_authorization(broker.token()),
+    )
+
+    response = await raw_proxy(started.port, request)
+
+    assert response.status == 405
+    assert response.headers["x-mindroom-error"] == "method_not_allowed"
+    assert response.json() == METHOD_NOT_ALLOWED
+    assert http_upstream.hits == []
+    assert broker.resolved == []
+    await assert_audited(
+        audit,
+        kind="denied",
+        method=method,
+        status=405,
+        path="/echo",
+        service=None,
+        code="method_not_allowed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_plain_http_other_methods_on_rule_host_are_forwarded(
+    broker: BrokerFactory,
+    http_upstream: Upstream,
+    raw_proxy: RawProxy,
+) -> None:
+    """Only TRACE and TRACK are refused on a rule host: DELETE to an unmatched path is forwarded as before."""
+    started = await broker(single_rule_config("localhost", path_prefix="/private"))
+    request = plain_request(
+        f"localhost:{http_upstream.port}",
+        path="/echo",
+        method="DELETE",
+        authorization=proxy_authorization(broker.token()),
+    )
+
+    response = await raw_proxy(started.port, request)
+
+    assert (response.status, response.json()["method"]) == (200, "DELETE")
+    assert http_upstream.hits == ["/echo"]
+
+
+@pytest.mark.asyncio
+async def test_plain_http_trace_on_host_without_rules_is_forwarded(
+    broker: BrokerFactory,
+    http_upstream: Upstream,
+    raw_proxy: RawProxy,
+    audit: AuditLog,
+) -> None:
+    """Hosts without rules are untouched: nothing is injected there, so TRACE is forwarded like any method."""
+    started = await broker(single_rule_config("api.github.com"))
+    request = plain_request(
+        f"localhost:{http_upstream.port}",
+        path="/echo",
+        method="TRACE",
+        authorization=proxy_authorization(broker.token()),
+    )
+
+    response = await raw_proxy(started.port, request)
+
+    assert (response.status, response.json()["method"]) == (200, "TRACE")
+    assert http_upstream.hits == ["/echo"]
+    await assert_audited(audit, kind="request", method="TRACE", status=200, path="/echo", code=None)
 
 
 @pytest.mark.asyncio

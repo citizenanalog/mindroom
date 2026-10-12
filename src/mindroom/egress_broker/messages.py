@@ -31,6 +31,10 @@ _MESSAGES = {
         "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. "
         "Use a plain path."
     ),
+    "method_not_allowed": (
+        "TRACE and TRACK requests are refused because the server would echo the request, "
+        "injected credential included, back to the agent."
+    ),
     "tls_required": "Credentials are only added over HTTPS. Use https:// for {host}.",
     "host_mismatch": "The Host header does not match the host this connection was opened for.",
     "host_not_allowed": "{host} is not allowed by the administrator's egress policy.",
