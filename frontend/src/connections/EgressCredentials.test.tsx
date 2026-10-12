@@ -1468,6 +1468,30 @@ describe("recent requests on the personal page", () => {
     within(table)
       .getAllByRole("columnheader")
       .map((header) => header.textContent);
+  const openLog = async () => {
+    fireEvent.click(await toggle());
+    return screen.findByRole("table", { name: "Recent requests for personal" });
+  };
+  /** Opens a log of count requests to site0 to siteN, one minute apart, newest first. */
+  const openLogOf = async (count: number) => {
+    logs = () =>
+      json({
+        records: Array.from({ length: count }, (_, index) =>
+          record({
+            at: new Date(
+              Date.UTC(2026, 9, 9, 12, 0, 0) - index * 60_000,
+            ).toISOString(),
+            method: "GET",
+            host: `site${index}.example.com`,
+            path: "/",
+            service: null,
+            status: 200,
+          }),
+        ),
+      });
+    render(<EgressCredentials />);
+    return openLog();
+  };
 
   it("starts collapsed and does not load anything until it is opened", async () => {
     render(<EgressCredentials />);
@@ -1478,10 +1502,7 @@ describe("recent requests on the personal page", () => {
 
   it("loads the caller's 50 latest requests for that agent", async () => {
     render(<EgressCredentials />);
-    fireEvent.click(await toggle());
-    const table = await screen.findByRole("table", {
-      name: "Recent requests for personal",
-    });
+    const table = await openLog();
     expect(logRequests()).toEqual([
       "/api/connections/egress/logs?agent_name=personal&limit=50",
     ]);
@@ -1511,8 +1532,7 @@ describe("recent requests on the personal page", () => {
 
   it("shows a refusal code, and dashes for a missing service or path", async () => {
     render(<EgressCredentials />);
-    fireEvent.click(await toggle());
-    const rows = within(await screen.findByRole("table")).getAllByRole("row");
+    const rows = within(await openLog()).getAllByRole("row");
     const refused = within(rows[2]).getAllByRole("cell");
     expect(refused[4]).toHaveTextContent("-");
     expect(refused[5]).toHaveTextContent("403");
@@ -1669,6 +1689,122 @@ describe("recent requests on the personal page", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Could not complete the request. Try again.",
     );
+  });
+
+  describe("wording and wrapping", () => {
+    beforeEach(() => {
+      logs = () =>
+        json({
+          records: [
+            record({
+              kind: "tunnel",
+              method: "CONNECT",
+              host: "example.com",
+              path: "",
+              service: null,
+              status: 200,
+            }),
+            record({
+              at: "2026-10-09T10:00:00+00:00",
+              kind: "denied",
+              method: "GET",
+              host: "api.github.com",
+              path: "/repos/a/b",
+              status: 403,
+              code: "credential_not_configured",
+            }),
+            record({
+              at: "2026-10-09T09:00:00+00:00",
+              kind: "denied",
+              method: "CONNECT",
+              host: "blocked.example",
+              path: "",
+              service: null,
+              status: 403,
+              code: "host_not_allowed",
+            }),
+          ],
+        });
+    });
+
+    it("says a relayed CONNECT passed through with no key added", async () => {
+      render(<EgressCredentials />);
+      const rows = within(await openLog()).getAllByRole("row");
+      expect(within(rows[1]).getAllByRole("cell")[4]).toHaveTextContent(
+        "Passed through (no key added)",
+      );
+      // A refused CONNECT was not passed through, and a request with a service names it.
+      expect(within(rows[2]).getAllByRole("cell")[4]).toHaveTextContent(
+        "github",
+      );
+      expect(within(rows[3]).getAllByRole("cell")[4]).not.toHaveTextContent(
+        "Passed through",
+      );
+    });
+
+    it("explains in a caption that other sites pass straight through and that administrators can see the requests", async () => {
+      render(<EgressCredentials />);
+      const table = await openLog();
+      const caption = table.querySelector("caption");
+      expect(caption).toHaveTextContent(
+        "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.",
+      );
+      // A personal agent has no credential managers.
+      expect(caption).not.toHaveTextContent("credential managers");
+    });
+
+    it("lets a refusal code wrap after each underscore and never mid-word", async () => {
+      render(<EgressCredentials />);
+      const table = await openLog();
+      const code = within(table)
+        .getByText("credential_not_configured")
+        .closest("div")!;
+      expect(code.className).not.toContain("break-all");
+      expect(code.textContent).toBe("credential_not_configured");
+      expect(code.querySelectorAll("wbr")).toHaveLength(2);
+      // The break opportunities sit right after the underscores.
+      expect(code.innerHTML).toBe("credential_<wbr>not_<wbr>configured");
+    });
+  });
+
+  it("keeps the chevron of Recent requests still for someone who prefers reduced motion", async () => {
+    render(<EgressCredentials />);
+    expect((await toggle()).querySelector("svg")).toHaveClass(
+      "motion-reduce:transition-none",
+    );
+  });
+
+  it("points Recent requests at its table only while the table is shown", async () => {
+    render(<EgressCredentials />);
+    const button = await toggle();
+    expect(button).not.toHaveAttribute("aria-controls");
+    fireEvent.click(button);
+    expect(
+      document.getElementById(button.getAttribute("aria-controls") ?? ""),
+    ).not.toBeNull();
+    fireEvent.click(button);
+    expect(button).not.toHaveAttribute("aria-controls");
+  });
+
+  it("shows the newest ten and a Show all button with the count", async () => {
+    const table = await openLogOf(25);
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+    expect(within(table).getByText("site0.example.com")).toBeVisible();
+    expect(within(table).getByText("site9.example.com")).toBeVisible();
+    expect(within(table).queryByText("site10.example.com")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all (25)" }));
+    expect(within(table).getAllByRole("row")).toHaveLength(26);
+    expect(within(table).getByText("site24.example.com")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show latest 10" }));
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+  });
+
+  it("has no Show all button when there are ten or fewer", async () => {
+    const table = await openLogOf(10);
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+    expect(screen.queryByRole("button", { name: /Show all/ })).toBeNull();
   });
 });
 
@@ -2335,99 +2471,6 @@ describe("limiting a GitHub service to repositories", () => {
   });
 });
 
-describe("recent requests: wording and wrapping", () => {
-  beforeEach(() => {
-    vi.mocked(fetch).mockImplementation(async (input) => {
-      const path = String(input);
-      if (path === "/api/connections/me") return json(identity);
-      if (path === "/api/connections/egress") return json({ agents });
-      return json({
-        records: [
-          {
-            at: "2026-10-09T10:30:00+00:00",
-            kind: "tunnel",
-            agent_name: "personal",
-            method: "CONNECT",
-            host: "example.com",
-            path: "",
-            service: null,
-            status: 200,
-            code: null,
-          },
-          {
-            at: "2026-10-09T10:00:00+00:00",
-            kind: "denied",
-            agent_name: "personal",
-            method: "GET",
-            host: "api.github.com",
-            path: "/repos/a/b",
-            service: "github",
-            status: 403,
-            code: "credential_not_configured",
-          },
-          {
-            at: "2026-10-09T09:00:00+00:00",
-            kind: "denied",
-            agent_name: "personal",
-            method: "CONNECT",
-            host: "blocked.example",
-            path: "",
-            service: null,
-            status: 403,
-            code: "host_not_allowed",
-          },
-        ],
-      });
-    });
-  });
-
-  const openLog = async () => {
-    fireEvent.click(
-      within(
-        await screen.findByRole("region", { name: "Personal Mind" }),
-      ).getByRole("button", { name: "Recent requests" }),
-    );
-    return screen.findByRole("table", { name: "Recent requests for personal" });
-  };
-
-  it("says a relayed CONNECT passed through with no key added", async () => {
-    render(<EgressCredentials />);
-    const rows = within(await openLog()).getAllByRole("row");
-    expect(within(rows[1]).getAllByRole("cell")[4]).toHaveTextContent(
-      "Passed through (no key added)",
-    );
-    // A refused CONNECT was not passed through, and a request with a service names it.
-    expect(within(rows[2]).getAllByRole("cell")[4]).toHaveTextContent("github");
-    expect(within(rows[3]).getAllByRole("cell")[4]).not.toHaveTextContent(
-      "Passed through",
-    );
-  });
-
-  it("explains in a caption that other sites pass straight through and that administrators can see the requests", async () => {
-    render(<EgressCredentials />);
-    const table = await openLog();
-    const caption = table.querySelector("caption");
-    expect(caption).toHaveTextContent(
-      "Requests to sites without a service pass straight through; MindRoom sees only the host. Administrators can also see these requests (method, host, and path). Only your own requests are shown.",
-    );
-    // A personal agent has no credential managers.
-    expect(caption).not.toHaveTextContent("credential managers");
-  });
-
-  it("lets a refusal code wrap after each underscore and never mid-word", async () => {
-    render(<EgressCredentials />);
-    const table = await openLog();
-    const code = within(table)
-      .getByText("credential_not_configured")
-      .closest("div")!;
-    expect(code.className).not.toContain("break-all");
-    expect(code.textContent).toBe("credential_not_configured");
-    expect(code.querySelectorAll("wbr")).toHaveLength(2);
-    // The break opportunities sit right after the underscores.
-    expect(code.innerHTML).toBe("credential_<wbr>not_<wbr>configured");
-  });
-});
-
 describe("who uses a personal agent's keys", () => {
   const show = (changes: Partial<EgressCredentialAgent>) => {
     vi.mocked(fetch).mockImplementation(async (input) => {
@@ -2472,95 +2515,5 @@ describe("who uses a personal agent's keys", () => {
     ).toBeVisible();
     expect(within(card).queryByText(/Only you use/)).toBeNull();
     expect(within(card).queryByText(/Shared by all your agents/)).toBeNull();
-  });
-});
-
-describe("the latest recent requests", () => {
-  const records = (count: number) =>
-    Array.from({ length: count }, (_, index) => ({
-      at: new Date(
-        Date.UTC(2026, 9, 9, 12, 0, 0) - index * 60_000,
-      ).toISOString(),
-      kind: "request",
-      agent_name: "personal",
-      method: "GET",
-      host: `site${index}.example.com`,
-      path: "/",
-      service: null,
-      status: 200,
-      code: null,
-    }));
-  const openLog = async (count: number) => {
-    vi.mocked(fetch).mockImplementation(async (input) => {
-      const path = String(input);
-      if (path === "/api/connections/me") return json(identity);
-      if (path === "/api/connections/egress") return json({ agents });
-      return json({ records: records(count) });
-    });
-    render(<EgressCredentials />);
-    fireEvent.click(
-      within(
-        await screen.findByRole("region", { name: "Personal Mind" }),
-      ).getByRole("button", { name: "Recent requests" }),
-    );
-    return screen.findByRole("table", { name: "Recent requests for personal" });
-  };
-
-  it("keeps the chevron of Recent requests still for someone who prefers reduced motion", async () => {
-    render(<EgressCredentials />);
-    const toggle = within(
-      await screen.findByRole("region", { name: "Personal Mind" }),
-    ).getByRole("button", { name: "Recent requests" });
-    expect(toggle.querySelector("svg")).toHaveClass(
-      "motion-reduce:transition-none",
-    );
-  });
-
-  it("points Recent requests at its table only while the table is shown", async () => {
-    vi.mocked(fetch).mockImplementation(async (input) => {
-      const path = String(input);
-      if (path === "/api/connections/me") return json(identity);
-      if (path === "/api/connections/egress") return json({ agents });
-      return json({ records: records(2) });
-    });
-    render(<EgressCredentials />);
-    const toggle = within(
-      await screen.findByRole("region", { name: "Personal Mind" }),
-    ).getByRole("button", { name: "Recent requests" });
-    expect(toggle).not.toHaveAttribute("aria-controls");
-    fireEvent.click(toggle);
-    expect(
-      document.getElementById(toggle.getAttribute("aria-controls") ?? ""),
-    ).not.toBeNull();
-    fireEvent.click(toggle);
-    expect(toggle).not.toHaveAttribute("aria-controls");
-  });
-
-  it("shows the newest ten and a Show all button with the count", async () => {
-    const table = await openLog(25);
-    expect(within(table).getAllByRole("row")).toHaveLength(11);
-    expect(within(table).getByText("site0.example.com")).toBeVisible();
-    expect(within(table).getByText("site9.example.com")).toBeVisible();
-    expect(within(table).queryByText("site10.example.com")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Show all (25)" }));
-    expect(within(table).getAllByRole("row")).toHaveLength(26);
-    expect(within(table).getByText("site24.example.com")).toBeVisible();
-
-    fireEvent.click(screen.getByRole("button", { name: "Show latest 10" }));
-    expect(within(table).getAllByRole("row")).toHaveLength(11);
-  });
-
-  it("has no Show all button when there are ten or fewer", async () => {
-    const table = await openLog(10);
-    expect(within(table).getAllByRole("row")).toHaveLength(11);
-    expect(screen.queryByRole("button", { name: /Show all/ })).toBeNull();
-  });
-
-  it("says in the caption that only your own requests are shown", async () => {
-    const table = await openLog(3);
-    expect(table.querySelector("caption")).toHaveTextContent(
-      "Only your own requests are shown.",
-    );
   });
 });
