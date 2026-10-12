@@ -22,6 +22,7 @@ from mindroom.api.connection_agents import (
 )
 from mindroom.api.egress_credentials import EgressCredentialService, egress_services_for_agent
 from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.egress_broker.env import egress_broker_enabled
 from mindroom.logging_config import get_logger
 from mindroom.matrix.media import MatrixMediaUpstreamError, fetch_matrix_thumbnail, matrix_profile_avatar_uri
 from mindroom.matrix.users import create_agent_http_client
@@ -71,7 +72,8 @@ class AgentConnections(BaseModel):
     """Allowed services for one personal or managed shared agent.
 
     `egress_services` is a list for an agent whose egress credentials the user may use, empty when it has no
-    services, so the portal can link every such agent to the services page. It is null for any other agent.
+    services, so the portal can link every such agent to the services page. It is null for any other agent, for
+    every agent while the egress broker is off, and for an agent whose egress state cannot be read.
     `managers` is a shared or unscoped agent's credential managers as Matrix IDs, as the egress listing reports them;
     it is empty for any other agent, and for an agent with none only administrators manage its credentials.
     """
@@ -291,6 +293,19 @@ async def _service_connected(
     return oauth.personal_connection_view(result, can_manage=service.can_manage).connected
 
 
+async def _egress_services(
+    request: Request,
+    agent_name: str,
+    requester_id: str,
+) -> list[EgressCredentialService] | None:
+    """List an agent's egress rows for the catalog; one agent whose egress state cannot be read must not fail it."""
+    try:
+        return await egress_services_for_agent(request, agent_name, requester_id)
+    except Exception as exc:
+        logger.warning("connection_catalog_egress_unavailable", agent_name=agent_name, error_type=type(exc).__name__)
+        return None
+
+
 @router.get("/me")
 async def me(request: Request, response: Response) -> ConnectionsIdentity:
     """Return the signed-in identity for the Connections pages' header.
@@ -320,13 +335,14 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
     OAuth client, so the portal can count connected accounts before a card is opened; a service whose state cannot be
     read counts as not connected.
 
-    Egress rows follow the personal egress API's eligibility rule, only agents the user may use, and carry the
-    stored OAuth state of their services. That state is read only here, so status, connect and disconnect of other
-    providers never depend on it, and one service whose state cannot be read is shown as not connectable. Reading it
-    skips the token refresh; resolving the OAuth client of an egress service's provider can still bootstrap it over
-    the network once when none is stored.
+    Egress rows exist only while the egress broker is on. They follow the personal egress API's eligibility rule,
+    only agents the user may use, and carry the stored OAuth state of their services. That state is read only here,
+    so status, connect and disconnect of other providers never depend on it, and one service whose state cannot be
+    read is shown as not connectable. Reading it skips the token refresh; resolving the OAuth client of an egress
+    service's provider can still bootstrap it over the network once when none is stored.
     """
     requester_id = context.user.owner.requester_id
+    egress_enabled = egress_broker_enabled(context.runtime_paths)
     agents = [
         agent.model_copy(
             update={
@@ -336,7 +352,9 @@ async def catalog(request: Request, context: _ConnectionsContext) -> Connections
                     )
                     for service in agent.services
                 ],
-                "egress_services": await egress_services_for_agent(request, agent.agent_name, requester_id),
+                "egress_services": (
+                    await _egress_services(request, agent.agent_name, requester_id) if egress_enabled else None
+                ),
             },
         )
         for agent in context.catalog.agents

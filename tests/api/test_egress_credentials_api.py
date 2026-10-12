@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Never
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -834,6 +834,58 @@ def test_portal_catalog_sends_an_empty_list_for_an_eligible_agent_without_servic
     # The user of the agent keeps writing services, so the list fills as soon as one exists.
     assert _put_service(portal, "alice", "personal", "notes").status_code == 204
     assert [row["name"] for row in _catalog_services(portal, "alice", "personal")] == ["notes"]
+
+
+def _storage_dirs(portal: dict[str, Any]) -> set[Path]:
+    return {path for path in portal["paths"].storage_root.rglob("*") if path.is_dir()}
+
+
+def test_portal_catalog_reads_no_egress_state_while_the_broker_is_off(
+    egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a broker port the catalog sends no egress rows and reads no egress store or scope directory."""
+    _restart_with_env(egress_portal, MINDROOM_EGRESS_BROKER_PORT="")
+    services_read: list[object] = []
+    read_services = egress_status.effective_config
+    monkeypatch.setattr(
+        egress_status,
+        "effective_config",
+        lambda *args: services_read.append(args) or read_services(*args),
+    )
+    dirs_before = _storage_dirs(egress_portal)
+
+    response = egress_portal["client"].get("/api/connections", headers=egress_portal["headers"]["alice"])
+
+    assert response.status_code == 200, response.text
+    agents = response.json()["agents"]
+    assert {"personal", "shared_dev"} <= {agent["agent_name"] for agent in agents}
+    assert [agent["egress_services"] for agent in agents] == [None] * len(agents)
+    assert services_read == []
+    assert _storage_dirs(egress_portal) == dirs_before
+
+
+def test_portal_catalog_survives_egress_state_that_cannot_be_read(
+    egress_portal: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable egress store hides the agent's egress rows and neither fails the catalog nor leaks the error."""
+
+    def unreadable(*_args: object) -> Never:
+        msg = "internal-store-detail"
+        raise OSError(msg)
+
+    monkeypatch.setattr(egress_status, "effective_config", unreadable)
+
+    with capture_logs() as logs:
+        response = egress_portal["client"].get("/api/connections", headers=egress_portal["headers"]["alice"])
+
+    assert response.status_code == 200, response.text
+    assert all(agent["egress_services"] is None for agent in response.json()["agents"])
+    assert "internal-store-detail" not in response.text
+    warnings = [log for log in logs if log["event"] == "connection_catalog_egress_unavailable"]
+    assert {log["agent_name"] for log in warnings} == {"personal", "shared_dev"}
+    assert {log["error_type"] for log in warnings} == {"OSError"}
 
 
 # --- Connected accounts (OAuth) ---
