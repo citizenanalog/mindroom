@@ -1,3 +1,6 @@
+@import "@fontsource-variable/hanken-grotesk";
+@import "@fontsource-variable/bricolage-grotesque";
+@import "@fontsource-variable/jetbrains-mono";
 @import "./styles/tokens.css";
 @import "./styles/animations.css";
 @import "tailwindcss";
@@ -5,52 +8,56 @@
 
 @layer base {
   :root {
-    --background: 42 25% 93%;
-    --foreground: 39 16% 20%;
-    --card: 44 38% 98%;
-    --card-foreground: 39 16% 20%;
-    --popover: 44 38% 98%;
-    --popover-foreground: 39 16% 20%;
-    --primary: 154 23% 33%;
-    --primary-foreground: 48 30% 98%;
-    --secondary: 40 22% 90%;
-    --secondary-foreground: 39 16% 20%;
-    --muted: 40 18% 89%;
-    --muted-foreground: 36 8% 39%;
-    --accent: 143 17% 88%;
-    --accent-foreground: 154 23% 30%;
-    --destructive: 2 65% 48%;
-    --destructive-foreground: 36 30% 98%;
-    --border: 37 17% 82%;
-    --input: 37 17% 75%;
-    --ring: 154 23% 33%;
-    --radius: 0.625rem;
-    --glass-highlight: 0 0% 100% / 0.55;
-    --glass-shadow: 35 25% 20% / 0.06;
+    --background: 252 29% 97%;
+    --foreground: 247 33% 16%;
+    --card: 0 0% 100%;
+    --card-foreground: 247 33% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 247 33% 16%;
+    --primary: 253 56% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 248 29% 95%;
+    --secondary-foreground: 247 33% 16%;
+    --muted: 248 29% 95%;
+    --muted-foreground: 247 12% 42%;
+    --accent: 244 100% 97%;
+    --accent-foreground: 255 53% 46%;
+    --destructive: 3 65% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 251 22% 90%;
+    --input: 251 18% 77%;
+    --ring: 253 56% 55%;
+    --rail: 247 33% 16%;
+    --rail-foreground: 249 45% 94%;
+    --rail-muted: 248 25% 70%;
+    --rail-accent: 247 100% 87%;
+    --radius: 0.5rem;
   }
 
   .dark {
-    --background: 40 10% 12%;
-    --foreground: 42 23% 90%;
-    --card: 40 9% 17%;
-    --card-foreground: 42 23% 90%;
-    --popover: 40 9% 17%;
-    --popover-foreground: 42 23% 90%;
-    --primary: 145 25% 70%;
-    --primary-foreground: 145 20% 16%;
-    --secondary: 40 10% 23%;
-    --secondary-foreground: 42 23% 90%;
-    --muted: 40 9% 23%;
-    --muted-foreground: 39 11% 64%;
-    --accent: 145 12% 26%;
-    --accent-foreground: 145 25% 70%;
-    --destructive: 2 58% 48%;
-    --destructive-foreground: 34 17% 92%;
-    --border: 39 9% 28%;
-    --input: 39 9% 35%;
-    --ring: 145 25% 70%;
-    --glass-highlight: 42 30% 90% / 0.07;
-    --glass-shadow: 30 20% 3% / 0.18;
+    --background: 251 24% 9%;
+    --foreground: 251 35% 94%;
+    --card: 249 22% 13%;
+    --card-foreground: 251 35% 94%;
+    --popover: 248 19% 15%;
+    --popover-foreground: 251 35% 94%;
+    --primary: 247 100% 83%;
+    --primary-foreground: 247 33% 16%;
+    --secondary: 250 20% 18%;
+    --secondary-foreground: 251 35% 94%;
+    --muted: 250 20% 18%;
+    --muted-foreground: 249 17% 70%;
+    --accent: 249 31% 22%;
+    --accent-foreground: 247 100% 87%;
+    --destructive: 3 84% 68%;
+    --destructive-foreground: 247 33% 16%;
+    --border: 249 20% 21%;
+    --input: 249 18% 30%;
+    --ring: 247 100% 83%;
+    --rail: 253 29% 6%;
+    --rail-foreground: 251 35% 94%;
+    --rail-muted: 248 18% 66%;
+    --rail-accent: 247 100% 87%;
   }
 
   * {
