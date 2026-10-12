@@ -11,13 +11,13 @@ import yaml
 from fastapi import HTTPException
 
 from mindroom.api import egress_status, oauth
+from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.user_services import save_user_service
 from mindroom.oauth import registry as oauth_registry
-from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from tests.api.test_oauth_api import _fake_provider
 
 if TYPE_CHECKING:
@@ -376,21 +376,11 @@ def _save_own_service(name: str, agent_name: str | None = None) -> None:
     from mindroom.api import main  # noqa: PLC0415
 
     config = main._app_context(main.app).runtime_config
-    manager = get_runtime_credentials_manager(main._app_runtime_paths(main.app))
+    paths = main._app_runtime_paths(main.app)
+    manager = get_runtime_credentials_manager(paths)
     target = None
     if agent_name is not None:
-        identity = ToolExecutionIdentity(
-            channel="mcp",
-            agent_name=agent_name,
-            requester_id="@owner:example.org",
-            room_id=None,
-            thread_id=None,
-            resolved_thread_id=None,
-            session_id=None,
-            tenant_id=None,
-            account_id=None,
-        )
-        target = resolve_worker_target("shared", agent_name, identity, private_agent_names=frozenset())
+        target = build_connection_agent_target(config, paths, "@owner:example.org", agent_name)
     service = EgressService.model_validate({"rules": [{"host": "api.example.com", "auth": {"type": "bearer"}}]})
     save_user_service(
         manager,
