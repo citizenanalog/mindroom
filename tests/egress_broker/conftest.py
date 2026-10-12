@@ -33,6 +33,7 @@ from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import Secret, SecretMissing
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from tests.test_helpers import make_test_ca
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -147,44 +148,8 @@ class UpstreamCA:
 @pytest.fixture
 def upstream_ca() -> UpstreamCA:
     """Return a fresh test CA for the fake TLS upstream."""
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Egress Broker Test Upstream CA")])
-    now = datetime.now(UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(hours=1))
-        .not_valid_after(now + timedelta(days=1))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=False,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-        .sign(key, hashes.SHA256())
-    )
+    cert, key = make_test_ca("Egress Broker Test Upstream CA")
     return UpstreamCA(cert=cert, key=key)
-
-
-@pytest.fixture
-def test_ca_pem() -> str:
-    """Return a valid test CA certificate in PEM format."""
-    from tests.test_helpers import make_test_ca_pem  # noqa: PLC0415
-
-    return make_test_ca_pem()
 
 
 # Fake upstream routes. Add a handler here to make it available on both `tls_upstream` and `http_upstream`.

@@ -111,14 +111,6 @@ def sample_agent_data() -> dict[str, Any]:
 
 
 @pytest.fixture
-def test_ca_pem() -> str:
-    """Return a valid test CA certificate in PEM format."""
-    from tests.test_helpers import make_test_ca_pem  # noqa: PLC0415
-
-    return make_test_ca_pem()
-
-
-@pytest.fixture
 def calls_on_event_loop(monkeypatch: pytest.MonkeyPatch) -> Callable[[object, str], list[bool]]:
     """Return ``record(module, name)``: wrap ``module.name`` and log, for each call, whether it ran on the event loop."""
 

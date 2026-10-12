@@ -10,10 +10,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 
-def make_test_ca_pem() -> str:
-    """Return a valid test CA certificate in PEM format."""
+def make_test_ca(common_name: str) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
+    """Return a self-signed CA certificate named `common_name`, valid for a day, and its key."""
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Egress Broker CA")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.now(UTC)
     cert = (
         x509.CertificateBuilder()
@@ -41,4 +41,10 @@ def make_test_ca_pem() -> str:
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .sign(key, hashes.SHA256())
     )
+    return cert, key
+
+
+def make_test_ca_pem() -> str:
+    """Return a valid test CA certificate in PEM format."""
+    cert, _key = make_test_ca("Test Egress Broker CA")
     return cert.public_bytes(serialization.Encoding.PEM).decode()
