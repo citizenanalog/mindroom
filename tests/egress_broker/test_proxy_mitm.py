@@ -355,9 +355,8 @@ async def test_restrict_to_rules_refuses_unlisted_paths_in_tunnel(
     audit: AuditLog,
 ) -> None:
     """A restricted service's host serves only listed paths; others get 403 instead of an unauthenticated forward."""
-    rule = EgressRule(host="localhost", path_prefix="/echo", auth=EgressAuth(type="bearer"))
     await broker(
-        EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}),
+        single_rule_config(path_prefix="/echo", restrict_to_rules=True),
         secrets={"svc": SECRET},
         manage_url=MANAGE_URL,
     )
@@ -977,7 +976,7 @@ async def test_open_tunnel_follows_config_changes(
     client = proxy_client(broker.token())
 
     first = await client.get(tls_upstream.url("/echo"))
-    configs.append(EgressBrokerConfig(unmatched_hosts="deny", services=single_rule_config("api.github.com").services))
+    configs.append(single_rule_config("api.github.com", unmatched_hosts="deny"))
     second = await client.get(tls_upstream.url("/echo"))
 
     assert first.json()["headers"]["authorization"] == [f"Bearer {SECRET}"]

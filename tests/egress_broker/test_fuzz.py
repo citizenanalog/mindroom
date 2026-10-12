@@ -24,9 +24,15 @@ from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, Egress
 from mindroom.egress_broker import dial
 from mindroom.egress_broker.mitm import _host_header_name
 from mindroom.egress_broker.proxy import _token_from
-from mindroom.egress_broker.rules import EgressRules, is_ambiguous_path, route_request
+from mindroom.egress_broker.rules import is_ambiguous_path, route_request
 from mindroom.egress_broker.tokens import TokenSigner
-from tests.egress_broker.conftest import DEFAULT_CLAIMS, connect_request, proxy_authorization
+from tests.egress_broker.conftest import (
+    DEFAULT_CLAIMS,
+    connect_request,
+    proxy_authorization,
+    single_rule_config,
+    with_user_services,
+)
 from tests.egress_broker.raw_http import open_tunnel
 
 if TYPE_CHECKING:
@@ -233,10 +239,7 @@ def test_routed_paths_stay_under_their_prefix_after_server_normalization(
     path = path.split("?", 1)[0]
     operator = EgressBrokerConfig(services={"op": _service(operator_prefixes, restrict=operator_restricts)})
     user = {"mine": _service(user_prefixes, restrict=user_restricts)} if user_prefixes else {}
-    rules = EgressRules(
-        operator=operator,
-        effective=operator.model_copy(update={"services": {**operator.services, **user}}),
-    )
+    rules = with_user_services(operator, **user)
 
     route = route_request(rules, HOST, 443, path)
 
@@ -493,8 +496,7 @@ async def fuzz_broker(
         return await dial_checked_address(host, address, port, policy=policy, ssl_context=ssl_context)
 
     monkeypatch.setattr(dial, "_dial", dial_fake_upstreams_only)
-    rule = EgressRule(host="localhost", path_prefix=_RULE_PREFIX, auth=EgressAuth(type="bearer"))
-    return await broker(EgressBrokerConfig(services={"svc": EgressService(rules=[rule])}), secrets={"svc": SECRET})
+    return await broker(single_rule_config(path_prefix=_RULE_PREFIX), secrets={"svc": SECRET})
 
 
 async def _read_available(reader: asyncio.StreamReader, *, seconds: float) -> bytes:

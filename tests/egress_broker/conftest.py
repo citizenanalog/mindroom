@@ -12,7 +12,7 @@ import socket
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 import pytest
@@ -631,10 +631,15 @@ def single_rule_config(
     *,
     path_prefix: str = "/",
     auth: EgressAuth | None = None,
+    restrict_to_rules: bool = False,
+    unmatched_hosts: Literal["passthrough", "deny"] = "passthrough",
 ) -> EgressBrokerConfig:
     """Return a config with one service, ``svc``, whose one rule covers `path_prefix` on `host` (bearer by default)."""
     rule = EgressRule(host=host, path_prefix=path_prefix, auth=auth or EgressAuth(type="bearer"))
-    return EgressBrokerConfig(services={"svc": EgressService(rules=[rule])})
+    return EgressBrokerConfig(
+        unmatched_hosts=unmatched_hosts,
+        services={"svc": EgressService(restrict_to_rules=restrict_to_rules, rules=[rule])},
+    )
 
 
 def with_user_services(operator: EgressBrokerConfig, **user: EgressService) -> EgressRules:

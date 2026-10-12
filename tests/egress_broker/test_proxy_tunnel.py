@@ -25,6 +25,7 @@ from tests.egress_broker.conftest import (
     LOCALHOST_BLOCKED,
     LOCALHOST_UNREACHABLE,
     MALFORMED,
+    MANAGE_URL,
     METHOD_NOT_ALLOWED,
     PROXY_AUTHENTICATION_REQUIRED,
     assert_audited,
@@ -180,7 +181,7 @@ async def test_deny_ignores_user_rules_on_hosts_the_operator_does_not_name(
     http_upstream: Upstream,
 ) -> None:
     """Under deny a host only a user service names is refused on CONNECT and plain HTTP and is never intercepted."""
-    operator = EgressBrokerConfig(unmatched_hosts="deny", services=single_rule_config("api.github.com").services)
+    operator = single_rule_config("api.github.com", unmatched_hosts="deny")
     mine = EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])
     started = await broker(
         rules_provider=lambda _claims: with_user_services(operator, mine=mine),
@@ -244,7 +245,7 @@ async def test_operator_restriction_refuses_paths_only_a_user_rule_lists(
     await broker(
         rules_provider=lambda _claims: with_user_services(operator, mine=mine),
         secrets={"op": "operator-key", "mine": "user-key"},
-        manage_url="https://m.test/connections/egress",
+        manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
 
@@ -256,7 +257,7 @@ async def test_operator_restriction_refuses_paths_only_a_user_rule_lists(
         {
             "error": "path_not_allowed",
             "service": "op",
-            "manage_url": "https://m.test/connections/egress",
+            "manage_url": MANAGE_URL,
             "message": "localhost/echo is outside the paths op allows for this agent. "
             "Only an administrator can change this, at manage_url.",
         },
@@ -567,11 +568,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
     audit: AuditLog,
 ) -> None:
     """An unlisted path on a restricted host is refused over plain HTTP too, not forwarded without credentials."""
-    rule = EgressRule(host="localhost", path_prefix="/private", auth=EgressAuth(type="bearer"))
-    await broker(
-        EgressBrokerConfig(services={"svc": EgressService(restrict_to_rules=True, rules=[rule])}),
-        manage_url="https://m.test/connections/egress",
-    )
+    await broker(single_rule_config(path_prefix="/private", restrict_to_rules=True), manage_url=MANAGE_URL)
     client = proxy_client(broker.token())
 
     response = await client.get(http_upstream.url("/echo?page=2"))
@@ -580,7 +577,7 @@ async def test_plain_http_restricted_host_refuses_unlisted_path(
     assert response.json() == {
         "error": "path_not_allowed",
         "service": "svc",
-        "manage_url": "https://m.test/connections/egress",
+        "manage_url": MANAGE_URL,
         "message": "localhost/echo is outside the paths svc allows for this agent. "
         "Only an administrator can change this, at manage_url.",
     }
@@ -618,7 +615,7 @@ async def test_plain_http_denied_under_deny_policy(
     proxy_client: ProxyClient,
 ) -> None:
     """``unmatched_hosts: deny`` applies to plain requests too."""
-    await broker(EgressBrokerConfig(unmatched_hosts="deny", services=single_rule_config("api.github.com").services))
+    await broker(single_rule_config("api.github.com", unmatched_hosts="deny"))
     client = proxy_client(broker.token())
 
     response = await client.get(http_upstream.url("/echo"))

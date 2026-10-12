@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
-from mindroom.egress_broker.rules import EgressRules
+from mindroom.config.egress_broker import EgressAuth, EgressRule, EgressService
 from mindroom.egress_broker.secrets import SecretMissing, SecretNeedsReconnect
 from tests.egress_broker.conftest import (
     CONNECT_URL,
@@ -17,6 +16,8 @@ from tests.egress_broker.conftest import (
     git_ls_remote,
     pkt_line,
     proxy_authorization,
+    single_rule_config,
+    with_user_services,
 )
 
 if TYPE_CHECKING:
@@ -31,11 +32,9 @@ TLS_REQUIRED = "Credentials are only added over HTTPS. Use https:// for localhos
 GIT_USER_AGENT = {"User-Agent": "git/2.55.0"}
 
 
-def _config(*, unmatched_hosts: str = "passthrough") -> EgressBrokerConfig:
-    rule = EgressRule(host="localhost", auth=EgressAuth(type="basic", username="x-access-token"))
-    return EgressBrokerConfig.model_validate(
-        {"unmatched_hosts": unmatched_hosts, "services": {"svc": EgressService(rules=[rule])}},
-    )
+# One service, ``svc``, sending its key as git does: basic auth for ``x-access-token`` on localhost.
+_BASIC = EgressAuth(type="basic", username="x-access-token")
+_CONFIG = single_rule_config(auth=_BASIC)
 
 
 def _plain_get(target: str, *, token: str | None, method: str = "GET", git: bool = False) -> bytes:
@@ -66,7 +65,7 @@ async def test_plain_refusals_carry_the_code_header_and_the_message_as_reason(
     code: str,
 ) -> None:
     """Clients that print only the status line show the message; scripts read the code from X-MindRoom-Error."""
-    started = await broker(_config(unmatched_hosts="deny"))
+    started = await broker(single_rule_config(auth=_BASIC, unmatched_hosts="deny"))
 
     response = await raw_proxy(started.port, _plain_get(target, token=broker.token() if with_token else None))
 
@@ -86,7 +85,7 @@ async def test_tunnel_refusal_carries_the_code_header_and_the_message_as_reason(
     proxy_client: ProxyClient,
 ) -> None:
     """A refusal inside an intercepted tunnel has the same header and reason phrase as a plain one."""
-    await broker(_config())
+    await broker(_CONFIG)
 
     response = await proxy_client(broker.token()).get(tls_upstream.url("/echo"))
 
@@ -105,7 +104,7 @@ async def test_an_upstream_cannot_pass_its_response_off_as_a_broker_refusal(
     proxy_client: ProxyClient,
 ) -> None:
     """X-MindRoom-Error is removed from relayed responses, in a tunnel and on plain HTTP, so only refusals carry it."""
-    await broker(_config(), secrets={"svc": "s3cret"})
+    await broker(_CONFIG, secrets={"svc": "s3cret"})
     client = proxy_client(broker.token())
 
     tunneled = await client.get(tls_upstream.url("/forged-refusal"))
@@ -125,14 +124,13 @@ async def test_reason_phrase_is_printable_ascii_without_line_breaks_and_at_most_
     proxy_client: ProxyClient,
 ) -> None:
     """A display name with CR, LF, or non-ASCII text never splits the status line; a long message is cut at 200."""
-    operator = _config()
     limit = EgressService(
         restrict_only=True,
         display_name="Evil\r\nX-Injected: yes café",
         rules=[EgressRule(host="localhost", path_prefix="/echo")],
     )
-    effective = operator.model_copy(update={"services": {**operator.services, "limit": limit}})
-    await broker(rules_provider=lambda _claims: EgressRules(operator=operator, effective=effective))
+    rules = with_user_services(_CONFIG, limit=limit)
+    await broker(rules_provider=lambda _claims: rules)
     long_path = "/other/" + "a" * 300
 
     response = await proxy_client(broker.token()).get(tls_upstream.url(long_path))
@@ -163,7 +161,7 @@ async def test_git_discovery_refusal_in_a_tunnel_is_an_advertisement_ending_in_e
     first_line: bytes,
 ) -> None:
     """Git reads `ERR <message>` from a 200 advertisement and prints it; the audit row keeps the refusal code."""
-    await broker(_config())
+    await broker(_CONFIG)
 
     response = await proxy_client(broker.token()).get(
         tls_upstream.url(f"/repo.git/info/refs?service={service}"),
@@ -191,7 +189,7 @@ async def test_plain_git_discovery_refusal_is_an_advertisement_but_the_proxy_cha
     raw_proxy: RawProxy,
 ) -> None:
     """Over plain HTTP the refusal takes git's form too, but git's curl must still see the 407 to send credentials."""
-    started = await broker(_config())
+    started = await broker(_CONFIG)
     target = "http://localhost:1/repo.git/info/refs?service=git-upload-pack"
 
     refused = await raw_proxy(started.port, _plain_get(target, token=broker.token(), git=True))
@@ -224,7 +222,7 @@ async def test_other_requests_keep_the_json_refusal(
     path: str,
 ) -> None:
     """Only a GET for one smart-HTTP discovery service gets git's form; everything else keeps the JSON body."""
-    started = await broker(_config())
+    started = await broker(_CONFIG)
 
     response = await raw_proxy(
         started.port,
@@ -255,7 +253,7 @@ async def test_only_a_git_client_gets_the_git_form(
     git_form: bool,
 ) -> None:
     """A discovery URL fetched by anything but git keeps the JSON refusal its client can read."""
-    await broker(_config())
+    await broker(_CONFIG)
 
     response = await proxy_client(broker.token()).get(
         tls_upstream.url("/repo.git/info/refs?service=git-upload-pack"),
@@ -304,7 +302,7 @@ async def test_git_error_line_names_the_manage_link_but_never_the_connect_link(
     json_message: str,
 ) -> None:
     """Git shows only the ERR line, so it carries the manage link itself; the token-bearing connect link never."""
-    await broker(_config(), resolve_secret=lambda _claims, _service: lookup, manage_url=MANAGE_URL)
+    await broker(_CONFIG, resolve_secret=lambda _claims, _service: lookup, manage_url=MANAGE_URL)
     client = proxy_client(broker.token())
     url = tls_upstream.url("/repo.git/info/refs?service=git-upload-pack")
 
@@ -325,7 +323,7 @@ async def test_a_target_that_does_not_parse_as_a_url_keeps_the_json_refusal(
     raw_proxy: RawProxy,
 ) -> None:
     """Choosing the refusal's form never fails on a malformed target: it gets the plain 400, not a broker error."""
-    started = await broker(_config())
+    started = await broker(_CONFIG)
 
     response = await raw_proxy(
         started.port,
@@ -346,7 +344,7 @@ async def test_git_ls_remote_prints_the_refusal_message(
     audit: AuditLog,
 ) -> None:
     """A real git client shows `remote error: <message>` instead of a bare 403 when the broker refuses."""
-    await broker(_config())
+    await broker(_CONFIG)
 
     returncode, _stdout, stderr = await git_ls_remote(broker, tls_upstream.url("/repo.git"), tmp_path)
 

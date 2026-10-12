@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mindroom.egress_broker.messages import refusal_body
-from tests.egress_broker.conftest import CONNECT_URL
+from tests.egress_broker.conftest import CONNECT_URL, MANAGE_URL
 
 
 @pytest.mark.parametrize(
@@ -206,7 +206,7 @@ def test_body_keeps_its_fields_and_adds_only_service_and_provider() -> None:
         service="github",
         provider="github",
         connectable=True,
-        manage_url="https://m.test/connections/egress",
+        manage_url=MANAGE_URL,
         connect_url=CONNECT_URL,
     )
 
@@ -214,7 +214,7 @@ def test_body_keeps_its_fields_and_adds_only_service_and_provider() -> None:
         "error": "credential_not_configured",
         "service": "github",
         "provider": "github",
-        "manage_url": "https://m.test/connections/egress",
+        "manage_url": MANAGE_URL,
         "connect_url": CONNECT_URL,
         "message": "No github credential is set for this agent. "
         "Ask the user to connect it at connect_url or add a key at manage_url, then retry.",

@@ -11,11 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mindroom.config.egress_broker import EgressAuth, EgressBrokerConfig, EgressRule, EgressService
 from mindroom.egress_broker import dial
 from mindroom.egress_broker.dial import DestinationBlockedError, DialPolicy, open_upstream
 from mindroom.worker_computer.browser_proxy import BrowserEgress, UpstreamTunnelRefusedError, _UpstreamProxy
-from tests.egress_broker.conftest import connect_request, proxy_authorization, serving
+from tests.egress_broker.conftest import connect_request, proxy_authorization, serving, single_rule_config
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -379,9 +378,7 @@ async def test_intercepted_request_reaches_destination_through_operator_proxy(
     tmp_path: Path,
 ) -> None:
     """The secret is injected on the broker's own TLS session inside the tunnel; the operator proxy only sees CONNECT."""
-    config = EgressBrokerConfig(
-        services={"svc": EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])},
-    )
+    config = single_rule_config()
     operator = _OperatorProxy(inner_tls=upstream_ca.server_context(tmp_path))
     async with operator as proxy:
         await broker(config, secrets={"svc": "s3cret"}, dial_policy=DialPolicy(egress=BrowserEgress(https=proxy)))
