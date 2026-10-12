@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -16,14 +15,13 @@ from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
-from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.user_services import save_user_service
 from mindroom.oauth import registry as oauth_registry
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from tests.api.test_oauth_api import _fake_provider
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Iterator
     from pathlib import Path
 
     from fastapi.testclient import TestClient
@@ -96,17 +94,12 @@ def broker_test_client(egress_config_file: Path) -> TestClient:
 
 
 @pytest.fixture
-def mock_active_audit_log() -> Generator[MagicMock, None, None]:
-    """Mock active_audit_log to control broker running state."""
-    with patch("mindroom.api.egress_broker.active_audit_log") as mock:
-        yield mock
-
-
-@pytest.fixture
-def mock_active_ca_pem() -> Generator[MagicMock, None, None]:
-    """Mock active_ca_pem to control broker running state."""
-    with patch("mindroom.api.egress_broker.active_ca_pem") as mock:
-        yield mock
+def audit_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[AuditLog]:
+    """Serve the admin log from a real audit log, as if the broker were running."""
+    log = AuditLog(tmp_path / "audit.sqlite3")
+    monkeypatch.setattr("mindroom.api.egress_broker.active_audit_log", lambda: log)
+    yield log
+    log.close()
 
 
 def _scope_params(agent_name: str | None) -> dict[str, str]:
@@ -185,34 +178,10 @@ def test_put_blank_secret_422(broker_test_client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_agent_scoped_put_lands_in_agent_scope(broker_test_client: TestClient) -> None:
-    """Secret for a shared agent should go to for_primary_runtime_agent_scope."""
-    # Set a secret for a shared agent
-    response = broker_test_client.put(
-        "/api/egress-broker/services/github/secret?agent_name=test_agent",
-        json={"secret": "agent-secret"},
-    )
-    assert response.status_code == 204
-
-    # Verify it landed in the right scope by checking status
-    response = broker_test_client.get("/api/egress-broker/services?agent_name=test_agent")
-    assert response.status_code == 200
-    data = response.json()
-    services = data.get("services", [])
-    github_service = next((s for s in services if s["name"] == "github"), None)
-    assert github_service is not None
-    assert github_service["configured"] is True
-
-
-def test_logs_and_ca_409_when_inactive(
-    broker_test_client: TestClient,
-    mock_active_audit_log: MagicMock,
-    mock_active_ca_pem: MagicMock,
-) -> None:
+def test_logs_and_ca_409_when_inactive(broker_test_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """Logs and CA endpoints should return 409 when broker is not running."""
-    # Broker not running
-    mock_active_audit_log.return_value = None
-    mock_active_ca_pem.return_value = None
+    monkeypatch.setattr("mindroom.api.egress_broker.active_audit_log", lambda: None)
+    monkeypatch.setattr("mindroom.api.egress_broker.active_ca_pem", lambda: None)
 
     # Logs should return 409
     response = broker_test_client.get("/api/egress-broker/logs")
@@ -238,48 +207,22 @@ def test_services_listing_summarizes_rules_with_how_they_send_the_key(broker_tes
     assert "x-access-token" not in response.text
 
 
-def test_presets_are_listed_with_their_rules_and_login(broker_test_client: TestClient) -> None:
-    """The dashboard editor gets the same preset list the personal page does."""
-    response = broker_test_client.get("/api/egress-broker/presets")
-
-    assert response.status_code == 200, response.text
-    presets = response.json()["presets"]
-    assert [preset["id"] for preset in presets] == list(EGRESS_PRESETS)
-    github = presets[0]
-    assert (github["id"], github["display_name"], github["oauth_provider"]) == ("github", "GitHub", "github")
-    assert github["rules"][0] == {"host": "api.github.com", "port": None, "path_prefix": "/"}
-    assert github["placeholder_env"] == {"GH_TOKEN": "mindroom-brokered", "GITHUB_TOKEN": "mindroom-brokered"}
-    assert next(preset for preset in presets if preset["id"] == "anthropic")["oauth_provider"] is None
-    assert all(set(rule) == {"host", "port", "path_prefix"} for preset in presets for rule in preset["rules"])
-    providers = {provider["id"]: provider for provider in response.json()["oauth_providers"]}
-    assert providers["github"] == {"id": "github", "display_name": "GitHub"}
-    assert {"google_drive", "google_gmail", "atlassian"} <= set(providers)
-
-
-def test_presets_carry_the_same_user_service_validation_as_the_personal_page(broker_test_client: TestClient) -> None:
-    """The dashboard editor validates a user service against what the server enforces, like the personal one."""
-    response = broker_test_client.get("/api/egress-broker/presets")
-
-    assert response.status_code == 200, response.text
-    validation = response.json()["validation"]
-    assert validation == egress_status.presets_response({}).validation.model_dump(mode="json")
-    assert set(validation) == {"max_rules_per_service", "max_service_bytes", "placeholder"}
-
-
-def test_presets_route_sits_behind_the_dashboard_auth() -> None:
-    """The presets route is mounted with the dashboard's `verify_user` like every other egress-broker route."""
+def test_routes_require_dashboard_auth() -> None:
+    """Every egress-broker route, presets included, is mounted with the dashboard's `verify_user`."""
     from mindroom.api import main  # noqa: PLC0415
     from mindroom.api.auth import verify_user  # noqa: PLC0415
 
-    route = next(r for r in main.app.routes if getattr(r, "path", None) == "/api/egress-broker/presets")
-    assert any(dependency.call is verify_user for dependency in route.dependant.dependencies)  # type: ignore[attr-defined]
+    routes = [route for route in main.app.routes if getattr(route, "path", "").startswith("/api/egress-broker/")]
+    assert "/api/egress-broker/presets" in {route.path for route in routes}  # type: ignore[attr-defined]
+    for route in routes:
+        dependencies = route.dependant.dependencies  # type: ignore[attr-defined]
+        assert any(dependency.call is verify_user for dependency in dependencies), route.path  # type: ignore[attr-defined]
 
 
-def test_logs_return_the_refusal_code(broker_test_client: TestClient, tmp_path: Path) -> None:
+def test_logs_return_the_refusal_code(broker_test_client: TestClient, audit_log: AuditLog) -> None:
     """The administrator's log shows why a request was refused, and null for one that was forwarded."""
-    audit = AuditLog(tmp_path / "codes.sqlite3")
-    audit.record(_audit_record(at=datetime(2026, 10, 1, tzinfo=UTC), path="/ok"))
-    audit.record(
+    audit_log.record(_audit_record(at=datetime(2026, 10, 1, tzinfo=UTC), path="/ok"))
+    audit_log.record(
         _audit_record(
             at=datetime(2026, 10, 2, tzinfo=UTC),
             kind="denied",
@@ -289,25 +232,13 @@ def test_logs_return_the_refusal_code(broker_test_client: TestClient, tmp_path: 
         ),
     )
 
-    with patch("mindroom.api.egress_broker.active_audit_log", return_value=audit):
-        response = broker_test_client.get("/api/egress-broker/logs")
+    response = broker_test_client.get("/api/egress-broker/logs")
 
     assert response.status_code == 200, response.text
     assert [(row["path"], row["code"]) for row in response.json()["records"]] == [
         ("/nope", "path_not_allowed"),
         ("/ok", None),
     ]
-    audit.close()
-
-
-def test_routes_require_dashboard_auth(broker_test_client: TestClient) -> None:
-    """All egress-broker routes use the same auth dependencies as credentials routes."""
-    # This test verifies that the router is included with the right dependencies.
-    # The actual auth logic is tested elsewhere. Here we just ensure the routes exist
-    # and are accessible with proper auth (which broker_test_client provides).
-    response = broker_test_client.get("/api/egress-broker/services")
-    # Should get a valid response with broker_test_client which has auth
-    assert response.status_code == 200  # Should work with proper config
 
 
 @pytest.mark.parametrize("agent_name", [None, "test_agent"], ids=["global", "agent-scoped"])
@@ -322,8 +253,10 @@ def test_delete_secret_flips_status(broker_test_client: TestClient, agent_name: 
     )
     assert response.status_code == 204
 
-    # Check it's configured
+    # Check it's configured, in that scope only
     assert _service(broker_test_client, "github", agent_name)["configured"] is True
+    if agent_name is not None:
+        assert _service(broker_test_client, "github")["configured"] is False
 
     # Delete it
     response = broker_test_client.delete("/api/egress-broker/services/github/secret", params=params)
@@ -333,18 +266,10 @@ def test_delete_secret_flips_status(broker_test_client: TestClient, agent_name: 
     assert _service(broker_test_client, "github", agent_name)["configured"] is False
 
 
-def test_logs_filtering_with_real_audit_log(
-    broker_test_client: TestClient,
-    tmp_path: Path,
-) -> None:
+def test_logs_filtering_with_real_audit_log(broker_test_client: TestClient, audit_log: AuditLog) -> None:
     """Test /logs endpoint with real AuditLog and filtering."""
-    # Create a real audit log
-    log_path = tmp_path / "test_audit.sqlite3"
-    audit = AuditLog(log_path)
-
-    # Add some test records
-    audit.record(_audit_record(bytes_up=100, bytes_down=500, duration_ms=50))
-    audit.record(
+    audit_log.record(_audit_record(bytes_up=100, bytes_down=500, duration_ms=50))
+    audit_log.record(
         _audit_record(
             agent_name="other_agent",
             method="POST",
@@ -357,58 +282,52 @@ def test_logs_filtering_with_real_audit_log(
         ),
     )
 
-    # Mock active_audit_log to return our test log
-    with patch("mindroom.api.egress_broker.active_audit_log", return_value=audit):
-        # Test filtering by agent_name
-        response = broker_test_client.get("/api/egress-broker/logs?agent_name=test_agent")
-        assert response.status_code == 200
-        records = response.json()["records"]
-        assert len(records) == 1
-        assert records[0]["agent_name"] == "test_agent"
-        assert records[0]["host"] == "api.github.com"
+    # Test filtering by agent_name
+    response = broker_test_client.get("/api/egress-broker/logs?agent_name=test_agent")
+    assert response.status_code == 200
+    records = response.json()["records"]
+    assert len(records) == 1
+    assert records[0]["agent_name"] == "test_agent"
+    assert records[0]["host"] == "api.github.com"
 
-        # Test filtering by host
-        response = broker_test_client.get("/api/egress-broker/logs?host=api.openai.com")
-        assert response.status_code == 200
-        records = response.json()["records"]
-        assert len(records) == 1
-        assert records[0]["host"] == "api.openai.com"
+    # Test filtering by host
+    response = broker_test_client.get("/api/egress-broker/logs?host=api.openai.com")
+    assert response.status_code == 200
+    records = response.json()["records"]
+    assert len(records) == 1
+    assert records[0]["host"] == "api.openai.com"
 
-        # Test filtering by service
-        response = broker_test_client.get("/api/egress-broker/logs?service=github")
-        assert response.status_code == 200
-        records = response.json()["records"]
-        assert len(records) == 1
-        assert records[0]["service"] == "github"
+    # Test filtering by service
+    response = broker_test_client.get("/api/egress-broker/logs?service=github")
+    assert response.status_code == 200
+    records = response.json()["records"]
+    assert len(records) == 1
+    assert records[0]["service"] == "github"
 
-        # Test limit
-        response = broker_test_client.get("/api/egress-broker/logs?limit=1")
-        assert response.status_code == 200
-        records = response.json()["records"]
-        assert len(records) == 1
-
-    audit.close()
+    # Test limit
+    response = broker_test_client.get("/api/egress-broker/logs?limit=1")
+    assert response.status_code == 200
+    records = response.json()["records"]
+    assert len(records) == 1
 
 
-def test_admin_logs_carry_requester_and_filter_by_it(broker_test_client: TestClient, tmp_path: Path) -> None:
+def test_admin_logs_carry_requester_and_filter_by_it(broker_test_client: TestClient, audit_log: AuditLog) -> None:
     """Each row names the requester whose worker token made it, and the filter matches that ID exactly."""
-    audit = AuditLog(tmp_path / "requesters.sqlite3")
     for requester_id, path in (
         ("@alice:example.org", "/a"),
         ("@bob:example.org", "/b"),
         ("@alice:example.org", "/c"),
         (None, "/d"),
     ):
-        audit.record(_audit_record(requester_id=requester_id, path=path))
+        audit_log.record(_audit_record(requester_id=requester_id, path=path))
 
-    with patch("mindroom.api.egress_broker.active_audit_log", return_value=audit):
-        everyone = broker_test_client.get("/api/egress-broker/logs").json()["records"]
-        alice = broker_test_client.get("/api/egress-broker/logs", params={"requester": "@alice:example.org"})
-        nobody = broker_test_client.get("/api/egress-broker/logs", params={"requester": "@ali"})
-        both = broker_test_client.get(
-            "/api/egress-broker/logs",
-            params={"requester": "@alice:example.org", "agent_name": "test_agent", "host": "api.github.com"},
-        )
+    everyone = broker_test_client.get("/api/egress-broker/logs").json()["records"]
+    alice = broker_test_client.get("/api/egress-broker/logs", params={"requester": "@alice:example.org"})
+    nobody = broker_test_client.get("/api/egress-broker/logs", params={"requester": "@ali"})
+    both = broker_test_client.get(
+        "/api/egress-broker/logs",
+        params={"requester": "@alice:example.org", "agent_name": "test_agent", "host": "api.github.com"},
+    )
 
     assert sorted((row["path"], row["requester_id"]) for row in everyone) == [
         ("/a", "@alice:example.org"),
@@ -423,7 +342,6 @@ def test_admin_logs_carry_requester_and_filter_by_it(broker_test_client: TestCli
     ]
     assert nobody.json()["records"] == []
     assert [row["path"] for row in both.json()["records"]] == ["/c", "/a"]
-    audit.close()
 
 
 @pytest.mark.parametrize("agent_name", [None, "test_agent"])

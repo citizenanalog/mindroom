@@ -2400,6 +2400,18 @@ def test_presets_serve_the_user_service_validation_the_server_enforces(egress_po
     }
 
 
+def test_dashboard_presets_are_the_personal_presets(egress_portal: dict[str, Any]) -> None:
+    """The dashboard editor gets the same presets, account logins, and validation as the personal page."""
+    client, headers = egress_portal["client"], egress_portal["headers"]
+
+    dashboard = client.get("/api/egress-broker/presets", headers=headers["admin"])
+    personal = client.get("/api/connections/egress/presets", headers=headers["alice"])
+
+    assert dashboard.status_code == 200, dashboard.text
+    assert personal.status_code == 200, personal.text
+    assert dashboard.json() == personal.json()
+
+
 def test_served_placeholder_rules_give_the_answers_of_the_server_checks() -> None:
     """Each served placeholder rule refuses what the server refuses, so an editor that checks them agrees with a save."""
     placeholder = egress_status.presets_response({}).validation.placeholder
