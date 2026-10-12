@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import time
 import urllib.request
@@ -31,11 +30,13 @@ from tests.egress_broker.conftest import (
     assert_audited,
     audit_records,
     connect_request,
+    env_without_proxies,
     free_port,
     host_not_allowed,
     plain_request,
     proxy_authorization,
     read_raw_response,
+    run_command,
     single_rule_config,
     with_user_services,
 )
@@ -51,9 +52,10 @@ if TYPE_CHECKING:
     from tests.egress_broker.conftest import BrokerFactory, ProxyClient, RawProxy, ServeFactory, Upstream, UpstreamCA
 
 
-def _plain_get(upstream: Upstream, path: str, token: str) -> bytes:
-    """Return a raw absolute-form GET for `path` on `upstream`, which httpx would normalize."""
-    return plain_request(f"localhost:{upstream.port}", path=path, authorization=proxy_authorization(token))
+def _plain_get(upstream: Upstream, path: str, token: str, *, method: str = "GET") -> bytes:
+    """Return a raw absolute-form `method` request for `path` on `upstream`, which httpx would normalize."""
+    target = f"localhost:{upstream.port}"
+    return plain_request(target, path=path, method=method, authorization=proxy_authorization(token))
 
 
 @pytest.mark.asyncio
@@ -157,16 +159,11 @@ async def test_python_urllib_and_curl_authenticate(
             pytest.skip("curl not installed")
         ca_file = tmp_path / "upstream-ca.pem"
         ca_file.write_text(upstream_ca.pem)
-        env = {name: value for name, value in os.environ.items() if not name.lower().endswith("_proxy")}
-        process = await asyncio.create_subprocess_exec(
+        returncode, body, stderr = await run_command(
             *("curl", "-q", "-sS", "--fail", "--cacert", str(ca_file), url),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**env, "https_proxy": proxy_url},
+            env=env_without_proxies(https_proxy=proxy_url),
         )
-        async with asyncio.timeout(30):
-            body, stderr = await process.communicate()
-        assert process.returncode == 0, stderr.decode()
+        assert returncode == 0, stderr
 
     echoed = json.loads(body)
     assert echoed["path"] == "/echo"
@@ -491,14 +488,7 @@ async def test_plain_http_trace_and_track_on_rule_host_are_refused(
 ) -> None:
     """TRACE and TRACK get 405 on a rule host before the rule match, any secret lookup, or an upstream dial."""
     started = await broker(single_rule_config("localhost"), secrets={"svc": "s3cret"})
-    request = plain_request(
-        f"localhost:{http_upstream.port}",
-        path="/echo",
-        method=method,
-        authorization=proxy_authorization(broker.token()),
-    )
-
-    response = await raw_proxy(started.port, request)
+    response = await raw_proxy(started.port, _plain_get(http_upstream, "/echo", broker.token(), method=method))
 
     assert response.status == 405
     assert response.headers["x-mindroom-error"] == "method_not_allowed"
@@ -524,14 +514,7 @@ async def test_plain_http_other_methods_on_rule_host_are_forwarded(
 ) -> None:
     """Only TRACE and TRACK are refused on a rule host: DELETE to an unmatched path is forwarded as before."""
     started = await broker(single_rule_config("localhost", path_prefix="/private"))
-    request = plain_request(
-        f"localhost:{http_upstream.port}",
-        path="/echo",
-        method="DELETE",
-        authorization=proxy_authorization(broker.token()),
-    )
-
-    response = await raw_proxy(started.port, request)
+    response = await raw_proxy(started.port, _plain_get(http_upstream, "/echo", broker.token(), method="DELETE"))
 
     assert (response.status, response.json()["method"]) == (200, "DELETE")
     assert http_upstream.hits == ["/echo"]
@@ -546,14 +529,7 @@ async def test_plain_http_trace_on_host_without_rules_is_forwarded(
 ) -> None:
     """Hosts without rules are untouched: nothing is injected there, so TRACE is forwarded like any method."""
     started = await broker(single_rule_config("api.github.com"))
-    request = plain_request(
-        f"localhost:{http_upstream.port}",
-        path="/echo",
-        method="TRACE",
-        authorization=proxy_authorization(broker.token()),
-    )
-
-    response = await raw_proxy(started.port, request)
+    response = await raw_proxy(started.port, _plain_get(http_upstream, "/echo", broker.token(), method="TRACE"))
 
     assert (response.status, response.json()["method"]) == (200, "TRACE")
     assert http_upstream.hits == ["/echo"]
