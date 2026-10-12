@@ -4,10 +4,10 @@ import {
   GITHUB_UPLOADS_HOST,
   GITHUB_WEB_HOST,
   githubRepositoryRules,
+  GRAPHQL_PATH,
 } from "./githubRepositoryRules";
 
 const API_HOSTS = [GITHUB_API_HOST, GITHUB_UPLOADS_HOST];
-const GRAPHQL_PATH = "/graphql";
 
 /** Rules as listed or as authored; only the host and path are read, and an authored rule without a path covers `/`. */
 type Rule = { host: string; path_prefix?: string };

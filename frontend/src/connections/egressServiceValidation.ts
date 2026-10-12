@@ -2,6 +2,7 @@ import { headerNameError, templateError } from "./egressRuleAuth";
 import {
   type EditorOptions,
   type EgressServiceForm,
+  MAX_NAME_LENGTH,
   type PlaceholderForm,
   type RuleForm,
   serializeService,
@@ -22,7 +23,7 @@ import type { AuthoredEgressService } from "./types";
  * the editor where to put them.
  */
 
-const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 
 function hostError(host: string): string | null {
@@ -135,8 +136,8 @@ function nameProblem(
   settings: { takenNames: readonly string[] },
 ): string | null {
   if (name === "") return "Name is required";
-  if (!NAME_PATTERN.test(name))
-    return "Name must start with a lowercase letter or digit and use only lowercase letters, digits, - and _ (63 characters at most)";
+  if (!NAME_PATTERN.test(name) || name.length > MAX_NAME_LENGTH)
+    return `Name must start with a lowercase letter or digit and use only lowercase letters, digits, - and _ (${MAX_NAME_LENGTH} characters at most)`;
   if (/_oauth(_client)?$/.test(name))
     return "Name must not end in _oauth or _oauth_client";
   if (settings.takenNames.includes(name))

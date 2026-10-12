@@ -12,7 +12,7 @@ export const PLACEHOLDER_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 
 /** What the dashboard says about a name outside `PLACEHOLDER_NAME_PATTERN`, quoting the pattern as the server does. */
 export function operatorPlaceholderNameError(name: string): string {
-  return `Placeholder name ${name} must match ^[A-Z_][A-Z0-9_]*$`;
+  return `Placeholder name ${name} must match ${PLACEHOLDER_NAME_PATTERN.source}`;
 }
 
 /** Why no service may use this valid placeholder name, or null; the server refuses these in every scope. */

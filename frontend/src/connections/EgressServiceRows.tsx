@@ -28,6 +28,10 @@ const EGRESS_LISTING_PATH = "/api/connections/egress";
 export const keyPath = (agentName: string, serviceName: string) =>
   `${EGRESS_LISTING_PATH}/agents/${encodeURIComponent(agentName)}/${encodeURIComponent(serviceName)}`;
 
+/** Where the personal page reads and writes one of its own services. */
+export const servicePath = (agentName: string, serviceName: string) =>
+  `${EGRESS_LISTING_PATH}/agents/${encodeURIComponent(agentName)}/services/${encodeURIComponent(serviceName)}`;
+
 const accountConnectedIn = (
   services: readonly EgressCredentialService[] | undefined,
   serviceName: string,

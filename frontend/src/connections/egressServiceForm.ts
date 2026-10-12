@@ -296,7 +296,7 @@ export function splitHostInput(value: string): { host: string; path: string } {
   return { host: rest.slice(0, end), path };
 }
 
-const MAX_NAME_LENGTH = 63;
+export const MAX_NAME_LENGTH = 63;
 
 /**
  * The name a new service gets until the user types one: the preset's id, or

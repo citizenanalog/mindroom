@@ -9,6 +9,7 @@ import type { EgressAuth, EgressRule } from "./types";
 export const GITHUB_API_HOST = "api.github.com";
 export const GITHUB_WEB_HOST = "github.com";
 export const GITHUB_UPLOADS_HOST = "uploads.github.com";
+export const GRAPHQL_PATH = "/graphql";
 const GITHUB_REPOSITORY_LINE =
   /^([A-Za-z0-9][A-Za-z0-9-]*)\/(\*|[A-Za-z0-9._-]+)$/;
 const GITHUB_MAX_OWNER_LENGTH = 39;
@@ -80,7 +81,7 @@ export function githubRepositoryRules(
   if (options.graphql)
     rules.push({
       host: GITHUB_API_HOST,
-      path_prefix: "/graphql",
+      path_prefix: GRAPHQL_PATH,
       auth: bearer,
     });
   return { rules, errors, repositories: [...targets.keys()] };

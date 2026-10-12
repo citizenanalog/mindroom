@@ -17,7 +17,7 @@ import { InactiveServices } from "./EgressInactiveServices";
 import { DiscardEditsNotice, EgressServiceEditor } from "./EgressServiceEditor";
 import { configPlaceholderOwners } from "./egressServiceNotes";
 import type { RowAgent, ServiceEditing } from "./egressRowText";
-import { EgressServiceRows, keyPath } from "./EgressServiceRows";
+import { EgressServiceRows, keyPath, servicePath } from "./EgressServiceRows";
 import {
   errorText,
   type RequestErrorMessages,
@@ -69,10 +69,6 @@ function loadPresets(signal: AbortSignal): Promise<EgressPresetCatalog> {
     "/api/connections/egress/presets",
     signal,
   );
-}
-
-function servicePath(agentName: string, serviceName: string): string {
-  return `/api/connections/egress/agents/${encodeURIComponent(agentName)}/services/${encodeURIComponent(serviceName)}`;
 }
 
 /**
