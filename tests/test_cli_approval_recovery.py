@@ -40,6 +40,7 @@ from mindroom.agent_cli.shell_contract import AgentCliShellEnv, current_agent_cl
 from mindroom.approval import execution as approval_execution
 from mindroom.approval import tool_owners as approval_tools
 from mindroom.config.agent import AgentConfig
+from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.event_journal import ApprovalCall, ApprovalDecision, approval_arguments_digest
 from mindroom.history.session_context import close_agent_runtime_state_dbs
 from mindroom.media_inputs import MediaInputs
@@ -1099,3 +1100,22 @@ async def test_a_cli_wait_fails_an_approval_whose_final_matrix_refused(*, perman
     else:
         responses.finish_approval.assert_awaited_once_with("approval-1")
         responses.request_failure.assert_not_awaited()
+
+
+def test_a_folded_run_replays_only_the_tool_calls_its_record_still_holds() -> None:
+    """A fold summarized the earlier calls, so the recovered record names it and does not repeat them as tools."""
+    folded = ToolExecution(tool_call_id="call-folded", tool_name="run_shell_command", result="folded")
+    kept = ToolExecution(tool_call_id="call-kept", tool_name="run_shell_command", result="kept")
+    persisted = RunOutput(
+        run_id="run",
+        messages=[
+            Message(role="assistant", tool_calls=[{"id": "call-kept", "type": "function", "function": {"name": "x"}}]),
+            Message(role="tool", tool_call_id="call-kept", content="kept"),
+        ],
+        tools=[folded, kept],
+        metadata={MID_TURN_GENERATION_METADATA_KEY: 3},
+    )
+
+    assert cli_approval_recovery._replayed_tools(persisted) == [kept]
+    persisted.metadata = {}
+    assert cli_approval_recovery._replayed_tools(persisted) == [folded, kept]

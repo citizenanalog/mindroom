@@ -7879,6 +7879,7 @@ depends_on = [
     "mindroom.agent_cli.agno_compat_cli_checkpoint",
     "mindroom.ai",
     "mindroom.approval.tool_owners",
+    "mindroom.constants",
     "mindroom.delegation.state",
     "mindroom.dynamic_tool_continuation",
     "mindroom.history.interrupted_replay",

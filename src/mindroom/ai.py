@@ -58,7 +58,7 @@ from mindroom.history.interrupted_replay import (
     split_interrupted_tool_trace,
     tool_execution_call_id,
 )
-from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle
+from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, without_fold_records
 from mindroom.history.prompt_tokens import agent_tool_definition_payloads_for_logging
 from mindroom.history.replay import apply_replay_plan
 from mindroom.history.runtime import note_prepared_history_timing
@@ -1365,7 +1365,7 @@ async def _prepare_agent_run_context(
             correlation_id=ctx.correlation_id,
             tools_schema=agent_tool_definition_payloads_for_logging(agent) if agent.model is not None else [],
             model_params=model_params_payload(agent.model) if agent.model is not None else {},
-            extra_metadata=deep_merge_metadata(ctx.matrix_run_metadata, run_extra_content),
+            extra_metadata=deep_merge_metadata(without_fold_records(ctx.matrix_run_metadata), run_extra_content),
         )
         if ctx.agent_mode == "minimal":
             metadata = dict(metadata or {}) | {"agent_mode": "minimal"}

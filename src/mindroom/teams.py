@@ -71,7 +71,11 @@ from mindroom.history.interrupted_replay import (
     split_interrupted_tool_trace,
     tool_execution_call_id,
 )
-from mindroom.history.mid_turn_compaction import bind_compaction_lifecycle, install_mid_turn_compaction
+from mindroom.history.mid_turn_compaction import (
+    bind_compaction_lifecycle,
+    install_mid_turn_compaction,
+    without_fold_records,
+)
 from mindroom.history.native import restore_paused_history
 from mindroom.history.prompt_tokens import team_tool_definition_payloads_for_logging
 from mindroom.history.runtime import note_prepared_history_timing
@@ -2929,7 +2933,7 @@ async def prepare_materialized_team_execution(
         correlation_id=ctx.correlation_id,
         tools_schema=team_tool_definition_payloads_for_logging(team),
         model_params=model_params_payload(team.model) if team.model is not None else {},
-        extra_metadata=deep_merge_metadata(ctx.matrix_run_metadata, run_extra_content),
+        extra_metadata=deep_merge_metadata(without_fold_records(ctx.matrix_run_metadata), run_extra_content),
     )
     return _PreparedMaterializedTeamExecution(
         messages=prepared_execution.messages,

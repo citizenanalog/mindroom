@@ -176,6 +176,17 @@ def install_mid_turn_compaction(
     install_request_preparation(model, marker=_HOOK_MARKER, prepare=partial(_prepare_request, binding))
 
 
+def without_fold_records(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a run's metadata for seeding a new run, without the fold id and folded usage that belong to that run."""
+    if metadata is None:
+        return None
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in {MID_TURN_GENERATION_METADATA_KEY, COMPACTED_REQUESTS_METADATA_KEY}
+    }
+
+
 def bind_compaction_lifecycle(
     target: Agent | Team,
     lifecycle: CompactionLifecycle | None,

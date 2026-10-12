@@ -16,6 +16,7 @@ from mindroom.agent_cli.events import project_cli_execution, stream_cli_events
 from mindroom.agent_cli.lifetime import response_cli_lifetime
 from mindroom.agent_cli.projection import register_cli_media
 from mindroom.approval.tool_owners import validate_approval_tool_owners
+from mindroom.constants import MID_TURN_GENERATION_METADATA_KEY
 from mindroom.delegation.state import DelegationState
 from mindroom.dynamic_tool_continuation import continuation_decision_from_tools
 from mindroom.history.interrupted_replay import (
@@ -45,7 +46,7 @@ from mindroom.tool_system.tool_access import ToolKey
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from agno.models.response import ModelResponse
+    from agno.models.response import ModelResponse, ToolExecution
     from agno.run.agent import RunOutput
     from agno.session.agent import AgentSession
 
@@ -70,6 +71,15 @@ class CliFollowUpTurn:
     initial_continuation_count: int
     delegation_depth: int
     media: MediaInputs
+
+
+def _replayed_tools(persisted: RunOutput) -> list[ToolExecution]:
+    """Return the run's tool calls, without those a mid-turn fold already summarized out of its messages."""
+    tools = list(persisted.tools or [])
+    if MID_TURN_GENERATION_METADATA_KEY not in (persisted.metadata or {}):
+        return tools
+    held = {call.get("id") for message in persisted.messages or [] for call in message.tool_calls or []}
+    return [tool for tool in tools if tool.tool_call_id in held]
 
 
 async def continue_cli_approval(  # noqa: C901, PLR0912, PLR0915 - one claimed recovery attempt
@@ -324,7 +334,7 @@ async def continue_cli_approval(  # noqa: C901, PLR0912, PLR0915 - one claimed r
             await catalog.close()
         finally:
             await resources.aclose()
-    completed_trace, interrupted_trace = split_interrupted_tool_trace(persisted.tools)
+    completed_trace, interrupted_trace = split_interrupted_tool_trace(_replayed_tools(persisted))
     known_ids = {entry.tool_call_id for entry in (*completed_trace, *interrupted_trace)}
     for entry in presentation.tool_trace:
         if entry.tool_call_id not in known_ids:
