@@ -9,12 +9,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
-/** A question with a Cancel and one destructive answer, for the actions a row confirms. */
+/** A question with a Cancel and one answer, destructive unless told otherwise, for the actions a row confirms. */
 export function ConfirmDialog({
   open,
   title,
   description,
   confirmLabel,
+  destructive = true,
   onCancel,
   onConfirm,
 }: {
@@ -22,6 +23,7 @@ export function ConfirmDialog({
   title: ReactNode;
   description: ReactNode;
   confirmLabel: string;
+  destructive?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -36,7 +38,10 @@ export function ConfirmDialog({
           <Button variant="outline" onClick={onCancel}>
             Cancel
           </Button>
-          <Button variant="destructive" onClick={onConfirm}>
+          <Button
+            variant={destructive ? "destructive" : "default"}
+            onClick={onConfirm}
+          >
             {confirmLabel}
           </Button>
         </DialogFooter>

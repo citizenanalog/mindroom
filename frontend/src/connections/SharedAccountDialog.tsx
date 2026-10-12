@@ -1,14 +1,6 @@
 import { useEffect, useRef } from "react";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { SHARED_ACCOUNT_TITLE, sharedAccountBody } from "./accountCopy";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 /** Asked before connecting an account on a shared agent, since everyone who uses the agent acts as it. */
 export function SharedAccountDialog({
@@ -35,21 +27,14 @@ export function SharedAccountDialog({
     onContinue();
   };
   return (
-    <Dialog open={open} onOpenChange={(next) => !next && onCancel()}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{SHARED_ACCOUNT_TITLE}</DialogTitle>
-          <DialogDescription>
-            {sharedAccountBody(agent, provider)}
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button variant="outline" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button onClick={doContinue}>Continue</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <ConfirmDialog
+      open={open}
+      title={SHARED_ACCOUNT_TITLE}
+      description={sharedAccountBody(agent, provider)}
+      confirmLabel="Continue"
+      destructive={false}
+      onCancel={onCancel}
+      onConfirm={doContinue}
+    />
   );
 }
