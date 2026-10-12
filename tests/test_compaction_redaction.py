@@ -821,6 +821,34 @@ def test_removing_a_run_that_folded_and_was_then_archived_removes_the_runs_after
     assert _summary(_stored(storage)) is None
 
 
+@pytest.mark.parametrize("removal", ["edit", "redaction"])
+def test_removing_an_older_resumed_run_archived_after_its_fold_keeps_only_the_runs_before_it(
+    storage: SqliteDb,
+    removal: str,
+) -> None:
+    """A later compaction archived the resumed run, and its fold's newer runs still go with it."""
+    session = _seed_runs(storage, _run("r1"), _run("p"), _run("b"))
+    _fold(storage, session, "p", ["r1", "b"])
+    reconcile_compaction_state(storage, session, _SCOPE)
+    archive_compaction_chunk(
+        storage=storage,
+        session=_stored(storage),
+        scope=_SCOPE,
+        summary=SessionSummary(summary="folded p", updated_at=datetime.now(UTC)),
+        summary_model="summary-model",
+        archived_runs=[run for run in _stored(storage).runs or [] if run.run_id == "p"],
+    )
+    assert _live(storage) == []
+
+    if removal == "edit":
+        assert remove_runs_for_sources(storage, "session", SessionType.AGENT, _SCOPE, ("$p",)) is True
+    else:
+        assert _remove_redacted_event_from_history(storage, _stored(storage), _SCOPE, event_id="$p") is True
+
+    assert _live(storage) == ["r1"]
+    assert _summary(_stored(storage)) is None
+
+
 def _answering(run_id: str, event_id: str) -> RunOutput:
     run = _run(run_id)
     run.metadata = {**(run.metadata or {}), constants.MATRIX_EVENT_ID_METADATA_KEY: event_id}

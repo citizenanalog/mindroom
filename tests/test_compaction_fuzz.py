@@ -343,11 +343,16 @@ class _Runner:
         if not candidates:
             return None
         event_id = candidates[action.index % len(candidates)]
-        # A legacy summary's provenance cannot be split by run, so redacting under it may retire every summary.
-        self._retiring = self._legacy and archive.has_legacy_summary(
-            self._storage,
-            session_id=_SESSION,
-            scope_key=_SCOPE.key,
+        # A legacy summary's provenance cannot be split by run, so redacting under it may retire every summary; an
+        # edit's source is a message this conversation created, which no legacy summary holds.
+        self._retiring = (
+            not edit
+            and self._legacy
+            and archive.has_legacy_summary(
+                self._storage,
+                session_id=_SESSION,
+                scope_key=_SCOPE.key,
+            )
         )
         if edit:
             remove_runs_for_sources(self._storage, _SESSION, SessionType.AGENT, _SCOPE, (event_id,))
@@ -416,10 +421,11 @@ class _Runner:
             sources = [redacted_event_id[1:], *readers]
             first = min(self._created.index(run_id) for run_id in sources)
             assert lost <= self._depending_on(set(self._created[first:]))
-            # When one of them still replayed, it and every run after it are gone.
+            # When one of them still replayed, no run from it on stays live; a later archived run stays archived
+            # unless it read the event, which the archive invariants above check.
             if remaining := [run_id for run_id in sources if run_id in self._replayable]:
                 gone = self._depending_on(set(self._created[min(map(self._created.index, remaining)) :]))
-                assert not gone & replayable
+                assert not gone & live
         self._present = present
         self._replayable = replayable
         # Seen ids are exactly the events replay represents, so nothing is repeated or dropped; a paused run is
@@ -585,6 +591,36 @@ _ACTIONS = st.builds(
         Action("resume_fold", index=1),
         Action("snapshot"),
         Action("edit", index=1),
+    ],
+    legacy=False,
+)
+@example(
+    # The same, with a later run after the compaction, and an edit instead of a redaction.
+    actions=[
+        Action("add"),
+        Action("pause"),
+        Action("add"),
+        Action("resume_fold", index=1),
+        Action("compact"),
+        Action("add"),
+        Action("edit", index=1),
+    ],
+    legacy=False,
+)
+@example(
+    # An edit under a legacy summary keeps a fold whose run it does not remove.
+    actions=[Action("add"), Action("midturn", index=1), Action("add"), Action("edit", index=1)],
+    legacy=True,
+)
+@example(
+    # A resumed older run folds a newer run, a later compaction archives the resumed run, and it is redacted.
+    actions=[
+        Action("add"),
+        Action("pause"),
+        Action("add"),
+        Action("resume_fold", index=1),
+        Action("compact"),
+        Action("redact", index=1),
     ],
     legacy=False,
 )

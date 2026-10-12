@@ -497,46 +497,19 @@ def _replayed_archive_event_ids(
     return {row[0] for row in rows}
 
 
-def live_run_indexes(storage: BaseDb, *, session_id: str) -> dict[str, int]:
-    """Return each live run's index, so a removal can bound its rollback by where the removed runs stood."""
-    db = _sqlite(storage)
-    runs = agno_compat_sqlite.owned_table(db, "runs")
-    with db.db_engine.begin() as connection:
-        return {
-            run_id: run_index
-            for run_id, run_index in connection.execute(
-                select(runs.c.run_id, runs.c.run_index).where(runs.c.session_id == session_id),
-            )
-            if run_index is not None
-        }
-
-
-def live_runs_after(storage: BaseDb, *, session_id: str, run_id: str) -> list[str] | None:
-    """Return the live runs stored after ``run_id`` if it is archived, or None when its index was not recorded.
-
-    A run that is not archived has none: it is live or already removed with the runs after it.
-    """
+def run_indexes(storage: BaseDb, *, session_id: str) -> dict[str, int]:
+    """Return the index of each live and archived run, so a removal can bound its rollback by where they stood."""
     db = _sqlite(storage)
     _, compacted_runs = _table_names(db)
     runs = agno_compat_sqlite.owned_table(db, "runs")
     with db.db_engine.begin() as connection:
         _ensure_tables(connection, db)
-        row = connection.exec_driver_sql(
-            f"SELECT run_index FROM {compacted_runs} WHERE session_id = ? AND run_id = ?",  # noqa: S608
-            (session_id, run_id),
-        ).first()
-        if row is None:
-            return []
-        if row[0] is None:
-            return None
-        return [
-            live_run_id
-            for (live_run_id,) in connection.execute(
-                select(runs.c.run_id)
-                .where(runs.c.session_id == session_id, runs.c.run_index > row[0])
-                .order_by(runs.c.run_index),
-            )
-        ]
+        archived = connection.exec_driver_sql(
+            f"SELECT run_id, run_index FROM {compacted_runs} WHERE session_id = ?",  # noqa: S608
+            (session_id,),
+        )
+        live = connection.execute(select(runs.c.run_id, runs.c.run_index).where(runs.c.session_id == session_id))
+        return {run_id: run_index for run_id, run_index in [*archived, *live] if run_index is not None}
 
 
 def find_archived_event(
@@ -685,10 +658,10 @@ def roll_back_to(
             # LEGACY_COMPAT: Archived runs without their live-table index.
             # Legacy format: A ``compacted_runs`` row with a NULL ``run_index``, written before archived rows recorded
             # the run's index in the live table.
-            # Last legacy release: v2026.10.253; replacement: the next release records ``run_index`` on every row.
+            # Last legacy release: v2026.10.256; replacement: the next release records ``run_index`` on every row.
             # Handling: The run is appended after the live runs in archive order, as before, so it can follow an
             # older live run that compaction skipped; rows with an index return to it. Removing such a run also
-            # removes every live run, as before, since none can be placed after it (``live_runs_after``).
+            # removes every live run, as before, since none can be placed after it (``storage.py``'s rollback cut).
             # Coverage: tests/test_history_archive.py::test_runs_archived_without_an_index_are_appended_in_archive_order;
             # tests/test_compaction_redaction.py::test_removing_an_archived_run_keeps_an_older_pending_approval.
             agno_compat_sqlite.insert_run_row(

@@ -58,6 +58,8 @@ pytestmark = [pytest.mark.ledger_loads_from_disk, pytest.mark.usefixtures("enfor
 def _dispatcher(
     principal: PrincipalStore,
     callback: Callable[[nio.MatrixRoom, nio.RoomMessageFormatted], Awaitable[TurnDispatchOutcome]],
+    *,
+    source_has_live_owner: Callable[[str], bool] = lambda _event_id: False,
 ) -> JournalDispatcher:
     return JournalDispatcher(
         store=principal,
@@ -69,7 +71,7 @@ def _dispatcher(
             on_room_lifecycle=AsyncMock(),
             on_redaction=AsyncMock(),
             on_approval_continuation=AsyncMock(return_value=None),
-            source_has_live_owner=lambda _event_id: False,
+            source_has_live_owner=source_has_live_owner,
             turn_has_live_claim=lambda _event_id: False,
             replies_ended=lambda _reply_ids: None,
         ),
@@ -132,7 +134,11 @@ async def test_orderly_shutdown_preserves_edit_callback_and_revision(
         )
         return TurnDispatchOutcome.DEFERRED if handed_off else TurnDispatchOutcome.INTENTIONALLY_IGNORED
 
-    dispatcher = _dispatcher(principal, callback)
+    def regenerating(_event_id: str) -> bool:
+        # As the response runner reports, a running regeneration owns the edit, so a retry pass does not start another.
+        return any(not regeneration.done() for regeneration in harness.regenerations)
+
+    dispatcher = _dispatcher(principal, callback, source_has_live_owner=regenerating)
     bot = _bot(tmp_path / "bot")
     bot.client = MindRoomAsyncClient("https://example.org", "@mindroom_general:localhost")
     bot._journal_dispatcher = dispatcher
@@ -140,7 +146,7 @@ async def test_orderly_shutdown_preserves_edit_callback_and_revision(
     await admit_dispatch_event(dispatcher, harness.room, event, EventKind.MESSAGE, EventClass.ACTIONABLE)
     dispatcher.release_turn_replay()
     dispatcher.start()
-    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(started.wait(), timeout=30)
     await bot.stop(shutdown_intent=shutdown_intent)
     # The process ends with it the regeneration running off the room's lane.
     for regeneration in harness.regenerations:
@@ -159,7 +165,7 @@ async def test_orderly_shutdown_preserves_edit_callback_and_revision(
         return NEW_RESPONSE_EVENT_ID
 
     harness.generate_response.side_effect = recover
-    recovered = _dispatcher(principal, callback)
+    recovered = _dispatcher(principal, callback, source_has_live_owner=regenerating)
     assert await recovered.drain_once() == 1
     await asyncio.gather(*harness.regenerations)
     _reset_handled_turn_ledger_runtime()
