@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
@@ -180,8 +181,8 @@ def test_runs_archived_without_an_index_are_appended_in_archive_order(storage: S
     assert _live_run_ids(storage) == ["p", "r1", "r2"]
 
 
-def test_an_existing_archive_gains_the_new_columns(tmp_path: Path) -> None:
-    """Archives created before positioned generations read as unpositioned and accept the new fields."""
+def _with_previous_archive(tmp_path: Path) -> AgentSession:
+    """Seed two runs beside an archive as the previous release created it, holding one generation."""
     storage = _open(tmp_path)
     session = _seed(storage, ["r1", "r2"])
     compactions, compacted_runs = archive_table_names("code_sessions")
@@ -192,6 +193,15 @@ def test_an_existing_archive_gains_the_new_columns(tmp_path: Path) -> None:
             f"INSERT INTO {compactions} (session_id, scope_key, summary, created_at) VALUES ('session', ?, 'old', 0)",  # noqa: S608
             (_SCOPE,),
         )
+    storage.close()
+    return session
+
+
+def test_an_existing_archive_gains_the_new_columns(tmp_path: Path) -> None:
+    """Archives created before positioned generations read as unpositioned and accept the new fields."""
+    session = _with_previous_archive(tmp_path)
+    compactions, compacted_runs = archive_table_names("code_sessions")
+    storage = _open(tmp_path)
 
     _archive(storage, session, ["r1"], "new")
 
@@ -203,6 +213,47 @@ def test_an_existing_archive_gains_the_new_columns(tmp_path: Path) -> None:
     assert "run_index" in run_columns
     assert positions == [None, None]
     storage.close()
+
+
+def test_opening_the_database_upgrades_an_existing_archive_before_any_reply_uses_it(tmp_path: Path) -> None:
+    """Rooms then use the archive concurrently without altering it, so none races another on the new columns."""
+    _with_previous_archive(tmp_path)
+    compactions, compacted_runs = archive_table_names("code_sessions")
+
+    storage = _open(tmp_path)
+
+    with storage.db_engine.connect() as connection:
+        generation_columns = {row[1] for row in connection.exec_driver_sql(f"PRAGMA table_info({compactions})")}
+        run_columns = {row[1] for row in connection.exec_driver_sql(f"PRAGMA table_info({compacted_runs})")}
+    assert {"through_run_id", "covered_run_ids", "event_ids", "seen_event_ids"} <= generation_columns
+    assert "run_index" in run_columns
+    storage.close()
+
+
+def test_concurrent_opens_of_an_existing_archive_all_succeed(tmp_path: Path) -> None:
+    """The upgrade runs once under the database's write lock, and every other opener finds it done."""
+    _with_previous_archive(tmp_path)
+    ready = threading.Barrier(8)
+    failures: list[BaseException] = []
+
+    def open_and_read() -> None:
+        ready.wait()
+        try:
+            storage = _open(tmp_path)
+            try:
+                assert archive.positioned_generations(storage, session_id="session", scope_key=_SCOPE) == []
+            finally:
+                storage.close()
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=open_and_read) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
 
 
 _PREVIOUS_ARCHIVE_DDL = (

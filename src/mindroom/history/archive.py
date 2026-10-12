@@ -30,7 +30,7 @@ from sqlalchemy import select
 
 from mindroom import agno_compat_sqlite
 from mindroom.agent_storage import delete_run_subtrees, runs_without
-from mindroom.history.archive_schema import archive_schema_sql, archive_table_names, upgrade_archive_schema
+from mindroom.history.archive_schema import archive_schema_sql, archive_table_names
 from mindroom.usage.storage import quote_identifier
 
 if TYPE_CHECKING:
@@ -735,4 +735,3 @@ def _table_names(db: SqliteDb) -> tuple[str, str]:
 def _ensure_tables(connection: Connection, db: SqliteDb) -> None:
     for statement in archive_schema_sql(db.session_table_name):
         connection.exec_driver_sql(statement)
-    upgrade_archive_schema(connection, db.session_table_name)

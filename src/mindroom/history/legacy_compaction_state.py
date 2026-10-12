@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from mindroom.constants import MINDROOM_COMPACTION_METADATA_KEY, MINDROOM_MATRIX_HISTORY_METADATA_KEY
-from mindroom.history.archive_schema import archive_schema_sql, archive_table_names
+from mindroom.history.archive_schema import archive_schema_sql, archive_table_names, archive_upgrade_sql
 from mindroom.history.types import HistoryScope
 from mindroom.legacy_session_storage import decode_persisted_session_json
 from mindroom.usage.storage import quote_identifier
@@ -40,7 +40,7 @@ _SEEN_STATE_KEYS = frozenset({"seen_event_ids"})
 
 
 def migrate_compaction_database(path: Path, session_table: str) -> None:
-    """Create the archive once, adopting every scope the destructive compactor left behind."""
+    """Create the archive once, adopting every scope the destructive compactor left behind, or upgrade an older one."""
     if not path.is_file():
         return
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True, timeout=30)
@@ -50,10 +50,12 @@ def migrate_compaction_database(path: Path, session_table: str) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("BEGIN IMMEDIATE")
         # Another startup may have finished while this connection waited for its write lock.
-        if _needs_migration(connection, session_table):
+        if _lacks_archive(connection, session_table):
             for statement in archive_schema_sql(session_table):
                 connection.execute(statement)
             _adopt_legacy_sessions(connection, session_table)
+        for statement in archive_upgrade_sql(connection, session_table):
+            connection.execute(statement)
         connection.commit()
     finally:
         # close rolls back both DDL and rows on interruption, leaving migration retryable.
@@ -61,6 +63,10 @@ def migrate_compaction_database(path: Path, session_table: str) -> None:
 
 
 def _needs_migration(connection: sqlite3.Connection, session_table: str) -> bool:
+    return _lacks_archive(connection, session_table) or bool(archive_upgrade_sql(connection, session_table))
+
+
+def _lacks_archive(connection: sqlite3.Connection, session_table: str) -> bool:
     tables = {name for (name,) in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     return session_table in tables and archive_table_names(session_table)[0] not in tables
 
