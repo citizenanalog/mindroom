@@ -28,6 +28,13 @@ import type {
   EgressPlaceholderValidation,
 } from "./types";
 
+const placeholderErrors = (
+  name: string,
+  options = personal,
+  value = "mindroom-brokered",
+) =>
+  errorsFor({ preset: "github" }, { placeholders: [{ name, value }] }, options);
+
 describe("validating a service", () => {
   it("accepts a preset alone and a valid custom service", () => {
     expect(errorsFor({ preset: "github" })).toEqual([]);
@@ -163,50 +170,22 @@ describe("validating a service", () => {
   });
 
   it("applies the personal placeholder rules to personal services only", () => {
-    const placeholders = (name: string, value = "mindroom-brokered") => ({
-      placeholders: [{ name, value }],
-    });
-    expect(errorsFor({ preset: "github" }, placeholders("MY_API_KEY"))).toEqual(
-      [],
-    );
-    expect(errorsFor({ preset: "github" }, placeholders("LD_PRELOAD"))[0]).toBe(
+    expect(placeholderErrors("MY_API_KEY")).toEqual([]);
+    expect(placeholderErrors("LD_PRELOAD")[0]).toBe(
       "LD_PRELOAD is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
     );
     // A credential word has to be a whole part: PYTHONPATH only contains PAT.
-    expect(
-      errorsFor({ preset: "github" }, placeholders("PYTHONPATH")),
-    ).toHaveLength(1);
-    expect(errorsFor({ preset: "github" }, placeholders("MY_PAT"))).toEqual([]);
-    expect(
-      errorsFor(
-        { preset: "github" },
-        placeholders("MY_API_KEY", "has space"),
-      )[0],
-    ).toBe(
+    expect(placeholderErrors("PYTHONPATH")).toHaveLength(1);
+    expect(placeholderErrors("MY_PAT")).toEqual([]);
+    expect(placeholderErrors("MY_API_KEY", personal, "has space")[0]).toBe(
       "The value of MY_API_KEY must be 1 to 256 letters, digits, or . _ : -",
     );
-    expect(
-      errorsFor({ preset: "github" }, placeholders("MY_API_KEY", "")),
-    ).toHaveLength(1);
+    expect(placeholderErrors("MY_API_KEY", personal, "")).toHaveLength(1);
     // The operator may use any valid variable name and any value.
-    expect(
-      errorsFor(
-        { preset: "github" },
-        placeholders("LD_PRELOAD", "a b"),
-        operator,
-      ),
-    ).toEqual([]);
+    expect(placeholderErrors("LD_PRELOAD", operator, "a b")).toEqual([]);
   });
 
   describe("placeholder names the server refuses", () => {
-    const placeholder = (name: string, value = "mindroom-brokered") => ({
-      placeholders: [{ name, value }],
-    });
-    const personalErrors = (name: string) =>
-      errorsFor({ preset: "github" }, placeholder(name));
-    const operatorErrors = (name: string) =>
-      errorsFor({ preset: "github" }, placeholder(name), operator);
-
     it.each([
       "PATH",
       "HOME",
@@ -221,11 +200,11 @@ describe("validating a service", () => {
       "GIT_SSL_CAINFO",
       "NODE_EXTRA_CA_CERTS",
     ])("reserves %s for the broker in every context", (name) => {
-      expect(operatorErrors(name)).toEqual([
+      expect(placeholderErrors(name, operator)).toEqual([
         `Placeholder name ${name} is reserved`,
       ]);
       // One reason is enough: a personal service is not also told about its words.
-      expect(personalErrors(name)).toEqual([
+      expect(placeholderErrors(name)).toEqual([
         `Placeholder name ${name} is reserved`,
       ]);
     });
@@ -235,8 +214,8 @@ describe("validating a service", () => {
       ["GIT_CONFIG_KEY_0", "GIT_CONFIG_"],
     ])("reserves the prefix of %s in every context", (name, prefix) => {
       const message = `Placeholder name ${name} starts with reserved prefix ${prefix}`;
-      expect(operatorErrors(name)).toEqual([message]);
-      expect(personalErrors(name)).toEqual([message]);
+      expect(placeholderErrors(name, operator)).toEqual([message]);
+      expect(placeholderErrors(name)).toEqual([message]);
     });
 
     it.each([
@@ -252,12 +231,12 @@ describe("validating a service", () => {
       "MY_KEY_OPTIONS",
       "MY_KEY_EXTENSIONS",
     ])("refuses %s on a personal service only", (name) => {
-      const errors = personalErrors(name);
+      const errors = placeholderErrors(name);
       expect(errors).toHaveLength(1);
       expect(errors[0]).toBe(
         `${name} is not allowed: tools read names with COMMAND, CMD, FILE, DIR, PROVIDER, HELPER, OPTS, OPTIONS, or EXTENSIONS, or starting with SSH_, as programs or paths.`,
       );
-      expect(operatorErrors(name)).toEqual([]);
+      expect(placeholderErrors(name, operator)).toEqual([]);
     });
 
     it("refuses whole words only, and SSH_ only at the start", () => {
@@ -269,13 +248,15 @@ describe("validating a service", () => {
         "MY_DIRECTORY_KEY",
         "OPTIONAL_TOKEN",
       ])
-        expect(personalErrors(name)).toEqual([]);
+        expect(placeholderErrors(name)).toEqual([]);
     });
 
     it("keeps the credential word rule ahead of the refused words", () => {
       // LD_PRELOAD has no credential word, so that is what the user hears.
-      expect(personalErrors("LD_PRELOAD")[0]).toContain("name a credential");
-      expect(personalErrors("SSH_AGENT_PID")[0]).toContain("name a credential");
+      expect(placeholderErrors("LD_PRELOAD")[0]).toContain("name a credential");
+      expect(placeholderErrors("SSH_AGENT_PID")[0]).toContain(
+        "name a credential",
+      );
     });
   });
 
@@ -552,9 +533,6 @@ describe("the validation the server sends", () => {
       placeholder: { ...validation.placeholder, ...placeholder },
     },
   });
-  const withPlaceholder = (name: string, value = "mindroom-brokered") => ({
-    placeholders: [{ name, value }],
-  });
   const withoutValidation = { ...personal, validation: null };
 
   it("has name and value patterns from Python that read as JavaScript regular expressions", () => {
@@ -608,18 +586,16 @@ describe("the validation the server sends", () => {
         refused_prefix: "ZZ_",
       },
     );
-    const errors = (name: string) =>
-      errorsFor({ preset: "github" }, withPlaceholder(name), options);
-    expect(errors("MY_WIDGET")).toEqual([]);
-    expect(errors("MY_API_KEY")).toEqual([
+    expect(placeholderErrors("MY_WIDGET", options)).toEqual([]);
+    expect(placeholderErrors("MY_API_KEY", options)).toEqual([
       "MY_API_KEY is not allowed as a placeholder: name a credential, such as MY_API_KEY, with WIDGET, or GADGET as one of its words.",
     ]);
-    expect(errors("MY_GADGET_BLOB")).toEqual([
+    expect(placeholderErrors("MY_GADGET_BLOB", options)).toEqual([
       "MY_GADGET_BLOB is not allowed: tools read names with BLOB, or CLOB, or starting with ZZ_, as programs or paths.",
     ]);
-    expect(errors("ZZ_WIDGET")).toHaveLength(1);
+    expect(placeholderErrors("ZZ_WIDGET", options)).toHaveLength(1);
     // The fixture's refused words are the server's no longer.
-    expect(errors("MY_WIDGET_FILE")).toEqual([]);
+    expect(placeholderErrors("MY_WIDGET_FILE", options)).toEqual([]);
   });
 
   it("takes the reserved names and prefixes from the server, for every context", () => {
@@ -629,43 +605,33 @@ describe("the validation the server sends", () => {
     };
     for (const base of [personal, operator]) {
       const options = optionsWith({}, reserved, base);
-      const errors = (name: string) =>
-        errorsFor({ preset: "github" }, withPlaceholder(name), options);
-      expect(errors("MY_RESERVED")).toEqual([
+      expect(placeholderErrors("MY_RESERVED", options)).toEqual([
         "Placeholder name MY_RESERVED is reserved",
       ]);
-      expect(errors("NOPE_TOKEN")).toEqual([
+      expect(placeholderErrors("NOPE_TOKEN", options)).toEqual([
         "Placeholder name NOPE_TOKEN starts with reserved prefix NOPE_",
       ]);
     }
     // PATH is reserved only because the fixture says so.
     expect(
-      errorsFor(
-        { preset: "github" },
-        withPlaceholder("PATH"),
-        optionsWith({}, reserved, operator),
-      ),
+      placeholderErrors("PATH", optionsWith({}, reserved, operator)),
     ).toEqual([]);
   });
 
   it("matches the name pattern from the server against the whole name", () => {
     const options = optionsWith({}, { name_pattern: "[A-Z]{2}_KEY" });
-    const errors = (name: string) =>
-      errorsFor({ preset: "github" }, withPlaceholder(name), options);
-    expect(errors("MY_KEY")).toEqual([]);
+    expect(placeholderErrors("MY_KEY", options)).toEqual([]);
     for (const name of ["ABC_KEY", "MY_KEY_ID", "_MY_KEY"])
-      expect(errors(name)).toEqual([
+      expect(placeholderErrors(name, options)).toEqual([
         `${name} is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.`,
       ]);
   });
 
   it("leaves a name pattern it cannot read to the server, and still checks the words", () => {
     const options = optionsWith({}, { name_pattern: "(" });
-    const errors = (name: string) =>
-      errorsFor({ preset: "github" }, withPlaceholder(name), options);
     // The server's own pattern refuses a leading underscore.
-    expect(errors("_MY_KEY")).toEqual([]);
-    expect(errors("MY_NAME")).toEqual([
+    expect(placeholderErrors("_MY_KEY", options)).toEqual([]);
+    expect(placeholderErrors("MY_NAME", options)).toEqual([
       "MY_NAME is not allowed as a placeholder: name a credential, such as MY_API_KEY, with TOKEN, KEY, SECRET, PASSWORD, PAT, AUTH, or CREDENTIAL as one of its words.",
     ]);
   });
@@ -675,15 +641,9 @@ describe("the validation the server sends", () => {
       {},
       { value_pattern: "[a-z]{1,3}", value_max_length: 3 },
     );
-    const errors = (value: string) =>
-      errorsFor(
-        { preset: "github" },
-        withPlaceholder("MY_API_KEY", value),
-        options,
-      );
-    expect(errors("abc")).toEqual([]);
+    expect(placeholderErrors("MY_API_KEY", options, "abc")).toEqual([]);
     for (const value of ["abcd", "xabc", "abc1", "ab\n", ""])
-      expect(errors(value)).toEqual([
+      expect(placeholderErrors("MY_API_KEY", options, value)).toEqual([
         "The value of MY_API_KEY must be 1 to 3 letters, digits, or . _ : -",
       ]);
   });
@@ -691,11 +651,7 @@ describe("the validation the server sends", () => {
   it("leaves a value pattern it cannot read to the server", () => {
     const options = optionsWith({}, { value_pattern: "(" });
     expect(
-      errorsFor(
-        { preset: "github" },
-        withPlaceholder("MY_API_KEY", "any value at all"),
-        options,
-      ),
+      placeholderErrors("MY_API_KEY", options, "any value at all"),
     ).toEqual([]);
   });
 
@@ -721,26 +677,21 @@ describe("the validation the server sends", () => {
     });
 
     it("skips the reserved names and the personal placeholder rules", () => {
-      const errors = (name: string, value?: string) =>
-        errorsFor(
-          { preset: "github" },
-          withPlaceholder(name, value),
-          withoutValidation,
-        );
-      expect(errors("PATH")).toEqual([]);
-      expect(errors("MINDROOM_TOKEN")).toEqual([]);
-      expect(errors("LD_PRELOAD")).toEqual([]);
-      expect(errors("MY_API_KEY", "has space")).toEqual([]);
+      expect(placeholderErrors("PATH", withoutValidation)).toEqual([]);
+      expect(placeholderErrors("MINDROOM_TOKEN", withoutValidation)).toEqual(
+        [],
+      );
+      expect(placeholderErrors("LD_PRELOAD", withoutValidation)).toEqual([]);
+      expect(
+        placeholderErrors("MY_API_KEY", withoutValidation, "has space"),
+      ).toEqual([]);
       // A name no server accepts is left to the server too, since its words are not known.
-      expect(errors("lowercase")).toEqual([]);
+      expect(placeholderErrors("lowercase", withoutValidation)).toEqual([]);
     });
 
     it("still checks what needs no validation from the server", () => {
       expect(
-        errorsFor({ preset: "github" }, withPlaceholder("lowercase"), {
-          ...operator,
-          validation: null,
-        }),
+        placeholderErrors("lowercase", { ...operator, validation: null }),
       ).toEqual(["Placeholder name lowercase must match ^[A-Z_][A-Z0-9_]*$"]);
       expect(
         errorsFor(
