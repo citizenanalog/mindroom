@@ -649,6 +649,45 @@ describe("the GitHub helper in the editor", () => {
     ).toBeVisible();
   });
 
+  describe("while another service of the viewer's opens the GitHub hosts", () => {
+    const githubHosts = ["api.github.com", "github.com"].map((host) => ({
+      host,
+      port: null,
+      path_prefix: "/",
+      auth_type: "bearer" as const,
+      auth_name: null,
+    }));
+    const own = (changes: Partial<EgressCredentialService> = {}) =>
+      credentialService({
+        name: "my-github",
+        display_name: "My GitHub",
+        source: "user",
+        rules: githubHosts,
+        ...changes,
+      });
+
+    it("says other paths are not refused, instead of saying they are", async () => {
+      await renderGithub({ agentServices: [own()] });
+      expect(
+        screen.getByText(
+          /Applying replaces the rules above with rules for just those repositories \(API and git over HTTPS\)\. Other paths on api\.github\.com and github\.com are not refused while My GitHub also allows requests to api\.github\.com and github\.com\./,
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText(/refuses every other path/)).toBeNull();
+    });
+
+    it("keeps saying they are refused for a limit, the administrator's service, and the service itself", async () => {
+      await renderGithub({
+        agentServices: [
+          own({ name: "limit", restrict_only: true }),
+          own({ name: "admin", source: "config" }),
+          own({ name: "github" }),
+        ],
+      });
+      expect(screen.getByText(/refuses every other path/)).toBeVisible();
+    });
+  });
+
   it("makes owner-wide rules and leaves uploads and GraphQL off by default", async () => {
     await renderGithub();
     expect(

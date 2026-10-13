@@ -394,13 +394,17 @@ export function EgressServiceEditor({
   const overlaps = limiting
     ? []
     : overlapWarnings(form, preset, agentServices, name);
-  // Another service of the user's that keeps the GitHub hosts a limit covers open.
+  // Another service of the user's that keeps the GitHub hosts a limit, or the
+  // repositories applied to this service, cover open.
   const bypass = limiting
     ? limitBypass(
         [GITHUB_API_HOST, GITHUB_UPLOADS_HOST, GITHUB_WEB_HOST],
         agentServices,
       )
-    : null;
+    : limitBypass(
+        [GITHUB_API_HOST, GITHUB_WEB_HOST],
+        agentServices.filter((other) => other.name !== name),
+      );
   const primaryRule = form.rules[0] ?? emptyRule();
   const ruleEditing = (index: number, rule: RuleForm): RuleEditing => ({
     index,
