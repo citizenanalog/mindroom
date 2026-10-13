@@ -29,6 +29,7 @@ from mindroom.api.egress_status import (
     EgressRuleSummary,
     EgressSourceStatus,
     PresetsResponse,
+    PutSecretRequest,
     audit_logs_response,
     effective_services,
     egress_agent_scope,
@@ -408,14 +409,6 @@ async def get_presets(request: Request, _requester_id: _EgressUser) -> PresetsRe
 
 
 # Keys
-
-
-class PutSecretRequest(BaseModel):
-    """Request body for setting a secret (write-only)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    secret: str
 
 
 @router.put("/agents/{agent_name}/{service}", status_code=204)

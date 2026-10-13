@@ -7,7 +7,7 @@ from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from mindroom.api import config_lifecycle, oauth
 from mindroom.api.connection_agents import CONNECTIONS_HEADERS
@@ -273,6 +273,14 @@ def audit_logs_response(records: Iterable[AuditRecord]) -> AuditLogsResponse:
     return AuditLogsResponse(
         records=[AuditRecordResponse.model_validate({**asdict(rec), "at": rec.at.isoformat()}) for rec in records],
     )
+
+
+class PutSecretRequest(BaseModel):
+    """Request body for setting a secret (write-only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    secret: str
 
 
 class EgressSourceStatus(BaseModel):

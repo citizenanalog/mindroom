@@ -191,6 +191,15 @@ def test_put_blank_secret_422(broker_test_client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_put_secret_with_unknown_field_422(broker_test_client: TestClient) -> None:
+    """PUT with a field beyond `secret` is refused like the personal route does, not silently accepted."""
+    response = broker_test_client.put(
+        "/api/egress-broker/services/github/secret",
+        json={"secret": "s3cret", "unexpected": "value"},
+    )
+    assert response.status_code == 422
+
+
 def test_logs_and_ca_409_when_inactive(broker_test_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """Logs and CA endpoints should return 409 when broker is not running."""
     monkeypatch.setattr("mindroom.api.egress_broker.active_audit_log", lambda: None)

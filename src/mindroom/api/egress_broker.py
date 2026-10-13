@@ -21,6 +21,7 @@ from mindroom.api.egress_status import (
     EgressRuleSummary,
     EgressSourceStatus,
     PresetsResponse,
+    PutSecretRequest,
     audit_logs_response,
     effective_services,
     egress_agent_scope,
@@ -82,12 +83,6 @@ class ServicesResponse(BaseModel):
     has_unscoped_agents: bool
     has_personal_agents: bool
     personal_page_served: bool
-
-
-class PutSecretRequest(BaseModel):
-    """Request body for setting a secret."""
-
-    secret: str
 
 
 async def _load_service_statuses_for_target(
