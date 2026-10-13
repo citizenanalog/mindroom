@@ -10,7 +10,7 @@ import stat
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
 
@@ -39,6 +39,7 @@ from mindroom.egress_broker.tokens import TokenSigner
 from mindroom.egress_broker.user_services import (
     USER_SERVICES_CREDENTIAL_SERVICE,
     delete_user_service,
+    save_service_key,
     save_user_service,
 )
 from mindroom.oauth.google_drive import google_drive_oauth_provider
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
+    from mindroom.egress_broker.secrets import SecretResult
     from mindroom.tool_system.worker_routing import WorkerScope
     from mindroom.worker_computer.browser_proxy import BrowserEgress
 
@@ -1206,6 +1208,140 @@ async def test_user_service_edits_apply_to_the_running_broker(
     assert "authorization" not in before.json()["headers"]
     assert saved.json()["headers"]["authorization"] == ["Bearer alice-key"]
     assert "authorization" not in deleted.json()["headers"]
+
+
+@dataclass
+class _PausedLookup:
+    """Holds a broker's secret lookups, after routing and before resolution, until `resume` is set."""
+
+    reached: threading.Event = field(default_factory=threading.Event)
+    resume: threading.Event = field(default_factory=threading.Event)
+
+    async def get_after(
+        self,
+        get_through: GetThrough,
+        env: dict[str, str],
+        write: Callable[[], None],
+    ) -> httpx.Response:
+        """Send ``GET /echo`` with `env`, and run `write` after the broker routed it but before it resolves the secret."""
+        request = asyncio.create_task(get_through(env))
+        assert await asyncio.to_thread(self.reached.wait, 10)
+        write()
+        self.resume.set()
+        return await request
+
+
+@pytest.fixture
+def paused_lookup(monkeypatch: pytest.MonkeyPatch) -> _PausedLookup:
+    """Pause the secret lookups of brokers started after this; the broker loop waits in a thread, so it stays live."""
+    pause = _PausedLookup()
+    resolve = service._resolve_secret
+
+    async def paused(*args: Any, **kwargs: Any) -> SecretResult:  # noqa: ANN401 - forwards the resolver's arguments
+        pause.reached.set()
+        await asyncio.to_thread(pause.resume.wait, 10)
+        return await resolve(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_resolve_secret", paused)
+    return pause
+
+
+def _save_team(manager: CredentialsManager, target: ResolvedWorkerTarget, service: dict[str, object]) -> None:
+    """Save `service` as the shared scope's own user service ``team``, as a credential manager does through the API."""
+    save_user_service(
+        manager,
+        target,
+        "team",
+        EgressService.model_validate(service),
+        config_services={},
+        oauth_providers=_PROVIDERS,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_key_saved_for_new_rules_never_reaches_the_host_a_pending_request_was_routed_to(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    tls_upstream: Upstream,
+    get_through: GetThrough,
+    paused_lookup: _PausedLookup,
+) -> None:
+    """A shared service is routed to one host, then moved to OpenAI and given a key: that request gets a 502.
+
+    The key belongs to the new rules, so the request routed by the old ones is refused without reaching its host.
+    """
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
+    config = _config()
+    target = _routable_target(scope="shared")
+    _save_team(manager, target, _GITHUB)
+
+    def move_to_openai() -> None:
+        _save_team(manager, target, _OPENAI)
+        save_service_key(manager, target, "team", "openai-key", config_services={})
+
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
+        response = await paused_lookup.get_after(get_through, env, move_to_openai)
+        audit = active_audit_log()
+        assert audit is not None
+        [record] = await audit_records(audit, 1)
+    # The fake upstream echoes the request headers, so a sent key would show here.
+    assert "openai-key" not in response.text
+    assert tls_upstream.hits == []
+    assert response.status_code == 502
+    assert response.json()["error"] == "broker_error"
+    assert (record.kind, record.service, record.status, record.code) == ("request", "team", 502, "broker_error")
+
+
+@pytest.mark.usefixtures("github_oauth_client")
+@pytest.mark.asyncio
+async def test_an_account_a_service_gains_never_reaches_the_host_a_pending_request_was_routed_to(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    tls_upstream: Upstream,
+    get_through: GetThrough,
+    paused_lookup: _PausedLookup,
+) -> None:
+    """A personal service is routed to its own host, then replaced by the GitHub preset: that request gets a 502.
+
+    The connected GitHub account may only go to GitHub's hosts, so the request routed by the old rule gets no token.
+    """
+    runtime_paths = _oauth_runtime(tmp_runtime_paths)
+    config = _config()
+    target = _routable_target()
+    _save_mine(manager, target, config, {"rules": [{"host": "localhost", "auth": {"type": "bearer"}}]})
+    connect_account(manager, account_store("@alice:example.org"), "alice-oauth")
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
+        response = await paused_lookup.get_after(
+            get_through,
+            env,
+            lambda: _save_mine(manager, target, config, {"preset": "github"}),
+        )
+    assert "alice-oauth" not in response.text
+    assert tls_upstream.hits == []
+    assert response.status_code == 502
+    assert response.json()["error"] == "broker_error"
+
+
+@pytest.mark.asyncio
+async def test_a_pending_request_keeps_the_key_of_a_service_saved_again_unchanged(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    get_through: GetThrough,
+    paused_lookup: _PausedLookup,
+) -> None:
+    """Saving the routed service again with the same definition, which rereads it from the store, keeps its key."""
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
+    config = _config()
+    target = _routable_target(scope="shared")
+    _save_team(manager, target, _GITHUB)
+    save_service_key(manager, target, "team", "team-key", config_services={})
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
+        response = await paused_lookup.get_after(get_through, env, lambda: _save_team(manager, target, _GITHUB))
+    assert response.status_code == 200
+    assert response.json()["headers"]["authorization"] == ["Bearer team-key"]
 
 
 @pytest.mark.usefixtures("github_oauth_client")

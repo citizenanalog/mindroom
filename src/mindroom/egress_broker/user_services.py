@@ -14,7 +14,8 @@ they cannot use an OAuth connection, which would let a manager route the agent's
 Where they can, the connection only goes to the rule hosts of the built-in presets bound to its provider.
 On shared or unscoped agents a key also stays bound to the rules it was set for: new rules delete it, and a key stored
 for a config service deletes the entry that service shadows, so a manager cannot route a teammate's key to a host
-they control.
+they control. A request routed before such a write gets nothing: the broker resolves a credential only while the
+service still has the definition that routed the request (`consistent_read`).
 Their placeholders are limited to credential-like names and plain values, since a shared agent's services set env
 in every requester's sandbox, and config placeholders win over theirs.
 """
@@ -43,7 +44,7 @@ from mindroom.egress_broker.secrets import (
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Collection, Iterator, Mapping
 
     from mindroom.config.egress_broker import EgressBrokerConfig
     from mindroom.credentials.manager import CredentialsManager
@@ -65,6 +66,7 @@ __all__ = [
     "InactiveUserService",
     "ServiceSource",
     "UserServiceConflictError",
+    "consistent_read",
     "delete_user_service",
     "effective_config",
     "inactive_user_services",
@@ -288,6 +290,18 @@ def save_service_key(
                 finally:
                     _cache.invalidate()
         save_secret(manager, target, name, secret)
+
+
+@contextlib.contextmanager
+def consistent_read() -> Iterator[None]:
+    """Hold off this process's user-service and key writes while the caller reads a scope's services and keys.
+
+    `save_user_service`, `delete_user_service`, and `save_service_key` write under the same lock, so the reads inside
+    see one state of both. Deleting a key with `secrets.delete_secret` only removes a credential and config reloads
+    are trusted, so neither takes it. This blocks, so callers on an event loop run it in a thread.
+    """
+    with _write_lock:
+        yield
 
 
 def effective_config(
@@ -536,5 +550,6 @@ class _EffectiveConfigCache:
 
 
 _cache = _EffectiveConfigCache()
-# Serializes read-modify-write of the services documents in this process, so concurrent saves lose nothing.
+# Serializes read-modify-write of the services documents and key saves in this process, so concurrent saves lose
+# nothing; `consistent_read` holds it too, so the broker checks a routed service and reads its key in one state.
 _write_lock = threading.Lock()

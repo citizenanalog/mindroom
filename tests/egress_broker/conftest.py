@@ -486,7 +486,7 @@ class BrokerFactory:
         config: EgressBrokerConfig | None = None,
         *,
         secrets: dict[str, str] | None = None,
-        resolve_secret: Callable[[WorkerClaims, str], SecretResult] | None = None,
+        resolve_secret: Callable[[WorkerClaims, str, EgressService], SecretResult] | None = None,
         dial_policy: DialPolicy | None = None,
         manage_url: str | None = None,
         scope_info: Callable[[WorkerClaims], ScopeInfo] | None = None,
@@ -510,12 +510,12 @@ class BrokerFactory:
 
         stored = dict(secrets or {})
         lookup = resolve_secret or (
-            lambda _claims, service: Secret(stored[service]) if service in stored else SecretMissing()
+            lambda _claims, service, _routed: Secret(stored[service]) if service in stored else SecretMissing()
         )
 
-        async def recording_lookup(claims: WorkerClaims, service: str) -> SecretResult:
+        async def recording_lookup(claims: WorkerClaims, service: str, routed: EgressService) -> SecretResult:
             self.resolved.append(service)
-            return lookup(claims, service)
+            return lookup(claims, service, routed)
 
         broker = EgressBroker(
             ca=self.ca,

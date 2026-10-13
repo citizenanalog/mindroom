@@ -29,6 +29,8 @@ Blind tunnels keep the upstream's real certificate, so workers get a combined tr
 The TLS server name and the `Host` header must match it, plain `http://` to a matched host is refused, and redirects are returned to the client instead of followed.
 Any of those would otherwise let a request carry one host's secret to another host.
 
+**A request only gets the credential of the service definition that routed it**: a service changed while the request waited for its secret may hold a key or account meant for other hosts, so the request gets a retryable 502 instead.
+
 **Ambiguous paths are refused, not normalized.**
 Path limits only hold if the broker and the upstream agree on what a path means. Dot segments at any decoding layer (including Unicode look-alikes), NUL, invalid UTF-8, raw `//`, and `\` are refused because servers normalize them differently.
 

@@ -30,6 +30,7 @@ from mindroom.egress_broker.mitm import TlsInterceptor
 if TYPE_CHECKING:
     import ssl
 
+    from mindroom.config.egress_broker import EgressService
     from mindroom.egress_broker.audit import AuditLog
     from mindroom.egress_broker.ca import BrokerCA
     from mindroom.egress_broker.dial import DialPolicy
@@ -42,8 +43,9 @@ __all__ = ["EgressBroker", "RulesProvider", "ScopeInfoProvider", "SecretResolver
 
 # Called in a thread with the verified requester's claims; returns the rules that requester's traffic matches.
 type RulesProvider = Callable[[WorkerClaims], EgressRules]
-# Awaited on the broker's loop: the resolver chooses which executor each blocking lookup runs on.
-type SecretResolver = Callable[[WorkerClaims, str], Awaitable[SecretResult]]
+# Awaited on the broker's loop with the matched service's name and the definition its rule came from: the resolver
+# chooses which executor each blocking lookup runs on.
+type SecretResolver = Callable[[WorkerClaims, str, EgressService], Awaitable[SecretResult]]
 # Called on the broker's loop when a refusal says who can add a missing key or change a path limit.
 type ScopeInfoProvider = Callable[[WorkerClaims], ScopeInfo]
 

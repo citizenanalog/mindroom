@@ -584,7 +584,7 @@ async def test_missing_secret_offers_oauth_connect_link(
     """
     await broker(
         single_rule_config(),
-        resolve_secret=lambda _claims, _service: SecretMissing(provider="github", connect_url=CONNECT_URL),
+        resolve_secret=lambda _claims, _service, _routed: SecretMissing(provider="github", connect_url=CONNECT_URL),
         manage_url=MANAGE_URL,
         scope_info=scope_info,
     )
@@ -677,7 +677,7 @@ async def test_oauth_reconnect_required_gets_403_without_reaching_upstream(
     """A connection that cannot supply a token tells the agent to reconnect, or to reset first, and is audited."""
     await broker(
         single_rule_config(),
-        resolve_secret=lambda _claims, _service: result,
+        resolve_secret=lambda _claims, _service, _routed: result,
         manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
@@ -709,7 +709,7 @@ async def test_oauth_refresh_outage_gets_retryable_503(
     """A provider outage is a retryable 503 that names the service and provider, with no reconnect prompt."""
     await broker(
         single_rule_config(),
-        resolve_secret=lambda _claims, _service: SecretUnavailable(provider="github"),
+        resolve_secret=lambda _claims, _service, _routed: SecretUnavailable(provider="github"),
         manage_url=MANAGE_URL,
     )
     client = proxy_client(broker.token())
@@ -1135,7 +1135,10 @@ async def test_secret_with_line_break_gets_502_without_leaking(
     audit: AuditLog,
 ) -> None:
     """A stored secret that is not a valid header value fails the request without reaching logs or the upstream."""
-    await broker(single_rule_config(), resolve_secret=lambda _claims, _service: Secret(f"{SECRET}\r\nX-Injected: y"))
+    await broker(
+        single_rule_config(),
+        resolve_secret=lambda _claims, _service, _routed: Secret(f"{SECRET}\r\nX-Injected: y"),
+    )
     client = proxy_client(broker.token())
 
     with capture_logs() as logs:
