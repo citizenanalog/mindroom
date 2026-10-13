@@ -9,7 +9,7 @@ from functools import cache
 from typing import TYPE_CHECKING
 
 from mindroom.logging_config import get_logger
-from mindroom.server_fetch_url import validated_connect_addresses
+from mindroom.server_fetch_url import ServerFetchUrlError, validated_connect_addresses
 from mindroom.worker_computer.browser_proxy import UpstreamTunnelRefusedError, is_loopback, open_upstream_tunnel
 
 if TYPE_CHECKING:
@@ -128,10 +128,9 @@ async def open_upstream(
             allow_private_networks=policy.allow_private_networks,
             allow_loopback=policy.allow_loopback,
         )
-    except ValueError as exc:
-        # Check if this is a resolution failure or a validation failure
-        # ServerFetchUrlError has a reason attribute that distinguishes these
-        if hasattr(exc, "reason") and exc.reason == "dns_resolution_failed":
+    except ServerFetchUrlError as exc:
+        # An unresolvable name is a failed connect, not a policy refusal.
+        if exc.reason == "dns_resolution_failed":
             raise OSError(str(exc)) from exc
         raise DestinationBlockedError(str(exc)) from exc
 
