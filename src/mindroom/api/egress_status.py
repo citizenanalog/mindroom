@@ -72,6 +72,23 @@ def effective_services(
     return effective_config(config.egress_broker, manager, target).services
 
 
+type EgressAgentScope = Literal["user", "user_agent", "shared", "unscoped"]
+
+
+def egress_agent_scope(config: Config, agent_name: str) -> EgressAgentScope | None:
+    """Return whose store an agent's egress services and keys live in, or None when it never reaches the broker.
+
+    Brokered traffic only comes from a `shell` or `python` tool among the agent's resolved tools, presets and
+    defaults included. The store is one `user_agent` agent's own per requester, every `user` agent's of a requester,
+    everyone's on a `shared` agent, or the global one all agents without a worker scope share (`unscoped`).
+    Both egress APIs decide here which agents use the broker.
+    """
+    entity = config.resolve_entity(agent_name)
+    if not any(tool in entity.available_tools for tool in ("shell", "python")):
+        return None
+    return "unscoped" if entity.execution_scope is None else entity.execution_scope
+
+
 class EgressRuleLocation(BaseModel):
     """Where one rule applies: its host, port, and path prefix."""
 

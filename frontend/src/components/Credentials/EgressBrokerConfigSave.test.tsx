@@ -107,6 +107,9 @@ beforeEach(async () => {
     if (path === "/api/egress-broker/services")
       return json({
         services: [row("github", "GitHub"), row("openai", "OpenAI")],
+        // `coder` has no worker scope, so it uses the global keys.
+        shared_agents: [],
+        has_unscoped_agents: true,
       });
     if (path === "/api/egress-broker/logs") return json({ records: [] });
     if (path === "/api/egress-broker/presets") return json(egressPresets);

@@ -46,11 +46,7 @@ import {
   type SaveConfigResult,
   useConfigStore,
 } from "@/store/configStore";
-import {
-  type Agent,
-  type Config,
-  resolveEffectiveDefaultTools,
-} from "@/types/config";
+import type { Config } from "@/types/config";
 
 const NOT_RUNNING_MESSAGE =
   "Egress broker is not running. Set MINDROOM_EGRESS_BROKER_PORT and MINDROOM_EGRESS_BROKER_URL.";
@@ -62,8 +58,6 @@ const UNSCOPED_OPTION = "Agents without a scope";
 const UNSCOPED_AGENTS = "the agents without a scope";
 // The target that uses the one set of keys all agents without a worker scope share.
 const UNSCOPED_VALUE = "";
-// Brokered traffic only exists for agents that can run commands.
-const EGRESS_TOOLS = ["shell", "python"];
 const SECRET_ERROR_MESSAGES: RequestErrorMessages = {
   forbidden: "You are not allowed to change egress keys or accounts.",
   notFound:
@@ -80,8 +74,21 @@ type BrokerService = Omit<
   | "placeholder_names"
 > & { display_name: string | null };
 
-/** The unscoped listing as the check that the broker is on read it: its services, or the error to show. */
-type Listing = { services: BrokerService[] } | { error: string };
+/**
+ * The dashboard listing: one scope's services, and the agents whose keys the
+ * panel sets, the same for every scope. The backend decides which agents use
+ * the broker from their resolved tools, so the panel never guesses.
+ */
+interface ServicesListing {
+  services: BrokerService[];
+  /** The shared agents that use the broker, each with keys of its own. */
+  shared_agents: string[];
+  /** Whether an agent without a worker scope uses it; all of them share one set of keys. */
+  has_unscoped_agents: boolean;
+}
+
+/** The unscoped listing as the check that the broker is on read it, or the error to show. */
+type Listing = ServicesListing | { error: string };
 
 // The dashboard operator manages every service. Only shared agents and the
 // global store are offered, so every key here is shared, and the global one is
@@ -177,32 +184,12 @@ function loadPresets(): Promise<EgressPresetCatalog> {
   return fetchJSON<EgressPresetCatalog>(API_ENDPOINTS.egressBroker.presets);
 }
 
-function canUseEgress(agent: Agent, defaults: Config["defaults"]): boolean {
-  const inherited =
-    agent.include_default_tools === false
-      ? []
-      : resolveEffectiveDefaultTools(defaults);
-  return [...agent.tools, ...inherited].some((tool) =>
-    EGRESS_TOOLS.includes(tool),
-  );
-}
-
-type KeyScope = "shared" | "unscoped" | "requester";
-
-// Keys for `user` and `user_agent` agents belong to each requester, so the
-// admin API rejects them; their users set keys on the Connections page.
-function keyScope(agent: Agent, defaults: Config["defaults"]): KeyScope {
-  if (agent.private != null) return "requester";
-  const scope = agent.worker_scope ?? defaults?.worker_scope ?? null;
-  if (scope === "user" || scope === "user_agent") return "requester";
-  return scope === "shared" ? "shared" : "unscoped";
-}
-
 function ServiceSection({
   agentName,
   agentLabel,
   keysUnused,
   initial,
+  onListing,
 }: {
   agentName: string | null;
   /** How the agent, or the agents without a scope, reads in a sentence. */
@@ -211,6 +198,8 @@ function ServiceSection({
   keysUnused: boolean;
   /** The listing already read for this section, which it then does not read again on mount. */
   initial?: Listing;
+  /** Receives every listing this section reads, which names the agents whose keys the panel sets. */
+  onListing: (listing: ServicesListing) => void;
 }) {
   const config = useConfigStore((state) => state.config);
   const dirtyRoots = useConfigStore((state) => state.dirtyRoots);
@@ -243,17 +232,18 @@ function ServiceSection({
   const load = useCallback(async () => {
     const request = ++latest.current;
     try {
-      const payload = await fetchJSON<{ services: BrokerService[] }>(
+      const payload = await fetchJSON<ServicesListing>(
         withAgentName(API_ENDPOINTS.egressBroker.services, agentName),
       );
       if (request !== latest.current) return;
       setServices(panelRows(payload.services, agentName));
       setError(null);
+      onListing(payload);
     } catch (cause) {
       if (request !== latest.current) return;
       setError(errorText(cause, LISTING_ERROR_MESSAGE));
     }
-  }, [agentName]);
+  }, [agentName, onListing]);
 
   useEffect(() => {
     if (!preloaded) void load();
@@ -691,8 +681,7 @@ async function checkListing(signal: AbortSignal): Promise<Listing | "off"> {
         ),
       };
     }
-    const payload = (await response.json()) as { services: BrokerService[] };
-    return { services: payload.services };
+    return (await response.json()) as ServicesListing;
   } catch (cause) {
     return {
       error: signal.aborted
@@ -738,9 +727,12 @@ export function EgressBroker() {
  */
 function AgentKeys({ checked }: { checked: Listing }) {
   const agents = useConfigStore((state) => state.agents);
-  const config = useConfigStore((state) => state.config);
-  const defaults = config?.defaults;
   const [selected, setSelected] = useState<string | null>(null);
+  // The agents the latest listing names; unknown while no listing has loaded.
+  const [keyAgents, setKeyAgents] = useState<Omit<
+    ServicesListing,
+    "services"
+  > | null>("services" in checked ? checked : null);
   // Only the section shown first starts from the check's listing, when it is
   // the unscoped one; a section shown later reads its own.
   const [checkedListing, setCheckedListing] = useState<Listing | undefined>(
@@ -748,29 +740,21 @@ function AgentKeys({ checked }: { checked: Listing }) {
   );
   useEffect(() => setCheckedListing(undefined), []);
 
-  // Brokered traffic only exists for agents that can run commands. Shared
-  // agents come first, each with keys of its own. All agents without a worker
-  // scope share one set of keys, so they are one option, offered only when
-  // such an agent exists.
+  // Shared agents come first, each with keys of its own. All agents without a
+  // worker scope share one set of keys, so they are one option, offered only
+  // when such an agent uses the broker.
   const targets = useMemo(() => {
-    const commandAgents = agents.filter((agent) =>
-      canUseEgress(agent, defaults),
-    );
-    const shared = commandAgents
-      .filter((agent) => keyScope(agent, defaults) === "shared")
-      .map((agent) => ({
-        value: agent.id,
-        label: agent.display_name || agent.id,
-      }));
-    const hasUnscoped = commandAgents.some(
-      (agent) => keyScope(agent, defaults) === "unscoped",
-    );
-    return hasUnscoped
+    if (keyAgents === null) return [];
+    const shared = keyAgents.shared_agents.map((name) => ({
+      value: name,
+      label: agents.find((agent) => agent.id === name)?.display_name || name,
+    }));
+    return keyAgents.has_unscoped_agents
       ? [...shared, { value: UNSCOPED_VALUE, label: UNSCOPED_OPTION }]
       : shared;
-  }, [agents, defaults]);
-  // The first target is the default, and the fallback when the selected one
-  // disappears from the config.
+  }, [agents, keyAgents]);
+  // The first target is the default, and the fallback when a later listing no
+  // longer names the selected one.
   const target = targets.find((item) => item.value === selected) ?? targets[0];
   const agentName =
     target === undefined || target.value === UNSCOPED_VALUE
@@ -813,8 +797,9 @@ function AgentKeys({ checked }: { checked: Listing }) {
           agentLabel={
             agentName === null ? UNSCOPED_AGENTS : (target?.label ?? agentName)
           }
-          keysUnused={target === undefined && config !== null}
+          keysUnused={target === undefined && keyAgents !== null}
           initial={agentName === null ? checkedListing : undefined}
+          onListing={setKeyAgents}
         />
         <LogSection />
       </CardContent>

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -25,11 +25,13 @@ from mindroom.api.connection_agents import (
 from mindroom.api.egress_status import (
     RESTRICT_ONLY_KEY_REFUSAL,
     AuditLogsResponse,
+    EgressAgentScope,
     EgressRuleSummary,
     EgressSourceStatus,
     PresetsResponse,
     audit_logs_response,
     effective_services,
+    egress_agent_scope,
     egress_oauth_status,
     egress_service_status,
     oauth_provider_of_service,
@@ -125,11 +127,11 @@ def _check_agent_eligibility(
 ) -> tuple[bool, bool] | None:
     """Return ``(is_shared, can_manage)`` for an eligible agent, else ``None``.
 
-    Eligibility requires a ``shell`` or ``python`` tool and permission to use the agent.
+    Eligibility requires an agent that reaches the broker (`egress_agent_scope`) and permission to use it.
     Listing, portal catalog, mutations, and the request log's shared-agent rows all decide through this one rule.
     """
-    entity = config.resolve_entity(agent_name)
-    if not any(tool in entity.available_tools for tool in ("shell", "python")):
+    scope = egress_agent_scope(config, agent_name)
+    if scope is None:
         return None
     if not is_sender_allowed_for_responder(
         requester_id,
@@ -140,7 +142,7 @@ def _check_agent_eligibility(
         config_lifecycle.app_state(request.app).agent_reply_memberships,
     ):
         return None
-    is_shared = entity.execution_scope in {None, "shared"}
+    is_shared = scope in {"shared", "unscoped"}
     can_manage = not is_shared or is_sender_allowed_for_agent_credential_management(
         requester_id,
         agent_name,
@@ -242,9 +244,6 @@ class EgressCredentialService(EgressSourceStatus):
     restrict_only: bool
 
 
-type _AgentScope = Literal["user", "user_agent", "shared", "unscoped"]
-
-
 class EgressCredentialAgent(BaseModel):
     """One agent with its egress services.
 
@@ -266,7 +265,7 @@ class EgressCredentialAgent(BaseModel):
     agent_display_name: str
     shared: bool
     can_manage: bool
-    scope: _AgentScope
+    scope: EgressAgentScope
     scope_agents: list[str]
     managers: list[str]
     services: list[EgressCredentialService]
@@ -343,12 +342,6 @@ async def egress_services_for_agent(
     return rows
 
 
-def _agent_scope(config: Config, agent_name: str) -> _AgentScope:
-    """Return whose store an agent's egress services and keys live in."""
-    scope = config.resolve_entity(agent_name).execution_scope
-    return "unscoped" if scope is None else scope
-
-
 async def _load_egress_agents(request: Request, requester_id: str) -> list[EgressCredentialAgent]:
     """List every agent the requester may use, with its egress services, in config declaration order."""
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
@@ -369,16 +362,16 @@ async def _load_egress_agents(request: Request, requester_id: str) -> list[Egres
     user_store_agents = [
         agent.display_name
         for agent_name, agent in config.agents.items()
-        if agent_name in eligible and _agent_scope(config, agent_name) == "user"
+        if agent_name in eligible and egress_agent_scope(config, agent_name) == "user"
     ]
 
     agents: list[EgressCredentialAgent] = []
     for agent_name, agent in config.agents.items():
         eligibility = eligible.get(agent_name)
-        if eligibility is None:
+        scope = egress_agent_scope(config, agent_name)
+        if eligibility is None or scope is None:
             continue
         is_shared, can_manage = eligibility
-        scope = _agent_scope(config, agent_name)
         services = await egress_services_for_agent(request, agent_name, human_requester, eligibility=eligibility)
         if services is None:
             continue
@@ -699,7 +692,7 @@ def get_personal_logs(
         is_shared, can_manage = eligibility or (False, False)
         if is_shared and can_manage:
             # Rows the agent logged before it was shared were personal, so they stay with their requesters.
-            log_requester, log_scope = None, _agent_scope(config, agent_name)
+            log_requester, log_scope = None, egress_agent_scope(config, agent_name)
     records = audit.query(
         requester_id=log_requester,
         agent_name=agent_name or None,

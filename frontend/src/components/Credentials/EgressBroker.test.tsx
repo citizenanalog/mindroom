@@ -129,6 +129,8 @@ const json = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), { status });
 
 let services: unknown[];
+// The agents whose keys the panel sets, which every services listing names.
+let keyAgents: { shared_agents: string[]; has_unscoped_agents: boolean };
 let logsResponse: () => Response | Promise<Response>;
 let mutationResponse: () => Response;
 
@@ -137,7 +139,7 @@ function mockApi() {
     const url = new URL(String(input), "http://localhost");
     const method = init?.method ?? "GET";
     if (url.pathname === "/api/egress-broker/services" && method === "GET")
-      return json({ services });
+      return json({ services, ...keyAgents });
     if (url.pathname === "/api/egress-broker/logs") return logsResponse();
     if (url.pathname === "/api/egress-broker/presets")
       return json(egressPresets);
@@ -167,6 +169,7 @@ const selectTarget = (value: string) =>
   });
 // The panel starts on the first shared agent; "" is Agents without a scope.
 function sharedCoder() {
+  keyAgents = { shared_agents: ["coder"], has_unscoped_agents: true };
   storeState = {
     agents: [
       agent("coder", ["shell"], { worker_scope: "shared" }),
@@ -188,6 +191,7 @@ beforeEach(() => {
     config: { defaults: { tools: ["shell"] } },
   };
   services = [github, openai];
+  keyAgents = { shared_agents: [], has_unscoped_agents: true };
   logsResponse = () => json({ records: [newest, oldest] });
   mutationResponse = () => new Response(null, { status: 204 });
   mockApi();
@@ -381,23 +385,22 @@ describe("egress broker key target", () => {
       .queryAllByRole("option")
       .map((option) => option.textContent);
 
-  it("lists shared agents first, then Agents without a scope", async () => {
-    storeState = {
-      agents: [
-        agent("coder", ["shell"]),
-        agent("mine", ["shell"], { private: { per: "user_agent" } }),
-        agent("team", ["python"], { worker_scope: "shared" }),
-        agent("per_user", ["shell"], { worker_scope: "user" }),
-        agent("ops", ["shell"], { worker_scope: "shared" }),
-        agent("per_agent", ["shell"], { worker_scope: "user_agent" }),
-      ],
-      config: { defaults: { worker_scope: null } },
-    };
+  // The three agents the target tests name, labelled from the store.
+  const teamAgents = () => ({
+    agents: [
+      agent("coder", ["shell"]),
+      agent("team", ["python"], { worker_scope: "shared" }),
+      agent("ops", ["shell"], { worker_scope: "shared" }),
+    ],
+    config: { defaults: {} },
+  });
+
+  it("lists the shared agents the listing names first, then Agents without a scope", async () => {
+    keyAgents = { shared_agents: ["team", "ops"], has_unscoped_agents: true };
+    storeState = teamAgents();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    // `coder` comes first in the config but has no scope, so it is part of the
-    // last option. Agents whose keys belong to each requester are left out.
     expect(optionsOf()).toEqual([
       "Agent team",
       "Agent ops",
@@ -405,15 +408,34 @@ describe("egress broker key target", () => {
     ]);
   });
 
-  it("defaults to the first shared agent and loads its keys", async () => {
+  it("offers a shared agent whose shell comes from a tool preset", async () => {
+    // The backend resolves the preset, which includes `shell`, so it names this agent.
+    keyAgents = { shared_agents: ["team"], has_unscoped_agents: false };
     storeState = {
       agents: [
-        agent("coder", ["shell"]),
-        agent("team", ["python"], { worker_scope: "shared" }),
-        agent("ops", ["shell"], { worker_scope: "shared" }),
+        agent("team", ["openclaw_compat"], {
+          worker_scope: "shared",
+          include_default_tools: false,
+        }),
       ],
       config: { defaults: {} },
     };
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+
+    expect(optionsOf()).toEqual(["Agent team"]);
+    expect(screen.getByLabelText("Keys for")).toBeEnabled();
+    expect(screen.getByLabelText("Keys for")).toHaveValue("team");
+    expect(listings()[0].searchParams.get("agent_name")).toBe("team");
+    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Set key for GitHub" }),
+    ).toBeVisible();
+  });
+
+  it("defaults to the first shared agent and loads its keys", async () => {
+    keyAgents = { shared_agents: ["team", "ops"], has_unscoped_agents: true };
+    storeState = teamAgents();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
@@ -423,37 +445,17 @@ describe("egress broker key target", () => {
     expect(loads[0].searchParams.get("agent_name")).toBe("team");
   });
 
-  it("offers Agents without a scope only when such agents exist", async () => {
-    // Shared agents only.
-    storeState = {
-      agents: [agent("team", ["shell"], { worker_scope: "shared" })],
-      config: { defaults: {} },
-    };
+  it("offers Agents without a scope only when the listing says one uses the broker", async () => {
+    keyAgents = { shared_agents: ["team"], has_unscoped_agents: false };
+    storeState = teamAgents();
     const { unmount } = render(<EgressBroker />);
     await screen.findByText("GitHub");
     expect(optionsOf()).toEqual(["Agent team"]);
     unmount();
 
-    // An agent without a scope that cannot run commands never reaches the
-    // broker, so it does not count.
-    storeState = {
-      agents: [
-        agent("team", ["shell"], { worker_scope: "shared" }),
-        agent("writer", ["file"], { include_default_tools: false }),
-      ],
-      config: { defaults: {} },
-    };
-    const second = render(<EgressBroker />);
-    await screen.findByText("GitHub");
-    expect(optionsOf()).toEqual(["Agent team"]);
-    second.unmount();
-
     // Only agents without a scope: the one option is the default and uses the
     // keys that all of them share, so no agent is named.
-    storeState = {
-      agents: [agent("coder", ["shell"])],
-      config: { defaults: {} },
-    };
+    keyAgents = { shared_agents: [], has_unscoped_agents: true };
     vi.mocked(fetch).mockClear();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
@@ -466,39 +468,53 @@ describe("egress broker key target", () => {
     ).toEqual([null]);
   });
 
-  it("follows the default worker scope for agents without their own", async () => {
-    storeState = {
-      agents: [
-        agent("inherits", ["shell"]),
-        agent("team", ["shell"], { worker_scope: "shared" }),
-      ],
-      config: { defaults: { worker_scope: "user_agent" } },
-    };
-    const { unmount } = render(<EgressBroker />);
-    await screen.findByText("GitHub");
-    expect(optionsOf()).toEqual(["Agent team"]);
-    unmount();
-
-    storeState = {
-      agents: [agent("inherits", ["shell"])],
-      config: { defaults: { worker_scope: "shared" } },
-    };
-    render(<EgressBroker />);
-    await screen.findByText("GitHub");
-    expect(optionsOf()).toEqual(["Agent inherits"]);
-  });
-
-  it("has nothing to choose while the config is not loaded", async () => {
+  it("names a shared agent by its id while the config is not loaded", async () => {
+    keyAgents = { shared_agents: ["team"], has_unscoped_agents: false };
     storeState = { agents: [], config: null };
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
+    expect(optionsOf()).toEqual(["team"]);
+  });
+
+  it("has nothing to choose and claims nothing about the keys when the listing fails", async () => {
+    vi.mocked(fetch).mockImplementation(async (input) =>
+      String(input).includes("/services")
+        ? json({ detail: "boom" }, 500)
+        : logsResponse(),
+    );
+    render(<EgressBroker />);
+    await screen.findByText("boom");
+
     expect(optionsOf()).toEqual([]);
     expect(screen.getByLabelText("Keys for")).toBeDisabled();
+    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
+  });
+
+  it("says that no agent uses these keys only when the listing names no shared agent and none without a scope", async () => {
+    storeState = { agents: [], config: { defaults: {} } };
+    const cases: Array<[string[], boolean, boolean]> = [
+      [["team"], false, false],
+      [[], true, false],
+      [[], false, true],
+    ];
+    for (const [sharedAgents, hasUnscopedAgents, unused] of cases) {
+      keyAgents = {
+        shared_agents: sharedAgents,
+        has_unscoped_agents: hasUnscopedAgents,
+      };
+      const { unmount } = render(<EgressBroker />);
+      await screen.findByText("GitHub");
+      expect(screen.queryByText("No agent uses these keys.") !== null).toBe(
+        unused,
+      );
+      unmount();
+    }
   });
 
   it("hides the key actions and says so when no agent uses these keys", async () => {
-    // Every command agent keeps keys per requester, so none is offered.
+    // Every command agent keeps keys per requester, so none is named.
+    keyAgents = { shared_agents: [], has_unscoped_agents: false };
     storeState = {
       agents: [agent("mine", ["shell"], { worker_scope: "user" })],
       config: { defaults: {} },
@@ -521,6 +537,7 @@ describe("egress broker key target", () => {
   });
 
   it("hides the connect and disconnect actions of an account too", async () => {
+    keyAgents = { shared_agents: [], has_unscoped_agents: false };
     storeState = {
       agents: [agent("mine", ["shell"], { worker_scope: "user" })],
       config: { defaults: {} },
@@ -557,14 +574,6 @@ describe("egress broker key target", () => {
     ).toBeNull();
   });
 
-  it("does not claim that no agent uses the keys before the config has loaded", async () => {
-    storeState = { agents: [], config: null };
-    render(<EgressBroker />);
-    await screen.findByText("GitHub");
-
-    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
-  });
-
   it("keeps the key actions while an agent uses the keys", async () => {
     sharedCoder();
     render(<EgressBroker />);
@@ -577,6 +586,7 @@ describe("egress broker key target", () => {
   });
 
   it("no longer says that requester-scoped agents are left out", async () => {
+    keyAgents = { shared_agents: ["team"], has_unscoped_agents: false };
     storeState = {
       agents: [
         agent("team", ["shell"], { worker_scope: "shared" }),
@@ -701,27 +711,31 @@ describe("egress broker key target", () => {
     expect(screen.getByText("Loading services...")).toBeInTheDocument();
   });
 
-  it("falls back to the first target when the selected one goes away", async () => {
+  it("falls back to the first target when a later listing no longer names the selected one", async () => {
     sharedCoder();
-    const { rerender } = render(<EgressBroker />);
+    render(<EgressBroker />);
     await screen.findByText("GitHub");
     selectTarget("");
+    await waitFor(() => expect(listings()).toHaveLength(2));
+    await screen.findByText("GitHub");
+
+    // No agent without a scope is left, which the reload after a saved key says.
+    keyAgents = { shared_agents: ["coder"], has_unscoped_agents: false };
+    fireEvent.click(screen.getByRole("button", { name: "Set key for GitHub" }));
+    fireEvent.change(screen.getByLabelText("GitHub API key"), {
+      target: { value: "ghp_secret" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
     await waitFor(() =>
-      expect(screen.getByLabelText("Keys for")).toHaveValue(""),
+      expect(screen.getByLabelText("Keys for")).toHaveValue("coder"),
     );
-
-    // No agent without a scope is left, so that option goes too.
-    storeState = {
-      ...storeState,
-      agents: [agent("coder", ["shell"], { worker_scope: "shared" })],
-    };
-    rerender(<EgressBroker />);
-
-    expect(screen.getByLabelText("Keys for")).toHaveValue("coder");
+    expect(optionsOf()).toEqual(["Agent coder"]);
     await waitFor(() => {
       const loads = listings();
-      expect(loads).toHaveLength(3);
-      expect(loads[2].searchParams.get("agent_name")).toBe("coder");
+      expect(loads).toHaveLength(4);
+      expect(loads[2].searchParams.get("agent_name")).toBeNull();
+      expect(loads[3].searchParams.get("agent_name")).toBe("coder");
     });
   });
 
@@ -1160,7 +1174,7 @@ describe("egress broker request log", () => {
     vi.mocked(fetch).mockImplementation(async (input, init) => {
       const url = new URL(String(input), "http://localhost");
       if (url.pathname === "/api/egress-broker/services")
-        return json({ services: [github] });
+        return json({ services: [github], ...keyAgents });
       return new Promise<Response>((_, reject) => {
         init?.signal?.addEventListener("abort", () =>
           reject(new DOMException("Aborted", "AbortError")),

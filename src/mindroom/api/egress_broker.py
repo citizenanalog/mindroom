@@ -23,6 +23,7 @@ from mindroom.api.egress_status import (
     PresetsResponse,
     audit_logs_response,
     effective_services,
+    egress_agent_scope,
     egress_oauth_status,
     egress_service_status,
     oauth_provider_of_service,
@@ -65,9 +66,17 @@ class _ServiceStatus(EgressSourceStatus):
 
 
 class ServicesResponse(BaseModel):
-    """List of egress services with their status."""
+    """List of egress services with their status, and the agents whose keys the panel sets.
+
+    `shared_agents` names the shared agents that reach the broker, in config order, each with keys of its own.
+    `has_unscoped_agents` says whether an agent without a worker scope reaches it; all of those share the global keys.
+    Agents whose keys belong to each requester (`user`, `user_agent`, and private agents) are never named: their
+    users set keys on the Connections page. Both fields are the same whichever scope is selected.
+    """
 
     services: list[_ServiceStatus]
+    shared_agents: list[str]
+    has_unscoped_agents: bool
 
 
 class PutSecretRequest(BaseModel):
@@ -167,7 +176,13 @@ async def get_services(
     target = resolve_request_credentials_target(request, agent_name=agent_name)
 
     services = await _load_service_statuses_for_target(request, target)
-    return ServicesResponse(services=services)
+    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    scopes = {name: egress_agent_scope(config, name) for name in config.agents} if config is not None else {}
+    return ServicesResponse(
+        services=services,
+        shared_agents=[name for name, scope in scopes.items() if scope == "shared"],
+        has_unscoped_agents="unscoped" in scopes.values(),
+    )
 
 
 @router.get("/presets", response_model=PresetsResponse)

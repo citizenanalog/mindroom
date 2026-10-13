@@ -126,7 +126,7 @@ describe("Credentials", () => {
       const path = String(input).split("?")[0];
       const body =
         path === "/api/egress-broker/services"
-          ? { services: [] }
+          ? { services: [], shared_agents: [], has_unscoped_agents: false }
           : path === "/api/egress-broker/logs"
             ? { records: [] }
             : [];

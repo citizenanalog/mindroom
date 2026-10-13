@@ -220,6 +220,70 @@ def test_services_listing_summarizes_rules_with_how_they_send_the_key(broker_tes
     assert "x-access-token" not in response.text
 
 
+def _client_with_agents(
+    egress_config_file: Path,
+    agents: dict[str, dict[str, Any]],
+    **defaults: Any,  # noqa: ANN401
+) -> TestClient:
+    """Serve the admin API for the config file with `agents` in place of its agents and `defaults` added."""
+    config_data = yaml.safe_load(egress_config_file.read_text(encoding="utf-8"))
+    config_data["agents"] = agents
+    config_data["defaults"].update(defaults)
+    egress_config_file.write_text(yaml.dump(config_data), encoding="utf-8")
+    return _admin_client(egress_config_file)
+
+
+def _agent(tools: list[str], **extra: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Return an agent with exactly `tools`, none inherited from the defaults."""
+    return {"display_name": "Agent", "role": "", "tools": tools, "include_default_tools": False, **extra}
+
+
+def _key_targets(client: TestClient, agent_name: str | None = None) -> tuple[list[str], bool]:
+    response = client.get("/api/egress-broker/services", params=_scope_params(agent_name))
+    assert response.status_code == 200, response.text
+    return response.json()["shared_agents"], response.json()["has_unscoped_agents"]
+
+
+def test_services_listing_names_the_agents_whose_keys_the_dashboard_sets(egress_config_file: Path) -> None:
+    """The listing names the shared agents that reach the broker by their resolved tools, a preset's included.
+
+    Agents whose keys belong to each requester (`user`, `user_agent`, private) are left out, and so is an agent
+    without a command tool. Every scope the panel selects gets the same answer.
+    """
+    client = _client_with_agents(
+        egress_config_file,
+        {
+            "preset_team": _agent(["openclaw_compat"], worker_scope="shared"),
+            "calculator_team": _agent(["calculator"], worker_scope="shared"),
+            "per_user": _agent(["shell"], worker_scope="user"),
+            "per_agent": _agent(["python"], worker_scope="user_agent"),
+            "mine": _agent(["shell"], private={"per": "user_agent"}),
+            "notes": _agent(["calculator"]),
+        },
+    )
+
+    assert _key_targets(client) == (["preset_team"], False)
+    assert _key_targets(client, "preset_team") == (["preset_team"], False)
+
+
+def test_services_listing_says_whether_an_agent_without_a_scope_reaches_the_broker(egress_config_file: Path) -> None:
+    """All agents without a scope share the global keys, so one of them reaching the broker is enough."""
+    client = _client_with_agents(egress_config_file, {"coder": _agent(["openclaw_compat"]), "notes": _agent([])})
+
+    assert _key_targets(client) == ([], True)
+
+
+def test_services_listing_follows_the_default_worker_scope(egress_config_file: Path) -> None:
+    """An agent without a worker scope of its own takes the default one, which decides where its keys live."""
+    agents = {"inherits": _agent(["shell"]), "team": _agent(["shell"], worker_scope="shared")}
+
+    assert _key_targets(_client_with_agents(egress_config_file, agents, worker_scope="user_agent")) == (["team"], False)
+    assert _key_targets(_client_with_agents(egress_config_file, agents, worker_scope="shared")) == (
+        ["inherits", "team"],
+        False,
+    )
+
+
 def test_routes_require_dashboard_auth() -> None:
     """Every egress-broker route, presets included, is mounted with the dashboard's `verify_user`."""
     from mindroom.api import main  # noqa: PLC0415
