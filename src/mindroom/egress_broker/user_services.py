@@ -12,6 +12,9 @@ User services can narrow operator policy, never widen it: `rules.EgressRules` ke
 operator's `restrict_to_rules`. They never inherit a key stored under their name, and on shared or unscoped agents
 they cannot use an OAuth connection, which would let a manager route the agent's shared account to any host.
 Where they can, the connection only goes to the rule hosts of the built-in presets bound to its provider.
+On shared or unscoped agents a key also stays bound to the rules it was set for: new rules delete it, and a key stored
+for a config service deletes the entry that service shadows, so a manager cannot route a teammate's key to a host
+they control.
 Their placeholders are limited to credential-like names and plain values, since a shared agent's services set env
 in every requester's sandbox, and config placeholders win over theirs.
 """
@@ -34,6 +37,7 @@ from mindroom.egress_broker.secrets import (
     is_personal_target,
     load_egress_document,
     save_egress_document,
+    save_secret,
 )
 from mindroom.logging_config import get_logger
 
@@ -64,6 +68,7 @@ __all__ = [
     "effective_config",
     "inactive_user_services",
     "load_user_services",
+    "save_service_key",
     "save_user_service",
     "service_source",
     "user_service_hosts_not_allowed",
@@ -184,7 +189,9 @@ def save_user_service(
 
     A new name starts without a key: any key stored under it in the scope, for example one left by a removed config
     service, is deleted first. Replacing an existing service keeps its key, unless it becomes `restrict_only`, which
-    never uses one. `oauth_providers` holds the ids of the registry's providers (`oauth.registry.load_oauth_providers`).
+    never uses one, or the scope is not personal (shared or unscoped) and the validated `rules` differ from the stored
+    entry's, which counts a stored entry that no longer validates as different. `oauth_providers` holds the ids of the
+    registry's providers (`oauth.registry.load_oauth_providers`).
 
     Raises UserServiceConflictError when `config_services` has the name, and ValueError for an invalid name, a
     service that sets `oauth_on_shared_workers`, an OAuth provider (a preset's included) that the registry does not
@@ -204,6 +211,8 @@ def save_user_service(
     with _write_lock:
         stored = _stored_services(manager, target)
         new = name not in stored
+        # Outside a personal scope the key may be a teammate's, so it never follows the service to new rules.
+        rebound = not new and not is_personal_target(target) and _rules_changed(name, stored[name], service)
         if new and len(stored) >= MAX_USER_SERVICES:
             msg = f"a scope can have at most {MAX_USER_SERVICES} services of its own; delete one before adding another"
             raise ValueError(msg)
@@ -212,7 +221,7 @@ def save_user_service(
             msg = f"a scope's own services can take at most {MAX_DOCUMENT_BYTES // 1024} KiB together"
             raise ValueError(msg)
         try:
-            if new or service.restrict_only:
+            if new or rebound or service.restrict_only:
                 delete_secret(manager, target, name)
             save_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE, {"services": stored})
         finally:
@@ -239,10 +248,7 @@ def delete_user_service(
             return False
         del stored[name]
         try:
-            if stored:
-                save_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE, {"services": stored})
-            else:
-                delete_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE)
+            _write_stored_services(manager, target, stored)
             if name not in config_services:
                 # Only an entry written outside `save_user_service` can have a name the store rejects, and such a
                 # name never had a key.
@@ -251,6 +257,36 @@ def delete_user_service(
         finally:
             _cache.invalidate()
     return True
+
+
+def save_service_key(
+    manager: CredentialsManager,
+    target: ResolvedWorkerTarget | None,
+    name: str,
+    secret: str,
+    *,
+    config_services: Mapping[str, EgressService],
+) -> None:
+    """Store the key of one of the scope's services, a config service or its own, with `secrets.save_secret`.
+
+    When the scope is not personal (shared or unscoped) and `config_services` has the name, the scope's stored entry
+    of that name, which the config service shadows, is deleted too, so it never becomes active with this key once the
+    config service is gone. In a personal scope the requester owns both, so the entry stays.
+
+    Raises ValueError for an invalid secret, before anything is written.
+    """
+    with _write_lock:
+        save_secret(manager, target, name, secret)
+        if name not in config_services or is_personal_target(target):
+            return
+        stored = _stored_services(manager, target)
+        if name not in stored:
+            return
+        del stored[name]
+        try:
+            _write_stored_services(manager, target, stored)
+        finally:
+            _cache.invalidate()
 
 
 def effective_config(
@@ -394,6 +430,26 @@ def _stored_services(manager: CredentialsManager, target: ResolvedWorkerTarget |
         logger.warning("egress_broker_user_services_malformed")
         return {}
     return dict(services)
+
+
+def _write_stored_services(
+    manager: CredentialsManager,
+    target: ResolvedWorkerTarget | None,
+    stored: dict[str, object],
+) -> None:
+    """Write the scope's entries back; with none left the document is deleted."""
+    if stored:
+        save_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE, {"services": stored})
+    else:
+        delete_egress_document(manager, target, USER_SERVICES_CREDENTIAL_SERVICE)
+
+
+def _rules_changed(name: str, authored: object, service: EgressService) -> bool:
+    """Return whether `service` has other validated rules than a stored entry; one that no longer validates has."""
+    try:
+        return _validated(name, authored).rules != service.rules
+    except ValueError:
+        return True
 
 
 def _validated(name: str, authored: object) -> EgressService:

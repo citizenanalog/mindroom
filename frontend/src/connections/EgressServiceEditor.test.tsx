@@ -1824,6 +1824,42 @@ describe("saving the API key with the service", () => {
   });
 });
 
+describe("the note that new rules remove a shared service's key", () => {
+  const note =
+    "Saving changed rules removes the saved key, so it must be set again.";
+  const keyed = credentialService({
+    name: "notes",
+    source: "user",
+    key_configured: true,
+  });
+  const editNotes = (props: Partial<EgressServiceEditorProps> = {}) =>
+    renderEditor({
+      service: { rules: [bearerRule] },
+      name: "notes",
+      sharedTarget: true,
+      agentServices: [keyed],
+      ...props,
+    });
+
+  it("shows when a manager edits a shared or unscoped agent's service that has a key", async () => {
+    await editNotes();
+    expect(screen.getByText(note)).toBeInTheDocument();
+  });
+
+  it.each<[string, Partial<EgressServiceEditorProps>]>([
+    [
+      "the service has no key",
+      { agentServices: [{ ...keyed, key_configured: false }] },
+    ],
+    ["the agent is personal", { sharedTarget: false }],
+    ["a service is being added", { name: undefined, service: null }],
+    ["the dashboard edits config.yaml", { context: "operator" }],
+  ])("says nothing when %s", async (_case, props) => {
+    await editNotes(props);
+    expect(screen.queryByText(note)).toBeNull();
+  });
+});
+
 describe("a placeholder an administrator's service also sets", () => {
   const configPlaceholders = { GH_TOKEN: "GitHub" };
   const warning =

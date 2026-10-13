@@ -601,7 +601,7 @@ A user service routes only that scope's keys and accounts, so it cannot reach an
 
 **Rules about names and overlap:**
 
-- Config names win. Saving a name that a config service already uses returns 409, and a user entry that a config service later shadows is ignored. It can still be deleted, and its key then stays, because the config service uses that key.
+- Config names win. Saving a name that a config service already uses returns 409, and a user entry that a config service later shadows is ignored. It can still be deleted, and its key then stays, because the config service uses that key. On a shared or unscoped agent, storing a key for that config service deletes the entry (see **Keys** below).
 - On a host that both a config service and a user service name, the usual order applies (exact host, specific port, longest path prefix, then config services before user services, then service name), so a longer user prefix takes those paths for that user only.
 
 **Inactive entries.**
@@ -624,6 +624,12 @@ Going over one of these is a 422, except that a request body over 16 KiB is refu
 **Keys.**
 Creating a user service clears any stored key with the same name in that scope first, so a new service never inherits an old key (for example one left behind by a removed config service); replacing a service keeps its key, unless the saved service is `restrict_only`, which never has one and so deletes it.
 Deleting a user service deletes its key, unless a config service now shadows the entry.
+On shared and unscoped agents a key stays bound to the hosts it was set for, because the manager who changes a service may not be the one who stored its key:
+
+- Replacing a service whose rules change (a host, port, path prefix, or how the key is sent, a preset's rules included) deletes its key, and a stored entry that no longer validates counts as changed. A change that leaves the rules as they were, such as the display name, description, or placeholders, keeps the key.
+- Storing a key for a config service, from the dashboard or the personal page, deletes the scope's user entry of the same name, which that config service shadows, so the entry never becomes active with that key when the config service is removed or renamed.
+
+On `user` and `user_agent` agents the requester owns both the service and the key, so a changed service keeps its key and a shadowed entry stays until they delete it.
 
 **Placeholder variables.**
 A user service's `placeholder_env` has stricter rules than a config service's, because a shared agent's services set variables in every requester's sandbox:
@@ -655,7 +661,7 @@ One editor adds, edits, and deletes services in two places:
 - **Send the key as**: Bearer token, Header, Basic, Query parameter, or Custom template (a header with a value template). A Query parameter or Custom template adds a **Value template** field with the hint "Leave empty to send the key as is."
 - **Header name**, with the hint "For example X-Api-Key" (or **Username** for Basic, or **Parameter name** for a query parameter, with the hint "For example api_key").
 - **Name**, fixed once saved. For a new service it follows the preset id, or the first label of the website (`httpbin.org` gives `httpbin`), until you type one, and it takes the first free `{name}-2` or `{name}-3` when the name is taken. An empty name says "Name is required".
-- **API key**, an optional password field with the hint "Paste the key now or later". It appears on the personal page only, where the caller may set the agent's keys.
+- **API key**, an optional password field with the hint "Paste the key now or later". It appears on the personal page only, where the caller may set the agent's keys. When the service being edited belongs to a shared or unscoped agent and has a key, a line under it says "Saving changed rules removes the saved key, so it must be set again." (see [User services](#user-services)).
 
 When another service of this agent that sends a key already has a rule on a host the form covers, a status line under the website fields warns: "{service} already sends a key to {hosts} for this agent. The most specific path wins, and equal paths go to the service listed first."
 It compares hosts only, lists all the hosts a service shares, skips `restrict_only` services and rules that send nothing, skips the service being edited, and shows on the personal page only, because the dashboard has no per-agent listing to compare with.

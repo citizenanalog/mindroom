@@ -2306,6 +2306,58 @@ def test_a_shadowed_entry_is_listed_with_its_reason_and_deleted_keeping_the_key(
     assert _stored_key(portal, "notes") == "k"
 
 
+def _put_key_from(portal: dict[str, Any], route: str, agent: str, service: str, secret: str) -> Any:  # noqa: ANN401
+    """Set a key as an administrator on the dashboard panel, or as the manager Bob on the personal page."""
+    if route == "connections":
+        return _put_key(portal, "bob", agent, service, secret)
+    return portal["client"].put(
+        f"/api/egress-broker/services/{service}/secret",
+        params={"agent_name": agent},
+        json={"secret": secret},
+        headers=portal["headers"]["admin"],
+    )
+
+
+@pytest.mark.parametrize("route", ["dashboard", "connections"])
+@pytest.mark.parametrize("agent", ["shared_dev", "unscoped_dev"])
+def test_a_key_for_a_config_service_removes_the_entry_it_shadows_on_a_shared_or_unscoped_agent(
+    unscoped_portal: dict[str, Any],
+    agent: str,
+    route: str,
+) -> None:
+    """A manager's entry under a config service's name never becomes active again with the key stored for it."""
+    portal = unscoped_portal
+    collector = {"rules": [{"host": "collector.bob.example", "auth": {"type": "bearer"}}]}
+    assert _put_service(portal, "bob", agent, "notes", collector).status_code == 204
+    portal["payload"]["egress_broker"]["services"]["notes"] = _NOTES
+    _republish(portal)
+    assert _listed_agents(portal, "bob")[agent]["inactive_services"] == [{"name": "notes", "reason": "shadowed"}]
+
+    put = _put_key_from(portal, route, agent, "notes", "sk-ADMIN-TEAM-KEY")
+    assert put.status_code == 204, put.text
+    assert _listed_agents(portal, "bob")[agent]["inactive_services"] == []
+
+    # Removing the config service leaves its key for when it comes back, as always, but no entry to take it.
+    del portal["payload"]["egress_broker"]["services"]["notes"]
+    _republish(portal)
+    assert "notes" not in _listed_names(portal, "bob", agent)
+    assert _stored_key(portal, "notes", agent, "@bob:example.org") == "sk-ADMIN-TEAM-KEY"
+
+
+def test_a_key_for_a_config_service_keeps_the_entry_it_shadows_on_a_personal_agent(
+    egress_portal: dict[str, Any],
+) -> None:
+    """The requester owns both the entry and the key in a personal scope, so the entry stays until they delete it."""
+    portal = egress_portal
+    assert _put_service(portal, "alice", "personal", "notes").status_code == 204
+    portal["payload"]["egress_broker"]["services"]["notes"] = _NOTES
+    _republish(portal)
+
+    assert _put_key(portal, "alice", "personal", "notes", "alice-token").status_code == 204
+
+    assert _listed_agents(portal, "alice")["personal"]["inactive_services"] == [{"name": "notes", "reason": "shadowed"}]
+
+
 def test_an_invalid_entry_is_listed_with_its_reason_and_deleted_with_its_key(egress_portal: dict[str, Any]) -> None:
     """An entry that no longer validates is shown as inactive, never as a service, and deleting it removes its key."""
     portal = egress_portal

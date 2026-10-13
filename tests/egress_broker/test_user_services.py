@@ -11,7 +11,7 @@ from mindroom.config.egress_broker import EgressBrokerConfig, EgressService
 from mindroom.credentials.manager import CredentialsManager
 from mindroom.egress_broker import user_services
 from mindroom.egress_broker.rules import EgressRules, host_has_rules, route_request
-from mindroom.egress_broker.secrets import load_secret, save_secret
+from mindroom.egress_broker.secrets import load_secret, save_egress_document, save_secret
 from mindroom.egress_broker.user_services import (
     MAX_RULES_PER_SERVICE,
     MAX_USER_SERVICES,
@@ -459,7 +459,7 @@ def test_a_limit_under_deny_may_name_hosts_the_operator_does_not_cover() -> None
 
 
 def test_a_new_service_never_inherits_a_stored_key(manager: CredentialsManager) -> None:
-    """Saving a new name clears a key left under it; replacing the service keeps its key; deleting removes it."""
+    """Saving a new name clears a key left under it, and deleting the service removes its key."""
     for target in (worker_target(), worker_target(scope="shared")):
         # For example a key a since-removed config service of the same name left behind.
         save_secret(manager, target, "mine", "left-behind")
@@ -467,11 +467,86 @@ def test_a_new_service_never_inherits_a_stored_key(manager: CredentialsManager) 
         assert load_secret(manager, target, "mine") is None
 
         save_secret(manager, target, "mine", "own-key")
-        _save(manager, target, "mine", _service("other.example.com"))
-        assert load_secret(manager, target, "mine") == "own-key"
-
         assert _delete(manager, target, "mine")
         assert load_secret(manager, target, "mine") is None
+
+
+@pytest.mark.parametrize("scope", ["user_agent", "user"])
+def test_new_rules_on_a_personal_service_keep_its_key(manager: CredentialsManager, scope: WorkerScope) -> None:
+    """The requester owns both the service and its key, so pointing the service at other hosts keeps the key."""
+    target = worker_target(scope=scope)
+    _save(manager, target, "mine", _service())
+    save_secret(manager, target, "mine", "own-key")
+
+    _save(manager, target, "mine", _service("other.example.com"))
+
+    assert load_secret(manager, target, "mine") == "own-key"
+
+
+@pytest.mark.parametrize("scope", ["shared", None], ids=["shared", "unscoped"])
+def test_new_rules_on_a_shared_or_unscoped_service_delete_its_key(
+    manager: CredentialsManager,
+    scope: WorkerScope | None,
+) -> None:
+    """A manager who points the service at a host of their own never gets the key another manager stored for it."""
+    target = None if scope is None else worker_target(scope=scope)
+    other_rules = (
+        _service("collector.bob.example"),
+        EgressService.model_validate(
+            {"rules": [{"host": "api.openai.com", "auth": {"type": "query", "name": "key"}}]},
+        ),
+        EgressService.model_validate(
+            {"rules": [{"host": "api.openai.com", "path_prefix": "/v1/", "auth": {"type": "bearer"}}]},
+        ),
+        EgressService.model_validate(
+            {
+                "rules": [
+                    {"host": "api.openai.com", "auth": {"type": "bearer"}},
+                    {"host": "collector.bob.example", "auth": {"type": "bearer"}},
+                ],
+            },
+        ),
+    )
+    for replacement in other_rules:
+        _save(manager, target, "team-openai", _service("api.openai.com"))
+        save_secret(manager, target, "team-openai", "sk-TEAM-SECRET")
+
+        _save(manager, target, "team-openai", replacement)
+
+        assert load_secret(manager, target, "team-openai") is None
+        assert load_user_services(manager, target)["team-openai"].rules == replacement.rules
+
+    # A stored entry that no longer validates has no rules to compare, so it counts as changed.
+    save_egress_document(
+        manager,
+        target,
+        USER_SERVICES_CREDENTIAL_SERVICE,
+        {"services": {"team-openai": {"rules": []}}},
+    )
+    save_secret(manager, target, "team-openai", "sk-TEAM-SECRET")
+    _save(manager, target, "team-openai", _service("api.openai.com"))
+    assert load_secret(manager, target, "team-openai") is None
+
+
+@pytest.mark.parametrize("scope", ["shared", None], ids=["shared", "unscoped"])
+def test_a_shared_or_unscoped_service_with_the_same_rules_keeps_its_key(
+    manager: CredentialsManager,
+    scope: WorkerScope | None,
+) -> None:
+    """Changing what a service is called or describes, or the placeholders it sets, sends the key nowhere new."""
+    target = None if scope is None else worker_target(scope=scope)
+    _save(manager, target, "team-claude", EgressService.model_validate({"preset": "anthropic"}))
+    save_secret(manager, target, "team-claude", "sk-TEAM-SECRET")
+    preset_rules = load_user_services(manager, target)["team-claude"].rules
+
+    for authored in (
+        {"preset": "anthropic", "display_name": "Team Claude", "description": "The team's account"},
+        {"preset": "anthropic", "placeholder_env": {"TEAM_CLAUDE_KEY": "mindroom-brokered"}},
+        # The preset's rules written out are the same rules.
+        {"rules": [rule.model_dump() for rule in preset_rules]},
+    ):
+        _save(manager, target, "team-claude", EgressService.model_validate(authored))
+        assert load_secret(manager, target, "team-claude") == "sk-TEAM-SECRET"
 
 
 def test_turning_a_service_into_a_limit_deletes_its_stored_key(manager: CredentialsManager) -> None:

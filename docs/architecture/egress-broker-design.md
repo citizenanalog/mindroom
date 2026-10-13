@@ -67,6 +67,7 @@ Everyone acts as that account, so connecting it asks for confirmation and every 
 
 **Configuration is trusted.**
 Whoever can write the `egress_broker` config, including agents with `config_manager`, can point a service at another host and so send its key there. User services can never take a config service's name or inherit its stored key, so users cannot do the same.
+On shared and unscoped agents, changing a user service's rules deletes its key and storing a config service's key deletes the user entry it shadows, so a key stays bound to the hosts it was set for and a manager cannot route a teammate's key to a host they control.
 
 ## Visibility
 

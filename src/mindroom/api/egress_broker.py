@@ -30,9 +30,9 @@ from mindroom.api.egress_status import (
     require_egress_broker_enabled,
     rule_summaries,
 )
-from mindroom.egress_broker.secrets import delete_secret, save_secret
+from mindroom.egress_broker.secrets import delete_secret
 from mindroom.egress_broker.service import active_audit_log, active_ca_pem
-from mindroom.egress_broker.user_services import ServiceSource, service_source
+from mindroom.egress_broker.user_services import ServiceSource, save_service_key, service_source
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 
 if TYPE_CHECKING:
@@ -183,7 +183,7 @@ def put_service_secret(
     body: PutSecretRequest,
     agent_name: Annotated[str | None, Query()] = None,
 ) -> None:
-    """Set an egress service secret.
+    """Set an egress service secret; on a shared or unscoped scope a config service's key removes the entry it shadows.
 
     Raises 404 if the service is neither configured nor one of the selected scope's own services, 422 if the
     secret is invalid or the service is `restrict_only`, which takes no key.
@@ -191,9 +191,11 @@ def put_service_secret(
     target, worker_target, service = _resolve_scope_and_service(request, name, agent_name)
     if service.restrict_only:
         raise HTTPException(status_code=422, detail=RESTRICT_ONLY_KEY_REFUSAL)
+    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    config_services = config.egress_broker.services if config is not None else {}
 
     try:
-        save_secret(target.base_manager, worker_target, name, body.secret)
+        save_service_key(target.base_manager, worker_target, name, body.secret, config_services=config_services)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

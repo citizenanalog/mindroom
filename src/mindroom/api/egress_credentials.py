@@ -41,7 +41,7 @@ from mindroom.api.egress_status import (
 from mindroom.authorization import is_sender_allowed_for_agent_credential_management, is_sender_allowed_for_responder
 from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import get_runtime_credentials_manager
-from mindroom.egress_broker.secrets import delete_secret, save_secret
+from mindroom.egress_broker.secrets import delete_secret
 from mindroom.egress_broker.service import active_audit_log
 from mindroom.egress_broker.user_services import (
     MAX_SERVICE_BYTES,
@@ -50,6 +50,7 @@ from mindroom.egress_broker.user_services import (
     UserServiceConflictError,
     delete_user_service,
     inactive_user_services,
+    save_service_key,
     save_user_service,
     service_source,
     user_service_hosts_not_allowed,
@@ -432,7 +433,10 @@ def put_egress_secret(
     body: PutSecretRequest,
     requester_id: _EgressUser,
 ) -> None:
-    """Set or replace an egress service secret for one agent; a `restrict_only` service takes no key (422)."""
+    """Set or replace an egress service secret for one agent; a `restrict_only` service takes no key (422).
+
+    On a shared or unscoped agent a config service's key also removes the scope's entry it shadows (`save_service_key`).
+    """
     _require_egress_same_origin(request)
 
     agent, egress_service = _resolve_agent_and_service(request, requester_id, agent_name, service)
@@ -440,7 +444,13 @@ def put_egress_secret(
         raise _unprocessable(RESTRICT_ONLY_KEY_REFUSAL)
 
     try:
-        save_secret(agent.manager, agent.target, service, body.secret)
+        save_service_key(
+            agent.manager,
+            agent.target,
+            service,
+            body.secret,
+            config_services=agent.config.egress_broker.services,
+        )
     except ValueError as exc:
         raise _unprocessable(str(exc)) from exc
 
