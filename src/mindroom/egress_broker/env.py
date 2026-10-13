@@ -37,12 +37,16 @@ def egress_broker_enabled(runtime_paths: RuntimePaths) -> bool:
 
 
 def personal_page_served(runtime_paths: RuntimePaths) -> bool:
-    """Return whether the personal egress page is served: the broker is on and trusted upstream auth is enabled.
+    """Return whether the personal egress page is served: the broker is on and trusted upstream auth has JWT on.
 
     Only that page, `/connections/egress`, sets the keys of `user` and `user_agent` agents, which belong to each
-    requester.
+    requester. Its API answers 403 unless trusted upstream auth is enabled and requires a signed JWT.
     """
-    return egress_broker_enabled(runtime_paths) and runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED")
+    return (
+        egress_broker_enabled(runtime_paths)
+        and runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED")
+        and runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT")
+    )
 
 
 def egress_tool_unavailable(tool_name: str, runtime_paths: RuntimePaths) -> bool:

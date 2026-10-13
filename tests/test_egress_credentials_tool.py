@@ -60,8 +60,12 @@ _SERVICES: dict[str, object] = {
 }
 
 
-# Serves the personal egress page: the broker is on behind trusted upstream auth.
-_PAGE_SERVED = {"MINDROOM_EGRESS_BROKER_PORT": "8768", "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"}
+# Serves the personal egress page: the broker is on behind trusted upstream auth with JWT.
+_PAGE_SERVED = {
+    "MINDROOM_EGRESS_BROKER_PORT": "8768",
+    "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
+    "MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT": "true",
+}
 
 
 def _runtime_paths(tmp_path: Path, **env: str) -> RuntimePaths:
@@ -316,12 +320,21 @@ _PAGE_NOT_SERVED_NOTE = (
 
 
 @pytest.mark.parametrize("worker_scope", ["user", "user_agent"])
+@pytest.mark.parametrize(
+    "env",
+    [{}, {"MINDROOM_EGRESS_BROKER_PORT": "8768", "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"}],
+    ids=["standalone", "trusted-without-jwt"],
+)
 def test_personal_scope_without_the_personal_page_is_sent_to_no_page(
     tmp_path: Path,
     worker_scope: WorkerScope,
+    env: dict[str, str],
 ) -> None:
-    """Only the personal page sets a personal scope's keys; where it is not served the tool names no page, as the broker."""
-    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    """Only the personal page sets a personal scope's keys; where it is not served the tool names no page, as the broker.
+
+    Trusted upstream auth without JWT does not serve it: the personal API answers 403 without signed requests.
+    """
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example", **env)
     tool = _tool(runtime_paths, worker_scope=worker_scope)
 
     payload = _list(tool, _context(runtime_paths, _PRESET_SERVICES))

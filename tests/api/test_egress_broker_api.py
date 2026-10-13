@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import jwt
 import pytest
 import yaml
 from fastapi import HTTPException
@@ -17,6 +18,12 @@ from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.user_services import save_user_service
+from tests.api.test_api import (
+    _trusted_upstream_jwks,
+    _trusted_upstream_jwt,
+    _trusted_upstream_jwt_key,
+    _trusted_upstream_strict_jwt_env,
+)
 from tests.api.test_egress_credentials_api import (
     _finish_oauth,
     _oauth_block,
@@ -302,23 +309,51 @@ def test_services_listing_says_whether_an_agent_with_per_user_keys_reaches_the_b
     assert response.json()["has_personal_agents"] is has_personal_agents
 
 
-def test_services_listing_says_whether_the_personal_page_is_served(egress_config_file: Path) -> None:
-    """The page where each user sets per-user keys is served only behind trusted upstream auth."""
+def test_services_listing_says_whether_the_personal_page_is_served(
+    egress_config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The page where each user sets per-user keys is served only behind signed trusted upstream auth.
+
+    Trusted upstream auth without JWT does not serve it: the personal API answers 403 without a verified identity.
+    """
     from tests.api.conftest import trusted_upstream_headers  # noqa: PLC0415
 
-    standalone = _admin_client(egress_config_file).get("/api/egress-broker/services")
-    trusted = _admin_client(
-        egress_config_file,
-        MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
-        MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER="X-Trusted-User",
-        MINDROOM_TRUSTED_UPSTREAM_EMAIL_HEADER="X-Trusted-Email",
-        MINDROOM_TRUSTED_UPSTREAM_MATRIX_USER_ID_HEADER="X-Trusted-Matrix-User",
-    ).get("/api/egress-broker/services", headers=trusted_upstream_headers(matrix_user_id="@owner:example.org"))
+    trusted_env = {
+        "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
+        "MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER": "X-Trusted-User",
+        "MINDROOM_TRUSTED_UPSTREAM_EMAIL_HEADER": "X-Trusted-Email",
+        "MINDROOM_TRUSTED_UPSTREAM_MATRIX_USER_ID_HEADER": "X-Trusted-Matrix-User",
+    }
+    private_key = _trusted_upstream_jwt_key()
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: _trusted_upstream_jwks(private_key))
+    signed_headers = {
+        "X-Trusted-User": "owner",
+        "X-Trusted-Email": "owner@example.com",
+        "X-Trusted-Jwt": _trusted_upstream_jwt(
+            private_key,
+            email="owner@example.com",
+            matrix_user_id="@owner:example.org",
+            user_id="owner",
+        ),
+    }
 
-    assert standalone.status_code == 200, standalone.text
-    assert trusted.status_code == 200, trusted.text
+    standalone = _admin_client(egress_config_file).get("/api/egress-broker/services")
+    unsigned = _admin_client(egress_config_file, **trusted_env).get(
+        "/api/egress-broker/services",
+        headers=trusted_upstream_headers(matrix_user_id="@owner:example.org"),
+    )
+    signed = _admin_client(
+        egress_config_file,
+        **_trusted_upstream_strict_jwt_env(tmp_path, matrix_user_id_claim="matrix_user_id"),
+    ).get("/api/egress-broker/services", headers=signed_headers)
+
+    for response in (standalone, unsigned, signed):
+        assert response.status_code == 200, response.text
     assert standalone.json()["personal_page_served"] is False
-    assert trusted.json()["personal_page_served"] is True
+    assert unsigned.json()["personal_page_served"] is False
+    assert signed.json()["personal_page_served"] is True
 
 
 def test_services_listing_says_whether_an_agent_without_a_scope_reaches_the_broker(egress_config_file: Path) -> None:

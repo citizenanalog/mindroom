@@ -325,6 +325,7 @@ async def test_missing_secret_reports_manage_url(
         **_broker_env(free_port()),
         MINDROOM_PUBLIC_URL="https://chat.example.org/",
         MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
+        MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT="true",
     )
     config = _config(github=_GITHUB)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
@@ -721,14 +722,23 @@ async def test_bind_error_propagates(
                 **_broker_env(8768),
                 "MINDROOM_PUBLIC_URL": "https://chat.example.org/",
                 "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
+                "MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT": "true",
             },
             "https://chat.example.org/connections/egress",
+        ),
+        (
+            {
+                **_broker_env(8768),
+                "MINDROOM_PUBLIC_URL": "https://chat.example.org/",
+                "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
+            },
+            "https://chat.example.org/",
         ),
         ({"MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"}, None),
     ],
 )
 def test_manage_url(tmp_runtime_paths: Callable[..., RuntimePaths], env: dict[str, str], expected: str | None) -> None:
-    """The manage link is the personal egress page where it is served, else the dashboard."""
+    """The manage link is the personal egress page where it is served (signed trusted upstream auth), else the dashboard."""
     assert manage_url(tmp_runtime_paths(**env)) == expected
 
 
@@ -771,6 +781,7 @@ def _oauth_runtime(tmp_runtime_paths: Callable[..., RuntimePaths], backend: str 
         **_broker_env(free_port()),
         MINDROOM_PUBLIC_URL=_PUBLIC_URL,
         MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
+        MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT="true",
         MINDROOM_WORKER_BACKEND=backend,
     )
 
@@ -892,43 +903,51 @@ async def test_missing_key_message_names_the_calling_agents_credential_managers(
     assert response.json() == _no_key_refusal(message)
 
 
+_NO_PERSONAL_PAGE_KEY = (
+    "No github key: each user sets this agent's keys on the Connections page, "
+    "which this deployment does not serve. "
+    "An administrator can enable trusted upstream auth or make the agent shared."
+)
+_SIGNED_UPSTREAM = {
+    "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
+    "MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT": "true",
+}
+
+
 @pytest.mark.parametrize(
-    ("scope", "trusted", "link", "message"),
+    ("scope", "upstream", "link", "message"),
     [
-        ("user_agent", True, f"{_PUBLIC_URL}/connections/egress", _NO_GITHUB_KEY),
-        (
-            "user",
-            False,
-            None,
-            "No github key: each user sets this agent's keys on the Connections page, "
-            "which this deployment does not serve. "
-            "An administrator can enable trusted upstream auth or make the agent shared.",
-        ),
-        ("shared", False, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
-        (None, False, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
+        ("user_agent", _SIGNED_UPSTREAM, f"{_PUBLIC_URL}/connections/egress", _NO_GITHUB_KEY),
+        ("user", {}, None, _NO_PERSONAL_PAGE_KEY),
+        # The personal API answers 403 without signed requests, so the page cannot set the key either.
+        ("user", {"MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"}, None, _NO_PERSONAL_PAGE_KEY),
+        ("shared", {}, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
+        (None, {}, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
     ],
-    ids=["personal-page", "personal-without-page", "shared-dashboard", "unscoped-dashboard"],
+    ids=[
+        "personal-page",
+        "personal-without-page",
+        "personal-trusted-without-jwt",
+        "shared-dashboard",
+        "unscoped-dashboard",
+    ],
 )
 @pytest.mark.asyncio
 async def test_missing_key_refusal_links_only_a_page_that_can_set_the_key(
     tmp_runtime_paths: Callable[..., RuntimePaths],
     manager: CredentialsManager,
     scope: WorkerScope | None,
-    trusted: bool,
+    upstream: dict[str, str],
     link: str | None,
     message: str,
     get_through: GetThrough,
 ) -> None:
-    """A personal scope's key is set only on the personal page, served behind trusted upstream auth.
+    """A personal scope's key is set only on the personal page, served behind signed trusted upstream auth.
 
     Without it the refusal links no page and says what an administrator can do; shared and unscoped keys are set on
     the dashboard either way. The reason phrase, cut at 200 characters, carries each message whole.
     """
-    runtime_paths = tmp_runtime_paths(
-        **_broker_env(free_port()),
-        MINDROOM_PUBLIC_URL=_PUBLIC_URL,
-        MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED=str(trusted).lower(),
-    )
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()), MINDROOM_PUBLIC_URL=_PUBLIC_URL, **upstream)
     config = _config(github=_GITHUB)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target(scope=scope))
