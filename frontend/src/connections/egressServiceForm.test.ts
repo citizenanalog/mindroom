@@ -519,9 +519,7 @@ describe("the display name a new custom service gets", () => {
   it("is the first rule's host, lowercased, and not a title-cased name", () => {
     expect(
       add({ rules: [{ ...bearerRule, host: "Echo-Test.example.com" }] }),
-    ).toMatchObject({
-      display_name: "echo-test.example.com",
-    });
+    ).toMatchObject({ display_name: "echo-test.example.com" });
   });
 
   it("gives way to a display name that is typed", () => {
