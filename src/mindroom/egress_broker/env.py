@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping  # noqa: TC003
 from pathlib import Path  # noqa: TC003
-from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from mindroom.constants import WORKER_EGRESS_NO_PROXY, RuntimePaths, compose_worker_proxy_env
 from mindroom.runtime_env_policy import EGRESS_BROKER_ENV_BY_KEY
-
-if TYPE_CHECKING:
-    from mindroom.constants import RuntimePaths
 
 __all__ = [
     "BROKER_CA_PEM_ENV",
@@ -68,9 +65,6 @@ def broker_execution_env(
     kept and the broker's are appended, so overlaying the result on it drops
     none of them.
     """
-    # Import here to avoid circular dependency with constants
-    from mindroom.constants import WORKER_EGRESS_NO_PROXY, compose_worker_proxy_env  # noqa: PLC0415
-
     # NO_PROXY: the base entries, then the extra hosts, each once and in first-seen order
     no_proxy = ",".join(dict.fromkeys([*WORKER_EGRESS_NO_PROXY.split(","), *extra_no_proxy_hosts]))
 
