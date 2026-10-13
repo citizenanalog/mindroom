@@ -387,7 +387,7 @@ Connected accounts live in MindRoom's OAuth credential stores under the same pri
 Agents without a worker scope do not get a store of their own: they all read the one global key per service, so setting or removing it affects every such agent.
 The dashboard panel edits it as **Agents without a scope**.
 
-Set secrets and connect accounts in the **Agent Keys** panel on the dashboard's Credentials page, or on the personal egress page at `/connections/egress` (linked as "API keys and accounts" from the Connections pages).
+Set secrets and connect accounts in the **Agent Keys** panel on the dashboard's Credentials page, or on the personal egress page at `/connections/egress`, linked as "Agent Keys" from the Connections header and as "Manage services" ("View services" when you cannot change them) under each agent in the portal.
 The panel's **Keys for** selector lists the `shared` agents that can run commands and, when such an agent exists, **Agents without a scope**.
 Keys for `user` and `user_agent` agents, private agents included, belong to each requester, so the panel does not list them and each user sets them on the personal egress page.
 The panel's note says so, and links that page where it is served; otherwise it says the page needs [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/).
