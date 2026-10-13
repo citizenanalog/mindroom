@@ -15,7 +15,7 @@ import h11
 import pytest
 
 from mindroom.egress_broker._relay import Peer
-from tests.egress_broker.conftest import single_rule_config
+from tests.egress_broker.conftest import assert_audited, single_rule_config
 from tests.egress_broker.raw_http import (
     OK,
     SECOND,
@@ -28,7 +28,10 @@ from tests.egress_broker.raw_http import (
 )
 
 if TYPE_CHECKING:
-    from tests.egress_broker.conftest import BrokerFactory
+    from pathlib import Path
+
+    from mindroom.egress_broker.audit import AuditLog
+    from tests.egress_broker.conftest import BrokerFactory, ServeFactory, UpstreamCA
     from tests.egress_broker.raw_http import Action, Script, UpstreamFactory
 
 
@@ -154,7 +157,7 @@ async def test_upstream_anomaly(
     await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(anomaly.script, tls=tunnel)
     probe = await upstreams()
-    client, target = await client_for(broker, upstream, tunnel=tunnel)
+    client, target = await client_for(broker, upstream.port, tunnel=tunnel)
     replies: list[Reply | None] = []
     try:
         for index, method in enumerate(anomaly.methods):
@@ -189,6 +192,67 @@ async def test_upstream_anomaly(
         host=target.host,
     )
     await assert_listener_serves(broker, probe)
+
+
+_UPLOAD_BYTES = 16 * 1024 * 1024
+# A complete answer an upstream gives from the request head alone, without reading the body.
+_EARLY_413 = (
+    b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n"
+    b"Set-Cookie: session=1\r\nX-MindRoom-Error: forged\r\n\r\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tunnel", [False, True], ids=["plain", "tunnel"])
+@pytest.mark.parametrize(("answer", "status"), [(_EARLY_413, 413), (b"", 502)], ids=["final-response", "no-response"])
+async def test_upstream_answering_an_upload_from_its_head(
+    broker: BrokerFactory,
+    serve: ServeFactory,
+    upstream_ca: UpstreamCA,
+    audit: AuditLog,
+    tmp_path: Path,
+    answer: bytes,
+    status: int,
+    tunnel: bool,
+) -> None:
+    """An upstream that answers a large upload from its head and closes has that answer relayed; silence is a 502."""
+
+    async def answer_head(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(answer)
+        await writer.drain()
+        writer.close()
+
+    port = await serve(answer_head, ssl_context=upstream_ca.server_context(tmp_path) if tunnel else None)
+    await broker(single_rule_config(), secrets={"svc": SECRET})
+    client, target = await client_for(broker, port, tunnel=tunnel)
+    try:
+        # Below the broker's body limit; buffered at once, so the client reads while its transport sends.
+        head = f"POST {{t}}/upload HTTP/1.1\r\nHost: {{h}}\r\n{{a}}Content-Length: {_UPLOAD_BYTES}\r\n\r\n"
+        client.send(target.render(head) + b"x" * _UPLOAD_BYTES)
+        reply = await client.reply()
+        closed = await client.closed()
+    finally:
+        client.close()
+
+    assert reply is not None
+    assert reply.status == status
+    assert closed is True
+    if status == 413:
+        # Relayed like any response: hop-by-hop and forged refusal headers dropped, Set-Cookie too on a host with rules.
+        assert (reply.body, reply.headers["content-length"], reply.headers["connection"]) == (b"", "0", "close")
+        assert "x-mindroom-error" not in reply.headers
+        assert ("set-cookie" in reply.headers) is not tunnel
+    else:
+        unreachable = {
+            "error": "upstream_unreachable",
+            "message": f"{target.host.partition(':')[0]} could not be reached.",
+        }
+        assert json.loads(reply.body) == unreachable
+    record = await assert_audited(audit, kind="request", path="/upload", status=status)
+    assert record.code == (None if status == 413 else "upstream_unreachable")
+    assert 0 < record.bytes_up < _UPLOAD_BYTES
+    assert SECRET.encode() not in client.received
 
 
 @pytest.mark.asyncio

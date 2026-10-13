@@ -364,7 +364,7 @@ async def test_request_corpus(broker: BrokerFactory, upstreams: UpstreamFactory,
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
     outcome = case.tunnel if tunnel else case.plain
-    client, target = await client_for(broker, upstream, tunnel=tunnel)
+    client, target = await client_for(broker, upstream.port, tunnel=tunnel)
     try:
         raw = target.render(case.template)
         client.send(case.rewrite(raw) if case.rewrite else raw)
@@ -404,7 +404,7 @@ async def test_expect_continue_forwards_one_request_after_the_body(
     await broker(single_rule_config(), secrets={"svc": SECRET})
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
-    client, target = await client_for(broker, upstream, tunnel=tunnel)
+    client, target = await client_for(broker, upstream.port, tunnel=tunnel)
     try:
         client.send(target.render(_POST + "Content-Length: 5\r\nExpect: 100-continue\r\n\r\n"))
         interim = await client.reply()
@@ -477,7 +477,7 @@ async def test_head_limit_holds_however_the_head_is_split(
     await broker(single_rule_config(), secrets={"svc": SECRET}, max_body_bytes=MAX_BODY)
     upstream = await upstreams(tls=tunnel)
     probe = await upstreams()
-    client, target = await client_for(broker, upstream, tunnel=tunnel)
+    client, target = await client_for(broker, upstream.port, tunnel=tunnel)
     # Counted only from here on: the CONNECT head is far shorter than either first part anyway.
     reads = _ServerReads(monkeypatch)
     try:
@@ -513,7 +513,7 @@ async def test_pipelined_plain_requests_reach_only_their_own_hosts(
     first = await upstreams()
     second = await upstreams(lambda _index: [SECOND])
     probe = await upstreams()
-    client, _target = await client_for(broker, first, tunnel=False)
+    client, _target = await client_for(broker, first.port, tunnel=False)
     credential = proxy_authorization(broker.token())
     try:
         client.send(

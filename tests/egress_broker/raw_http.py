@@ -342,16 +342,16 @@ class Target:
         return template.format(t=self.prefix, h=self.host, a=self.auth).encode("latin-1")
 
 
-async def client_for(broker: BrokerFactory, upstream: RawUpstream, *, tunnel: bool) -> tuple[Client, Target]:
-    """Open a connection whose requests reach `upstream`: through an intercepted tunnel, or as plain HTTP.
+async def client_for(broker: BrokerFactory, port: int, *, tunnel: bool) -> tuple[Client, Target]:
+    """Open a connection whose requests reach the upstream on `port`: through an intercepted tunnel, or as plain HTTP.
 
     The plain upstream is 127.0.0.1, a host without rules, because a plain request a rule matches is refused.
     """
     if tunnel:
-        client = await open_tunnel(broker, upstream.port)
-        return client, Target(prefix="", host=f"localhost:{upstream.port}", auth="")
+        client = await open_tunnel(broker, port)
+        return client, Target(prefix="", host=f"localhost:{port}", auth="")
     client = await open_client(broker.latest.port)
-    authority = f"127.0.0.1:{upstream.port}"
+    authority = f"127.0.0.1:{port}"
     credential = f"Proxy-Authorization: {proxy_authorization(broker.token())}\r\n"
     return client, Target(prefix=f"http://{authority}", host=authority, auth=credential)
 

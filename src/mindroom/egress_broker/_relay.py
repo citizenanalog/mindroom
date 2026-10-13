@@ -48,6 +48,7 @@ __all__ = [
 _CHUNK = 64 * 1024
 # A client's request head, request line through the blank line, whether it arrives in one read or many.
 _MAX_REQUEST_HEAD = 64 * 1024
+# How long a closing connection gets: to flush what was written, or for an upstream that failed an upload to answer.
 _CLOSE_TIMEOUT = 5.0
 # How long a peer may send nothing, while the broker waits on it or splices, before the connection ends.
 _IDLE_TIMEOUT = 1800.0
@@ -316,6 +317,19 @@ async def _read_response(upstream: Peer) -> h11.Response | h11.InformationalResp
             return event
 
 
+async def _keep_first_read(upstream: Peer, read: asyncio.Task[bytes]) -> None:
+    """Hand h11 what `read` took from the upstream, or cancel it and leave any unread bytes in the stream.
+
+    A failed read is not raised here: the stream keeps the error, and the next read raises it.
+    """
+    if not read.done():
+        read.cancel()
+        # Awaited, so no read is still waiting on the stream when the next one starts.
+        await asyncio.wait([read])
+    if not read.cancelled() and read.exception() is None:
+        upstream.conn.receive_data(read.result())
+
+
 def normalize_host(host: str) -> str:
     """Return a lowercase hostname without its trailing dot or a compressed IPv6 literal, rejecting anything else."""
     host = host.lower().removesuffix(".")
@@ -565,6 +579,45 @@ class Relay:
                 group.create_task(pump(client.reader, upstream.writer, upload=True))
                 group.create_task(pump(upstream.reader, client.writer, upload=False))
 
+    async def _upload(
+        self,
+        client: Peer,
+        upstream: Peer,
+        entry: AuditEntry,
+    ) -> h11.Response | h11.InformationalResponse:
+        """Stream the request body upstream, counting it against the body limit, and return the response head.
+
+        When a body write fails, a final response the upstream sent within `_CLOSE_TIMEOUT` is returned, and the client
+        connection, whose remaining body goes unread, closes after it; otherwise the write's failure is raised.
+        """
+        # The response's first read runs during the upload: once a write fails, asyncio raises that error on every
+        # read, even of bytes it already received.
+        first_read = asyncio.create_task(upstream.reader.read(_CHUNK))
+        upload_error: _RequestFailedError | None = None
+        try:
+            while isinstance(event := await client.next_event(), h11.Data):
+                entry.bytes_up += len(event.data)
+                if entry.bytes_up > self.max_body_bytes:
+                    raise _RequestFailedError(413, "request_body_too_large")  # noqa: TRY301 - forward answers it
+                await _from_upstream(upstream.send(event))
+            await _from_upstream(upstream.send(h11.EndOfMessage()))
+        except _RequestFailedError as exc:
+            if exc.code == "request_body_too_large":
+                raise
+            upload_error = exc
+        finally:
+            await _keep_first_read(upstream, first_read)
+        if upload_error is None:
+            return await _from_upstream(_read_response(upstream))
+        try:
+            response = await _from_upstream(asyncio.wait_for(_read_response(upstream), _CLOSE_TIMEOUT))
+        except _RequestFailedError:
+            response = None
+        if not isinstance(response, h11.Response):
+            raise upload_error
+        client.close_after_response = True
+        return response
+
     async def forward(
         self,
         client: Peer,
@@ -577,19 +630,14 @@ class Relay:
         """Relay one request and its response, then audit it; return whether the client connection stays open.
 
         Redirects are never followed. After a protocol switch (101) the connection becomes a byte splice until either
-        side closes.
+        side closes. An upstream may answer from the request head and close before taking the whole body, as with an
+        early 413: when a body write fails, a final response it sent is relayed, and the client connection closes.
         """
         try:
             await _from_upstream(upstream.send(request))
             if client.conn.they_are_waiting_for_100_continue:
                 await client.send(h11.InformationalResponse(status_code=100, headers=[]))
-            while isinstance(event := await client.next_event(), h11.Data):
-                entry.bytes_up += len(event.data)
-                if entry.bytes_up > self.max_body_bytes:
-                    raise _RequestFailedError(413, "request_body_too_large")  # noqa: TRY301 - answered below
-                await _from_upstream(upstream.send(event))
-            await _from_upstream(upstream.send(h11.EndOfMessage()))
-            response = await _from_upstream(_read_response(upstream))
+            response = await self._upload(client, upstream, entry)
             entry.status = response.status_code
             switched = isinstance(response, h11.InformationalResponse)
             headers = _downstream_response_headers(
