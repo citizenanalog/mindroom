@@ -431,13 +431,10 @@ def _signable_target(worker_target: ResolvedWorkerTarget, routed_worker_key: obj
 
 
 def _unscoped_worker_key(worker_target: ResolvedWorkerTarget) -> str | None:
-    identity = worker_target.execution_identity
-    agent_name = worker_target.routing_agent_name or (identity.agent_name if identity is not None else None)
-    if agent_name is None:
+    if worker_target.routing_agent_name is None:
         return None
     return resolve_unscoped_worker_key(
-        agent_name=agent_name,
-        execution_identity=identity,
+        agent_name=worker_target.routing_agent_name,
         tenant_id=worker_target.tenant_id,
         account_id=worker_target.account_id,
     )

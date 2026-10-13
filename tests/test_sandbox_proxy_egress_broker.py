@@ -264,10 +264,7 @@ async def test_static_runner_shell_call_signs_unscoped_worker_key(
     [payload] = payloads
     assert "worker_key" not in payload
     assert "HTTPS_PROXY" in payload["execution_env"]
-    assert _token_worker_key(runtime_paths, payload["execution_env"]) == resolve_unscoped_worker_key(
-        "code",
-        _identity(),
-    )
+    assert _token_worker_key(runtime_paths, payload["execution_env"]) == resolve_unscoped_worker_key("code")
 
 
 @pytest.mark.usefixtures("dedicated_routing")
