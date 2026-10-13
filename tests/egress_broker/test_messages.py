@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mindroom.egress_broker.messages import refusal_body
+from mindroom.egress_broker.messages import git_error_text, refusal_body
 from tests.egress_broker.conftest import CONNECT_URL, MANAGE_URL
 
 
@@ -181,6 +181,91 @@ def test_path_not_allowed_by_the_operator_names_an_administrator_whatever_the_sc
         "Only an administrator can change this, at manage_url."
     )
     assert set(body) == {"error", "service", "message"}
+
+
+# Where the personal page is not served, a personal scope's keys and services cannot be set anywhere.
+_PAGE_NOT_SERVED = (
+    "on the Connections page, which this deployment does not serve. "
+    "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope."
+)
+_PATH = {"host": "api.github.com", "path": "/repos/o/b?page=2", "service": "github-limited"}
+
+
+@pytest.mark.parametrize(
+    ("code", "values", "message"),
+    [
+        (
+            "credential_not_configured",
+            {"service": "openai"},
+            "No openai key is set for this agent. Each user sets this agent's keys " + _PAGE_NOT_SERVED,
+        ),
+        (
+            "credential_not_configured",
+            {"service": "github", "provider": "github", "connectable": True},
+            "No github credential is set for this agent. Ask the user to connect it at connect_url, then retry.",
+        ),
+        (
+            "oauth_connection_required",
+            {"service": "github", "provider": "github"},
+            "The github account for github must be connected again. Ask the user to reconnect at connect_url.",
+        ),
+        (
+            "oauth_refresh_failed",
+            {"service": "drive", "provider": "google_drive"},
+            "google_drive did not refresh the account token. "
+            "Retry in a minute; if it keeps failing, tell an administrator.",
+        ),
+        (
+            "path_not_allowed",
+            _PATH,
+            "api.github.com/repos/o/b is outside the paths github-limited allows for this agent. "
+            "Each user sets this agent's services " + _PAGE_NOT_SERVED,
+        ),
+    ],
+)
+def test_personal_scope_without_the_personal_page_gets_no_manage_link(
+    code: str,
+    values: dict[str, object],
+    message: str,
+) -> None:
+    """Only the personal page sets a personal scope's keys, so where it is not served no refusal links a page.
+
+    The body drops `manage_url`, which would be the dashboard, and git's ERR line says the same sentence.
+    """
+    body = refusal_body(code, personal_page=False, manage_url="https://m.test/", **values)
+
+    assert body["message"] == message
+    assert "manage_url" not in body
+    assert git_error_text(body) == message
+
+
+@pytest.mark.parametrize(
+    ("code", "values"),
+    [
+        ("credential_not_configured", {"service": "openai", "managers": ("@alice:example.org",)}),
+        ("credential_not_configured", {"service": "github", "provider": "github", "connectable": True}),
+        ("oauth_connection_required", {"service": "github", "provider": "github"}),
+        ("oauth_refresh_failed", {"service": "drive", "provider": "google_drive"}),
+        ("path_not_allowed", {**_PATH, "managers": ("@alice:example.org",)}),
+    ],
+)
+def test_shared_scopes_keep_their_refusals_without_the_personal_page(code: str, values: dict[str, object]) -> None:
+    """Shared and unscoped keys are set on the dashboard, so their refusals stay the same whether the page is served."""
+    served = refusal_body(code, shared=True, manage_url=MANAGE_URL, **values)
+
+    assert refusal_body(code, shared=True, personal_page=False, manage_url=MANAGE_URL, **values) == served
+    assert served["manage_url"] == MANAGE_URL
+
+
+def test_operator_limit_on_a_personal_scope_keeps_the_manage_link_without_the_personal_page() -> None:
+    """Only an administrator changes the operator's services, on the dashboard, whether or not the page is served."""
+    body = refusal_body("path_not_allowed", by_operator=True, personal_page=False, manage_url=MANAGE_URL, **_PATH)
+
+    assert body["manage_url"] == MANAGE_URL
+    assert body["message"] == (
+        "api.github.com/repos/o/b is outside the paths github-limited allows for this agent. "
+        "Only an administrator can change this, at manage_url."
+    )
 
 
 def test_path_in_a_message_never_includes_the_query() -> None:

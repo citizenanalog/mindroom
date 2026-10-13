@@ -882,7 +882,7 @@ To migrate from Agent Vault, switch in one upgrade and have users enter their ke
 
 1. Add the services to the deployment's `config.yaml` under `egress_broker.services`.
 2. Run one `helm upgrade` with `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`. If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in that upgrade.
-3. Have users and credential managers enter secrets on `/connections/egress` or the dashboard. Until they do, brokered calls answer 403 `credential_not_configured` with a message that says where to add the key. The personal page needs trusted upstream auth with JWT; without it only the dashboard can manage secrets.
+3. Have users and credential managers enter secrets on `/connections/egress` or the dashboard. Until they do, brokered calls answer 403 `credential_not_configured` with a message that says where to add the key. The personal page needs trusted upstream auth with JWT; without it the dashboard sets only the keys of `shared` and unscoped agents, and `user` and `user_agent` agents get none until it is enabled or they get a shared worker scope.
 4. Verify with brokered calls from real workers, then delete the Agent Vault bootstrap Secret and PVC after a grace period.
 The broker connects directly from the primary pod, unless the primary's `HTTPS_PROXY`/`NO_PROXY` routes it through an operator proxy.
 If `networkPolicy.extraEgress` restricts the primary, allow TCP 80 and 443 to public addresses yourself, because the chart cannot infer that rule.
@@ -937,7 +937,7 @@ See [Trusted Upstream Browser Auth](../../../docs/deployment/trusted-upstream-au
 Required for multi-user self-service: also set `MINDROOM_CONNECTIONS_AGENT` to a private agent (`private.per: user` or `user_agent`), as in the example.
 The egress page itself works without it, and only the portal's catalog needs it, but without it `_require_connections_route_authorized` returns early, so nothing keeps trusted users outside the administrator routes and every user the gateway admits gets full dashboard access: configuration edits, shared keys, and the full admin request log, whatever `administrators` lists.
 With it, a user outside `administrators` reaches only the Connections routes and the OAuth callback pages.
-Without trusted upstream auth with JWT, only administrators can manage keys and accounts, in the **Agent Keys** panel on the dashboard's Credentials page, and users cannot add services or see their requests.
+Without trusted upstream auth with JWT, the personal page is not served: administrators set the keys and accounts of `shared` and unscoped agents in the **Agent Keys** panel on the dashboard's Credentials page, but no page sets the keys of `user` and `user_agent` agents, private agents included, so give those agents a shared worker scope; users cannot add services or see their requests.
 
 ## Matrix Managed Account Authentication
 

@@ -389,8 +389,9 @@ The dashboard panel edits it as **Agents without a scope**.
 
 Set secrets and connect accounts in the **Agent Keys** panel on the dashboard's Credentials page, or on the personal egress page at `/connections/egress` (linked as "API keys and accounts" from the Connections pages).
 The panel's **Keys for** selector lists the `shared` agents that can run commands and, when such an agent exists, **Agents without a scope**.
-When no agent uses the panel's keys at all (every agent that can run commands is `user` or `user_agent`), the panel hides its key actions and says "No agent uses these keys."
-Keys for `user` and `user_agent` agents belong to each requester, so the panel does not list them and each user sets them on the personal egress page.
+Keys for `user` and `user_agent` agents, private agents included, belong to each requester, so the panel does not list them and each user sets them on the personal egress page.
+The panel's note says so, and links that page where it is served; otherwise it says the page needs [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/).
+When no agent uses the panel's keys (every agent that can run commands is `user` or `user_agent`), the panel hides its key actions and says "Only agents whose keys each user sets use the broker, so no keys are set here.", or "No agent uses these keys." when no agent can run commands at all.
 The status API returns, for each service and scope, whether a key is set and when it was last updated, and the state of the connected account; it never returns a secret or token.
 `configured` is true when either source is available, `active_source` is `key`, `oauth`, or `null`, and `source` is `config` for a service in `config.yaml` and `user` for a [user service](#user-services).
 
@@ -433,7 +434,8 @@ On the dashboard panel, a GitHub or Atlassian account is likewise the signed-in 
 The panel's scopes are shared and unscoped agents, which are shared sandboxes, so it offers such a connection only where the service sets `oauth_on_shared_workers`.
 
 The personal egress page and its API, `/api/connections/egress`, need [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/) with JWT (`MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT`) and a verified Matrix identity on the request.
-Without that signed identity gate, such as on a lab host that has no upstream proxy, only the dashboard can manage secrets.
+Without that signed identity gate, such as on a lab host that has no upstream proxy, the personal page is not served and the dashboard sets only the keys and accounts of `shared` and unscoped agents.
+A `user` or `user_agent` agent, private agents included, then has no page where its keys can be set: until an administrator enables trusted upstream auth or gives the agent a shared worker scope, its brokered calls to a service without a key are refused, and the refusal names no page (see [Error responses](#error-responses)).
 When more than one user can sign in through the gateway, `MINDROOM_CONNECTIONS_AGENT` is required as well: the egress routes themselves work without it, but without it every user the gateway admits has full dashboard access, including configuration edits, shared keys, and every requester's log (see [Security Boundary](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#security-boundary)).
 With `MINDROOM_CONNECTIONS_AGENT` set, a user who is not in `administrators` and opens a dashboard page (a browser `GET` that accepts `text/html`, outside `/api/`) is redirected with 303 to `/connections?notice=admin-only` instead of seeing a JSON refusal.
 There a notice says the dashboard is for administrators. API calls still get the 403 JSON.
@@ -783,6 +785,7 @@ Every JSON refusal the broker writes has a `message`: a plain sentence that an a
 Messages name only the service, the provider, the host, the path (without its query string), and the Matrix IDs of credential managers, and never a secret, token, query string, or connect link.
 Links travel in their own fields, `connect_url` and `manage_url`, which the messages point to by name.
 `manage_url` is `null` when `MINDROOM_PUBLIC_URL` is not set.
+It is left out of the refusals for a `user` or `user_agent` agent where the personal page is not served (no trusted upstream auth): the dashboard cannot set that agent's keys, so those messages name no page, as listed below.
 
 **Transport of a refusal.** The JSON body is not the only place a refusal says what happened, because many clients print only the status line:
 
@@ -827,6 +830,10 @@ The messages, with `{service}` (the service's display name, or its name when it 
 | `oauth_connection_required` | "The {provider} account for {service} must be connected again. Ask the user to reconnect at connect_url or manage_url." |
 | `oauth_refresh_failed` | "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, ask the user to reconnect at manage_url." |
 | `path_not_allowed`, personal agent, limit set by the agent's own services | "{host}{path} is outside the paths {service} allows for this agent. Ask the user to add it at manage_url if the agent needs it." |
+| `credential_not_configured`, personal agent, personal page not served | "No {service} key is set for this agent. Each user sets this agent's keys on the Connections page, which this deployment does not serve. An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope." With a connect link: "No {service} credential is set for this agent. Ask the user to connect it at connect_url, then retry." |
+| `oauth_connection_required`, personal agent, personal page not served | "The {provider} account for {service} must be connected again. Ask the user to reconnect at connect_url." |
+| `oauth_refresh_failed`, personal agent, personal page not served | "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, tell an administrator." |
+| `path_not_allowed`, personal agent, personal page not served, limit set by the agent's own services | "{host}{path} is outside the paths {service} allows for this agent. Each user sets this agent's services on the Connections page, which this deployment does not serve. An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope." |
 | `path_not_allowed`, shared or unscoped agent, limit set by the agent's own services | "{host}{path} is outside the paths {service} allows for this agent. Only its credential managers ({managers}) can change this, at manage_url." |
 | `path_not_allowed`, limit set by the administrator's service on any agent, or a shared or unscoped agent with no managers | "{host}{path} is outside the paths {service} allows for this agent. Only an administrator can change this, at manage_url." |
 | `bad_request`, ambiguous path | "The request path is ambiguous (dot segments, //, backslashes, or encoded forms of them) and was refused. Use a plain path." |
@@ -866,7 +873,7 @@ Apply steps 1 to 5 as one change, so Agent Vault stops serving when the broker s
 3. Rebuild the worker image from the updated checkout so workers install the broker's CA: `cd /srv/mindroom && docker build -t mindroom:dev -f local/instances/deploy/Dockerfile.mindroom .`
 4. Add the `github` service (or other services you use) to `~/.mindroom-chat/config.yaml` under `egress_broker.services`, for example `github: {preset: github}`.
 5. Remove the `agent-vault-bridge` plugin from config.
-6. Set the secrets or connect accounts in the dashboard's **Agent Keys** panel on the Credentials page. The personal egress page needs trusted upstream auth with JWT, which a lab host without an upstream proxy does not have.
+6. Set the keys or connect the accounts of `shared` and unscoped agents in the dashboard's **Agent Keys** panel on the Credentials page. Each user sets the keys of `user` and `user_agent` agents, private agents included, on the personal egress page, which needs trusted upstream auth with JWT; a lab host without an upstream proxy does not have it, so give those agents a shared worker scope, or their brokered calls that need a key are refused.
 7. Verify the broker works by running a worker command that uses a brokered service (such as `gh pr list` or `git clone` of a private repository) and checking that the request succeeds, the audit log records it, and the worker environment and workspace contain no trace of the token.
 8. Remove the Agent Vault CA pin from the NixOS configuration.
 9. Stop the `agent-vault` compose stack on the `nas` host after a grace period.

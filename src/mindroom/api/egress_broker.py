@@ -31,7 +31,8 @@ from mindroom.api.egress_status import (
     require_egress_broker_enabled,
     rule_summaries,
 )
-from mindroom.egress_broker.secrets import delete_secret
+from mindroom.egress_broker.env import personal_page_served
+from mindroom.egress_broker.secrets import PERSONAL_WORKER_SCOPES, delete_secret
 from mindroom.egress_broker.service import active_audit_log, active_ca_pem
 from mindroom.egress_broker.user_services import ServiceSource, save_service_key, service_source
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
@@ -71,12 +72,16 @@ class ServicesResponse(BaseModel):
     `shared_agents` names the shared agents that reach the broker, in config order, each with keys of its own.
     `has_unscoped_agents` says whether an agent without a worker scope reaches it; all of those share the global keys.
     Agents whose keys belong to each requester (`user`, `user_agent`, and private agents) are never named: their
-    users set keys on the Connections page. Both fields are the same whichever scope is selected.
+    users set keys on the personal egress page. `has_personal_agents` says whether one of them reaches the broker,
+    and `personal_page_served` whether this deployment serves that page. All four fields are the same whichever scope
+    is selected.
     """
 
     services: list[_ServiceStatus]
     shared_agents: list[str]
     has_unscoped_agents: bool
+    has_personal_agents: bool
+    personal_page_served: bool
 
 
 class PutSecretRequest(BaseModel):
@@ -182,6 +187,8 @@ async def get_services(
         services=services,
         shared_agents=[name for name, scope in scopes.items() if scope == "shared"],
         has_unscoped_agents="unscoped" in scopes.values(),
+        has_personal_agents=any(scope in PERSONAL_WORKER_SCOPES for scope in scopes.values()),
+        personal_page_served=personal_page_served(target.runtime_paths),
     )
 
 

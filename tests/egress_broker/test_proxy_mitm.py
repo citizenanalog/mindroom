@@ -458,7 +458,7 @@ async def test_limit_in_place_on_a_shared_agent_keeps_the_operator_key_and_names
         rules_provider=lambda _claims: with_user_services(operator, limited=limited),
         secrets={"op": "operator-key", "limited": "never-sent"},
         manage_url=MANAGE_URL,
-        scope_info=lambda _claims: ScopeInfo(shared=True, managers=managers),
+        scope_info=lambda _claims: ScopeInfo(shared=True, managers=managers, personal_page=True),
     )
     client = proxy_client(broker.token())
 
@@ -568,7 +568,7 @@ async def test_missing_secret_returns_403_with_manage_url(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "scope_info",
-    [None, lambda _claims: ScopeInfo(shared=True, managers=("@alice:example.org",))],
+    [None, lambda _claims: ScopeInfo(shared=True, managers=("@alice:example.org",), personal_page=True)],
     ids=["personal", "shared-with-managers"],
 )
 async def test_missing_secret_offers_oauth_connect_link(
@@ -618,7 +618,7 @@ async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
 
     def shared_scope(claims: WorkerClaims) -> ScopeInfo:
         asked.append(claims)
-        return ScopeInfo(shared=True, managers=("@alice:example.org",))
+        return ScopeInfo(shared=True, managers=("@alice:example.org",), personal_page=True)
 
     await broker(single_rule_config(), manage_url=MANAGE_URL, scope_info=shared_scope)
     client = proxy_client(broker.token())
@@ -727,6 +727,117 @@ async def test_oauth_refresh_outage_gets_retryable_503(
     }
     assert tls_upstream.hits == []
     await assert_audited(audit, kind="request", status=503, service="svc", path="/echo", code="oauth_refresh_failed")
+
+
+# The end of a personal scope's refusal where the personal page, the only place that sets its keys, is not served.
+_PAGE_NOT_SERVED = (
+    "on the Connections page, which this deployment does not serve. "
+    "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope."
+)
+_WITHOUT_PAGE = ScopeInfo(shared=False, managers=(), personal_page=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "status", "expected"),
+    [
+        (
+            SecretMissing(),
+            403,
+            {
+                "error": "credential_not_configured",
+                "service": "svc",
+                "message": "No svc key is set for this agent. Each user sets this agent's keys " + _PAGE_NOT_SERVED,
+            },
+        ),
+        (
+            SecretMissing(provider="github", connect_url=CONNECT_URL),
+            403,
+            {
+                "error": "credential_not_configured",
+                "service": "svc",
+                "provider": "github",
+                "connect_url": CONNECT_URL,
+                "message": "No svc credential is set for this agent. Ask the user to connect it at connect_url, then retry.",
+            },
+        ),
+        (
+            SecretNeedsReconnect(provider="github", connect_url=CONNECT_URL),
+            403,
+            {
+                "error": "oauth_connection_required",
+                "service": "svc",
+                "provider": "github",
+                "connect_url": CONNECT_URL,
+                "message": "The github account for svc must be connected again. Ask the user to reconnect at connect_url.",
+            },
+        ),
+        (
+            SecretUnavailable(provider="github"),
+            503,
+            {
+                "error": "oauth_refresh_failed",
+                "service": "svc",
+                "provider": "github",
+                "message": "github did not refresh the account token. "
+                "Retry in a minute; if it keeps failing, tell an administrator.",
+            },
+        ),
+    ],
+    ids=["key", "connectable", "reconnect", "refresh"],
+)
+async def test_personal_scope_without_the_personal_page_links_no_page(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+    result: SecretMissing | SecretNeedsReconnect | SecretUnavailable,
+    status: int,
+    expected: dict[str, object],
+) -> None:
+    """Where the personal page is not served, a personal scope's refusal never names the dashboard, which cannot help."""
+    await broker(
+        single_rule_config(),
+        resolve_secret=lambda _claims, _service, _routed: result,
+        manage_url="https://m.test/",
+        scope_info=lambda _claims: _WITHOUT_PAGE,
+    )
+    client = proxy_client(broker.token())
+
+    response = await client.get(tls_upstream.url("/echo"))
+
+    assert (response.status_code, response.json()) == (status, expected)
+    assert tls_upstream.hits == []
+
+
+@pytest.mark.asyncio
+async def test_user_limit_without_the_personal_page_links_no_page(
+    broker: BrokerFactory,
+    tls_upstream: Upstream,
+    proxy_client: ProxyClient,
+) -> None:
+    """A limit from the scope's own services is edited only on the personal page, so its refusal links no page either."""
+    operator = EgressBrokerConfig(
+        services={"op": EgressService(rules=[EgressRule(host="localhost", auth=EgressAuth(type="bearer"))])},
+    )
+    limited = EgressService(restrict_only=True, rules=[EgressRule(host="localhost", path_prefix="/echo")])
+    await broker(
+        rules_provider=lambda _claims: with_user_services(operator, limited=limited),
+        secrets={"op": "operator-key"},
+        manage_url="https://m.test/",
+        scope_info=lambda _claims: _WITHOUT_PAGE,
+    )
+    client = proxy_client(broker.token())
+
+    refused = await client.get(tls_upstream.url("/ok"))
+
+    assert refused.status_code == 403
+    assert refused.json() == {
+        "error": "path_not_allowed",
+        "service": "limited",
+        "message": "localhost/ok is outside the paths limited allows for this agent. "
+        "Each user sets this agent's services " + _PAGE_NOT_SERVED,
+    }
+    assert tls_upstream.hits == []
 
 
 @pytest.mark.asyncio

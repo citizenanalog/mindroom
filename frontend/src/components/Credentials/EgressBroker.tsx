@@ -84,6 +84,10 @@ interface ServicesListing {
   shared_agents: string[];
   /** Whether an agent without a worker scope uses it; all of them share one set of keys. */
   has_unscoped_agents: boolean;
+  /** Whether an agent whose keys each user sets (`user`, `user_agent`, private) uses it. */
+  has_personal_agents: boolean;
+  /** Whether the Agent Keys page where those users set their keys is served (trusted upstream auth). */
+  personal_page_served: boolean;
 }
 
 // The dashboard operator manages every service. Only shared agents and the
@@ -184,6 +188,8 @@ function ServiceSection({
   agentName,
   agentLabel,
   keysUnused,
+  personalAgents,
+  personalPage,
   initial,
   onListing,
 }: {
@@ -192,6 +198,10 @@ function ServiceSection({
   agentLabel: string;
   /** No agent uses these keys, so there is nothing to set or connect them for. */
   keysUnused: boolean;
+  /** An agent whose keys each user sets uses the broker. */
+  personalAgents: boolean;
+  /** The Agent Keys page where those users set their keys is served. */
+  personalPage: boolean;
   /** The listing already read for this section, which it then does not read again on mount. */
   initial?: ServicesListing;
   /** Receives every listing this section reads, which names the agents whose keys the panel sets. */
@@ -341,19 +351,32 @@ function ServiceSection({
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Services you add here are offered to every agent and user. Private
-        agents are not listed: each user sets their own keys on the{" "}
-        <a
-          href="/connections"
-          className="font-medium text-primary underline-offset-4 hover:underline"
-        >
-          Connections page
-        </a>
-        .
+        Services you add here are offered to every agent and user. Agents with a{" "}
+        <code>user</code> or <code>user_agent</code> worker scope and private
+        agents are not listed: each user sets their keys on the Connections
+        page&apos;s{" "}
+        {personalPage ? (
+          <>
+            <a
+              href="/connections/egress"
+              className="font-medium text-primary underline-offset-4 hover:underline"
+            >
+              Agent Keys page
+            </a>
+            .
+          </>
+        ) : (
+          <>
+            Agent Keys page, which needs trusted upstream auth and is not served
+            here. Give such agents a shared worker scope to set their keys here.
+          </>
+        )}
       </p>
       {keysUnused && (
         <p className="text-xs text-muted-foreground">
-          No agent uses these keys.
+          {personalAgents
+            ? "Only agents whose keys each user sets use the broker, so no keys are set here."
+            : "No agent uses these keys."}
         </p>
       )}
       {error && (
@@ -771,6 +794,8 @@ function AgentKeys({ checked }: { checked: ServicesListing }) {
             agentName === null ? UNSCOPED_AGENTS : (target?.label ?? agentName)
           }
           keysUnused={target === undefined}
+          personalAgents={keyAgents.has_personal_agents}
+          personalPage={keyAgents.personal_page_served}
           initial={agentName === null ? checkedListing : undefined}
           onListing={setKeyAgents}
         />

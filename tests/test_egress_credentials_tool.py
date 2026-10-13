@@ -292,12 +292,13 @@ def test_unscoped_target_reads_the_global_store(tmp_path: Path) -> None:
 
 
 def test_manage_url_points_at_the_dashboard_or_the_personal_page(tmp_path: Path) -> None:
-    """The link follows the broker's rule: the personal page behind trusted upstream auth, else the dashboard."""
+    """The link follows the broker's rule: the personal page where it is served, else the dashboard."""
     dashboard = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example/")
     personal = _runtime_paths(
         tmp_path,
         MINDROOM_PUBLIC_URL="https://mindroom.example",
         MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
+        MINDROOM_EGRESS_BROKER_PORT="8768",
     )
 
     dashboard_payload = _list(_tool(dashboard), _context(dashboard))

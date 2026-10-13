@@ -130,7 +130,13 @@ const json = (value: unknown, status = 200) =>
 
 let services: unknown[];
 // The agents whose keys the panel sets, which every services listing names.
-let keyAgents: { shared_agents: string[]; has_unscoped_agents: boolean };
+// Unless a test says otherwise, no agent has per-user keys and their page is served.
+let keyAgents: {
+  shared_agents: string[];
+  has_unscoped_agents: boolean;
+  has_personal_agents?: boolean;
+  personal_page_served?: boolean;
+};
 let logsResponse: () => Response | Promise<Response>;
 let mutationResponse: () => Response;
 
@@ -139,7 +145,12 @@ function mockApi() {
     const url = new URL(String(input), "http://localhost");
     const method = init?.method ?? "GET";
     if (url.pathname === "/api/egress-broker/services" && method === "GET")
-      return json({ services, ...keyAgents });
+      return json({
+        services,
+        has_personal_agents: false,
+        personal_page_served: true,
+        ...keyAgents,
+      });
     if (url.pathname === "/api/egress-broker/logs") return logsResponse();
     if (url.pathname === "/api/egress-broker/presets")
       return json(egressPresets);
@@ -324,17 +335,17 @@ describe("egress broker panel", () => {
     expect(screen.queryByText("Egress broker")).toBeNull();
   });
 
-  it("says what Add service offers and links the Connections page", async () => {
+  it("says what Add service offers and links the page where each user sets per-user keys", async () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
     const note = screen.getByText(/Services you add here are offered/);
     expect(note.textContent).toBe(
-      "Services you add here are offered to every agent and user. Private agents are not listed: each user sets their own keys on the Connections page.",
+      "Services you add here are offered to every agent and user. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page.",
     );
     expect(
-      within(note).getByRole("link", { name: "Connections page" }),
-    ).toHaveAttribute("href", "/connections");
+      within(note).getByRole("link", { name: "Agent Keys page" }),
+    ).toHaveAttribute("href", "/connections/egress");
     // It sits under the Add service button, whatever the agents are.
     expect(
       screen
@@ -343,18 +354,30 @@ describe("egress broker panel", () => {
     ).toBeTruthy();
   });
 
+  it("says that per-user keys need trusted upstream auth where their page is not served", async () => {
+    keyAgents = { ...keyAgents, personal_page_served: false };
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+
+    const note = screen.getByText(/Services you add here are offered/);
+    expect(note.textContent).toBe(
+      "Services you add here are offered to every agent and user. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page, which needs trusted upstream auth and is not served here. Give such agents a shared worker scope to set their keys here.",
+    );
+    expect(within(note).queryByRole("link")).toBeNull();
+  });
+
   it("repeats the note for every target", async () => {
     sharedCoder();
     render(<EgressBroker />);
     await screen.findByText("GitHub");
     expect(
-      screen.getAllByRole("link", { name: "Connections page" }),
+      screen.getAllByRole("link", { name: "Agent Keys page" }),
     ).toHaveLength(1);
 
     selectTarget("");
     await screen.findByText("GitHub");
     expect(
-      screen.getAllByRole("link", { name: "Connections page" }),
+      screen.getAllByRole("link", { name: "Agent Keys page" }),
     ).toHaveLength(1);
   });
 
@@ -518,10 +541,10 @@ describe("egress broker key target", () => {
   });
 
   it("hides the key actions and says so when no agent uses these keys", async () => {
-    // Every command agent keeps keys per requester, so none is named.
+    // No agent runs commands, so none uses the broker.
     keyAgents = { shared_agents: [], has_unscoped_agents: false };
     storeState = {
-      agents: [agent("mine", ["shell"], { worker_scope: "user" })],
+      agents: [agent("notes", ["calculator"], { worker_scope: "user" })],
       config: { defaults: {} },
     };
     render(<EgressBroker />);
@@ -590,22 +613,30 @@ describe("egress broker key target", () => {
     ).toBeVisible();
   });
 
-  it("no longer says that requester-scoped agents are left out", async () => {
-    keyAgents = { shared_agents: ["team"], has_unscoped_agents: false };
+  it("says that only agents with per-user keys use the broker, not that no agent does", async () => {
+    // Every command agent keeps keys per requester, so none is named.
+    keyAgents = {
+      shared_agents: [],
+      has_unscoped_agents: false,
+      has_personal_agents: true,
+    };
     storeState = {
-      agents: [
-        agent("team", ["shell"], { worker_scope: "shared" }),
-        agent("mine", ["shell"], { private: { per: "user" } }),
-      ],
+      agents: [agent("mine", ["shell"], { worker_scope: "user" })],
       config: { defaults: {} },
     };
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
+    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
     expect(
-      screen.queryByText(/Agents with user or user_agent scope/),
+      screen.getByText(
+        "Only agents whose keys each user sets use the broker, so no keys are set here.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Keys for")).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "Set key for GitHub" }),
     ).toBeNull();
-    expect(screen.queryByText(/personal egress page/)).toBeNull();
   });
 
   it("loads the services of the selected target", async () => {

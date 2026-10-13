@@ -54,6 +54,27 @@ _PATH_SHARED = _PATH_OUTSIDE + "Only its credential managers ({managers}) can ch
 _PATH_ADMINISTRATOR = _PATH_OUTSIDE + "Only an administrator can change this, at manage_url."
 # The spec words `bad_request` for the ambiguous-path refusal; a request the broker cannot read at all has no path.
 _MALFORMED = "The request is malformed and was refused."
+# A personal scope's keys and services are set only on the personal page. Where it is not served, its refusals take
+# their texts from `_WITHOUT_PAGE`, which names no page there, and `refusal_body` drops `manage_url`, the dashboard.
+_PAGE_NOT_SERVED = (
+    "on the Connections page, which this deployment does not serve. "
+    "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope."
+)
+_WITHOUT_PAGE = {
+    **_MESSAGES,
+    "credential_not_configured": "No {service} key is set for this agent. Each user sets this agent's keys "
+    + _PAGE_NOT_SERVED,
+    "oauth_connection_required": (
+        "The {provider} account for {service} must be connected again. Ask the user to reconnect at connect_url."
+    ),
+    "oauth_refresh_failed": (
+        "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, tell an administrator."
+    ),
+    "path_not_allowed": _PATH_OUTSIDE + "Each user sets this agent's services " + _PAGE_NOT_SERVED,
+}
+_CONNECTABLE_WITHOUT_PAGE = (
+    "No {service} credential is set for this agent. Ask the user to connect it at connect_url, then retry."
+)
 
 
 @dataclass(frozen=True)
@@ -61,11 +82,13 @@ class ScopeInfo:
     """Who can fix a missing key for one requester's scope.
 
     `shared` is true for a `shared` or unscoped agent, whose keys only its credential managers (`managers`, Matrix
-    IDs) and administrators may set; a personal (`user` or `user_agent`) scope's user sets their own.
+    IDs) and administrators may set; a personal (`user` or `user_agent`) scope's user sets their own, on the personal
+    page. `personal_page` says whether this deployment serves that page; without it nobody can set a personal key.
     """
 
     shared: bool
     managers: tuple[str, ...]
+    personal_page: bool
 
 
 def _template(
@@ -74,11 +97,13 @@ def _template(
     path: str | None,
     managers: Sequence[str],
     shared: bool,
+    personal_page: bool,
     connectable: bool,
     by_operator: bool,
 ) -> str:
+    without_page = not (shared or personal_page)
     if code == "credential_not_configured" and connectable:
-        return _CONNECTABLE
+        return _CONNECTABLE_WITHOUT_PAGE if without_page else _CONNECTABLE
     if code == "credential_not_configured" and shared:
         return _SHARED if managers else _SHARED_WITHOUT_MANAGERS
     if code == "path_not_allowed" and (by_operator or (shared and not managers)):
@@ -88,7 +113,7 @@ def _template(
     if code == "bad_request" and path is None:
         return _MALFORMED
     try:
-        return _MESSAGES[code]
+        return (_WITHOUT_PAGE if without_page else _MESSAGES)[code]
     except KeyError:
         msg = f"No refusal message for {code}."
         raise ValueError(msg) from None
@@ -104,6 +129,7 @@ def refusal_body(
     provider: str | None = None,
     managers: Sequence[str] | None = None,
     shared: bool = False,
+    personal_page: bool = True,
     connectable: bool = False,
     by_operator: bool = False,
     **extra: object,
@@ -116,6 +142,8 @@ def refusal_body(
     otherwise a `shared` scope names its `managers` (or an administrator when there are none); a `shared`
     `path_not_allowed` names them as the ones who can change the limit. A `path_not_allowed` set by the operator's
     service (`by_operator`) names an administrator whatever the scope, since only an administrator edits it.
+    A personal scope without the personal page (`personal_page` false) has no page that sets its keys or services:
+    its texts say so, keep only a connect link, and the body leaves out `manage_url`, which would be the dashboard.
     A `bad_request` with a `path` is the ambiguous-path refusal; without one, the request itself was malformed.
     Raises ValueError for a code without a text and KeyError when the text needs a value that was not given.
     """
@@ -124,9 +152,13 @@ def refusal_body(
         path=path,
         managers=managers or (),
         shared=shared,
+        personal_page=personal_page,
         connectable=connectable,
         by_operator=by_operator,
     )
+    if "manage_url" not in template:
+        # A body carries the manage link only where its text names it.
+        extra.pop("manage_url", None)
     values = {
         "host": host,
         "path": None if path is None else path.split("?", 1)[0],

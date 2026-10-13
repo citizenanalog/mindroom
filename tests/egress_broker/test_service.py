@@ -717,14 +717,18 @@ async def test_bind_error_propagates(
         ({"MINDROOM_PUBLIC_URL": "https://chat.example.org"}, "https://chat.example.org/"),
         ({"MINDROOM_PUBLIC_URL": "https://chat.example.org/"}, "https://chat.example.org/"),
         (
-            {"MINDROOM_PUBLIC_URL": "https://chat.example.org/", "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"},
+            {
+                **_broker_env(8768),
+                "MINDROOM_PUBLIC_URL": "https://chat.example.org/",
+                "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
+            },
             "https://chat.example.org/connections/egress",
         ),
         ({"MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"}, None),
     ],
 )
 def test_manage_url(tmp_runtime_paths: Callable[..., RuntimePaths], env: dict[str, str], expected: str | None) -> None:
-    """The manage link is the personal egress page behind trusted upstream auth, else the dashboard."""
+    """The manage link is the personal egress page where it is served, else the dashboard."""
     assert manage_url(tmp_runtime_paths(**env)) == expected
 
 
@@ -886,6 +890,52 @@ async def test_missing_key_message_names_the_calling_agents_credential_managers(
         response = await get_through(env)
     assert response.status_code == 403
     assert response.json() == _no_key_refusal(message)
+
+
+@pytest.mark.parametrize(
+    ("scope", "trusted", "link", "message"),
+    [
+        ("user_agent", True, f"{_PUBLIC_URL}/connections/egress", _NO_GITHUB_KEY),
+        (
+            "user",
+            False,
+            None,
+            "No github key is set for this agent. Each user sets this agent's keys on the Connections page, "
+            "which this deployment does not serve. "
+            "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope.",
+        ),
+        ("shared", False, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
+        (None, False, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
+    ],
+    ids=["personal-page", "personal-without-page", "shared-dashboard", "unscoped-dashboard"],
+)
+@pytest.mark.asyncio
+async def test_missing_key_refusal_links_only_a_page_that_can_set_the_key(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    scope: WorkerScope | None,
+    trusted: bool,
+    link: str | None,
+    message: str,
+    get_through: GetThrough,
+) -> None:
+    """A personal scope's key is set only on the personal page, served behind trusted upstream auth.
+
+    Without it the refusal links no page and says what an administrator can do; shared and unscoped keys are set on
+    the dashboard either way.
+    """
+    runtime_paths = tmp_runtime_paths(
+        **_broker_env(free_port()),
+        MINDROOM_PUBLIC_URL=_PUBLIC_URL,
+        MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED=str(trusted).lower(),
+    )
+    config = _config(github=_GITHUB)
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target(scope=scope))
+        response = await get_through(env)
+    expected = {"error": "credential_not_configured", "service": "github", "message": message}
+    assert response.status_code == 403
+    assert response.json() == expected if link is None else {**expected, "manage_url": link}
 
 
 @pytest.mark.usefixtures("github_oauth_client")

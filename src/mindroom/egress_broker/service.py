@@ -18,7 +18,12 @@ from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.audit import AuditLog
 from mindroom.egress_broker.ca import BrokerCA
 from mindroom.egress_broker.dial import DialPolicy
-from mindroom.egress_broker.env import broker_execution_env, egress_broker_enabled, primary_callback_hosts
+from mindroom.egress_broker.env import (
+    broker_execution_env,
+    egress_broker_enabled,
+    personal_page_served,
+    primary_callback_hosts,
+)
 from mindroom.egress_broker.messages import ScopeInfo
 from mindroom.egress_broker.oauth_source import oauth_status, resolve_oauth_token
 from mindroom.egress_broker.proxy import EgressBroker
@@ -172,11 +177,15 @@ def _unusable_proxy_message(variable: str) -> str:
 
 
 def manage_url(runtime_paths: RuntimePaths) -> str | None:
-    """Return where a user sets a missing egress secret: the personal page behind trusted upstream auth, else the dashboard."""
+    """Return where a missing egress secret is set: the personal page where it is served, else the dashboard.
+
+    The dashboard sets only shared and unscoped keys, so a refusal for a personal scope names no page without the
+    personal one (see `ScopeInfo`).
+    """
     public_url = (runtime_paths.env_value("MINDROOM_PUBLIC_URL") or "").strip().rstrip("/")
     if not public_url:
         return None
-    if runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED"):
+    if personal_page_served(runtime_paths):
         return f"{public_url}/connections/egress"
     return f"{public_url}/"
 
@@ -193,9 +202,12 @@ class _LastGoodConfig:
         self,
         config_provider: Callable[[], Config | None],
         credentials_manager: CredentialsManager,
+        *,
+        personal_page: bool,
     ) -> None:
         self._config_provider = config_provider
         self._credentials_manager = credentials_manager
+        self._personal_page = personal_page
         self._config: Config | None = None
 
     def current(self) -> Config | None:
@@ -223,12 +235,17 @@ class _LastGoodConfig:
     def scope_info(self, claims: WorkerClaims) -> ScopeInfo:
         """Return who can add a missing key for one requester: themselves, or a shared agent's credential managers.
 
-        `user` and `user_agent` scopes are personal; `shared` and unscoped agents are shared.
+        `user` and `user_agent` scopes are personal, and their users set keys only where the personal page is served;
+        `shared` and unscoped agents are shared.
         """
         config = self.current()
         agent = None if config is None else config.agents.get(claims.agent_name)
         managers = () if agent is None else tuple(agent.credential_managers)
-        return ScopeInfo(shared=claims.worker_scope not in PERSONAL_WORKER_SCOPES, managers=managers)
+        return ScopeInfo(
+            shared=claims.worker_scope not in PERSONAL_WORKER_SCOPES,
+            managers=managers,
+            personal_page=self._personal_page,
+        )
 
 
 def _routed_key(
@@ -326,7 +343,11 @@ class _BrokerService:
         signer = TokenSigner.load_or_create(state_dir / "token.key", ttl_seconds=self._settings.token_ttl_seconds)
         self._audit = audit = AuditLog(state_dir / "requests.sqlite3")
         credentials_manager = self._credentials_manager
-        config = _LastGoodConfig(self._config_provider, credentials_manager)
+        config = _LastGoodConfig(
+            self._config_provider,
+            credentials_manager,
+            personal_page=personal_page_served(self._runtime_paths),
+        )
         self._oauth_executor = oauth_executor = ThreadPoolExecutor(
             max_workers=_OAUTH_LOOKUP_WORKERS,
             thread_name_prefix="mindroom-egress-oauth",

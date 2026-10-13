@@ -1,4 +1,4 @@
-"""Whether the broker is enabled, the worker execution env overlay, and runner CA bundle materialization."""
+"""Whether the broker and its personal page are on, the worker env overlay, and runner CA bundle materialization."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ __all__ = [
     "broker_execution_env",
     "egress_broker_enabled",
     "egress_tool_unavailable",
+    "personal_page_served",
     "primary_callback_hosts",
 ]
 
@@ -33,6 +34,15 @@ def egress_broker_enabled(runtime_paths: RuntimePaths) -> bool:
     nothing of the feature shows or runs. A set but invalid port counts as enabled, so startup refuses it loudly.
     """
     return bool((runtime_paths.env_value(EGRESS_BROKER_ENV_BY_KEY["port"]) or "").strip())
+
+
+def personal_page_served(runtime_paths: RuntimePaths) -> bool:
+    """Return whether the personal egress page is served: the broker is on and trusted upstream auth is enabled.
+
+    Only that page, `/connections/egress`, sets the keys of `user` and `user_agent` agents, which belong to each
+    requester.
+    """
+    return egress_broker_enabled(runtime_paths) and runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED")
 
 
 def egress_tool_unavailable(tool_name: str, runtime_paths: RuntimePaths) -> bool:

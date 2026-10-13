@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, Response
 
 from mindroom.api.auth import login_redirect_for_request, request_has_frontend_access, sanitize_next_path
 from mindroom.api.config_lifecycle import api_runtime_paths
-from mindroom.egress_broker.env import egress_broker_enabled
+from mindroom.egress_broker.env import egress_broker_enabled, personal_page_served
 from mindroom.frontend_assets import ensure_frontend_dist_dir
 
 if TYPE_CHECKING:
@@ -60,11 +60,7 @@ def _connections_frontend_enabled(runtime_paths: RuntimePaths, path: str) -> boo
         return False
     if (runtime_paths.env_value("MINDROOM_CONNECTIONS_AGENT") or "").strip():
         return True
-    return (
-        page in _EGRESS_PAGE_SEGMENTS
-        and runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED")
-        and egress_broker_enabled(runtime_paths)
-    )
+    return page in _EGRESS_PAGE_SEGMENTS and personal_page_served(runtime_paths)
 
 
 @router.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)

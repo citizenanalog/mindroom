@@ -412,7 +412,7 @@ class Relay:
     """Per-request work both listener paths share: reading rules, dialing, streaming, answering, and auditing.
 
     `manage_url` is where the verified requester changes their egress keys and services, and `scope_info` returns who
-    else can change them on a shared agent, for refusal bodies.
+    else can change them on a shared agent, and whether a personal scope's page is served at all, for refusal bodies.
     """
 
     audit: AuditLog
@@ -475,6 +475,7 @@ class Relay:
                 service_label=route.restricted_by_label,
                 shared=scope.shared,
                 managers=scope.managers,
+                personal_page=scope.personal_page,
                 by_operator=route.restricted_by_operator,
                 manage_url=self.manage_url,
             )

@@ -84,8 +84,8 @@ def egress_config_file(tmp_path: Path) -> Generator[Path, None, None]:
     temp_path.unlink(missing_ok=True)
 
 
-def _admin_client(egress_config_file: Path, *, broker_on: bool = True) -> TestClient:
-    """Serve the admin API for the config file, with the broker enabled unless `broker_on` is false."""
+def _admin_client(egress_config_file: Path, *, broker_on: bool = True, **env: str) -> TestClient:
+    """Serve the admin API for the config file, with the broker enabled unless `broker_on` is false, and `env` added."""
     from fastapi.testclient import TestClient  # noqa: PLC0415
 
     from mindroom import constants  # noqa: PLC0415
@@ -93,7 +93,7 @@ def _admin_client(egress_config_file: Path, *, broker_on: bool = True) -> TestCl
 
     runtime_paths = constants.resolve_primary_runtime_paths(
         config_path=egress_config_file,
-        process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org", **(_BROKER_ON if broker_on else {})},
+        process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org", **(_BROKER_ON if broker_on else {}), **env},
     )
     main.initialize_api_app(main.app, runtime_paths)
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
@@ -264,6 +264,52 @@ def test_services_listing_names_the_agents_whose_keys_the_dashboard_sets(egress_
 
     assert _key_targets(client) == (["preset_team"], False)
     assert _key_targets(client, "preset_team") == (["preset_team"], False)
+
+
+@pytest.mark.parametrize(
+    ("agents", "has_personal_agents"),
+    [
+        ({"per_user": _agent(["shell"], worker_scope="user")}, True),
+        ({"per_agent": _agent(["python"], worker_scope="user_agent")}, True),
+        ({"mine": _agent(["shell"], private={"per": "user_agent"})}, True),
+        (
+            {"team": _agent(["shell"], worker_scope="shared"), "notes": _agent(["calculator"], worker_scope="user")},
+            False,
+        ),
+        ({"coder": _agent(["shell"])}, False),
+    ],
+    ids=["user", "user_agent", "private", "shared-and-calculator", "unscoped"],
+)
+def test_services_listing_says_whether_an_agent_with_per_user_keys_reaches_the_broker(
+    egress_config_file: Path,
+    agents: dict[str, dict[str, Any]],
+    *,
+    has_personal_agents: bool,
+) -> None:
+    """The listing never names those agents (`user`, `user_agent`, private), but says whether one uses the broker."""
+    response = _client_with_agents(egress_config_file, agents).get("/api/egress-broker/services")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["has_personal_agents"] is has_personal_agents
+
+
+def test_services_listing_says_whether_the_personal_page_is_served(egress_config_file: Path) -> None:
+    """The page where each user sets per-user keys is served only behind trusted upstream auth."""
+    from tests.api.conftest import trusted_upstream_headers  # noqa: PLC0415
+
+    standalone = _admin_client(egress_config_file).get("/api/egress-broker/services")
+    trusted = _admin_client(
+        egress_config_file,
+        MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
+        MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER="X-Trusted-User",
+        MINDROOM_TRUSTED_UPSTREAM_EMAIL_HEADER="X-Trusted-Email",
+        MINDROOM_TRUSTED_UPSTREAM_MATRIX_USER_ID_HEADER="X-Trusted-Matrix-User",
+    ).get("/api/egress-broker/services", headers=trusted_upstream_headers(matrix_user_id="@owner:example.org"))
+
+    assert standalone.status_code == 200, standalone.text
+    assert trusted.status_code == 200, trusted.text
+    assert standalone.json()["personal_page_served"] is False
+    assert trusted.json()["personal_page_served"] is True
 
 
 def test_services_listing_says_whether_an_agent_without_a_scope_reaches_the_broker(egress_config_file: Path) -> None:

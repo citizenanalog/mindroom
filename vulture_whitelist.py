@@ -30,6 +30,7 @@ scope_agents  # JSON response field consumed by the personal egress page (src/mi
 placeholder_names  # JSON response field consumed by the personal egress page (src/mindroom/api/egress_credentials.py)
 shared_agents  # JSON response field consumed by the dashboard Agent Keys panel (src/mindroom/api/egress_broker.py)
 has_unscoped_agents  # JSON response field consumed by the dashboard Agent Keys panel (src/mindroom/api/egress_broker.py)
+has_personal_agents  # JSON response field consumed by the dashboard Agent Keys panel (src/mindroom/api/egress_broker.py)
 name_pattern  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 credential_words  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)
 refused_words  # JSON response field consumed by the egress service editor (src/mindroom/api/egress_status.py)

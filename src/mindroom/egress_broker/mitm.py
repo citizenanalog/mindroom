@@ -231,19 +231,23 @@ class TlsInterceptor:
     def _refusal(self, claims: WorkerClaims, service: str, result: SecretResult) -> tuple[int, dict[str, object]]:
         """Return the status and body for a lookup without a secret: retry, retry later, reconnect, or set one.
 
-        Each body but the `broker_error` for a changed service carries `manage_url`, which its message names, and a
-        connect link only in `connect_url`.
+        Each body but the `broker_error` for a changed service carries `manage_url`, which its message names, unless
+        no page sets the scope's keys (a personal scope without the personal page), and a connect link only in
+        `connect_url`.
         """
         if isinstance(result, SecretServiceChanged):
             # The service changed after routing, so its credential may be for other hosts; a retry routes afresh.
             return 502, refusal_body("broker_error")
         manage_url = self._relay.manage_url
+        scope = self._relay.scope_info(claims)
         if isinstance(result, SecretUnavailable):
             # The provider may recover, so this is a retryable failure, not a prompt to reconnect.
             return 503, refusal_body(
                 "oauth_refresh_failed",
                 service=service,
                 provider=result.provider,
+                shared=scope.shared,
+                personal_page=scope.personal_page,
                 manage_url=manage_url,
             )
         if isinstance(result, SecretNeedsReconnect):
@@ -251,6 +255,8 @@ class TlsInterceptor:
                 "oauth_connection_required",
                 service=service,
                 provider=result.provider,
+                shared=scope.shared,
+                personal_page=scope.personal_page,
                 connect_url=result.connect_url,
                 manage_url=manage_url,
             )
@@ -260,13 +266,13 @@ class TlsInterceptor:
         # No secret, or an empty one: the body also names the account the user can connect instead, if any.
         provider = result.provider if isinstance(result, SecretMissing) else None
         connect_url = result.connect_url if isinstance(result, SecretMissing) else None
-        scope = self._relay.scope_info(claims)
         missing = refusal_body(
             "credential_not_configured",
             service=service,
             provider=provider,
             managers=scope.managers,
             shared=scope.shared,
+            personal_page=scope.personal_page,
             connectable=provider is not None and connect_url is not None,
             manage_url=manage_url,
         )

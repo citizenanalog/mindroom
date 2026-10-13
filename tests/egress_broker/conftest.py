@@ -528,7 +528,7 @@ class BrokerFactory:
             manage_url=manage_url,
             max_body_bytes=max_body_bytes,
             head_timeout=head_timeout,
-            scope_info=scope_info or (lambda _claims: ScopeInfo(shared=False, managers=())),
+            scope_info=scope_info or (lambda _claims: ScopeInfo(shared=False, managers=(), personal_page=True)),
         )
         await broker.start("127.0.0.1", 0)
         self.brokers.append(broker)
