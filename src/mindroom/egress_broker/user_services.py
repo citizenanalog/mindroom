@@ -38,6 +38,7 @@ from mindroom.egress_broker.secrets import (
     load_egress_document,
     save_egress_document,
     save_secret,
+    validate_secret,
 )
 from mindroom.logging_config import get_logger
 
@@ -273,20 +274,20 @@ def save_service_key(
     of that name, which the config service shadows, is deleted too, so it never becomes active with this key once the
     config service is gone. In a personal scope the requester owns both, so the entry stays.
 
-    Raises ValueError for an invalid secret, before anything is written.
+    Raises ValueError for an invalid secret, before anything is written. The shadowed entry goes before the key is
+    stored, so a failed write never leaves the new key next to an entry that could adopt it.
     """
     with _write_lock:
+        validate_secret(secret)
+        if name in config_services and not is_personal_target(target):
+            stored = _stored_services(manager, target)
+            if name in stored:
+                del stored[name]
+                try:
+                    _write_stored_services(manager, target, stored)
+                finally:
+                    _cache.invalidate()
         save_secret(manager, target, name, secret)
-        if name not in config_services or is_personal_target(target):
-            return
-        stored = _stored_services(manager, target)
-        if name not in stored:
-            return
-        del stored[name]
-        try:
-            _write_stored_services(manager, target, stored)
-        finally:
-            _cache.invalidate()
 
 
 def effective_config(

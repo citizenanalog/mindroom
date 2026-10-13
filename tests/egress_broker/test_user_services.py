@@ -9,7 +9,7 @@ from structlog.testing import capture_logs
 
 from mindroom.config.egress_broker import EgressBrokerConfig, EgressService
 from mindroom.credentials.manager import CredentialsManager
-from mindroom.egress_broker import user_services
+from mindroom.egress_broker import secrets, user_services
 from mindroom.egress_broker.rules import EgressRules, host_has_rules, route_request
 from mindroom.egress_broker.secrets import load_secret, save_egress_document, save_secret
 from mindroom.egress_broker.user_services import (
@@ -21,6 +21,7 @@ from mindroom.egress_broker.user_services import (
     effective_config,
     inactive_user_services,
     load_user_services,
+    save_service_key,
     save_user_service,
     user_service_hosts_not_allowed,
 )
@@ -581,6 +582,41 @@ def test_deleting_a_shadowed_entry_keeps_the_key_its_config_service_uses(manager
         save_secret(manager, target, "mine", "own-key")
         assert _delete(manager, target, "mine") is True
         assert load_secret(manager, target, "mine") is None
+
+
+def _fail(*_args: object, **_kwargs: object) -> None:
+    msg = "disk write failed"
+    raise OSError(msg)
+
+
+@pytest.mark.parametrize("failing_write", ["entry_delete", "key_write", "invalid_secret"])
+def test_a_failed_key_save_never_leaves_the_new_key_next_to_the_entry_it_shadows(
+    manager: CredentialsManager,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_write: str,
+) -> None:
+    """A write that fails never stores the new key while the shadowed entry stays, so the entry cannot adopt it."""
+    shadowing = {**_CONFIG.services, "mine": _service("config.example.com")}
+    secret = "new-key"  # noqa: S105 - test credential
+    for target in (worker_target(scope="shared"), None):
+        _save(manager, target, "mine", _service())
+        save_secret(manager, target, "mine", "old-key")
+        if failing_write == "entry_delete":
+            monkeypatch.setattr(user_services, "delete_egress_document", _fail)
+        elif failing_write == "key_write":
+            monkeypatch.setattr(secrets, "save_egress_document", _fail)
+        else:
+            secret = "bad\nkey"  # noqa: S105 - test credential
+
+        with pytest.raises(ValueError if failing_write == "invalid_secret" else OSError):
+            save_service_key(manager, target, "mine", secret, config_services=shadowing)
+        monkeypatch.undo()
+
+        entry_stays = "mine" in load_user_services(manager, target)
+        assert not (entry_stays and load_secret(manager, target, "mine") == "new-key")
+        if failing_write == "invalid_secret":
+            assert entry_stays
+            assert load_secret(manager, target, "mine") == "old-key"
 
 
 @pytest.mark.parametrize("scope", ["shared", None], ids=["shared", "unscoped"])
