@@ -892,7 +892,7 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
                 agent_name,
             )
             return None
-        hidden_tool_names = _context_hidden_toolkits(execution_identity)
+        hidden_tool_names = _context_hidden_toolkits(execution_identity, runtime_paths)
         if not _visible_deferred_tool_names(config, agent_name, hidden_tool_names=hidden_tool_names):
             logger.warning(
                 "Skipping 'dynamic_tools' tool for agent '%s': no compatible deferred tools are available",
@@ -1103,10 +1103,18 @@ def _is_learning_enabled(agent_config: AgentConfig, defaults: DefaultsConfig) ->
     return learning is not False
 
 
-def _context_hidden_toolkits(execution_identity: ToolExecutionIdentity | None) -> frozenset[str]:
-    if execution_identity is None or execution_identity.room_id is not None:
-        return frozenset()
-    return frozenset(tool_name for tool_name, metadata in TOOL_METADATA.items() if metadata.requires_room_context)
+def _context_hidden_toolkits(
+    execution_identity: ToolExecutionIdentity | None,
+    runtime_paths: constants.RuntimePaths,
+) -> frozenset[str]:
+    """Return the toolkits this agent cannot use here, eager or deferred, for every tool surface to leave out.
+
+    That is the egress credentials tool while the broker is off, and the room-bound toolkits when there is no room.
+    """
+    hidden = {tool_name for tool_name in TOOL_METADATA if egress_tool_unavailable(tool_name, runtime_paths)}
+    if execution_identity is not None and execution_identity.room_id is None:
+        hidden.update(tool_name for tool_name, metadata in TOOL_METADATA.items() if metadata.requires_room_context)
+    return frozenset(hidden)
 
 
 def _visible_deferred_tool_names(
@@ -1528,7 +1536,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - loaded and deferred tools
         include_matrix_room_runtime_tools=include_matrix_room_runtime_tools,
         required_tool_names=required_tool_names,
     )
-    hidden_toolkits = _context_hidden_toolkits(execution_identity)
+    hidden_toolkits = _context_hidden_toolkits(execution_identity, runtime_paths)
     resolved_tool_configs = {entry.name: entry for entry in dynamic_tool_selection.runtime_tool_configs}
     if disable_runtime_capabilities:
         resolved_tool_configs = {}
