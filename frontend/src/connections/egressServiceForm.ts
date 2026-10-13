@@ -102,7 +102,7 @@ export function ruleFormFrom(rule: EgressRule): RuleForm {
   const auth = rule.auth ?? { type: "bearer" as const };
   return {
     host: rule.host,
-    port: rule.port === undefined ? "" : String(rule.port),
+    port: rule.port == null ? "" : String(rule.port),
     pathPrefix: rule.path_prefix ?? "",
     authType:
       auth.type === "header" && hasCustomTemplate(auth.template)

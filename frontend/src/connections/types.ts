@@ -183,7 +183,8 @@ export interface EgressAuth {
 
 export interface EgressRule {
   host: string;
-  port?: number;
+  /** Null, like no port, means any port. */
+  port?: number | null;
   path_prefix?: string;
   /** Required unless the service is restrict-only, whose rules send nothing and may leave it out. */
   auth?: EgressAuth;

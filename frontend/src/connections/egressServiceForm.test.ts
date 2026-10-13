@@ -173,6 +173,17 @@ describe("an unchanged save writes the service back as it was", () => {
       expect(serialize(service, operator)).toEqual(service);
   });
 
+  it("opens a rule with a null port as any port and saves it without an error", () => {
+    const service: AuthoredEgressService = {
+      rules: [{ ...bearerRule, port: null }],
+    };
+    expect(formFromService("svc", service).rules[0].port).toBe("");
+    expect(
+      problemsFor(service, {}, personal, { editing: true, takenNames: [] }),
+    ).toEqual([]);
+    expect(serialize(service)).toEqual({ rules: [bearerRule] });
+  });
+
   it("leaves the keys out when the service never had them", () => {
     expect(serialize({ preset: "github" }, operator)).toEqual({
       preset: "github",
@@ -508,7 +519,9 @@ describe("the display name a new custom service gets", () => {
   it("is the first rule's host, lowercased, and not a title-cased name", () => {
     expect(
       add({ rules: [{ ...bearerRule, host: "Echo-Test.example.com" }] }),
-    ).toMatchObject({ display_name: "echo-test.example.com" });
+    ).toMatchObject({
+      display_name: "echo-test.example.com",
+    });
   });
 
   it("gives way to a display name that is typed", () => {
