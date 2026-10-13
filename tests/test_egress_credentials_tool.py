@@ -60,6 +60,10 @@ _SERVICES: dict[str, object] = {
 }
 
 
+# Serves the personal egress page: the broker is on behind trusted upstream auth.
+_PAGE_SERVED = {"MINDROOM_EGRESS_BROKER_PORT": "8768", "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"}
+
+
 def _runtime_paths(tmp_path: Path, **env: str) -> RuntimePaths:
     """Return a runtime on the Docker worker backend unless `env` names another, so `user_agent` workers are private."""
     return resolve_runtime_paths(
@@ -294,14 +298,9 @@ def test_unscoped_target_reads_the_global_store(tmp_path: Path) -> None:
 def test_manage_url_points_at_the_dashboard_or_the_personal_page(tmp_path: Path) -> None:
     """The link follows the broker's rule: the personal page where it is served, else the dashboard."""
     dashboard = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example/")
-    personal = _runtime_paths(
-        tmp_path,
-        MINDROOM_PUBLIC_URL="https://mindroom.example",
-        MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED="true",
-        MINDROOM_EGRESS_BROKER_PORT="8768",
-    )
+    personal = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example", **_PAGE_SERVED)
 
-    dashboard_payload = _list(_tool(dashboard), _context(dashboard))
+    dashboard_payload = _list(_tool(dashboard, worker_scope="shared"), _context(dashboard))
     personal_payload = _list(_tool(personal), _context(personal))
 
     assert dashboard_payload["manage_url"] == "https://mindroom.example/"
@@ -309,9 +308,53 @@ def test_manage_url_points_at_the_dashboard_or_the_personal_page(tmp_path: Path)
     assert "https://mindroom.example/connections/egress" in str(personal_payload["note"])
 
 
+# What the tool says where a personal scope's keys cannot be set: the broker's refusal says the same.
+_PAGE_NOT_SERVED_NOTE = (
+    "Each user sets this agent's keys and accounts on the Connections page, which this deployment does not serve. "
+    "An administrator can enable trusted upstream auth or make the agent shared."
+)
+
+
+@pytest.mark.parametrize("worker_scope", ["user", "user_agent"])
+def test_personal_scope_without_the_personal_page_is_sent_to_no_page(
+    tmp_path: Path,
+    worker_scope: WorkerScope,
+) -> None:
+    """Only the personal page sets a personal scope's keys; where it is not served the tool names no page, as the broker."""
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    tool = _tool(runtime_paths, worker_scope=worker_scope)
+
+    payload = _list(tool, _context(runtime_paths, _PRESET_SERVICES))
+    no_services = _list(tool, _context(runtime_paths, services={}))
+
+    note = str(payload["note"])
+    assert payload["manage_url"] is None
+    assert no_services["manage_url"] is None
+    assert _PAGE_NOT_SERVED_NOTE in note
+    assert "When `can_connect_account` is true, the user can still connect their `provider` account at" in note
+    assert "connect_url" in note
+    assert "https://" not in note
+    assert "Never ask the user to paste a key into the chat." in note
+
+
+@pytest.mark.parametrize("worker_scope", ["shared", None])
+def test_shared_scope_without_the_personal_page_keeps_the_dashboard(
+    tmp_path: Path,
+    worker_scope: WorkerScope | None,
+) -> None:
+    """The dashboard sets shared and unscoped keys, so the tool still sends their users there."""
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+
+    payload = _list(_tool(runtime_paths, worker_scope=worker_scope), _context(runtime_paths))
+
+    assert payload["manage_url"] == "https://mindroom.example/"
+    assert "at https://mindroom.example/" in str(payload["note"])
+    assert _PAGE_NOT_SERVED_NOTE not in str(payload["note"])
+
+
 def test_manage_url_is_null_without_a_public_url(tmp_path: Path) -> None:
     """Without a public URL the tool still answers and tells the agent to ask the operator."""
-    runtime_paths = _runtime_paths(tmp_path)
+    runtime_paths = _runtime_paths(tmp_path, **_PAGE_SERVED)
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths))
 
@@ -608,7 +651,7 @@ def test_unknown_oauth_provider_is_ignored(tmp_path: Path) -> None:
 
 def test_output_carries_no_token_or_connect_link(tmp_path: Path) -> None:
     """Neither an access token nor a one-time connect link reaches the model; only the manage page does."""
-    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example", **_PAGE_SERVED)
     manager = get_runtime_credentials_manager(runtime_paths)
     _configure_github_client(manager)
     _connect_github(manager)
@@ -624,12 +667,12 @@ def test_output_carries_no_token_or_connect_link(tmp_path: Path) -> None:
         assert "github-refresh" not in output
         assert _CONNECT_PATH not in output
         assert "token=" not in output
-        assert json.loads(output)["manage_url"] == "https://mindroom.example/"
+        assert json.loads(output)["manage_url"] == "https://mindroom.example/connections/egress"
 
 
 def test_note_points_at_connecting_an_account_or_adding_a_key(tmp_path: Path) -> None:
     """The note covers both fixes, where to do them, and that a key wins; it never asks for a pasted key."""
-    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example", **_PAGE_SERVED)
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 
@@ -637,16 +680,16 @@ def test_note_points_at_connecting_an_account_or_adding_a_key(tmp_path: Path) ->
     assert "neither an API key nor a connected account" in note
     assert "an API key wins over a connected account" in note
     assert (
-        "When `can_connect_account` is true, the user can connect their `provider` account at https://mindroom.example/"
-        in note
-    )
+        "When `can_connect_account` is true, the user can connect their `provider` account at "
+        "https://mindroom.example/connections/egress"
+    ) in note
     assert "otherwise, or to use their own key instead, they can add an API key there" in note
     assert "Never ask the user to paste a key into the chat." in note
 
 
 def test_note_without_a_public_url_sends_the_agent_to_the_operator(tmp_path: Path) -> None:
     """With no manage link the note still names both fixes and tells the agent to ask the operator where to do them."""
-    runtime_paths = _runtime_paths(tmp_path)
+    runtime_paths = _runtime_paths(tmp_path, **_PAGE_SERVED)
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
 

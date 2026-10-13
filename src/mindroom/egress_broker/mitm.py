@@ -257,6 +257,7 @@ class TlsInterceptor:
                 provider=result.provider,
                 shared=scope.shared,
                 personal_page=scope.personal_page,
+                connectable=result.connect_url is not None,
                 connect_url=result.connect_url,
                 manage_url=manage_url,
             )

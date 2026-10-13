@@ -186,7 +186,7 @@ def test_path_not_allowed_by_the_operator_names_an_administrator_whatever_the_sc
 # Where the personal page is not served, a personal scope's keys and services cannot be set anywhere.
 _PAGE_NOT_SERVED = (
     "on the Connections page, which this deployment does not serve. "
-    "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope."
+    "An administrator can enable trusted upstream auth or make the agent shared."
 )
 _PATH = {"host": "api.github.com", "path": "/repos/o/b?page=2", "service": "github-limited"}
 
@@ -197,7 +197,7 @@ _PATH = {"host": "api.github.com", "path": "/repos/o/b?page=2", "service": "gith
         (
             "credential_not_configured",
             {"service": "openai"},
-            "No openai key is set for this agent. Each user sets this agent's keys " + _PAGE_NOT_SERVED,
+            "No openai key: each user sets this agent's keys " + _PAGE_NOT_SERVED,
         ),
         (
             "credential_not_configured",
@@ -206,8 +206,14 @@ _PATH = {"host": "api.github.com", "path": "/repos/o/b?page=2", "service": "gith
         ),
         (
             "oauth_connection_required",
-            {"service": "github", "provider": "github"},
+            {"service": "github", "provider": "github", "connectable": True},
             "The github account for github must be connected again. Ask the user to reconnect at connect_url.",
+        ),
+        (
+            "oauth_connection_required",
+            {"service": "github", "provider": "github"},
+            "The github account for github must be connected again. Each user connects this agent's accounts "
+            + _PAGE_NOT_SERVED,
         ),
         (
             "oauth_refresh_failed",
@@ -230,7 +236,8 @@ def test_personal_scope_without_the_personal_page_gets_no_manage_link(
 ) -> None:
     """Only the personal page sets a personal scope's keys, so where it is not served no refusal links a page.
 
-    The body drops `manage_url`, which would be the dashboard, and git's ERR line says the same sentence.
+    The body drops `manage_url`, which would be the dashboard, and git's ERR line says the same sentence. A reconnect
+    without a connect link (`connectable` false) names none either.
     """
     body = refusal_body(code, personal_page=False, manage_url="https://m.test/", **values)
 
@@ -245,6 +252,7 @@ def test_personal_scope_without_the_personal_page_gets_no_manage_link(
         ("credential_not_configured", {"service": "openai", "managers": ("@alice:example.org",)}),
         ("credential_not_configured", {"service": "github", "provider": "github", "connectable": True}),
         ("oauth_connection_required", {"service": "github", "provider": "github"}),
+        ("oauth_connection_required", {"service": "github", "provider": "github", "connectable": True}),
         ("oauth_refresh_failed", {"service": "drive", "provider": "google_drive"}),
         ("path_not_allowed", {**_PATH, "managers": ("@alice:example.org",)}),
     ],

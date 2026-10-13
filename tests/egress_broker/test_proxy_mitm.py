@@ -732,7 +732,7 @@ async def test_oauth_refresh_outage_gets_retryable_503(
 # The end of a personal scope's refusal where the personal page, the only place that sets its keys, is not served.
 _PAGE_NOT_SERVED = (
     "on the Connections page, which this deployment does not serve. "
-    "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope."
+    "An administrator can enable trusted upstream auth or make the agent shared."
 )
 _WITHOUT_PAGE = ScopeInfo(shared=False, managers=(), personal_page=False)
 
@@ -747,7 +747,7 @@ _WITHOUT_PAGE = ScopeInfo(shared=False, managers=(), personal_page=False)
             {
                 "error": "credential_not_configured",
                 "service": "svc",
-                "message": "No svc key is set for this agent. Each user sets this agent's keys " + _PAGE_NOT_SERVED,
+                "message": "No svc key: each user sets this agent's keys " + _PAGE_NOT_SERVED,
             },
         ),
         (
@@ -773,6 +773,19 @@ _WITHOUT_PAGE = ScopeInfo(shared=False, managers=(), personal_page=False)
             },
         ),
         (
+            SecretNeedsReconnect(provider="github", reset_required=True),
+            403,
+            {
+                "error": "oauth_connection_required",
+                "service": "svc",
+                "provider": "github",
+                "connect_url": None,
+                "reset_required": True,
+                "message": "The github account for svc must be connected again. "
+                "Each user connects this agent's accounts " + _PAGE_NOT_SERVED,
+            },
+        ),
+        (
             SecretUnavailable(provider="github"),
             503,
             {
@@ -784,7 +797,7 @@ _WITHOUT_PAGE = ScopeInfo(shared=False, managers=(), personal_page=False)
             },
         ),
     ],
-    ids=["key", "connectable", "reconnect", "refresh"],
+    ids=["key", "connectable", "reconnect", "reconnect-without-link", "refresh"],
 )
 async def test_personal_scope_without_the_personal_page_links_no_page(
     broker: BrokerFactory,

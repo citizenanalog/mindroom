@@ -900,9 +900,9 @@ async def test_missing_key_message_names_the_calling_agents_credential_managers(
             "user",
             False,
             None,
-            "No github key is set for this agent. Each user sets this agent's keys on the Connections page, "
+            "No github key: each user sets this agent's keys on the Connections page, "
             "which this deployment does not serve. "
-            "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope.",
+            "An administrator can enable trusted upstream auth or make the agent shared.",
         ),
         ("shared", False, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
         (None, False, f"{_PUBLIC_URL}/", _NO_SHARED_GITHUB_KEY),
@@ -922,7 +922,7 @@ async def test_missing_key_refusal_links_only_a_page_that_can_set_the_key(
     """A personal scope's key is set only on the personal page, served behind trusted upstream auth.
 
     Without it the refusal links no page and says what an administrator can do; shared and unscoped keys are set on
-    the dashboard either way.
+    the dashboard either way. The reason phrase, cut at 200 characters, carries each message whole.
     """
     runtime_paths = tmp_runtime_paths(
         **_broker_env(free_port()),
@@ -936,6 +936,7 @@ async def test_missing_key_refusal_links_only_a_page_that_can_set_the_key(
     expected = {"error": "credential_not_configured", "service": "github", "message": message}
     assert response.status_code == 403
     assert response.json() == expected if link is None else {**expected, "manage_url": link}
+    assert response.reason_phrase == message
 
 
 @pytest.mark.usefixtures("github_oauth_client")

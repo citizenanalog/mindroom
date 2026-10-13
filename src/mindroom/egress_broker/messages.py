@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ["ScopeInfo", "git_error_text", "refusal_body"]
+__all__ = ["CONNECTIONS_PAGE_NOT_SERVED", "ScopeInfo", "git_error_text", "refusal_body"]
 
 # Texts from the design spec (sections 12.5 and 14). They name only a service, provider, host, path without its
 # query, or manager IDs, never a secret, token, or connect link: the links travel in their own fields, which the texts
@@ -54,27 +54,35 @@ _PATH_SHARED = _PATH_OUTSIDE + "Only its credential managers ({managers}) can ch
 _PATH_ADMINISTRATOR = _PATH_OUTSIDE + "Only an administrator can change this, at manage_url."
 # The spec words `bad_request` for the ambiguous-path refusal; a request the broker cannot read at all has no path.
 _MALFORMED = "The request is malformed and was refused."
-# A personal scope's keys and services are set only on the personal page. Where it is not served, its refusals take
-# their texts from `_WITHOUT_PAGE`, which names no page there, and `refusal_body` drops `manage_url`, the dashboard.
-_PAGE_NOT_SERVED = (
+# A personal scope's keys, accounts, and services are set only on the personal page. Where it is not served, its
+# refusals take their texts from `_WITHOUT_PAGE`, which names no page, or `_WITHOUT_PAGE_LINKED` when the body carries
+# a connect link, and `refusal_body` drops `manage_url`, the dashboard. The `egress_credentials` tool ends its note
+# with the same sentences, and the key text stays short enough for the 200-character reason phrase.
+CONNECTIONS_PAGE_NOT_SERVED = (
     "on the Connections page, which this deployment does not serve. "
-    "An administrator must enable it (trusted upstream auth) or give the agent a shared worker scope."
+    "An administrator can enable trusted upstream auth or make the agent shared."
 )
 _WITHOUT_PAGE = {
     **_MESSAGES,
-    "credential_not_configured": "No {service} key is set for this agent. Each user sets this agent's keys "
-    + _PAGE_NOT_SERVED,
+    "credential_not_configured": "No {service} key: each user sets this agent's keys " + CONNECTIONS_PAGE_NOT_SERVED,
     "oauth_connection_required": (
-        "The {provider} account for {service} must be connected again. Ask the user to reconnect at connect_url."
+        "The {provider} account for {service} must be connected again. Each user connects this agent's accounts "
+        + CONNECTIONS_PAGE_NOT_SERVED
     ),
     "oauth_refresh_failed": (
         "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, tell an administrator."
     ),
-    "path_not_allowed": _PATH_OUTSIDE + "Each user sets this agent's services " + _PAGE_NOT_SERVED,
+    "path_not_allowed": _PATH_OUTSIDE + "Each user sets this agent's services " + CONNECTIONS_PAGE_NOT_SERVED,
 }
-_CONNECTABLE_WITHOUT_PAGE = (
-    "No {service} credential is set for this agent. Ask the user to connect it at connect_url, then retry."
-)
+_WITHOUT_PAGE_LINKED = {
+    **_WITHOUT_PAGE,
+    "credential_not_configured": (
+        "No {service} credential is set for this agent. Ask the user to connect it at connect_url, then retry."
+    ),
+    "oauth_connection_required": (
+        "The {provider} account for {service} must be connected again. Ask the user to reconnect at connect_url."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -102,8 +110,8 @@ def _template(
     by_operator: bool,
 ) -> str:
     without_page = not (shared or personal_page)
-    if code == "credential_not_configured" and connectable:
-        return _CONNECTABLE_WITHOUT_PAGE if without_page else _CONNECTABLE
+    if code == "credential_not_configured" and connectable and not without_page:
+        return _CONNECTABLE
     if code == "credential_not_configured" and shared:
         return _SHARED if managers else _SHARED_WITHOUT_MANAGERS
     if code == "path_not_allowed" and (by_operator or (shared and not managers)):
@@ -112,8 +120,11 @@ def _template(
         return _PATH_SHARED
     if code == "bad_request" and path is None:
         return _MALFORMED
+    texts = _MESSAGES
+    if without_page:
+        texts = _WITHOUT_PAGE_LINKED if connectable else _WITHOUT_PAGE
     try:
-        return (_WITHOUT_PAGE if without_page else _MESSAGES)[code]
+        return texts[code]
     except KeyError:
         msg = f"No refusal message for {code}."
         raise ValueError(msg) from None
@@ -138,12 +149,14 @@ def refusal_body(
 
     `host`, `path`, `service_label`, and `managers` only fill in the message; `path` is cut at its query, which could
     hold a secret, and `service_label` (a display name) names the service there instead of `service`.
-    For `credential_not_configured`, `connectable` offers connecting an account as well as adding a key, and
-    otherwise a `shared` scope names its `managers` (or an administrator when there are none); a `shared`
-    `path_not_allowed` names them as the ones who can change the limit. A `path_not_allowed` set by the operator's
-    service (`by_operator`) names an administrator whatever the scope, since only an administrator edits it.
-    A personal scope without the personal page (`personal_page` false) has no page that sets its keys or services:
-    its texts say so, keep only a connect link, and the body leaves out `manage_url`, which would be the dashboard.
+    For `credential_not_configured`, `connectable` (the body carries a connect link) offers connecting an account as
+    well as adding a key, and otherwise a `shared` scope names its `managers` (or an administrator when there are
+    none); a `shared` `path_not_allowed` names them as the ones who can change the limit. A `path_not_allowed` set by
+    the operator's service (`by_operator`) names an administrator whatever the scope, since only an administrator
+    edits it.
+    A personal scope without the personal page (`personal_page` false) has no page that sets its keys, accounts, or
+    services: its texts say so and offer only a connect link, for `oauth_connection_required` too where `connectable`
+    says the body carries one, and the body leaves out `manage_url`, which would be the dashboard.
     A `bad_request` with a `path` is the ambiguous-path refusal; without one, the request itself was malformed.
     Raises ValueError for a code without a text and KeyError when the text needs a value that was not given.
     """

@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING
 from agno.tools import Toolkit
 
 from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.egress_broker.env import personal_page_served
+from mindroom.egress_broker.messages import CONNECTIONS_PAGE_NOT_SERVED
 from mindroom.egress_broker.oauth_source import oauth_status
-from mindroom.egress_broker.secrets import service_status
+from mindroom.egress_broker.secrets import is_personal_target, service_status
 from mindroom.egress_broker.service import manage_url
 from mindroom.egress_broker.user_services import effective_config, service_source
 from mindroom.logging_config import get_logger
@@ -70,7 +72,9 @@ class EgressCredentialsTools(Toolkit):
         where the user connects accounts and adds or replaces keys. Never ask the user to paste a key into
         the chat; send them to the link instead.
         """
-        link = manage_url(self._runtime_paths)
+        # Only the personal page sets a personal scope's keys and accounts, so without it there is no page to name.
+        settable = not is_personal_target(self._worker_target) or personal_page_served(self._runtime_paths)
+        link = manage_url(self._runtime_paths) if settable else None
         if self._worker_target is None:
             return self._payload([], link, _NO_WORKER_NOTE)
         context = get_tool_runtime_context()
@@ -88,7 +92,7 @@ class EgressCredentialsTools(Toolkit):
         if not services:
             return self._payload([], link, _NO_SERVICES_NOTE)
         entries = [self._entry(manager, config, name, service) for name, service in services.items()]
-        return self._payload(entries, link, self._note(link))
+        return self._payload(entries, link, self._note(link, settable=settable))
 
     def _entry(
         self,
@@ -135,19 +139,34 @@ class EgressCredentialsTools(Toolkit):
         return entry
 
     @staticmethod
-    def _note(link: str | None) -> str:
-        where = (
-            f"at {link}"
-            if link is not None
-            else "on the page where egress credentials are managed (ask the operator for it, usually the dashboard Credentials tab)"
-        )
+    def _note(link: str | None, *, settable: bool) -> str:
+        """Explain the entries and where the user fixes a missing credential; `settable` is false without such a page.
+
+        That is a personal scope where the personal page is not served: the note then says so, as the broker's
+        refusal does, and points at the connect link in the refusal for an account.
+        """
+        if settable:
+            where = (
+                f"at {link}"
+                if link is not None
+                else "on the page where egress credentials are managed (ask the operator for it, usually the dashboard Credentials tab)"
+            )
+            fix = (
+                f"When `can_connect_account` is true, the user can connect their `provider` account {where}; "
+                "otherwise, or to use their own key instead, they can add an API key there. "
+            )
+        else:
+            fix = (
+                f"Each user sets this agent's keys and accounts {CONNECTIONS_PAGE_NOT_SERVED} "
+                "When `can_connect_account` is true, the user can still connect their `provider` account at the "
+                "`connect_url` in the broker's refusal. "
+            )
         return (
             "Services with `configured: false` have neither an API key nor a connected account in this agent's scope, "
             "so brokered requests to them fail with `credential_not_configured`. "
             "`active_source` names what a configured service uses; an API key wins over a connected account. "
             "`source` is `config` for a service the administrator defined and `user` for one the user added themselves. "
-            f"When `can_connect_account` is true, the user can connect their `provider` account {where}; "
-            "otherwise, or to use their own key instead, they can add an API key there. "
+            f"{fix}"
             "Never ask the user to paste a key into the chat."
         )
 
