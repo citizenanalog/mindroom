@@ -29,7 +29,7 @@ The TTL applies to new requests: an expired token gets 407 on every new request,
 ### Request handling
 
 The broker forwards one well-formed request for each request it reads, so a request that two HTTP parsers would read differently cannot reach an upstream as two requests.
-It refuses a request it cannot read unambiguously, a request head over 64 KiB, a TLS server name or `Host` header that names a different host than the CONNECT target, and `TRACE` or `TRACK` on a host with rules; [Error responses](#error-responses) lists each refusal and its fix.
+It refuses a request it cannot read unambiguously, a request head over 64 KiB, a TLS server name or `Host` header that names a different host than the CONNECT target, and `TRACE` or `TRACK` on a host with rules; [Error responses](#error-responses) lists the responses, and [Troubleshooting](#troubleshooting) gives the fixes for the common ones.
 Websocket frames after a 101 and raw tunnels to hosts without rules are relayed as they come, without injection.
 The broker replaces any value the client sent in the header or query parameter it injects into, and returns redirects to the client without following them, so a redirect to another host gets a credential only where a rule matches that host.
 A path is matched against the rules only after the ambiguity checks under [Limiting paths and repositories](#limiting-paths-and-repositories).
@@ -605,7 +605,7 @@ A 407 and a malformed request the broker rejects before it can route it write no
 
 On the personal egress page each agent has a collapsible **Recent requests** table with its latest requests (the newest 50 at most) and the broker's error code under the status when there is one.
 On a shared or unscoped agent you manage, the table holds everyone's requests, with a **User** column for each requester's Matrix ID.
-A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)", because MindRoom sees only the host of such a request.
+A `CONNECT` row for a host without a service, a tunnel the broker only relayed, reads "Passed through (no key added)", because no service matched the host.
 Administrators can also see a user's requests (method, host, and path), and on a shared or unscoped agent so can its credential managers.
 
 ## Agent tool
@@ -804,7 +804,7 @@ The broker returns these errors to worker code:
 | `Host` header inside an intercepted tunnel naming a different host than the CONNECT target | 403 JSON `{"error": "host_mismatch", "message": "..."}` |
 | Client TLS server name (SNI) that differs from the CONNECT host | No response: the TLS handshake is aborted with an `unrecognized_name` alert, and nothing is forwarded |
 | Websocket upgrade inside a tunnel on a request that has both `Content-Length` and `Transfer-Encoding` | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text |
-| Request the broker cannot read: an invalid CONNECT target, a CONNECT with a body or with bytes sent before its answer, an invalid absolute URL on a plain HTTP request, a non-origin-form request target (absolute, authority, or asterisk form) inside an intercepted tunnel, or an HTTP protocol error | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text (431 for a request head over 64 KiB, however it is split across reads) |
+| Request the broker cannot read: an invalid CONNECT target, a CONNECT with a body or with bytes sent before its answer, an invalid absolute URL on a plain HTTP request, a non-origin-form request target (absolute, authority, or asterisk form) inside an intercepted tunnel, or an HTTP protocol error | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text (431 for a request head over 64 KiB, however it is split across reads, and 501 for a `Transfer-Encoding` that is not a single `chunked`, such as `gzip` or a repeated `chunked`) |
 | Path on a host with rules with empty segments or raw backslashes, or with a dot segment, NUL, or invalid UTF-8 in it or any percent-decoded form of it | 400 JSON `{"error": "bad_request", "message": "..."}` with the ambiguous-path text |
 | `TRACE` or `TRACK` request (any letter case) to a host with rules, inside an intercepted tunnel or over plain HTTP, refused before any key is looked up | 405 JSON `{"error": "method_not_allowed", "message": "..."}`; the upstream would echo the injected credential back |
 | Path that fails a restriction (see [Limiting paths and repositories](#limiting-paths-and-repositories)) | 403 JSON `{"error": "path_not_allowed", "service": "<restricting service>", "manage_url": "<link>", "message": "..."}`; the message names the service by its display name |
