@@ -562,6 +562,7 @@ class TestConfigInit:
 
         assert result.exit_code == 0
         config = yaml.safe_load(target.read_text())
+        assert "mindroom_user" not in config
         assert "knowledge_bases" not in config
         assert "${MINDROOM_STORAGE_PATH}" not in target.read_text()
         assert (tmp_path / "mindroom_data" / "agents" / "mind" / "workspace").exists()

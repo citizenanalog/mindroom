@@ -417,9 +417,6 @@ room_defaults:
 authorization:
   config_command_enabled: false
 bot_accounts: []
-mindroom_user:
-  display_name: MindRoomUser
-  username: mindroom_user
 defaults:
   enable_streaming: true
   learning: true

@@ -21,7 +21,7 @@ HEADER = """\
 
 def saas_config() -> dict:
     """Return the config init starter adapted to hosted SaaS instances."""
-    template = _full_template("openrouter", matrix_server="self-hosted")
+    template = _full_template("openrouter")
     config = yaml.safe_load(template)
 
     # Hosted tenants choose from the central OpenRouter presets in the dashboard.

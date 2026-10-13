@@ -118,9 +118,6 @@ agents:
 router:
   model: luna
   accept_invites: true
-mindroom_user:
-  username: mindroom_user
-  display_name: MindRoomUser
 administrators:
 - __MINDROOM_OWNER_USER_ID_FROM_PAIRING__
 room_defaults:

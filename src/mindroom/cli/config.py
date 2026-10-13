@@ -520,7 +520,7 @@ def config_init(
     )
 
     if print_config:
-        content = _starter_config(target, selected_matrix_server, selected_preset)
+        content = _starter_config(target, selected_preset)
         console.print(_yaml_syntax(content, line_numbers=False, word_wrap=False), soft_wrap=True)
         return
 
@@ -624,11 +624,10 @@ def _prompt_provider_key(
 
 def _starter_config(
     target: Path,
-    matrix_server: _MatrixServerPreset,
     selected_preset: _ProviderPreset,
 ) -> str:
     """Return the rendered starter config for one config path."""
-    content = _full_template(selected_preset, matrix_server=matrix_server)
+    content = _full_template(selected_preset)
 
     # `connect` can run before `config init`, when no config exists to patch.
     # In that order, connect persists the owner MXID in .env so init can render
@@ -656,7 +655,7 @@ def _write_starter_setup(
 
     `.env` comes first so a failed write leaves no config that would skip first-run setup next time.
     """
-    content = _starter_config(target, matrix_server, selected_preset)
+    content = _starter_config(target, selected_preset)
     env_changed = _write_env_file(
         env_path,
         matrix_server,
@@ -1143,11 +1142,7 @@ def _commented_model_options_template_block(provider_preset: _ProviderPreset) ->
     return "\n".join(lines)
 
 
-def _full_template(
-    provider_preset: _ProviderPreset,
-    *,
-    matrix_server: _MatrixServerPreset,
-) -> str:
+def _full_template(provider_preset: _ProviderPreset) -> str:
     """Return a provider-aware starter config.
 
     `config init` intentionally generates the shared single-user starter model.
@@ -1159,18 +1154,6 @@ def _full_template(
     helper_model = CONFIG_INIT_HELPER_MODELS.get(provider_preset)
     router_model = helper_model or "default"
     thread_summary_model_block = f"\n  thread_summary_model: {helper_model}" if helper_model else ""
-
-    if matrix_server == "mindroom.chat":
-        mindroom_user_block = ""
-    else:
-        mindroom_user_block = textwrap.dedent("""\
-
-            # Set username before first run; once created, it cannot be changed.
-            # You can still change display_name later.
-            mindroom_user:
-              username: mindroom_user
-              display_name: MindRoomUser
-        """)
 
     return f"""\
 # MindRoom Configuration
@@ -1235,7 +1218,7 @@ agents:
 router:
   model: {router_model}
   accept_invites: true
-{mindroom_user_block}
+
 administrators:
   # MindRoom Chat pairing writes the paired owner's Matrix user ID here.
   - {constants.OWNER_MATRIX_USER_ID_PLACEHOLDER}
