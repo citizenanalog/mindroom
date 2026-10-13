@@ -84,3 +84,23 @@ def test_broker_env_without_agent_vault_config(tmp_path: Path, test_ca_pem: str)
     assert "mrb1.token" in final_env["HTTPS_PROXY"]
     assert BROKER_CA_PEM_ENV not in final_env
     assert "SSL_CERT_FILE" in final_env
+
+
+def test_agent_vault_overlay_applies_when_execution_env_has_no_broker_ca(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Without a broker CA the Agent Vault overlay lands on the request env exactly as before the broker existed."""
+    token_path = tmp_path / "av-token"
+    token_path.write_text("av_sess_worker_token\n", encoding="utf-8")
+    monkeypatch.setenv("MINDROOM_WORKER_EGRESS_PROXY_URL", "http://agent-vault:14322")
+    monkeypatch.setenv("MINDROOM_WORKER_EGRESS_PROXY_TOKEN_FILE", str(token_path))
+    monkeypatch.setenv("MINDROOM_WORKER_EGRESS_PROXY_VAULT", "agent-vault-worker")
+    monkeypatch.setenv("MINDROOM_WORKER_EGRESS_PROXY_CA_FILE", "/etc/agent-vault/ca.pem")
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path, process_env={})
+
+    final_env = sandbox_exec.request_execution_env("shell", {"KEEP": "1"}, runtime_paths)
+
+    assert final_env["KEEP"] == "1"
+    assert final_env["HTTPS_PROXY"] == "http://av_sess_worker_token:agent-vault-worker@agent-vault:14322"
+    assert final_env["REQUESTS_CA_BUNDLE"] == "/etc/agent-vault/ca.pem"

@@ -22,7 +22,6 @@ from mindroom import constants
 from mindroom.egress_broker.env import (
     apply_runner_ca_bundle,
 )
-from mindroom.logging_config import get_logger
 from mindroom.path_confinement import resolve_path_within_root
 from mindroom.runtime_env_policy import (
     KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY,
@@ -34,8 +33,6 @@ from mindroom.runtime_env_policy import (
 )
 from mindroom.tool_system.worker_routing import worker_dir_name
 from mindroom.vendor_telemetry import vendor_telemetry_env_values
-
-logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -54,7 +51,6 @@ _WORKSPACE_ENV_HOOK_MAX_OVERLAY_BYTES = 128 * 1024
 _KUBERNETES_STORAGE_SUBPATH_PREFIX_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["storage_subpath_prefix"]
 _DEFAULT_WORKER_STORAGE_SUBPATH_PREFIX = "workers"
 EXECUTION_ENV_TOOL_NAMES = constants.EXECUTION_ENV_TOOL_NAMES
-_EGRESS_BROKER_OVERRIDE_LOGGED = False
 
 
 def _runner_execution_mode(runtime_paths: RuntimePaths) -> str:
@@ -166,7 +162,6 @@ def request_execution_env(
     extra_env_passthrough: str | None = None,
 ) -> dict[str, str]:
     """Return the effective runtime-scoped execution env for one request."""
-    global _EGRESS_BROKER_OVERRIDE_LOGGED
     if tool_name not in EXECUTION_ENV_TOOL_NAMES:
         return {}
     # Agent Vault egress is composed from the worker pod's own token + endpoint,
@@ -183,14 +178,8 @@ def request_execution_env(
         env = {key: value for key, value in execution_env.items() if key not in protected_env_names}
         # Apply broker CA bundle if present
         bundle_dir = Path(tempfile.gettempdir()) / "mindroom-egress-broker"
-        broker_active = apply_runner_ca_bundle(env, bundle_dir)
-        if broker_active:
-            # Native broker wins; skip Agent Vault overlay
-            if agent_vault_env and not _EGRESS_BROKER_OVERRIDE_LOGGED:
-                logger.info("egress_broker_overrides_agent_vault")
-                _EGRESS_BROKER_OVERRIDE_LOGGED = True
-        else:
-            # No broker CA; apply Agent Vault overlay if configured
+        # The native broker wins: with its CA active the Agent Vault overlay is skipped.
+        if not apply_runner_ca_bundle(env, bundle_dir):
             env.update(agent_vault_env)
         return env
     shell_process_env = (
