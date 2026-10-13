@@ -220,14 +220,27 @@ describe("whether the panel shows", () => {
     );
   });
 
-  it("shows the panel, which reports the failure, when the check itself fails", async () => {
-    vi.mocked(fetch).mockRejectedValue(new Error("Network down"));
-    render(<EgressBroker />);
+  it("shows nothing and asks nothing more when the check itself fails", async () => {
+    // Only a listing tells that the broker is on; a failure tells nothing.
+    const failures: Array<() => Promise<Response>> = [
+      () => Promise.reject(new Error("Network down")),
+      async () => json({ detail: "Not authenticated" }, 401),
+      async () => json({ detail: "boom" }, 500),
+    ];
+    for (const failure of failures) {
+      vi.mocked(fetch).mockClear();
+      vi.mocked(fetch).mockImplementation(failure);
+      const { container, unmount } = render(<EgressBroker />);
 
-    expect(
-      await screen.findByRole("heading", { name: "Agent Keys" }),
-    ).toBeInTheDocument();
-    expect(await screen.findByText("Network down")).toBeInTheDocument();
+      await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+      // Give a follow-up request, or a card, the chance to appear.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(container).toBeEmptyDOMElement();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      unmount();
+    }
   });
 
   it("starts the keys of the agents without a scope from the check's listing, without reading it again", async () => {
@@ -243,7 +256,7 @@ describe("whether the panel shows", () => {
     ).toEqual([""]);
   });
 
-  it("gives up on a hung check and shows the panel with the timeout error", async () => {
+  it("gives up on a hung check and shows nothing", async () => {
     // Testing Library's async helpers wait on real timers, so capture the
     // 30 second timeouts instead of faking time.
     const realSetTimeout = globalThis.setTimeout;
@@ -275,11 +288,13 @@ describe("whether the panel shows", () => {
     await act(async () => {
       timeouts.forEach((fire) => fire());
     });
+    // Give a follow-up request, or a card, the chance to appear.
+    await act(async () => {
+      await new Promise((resolve) => realSetTimeout(resolve, 20));
+    });
 
-    expect(
-      await screen.findByRole("heading", { name: "Agent Keys" }),
-    ).toBeInTheDocument();
-    expect(await screen.findByText("API call timed out")).toBeInTheDocument();
+    expect(container).toBeEmptyDOMElement();
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("cancels the check when the panel goes away", async () => {
@@ -368,10 +383,14 @@ describe("egress broker panel", () => {
   });
 
   it("shows an error when the services cannot be loaded", async () => {
+    // The check's listing shows the panel; the shared agent's own listing fails.
+    sharedCoder();
     vi.mocked(fetch).mockImplementation(async (input) =>
-      String(input).includes("/services")
+      String(input).includes("agent_name=")
         ? json({ detail: "boom" }, 500)
-        : logsResponse(),
+        : String(input).includes("/services")
+          ? json({ services, ...keyAgents })
+          : logsResponse(),
     );
     render(<EgressBroker />);
 
@@ -475,20 +494,6 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
 
     expect(optionsOf()).toEqual(["team"]);
-  });
-
-  it("has nothing to choose and claims nothing about the keys when the listing fails", async () => {
-    vi.mocked(fetch).mockImplementation(async (input) =>
-      String(input).includes("/services")
-        ? json({ detail: "boom" }, 500)
-        : logsResponse(),
-    );
-    render(<EgressBroker />);
-    await screen.findByText("boom");
-
-    expect(optionsOf()).toEqual([]);
-    expect(screen.getByLabelText("Keys for")).toBeDisabled();
-    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
   });
 
   it("says that no agent uses these keys only when the listing names no shared agent and none without a scope", async () => {

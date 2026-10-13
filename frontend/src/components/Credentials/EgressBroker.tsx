@@ -23,7 +23,6 @@ import type {
 } from "@/connections/types";
 import {
   API_ENDPOINTS,
-  apiErrorMessageFromPayload,
   fetchJSON,
   withAgentName,
   withQueryParams,
@@ -86,9 +85,6 @@ interface ServicesListing {
   /** Whether an agent without a worker scope uses it; all of them share one set of keys. */
   has_unscoped_agents: boolean;
 }
-
-/** The unscoped listing as the check that the broker is on read it, or the error to show. */
-type Listing = ServicesListing | { error: string };
 
 // The dashboard operator manages every service. Only shared agents and the
 // global store are offered, so every key here is shared, and the global one is
@@ -197,7 +193,7 @@ function ServiceSection({
   /** No agent uses these keys, so there is nothing to set or connect them for. */
   keysUnused: boolean;
   /** The listing already read for this section, which it then does not read again on mount. */
-  initial?: Listing;
+  initial?: ServicesListing;
   /** Receives every listing this section reads, which names the agents whose keys the panel sets. */
   onListing: (listing: ServicesListing) => void;
 }) {
@@ -209,14 +205,9 @@ function ServiceSection({
   );
   const saveConfig = useConfigStore((state) => state.saveConfig);
   const [services, setServices] = useState<EgressCredentialService[] | null>(
-    () =>
-      initial && "services" in initial
-        ? panelRows(initial.services, agentName)
-        : null,
+    () => (initial ? panelRows(initial.services, agentName) : null),
   );
-  const [error, setError] = useState<string | null>(() =>
-    initial && "error" in initial ? initial.error : null,
-  );
+  const [error, setError] = useState<string | null>(null);
   const [preloaded] = useState(initial !== undefined);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
@@ -661,44 +652,31 @@ function LogSection() {
 
 /**
  * Read the unscoped listing to tell whether the broker is on: every egress
- * route answers 404 while it is off. Any other answer is the listing, or the
- * error the card shows for it, in `fetchJSON`'s words, an aborted read being
- * its timeout.
+ * route answers 404 while it is off. Only the listing itself says it is on, so
+ * a 404, an error, or a timeout gives null.
  */
-async function checkListing(signal: AbortSignal): Promise<Listing | "off"> {
+async function checkListing(
+  signal: AbortSignal,
+): Promise<ServicesListing | null> {
   try {
     const response = await fetch(API_ENDPOINTS.egressBroker.services, {
       credentials: "same-origin",
       signal,
     });
-    if (response.status === 404) return "off";
-    if (!response.ok) {
-      const payload: unknown = await response.json().catch(() => null);
-      return {
-        error: apiErrorMessageFromPayload(
-          payload,
-          `API call failed: ${response.status} ${response.statusText}`,
-        ),
-      };
-    }
-    return (await response.json()) as ServicesListing;
-  } catch (cause) {
-    return {
-      error: signal.aborted
-        ? "API call timed out"
-        : errorText(cause, LISTING_ERROR_MESSAGE),
-    };
+    return response.ok ? ((await response.json()) as ServicesListing) : null;
+  } catch {
+    return null;
   }
 }
 
 /**
  * The Agent Keys card, shown only while the egress broker is on. One listing
- * tells, and then nothing else asks while it is off. Any other answer shows
- * the card, which starts from that listing or reports its failure. The check
- * times out like the card's own requests and stops when the panel goes away.
+ * tells, and then nothing else asks while it is off or the check fails. The
+ * card starts from that listing. The check times out like the card's own
+ * requests and stops when the panel goes away.
  */
 export function EgressBroker() {
-  const [check, setCheck] = useState<Listing | "off" | null>(null);
+  const [check, setCheck] = useState<ServicesListing | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -715,9 +693,7 @@ export function EgressBroker() {
     };
   }, []);
 
-  return check === null || check === "off" ? null : (
-    <AgentKeys checked={check} />
-  );
+  return check === null ? null : <AgentKeys checked={check} />;
 }
 
 /**
@@ -725,26 +701,23 @@ export function EgressBroker() {
  * scope, plus the request log. `checked` is the unscoped listing the broker
  * check read.
  */
-function AgentKeys({ checked }: { checked: Listing }) {
+function AgentKeys({ checked }: { checked: ServicesListing }) {
   const agents = useConfigStore((state) => state.agents);
   const [selected, setSelected] = useState<string | null>(null);
-  // The agents the latest listing names; unknown while no listing has loaded.
-  const [keyAgents, setKeyAgents] = useState<Omit<
-    ServicesListing,
-    "services"
-  > | null>("services" in checked ? checked : null);
+  // The agents the latest listing names.
+  const [keyAgents, setKeyAgents] =
+    useState<Omit<ServicesListing, "services">>(checked);
   // Only the section shown first starts from the check's listing, when it is
   // the unscoped one; a section shown later reads its own.
-  const [checkedListing, setCheckedListing] = useState<Listing | undefined>(
-    checked,
-  );
+  const [checkedListing, setCheckedListing] = useState<
+    ServicesListing | undefined
+  >(checked);
   useEffect(() => setCheckedListing(undefined), []);
 
   // Shared agents come first, each with keys of its own. All agents without a
   // worker scope share one set of keys, so they are one option, offered only
   // when such an agent uses the broker.
   const targets = useMemo(() => {
-    if (keyAgents === null) return [];
     const shared = keyAgents.shared_agents.map((name) => ({
       value: name,
       label: agents.find((agent) => agent.id === name)?.display_name || name,
@@ -797,7 +770,7 @@ function AgentKeys({ checked }: { checked: Listing }) {
           agentLabel={
             agentName === null ? UNSCOPED_AGENTS : (target?.label ?? agentName)
           }
-          keysUnused={target === undefined && keyAgents !== null}
+          keysUnused={target === undefined}
           initial={agentName === null ? checkedListing : undefined}
           onListing={setKeyAgents}
         />
