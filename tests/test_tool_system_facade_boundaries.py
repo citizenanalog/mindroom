@@ -50,6 +50,7 @@ EXPECTED_PUBLIC_CATALOG_SYMBOLS = [
     "authored_tool_overrides_to_runtime",
     "clear_resolved_tool_state_cache",
     "deserialize_tool_validation_snapshot",
+    "egress_tool_unavailable",
     "ensure_tool_registry_loaded",
     "export_tools_metadata",
     "get_tool_by_name",

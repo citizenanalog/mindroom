@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 from structlog.testing import capture_logs
 
-from mindroom.agents import build_agent_toolkit
+from mindroom.agents import get_agent_toolkit_names
 from mindroom.config.agent import AgentConfig
 from mindroom.config.egress_broker import EgressService
 from mindroom.config.main import Config
@@ -391,22 +391,16 @@ def test_registers_and_builds_via_metadata(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("broker_on", [False, True])
 def test_an_agent_gets_the_tool_only_while_the_broker_is_on(tmp_path: Path, *, broker_on: bool) -> None:
-    """With the broker off an agent that lists the tool gets no toolkit, the way other unavailable tools are skipped."""
+    """With the broker off a config that lists the tool stays valid, and the agent's tools leave it out."""
     runtime_paths = _runtime_paths(tmp_path, **({"MINDROOM_EGRESS_BROKER_PORT": "8768"} if broker_on else {}))
     agent = AgentConfig(display_name="Code", tools=["shell", "egress_credentials"], worker_scope="user_agent")
     config = bind_runtime_paths(Config(agents={"code": agent}), runtime_paths)
 
-    toolkit = build_agent_toolkit(
-        "egress_credentials",
-        agent_name="code",
-        config=config,
-        runtime_paths=runtime_paths,
-        worker_tools=[],
-        runtime_overrides=None,
-        execution_identity=None,
-    )
+    toolkit_names = get_agent_toolkit_names("code", config)
 
-    assert (toolkit is not None) is broker_on
+    assert config.agents["code"].tool_names == ["shell", "egress_credentials"]
+    assert "shell" in toolkit_names
+    assert ("egress_credentials" in toolkit_names) is broker_on
 
 
 def test_connected_account_is_the_active_source_without_a_key(tmp_path: Path) -> None:

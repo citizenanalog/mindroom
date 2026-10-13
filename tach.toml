@@ -880,7 +880,6 @@ depends_on = [
     "mindroom.workers.runtime",
     "mindroom.workspaces",
     "mindroom.delegation.lifecycle",
-    "mindroom.egress_broker",
 ]
 
 [[modules]]
@@ -4938,7 +4937,6 @@ depends_on = [
 ]
 # The broker's wiring points: every module outside the feature that may import it.
 visibility = [
-    "mindroom.agents",
     "mindroom.api.connections",
     "mindroom.api.egress_broker",
     "mindroom.api.egress_credentials",
@@ -6231,6 +6229,7 @@ expose = [
     "authored_tool_overrides_to_runtime",
     "clear_resolved_tool_state_cache",
     "deserialize_tool_validation_snapshot",
+    "egress_tool_unavailable",
     "export_tools_metadata",
     "get_tool_by_name",
     "listable_tool_metadata",
@@ -6272,6 +6271,7 @@ expose = [
     "authored_tool_overrides_to_runtime",
     "clear_resolved_tool_state_cache",
     "deserialize_tool_validation_snapshot",
+    "egress_tool_unavailable",
     "ensure_tool_registry_loaded",
     "export_tools_metadata",
     "get_tool_by_name",

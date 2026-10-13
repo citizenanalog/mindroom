@@ -132,7 +132,7 @@ def _private_identity(requester_id: str) -> ToolExecutionIdentity:
     )
 
 
-def test_openai_compatible_context_hides_desktop(tmp_path: Path) -> None:
+def test_openai_compatible_context_hides_desktop() -> None:
     """Non-Matrix callers cannot access the Matrix-bound Desktop tool."""
     identity = ToolExecutionIdentity(
         channel="openai_compat",
@@ -144,7 +144,7 @@ def test_openai_compatible_context_hides_desktop(tmp_path: Path) -> None:
         session_id="api-session",
     )
 
-    assert "desktop" in _context_hidden_toolkits(identity, _runtime_paths(tmp_path))
+    assert "desktop" in _context_hidden_toolkits(identity)
 
 
 def _install_update_awareness_status(monkeypatch: pytest.MonkeyPatch) -> str:
@@ -949,7 +949,7 @@ def test_an_eager_egress_credentials_tool_is_attached_only_while_the_broker_is_o
     *,
     broker_on: bool,
 ) -> None:
-    """The broker switch also decides the eager entry, through the same hidden-toolkit set."""
+    """The broker switch also decides the eager entry."""
     env = _egress_broker_env(broker_on=broker_on)
     raw = _base_config_data()
     raw["agents"]["code"]["tools"] = ["egress_credentials", "sleep"]  # type: ignore[index]

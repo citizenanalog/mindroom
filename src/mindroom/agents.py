@@ -32,7 +32,6 @@ from mindroom.delegation.personas import (
     persona_tool_policy,
     require_built_persona_tools,
 )
-from mindroom.egress_broker.env import egress_tool_unavailable
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.error_handling import MinimalModeUnavailableError, minimal_mode_failure_message
 from mindroom.history.agno_compat_message_builder import apply_patch as install_message_builder_patch
@@ -743,17 +742,13 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
 
     Callers own runtime override resolution before invoking this builder.
     Returns ``None`` when the configured tool should be skipped, such as an
-    explicit ``delegate`` entry without valid delegation targets or the
-    ``egress_credentials`` tool while the egress broker is off.
+    explicit ``delegate`` entry without valid delegation targets.
 
     ``dynamic_tool_continuation`` is only set by callers that resume the turn
     after a load/unload (the standalone agent envelope and materialized team
     members). It stops the dynamic tools manager's provider loop so the rebuilt
     agent sees the new schema.
     """
-    if egress_tool_unavailable(tool_name, runtime_paths):
-        logger.warning("Skipping egress_credentials tool because the egress broker is not enabled", agent=agent_name)
-        return None
     agent_config = config.get_agent(agent_name)
     if agent_runtime is None:
         agent_runtime = resolve_agent_runtime(
@@ -892,7 +887,7 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
                 agent_name,
             )
             return None
-        hidden_tool_names = _context_hidden_toolkits(execution_identity, runtime_paths)
+        hidden_tool_names = _context_hidden_toolkits(execution_identity)
         if not _visible_deferred_tool_names(config, agent_name, hidden_tool_names=hidden_tool_names):
             logger.warning(
                 "Skipping 'dynamic_tools' tool for agent '%s': no compatible deferred tools are available",
@@ -1103,18 +1098,10 @@ def _is_learning_enabled(agent_config: AgentConfig, defaults: DefaultsConfig) ->
     return learning is not False
 
 
-def _context_hidden_toolkits(
-    execution_identity: ToolExecutionIdentity | None,
-    runtime_paths: constants.RuntimePaths,
-) -> frozenset[str]:
-    """Return the toolkits this agent cannot use here, eager or deferred, for every tool surface to leave out.
-
-    That is the egress credentials tool while the broker is off, and the room-bound toolkits when there is no room.
-    """
-    hidden = {tool_name for tool_name in TOOL_METADATA if egress_tool_unavailable(tool_name, runtime_paths)}
-    if execution_identity is not None and execution_identity.room_id is None:
-        hidden.update(tool_name for tool_name, metadata in TOOL_METADATA.items() if metadata.requires_room_context)
-    return frozenset(hidden)
+def _context_hidden_toolkits(execution_identity: ToolExecutionIdentity | None) -> frozenset[str]:
+    if execution_identity is None or execution_identity.room_id is not None:
+        return frozenset()
+    return frozenset(tool_name for tool_name, metadata in TOOL_METADATA.items() if metadata.requires_room_context)
 
 
 def _visible_deferred_tool_names(
@@ -1536,7 +1523,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - loaded and deferred tools
         include_matrix_room_runtime_tools=include_matrix_room_runtime_tools,
         required_tool_names=required_tool_names,
     )
-    hidden_toolkits = _context_hidden_toolkits(execution_identity, runtime_paths)
+    hidden_toolkits = _context_hidden_toolkits(execution_identity)
     resolved_tool_configs = {entry.name: entry for entry in dynamic_tool_selection.runtime_tool_configs}
     if disable_runtime_capabilities:
         resolved_tool_configs = {}
