@@ -41,9 +41,14 @@ import {
   ruleField,
   validateService,
 } from "./egressServiceValidation";
-import { hostPort } from "./egressRowText";
+import { hostPort, limitBypass } from "./egressRowText";
 import { looksLikeGithub } from "./githubLimits";
-import { githubRepositoryRules } from "./githubRepositoryRules";
+import {
+  GITHUB_API_HOST,
+  GITHUB_UPLOADS_HOST,
+  GITHUB_WEB_HOST,
+  githubRepositoryRules,
+} from "./githubRepositoryRules";
 import {
   GithubHelper,
   githubHelperChanges,
@@ -389,6 +394,13 @@ export function EgressServiceEditor({
   const overlaps = limiting
     ? []
     : overlapWarnings(form, preset, agentServices, name);
+  // Another service of the user's that keeps the GitHub hosts a limit covers open.
+  const bypass = limiting
+    ? limitBypass(
+        [GITHUB_API_HOST, GITHUB_UPLOADS_HOST, GITHUB_WEB_HOST],
+        agentServices,
+      )
+    : null;
   const primaryRule = form.rules[0] ?? emptyRule();
   const ruleEditing = (index: number, rule: RuleForm): RuleEditing => ({
     index,
@@ -610,6 +622,7 @@ export function EgressServiceEditor({
           errors={helperErrors}
           onApply={limiting ? undefined : applyHelper}
           limit={limiting}
+          bypass={bypass}
         />
       )}
       {limiting && (

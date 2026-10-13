@@ -10,6 +10,7 @@ import {
   canEdit,
   hostsNote,
   limitedNote,
+  limitBypass,
   limitOf,
   limitTarget,
   removeWarning,
@@ -86,6 +87,13 @@ export function EgressServiceItem({
 
   // A limit of the viewer's that narrows this administrator's service.
   const limit = limitOf(service, agent.services);
+  // Another service of the viewer's that keeps the limit's hosts open.
+  const bypass =
+    limit &&
+    limitBypass(
+      limit.rules.map((rule) => rule.host),
+      agent.services,
+    );
   // A service that already has a limit changes or removes it instead of getting another.
   const canLimit =
     limit === null &&
@@ -219,7 +227,9 @@ export function EgressServiceItem({
           {limit && (
             <div className="flex flex-wrap items-center gap-x-2">
               <p className="text-xs text-muted-foreground">
-                Limited to {limitTarget(limit)}
+                {bypass
+                  ? `The limit to ${limitTarget(limit)} has no effect while ${bypass}.`
+                  : `Limited to ${limitTarget(limit)}`}
               </p>
               {canEdit(serviceEditing, limit) && (
                 <LimitActions

@@ -133,6 +133,7 @@ export function GithubHelper({
   errors,
   onApply,
   limit = false,
+  bypass = null,
 }: {
   input: HelperInput;
   onInput: (input: HelperInput) => void;
@@ -142,6 +143,8 @@ export function GithubHelper({
   onApply?: () => void;
   /** The service only limits paths, so the text says what the limit does and not what is replaced. */
   limit?: boolean;
+  /** Why the limit has no effect, as `limitBypass` words it, which the text then says instead of what it refuses. */
+  bypass?: string | null;
 }) {
   const id = useId();
   return (
@@ -158,7 +161,9 @@ export function GithubHelper({
           One repository per line, as owner/repo, or owner/* for everything an
           owner has.{" "}
           {limit
-            ? "Requests to api.github.com, uploads.github.com, and github.com (API, release assets, and git over HTTPS) for any other repository are refused, and so are other API paths, such as /user or search. Your key or connected account stays the same."
+            ? bypass
+              ? `This limit has no effect while ${bypass}. Your key or connected account stays the same.`
+              : "Requests to api.github.com, uploads.github.com, and github.com (API, release assets, and git over HTTPS) for any other repository are refused, and so are other API paths, such as /user or search. Your key or connected account stays the same."
             : "Applying replaces the rules above with rules for just those repositories (API and git over HTTPS) and refuses every other path on api.github.com and github.com. Other API paths, such as /user or search, stop working."}{" "}
           Matching is case sensitive, so write names as they appear in GitHub
           URLs.

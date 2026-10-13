@@ -2065,6 +2065,14 @@ describe("limiting a GitHub service to repositories", () => {
     source: "config",
     rules: githubRules,
   });
+  // A GitHub service of the user's own that is not a limit.
+  const mine = (): EgressCredentialService => ({
+    ...service,
+    name: "my-github",
+    display_name: "My GitHub",
+    source: "user",
+    rules: githubRules,
+  });
   const githubRow = () => screen.findByLabelText("GitHub");
 
   beforeEach(() => {
@@ -2215,6 +2223,41 @@ describe("limiting a GitHub service to repositories", () => {
         name: "Limit to repositories for GitHub",
       }),
     ).toBeNull();
+  });
+
+  it("says the limit has no effect while another service of yours allows the same hosts", async () => {
+    // The broker lets a request past the user's limit when any of the user's rules matches it.
+    listing[0].services.push(
+      limited("github-limited", "basnijholt/agent-cli"),
+      mine(),
+    );
+    render(<EgressCredentials />);
+    const row = await githubRow();
+    expect(
+      within(row).getByText(
+        "The limit to basnijholt/agent-cli has no effect while My GitHub also allows requests to api.github.com and github.com.",
+      ),
+    ).toBeVisible();
+    expect(within(row).queryByText(/^Limited to/)).toBeNull();
+  });
+
+  it("says so in the limit's form too, instead of what it refuses", async () => {
+    listing[0].services.push(mine());
+    render(<EgressCredentials />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Limit to repositories for GitHub",
+      }),
+    );
+    const form = await screen.findByRole("form", {
+      name: "Limit to repositories",
+    });
+    expect(
+      within(form).getByText(
+        /This limit has no effect while My GitHub also allows requests to api\.github\.com and github\.com\./,
+      ),
+    ).toBeVisible();
+    expect(within(form).queryByText(/are refused/)).toBeNull();
   });
 
   it("lists the limit itself under what the user added, with its own Change and Remove", async () => {

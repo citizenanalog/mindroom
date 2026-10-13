@@ -223,6 +223,33 @@ export function limitTarget(limit: EgressCredentialService): string {
 }
 
 /**
+ * Why a limit of the viewer's on these hosts has no effect, as "My GitHub also
+ * allows requests to api.github.com", or null when it has one. The broker lets
+ * a request past the viewer's limit when any rule of the viewer's matches it,
+ * so another service of theirs that is not a limit keeps its hosts open.
+ */
+export function limitBypass(
+  hosts: readonly string[],
+  services: readonly EgressCredentialService[],
+): string | null {
+  const limited = new Set(hosts.map((host) => host.toLowerCase()));
+  const sharedHosts = (other: EgressCredentialService) =>
+    other.rules
+      .map((rule) => rule.host.toLowerCase())
+      .filter((host) => limited.has(host));
+  const open = services.filter(
+    (other) =>
+      other.source === "user" &&
+      !other.restrict_only &&
+      sharedHosts(other).length > 0,
+  );
+  if (open.length === 0) return null;
+  const names = formatList(open.map((other) => other.display_name));
+  const allowed = formatList([...new Set(open.flatMap(sharedHosts))]);
+  return `${names} also ${open.length === 1 ? "allows" : "allow"} requests to ${allowed}`;
+}
+
+/**
  * The limit that narrows an administrator's service: a service of the viewer's
  * that only restricts paths on one of its hosts. Null for any other service.
  */
