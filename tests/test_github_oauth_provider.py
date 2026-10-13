@@ -58,7 +58,7 @@ def _answer_login_lookup(
     monkeypatch.setattr(
         github_oauth,
         "_login_lookup_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
+        lambda: httpx.Client(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
     )
 
 
@@ -280,37 +280,31 @@ def test_github_login_lookup_targets_the_user_api_with_a_five_second_timeout() -
     assert LOGIN_LOOKUP_TIMEOUT_SECONDS == 5.0
     client = _REAL_LOGIN_LOOKUP_CLIENT()
     try:
-        assert isinstance(client, httpx.AsyncClient)
+        assert isinstance(client, httpx.Client)
         assert client.timeout == httpx.Timeout(5.0)
         assert client.follow_redirects is False
     finally:
-        asyncio.run(client.aclose())
+        client.close()
 
 
-def test_github_login_lookup_gives_up_after_one_overall_deadline(
+def test_github_login_lookup_timeout_still_connects_the_account(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    login_lookups: list[httpx.Request],
 ) -> None:
-    """A GitHub that stays silent cannot stall the connection for longer than the deadline, each phase included."""
+    """A GitHub that times out costs the account its label, never the connection."""
     runtime_paths = _runtime_paths(tmp_path)
     _save_client_config(runtime_paths)
-    monkeypatch.setattr(github_oauth, "LOGIN_LOOKUP_TIMEOUT_SECONDS", 0.2)
 
-    async def never_answers(_request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(30)
-        return httpx.Response(200, json={"login": "octo"})
+    def times_out(request: httpx.Request) -> httpx.Response:
+        message = "read timed out"
+        raise httpx.ReadTimeout(message, request=request)
 
-    # Each phase timeout is far longer than the deadline, so only the overall deadline can end the lookup.
-    monkeypatch.setattr(
-        github_oauth,
-        "_login_lookup_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(never_answers), timeout=60),
-    )
-    started = time.monotonic()
+    _answer_login_lookup(monkeypatch, login_lookups, times_out)
 
     result = _exchange(runtime_paths)
 
-    assert time.monotonic() - started < 5
+    assert len(login_lookups) == 1
     assert result.token_data["token"] == "github-user-access"  # noqa: S105
     assert result.claims == {}
 

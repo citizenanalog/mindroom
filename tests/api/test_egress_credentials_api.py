@@ -1150,7 +1150,7 @@ def _use_real_github_provider(
     monkeypatch.setattr(
         github_oauth,
         "_login_lookup_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
+        lambda: httpx.Client(transport=httpx.MockTransport(record), timeout=LOGIN_LOOKUP_TIMEOUT_SECONDS),
     )
     return lookups
 
@@ -1215,8 +1215,8 @@ def test_github_login_lookup_failure_never_leaks_the_token(
     row = _egress_row(portal, "bob", "personal", "gh")
     assert row["oauth"]["connected"] is True
     assert row["oauth"]["account_label"] is None
-    failures = [entry for entry in logs if entry["event"] == "github_login_lookup_failed"]
-    assert [entry["error_type"] for entry in failures] == ["ConnectError"]
+    failures = [entry for entry in logs if entry["event"] == "oauth_account_claims_read_failed"]
+    assert [(entry["provider_id"], entry["error_type"]) for entry in failures] == [("github", "ConnectError")]
     assert "gho-user-access" not in json.dumps(logs, default=str)
     assert "gho-user-access" not in json.dumps(row)
 

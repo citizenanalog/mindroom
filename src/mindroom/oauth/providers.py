@@ -600,8 +600,8 @@ class OAuthProvider:
     runtime_bootstrapper: _OAuthRuntimeBootstrapper | None = None
     # Reads verified account claims with the token a standard code exchange just returned, for a provider whose
     # token response carries none (GitHub's login). It runs once per connection and never on refresh, which keeps
-    # the claims already stored. It is best effort: it returns no claims instead of raising, and a failed read
-    # (an exception is caught and logged by its type only) leaves the connection without them.
+    # the claims already stored. It is best effort: it may return no claims or raise, and a failed read (an
+    # exception is caught and logged by its type only) leaves the connection without them.
     account_claims_reader: _OAuthAccountClaimsReader | None = None
 
     def __post_init__(self) -> None:
