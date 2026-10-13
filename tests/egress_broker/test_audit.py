@@ -228,39 +228,34 @@ def test_requester_filter_matches_only_that_requester(log: AuditLog, sample_reco
     assert len(log.query()) == 8
 
 
-def test_prune_by_age_and_max_rows(tmp_path: Path, sample_record: AuditRecord) -> None:
-    """Prune deletes rows older than retention_days, then trims to max_rows."""
-    log = AuditLog(tmp_path / "audit.db", retention_days=7, max_rows=100)
-
-    # Insert 10 old records (beyond retention)
+def test_the_thousandth_record_prunes_rows_older_than_retention(tmp_path: Path, sample_record: AuditRecord) -> None:
+    """Rows beyond retention_days stay until the 1000th insert, which prunes them."""
+    log = AuditLog(tmp_path / "audit.db", retention_days=7)
     _record_series(log, sample_record, 10, agent_name="agent_old", path_prefix="/old", age=timedelta(days=10))
-    # Insert 5 recent records (within retention)
-    _record_series(log, sample_record, 5, agent_name="agent_recent", path_prefix="/recent", age=timedelta(days=3))
+    _record_series(log, sample_record, 989, agent_name="agent_recent", path_prefix="/recent", age=timedelta(days=3))
+    assert len(log.query(limit=2000)) == 999
 
-    # Prune should delete the 10 old records
-    deleted = log.prune()
-    assert deleted == 10
+    _record_series(log, sample_record, 1, agent_name="agent_recent", path_prefix="/last", age=timedelta(days=3))
 
-    # Verify only 5 recent records remain
-    results = log.query(limit=1000)
-    assert len(results) == 5
+    results = log.query(limit=2000)
+    assert len(results) == 990
     assert all(r.agent_name == "agent_recent" for r in results)
 
-    # Now test max_rows pruning
-    # Insert 200 more recent records
-    _record_series(log, sample_record, 200, agent_name="agent_bulk", path_prefix="/bulk", age=timedelta(hours=1))
+    log.close()
 
-    # We now have 205 records total (5 recent + 200 bulk)
-    # Prune should trim to max_rows=100
-    deleted = log.prune()
-    assert deleted == 105  # 205 - 100
 
-    # Verify exactly 100 records remain
-    results = log.query(limit=1000)
+def test_the_thousandth_record_trims_to_max_rows_keeping_the_newest(tmp_path: Path, sample_record: AuditRecord) -> None:
+    """Rows beyond max_rows stay until the 1000th insert, which deletes the oldest of them."""
+    log = AuditLog(tmp_path / "audit.db", max_rows=100)
+    _record_series(log, sample_record, 500, agent_name="agent_older", path_prefix="/older", age=timedelta(days=3))
+    _record_series(log, sample_record, 499, agent_name="agent_newer", path_prefix="/newer", age=timedelta(hours=1))
+    assert len(log.query(limit=2000)) == 999
+
+    _record_series(log, sample_record, 1, agent_name="agent_newer", path_prefix="/last", age=timedelta(hours=1))
+
+    results = log.query(limit=2000)
     assert len(results) == 100
-
-    # Verify the newest 100 are kept (all should be agent_bulk since they're most recent)
-    assert all(r.agent_name == "agent_bulk" for r in results)
+    assert all(r.agent_name == "agent_newer" for r in results)
 
     log.close()
 

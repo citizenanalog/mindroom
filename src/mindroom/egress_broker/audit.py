@@ -139,30 +139,13 @@ class AuditLog:
             rows = self._conn.execute(query, {**params, "limit": limit}).fetchall()
         return [AuditRecord(datetime.fromisoformat(row[0]).replace(tzinfo=UTC), *row[1:]) for row in rows]
 
-    def prune(self) -> int:
-        """Delete records older than `retention_days`, then all but the newest `max_rows`; return how many went."""
-        with self._lock:
-            return self._prune_unlocked()
-
-    def _prune_unlocked(self) -> int:
-        """Internal prune implementation (assumes lock is held)."""
-        total_deleted = 0
-
-        # Delete records older than retention_days
+    def _prune_unlocked(self) -> None:
+        """Delete records older than `retention_days`, then all but the newest `max_rows`; the caller holds the lock."""
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
-        cursor = self._conn.execute(
-            "DELETE FROM audit WHERE at < ?",
-            (cutoff.isoformat(),),
-        )
-        total_deleted += cursor.rowcount
+        self._conn.execute("DELETE FROM audit WHERE at < ?", (cutoff.isoformat(),))
 
-        # Trim to max_rows by deleting oldest records
-        cursor = self._conn.execute("SELECT COUNT(*) FROM audit")
-        row_count = cursor.fetchone()[0]
-
+        row_count = self._conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
         if row_count > self._max_rows:
-            # Delete oldest records to get down to max_rows
-            to_delete = row_count - self._max_rows
             self._conn.execute(
                 """
                 DELETE FROM audit
@@ -172,12 +155,10 @@ class AuditLog:
                     LIMIT ?
                 )
                 """,
-                (to_delete,),
+                (row_count - self._max_rows,),
             )
-            total_deleted += to_delete
 
         self._conn.commit()
-        return total_deleted
 
     def close(self) -> None:
         """Close the database connection."""
