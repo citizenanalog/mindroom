@@ -111,8 +111,9 @@ def _existing_table(db: SqliteDb, table_type: Literal["runs", "sessions"]) -> Ta
 # Upstream PR: None identified for sharing the run transaction.
 # Remove when: Agno accepts a caller-owned transaction or an in-transaction persistence hook;
 # retain the owner's independent usage retention and atomic snapshot update.
-# Coverage: tests/test_usage_storage.py::test_usage_write_failure_rolls_back_the_run and
-# tests/test_usage_storage.py::test_a_refused_save_of_a_removed_run_still_records_usage.
+# Coverage: tests/test_usage_storage.py::test_usage_write_failure_rolls_back_the_run,
+# tests/test_usage_storage.py::test_a_refused_save_of_a_removed_run_still_records_usage, and
+# tests/test_budget_spend.py::test_spend_charges_a_resumed_run_for_its_requests_this_month.
 def _insert_run_row(
     transaction: Session,
     runs: Table,
@@ -169,7 +170,7 @@ def _insert_run_row(
                     else_=func.coalesce(runs.c.run_index, statement.excluded.run_index),
                 ),
             },
-        ).returning(runs.c.session_id, runs.c.run_id, runs.c.run_data, runs.c.created_at),
+        ).returning(runs.c.session_id, runs.c.run_id, runs.c.run_data, runs.c.created_at, runs.c.updated_at),
     ).one()
 
 
@@ -228,10 +229,11 @@ def upsert_run_at_end(
         if stored == "removed":
             # The provider calls behind a save of a cut run were made; the ledger outlives deleted runs.
             run_data = cast("dict[str, Any]", run) if isinstance(run, dict) else run.to_dict()
-            payload_run = {**run_data, "created_at": run_data.get("created_at") or int(time.time())}
+            now = int(time.time())
+            payload_run = {**run_data, "created_at": run_data.get("created_at") or now, "updated_at": now}
             run_id = run_data["run_id"]
         else:
-            payload_run = {**stored.run_data, "created_at": stored.created_at}
+            payload_run = {**stored.run_data, "created_at": stored.created_at, "updated_at": stored.updated_at}
             run_id = stored.run_id
         connection.exec_driver_sql(usage_table_sql(db.session_table_name))
         connection.exec_driver_sql(
