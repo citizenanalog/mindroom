@@ -32,6 +32,7 @@ from mindroom.session_storage import (
     agno_compat_session_persistence,
     agno_compat_sqlite,
 )
+from mindroom.session_storage.legacy_session_storage import drop_run_tool_schemas
 from mindroom.session_storage.preflight import session_storage_preflight
 from mindroom.usage.legacy_usage_storage import migrate_usage_database
 from mindroom.usage.storage import project_usage, quote_identifier, usage_table_sql, usage_upsert_sql
@@ -381,6 +382,7 @@ class _ConversationSqliteDb(SqliteDb):
         session = agno_compat_sqlite.read_session(self, session_id, session_type, deserialize=bool(deserialize))
         if isinstance(session, (AgentSession, TeamSession)):
             agno_compat_session_metrics.seed_accounted_usage(session)
+            drop_run_tool_schemas(session.runs or [])
         self._report_cache_counts()
         return session
 
