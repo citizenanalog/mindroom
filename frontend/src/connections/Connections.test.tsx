@@ -8,7 +8,11 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { credentialService, oauthStatus } from "@/test/egressServiceTestKit";
+import {
+  credentialService,
+  oauthStatus,
+  pressInDialog,
+} from "@/test/egressServiceTestKit";
 import { Connections } from "./Connections";
 import type { ConnectionService, EgressCredentialService } from "./types";
 
@@ -306,6 +310,80 @@ describe("brokered API keys on agent cards", () => {
       ),
     ).toBeVisible();
     expect(screen.queryByText(/shared agents/)).toBeNull();
+  });
+
+  describe("one account in both sections", () => {
+    // The tool section and the API keys section show the same Mail account.
+    let connected: boolean;
+    let catalogRequests: number;
+    beforeEach(() => {
+      connected = true;
+      catalogRequests = 0;
+      const disconnect = async () => {
+        connected = false;
+        return json({ status: "disconnected", provider: "mail" });
+      };
+      installApi({
+        "/api/connections": async () => {
+          catalogRequests += 1;
+          return json(
+            withEgress([
+              {
+                ...egressService,
+                name: "gmail",
+                display_name: "Gmail",
+                configured: connected,
+                active_source: connected ? "oauth" : null,
+                oauth: oauthStatus({
+                  provider: "mail",
+                  display_name: "Mail",
+                  connected,
+                  account_label: connected ? "user@example.com" : null,
+                }),
+              },
+            ]),
+          );
+        },
+        "/api/connections/agents/personal/mail/status": async () =>
+          json({
+            ...status,
+            connected,
+            account_label: connected ? "user@example.com" : null,
+          }),
+        "/api/connections/agents/personal/mail/disconnect": disconnect,
+        "/api/connections/egress/agents/personal/gmail/disconnect": disconnect,
+      });
+    });
+    const gmailRow = () => screen.getByRole("listitem", { name: "Gmail" });
+
+    it("refreshes the API keys section after a disconnect in the tool section", async () => {
+      render(<Connections />);
+      await expandAgent();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Disconnect for Mail" }),
+      );
+      await pressInDialog("Disconnect");
+
+      expect(await within(gmailRow()).findByText("Not set")).toBeVisible();
+      expect(catalogRequests).toBe(2);
+    });
+
+    it("refreshes the tool section after a disconnect in the API keys section", async () => {
+      render(<Connections />);
+      await expandAgent();
+      await screen.findByRole("button", { name: "Disconnect for Mail" });
+      fireEvent.click(
+        within(gmailRow()).getByRole("button", {
+          name: "Disconnect for Gmail",
+        }),
+      );
+      await pressInDialog("Disconnect");
+
+      expect(
+        await screen.findByRole("button", { name: "Connect Mail" }),
+      ).toBeEnabled();
+      expect(within(gmailRow()).getByText("Not set")).toBeVisible();
+    });
   });
 
   it("connects an account from the agent card and refreshes the catalog", async () => {

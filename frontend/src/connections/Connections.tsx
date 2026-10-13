@@ -14,10 +14,10 @@ export function Connections() {
   const mcp = useMcpSelection();
   const [connections, setConnections] = useState<ConnectionList | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The tool section and the API keys section can show the same account, so
+  // a change in either reloads the catalog and the tool statuses together.
   const [refreshVersion, setRefreshVersion] = useState(0);
-  const refreshConnections = () => setRefreshVersion((version) => version + 1);
-  const [catalogVersion, setCatalogVersion] = useState(0);
-  const reloadCatalog = () => setCatalogVersion((version) => version + 1);
+  const refresh = () => setRefreshVersion((version) => version + 1);
   useEffect(() => {
     const controller = new AbortController();
     void requestConnection<ConnectionList>(
@@ -37,7 +37,7 @@ export function Connections() {
           );
       });
     return () => controller.abort();
-  }, [catalogVersion]);
+  }, [refreshVersion]);
 
   return (
     <main className="min-h-screen bg-muted/20 px-4 py-8 sm:px-6 sm:py-12">
@@ -92,8 +92,8 @@ export function Connections() {
             agents={connections.agents}
             mcp={mcp}
             refreshVersion={refreshVersion}
-            onConnectionChange={refreshConnections}
-            onEgressChange={reloadCatalog}
+            onConnectionChange={refresh}
+            onEgressChange={refresh}
           />
         )}
         <ConnectedClients />
