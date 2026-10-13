@@ -781,8 +781,7 @@ _WITHOUT_PAGE = ScopeInfo(shared=False, managers=(), personal_page=False)
                 "provider": "github",
                 "connect_url": None,
                 "reset_required": True,
-                "message": "The github account for svc must be connected again. "
-                "Each user connects this agent's accounts " + _PAGE_NOT_SERVED,
+                "message": "Reconnect the github account for svc: each user does it " + _PAGE_NOT_SERVED,
             },
         ),
         (
@@ -819,6 +818,8 @@ async def test_personal_scope_without_the_personal_page_links_no_page(
     response = await client.get(tls_upstream.url("/echo"))
 
     assert (response.status_code, response.json()) == (status, expected)
+    # The reason phrase is cut at 200 characters and carries each of these messages whole.
+    assert response.reason_phrase == expected["message"]
     assert tls_upstream.hits == []
 
 

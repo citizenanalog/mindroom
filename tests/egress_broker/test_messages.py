@@ -212,8 +212,7 @@ _PATH = {"host": "api.github.com", "path": "/repos/o/b?page=2", "service": "gith
         (
             "oauth_connection_required",
             {"service": "github", "provider": "github"},
-            "The github account for github must be connected again. Each user connects this agent's accounts "
-            + _PAGE_NOT_SERVED,
+            "Reconnect the github account for github: each user does it " + _PAGE_NOT_SERVED,
         ),
         (
             "oauth_refresh_failed",
@@ -244,6 +243,14 @@ def test_personal_scope_without_the_personal_page_gets_no_manage_link(
     assert body["message"] == message
     assert "manage_url" not in body
     assert git_error_text(body) == message
+
+
+@pytest.mark.parametrize("code", ["credential_not_configured", "oauth_connection_required", "oauth_refresh_failed"])
+def test_personal_page_not_served_messages_fit_the_reason_phrase_for_a_provider_like_github(code: str) -> None:
+    """The HTTP reason phrase is cut at 200 characters, so these refusals stay short enough to carry their message whole."""
+    body = refusal_body(code, personal_page=False, service="GitHub", provider="GitHub")
+
+    assert len(str(body["message"])) <= 200
 
 
 @pytest.mark.parametrize(

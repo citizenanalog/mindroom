@@ -57,7 +57,7 @@ _MALFORMED = "The request is malformed and was refused."
 # A personal scope's keys, accounts, and services are set only on the personal page. Where it is not served, its
 # refusals take their texts from `_WITHOUT_PAGE`, which names no page, or `_WITHOUT_PAGE_LINKED` when the body carries
 # a connect link, and `refusal_body` drops `manage_url`, the dashboard. The `egress_credentials` tool ends its note
-# with the same sentences, and the key text stays short enough for the 200-character reason phrase.
+# with the same sentences, and the key and reconnect texts stay short enough for the 200-character reason phrase.
 CONNECTIONS_PAGE_NOT_SERVED = (
     "on the Connections page, which this deployment does not serve. "
     "An administrator can enable trusted upstream auth or make the agent shared."
@@ -66,8 +66,7 @@ _WITHOUT_PAGE = {
     **_MESSAGES,
     "credential_not_configured": "No {service} key: each user sets this agent's keys " + CONNECTIONS_PAGE_NOT_SERVED,
     "oauth_connection_required": (
-        "The {provider} account for {service} must be connected again. Each user connects this agent's accounts "
-        + CONNECTIONS_PAGE_NOT_SERVED
+        "Reconnect the {provider} account for {service}: each user does it " + CONNECTIONS_PAGE_NOT_SERVED
     ),
     "oauth_refresh_failed": (
         "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, tell an administrator."

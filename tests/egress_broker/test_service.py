@@ -1351,7 +1351,8 @@ async def test_a_key_saved_for_new_rules_never_reaches_the_host_a_pending_reques
 
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
-        response = await paused_lookup.get_after(get_through, env, move_to_openai)
+        with capture_logs() as logs:
+            response = await paused_lookup.get_after(get_through, env, move_to_openai)
         audit = active_audit_log()
         assert audit is not None
         [record] = await audit_records(audit, 1)
@@ -1360,6 +1361,10 @@ async def test_a_key_saved_for_new_rules_never_reaches_the_host_a_pending_reques
     assert tls_upstream.hits == []
     assert response.status_code == 502
     assert response.json()["error"] == "broker_error"
+    # Operators can tell the change from a store failure, and the event names only the service.
+    assert {"event": "egress_broker_service_changed", "log_level": "info", "service": "team"} in logs
+    assert not [log for log in logs if log["event"] == "egress_broker_secret_lookup_failed"]
+    assert "openai-key" not in repr(logs)
     assert (record.kind, record.service, record.status, record.code) == ("request", "team", 502, "broker_error")
 
 

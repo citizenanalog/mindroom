@@ -237,6 +237,7 @@ class TlsInterceptor:
         """
         if isinstance(result, SecretServiceChanged):
             # The service changed after routing, so its credential may be for other hosts; a retry routes afresh.
+            logger.info("egress_broker_service_changed", service=service)
             return 502, refusal_body("broker_error")
         manage_url = self._relay.manage_url
         scope = self._relay.scope_info(claims)
