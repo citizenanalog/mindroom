@@ -51,7 +51,7 @@ class AuditLog:
         retention_days: int = 30,
         max_rows: int = 100_000,
     ) -> None:
-        """Open or create the SQLite log at `path` (mode 0600); pruning keeps `retention_days` and `max_rows`."""
+        """Open or create the SQLite log at `path` (mode 0600) and prune it; pruning keeps `retention_days` and `max_rows`."""
         self._path = path
         self._retention_days = retention_days
         self._max_rows = max_rows
@@ -98,7 +98,9 @@ class AuditLog:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_service ON audit(service)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_requester_at ON audit(requester_id, at DESC)")
 
-        self._conn.commit()
+        # Prune on open too, so a primary that restarts before 1000 inserts still enforces both limits
+        with self._lock:
+            self._prune_unlocked()
 
     def record(self, rec: AuditRecord) -> None:
         """Store `rec` without the path's query string; every 1000th insert prunes old records."""

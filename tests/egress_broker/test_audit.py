@@ -260,6 +260,43 @@ def test_the_thousandth_record_trims_to_max_rows_keeping_the_newest(tmp_path: Pa
     log.close()
 
 
+def test_reopening_prunes_rows_older_than_retention_without_a_thousand_inserts(
+    tmp_path: Path,
+    sample_record: AuditRecord,
+) -> None:
+    """A process that restarts before its 1000th insert still drops rows past retention_days."""
+    log = AuditLog(tmp_path / "audit.db", retention_days=7)
+    _record_series(log, sample_record, 3, agent_name="agent_old", path_prefix="/old", age=timedelta(days=10))
+    _record_series(log, sample_record, 5, agent_name="agent_recent", path_prefix="/recent", age=timedelta(days=3))
+    assert len(log.query()) == 8
+    log.close()
+
+    reopened = AuditLog(tmp_path / "audit.db", retention_days=7)
+
+    results = reopened.query()
+    assert len(results) == 5
+    assert all(r.agent_name == "agent_recent" for r in results)
+
+    reopened.close()
+
+
+def test_reopening_trims_to_max_rows_keeping_the_newest(tmp_path: Path, sample_record: AuditRecord) -> None:
+    """A process that restarts before its 1000th insert still enforces max_rows."""
+    log = AuditLog(tmp_path / "audit.db", max_rows=4)
+    _record_series(log, sample_record, 6, agent_name="agent_older", path_prefix="/older", age=timedelta(days=3))
+    _record_series(log, sample_record, 4, agent_name="agent_newer", path_prefix="/newer", age=timedelta(hours=1))
+    assert len(log.query()) == 10
+    log.close()
+
+    reopened = AuditLog(tmp_path / "audit.db", max_rows=4)
+
+    results = reopened.query()
+    assert len(results) == 4
+    assert all(r.agent_name == "agent_newer" for r in results)
+
+    reopened.close()
+
+
 def test_concurrent_record_from_threads(log: AuditLog, sample_record: AuditRecord) -> None:
     """Concurrent writes from multiple threads all succeed."""
 
