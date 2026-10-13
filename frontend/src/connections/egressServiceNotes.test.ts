@@ -174,7 +174,7 @@ describe("services of the agent that already send a key to a website", () => {
         undefined,
       ),
     ).toEqual([
-      "GitHub already sends a key to api.github.com and github.com for this agent. The most specific path wins, and equal paths go to the service listed first.",
+      "GitHub already sends a key to api.github.com and github.com for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically.",
     ]);
   });
 
@@ -188,7 +188,7 @@ describe("services of the agent that already send a key to a website", () => {
         undefined,
       ),
     ).toEqual([
-      "Mine already sends a key to uploads.github.com for this agent. The most specific path wins, and equal paths go to the service listed first.",
+      "Mine already sends a key to uploads.github.com for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically.",
     ]);
     expect(
       overlapWarnings(

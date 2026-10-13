@@ -663,7 +663,7 @@ One editor adds, edits, and deletes services in two places:
 - **Name**, fixed once saved. For a new service it follows the preset id, or the first label of the website (`httpbin.org` gives `httpbin`), until you type one, and it takes the first free `{name}-2` or `{name}-3` when the name is taken. An empty name says "Name is required".
 - **API key**, an optional password field with the hint "Paste the key now or later". It appears on the personal page only, where the caller may set the agent's keys. When the service being edited belongs to a shared or unscoped agent and has a key, a line under it says "Saving changed rules removes the saved key, so it must be set again." (see [User services](#user-services)).
 
-When another service of this agent that sends a key already has a rule on a host the form covers, a status line under the website fields warns: "{service} already sends a key to {hosts} for this agent. The most specific path wins, and equal paths go to the service listed first."
+When another service of this agent that sends a key already has a rule on a host the form covers, a status line under the website fields warns: "{service} already sends a key to {hosts} for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically."
 It compares hosts only, lists all the hosts a service shares, skips `restrict_only` services and rules that send nothing, skips the service being edited, and shows on the personal page only, because the dashboard has no per-agent listing to compare with.
 
 On save, the service is written first and the key second, and a key is only sent when one was typed.

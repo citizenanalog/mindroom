@@ -2863,7 +2863,7 @@ describe("a website another service of the agent already sends a key to", () => 
       ...changes,
     });
   const WARNING =
-    " already sends a key to api.github.com for this agent. The most specific path wins, and equal paths go to the service listed first.";
+    " already sends a key to api.github.com for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically.";
 
   it("warns, naming the service and the website, as soon as the website is typed", async () => {
     await renderEditor({ agentServices: [sending()] });
@@ -2889,7 +2889,7 @@ describe("a website another service of the agent already sends a key to", () => 
     type("Preset", "github");
     expect(
       screen.getByText(
-        "GitHub already sends a key to api.github.com and github.com for this agent. The most specific path wins, and equal paths go to the service listed first.",
+        "GitHub already sends a key to api.github.com and github.com for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically.",
       ),
     ).toBeVisible();
   });

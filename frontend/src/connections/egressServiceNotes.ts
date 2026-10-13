@@ -67,8 +67,9 @@ export function configPlaceholderOwners(
 /**
  * What to tell the user when another service of the agent already sends a key
  * to a website this form covers: one text per such service, with all the
- * hosts it shares. Services that only limit paths send no key, and the service
- * being edited does not compete with itself.
+ * hosts it shares, and the broker's order for picking between them. Services
+ * that only limit paths send no key, and the service being edited does not
+ * compete with itself.
  */
 export function overlapWarnings(
   form: EgressServiceForm,
@@ -97,7 +98,7 @@ export function overlapWarnings(
     ];
     return shared.length > 0
       ? [
-          `${other.display_name} already sends a key to ${formatList(shared)} for this agent. The most specific path wins, and equal paths go to the service listed first.`,
+          `${other.display_name} already sends a key to ${formatList(shared)} for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically.`,
         ]
       : [];
   });
