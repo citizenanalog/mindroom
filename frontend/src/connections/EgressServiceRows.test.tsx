@@ -768,12 +768,44 @@ describe("connected accounts", () => {
     expect(onChanged).not.toHaveBeenCalled();
   });
 
-  it("explains a shared service account and offers no connect action", () => {
-    renderRows([withAccount({ service_account: true, can_connect: false })]);
+  it("says Agent Keys cannot use a shared service account and offers no connect action", () => {
+    // The responses for Google Drive while GOOGLE_SERVICE_ACCOUNT_FILE is set.
+    const drive = (
+      account: Partial<EgressOAuthStatus>,
+      service: Partial<EgressCredentialService>,
+    ) =>
+      credentialService({
+        name: "drive",
+        display_name: "Google Drive",
+        oauth: oauthStatus({
+          provider: "google_drive",
+          display_name: "Google Drive",
+          can_connect: false,
+          service_account: true,
+          ...account,
+        }),
+        ...service,
+      });
+    renderRows([drive({}, {})]);
     expect(
-      within(row("GitHub")).getByText("Uses a shared service account"),
+      within(row("Google Drive")).getByText("Not set"),
+    ).toBeInTheDocument();
+    expect(
+      within(row("Google Drive")).getByText(
+        "Agent Keys cannot use the shared service account, so this service needs a key.",
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Connect/ })).toBeNull();
+    cleanup();
+
+    renderRows([
+      drive({ connected: true }, { configured: true, active_source: "oauth" }),
+    ]);
+    expect(
+      within(row("Google Drive")).getByText(
+        "Agent Keys cannot use the shared service account, so this uses the account connected earlier.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("leaves services without an account provider as plain key rows", () => {

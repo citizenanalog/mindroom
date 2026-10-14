@@ -41,9 +41,13 @@ export function ServiceStatus({
           {sourceLabel}
         </Badge>
       )}
-      {oauth?.service_account && (
+      {/* A service account serves the provider's tools, but the broker never injects it. */}
+      {oauth?.service_account && service.active_source !== "key" && (
         <span className="text-xs text-muted-foreground">
-          Uses a shared service account
+          Agent Keys cannot use the shared service account, so{" "}
+          {service.active_source === "oauth"
+            ? "this uses the account connected earlier."
+            : "this service needs a key."}
         </span>
       )}
       {refusalShown && (
