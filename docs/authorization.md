@@ -190,6 +190,7 @@ Platform administrators may:
 - Talk to every responder regardless of its `access`.
 
 A credential manager may manage only the named agent's shared credentials and OAuth connections, and sees every requester's brokered requests on that agent in its [request log](deployment/egress-broker.md#personal-request-log).
+The credential managers of one agent can change each other's [Agent Keys](deployment/egress-broker.md#connecting-an-account) keys and services. Agents without a worker scope share one key store, so the credential managers of all such agents can too. List only people who trust each other.
 Requesters manage their own personal OAuth connections without being listed anywhere; see [Who Can Connect An Account](oauth-framework.md#who-can-connect-an-account).
 Reading or changing an agent's shared credentials returns HTTP 403 to anyone who is neither an administrator nor that agent's credential manager.
 Connections may show users with agent access whether a shared connection exists, without revealing the connected account or granting management.

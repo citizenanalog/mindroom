@@ -444,6 +444,7 @@ When more than one user can sign in through the gateway, `MINDROOM_CONNECTIONS_A
 With `MINDROOM_CONNECTIONS_AGENT` set, a user who is not in `administrators` and opens a dashboard page (a browser `GET` that accepts `text/html`, outside `/api/`) is redirected with 303 to `/connections?notice=admin-only` instead of seeing a JSON refusal.
 There a notice says the dashboard is for administrators. API calls still get the 403 JSON.
 On the personal page, users manage their own keys, accounts, and [services](#user-services) for `user` and `user_agent` agents, while keys, accounts, and services for shared and unscoped agents are managed only by administrators and the agent's `credential_managers`, who also see every requester's rows in that agent's [request log](#personal-request-log).
+The managers of a shared agent can change each other's keys and services. Unscoped agents share one store, so the managers of all unscoped agents can change each other's keys and services too. Choose credential managers who trust each other.
 
 **Dashboard API routes** (all require dashboard authentication):
 
@@ -501,7 +502,7 @@ A user service routes only that scope's keys and accounts, so it cannot reach an
 
 **Rules about names and overlap:**
 
-- Config names win. Saving a name that a config service already uses returns 409, and a user entry that a config service later shadows is ignored. It can still be deleted, and its key then stays, because the config service uses that key. On a shared or unscoped agent, storing a key for that config service deletes the entry (see **Keys** below).
+- Config names win. Saving a name that a config service already uses returns 409, and a user entry that a config service later shadows is ignored. It can still be deleted, and its key then stays, because the config service uses that key.
 - On a host that both a config service and a user service name, the usual order applies (exact host, specific port, longest path prefix, then config services before user services, then service name), so a longer user prefix takes those paths for that user only.
 
 **Inactive entries.**
@@ -522,14 +523,8 @@ Going over one of these is a 422, except that a request body over 16 KiB is refu
 - A user service sends a connected account only to its provider's own hosts, because the token works nowhere else: the rule hosts of the built-in [presets](#presets) bound to that provider, such as `api.github.com`, `uploads.github.com`, and `github.com` for `github`, or `www.googleapis.com` for `google_drive`. Ports and path prefixes are free, but hosts compare exactly, so a wildcard such as `*.github.com` is refused. Saving a service with `oauth_provider` whose rules name another host returns 422 naming the provider, its hosts, and the refused hosts ("oauth_provider 'github' can only be used on api.github.com, uploads.github.com, github.com, so these hosts cannot be used with it: api.notes.example.com"), and a provider no preset is bound to, such as `google_cloud` or a plugin provider, is refused on every host. A stored entry that breaks this rule keeps its rules but loses its `oauth_provider` on load with the warning `egress_broker_user_service_oauth_ignored`, so no token is resolved or reported for it. Services in `config.yaml` and user services that use an API key are not limited this way.
 
 **Keys.**
-Creating a user service clears any stored key with the same name in that scope first, so a new service never inherits an old key (for example one left behind by a removed config service); on personal agents, replacing a service keeps its key, unless the saved service is `restrict_only`, which never has one and so deletes it.
+Creating a user service clears any stored key with the same name in that scope first, so a new service never inherits an old key (for example one left behind by a removed config service); replacing a service keeps its key, unless the saved service is `restrict_only`, which never has one and so deletes it.
 Deleting a user service deletes its key, unless a config service now shadows the entry.
-On shared and unscoped agents a key stays bound to the hosts it was set for, because the manager who changes a service may not be the one who stored its key:
-
-- Replacing a service whose rules change (a host, port, path prefix, or how the key is sent, a preset's rules included) deletes its key, and a stored entry that no longer validates counts as changed. A change that leaves the rules as they were, such as the display name, description, or placeholders, keeps the key.
-- Storing a key for a config service, from the dashboard or the personal page, deletes the scope's user entry of the same name, which that config service shadows, so the entry never becomes active with that key when the config service is removed or renamed.
-
-On `user` and `user_agent` agents the requester owns both the service and the key, so a changed service keeps its key and a shadowed entry stays until they delete it.
 
 **Placeholder variables.**
 A user service's `placeholder_env` has stricter rules than a config service's, because a shared agent's services set variables in every requester's sandbox:
@@ -557,7 +552,7 @@ One editor adds, edits, and deletes services in two places:
 The editor saves the service and its key in one step.
 Pick a **Preset**, or **Custom** and fill in the website (the host of the first rule), how the key is sent (bearer token, header, basic auth, query parameter, or a custom header template), and the header, username, or parameter name.
 The **Name** is fixed once saved.
-The **API key** field appears on the personal page only, where the caller may set the agent's keys. When the service being edited belongs to a shared or unscoped agent and has a key, the editor warns that saving changed rules removes the saved key, so it must be set again (see [User services](#user-services)).
+The **API key** field appears on the personal page only, where the caller may set the agent's keys.
 **More options** holds the display name, description, path prefix, port, extra rules, **Replace the preset's rules with my own**, **Refuse other paths on these hosts** (`restrict_to_rules`), the account login (for a **Custom** service), and the placeholder variables.
 
 When another service of this agent that sends a key already has a rule on a host the form covers, a status line under the website fields warns: "{service} already sends a key to {hosts} for this agent. An exact host wins, then a specific port, then the longest path, then your administrator's services before your own, then the service name alphabetically."
