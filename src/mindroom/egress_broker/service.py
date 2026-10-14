@@ -280,7 +280,7 @@ async def _resolve_secret(
 
     `routed` is the definition of `name` whose rule routed the request. The requester's effective config (the
     config's services plus the scope's own) must still define `name` as `routed`, or the result is
-    `SecretServiceChanged`: a service or key saved since routing may be meant for other hosts. That check and the key
+    `SecretServiceChanged`: a service saved since routing may be meant for other hosts. That check and the key
     read run in one call on the loop's default executor (`_routed_key`); the OAuth lookup, which may refresh, then
     runs on `oauth_executor` with the provider of the checked definition.
     """

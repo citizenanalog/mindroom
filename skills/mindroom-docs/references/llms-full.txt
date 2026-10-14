@@ -13523,7 +13523,7 @@ Platform administrators may:
 - Talk to every responder regardless of its `access`.
 
 A credential manager may manage only the named agent's shared credentials and OAuth connections, and sees every requester's brokered requests on that agent in its [request log](https://docs.mindroom.chat/deployment/egress-broker/#personal-request-log).
-The credential managers of one agent can change each other's [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/#connecting-an-account) keys and services. Agents without a worker scope share one key store, so the credential managers of all such agents can too. List only people who trust each other.
+The credential managers of one agent can change each other's keys and services in [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/#connecting-an-account). Agents without a worker scope share one key store, so the credential managers of all such agents can too. List only people who trust each other.
 Requesters manage their own personal OAuth connections without being listed anywhere; see [Who Can Connect An Account](https://docs.mindroom.chat/oauth-framework/#who-can-connect-an-account).
 Reading or changing an agent's shared credentials returns HTTP 403 to anyone who is neither an administrator nor that agent's credential manager.
 Connections shows every user of an agent which account the agent's shared connection uses, such as its email or login.
@@ -14126,6 +14126,7 @@ On the shared static runner, including the hosted `static_runner` sidecar, a sco
 Personal GitHub and Atlassian accounts follow the same line: only `user` and `user_agent` workers on the Docker or Kubernetes backend get them, and the static runner needs the service's `oauth_on_shared_workers` opt-in.
 Users can define egress services of their own, and those stay per scope and never widen operator policy.
 A user service is stored in the same primary-only store as that scope's keys, so it applies only to the workers of that scope: a requester's own on `user` and `user_agent` agents, and the agent's (or the global scope's) on shared and unscoped agents, where only administrators and credential managers may write them.
+The credential managers of one key scope can change each other's keys and services, and unscoped agents share one key store, so the managers of all unscoped agents can too; the boundary is that agents and worker code never read a stored key, and users who are neither administrators nor credential managers cannot change keys or services (see [Egress Broker Design Decisions](https://docs.mindroom.chat/architecture/egress-broker-design/)).
 It routes only that scope's own keys and accounts, and it cannot take a config service's name or set `oauth_on_shared_workers`.
 Under `unmatched_hosts: deny` a user rule applies only on hosts that an operator service names, and on a host where an operator service sets `restrict_to_rules` a path must match an operator rule, so a user service can narrow operator policy but never open a host or path the operator refuses.
 A user service that sets `restrict_to_rules` also narrows the operator's services on its hosts, for its own scope only: a path must pass the operator's restriction and the requester's, and another requester on the same host is unaffected.
