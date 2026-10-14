@@ -17844,7 +17844,6 @@ The TTL applies to new requests: an expired token gets 407 on every new request,
 
 ### Request handling
 
-The broker forwards one well-formed request for each request it reads, so a request that two HTTP parsers would read differently cannot reach an upstream as two requests.
 It refuses a request it cannot read unambiguously, a request head over 64 KiB, a TLS server name or `Host` header that names a different host than the CONNECT target, and `TRACE` or `TRACK` on a host with rules; [Error responses](#error-responses) lists the responses, and [Troubleshooting](#troubleshooting) gives the fixes for the common ones.
 Websocket frames after a 101 and raw tunnels to hosts without rules are relayed as they come, without injection.
 The broker replaces any value the client sent in the header or query parameter it injects into, and returns redirects to the client without following them, so a redirect to another host gets a credential only where a rule matches that host.
@@ -18620,7 +18619,7 @@ The broker returns these errors to worker code:
 | Plain HTTP request matching a rule | 403 JSON `{"error": "tls_required", "service": "<name>", "message": "..."}` |
 | `Host` header inside an intercepted tunnel naming a different host than the CONNECT target | 403 JSON `{"error": "host_mismatch", "message": "..."}` |
 | Client TLS server name (SNI) that differs from the CONNECT host | No response: the TLS handshake is aborted with an `unrecognized_name` alert, and nothing is forwarded |
-| Request the broker cannot read unambiguously, such as an invalid CONNECT target or an HTTP protocol error | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text (431 for a request head over 64 KiB, 501 for an unsupported `Transfer-Encoding`) |
+| Request the broker cannot read unambiguously, such as an invalid CONNECT target or an HTTP protocol error | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text |
 | Path on a host with rules with empty segments or raw backslashes, or with a dot segment, NUL, or invalid UTF-8 in it or any percent-decoded form of it | 400 JSON `{"error": "bad_request", "message": "..."}` with the ambiguous-path text |
 | `TRACE` or `TRACK` request (any letter case) to a host with rules, inside an intercepted tunnel or over plain HTTP, refused before any key is looked up | 405 JSON `{"error": "method_not_allowed", "message": "..."}`; the upstream would echo the injected credential back |
 | Path that fails a restriction (see [Limiting paths and repositories](#limiting-paths-and-repositories)) | 403 JSON `{"error": "path_not_allowed", "service": "<restricting service>", "manage_url": "<link>", "message": "..."}`; the message names the service by its display name |
@@ -18739,7 +18738,6 @@ The broker has these known limits in the initial release:
 - **No body or websocket frame substitutions:** the broker injects into headers and query parameters only; path, body, and websocket frame substitutions planned for a later release.
 - **Background-script workers not yet covered:** the broker environment reaches dedicated Docker and Kubernetes workers and the static runner; background-script workers are not yet wired.
 - **Shared static runner is not an isolation boundary:** a scoped call's token lives in a process shared with other users' calls, valid for the token TTL, so keep the TTL short where that matters and use dedicated `user` or `user_agent` workers on `private` agents for isolation. A dedicated `shared` or unscoped worker does not isolate requesters either. For the same reason personal GitHub and Atlassian accounts are not used on the static runner unless the service sets `oauth_on_shared_workers`.
-- **Streamed request bodies:** the broker forwards a valid request head to the right upstream before it has read the body, so a body that turns out to be invalid or over the limit gets 400 or 413 after the upstream has already seen the head. The upstream then sees a partial request and a reset, and the head carries the injected secret to the host the request was routed to, as any request would.
 - **Not yet independently reviewed:** the transport code was tested with a smuggling corpus and property-based fuzzing, but no human or automated adversarial review of it has been done; see [Testing and review](https://docs.mindroom.chat/architecture/security-posture/#testing-and-review-of-the-egress-broker).
 - **Broker approvals stay with Squid:** the broker does not enforce approved-egress grants itself; in the Kubernetes chain Squid does, and the broker takes Agent Vault's place as its parent.
 
