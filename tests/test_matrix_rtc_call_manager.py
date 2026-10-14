@@ -7,6 +7,7 @@ import base64
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from types import MethodType, ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Literal, cast
@@ -49,7 +50,7 @@ from mindroom.matrix_rtc.call_origin import (
     _CallBriefMessage,
 )
 from mindroom.matrix_rtc.call_session import CallSession, CallSessionDeps, CallStartRevokedError
-from mindroom.matrix_rtc.call_tools import CallAgentResponse, CallAgentTooling
+from mindroom.matrix_rtc.call_tools import CallAgentTooling
 from mindroom.matrix_rtc.events import (
     CALL_ENCRYPTION_KEYS_EVENT_TYPE,
     CALL_MEMBER_EVENT_TYPE,
@@ -63,9 +64,9 @@ from mindroom.matrix_rtc.events import (
 )
 from mindroom.matrix_rtc.focus import SfuGrant
 from mindroom.matrix_rtc.frame_keys import _SharedWith
-from mindroom.matrix_rtc.live_voice_agent import LiveVoiceBridge
 from mindroom.matrix_rtc.transcript import CallTranscript
 from mindroom.matrix_rtc.voice_agent import (
+    CallAgentResponse,
     CallVoiceAgentOptions,
     CascadedVoiceAgentOptions,
     CascadedVoiceBridge,
@@ -380,6 +381,7 @@ def _manager(
     agent_reply_memberships: AgentReplyMembershipIndex | None = None,
     response_admission_gate: ResponseAdmissionGate | None = None,
     wait_for_admission_or_shutdown: Callable[[], Awaitable[bool]] | None = None,
+    bridge_factory: Callable[[str, bool], FakeBridge] | None = None,
 ) -> CallManager:
     admission_gate = response_admission_gate or ResponseAdmissionGate()
 
@@ -393,7 +395,7 @@ def _manager(
         client=client,
         runtime_paths=test_runtime_paths(tmp_path),
         ssl_verify=True,
-        bridge_factory=lambda _identity, _e2ee: bridge,
+        bridge_factory=bridge_factory or (lambda _identity, _e2ee: bridge),
         tool_support=tool_support,  # type: ignore[arg-type]
         get_invited_rooms_by_agent=lambda: invited_rooms_by_agent or {},
         clock_ms=clock_ms,
@@ -1118,8 +1120,15 @@ def test_call_manager_uses_assigned_realtime_profile(
     key_lookup.assert_called_once_with("voice-default", manager._runtime_paths)
 
 
-def test_default_bridge_factory_uses_assigned_profile_backend(tmp_path: Path) -> None:
-    """Each assigned profile selects its matching media bridge."""
+def test_default_bridge_factory_uses_assigned_profile_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each assigned profile selects its matching media bridge; live media runs in its own process."""
+
+    @dataclass
+    class RecordingProcessBridge:
+        local_identity: str
+        e2ee_enabled: bool
+
+    monkeypatch.setattr("mindroom.matrix_rtc.call_manager.ProcessLiveVoiceBridge", RecordingProcessBridge)
     stt = SpeechServiceConfig(
         provider="openai_compatible",
         model="stt",
@@ -1204,7 +1213,7 @@ def test_default_bridge_factory_uses_assigned_profile_backend(tmp_path: Path) ->
 
     assert isinstance(realtime_bridge, RealtimeVoiceBridge)
     assert isinstance(cascaded_bridge, CascadedVoiceBridge)
-    assert isinstance(live_bridge, LiveVoiceBridge)
+    assert live_bridge == RecordingProcessBridge(local_identity="@speaker:example.org:BOTDEV", e2ee_enabled=False)
     assert realtime_manager._call_config.backend == "realtime"
     assert realtime_manager._call_config.model == "gpt-realtime-custom"
     assert realtime_manager._call_config.voice == "marin"
@@ -2393,6 +2402,37 @@ async def test_preload_builds_the_token_encoder_off_the_event_loop(monkeypatch: 
     await preload_matrix_call_dependencies(_config())
     assert len(encoder_threads) == 1
     assert encoder_threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_preload_matches_the_configured_call_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In-process call backends load LiveKit here; GPT-Live calls get an idle audio process instead."""
+    imported: list[str] = []
+    prewarms: list[None] = []
+
+    class RecordingPlugins(ModuleType):
+        def __getattr__(self, name: str) -> ModuleType:
+            if name.startswith("__"):
+                raise AttributeError(name)
+            imported.append(name)
+            return ModuleType(name)
+
+    monkeypatch.setitem(sys.modules, "livekit.plugins", RecordingPlugins("livekit.plugins"))
+    monkeypatch.setattr("mindroom.matrix_rtc.call_manager.matrix_calls_dependencies_available", lambda: True)
+    monkeypatch.setattr("mindroom.matrix_rtc.call_manager.o200k_encoding", lambda: None)
+    monkeypatch.setattr("mindroom.matrix_rtc.call_manager.prewarm_call_audio_process", lambda: prewarms.append(None))
+
+    await preload_matrix_call_dependencies(_config())
+    assert (imported, prewarms) == (["openai"], [])
+
+    live_only = _config()
+    live_only.calls.profiles = {
+        "live": LiveCallProfile(backend="live", model="gpt-live-1", credentials_service="openai_live", voice="marin"),
+    }
+    live_only.calls.agents["helper"] = "live"
+    imported.clear()
+    await preload_matrix_call_dependencies(live_only)
+    assert (imported, prewarms) == ([], [None])
 
 
 def test_voice_backend_availability_requires_runtime_credentials(
@@ -5545,3 +5585,45 @@ async def test_manager_ownership_warning_requires_live_call_signal(tmp_path: Pat
     assert bridge.connected_grant is None
     client.room_get_state.assert_not_awaited()
     client.joined_members.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_join_closes_bridge_when_the_session_cannot_be_built(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A bridge is closed when the call fails before a session owns it, so no audio process is left behind."""
+
+    def fail_session(**_kwargs: object) -> None:
+        msg = "session rejected"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("mindroom.matrix_rtc.call_manager.CallSession", fail_session)
+    client = _client()
+    client.room_get_state.return_value = _state_response(_remote_member_event())
+    bridge = FakeBridge()
+    manager = _manager(client, bridge, tmp_path)
+
+    with pytest.raises(RuntimeError, match="session rejected"):
+        await _deliver(manager, manager.on_room_event(_room(), _member_unknown_event()))
+
+    assert bridge.closed
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_join_retries_when_the_audio_process_cannot_start(tmp_path: Path) -> None:
+    """A bridge that cannot start its audio process makes the join retry instead of failing silently."""
+    client = _client()
+    client.room_get_state.return_value = _state_response(_remote_member_event())
+
+    def fail_spawn(_identity: str, _e2ee: bool) -> FakeBridge:
+        msg = "fork failed"
+        raise BlockingIOError(msg)
+
+    manager = _manager(client, FakeBridge(), tmp_path, bridge_factory=fail_spawn)
+
+    await _deliver(manager, manager.on_room_event(_room(), _member_unknown_event()))
+
+    assert ROOM_ID in manager._retry_tasks
+    await manager.shutdown()

@@ -45,9 +45,10 @@ from mindroom.background_tasks import wait_for_background_tasks
 from mindroom.bot import AgentBot
 from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig
+from mindroom.config.calls import CallsConfig, RealtimeCallProfile
 from mindroom.config.main import Config
 from mindroom.config.matrix import EventJournalConfig
-from mindroom.config.models import ModelConfig, RouterConfig
+from mindroom.config.models import BackgroundToolJobsConfig, ModelConfig, RouterConfig
 from mindroom.constants import (
     ROUTER_AGENT_NAME,
     RuntimePaths,
@@ -95,6 +96,7 @@ from mindroom.runtime_state import (
     set_runtime_ready,
 )
 from mindroom.startup_errors import EventJournalHoldLostError, PermanentStartupError
+from mindroom.tool_jobs.runtime import ToolJobRuntime, get_background_runtime
 from mindroom.tool_system.metadata import TOOL_METADATA
 from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
 from tests.bot_helpers import (
@@ -269,6 +271,8 @@ def test_repeated_reply_membership_invalidation_schedules_one_revocation_wave(
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+
+    from mindroom.bot import TeamBot
 
 
 @pytest.fixture(autouse=True)
@@ -2808,8 +2812,26 @@ class TestMultiAgentOrchestrator:
     ) -> None:
         """Load the owned config, prepare optional call SDKs, and freeze the startup heap before creating bots."""
         config_path = tmp_path / "custom-config.yaml"
-        mock_config = _runtime_bound_config(Config(router=RouterConfig(model="default")), tmp_path)
-        mock_config.calls.enabled = calls_enabled
+        # A realtime call agent runs LiveKit in this process, so startup loads its plugins.
+        mock_config = _runtime_bound_config(
+            Config(
+                agents={"caller": AgentConfig(display_name="Caller", role="Voice agent")},
+                router=RouterConfig(model="default"),
+                calls=CallsConfig(
+                    enabled=calls_enabled,
+                    profiles={
+                        "realtime": RealtimeCallProfile(
+                            backend="realtime",
+                            model="gpt-realtime-2.1",
+                            credentials_service="openai",
+                            voice="marin",
+                        ),
+                    },
+                    agents={"caller": "realtime"},
+                ),
+            ),
+            tmp_path,
+        )
         call_import_threads: list[threading.Thread] = []
         original_import = builtins.__import__
 
@@ -2844,6 +2866,12 @@ class TestMultiAgentOrchestrator:
                             display_name="Router",
                             password=TEST_PASSWORD,
                         ),
+                        "caller": AgentMatrixUser(
+                            agent_name="caller",
+                            user_id="@mindroom_caller:localhost",
+                            display_name="Caller",
+                            password=TEST_PASSWORD,
+                        ),
                     },
                 ),
             ),
@@ -2866,7 +2894,7 @@ class TestMultiAgentOrchestrator:
             await orchestrator.initialize()
 
         mock_load_config.assert_called_once()
-        create_managed_bot.assert_called_once()
+        assert create_managed_bot.call_count == 2
         assert any(log["event"] == "calls_dependency_preload_failed" for log in logs) is (import_error is not None)
         assert mock_load_config.call_args.args[0].config_path == config_path.resolve()
 
@@ -3809,8 +3837,15 @@ class TestMultiAgentOrchestrator:
         """Initial startup must wait for router and responder generation first syncs."""
         orchestrator = _MultiAgentOrchestrator(runtime_paths=TestAgentBot._runtime_paths(tmp_path))
         orchestrator.config = MagicMock(source_fingerprint=None)
+        orchestrator.config.background_tool_jobs = BackgroundToolJobsConfig(enabled=True)
         responder_started = False
         runtime_support_bound = False
+        runtimes_before_sync: list[ToolJobRuntime | None] = []
+        start_sync = orchestrator._start_sync_task
+
+        def record_runtime_before_sync(entity_name: str, bot: AgentBot | TeamBot) -> None:
+            runtimes_before_sync.append(get_background_runtime(orchestrator.runtime_paths))
+            start_sync(entity_name, bot)
 
         router_bot = MagicMock()
         router_bot.agent_name = ROUTER_AGENT_NAME
@@ -3849,11 +3884,14 @@ class TestMultiAgentOrchestrator:
             patch.object(orchestrator, "_setup_rooms_and_memberships", new=AsyncMock()),
             patch.object(orchestrator, "_sync_runtime_support_services", new=AsyncMock()),
             patch.object(orchestrator, "_bind_started_runtime_support_services", side_effect=bind_runtime_support),
+            patch.object(orchestrator, "_start_sync_task", side_effect=record_runtime_before_sync),
             patch("mindroom.orchestrator.sync_forever_with_restart", new=AsyncMock()),
         ):
             await _run_orchestrator_start_until_ready(orchestrator)
 
         router_bot.recover_pending_turn_journal_events.assert_not_awaited()
+        assert runtimes_before_sync
+        assert all(runtime is not None for runtime in runtimes_before_sync)
 
     @pytest.mark.asyncio
     async def test_router_turn_recovery_delegates_unready_responder_filtering(
@@ -4949,6 +4987,7 @@ class TestMultiAgentOrchestrator:
         orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths)
         old_cards = MagicMock()
         router_cards = MagicMock()
+        orchestrator.config = config
         orchestrator.agent_bots = {ROUTER_AGENT_NAME: MagicMock(approval_store=router_cards)}
         store = initialize_approval_store(runtime_paths, cards=old_cards)
 
