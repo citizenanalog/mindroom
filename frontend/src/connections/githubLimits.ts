@@ -9,8 +9,8 @@ import {
 
 const API_HOSTS = [GITHUB_API_HOST, GITHUB_UPLOADS_HOST];
 
-/** Rules as listed or as authored; only the host and path are read, and an authored rule without a path covers `/`. */
-type Rule = { host: string; path_prefix?: string };
+/** Rules as listed or as authored; only the host, port, and path are read, and an authored rule without a path covers `/`. */
+type Rule = { host: string; port?: number | null; path_prefix?: string };
 type Rules = readonly Rule[];
 
 const pathOf = (rule: Rule) => rule.path_prefix ?? "/";
@@ -95,7 +95,9 @@ export interface GithubLimit {
   exact: boolean;
 }
 
-const ruleKey = (rule: Rule) => `${rule.host}${pathOf(rule)}`;
+// The helper never writes a port, so a rule with one is never what it writes.
+const ruleKey = (rule: Rule) =>
+  `${rule.host}:${rule.port ?? ""}${pathOf(rule)}`;
 
 /**
  * The repositories and options behind a limit's rules, for opening it in the

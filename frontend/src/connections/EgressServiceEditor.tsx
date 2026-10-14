@@ -56,7 +56,7 @@ import {
   restoredHelperInput,
 } from "./EgressGithubHelper";
 import type { HelperInput, HelperLabels } from "./EgressGithubHelper";
-import { MoreOptions } from "./EgressMoreOptions";
+import { MoreOptions, RulesSection } from "./EgressMoreOptions";
 import { errorText } from "./request";
 import {
   Field,
@@ -107,7 +107,8 @@ export interface EgressServiceEditorProps {
    * Add mode only: add a service that only limits GitHub repositories, which
    * has no key or account of its own, named after the first free
    * `github-limited` name. Editing a service that is restrict-only opens the
-   * same form.
+   * same form, with the repository list when that list writes back exactly
+   * the limit's rules, and with the rule fields otherwise.
    */
   initialRestrictOnly?: boolean;
   context: EditorContext;
@@ -228,6 +229,8 @@ export function EgressServiceEditor({
   // The repositories typed in the helper, which a save applies when the person
   // did not. A limit that is edited starts with the ones it is limited to, and
   // with the labels the helper wrote for them, which follow a changed list.
+  // A limit the helper cannot write back exactly keeps its own rules, which
+  // the rule fields edit instead.
   const [restored] = useState(() => restoredHelperInput(service));
   const helperLabels = useRef<HelperLabels>(restored.labels);
   const [helperInput, setHelperInput] = useState<HelperInput>(restored.input);
@@ -235,7 +238,7 @@ export function EgressServiceEditor({
   // The choices the form's rules were last written from, so a save writes
   // them anew only after they change and keeps rules edited by hand until then.
   const appliedHelper = useRef<string | null>(restored.applied);
-  const showGithubHelper = limiting || looksLikeGithub(form);
+  const showGithubHelper = limiting ? restored.exact : looksLikeGithub(form);
   const settings = { editing, takenNames: openedWithNames, service };
 
   // Writes the typed repositories into the form, or shows why they cannot be.
@@ -617,20 +620,32 @@ export function EgressServiceEditor({
           bypass={bypass}
         />
       )}
-      {limiting && (
+      {limiting && !showGithubHelper && (
         <>
-          {!restored.exact && (
-            <p role="status" className={warningClass}>
-              Some rules of this limit are not repositories from the list.
-              Changing the list replaces them.
-            </p>
-          )}
-          {scope !== undefined && context === "personal" && (
-            <p className="text-xs text-muted-foreground">
-              {administratorLimitNote(scope)}
-            </p>
-          )}
+          <div className="max-w-md">
+            <RuleHostField {...ruleEditing(0, primaryRule)} />
+          </div>
+          <RulesSection
+            id={`${id}-limit-rules`}
+            form={form}
+            set={set}
+            problemAt={problemAt}
+            disabled={disabled}
+            context={context}
+            validation={validation}
+            ruleEditing={ruleEditing}
+            sendsKey={false}
+          />
+          <p className="text-xs text-muted-foreground">
+            Requests to these hosts whose path matches none of these rules are
+            refused. Your key or connected account stays the same.
+          </p>
         </>
+      )}
+      {limiting && scope !== undefined && context === "personal" && (
+        <p className="text-xs text-muted-foreground">
+          {administratorLimitNote(scope)}
+        </p>
       )}
 
       {!limiting && (

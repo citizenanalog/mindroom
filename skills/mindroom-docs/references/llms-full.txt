@@ -18378,7 +18378,8 @@ A new limit is named `github-limited` (or the first free `github-limited-N`).
 It takes the repositories with a **GraphQL** choice and always limits `uploads.github.com` to the same repositories.
 It has no key, and **Save limit** never sends one.
 The usual caps on a service's rules (50) and size (16 KiB) apply, so a limit holds at most 12 `owner/repo` lines (4 rules each) or 16 `owner/*` lines (3 rules each).
-Changing a limit reads the repositories and the GraphQL choice back from its rules. When the stored rules are not exactly what the helper writes, the editor warns that changing the list replaces them, and saving without changing anything writes the stored rules back untouched.
+Changing a limit reads the repositories and the GraphQL choice back from its rules when they are exactly what the helper writes.
+Any other limit, such as a path limit on another website or a GitHub limit with a rule that names no repository or sets a port, opens in the ordinary website, path prefix, and port fields instead, with no way to send a key, and saving without changing anything writes its rules back untouched.
 **Remove limit** asks first, because every agent in the limit's scope can then reach every repository the key or connected account allows.
 
 On the personal page's rows:

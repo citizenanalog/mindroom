@@ -295,9 +295,11 @@ export function RuleSendFields({
   );
 }
 
-/** A rule beyond the first, with all its fields. */
-export function ExtraRule(props: RuleEditing & { onRemove: () => void }) {
-  const { onRemove, ...editing } = props;
+/** A rule beyond the first, with all its fields; a limit's rule sends no key, so it has no way to send one. */
+export function ExtraRule(
+  props: RuleEditing & { onRemove: () => void; sendsKey?: boolean },
+) {
+  const { onRemove, sendsKey = true, ...editing } = props;
   const label = `Rule ${editing.index + 1}`;
   return (
     <li
@@ -321,9 +323,11 @@ export function ExtraRule(props: RuleEditing & { onRemove: () => void }) {
         <RuleHostField {...editing} />
         <RulePathAndPortFields {...editing} />
       </div>
-      <div className="grid gap-3 sm:grid-cols-3">
-        <RuleSendFields {...editing} />
-      </div>
+      {sendsKey && (
+        <div className="grid gap-3 sm:grid-cols-3">
+          <RuleSendFields {...editing} />
+        </div>
+      )}
     </li>
   );
 }

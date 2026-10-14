@@ -64,6 +64,84 @@ function restrictHelp(
 }
 
 /**
+ * The first rule's path and port, every other rule, and Add rule; the first
+ * rule's host is in the basic form. A limit's rules send no key, so they have
+ * no way to send one.
+ */
+export function RulesSection({
+  id,
+  form,
+  set,
+  problemAt,
+  disabled,
+  context,
+  validation,
+  ruleEditing,
+  sendsKey = true,
+}: {
+  /** The id of the section's heading. */
+  id: string;
+  form: EgressServiceForm;
+  set: (changes: Partial<EgressServiceForm>) => void;
+  problemAt: (field: string) => string | undefined;
+  disabled: boolean;
+  context: EditorContext;
+  /** What the server checks on save, for the most rules; `null` until it says. */
+  validation: EgressValidation | null;
+  ruleEditing: (index: number, rule: RuleForm) => RuleEditing;
+  sendsKey?: boolean;
+}) {
+  const rulesProblem = problemAt("rules");
+  return (
+    <section aria-labelledby={id} className="space-y-3">
+      <h4 id={id} className="text-sm font-medium">
+        Paths and extra rules
+      </h4>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <RulePathAndPortFields
+          {...ruleEditing(0, form.rules[0] ?? emptyRule())}
+        />
+      </div>
+      <ul className="space-y-3">
+        {form.rules.slice(1).map((rule, offset) => (
+          <ExtraRule
+            // Rules have no identity beyond their position.
+            key={offset + 1}
+            {...ruleEditing(offset + 1, rule)}
+            sendsKey={sendsKey}
+            onRemove={() =>
+              set({
+                rules: form.rules.filter((_, i) => i !== offset + 1),
+              })
+            }
+          />
+        ))}
+      </ul>
+      {rulesProblem && (
+        // No field holds this problem, so the message takes the focus.
+        <p tabIndex={-1} data-problem-focus="" className={errorClass}>
+          {rulesProblem}
+        </p>
+      )}
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={
+          disabled ||
+          (context === "personal" &&
+            validation !== null &&
+            form.rules.length >= validation.max_rules_per_service)
+        }
+        onClick={() => set({ rules: [...form.rules, emptyRule()] })}
+      >
+        Add rule
+      </Button>
+    </section>
+  );
+}
+
+/**
  * Everything the basic form leaves out: display name and description, the
  * preset's rules, paths and extra rules, the restriction, the account login,
  * and the placeholders.
@@ -109,15 +187,12 @@ export function MoreOptions({
   /** The service is being added, so an empty display name is saved as its host; an edited one keeps none. */
   newService: boolean;
 }) {
-  const isPersonal = context === "personal";
-  const primaryRule = form.rules[0] ?? emptyRule();
-  const primaryHost = primaryRule.host.trim().toLowerCase();
+  const primaryHost = (form.rules[0]?.host ?? "").trim().toLowerCase();
   const displayNameHint = preset
     ? `Leave empty to use ${preset.display_name}.`
     : primaryHost && newService
       ? `Leave empty to use ${primaryHost}.`
       : undefined;
-  const rulesProblem = problemAt("rules");
   // The server's placeholder rules the hint spells out; `null` until they load or when they could not be loaded.
   const placeholderRules = validation?.placeholder ?? null;
   const setPlaceholder = (index: number, placeholder: PlaceholderForm) =>
@@ -220,48 +295,16 @@ export function MoreOptions({
       )}
 
       {usesOwnRules(form) && (
-        <section aria-labelledby={`${id}-rules`} className="space-y-3">
-          <h4 id={`${id}-rules`} className="text-sm font-medium">
-            Paths and extra rules
-          </h4>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <RulePathAndPortFields {...ruleEditing(0, primaryRule)} />
-          </div>
-          <ul className="space-y-3">
-            {form.rules.slice(1).map((rule, offset) => (
-              <ExtraRule
-                // Rules have no identity beyond their position.
-                key={offset + 1}
-                {...ruleEditing(offset + 1, rule)}
-                onRemove={() =>
-                  set({
-                    rules: form.rules.filter((_, i) => i !== offset + 1),
-                  })
-                }
-              />
-            ))}
-          </ul>
-          {rulesProblem && (
-            // No field holds this problem, so the message takes the focus.
-            <p tabIndex={-1} data-problem-focus="" className={errorClass}>
-              {rulesProblem}
-            </p>
-          )}
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={
-              disabled ||
-              (isPersonal &&
-                validation !== null &&
-                form.rules.length >= validation.max_rules_per_service)
-            }
-            onClick={() => set({ rules: [...form.rules, emptyRule()] })}
-          >
-            Add rule
-          </Button>
-        </section>
+        <RulesSection
+          id={`${id}-rules`}
+          form={form}
+          set={set}
+          problemAt={problemAt}
+          disabled={disabled}
+          context={context}
+          validation={validation}
+          ruleEditing={ruleEditing}
+        />
       )}
 
       <div className="space-y-1">

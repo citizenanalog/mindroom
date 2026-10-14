@@ -2543,32 +2543,116 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     );
     expect(screen.queryByLabelText(/Also allow uploads.github.com/)).toBeNull();
     expect(screen.getByLabelText(/Also allow GraphQL/)).toBeChecked();
-    expect(screen.queryByText(/Changing the list replaces them/)).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onSave).toHaveBeenCalledWith("github-limited", stored);
   });
 
-  it("warns that changing the list replaces rules it cannot show, and keeps them until then", async () => {
-    const odd: AuthoredEgressService = storedLimit("a/b", {
-      rules: [
-        ...limitRules("a/b"),
-        { host: "api.github.com", path_prefix: "/user" },
-      ],
-    });
+  const ownRulesLimit = (
+    rules: AuthoredEgressService["rules"],
+  ): AuthoredEgressService => ({
+    rules,
+    restrict_to_rules: true,
+    restrict_only: true,
+  });
+
+  it.each<[string, AuthoredEgressService]>([
+    [
+      "a path limit on another website",
+      ownRulesLimit([
+        { host: "www.googleapis.com", path_prefix: "/drive/v3/files" },
+      ]),
+    ],
+    [
+      "a GitHub limit that names no repository",
+      ownRulesLimit([{ host: "api.github.com", path_prefix: "/user" }]),
+    ],
+    [
+      "repositories with a rule the list cannot show",
+      storedLimit("a/b", {
+        rules: [
+          ...limitRules("a/b"),
+          { host: "api.github.com", path_prefix: "/user" },
+        ],
+      }),
+    ],
+    [
+      "repositories with a port the list cannot show",
+      storedLimit("a/b", {
+        rules: limitRules("a/b").map((rule, index) =>
+          index === 0 ? { ...rule, port: 8443 } : rule,
+        ),
+      }),
+    ],
+  ])(
+    "opens %s in the rule fields instead of the repository list, and saves it unchanged",
+    async (_case, stored) => {
+      const { onSave } = await renderLimit({
+        name: "my-limit",
+        service: stored,
+      });
+      expect(
+        screen.getByRole("form", { name: "Change limit" }),
+      ).toBeInTheDocument();
+      expect(screen.queryByLabelText("GitHub repositories")).toBeNull();
+      const [first, second] = stored.rules!;
+      expect(screen.getByLabelText("Website")).toHaveValue(first.host);
+      // Every rule's Path prefix field has that label; the first rule's comes first.
+      expect(screen.getAllByLabelText("Path prefix")[0]).toHaveValue(
+        first.path_prefix,
+      );
+      if (second)
+        expect(screen.getByLabelText("Rule 2 host")).toHaveValue(second.host);
+      // A limit sends no key, so its rules have no way to send one.
+      for (const label of ["Send the key as", "API key", "Preset"])
+        expect(screen.queryAllByLabelText(label)).toHaveLength(0);
+      expect(screen.queryByLabelText("Rule 2 auth type")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(onSave).toHaveBeenCalledWith("my-limit", stored);
+    },
+  );
+
+  it("edits the rules of a limit the repository list cannot write, and adds one, without a key", async () => {
     const { onSave } = await renderLimit({
-      name: "github-limited",
-      service: odd,
+      name: "drive-limited",
+      service: ownRulesLimit([
+        { host: "www.googleapis.com", path_prefix: "/drive/v3/files" },
+      ]),
     });
-    const warning = screen.getByText(
-      "Some rules of this limit are not repositories from the list. Changing the list replaces them.",
-    );
-    expect(warning).toBeVisible();
-    expect(warning).toHaveAttribute("role", "status");
+    type("Path prefix", "/drive/v3/files/abc");
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    type("Rule 2 host", "www.googleapis.com");
+    type("Rule 2 path prefix", "/upload/drive/v3/files/abc");
     fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    expect(onSave).toHaveBeenCalledWith("github-limited", odd);
+    expect(onSave).toHaveBeenCalledWith(
+      "drive-limited",
+      ownRulesLimit([
+        { host: "www.googleapis.com", path_prefix: "/drive/v3/files/abc" },
+        {
+          host: "www.googleapis.com",
+          path_prefix: "/upload/drive/v3/files/abc",
+        },
+      ]),
+    );
+  });
+
+  it("checks the rule fields of such a limit before it saves", async () => {
+    const { onSave } = await renderLimit({
+      name: "drive-limited",
+      service: ownRulesLimit([
+        { host: "www.googleapis.com", path_prefix: "/drive/v3/files" },
+      ]),
+    });
+    type("Website", "");
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    expect(screen.getByLabelText("Website")).toHaveAccessibleDescription(
+      /Host is required/,
+    );
+    expect(screen.getByLabelText("Website")).toHaveFocus();
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   it("is not unsaved changes until the repositories change", async () => {

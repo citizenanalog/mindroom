@@ -103,6 +103,14 @@ describe("the choices behind a limit's rules", () => {
     expect(odd.exact).toBe(false);
     // A rule missing from what the helper would write is not exact either.
     expect(parseGithubLimit(summarized("a/b").slice(0, 2)).exact).toBe(false);
+    // Nor is a rule with a port, which the helper never writes.
+    expect(
+      parseGithubLimit(
+        summarized("a/b").map((item, index) =>
+          index === 0 ? { ...item, port: 8443 } : item,
+        ),
+      ).exact,
+    ).toBe(false);
   });
 
   it("has nothing to read in rules that name no repository", () => {
