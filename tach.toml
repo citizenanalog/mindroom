@@ -1579,6 +1579,7 @@ depends_on = [
     "mindroom.api.connection_agents",
     "mindroom.api.oauth",
     "mindroom.config.egress_broker",
+    "mindroom.constants",
     "mindroom.egress_broker",
 ]
 

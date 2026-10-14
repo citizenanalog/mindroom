@@ -14,10 +14,12 @@ from fastapi.routing import APIRoute
 from mindroom.api import egress_status, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.egress_broker import EgressService
+from mindroom.constants import EXECUTION_ENV_TOOL_NAMES
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.user_services import save_user_service
+from mindroom.tool_system import sandbox_proxy
 from tests.api.test_api import (
     _trusted_upstream_jwks,
     _trusted_upstream_jwt,
@@ -280,6 +282,22 @@ def test_services_listing_names_the_agents_whose_keys_the_dashboard_sets(egress_
 
     assert _key_targets(client) == (["preset_team"], False)
     assert _key_targets(client, "preset_team") == (["preset_team"], False)
+
+
+def test_services_listing_names_agents_by_the_tools_that_get_the_broker_environment(
+    egress_config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent uses the broker when it has any tool the sandbox proxy gives the broker environment.
+
+    Both read one list, so a tool added there makes its agents eligible without a second edit.
+    """
+    assert egress_status.EXECUTION_ENV_TOOL_NAMES is sandbox_proxy.EXECUTION_ENV_TOOL_NAMES
+    tools = sorted({*EXECUTION_ENV_TOOL_NAMES, "calculator"})
+    monkeypatch.setattr(egress_status, "EXECUTION_ENV_TOOL_NAMES", frozenset(tools))
+    agents = {f"{tool}_team": _agent([tool], worker_scope="shared") for tool in tools}
+
+    assert _key_targets(_client_with_agents(egress_config_file, agents)) == (sorted(agents), False)
 
 
 @pytest.mark.parametrize(
