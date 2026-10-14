@@ -18385,7 +18385,7 @@ Any other limit, such as a path limit on another website or a GitHub limit with 
 On the personal page's rows:
 
 - The administrator's GitHub row shows "Limited to {repos}" with **Change limit** and **Remove limit** once the user has a limit that shares one of its hosts, and offers **Limit to repositories** only until then.
-- While another service of the user's own that is not a limit has a rule on one of the limit's hosts, the row reads "The limit to {repos} has no effect while {services} also allows requests to {hosts}." instead, and the limit editor's help says "This limit has no effect while {services} also allows requests to {hosts}.", because the broker lets a request past the user's limit when any of the user's rules matches it.
+- While another service of the user's own that is not a limit has a rule on one of the limit's hosts, the row reads "Limited to {repos}. {services} also has rules on {hosts}. A request is allowed when any of your own rules allows it.", and the limit editor's help adds the last two sentences, because the broker lets a request past the user's limit when any of the user's rules matches it. The page compares hosts only, not paths or ports, so it does not say whether the limit still refuses anything.
 - The limit is also a row of its own, with a "Limit only" badge and the same two actions.
 
 ## Connections pages

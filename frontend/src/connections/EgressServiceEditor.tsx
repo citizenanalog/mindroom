@@ -41,7 +41,7 @@ import {
   ruleField,
   validateService,
 } from "./egressServiceValidation";
-import { hostPort, limitBypass } from "./egressRowText";
+import { hostPort, limitOverlap } from "./egressRowText";
 import { looksLikeGithub } from "./githubLimits";
 import {
   GITHUB_API_HOST,
@@ -390,14 +390,14 @@ export function EgressServiceEditor({
   const overlaps = limiting
     ? []
     : overlapWarnings(form, preset, agentServices, name);
-  // Another service of the user's that keeps the GitHub hosts a limit, or the
-  // repositories applied to this service, cover open.
-  const bypass = limiting
-    ? limitBypass(
+  // Another service of the user's with rules on the GitHub hosts a limit, or
+  // the repositories applied to this service, cover.
+  const overlap = limiting
+    ? limitOverlap(
         [GITHUB_API_HOST, GITHUB_UPLOADS_HOST, GITHUB_WEB_HOST],
         agentServices,
       )
-    : limitBypass(
+    : limitOverlap(
         [GITHUB_API_HOST, GITHUB_WEB_HOST],
         agentServices.filter((other) => other.name !== name),
       );
@@ -617,7 +617,7 @@ export function EgressServiceEditor({
           errors={helperErrors}
           onApply={limiting ? undefined : applyHelper}
           limit={limiting}
-          bypass={bypass}
+          overlap={overlap}
         />
       )}
       {limiting && !showGithubHelper && (

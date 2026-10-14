@@ -666,14 +666,15 @@ describe("the GitHub helper in the editor", () => {
         ...changes,
       });
 
-    it("says other paths are not refused, instead of saying they are", async () => {
+    it("notes that it has rules there too, instead of saying other API paths stop working", async () => {
       await renderGithub({ agentServices: [own()] });
       expect(
         screen.getByText(
-          /Applying replaces the rules above with rules for just those repositories \(API and git over HTTPS\)\. Other paths on api\.github\.com and github\.com are not refused while My GitHub also allows requests to api\.github\.com and github\.com\./,
+          /Applying replaces the rules above with rules for just those repositories \(API and git over HTTPS\) and refuses every other path on api\.github\.com and github\.com\. My GitHub also has rules on api\.github\.com and github\.com\. A request is allowed when any of your own rules allows it\./,
         ),
       ).toBeVisible();
-      expect(screen.queryByText(/refuses every other path/)).toBeNull();
+      expect(screen.queryByText(/stop working/)).toBeNull();
+      expect(screen.queryByText(/not refused/)).toBeNull();
     });
 
     it("keeps saying they are refused for a limit, the administrator's service, and the service itself", async () => {

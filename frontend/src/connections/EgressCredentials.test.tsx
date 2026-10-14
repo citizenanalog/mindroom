@@ -2225,23 +2225,37 @@ describe("limiting a GitHub service to repositories", () => {
     ).toBeNull();
   });
 
-  it("says the limit has no effect while another service of yours allows the same hosts", async () => {
-    // The broker lets a request past the user's limit when any of the user's rules matches it.
-    listing[0].services.push(
-      limited("github-limited", "basnijholt/agent-cli"),
-      mine(),
-    );
-    render(<EgressCredentials />);
-    const row = await githubRow();
-    expect(
-      within(row).getByText(
-        "The limit to basnijholt/agent-cli has no effect while My GitHub also allows requests to api.github.com and github.com.",
-      ),
-    ).toBeVisible();
-    expect(within(row).queryByText(/^Limited to/)).toBeNull();
-  });
+  // The broker lets a request past the user's limit when any of the user's
+  // rules matches it, and the page compares hosts only, not paths or ports.
+  const OVERLAP =
+    "My GitHub also has rules on api.github.com and github.com. A request is allowed when any of your own rules allows it.";
 
-  it("says so in the limit's form too, instead of what it refuses", async () => {
+  it.each<[string, EgressCredentialService["rules"]]>([
+    ["every path", githubRules],
+    [
+      "only the limit's repository",
+      ruleSummaries([
+        { host: "api.github.com", path_prefix: "/repos/basnijholt/agent-cli" },
+        { host: "github.com", path_prefix: "/basnijholt/agent-cli" },
+      ]),
+    ],
+  ])(
+    "notes another service of yours with rules on the limit's hosts on %s, without saying what the limit does",
+    async (_case, rules) => {
+      listing[0].services.push(
+        limited("github-limited", "basnijholt/agent-cli"),
+        { ...mine(), rules },
+      );
+      render(<EgressCredentials />);
+      const row = await githubRow();
+      expect(
+        within(row).getByText(`Limited to basnijholt/agent-cli. ${OVERLAP}`),
+      ).toBeVisible();
+      expect(within(row).queryByText(/has no effect/)).toBeNull();
+    },
+  );
+
+  it("notes it in the limit's form too, after what the limit refuses", async () => {
     listing[0].services.push(mine());
     render(<EgressCredentials />);
     fireEvent.click(
@@ -2254,10 +2268,12 @@ describe("limiting a GitHub service to repositories", () => {
     });
     expect(
       within(form).getByText(
-        /This limit has no effect while My GitHub also allows requests to api\.github\.com and github\.com\./,
+        new RegExp(
+          `are refused, and so are other API paths, such as /user or search\\. ${OVERLAP.replace(/\./g, "\\.")} Your key or connected account stays the same\\.`,
+        ),
       ),
     ).toBeVisible();
-    expect(within(form).queryByText(/are refused/)).toBeNull();
+    expect(within(form).queryByText(/has no effect/)).toBeNull();
   });
 
   it("lists the limit itself under what the user added, with its own Change and Remove", async () => {

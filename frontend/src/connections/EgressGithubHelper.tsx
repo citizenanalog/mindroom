@@ -133,7 +133,7 @@ export function GithubHelper({
   errors,
   onApply,
   limit = false,
-  bypass = null,
+  overlap = null,
 }: {
   input: HelperInput;
   onInput: (input: HelperInput) => void;
@@ -143,8 +143,8 @@ export function GithubHelper({
   onApply?: () => void;
   /** The service only limits paths, so the text says what the limit does and not what is replaced. */
   limit?: boolean;
-  /** Why what the text says is refused is not, as `limitBypass` words it, which the text then says instead. */
-  bypass?: string | null;
+  /** The note `limitOverlap` gives on the user's other services with rules on these hosts, which the text adds. */
+  overlap?: string | null;
 }) {
   const id = useId();
   return (
@@ -161,12 +161,8 @@ export function GithubHelper({
           One repository per line, as owner/repo, or owner/* for everything an
           owner has.{" "}
           {limit
-            ? bypass
-              ? `This limit has no effect while ${bypass}. Your key or connected account stays the same.`
-              : "Requests to api.github.com, uploads.github.com, and github.com (API, release assets, and git over HTTPS) for any other repository are refused, and so are other API paths, such as /user or search. Your key or connected account stays the same."
-            : bypass
-              ? `Applying replaces the rules above with rules for just those repositories (API and git over HTTPS). Other paths on api.github.com and github.com are not refused while ${bypass}.`
-              : "Applying replaces the rules above with rules for just those repositories (API and git over HTTPS) and refuses every other path on api.github.com and github.com. Other API paths, such as /user or search, stop working."}{" "}
+            ? `Requests to api.github.com, uploads.github.com, and github.com (API, release assets, and git over HTTPS) for any other repository are refused, and so are other API paths, such as /user or search. ${overlap ? `${overlap} ` : ""}Your key or connected account stays the same.`
+            : `Applying replaces the rules above with rules for just those repositories (API and git over HTTPS) and refuses every other path on api.github.com and github.com. ${overlap ?? "Other API paths, such as /user or search, stop working."}`}{" "}
           Matching is case sensitive, so write names as they appear in GitHub
           URLs.
         </p>
