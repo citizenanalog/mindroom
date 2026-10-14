@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import click
@@ -27,6 +28,7 @@ def select[Value: str](message: str, choices: Sequence[tuple[Value, str]]) -> Va
 
     The first choice is the default; questionary would mark any other default as picked next to the pointer.
     """
+    _discard_typeahead()
     if _arrow_keys_work():
         import questionary  # noqa: PLC0415  # lazy: prompt_toolkit loads only for prompts
 
@@ -45,6 +47,7 @@ def select[Value: str](message: str, choices: Sequence[tuple[Value, str]]) -> Va
 
 def secret(message: str) -> str:
     """Return hidden text typed after `message`, or an empty string when Enter is pressed alone."""
+    _discard_typeahead()
     if _arrow_keys_work():
         import questionary  # noqa: PLC0415  # lazy: prompt_toolkit loads only for prompts
 
@@ -54,10 +57,12 @@ def secret(message: str) -> str:
 
 def confirm(message: str, *, default: bool) -> bool:
     """Return whether the yes/no question was answered yes."""
+    _discard_typeahead()
     if _arrow_keys_work():
         import questionary  # noqa: PLC0415  # lazy: prompt_toolkit loads only for prompts
 
-        return _ask(questionary.confirm(message, default=default)) is True
+        # Like a line prompt, an answer waits for Enter; otherwise the Enter typed after `y` answers the next question.
+        return _ask(questionary.confirm(message, default=default, auto_enter=False)) is True
     return typer.confirm(message, default=default)
 
 
@@ -71,8 +76,30 @@ def _arrow_keys_work() -> bool:
     return terminal_is_interactive() and os.environ.get("TERM", "").lower() not in {"dumb", "unknown"}
 
 
+def _discard_typeahead() -> None:
+    """Drop keys typed into the terminal before a prompt appeared, such as an Enter pressed while pairing waited.
+
+    Piped input is no terminal, so answers piped in ahead of time stay.
+    """
+    # Each platform imports only its own terminal module, which the other platform lacks.
+    if sys.platform == "win32":
+        import msvcrt  # noqa: PLC0415
+
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+        return
+    import termios  # noqa: PLC0415
+
+    with suppress(OSError, termios.error):
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+
 def _ask(question: Question) -> object:
     """Ask `question`, raising `typer.Abort` on Ctrl+C or end of input the way typer's prompts do."""
+    from prompt_toolkit.input.typeahead import clear_typeahead  # noqa: PLC0415  # lazy: loaded with questionary
+
+    # prompt_toolkit replays keys an earlier prompt read but did not use, such as a second Enter; they are not answers.
+    clear_typeahead(question.application.input)
     try:
         return question.unsafe_ask()
     except (KeyboardInterrupt, EOFError):

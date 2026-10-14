@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import pty
+import select
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -60,12 +63,28 @@ def test_secret_returns_empty_text_on_enter(keys: Callable[[str], None]) -> None
     assert interactive.secret("API key") == ""
 
 
-@pytest.mark.parametrize(("typed", "expected"), [("n", False), ("y", True), (_ENTER, True)])
+@pytest.mark.parametrize(("typed", "expected"), [("n" + _ENTER, False), ("y" + _ENTER, True), (_ENTER, True)])
 def test_confirm_reads_yes_no_and_the_default(keys: Callable[[str], None], typed: str, expected: bool) -> None:
-    """A key answers the question directly, and Enter takes the default."""
+    """An answer is confirmed with Enter, as in a line prompt, and Enter alone takes the default."""
     keys(typed)
 
     assert interactive.confirm("Continue?", default=True) is expected
+
+
+def test_confirm_answer_waits_for_enter(keys: Callable[[str], None]) -> None:
+    """A yes/no answer counts only on Enter, so a corrected key wins and nothing is left for the next question."""
+    keys("y" + "n" + _ENTER)
+
+    assert interactive.confirm("Is this your account?", default=True) is False
+
+
+def test_confirm_answers_only_its_own_question(keys: Callable[[str], None]) -> None:
+    """Keys left after an answer, such as a second Enter, must not answer the next question, such as a login service."""
+    keys("y" + _ENTER + _ENTER)
+    assert interactive.confirm("Is this your account?", default=True) is True
+
+    keys("n" + _ENTER)
+    assert interactive.confirm("Run MindRoom in the background?", default=True) is False
 
 
 @pytest.mark.parametrize(
@@ -114,3 +133,63 @@ def test_dumb_terminals_get_line_prompts(monkeypatch: pytest.MonkeyPatch, term: 
     monkeypatch.setenv("TERM", term)
 
     assert interactive._arrow_keys_work() is expected
+
+
+def test_keys_typed_before_a_prompt_are_not_its_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An Enter pressed while pairing waits must not accept "Is this your account?" once it appears."""
+    primary, secondary = pty.openpty()
+    with os.fdopen(secondary, "r") as terminal_input:
+        monkeypatch.setattr(sys, "stdin", terminal_input)
+        os.write(primary, b"\r")
+        assert select.select([terminal_input], [], [], 1)[0]
+
+        interactive._discard_typeahead()
+
+        assert not select.select([terminal_input], [], [], 0)[0]
+    os.close(primary)
+
+
+def test_every_prompt_discards_typeahead_before_asking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each prompt drops earlier keys before it reads, so none of them answers with a stray Enter."""
+    events: list[str] = []
+
+    def ask(*_args: object, default: object, **_kwargs: object) -> object:
+        events.append("ask")
+        return default
+
+    monkeypatch.setattr(interactive, "_discard_typeahead", lambda: events.append("discard"))
+    monkeypatch.setattr(typer, "prompt", ask)
+    monkeypatch.setattr(typer, "confirm", ask)
+
+    interactive.select("Provider?", _CHOICES)
+    interactive.secret("API key")
+    interactive.confirm("Continue?", default=True)
+
+    assert events == ["discard", "ask"] * 3
+
+
+def test_windows_drains_the_console_input_without_termios(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows has no termios, so the keys waiting in the console are read off instead."""
+    waiting_keys = ["y", "\r"]
+    console_input = SimpleNamespace(kbhit=lambda: bool(waiting_keys), getwch=waiting_keys.pop)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "msvcrt", console_input)
+    # Importing termios would now raise, as it does on Windows.
+    monkeypatch.setitem(sys.modules, "termios", None)
+
+    interactive._discard_typeahead()
+
+    assert waiting_keys == []
+
+
+def test_piped_answers_survive_the_typeahead_discard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only terminal input is discarded; answers piped in ahead of time, as in `mindroom config init < answers`, stay."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, b"n\n")
+    os.close(write_end)
+    with os.fdopen(read_end, "r") as piped_input:
+        monkeypatch.setattr(sys, "stdin", piped_input)
+
+        interactive._discard_typeahead()
+
+        assert piped_input.readline() == "n\n"
