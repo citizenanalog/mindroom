@@ -1155,6 +1155,23 @@ describe("egress broker request log", () => {
     expect(searchParams.get("service")).toBe("github");
   });
 
+  it("filters the log by an agent's display name, as the table shows it", async () => {
+    render(<EgressBroker />);
+    await screen.findByRole("table", { name: "Request log" });
+
+    fireEvent.change(screen.getByLabelText("Filter by agent"), {
+      target: { value: " Agent coder " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() =>
+      expect(requests("/api/egress-broker/logs")).toHaveLength(2),
+    );
+    expect(
+      requests("/api/egress-broker/logs")[1].searchParams.get("agent_name"),
+    ).toBe("coder");
+  });
+
   it("keeps the log filter independent of the secret target", async () => {
     sharedCoder();
     render(<EgressBroker />);

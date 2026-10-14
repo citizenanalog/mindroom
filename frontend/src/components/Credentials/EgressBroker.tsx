@@ -602,7 +602,10 @@ function LogSection() {
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    void load(filters);
+    // The table shows display names, but the log stores agent ids.
+    const agent = filters.agent.trim();
+    const named = agents.find((entry) => entry.display_name === agent);
+    void load({ ...filters, agent: named?.id ?? agent });
   };
 
   const filterInput = (field: keyof LogFilters, label: string) => (
