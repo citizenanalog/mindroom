@@ -28,7 +28,11 @@ from mindroom.tool_system.declarations import (
     ToolMetadata,
     ToolValidationInfo,
 )
-from mindroom.tool_system.dependencies import auto_install_optional_extra_for_import_retry, ensure_tool_deps
+from mindroom.tool_system.dependencies import (
+    auto_install_optional_extra_for_import_retry,
+    ensure_tool_deps,
+    optional_dependency_environment,
+)
 from mindroom.tool_system.filters import tool_name_allowed
 from mindroom.tool_system.legacy_tool_overrides import retired_tool_override
 from mindroom.tool_system.registry_state import (
@@ -740,7 +744,8 @@ def _build_tool_instance(
         factory,
         tool_config_overrides=validated_tool_config_overrides,
     )
-    tool_class = factory()
+    with optional_dependency_environment():
+        tool_class = factory()
     resolved_credentials_manager = _resolve_tool_credentials_manager(
         metadata,
         runtime_paths,
@@ -787,7 +792,8 @@ def _build_tool_instance(
     )
     include_tools, exclude_tools = _pop_implicit_toolkit_filters(metadata, init_kwargs)
 
-    toolkit = cast("Any", tool_class)(**init_kwargs)
+    with optional_dependency_environment():
+        toolkit = cast("Any", tool_class)(**init_kwargs)
     _apply_implicit_toolkit_filters(
         toolkit,
         include_tools=include_tools,
