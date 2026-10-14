@@ -48,14 +48,10 @@ _SEGMENT_TAIL = re.compile(r"[;?#]")
 
 @dataclass(frozen=True)
 class RuleMatch:
-    """A matched rule with its service's name and definition: the rule whose service's credential is injected.
-
-    The secret resolver gets `definition` too, so it resolves a credential only while `service` still has it.
-    """
+    """A matched rule with its service name: the rule whose service's credential is injected."""
 
     service: str
     rule: EgressRule
-    definition: EgressService
 
     @property
     def auth(self) -> EgressAuth:
@@ -296,7 +292,7 @@ def _best_match(
 
     # `min` keeps the first of equal candidates, so one service's rules keep their order.
     service_name, rule = min(candidates, key=rank)
-    return RuleMatch(service=service_name, rule=rule, definition=services[service_name])
+    return RuleMatch(service=service_name, rule=rule)
 
 
 def _restricting_service(services: Mapping[str, EgressService], host: str, port: int) -> str | None:

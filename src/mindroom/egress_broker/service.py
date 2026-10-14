@@ -33,12 +33,11 @@ from mindroom.egress_broker.secrets import (
     Secret,
     SecretMissing,
     SecretResult,
-    SecretServiceChanged,
     load_secret,
     service_status,
 )
 from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
-from mindroom.egress_broker.user_services import consistent_read, effective_config
+from mindroom.egress_broker.user_services import effective_config
 from mindroom.logging_config import get_logger
 from mindroom.runtime_env_policy import (
     CREDENTIALS_ENCRYPTION_KEY_ENV,
@@ -51,7 +50,6 @@ from mindroom.worker_computer.browser_proxy import browser_egress, proxy_env_set
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
 
-    from mindroom.config.egress_broker import EgressService
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
@@ -248,28 +246,9 @@ class _LastGoodConfig:
         )
 
 
-def _routed_key(
-    config: EgressBrokerConfig,
-    credentials_manager: CredentialsManager,
-    target: ResolvedWorkerTarget,
-    name: str,
-    routed: EgressService,
-) -> Secret | SecretServiceChanged | None:
-    """Return the scope's key for `name` while its effective config still defines `name` as `routed`; None without one.
-
-    Under `consistent_read` no user-service or key write lands between the check and the read.
-    """
-    with consistent_read():
-        if effective_config(config, credentials_manager, target).services.get(name) != routed:
-            return SecretServiceChanged()
-        key = load_secret(credentials_manager, target, name)
-    return Secret(key) if key else None
-
-
 async def _resolve_secret(
     claims: WorkerClaims,
     name: str,
-    routed: EgressService,
     *,
     config: _LastGoodConfig,
     runtime_paths: RuntimePaths,
@@ -278,26 +257,24 @@ async def _resolve_secret(
 ) -> SecretResult:
     """Return the secret for service `name` in the claims' scope: the stored key, else the OAuth connection's token.
 
-    `routed` is the definition of `name` whose rule routed the request. The requester's effective config (the
-    config's services plus the scope's own) must still define `name` as `routed`, or the result is
-    `SecretServiceChanged`: a service or key saved since routing may be meant for other hosts. That check and the key
-    read run in one call on the loop's default executor (`_routed_key`); the OAuth lookup, which may refresh, then
-    runs on `oauth_executor` with the provider of the checked definition.
+    The service, a config service or one of the scope's own, comes from the requester's effective config. The key
+    and that config are read on the loop's default executor; the OAuth lookup, which may refresh, runs on
+    `oauth_executor`.
     """
     target = claims.to_worker_target()
+    if key := await asyncio.to_thread(load_secret, credentials_manager, target, name):
+        return Secret(key)
     current = config.current()
     if current is None:
-        # Without a config nothing defines `name`, so `routed` is not its definition.
-        return SecretServiceChanged()
-    stored = await asyncio.to_thread(_routed_key, current.egress_broker, credentials_manager, target, name, routed)
-    if stored is not None:
-        return stored
-    if routed.oauth_provider is None:
+        return SecretMissing()
+    egress = await asyncio.to_thread(effective_config, current.egress_broker, credentials_manager, target)
+    egress_service = egress.services.get(name)
+    if egress_service is None or egress_service.oauth_provider is None:
         return SecretMissing()
     lookup = functools.partial(
         resolve_oauth_token,
         service=name,
-        provider_id=routed.oauth_provider,
+        provider_id=egress_service.oauth_provider,
         config=current,
         runtime_paths=runtime_paths,
         credentials_manager=credentials_manager,

@@ -383,13 +383,6 @@ export function EgressServiceEditor({
           scopeAgents,
         )
       : null;
-  // A shared or unscoped service's key may be a teammate's, so the server deletes it when the rules change.
-  const newRulesRemoveKey =
-    context === "personal" &&
-    sharedTarget &&
-    editing &&
-    !limiting &&
-    agentServices.some((other) => other.name === name && other.key_configured);
   // The services this form would send a key to the same website as, for this agent.
   const overlaps = limiting
     ? []
@@ -609,11 +602,6 @@ export function EgressServiceEditor({
             />
           )}
         </Field>
-      )}
-      {newRulesRemoveKey && (
-        <p className="text-xs text-muted-foreground">
-          Saving changed rules removes the saved key, so it must be set again.
-        </p>
       )}
       {showGithubHelper && (
         <GithubHelper

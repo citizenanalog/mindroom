@@ -25,7 +25,6 @@ __all__ = [
     "SecretMissing",
     "SecretNeedsReconnect",
     "SecretResult",
-    "SecretServiceChanged",
     "SecretUnavailable",
     "delete_egress_document",
     "delete_secret",
@@ -35,7 +34,6 @@ __all__ = [
     "save_egress_document",
     "save_secret",
     "service_status",
-    "validate_secret",
 ]
 
 _MAX_SECRET_SIZE = 16 * 1024  # 16 KiB
@@ -136,24 +134,6 @@ def load_secret(
     return credentials.get("secret")
 
 
-def validate_secret(secret: str) -> None:
-    """Raise ValueError if the secret is empty/whitespace, over 16 KiB, or contains ASCII control characters."""
-    if not secret or not secret.strip():
-        msg = "Secret cannot be empty or whitespace"
-        raise ValueError(msg)
-
-    # Check for ASCII control characters (ord < 0x20 or 0x7f)
-    for char in secret:
-        char_ord = ord(char)
-        if char_ord < 0x20 or char_ord == 0x7F:
-            msg = f"Secret contains invalid control character (ord {char_ord})"
-            raise ValueError(msg)
-
-    if len(secret.encode("utf-8")) > _MAX_SECRET_SIZE:
-        msg = f"Secret size exceeds maximum of 16 KiB ({len(secret.encode('utf-8'))} bytes)"
-        raise ValueError(msg)
-
-
 def save_secret(
     manager: CredentialsManager,
     target: ResolvedWorkerTarget | None,
@@ -172,7 +152,21 @@ def save_secret(
     or contains ASCII control characters.
 
     """
-    validate_secret(secret)
+    # Validate secret
+    if not secret or not secret.strip():
+        msg = "Secret cannot be empty or whitespace"
+        raise ValueError(msg)
+
+    # Check for ASCII control characters (ord < 0x20 or 0x7f)
+    for char in secret:
+        char_ord = ord(char)
+        if char_ord < 0x20 or char_ord == 0x7F:
+            msg = f"Secret contains invalid control character (ord {char_ord})"
+            raise ValueError(msg)
+
+    if len(secret.encode("utf-8")) > _MAX_SECRET_SIZE:
+        msg = f"Secret size exceeds maximum of 16 KiB ({len(secret.encode('utf-8'))} bytes)"
+        raise ValueError(msg)
 
     # Build credential document with secret and timestamp
     credentials = {
@@ -236,15 +230,7 @@ class SecretUnavailable:
     provider: str
 
 
-@dataclass(frozen=True)
-class SecretServiceChanged:
-    """The service no longer has the definition whose rule routed the request, so its credential may be for other hosts.
-
-    Nothing is resolved; a retry is routed by the current definition.
-    """
-
-
-type SecretResult = Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable | SecretServiceChanged
+type SecretResult = Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable
 
 
 @dataclass(frozen=True)
