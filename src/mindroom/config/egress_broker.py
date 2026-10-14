@@ -231,7 +231,8 @@ class EgressService(BaseModel):
     restrict_to_rules: bool = Field(
         default=False,
         description=(
-            "Refuse requests to this service's hosts whose path matches no rule of any service (403 "
+            "Refuse requests to this service's hosts whose path matches no rule of the same party's services on that "
+            "host (the administrator's for a config service, the requester's own for a user service; 403 "
             "path_not_allowed) instead of forwarding them without credentials. GraphQL (/graphql) is then "
             "refused unless a rule lists it; a listed GraphQL endpoint reaches everything the credential can. "
             "Presets never set this"
