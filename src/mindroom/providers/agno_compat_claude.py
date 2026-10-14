@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 from mindroom.model_defaults import CLAUDE_PROVIDER_DEFAULT_SAMPLING_MODEL_SUFFIXES
@@ -395,7 +396,8 @@ def _inline_media_note(
     kind = block_dict.get("type")
     media_type = source.get("media_type")
     data = source.get("data") or ""
-    data_bytes = len(data.encode()) if source_type == "text" else len(data)
+    # The SDK sends text as escaped JSON, where a newline or quote takes two bytes.
+    data_bytes = len(json.dumps(data, ensure_ascii=False).encode()) if source_type == "text" else len(data)
     if kind == "document" and source_type == "base64" and media_type != _BASE64_DOCUMENT_MEDIA_TYPE:
         reason = f"Claude reads only PDF and plain-text documents inline, not {media_type}"
     elif kind == "image" and data_bytes > max_image_bytes:

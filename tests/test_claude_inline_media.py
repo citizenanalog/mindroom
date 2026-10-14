@@ -243,7 +243,7 @@ def test_text_documents_count_toward_the_request_size_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A plain-text document that would push the request past the provider body limit is described instead."""
+    """A plain-text document whose escaped JSON would push the request past the provider body limit is described."""
     monkeypatch.setattr(claude_prompt_cache, "MAX_INLINE_MEDIA_BYTES", 2000)
     http_client, bodies = _capturing_http_client()
     model = _loaded_claude(tmp_path, "anthropic", http_client)
@@ -252,7 +252,8 @@ def test_text_documents_count_toward_the_request_size_budget(
         content="Compare the exports.",
         files=[
             File(content=b"Short notes.", mime_type="text/plain", filename="notes.txt"),
-            File(content=b"row\n" * 1000, mime_type="text/csv", filename="export.csv"),
+            # 1.8 KB of raw text that escapes to 2.25 KB of JSON on the wire.
+            File(content=b"a,b\n" * 450, mime_type="text/csv", filename="export.csv"),
         ],
     )
 
