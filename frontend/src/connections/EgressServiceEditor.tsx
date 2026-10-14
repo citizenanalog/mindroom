@@ -625,6 +625,7 @@ export function EgressServiceEditor({
           onApply={limiting ? undefined : applyHelper}
           limit={limiting}
           overlap={overlap}
+          disabled={disabled}
         />
       )}
       {limiting && !showGithubHelper && (

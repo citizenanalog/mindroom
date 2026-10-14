@@ -134,6 +134,7 @@ export function GithubHelper({
   onApply,
   limit = false,
   overlap = null,
+  disabled = false,
 }: {
   input: HelperInput;
   onInput: (input: HelperInput) => void;
@@ -145,6 +146,8 @@ export function GithubHelper({
   limit?: boolean;
   /** The note `limitOverlap` gives on the user's other services with rules on these hosts, which the text adds. */
   overlap?: string | null;
+  /** While the service saves or deletes, so an edit made then is not lost when the editor closes. */
+  disabled?: boolean;
 }) {
   const id = useId();
   return (
@@ -173,6 +176,7 @@ export function GithubHelper({
         placeholder={"basnijholt/agent-cli\nmindroom-ai/*"}
         rows={3}
         className="font-mono text-xs aria-invalid:border-destructive"
+        disabled={disabled}
         value={input.repositories}
         onChange={(event) =>
           onInput({ ...input, repositories: event.target.value })
@@ -185,6 +189,7 @@ export function GithubHelper({
             type="checkbox"
             className="mt-0.5 h-4 w-4"
             checked={input.uploads}
+            disabled={disabled}
             onChange={(event) =>
               onInput({ ...input, uploads: event.target.checked })
             }
@@ -200,6 +205,7 @@ export function GithubHelper({
           type="checkbox"
           className="mt-0.5 h-4 w-4"
           checked={input.graphql}
+          disabled={disabled}
           onChange={(event) =>
             onInput({ ...input, graphql: event.target.checked })
           }
@@ -221,7 +227,13 @@ export function GithubHelper({
         </Alert>
       )}
       {onApply && (
-        <Button type="button" size="sm" variant="outline" onClick={onApply}>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={disabled}
+          onClick={onApply}
+        >
           Use these repositories
         </Button>
       )}

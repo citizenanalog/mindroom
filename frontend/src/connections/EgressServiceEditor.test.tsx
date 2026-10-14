@@ -80,6 +80,33 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("repository helper while saving", () => {
+  it("takes no edits until the save finishes, so none are lost when it closes", async () => {
+    let finish = () => {};
+    const onSave = vi.fn(
+      () =>
+        new Promise<undefined>(
+          (resolve) => (finish = () => resolve(undefined)),
+        ),
+    );
+    await renderGithub({ onSave });
+    enter("owner/*");
+    save();
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+
+    const helper = screen
+      .getByLabelText("GitHub repositories")
+      .closest("section") as HTMLElement;
+    expect(within(helper).getByLabelText("GitHub repositories")).toBeDisabled();
+    for (const checkbox of within(helper).getAllByRole("checkbox"))
+      expect(checkbox).toBeDisabled();
+    expect(
+      within(helper).getByRole("button", { name: "Use these repositories" }),
+    ).toBeDisabled();
+    finish();
+  });
+});
+
 describe("the editor form", () => {
   it("saves a custom service in its authored form", async () => {
     const { onSave } = await renderEditor();
