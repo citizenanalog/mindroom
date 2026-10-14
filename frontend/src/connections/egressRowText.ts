@@ -225,10 +225,11 @@ export function limitTarget(limit: EgressCredentialService): string {
 /**
  * A note on the viewer's other services that are not limits and have rules on
  * these hosts, as "My GitHub also has rules on api.github.com. A request is
- * allowed when any of your own rules allows it.", or null when none has. The
- * broker lets a request past the viewer's limit when any rule of the viewer's
- * matches it. Only hosts are compared, not paths or ports, so the note does
- * not say whether the limit still refuses anything.
+ * allowed when any of this agent's own services allows it.", or null when none
+ * has. The broker lets a request past a limit when any rule of the agent's own
+ * services (the user's, or on a shared agent its credential managers') matches
+ * it. Only hosts are compared, not paths or ports, so the note does not say
+ * whether the limit still refuses anything.
  */
 export function limitOverlap(
   hosts: readonly string[],
@@ -248,7 +249,7 @@ export function limitOverlap(
   if (open.length === 0) return null;
   const names = formatList(open.map((other) => other.display_name));
   const allowed = formatList([...new Set(open.flatMap(sharedHosts))]);
-  return `${names} also ${open.length === 1 ? "has" : "have"} rules on ${allowed}. A request is allowed when any of your own rules allows it.`;
+  return `${names} also ${open.length === 1 ? "has" : "have"} rules on ${allowed}. A request is allowed when any of this agent's own services allows it.`;
 }
 
 /**

@@ -670,7 +670,7 @@ describe("the GitHub helper in the editor", () => {
       await renderGithub({ agentServices: [own()] });
       expect(
         screen.getByText(
-          /Applying replaces the rules above with rules for just those repositories \(API and git over HTTPS\) and refuses every other path on api\.github\.com and github\.com\. My GitHub also has rules on api\.github\.com and github\.com\. A request is allowed when any of your own rules allows it\./,
+          /Applying replaces the rules above with rules for just those repositories \(API and git over HTTPS\) and refuses every other path on api\.github\.com and github\.com\. My GitHub also has rules on api\.github\.com and github\.com\. A request is allowed when any of this agent's own services allows it\./,
         ),
       ).toBeVisible();
       expect(screen.queryByText(/stop working/)).toBeNull();
@@ -2566,6 +2566,13 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
       ]),
     ],
     [
+      "a path limit stored without restrict_to_rules",
+      {
+        restrict_only: true,
+        rules: [{ host: "www.googleapis.com", path_prefix: "/drive/v3/files" }],
+      },
+    ],
+    [
       "a GitHub limit that names no repository",
       ownRulesLimit([{ host: "api.github.com", path_prefix: "/user" }]),
     ],
@@ -2614,6 +2621,35 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
       expect(onSave).toHaveBeenCalledWith("my-limit", stored);
     },
   );
+
+  it("shows a limit that takes its rules from a preset read-only, and saves it back as a preset", async () => {
+    const stored: AuthoredEgressService = {
+      preset: "google_drive",
+      restrict_only: true,
+    };
+    const onDelete = vi.fn(async () => undefined);
+    const { onSave } = await renderLimit({
+      name: "drive-limited",
+      service: stored,
+      onDelete,
+    });
+    expect(
+      screen.getByText(
+        "This limit uses the rules of the Google Drive preset, which cover www.googleapis.com/drive/, www.googleapis.com/upload/drive/. They cannot be changed here.",
+      ),
+    ).toBeVisible();
+    for (const label of [
+      "GitHub repositories",
+      "Website",
+      "Path prefix",
+      "Send the key as",
+    ])
+      expect(screen.queryAllByLabelText(label)).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Remove limit" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Save limit" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith("drive-limited", stored);
+  });
 
   it("edits the rules of a limit the repository list cannot write, and adds one, without a key", async () => {
     const { onSave } = await renderLimit({

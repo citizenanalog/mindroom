@@ -2228,7 +2228,7 @@ describe("limiting a GitHub service to repositories", () => {
   // The broker lets a request past the user's limit when any of the user's
   // rules matches it, and the page compares hosts only, not paths or ports.
   const OVERLAP =
-    "My GitHub also has rules on api.github.com and github.com. A request is allowed when any of your own rules allows it.";
+    "My GitHub also has rules on api.github.com and github.com. A request is allowed when any of this agent's own services allows it.";
 
   it.each<[string, EgressCredentialService["rules"]]>([
     ["every path", githubRules],

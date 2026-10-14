@@ -449,7 +449,12 @@ export function EgressServiceEditor({
     }
     setConfirmingSave(false);
     setBusy("save");
-    const authored = serializeService(current, options, service);
+    // A limit saved without a change goes back exactly as it was stored, so a
+    // preset stays a preset and nothing the form cannot show is lost.
+    const authored =
+      limiting && service !== null && !dirty
+        ? service
+        : serializeService(current, options, service);
     const signature = JSON.stringify([current.name, authored]);
     try {
       // The service goes first, and the key only after it is written.
@@ -622,20 +627,34 @@ export function EgressServiceEditor({
       )}
       {limiting && !showGithubHelper && (
         <>
-          <div className="max-w-md">
-            <RuleHostField {...ruleEditing(0, primaryRule)} />
-          </div>
-          <RulesSection
-            id={`${id}-limit-rules`}
-            form={form}
-            set={set}
-            problemAt={problemAt}
-            disabled={disabled}
-            context={context}
-            validation={validation}
-            ruleEditing={ruleEditing}
-            sendsKey={false}
-          />
+          {usesOwnRules(form) ? (
+            <>
+              <div className="max-w-md">
+                <RuleHostField {...ruleEditing(0, primaryRule)} />
+              </div>
+              <RulesSection
+                id={`${id}-limit-rules`}
+                form={form}
+                set={set}
+                problemAt={problemAt}
+                disabled={disabled}
+                context={context}
+                validation={validation}
+                ruleEditing={ruleEditing}
+                sendsKey={false}
+              />
+            </>
+          ) : (
+            // The form writes a limit's own rules, never a preset's, so these are only shown.
+            <p className="text-xs text-muted-foreground">
+              This limit uses the rules of the{" "}
+              {preset?.display_name ?? form.preset} preset
+              {preset
+                ? `, which cover ${preset.rules.map(ruleCoverage).join(", ")}`
+                : ""}
+              . They cannot be changed here.
+            </p>
+          )}
           <p className="text-xs text-muted-foreground">
             Requests to these hosts whose path matches none of these rules are
             refused. Your key or connected account stays the same.

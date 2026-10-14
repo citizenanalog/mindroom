@@ -208,15 +208,18 @@ export function validateService(
     // and the server checks them again, but a long list can still pass the
     // caps on a service's size. The form has no field for those, so they
     // are told in its alert. A limit the helper cannot write has its rules in
-    // the rule fields, which are checked like a service's.
-    if (form.rules.length === 0)
-      problems.push({
-        field: "rules",
-        message: "Enter at least one repository, such as owner/repo",
-      });
-    form.rules.forEach((rule, index) =>
-      problems.push(...ruleProblems(rule, index)),
-    );
+    // the rule fields, which are checked like a service's, or takes them from
+    // a preset, which has some.
+    if (usesOwnRules(form)) {
+      if (form.rules.length === 0)
+        problems.push({
+          field: "rules",
+          message: "Enter at least one repository, such as owner/repo",
+        });
+      form.rules.forEach((rule, index) =>
+        problems.push(...ruleProblems(rule, index)),
+      );
+    }
     const tooManyRules = tooManyRulesProblem(form, options);
     if (tooManyRules) problems.push({ field: "form", message: tooManyRules });
     problems.push(...sizeProblems(form, options, settings.service, problems));

@@ -566,13 +566,15 @@ It takes the repositories with a **GraphQL** choice and always limits `uploads.g
 It has no key, and **Save limit** never sends one.
 The usual caps on a service's rules (50) and size (16 KiB) apply, so a limit holds at most 12 `owner/repo` lines (4 rules each) or 16 `owner/*` lines (3 rules each).
 Changing a limit reads the repositories and the GraphQL choice back from its rules when they are exactly what the helper writes.
-Any other limit, such as a path limit on another website or a GitHub limit with a rule that names no repository or sets a port, opens in the ordinary website, path prefix, and port fields instead, with no way to send a key, and saving without changing anything writes its rules back untouched.
+Any other limit with rules of its own, such as a path limit on another website or a GitHub limit with a rule that names no repository or sets a port, opens in the ordinary website, path prefix, and port fields instead, with no way to send a key.
+A limit that takes its rules from a preset shows them read-only, with **Remove limit**.
+Saving a limit without changing anything writes it back exactly as stored, so a preset stays a preset.
 **Remove limit** asks first, because every agent in the limit's scope can then reach every repository the key or connected account allows.
 
 On the personal page's rows:
 
 - The administrator's GitHub row shows "Limited to {repos}" with **Change limit** and **Remove limit** once the user has a limit that shares one of its hosts, and offers **Limit to repositories** only until then.
-- While another service of the user's own that is not a limit has a rule on one of the limit's hosts, the row reads "Limited to {repos}. {services} also has rules on {hosts}. A request is allowed when any of your own rules allows it.", and the limit editor's help adds the last two sentences, because the broker lets a request past the user's limit when any of the user's rules matches it. The page compares hosts only, not paths or ports, so it does not say whether the limit still refuses anything.
+- While another service of the user's own that is not a limit has a rule on one of the limit's hosts, the row reads "Limited to {repos}. {services} also has rules on {hosts}. A request is allowed when any of this agent's own services allows it.", and the limit editor's help adds the last two sentences, because the broker lets a request past the limit when any rule of the agent's own services (the user's, or on a shared agent its credential managers') matches it. The page compares hosts only, not paths or ports, so it does not say whether the limit still refuses anything.
 - The limit is also a row of its own, with a "Limit only" badge and the same two actions.
 
 ## Connections pages
