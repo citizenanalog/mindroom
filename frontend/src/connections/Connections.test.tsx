@@ -1905,6 +1905,59 @@ describe("agent table summary, search, and order", () => {
     );
   });
 
+  it("follows a refreshed catalog for an agent that was opened and closed, as after a disconnect through another agent", async () => {
+    // Both agents use the requester's own Mail account.
+    let connected = true;
+    const agent = (name: string, display_name: string) =>
+      agentWith(name, display_name, {
+        services: [{ ...service, connected }],
+        egress_services: [],
+      });
+    installApi({
+      "/api/connections": async () =>
+        json({
+          agents: [
+            agent("personal", "Personal assistant"),
+            agent("research", "Research Team"),
+          ],
+        }),
+      "/api/connections/agents/personal/mail/status": async () =>
+        json({ ...status, connected }),
+      "/api/connections/agents/research/mail/status": async () =>
+        json({ ...status, connected }),
+      "/api/connections/agents/research/mail/disconnect": async () => {
+        connected = false;
+        return json({ status: "disconnected", provider: "mail" });
+      },
+    });
+    render(<Connections />);
+    await expandAgent();
+    await screen.findByRole("button", { name: "Disconnect for Mail" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Collapse Personal assistant" }),
+    );
+    await expandAgent("Research Team");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Disconnect for Mail" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Disconnect",
+      }),
+    );
+    await waitFor(() =>
+      expect(agentRow("Research Team")).toHaveTextContent(
+        "1 tools / 0 of 1 accounts and keys set",
+      ),
+    );
+    // The closed agent cannot load its status again, so the refreshed catalog decides.
+    await waitFor(() =>
+      expect(agentRow("Personal assistant")).toHaveTextContent(
+        "1 tools / 0 of 1 accounts and keys set",
+      ),
+    );
+  });
+
   const twoAgents = () => ({
     agents: [
       {

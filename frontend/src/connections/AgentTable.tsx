@@ -35,7 +35,8 @@ const accountKey = (agentName: string, provider: string) =>
  * How many of an agent's accounts and keys are set, out of all of them: its
  * connectable services plus its egress services. A service counts as connected
  * by the catalog, until its status loads (when the agent is opened) and says
- * otherwise, as after a connect or disconnect.
+ * otherwise, as after a connect or disconnect, and again once the catalog is
+ * read anew.
  */
 function accountCounts(agent: AgentTableRow) {
   // A service that only limits paths is neither an account nor a key.
@@ -258,6 +259,14 @@ export function AgentTable({
   const [search, setSearch] = useState("");
   const [scope, setScope] = useState("all");
   const [accounts, setAccounts] = useState<ConnectedAccounts>({});
+  // Statuses count only until the catalog arrives again: an agent that is
+  // closed cannot load its status again, so a fresh catalog replaces them,
+  // and a status that loads after it still corrects it.
+  const [accountsCatalog, setAccountsCatalog] = useState(agents);
+  if (accountsCatalog !== agents) {
+    setAccountsCatalog(agents);
+    setAccounts({});
+  }
   const onAccountStatus = useCallback(
     (agentName: string, provider: string, status: ConnectionStatus) =>
       setAccounts((known) =>
