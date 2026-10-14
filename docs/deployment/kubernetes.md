@@ -189,7 +189,8 @@ Set `egressBroker.enabled: true` in the runtime chart to let workers call authen
 The primary serves the broker on its own port behind a `<fullname>-egress-broker` Service, workers send their traffic through it, and it injects the secret stored for the matching service and worker scope.
 It runs in two modes:
 
-- **Direct mode** points workers at the broker Service. With `egressProxy` as well, the chart adds a worker egress rule for the broker port, and the broker reaches the internet through the operator proxy when the primary's `HTTPS_PROXY` is set.
+- **Direct mode** points workers at the broker Service.
+  With `egressProxy` as well, the chart adds a worker egress rule for the broker port, and the broker reaches the internet through the operator proxy when the primary's `HTTPS_PROXY` is set.
 - **Chain mode** (with `approvedEgress.enabled`) keeps the approved egress proxy as the first hop, so grants still apply, and renders the broker as Squid's parent.
 
 It requires `workers.backend: kubernetes` and cannot be combined with `workers.kubernetes.agentVault`.
@@ -197,8 +198,11 @@ It requires `workers.backend: kubernetes` and cannot be combined with `workers.k
 
 Users who have no dashboard access still manage their own egress on the personal Connections page at `/connections/egress`:
 
-- Their own services, which can narrow the administrator's egress policy but never widen it, including a GitHub "Limit to repositories" helper and a limit in place on the administrator's GitHub service (**Limit to repositories**, then **Change limit** and **Remove limit**), which limits its paths without replacing its credential. A service that sets "Refuse other paths on these hosts" also limits the administrator's services on those hosts, for the agents that share its scope only. On shared and unscoped agents only administrators and credential managers change services.
-- Their own keys, set in the same step as the service, and their Google, GitHub, and Atlassian account connections. For a shared agent's team account (the Google providers), Connect first asks for confirmation, because everyone who uses the agent acts as the account, and every user sees which account is connected.
+- Their own services, which can narrow the administrator's egress policy but never widen it, including a GitHub "Limit to repositories" helper and a limit in place on the administrator's GitHub service (**Limit to repositories**, then **Change limit** and **Remove limit**), which limits its paths without replacing its credential.
+  A service that sets "Refuse other paths on these hosts" also limits the administrator's services on those hosts, for the agents that share its scope only.
+  On shared and unscoped agents only administrators and credential managers change services.
+- Their own keys, set in the same step as the service, and their Google, GitHub, and Atlassian account connections.
+  For a shared agent's team account (the Google providers), Connect first asks for confirmation, because everyone who uses the agent acts as the account, and every user sees which account is connected.
 - Their own request log, a **Recent requests** table per agent with the latest 10 requests and **Show all** for the rest, which on a shared or unscoped agent they manage holds everyone's requests.
 
 This needs [trusted upstream auth](trusted-upstream-auth.md) with JWT, set through `env.extra` because the runtime chart has no values for it, an HTTPS `MINDROOM_PUBLIC_URL`, and a gateway that forwards `/connections`, `/api/connections`, and `/api/oauth` to the runtime.
@@ -307,7 +311,10 @@ For the Tuwunel volume, use an offline snapshot or Tuwunel's own database backup
   A missing index is rebuilt in the background the next time the base is used, repeating every embedding call, and agents report the base as initializing meanwhile.
   The sources, including files uploaded through the dashboard, are not rebuildable unless they come from Git, in which case they are cloned again from the configured repository.
 - `logs/` only holds runtime log files.
-- `egress_broker/` holds the broker's CA, token signing key, and request log. Deleting it generates them again and loses the request log. Outstanding worker tokens stop working, and calls already running with the old CA certificate fail TLS until their next call, because each call gets a fresh token and CA from the primary. `ca.key` is encrypted with `MINDROOM_CREDENTIALS_ENCRYPTION_KEY`, so changing that key makes the broker fail to start until you remove `egress_broker/`.
+- `egress_broker/` holds the broker's CA, token signing key, and request log.
+  Deleting it generates them again and loses the request log.
+  Outstanding worker tokens stop working, and calls already running with the old CA certificate fail TLS until their next call, because each call gets a fresh token and CA from the primary.
+  `ca.key` is encrypted with `MINDROOM_CREDENTIALS_ENCRYPTION_KEY`, so changing that key makes the broker fail to start until you remove `egress_broker/`.
 - The approved egress volume only holds temporary grants, which expire after at most `approvedEgress.maxTtlSeconds`.
 
 Everything else on the storage, sessions, state, and journal volumes is not rebuildable.

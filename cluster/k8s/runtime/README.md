@@ -881,8 +881,11 @@ It cannot be combined with `workers.kubernetes.agentVault`.
 To migrate from Agent Vault, switch in one upgrade and have users enter their keys afterwards, because keys can only be entered once the broker is on and Agent Vault's secrets do not carry over:
 
 1. Add the services to the deployment's `config.yaml` under `egress_broker.services`.
-2. Run one `helm upgrade` with `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`. If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in that upgrade.
-3. Have users and credential managers enter secrets on `/connections/egress` or the dashboard. Until they do, brokered calls answer 403 `credential_not_configured` with a message that says where to add the key. The personal page needs trusted upstream auth with JWT; without it the dashboard sets only the keys of `shared` and unscoped agents, and `user` and `user_agent` agents get none until it is enabled or they get a shared worker scope.
+2. Run one `helm upgrade` with `egressBroker.enabled=true` and `workers.kubernetes.agentVault.enabled=false`.
+   If approved egress is on, the chart rewires Squid's parent from Agent Vault to the broker in that upgrade.
+3. Have users and credential managers enter secrets on `/connections/egress` or the dashboard.
+   Until they do, brokered calls answer 403 `credential_not_configured` with a message that says where to add the key.
+   The personal page needs trusted upstream auth with JWT; without it the dashboard sets only the keys of `shared` and unscoped agents, and `user` and `user_agent` agents get none until it is enabled or they get a shared worker scope.
 4. Verify with brokered calls from real workers, then delete the Agent Vault bootstrap Secret and PVC after a grace period.
 The broker connects directly from the primary pod, unless the primary's `HTTPS_PROXY`/`NO_PROXY` routes it through an operator proxy.
 If `networkPolicy.extraEgress` restricts the primary, allow TCP 80 and 443 to public addresses yourself, because the chart cannot infer that rule.
@@ -894,9 +897,15 @@ In a full Kubernetes deployment with this chart, most users have no dashboard ac
 With the broker on, each of them still gets the personal Connections page at `/connections/egress`:
 
 - The egress services of every agent they may use, with the state of their own keys and accounts.
-- Their own services: add, edit, and delete them on `user` and `user_agent` agents, including a GitHub "Limit to repositories" helper. The editor saves the service and its API key in one step. On shared and unscoped agents only administrators and the agent's `credential_managers` change services.
-- Limits in place: **Limit to repositories** on the administrator's GitHub service saves a `restrict_only` service of the user's own, which limits the paths of that service without replacing its credential, so the user's account or key still applies. The row then reads "Limited to {repos}" with **Change limit** and **Remove limit**. It has no key, and the broker refuses to store one.
-- Their own keys, and **Connect** and **Disconnect** for their Google, GitHub, and Atlassian accounts. For a shared agent's team account (the Google providers), **Connect** first asks "Connect a shared account?", and every user of the agent sees the connected account. The login popup tells the page how it ended (connected, cancelled, or failed) and closes itself.
+- Their own services: add, edit, and delete them on `user` and `user_agent` agents, including a GitHub "Limit to repositories" helper.
+  The editor saves the service and its API key in one step.
+  On shared and unscoped agents only administrators and the agent's `credential_managers` change services.
+- Limits in place: **Limit to repositories** on the administrator's GitHub service saves a `restrict_only` service of the user's own, which limits the paths of that service without replacing its credential, so the user's account or key still applies.
+  The row then reads "Limited to {repos}" with **Change limit** and **Remove limit**.
+  It has no key, and the broker refuses to store one.
+- Their own keys, and **Connect** and **Disconnect** for their Google, GitHub, and Atlassian accounts.
+  For a shared agent's team account (the Google providers), **Connect** first asks "Connect a shared account?", and every user of the agent sees the connected account.
+  The login popup tells the page how it ended (connected, cancelled, or failed) and closes itself.
 - Each row says how the service sends its key ("Sent as a bearer token", "Sent as header {name}", and so on), what the agent sees ("Your agent sees GH_TOKEN=mindroom-brokered"), and what happens while no key is set.
 - Their own request log, a **Recent requests** table per agent that shows the latest 10 requests, with **Show all** for the rest, which on a shared or unscoped agent they manage holds everyone's requests.
 
@@ -909,9 +918,14 @@ A refused request tells the agent why: the broker's reason phrase is the message
 
 The page needs these settings, which the chart does not render for you:
 
-- **Trusted upstream auth with JWT.** The Connections routes accept only a signed Matrix identity, so the gateway in front of the runtime must authenticate users and sign a JWT. This chart has no values for it; set the `MINDROOM_TRUSTED_UPSTREAM_*` variables through `env.extra`, as below (the instance chart's `trustedUpstreamAuth` values are the equivalent there). Header-only mode is not enough, and `MINDROOM_PUBLIC_URL` must be an HTTPS origin because every change checks the browser's `Origin` against it.
-- **Routing.** Forward `/connections`, `/connections/*`, `/api/connections`, `/api/connections/*`, and `/api/oauth/*` from the gateway to the runtime Service. The chart creates no ingress.
-- **Dedicated workers for personal GitHub and Atlassian accounts.** The broker already needs `workers.backend: kubernetes`. Personal GitHub and Atlassian accounts work for agents with worker scope `user` or `user_agent` (`worker_scope`, or `private.per` for private agents); on shared and unscoped agents they need `oauth_on_shared_workers: true` on the service. Google accounts follow the agent's worker scope.
+- **Trusted upstream auth with JWT.** The Connections routes accept only a signed Matrix identity, so the gateway in front of the runtime must authenticate users and sign a JWT.
+  This chart has no values for it; set the `MINDROOM_TRUSTED_UPSTREAM_*` variables through `env.extra`, as below (the instance chart's `trustedUpstreamAuth` values are the equivalent there).
+  Header-only mode is not enough, and `MINDROOM_PUBLIC_URL` must be an HTTPS origin because every change checks the browser's `Origin` against it.
+- **Routing.** Forward `/connections`, `/connections/*`, `/api/connections`, `/api/connections/*`, and `/api/oauth/*` from the gateway to the runtime Service.
+  The chart creates no ingress.
+- **Dedicated workers for personal GitHub and Atlassian accounts.** The broker already needs `workers.backend: kubernetes`.
+  Personal GitHub and Atlassian accounts work for agents with worker scope `user` or `user_agent` (`worker_scope`, or `private.per` for private agents); on shared and unscoped agents they need `oauth_on_shared_workers: true` on the service.
+  Google accounts follow the agent's worker scope.
 - **OAuth clients.** The administrator configures the providers' OAuth clients once; see [Built-In Providers](../../../docs/oauth-framework.md#built-in-providers).
 
 ```yaml
