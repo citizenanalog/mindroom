@@ -14322,6 +14322,9 @@ Blind tunnels keep the upstream's real certificate, so workers get a combined tr
 The TLS server name and the `Host` header must match it, plain `http://` to a matched host is refused, and redirects are returned to the client instead of followed.
 Any of those would otherwise let a request carry one host's secret to another host.
 
+**A request only gets the credential of the service definition that routed it.**
+A service changed while the request waited for its secret may hold a key or account meant for other hosts, so the request gets a retryable 502 instead, and worker code cannot catch a key or account in the moment a service changes.
+
 **Ambiguous paths are refused, not normalized.**
 Path limits only hold if the broker and the upstream agree on what a path means. Dot segments at any decoding layer (including Unicode look-alikes), NUL, invalid UTF-8, raw `//`, and `\` are refused because servers normalize them differently.
 
@@ -14359,13 +14362,14 @@ Even a personal worker shares the workspace folder on a non-private agent, so pe
 Everyone acts as that account, so connecting it asks for confirmation and every user sees which account it is.
 
 **Configuration is trusted.**
-Whoever can write the `egress_broker` config, including agents with `config_manager`, can point a service at another host and so send its key there. User services can never take a config service's name or inherit its stored key, so users cannot do the same.
+Whoever can write the `egress_broker` config, including agents with `config_manager`, can point a service at another host and so send its key there. User services can never take a config service's name, and a new one never inherits a key stored under its name, so users cannot do the same.
+An entry saved while no config service had its name is ignored once one does, and becomes active again with the key stored under that name when the config service is removed; under the trust model below, the entry and the key both come from people who may change each other's keys.
 
 **Credential managers of the same key scope trust each other.**
 A shared agent's credential managers and the administrators act for one team. Unscoped agents share one key store, so the managers of every unscoped agent form one group.
 They can set, replace, and redirect each other's keys and services, for example by pointing a user service with a key at another host.
 The boundary is elsewhere: agents and worker code never read a stored key, and users who are not credential managers or administrators cannot change keys or services.
-Protecting managers from each other cost recurring complexity, such as deleting keys when rules changed and checking a service again while a request waited for its key, for a threat the deployment does not have.
+Protecting managers from each other cost recurring complexity, such as deleting a key when its service's rules changed or an entry when a config service's key was saved, for a threat the deployment does not have.
 Keys stay write-only in the UI for simplicity, not as a boundary between managers.
 
 ## Visibility
@@ -18311,7 +18315,7 @@ A user service routes only that scope's keys and accounts, so it cannot reach an
 
 **Rules about names and overlap:**
 
-- Config names win. Saving a name that a config service already uses returns 409, and a user entry that a config service later shadows is ignored. It can still be deleted, and its key then stays, because the config service uses that key.
+- Config names win. Saving a name that a config service already uses returns 409, and a user entry that a config service later shadows is ignored. It can still be deleted, and its key then stays, because the config service uses that key. If the config service is removed instead, the entry becomes active again with that key.
 - On a host that both a config service and a user service name, the usual order applies (exact host, specific port, longest path prefix, then config services before user services, then service name), so a longer user prefix takes those paths for that user only.
 
 **Inactive entries.**
@@ -18328,7 +18332,7 @@ Going over one of these is a 422, except that a request body over 16 KiB is refu
 - Under `unmatched_hosts: deny`, only hosts that the operator's services name are allowed. At runtime a user rule applies only on a host and port pair that an operator rule names, and a user rule on any other host is ignored. Saving is stricter and returns 422 naming the hosts: it also rejects a wildcard host that the config does not cover with the same wildcard, and a rule with no port that no any-port config rule covers.
 - On a host where an operator service sets `restrict_to_rules`, a path must match an operator rule. A user rule only picks the credential for a path that is already allowed, so a user rule for `/` cannot open paths the operator refuses.
 - A user service that sets `restrict_to_rules` also limits the operator's services on its hosts: a path there must match one of the requester's own rules too, so an operator rule for a broader path no longer reaches it. This holds for the scope that holds the service only, and other requesters are unaffected; see [Limiting paths and repositories](#limiting-paths-and-repositories). A `restrict_only` user service does the same without a credential of its own, so the operator's service keeps sending the user's key or account for the paths it allows (see [Limiting in place](#limiting-in-place)).
-- A user service can sign in with a connected account (`oauth_provider`, or a preset that has one) only on personal agents (`user` and `user_agent`). On a shared or unscoped agent, saving one with a provider returns 422, because a manager could otherwise route the agent's shared account to any host; set `oauth_provider: null` and use a key. A provider the registry does not know is refused too.
+- A user service can sign in with a connected account (`oauth_provider`, or a preset that has one) only on personal agents (`user` and `user_agent`). On a shared or unscoped agent only the administrator's services use connected accounts, so saving one with a provider returns 422; set `oauth_provider: null` and use a key. A provider the registry does not know is refused too.
 - A user service sends a connected account only to its provider's own hosts, because the token works nowhere else: the rule hosts of the built-in [presets](#presets) bound to that provider, such as `api.github.com`, `uploads.github.com`, and `github.com` for `github`, or `www.googleapis.com` for `google_drive`. Ports and path prefixes are free, but hosts compare exactly, so a wildcard such as `*.github.com` is refused. Saving a service with `oauth_provider` whose rules name another host returns 422 naming the provider, its hosts, and the refused hosts ("oauth_provider 'github' can only be used on api.github.com, uploads.github.com, github.com, so these hosts cannot be used with it: api.notes.example.com"), and a provider no preset is bound to, such as `google_cloud` or a plugin provider, is refused on every host. A stored entry that breaks this rule keeps its rules but loses its `oauth_provider` on load with the warning `egress_broker_user_service_oauth_ignored`, so no token is resolved or reported for it. Services in `config.yaml` and user services that use an API key are not limited this way.
 
 **Keys.**

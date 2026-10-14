@@ -25,6 +25,9 @@ Blind tunnels keep the upstream's real certificate, so workers get a combined tr
 The TLS server name and the `Host` header must match it, plain `http://` to a matched host is refused, and redirects are returned to the client instead of followed.
 Any of those would otherwise let a request carry one host's secret to another host.
 
+**A request only gets the credential of the service definition that routed it.**
+A service changed while the request waited for its secret may hold a key or account meant for other hosts, so the request gets a retryable 502 instead, and worker code cannot catch a key or account in the moment a service changes.
+
 **Ambiguous paths are refused, not normalized.**
 Path limits only hold if the broker and the upstream agree on what a path means. Dot segments at any decoding layer (including Unicode look-alikes), NUL, invalid UTF-8, raw `//`, and `\` are refused because servers normalize them differently.
 
@@ -62,13 +65,14 @@ Even a personal worker shares the workspace folder on a non-private agent, so pe
 Everyone acts as that account, so connecting it asks for confirmation and every user sees which account it is.
 
 **Configuration is trusted.**
-Whoever can write the `egress_broker` config, including agents with `config_manager`, can point a service at another host and so send its key there. User services can never take a config service's name or inherit its stored key, so users cannot do the same.
+Whoever can write the `egress_broker` config, including agents with `config_manager`, can point a service at another host and so send its key there. User services can never take a config service's name, and a new one never inherits a key stored under its name, so users cannot do the same.
+An entry saved while no config service had its name is ignored once one does, and becomes active again with the key stored under that name when the config service is removed; under the trust model below, the entry and the key both come from people who may change each other's keys.
 
 **Credential managers of the same key scope trust each other.**
 A shared agent's credential managers and the administrators act for one team. Unscoped agents share one key store, so the managers of every unscoped agent form one group.
 They can set, replace, and redirect each other's keys and services, for example by pointing a user service with a key at another host.
 The boundary is elsewhere: agents and worker code never read a stored key, and users who are not credential managers or administrators cannot change keys or services.
-Protecting managers from each other cost recurring complexity, such as deleting keys when rules changed and checking a service again while a request waited for its key, for a threat the deployment does not have.
+Protecting managers from each other cost recurring complexity, such as deleting a key when its service's rules changed or an entry when a config service's key was saved, for a threat the deployment does not have.
 Keys stay write-only in the UI for simplicity, not as a boundary between managers.
 
 ## Visibility
