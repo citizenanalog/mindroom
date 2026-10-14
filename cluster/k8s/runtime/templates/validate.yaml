@@ -428,7 +428,7 @@
 {{- fail "egressBroker.enabled requires workers.backend=kubernetes" -}}
 {{- end -}}
 {{- if .Values.workers.kubernetes.agentVault.enabled -}}
-{{- fail "egressBroker and workers.kubernetes.agentVault cannot both be enabled: enter secrets on the egress page first, then disable agentVault in the upgrade that enables egressBroker" -}}
+{{- fail "egressBroker and workers.kubernetes.agentVault cannot both be enabled: disable agentVault in the upgrade that enables egressBroker, then enter keys on the Agent Keys pages" -}}
 {{- end -}}
 {{- if or (eq (int .Values.egressBroker.port) (int .Values.runtime.apiPort)) (eq (int .Values.egressBroker.port) (int .Values.scriptGateway.port)) -}}
 {{- fail "egressBroker.port must differ from runtime.apiPort and scriptGateway.port" -}}

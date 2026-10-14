@@ -4635,8 +4635,8 @@ def test_runtime_chart_egress_broker_ttl_env_only_when_set(ttl_args: tuple[str, 
                 "egressBroker.enabled=true",
                 "workers.kubernetes.agentVault.enabled=true",
             ),
-            "egressBroker and workers.kubernetes.agentVault cannot both be enabled: enter secrets on the egress page "
-            "first, then disable agentVault in the upgrade that enables egressBroker",
+            "egressBroker and workers.kubernetes.agentVault cannot both be enabled: disable agentVault in the "
+            "upgrade that enables egressBroker, then enter keys on the Agent Keys pages",
         ),
         (
             ("workers.backend=kubernetes", "egressBroker.enabled=true", "egressBroker.port=8765"),
