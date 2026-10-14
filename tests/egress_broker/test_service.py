@@ -1315,6 +1315,21 @@ def paused_lookup(monkeypatch: pytest.MonkeyPatch) -> _PausedLookup:
     return pause
 
 
+@pytest.fixture
+def paused_key_read(monkeypatch: pytest.MonkeyPatch) -> _PausedLookup:
+    """Pause the key reads of brokers started after this, inside the routed-definition check, until `resume` is set."""
+    pause = _PausedLookup()
+    load = service.load_secret
+
+    def paused(*args: Any, **kwargs: Any) -> str | None:  # noqa: ANN401 - forwards the reader's arguments
+        pause.reached.set()
+        pause.resume.wait(10)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(service, "load_secret", paused)
+    return pause
+
+
 def _save_team(manager: CredentialsManager, target: ResolvedWorkerTarget, service: dict[str, object]) -> None:
     """Save `service` as the shared scope's own user service ``team``, as a credential manager does through the API."""
     save_user_service(
@@ -1366,6 +1381,36 @@ async def test_a_key_saved_for_new_rules_never_reaches_the_host_a_pending_reques
     assert not [log for log in logs if log["event"] == "egress_broker_secret_lookup_failed"]
     assert "openai-key" not in repr(logs)
     assert (record.kind, record.service, record.status, record.code) == ("request", "team", 502, "broker_error")
+
+
+@pytest.mark.asyncio
+async def test_a_key_saved_after_a_config_change_never_reaches_the_host_a_pending_request_was_routed_to(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    tls_upstream: Upstream,
+    get_through: GetThrough,
+    paused_key_read: _PausedLookup,
+) -> None:
+    """Worker code calling a config service's host while an administrator moves it to OpenAI and sets its key gets a 502.
+
+    The lookup is already reading the store when the config changes, so only the check after the read can tell.
+    """
+    runtime_paths = tmp_runtime_paths(**_broker_env(free_port()))
+    configs = [_config(vendor=_GITHUB)]
+    target = _routable_target(scope="shared")
+
+    def move_to_openai() -> None:
+        configs.append(_config(vendor=_OPENAI))
+        save_secret(manager, target, "vendor", "openai-key")
+
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: configs[-1], credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=configs[0], worker_target=target)
+        response = await paused_key_read.get_after(get_through, env, move_to_openai)
+    # The fake upstream echoes the request headers, so a sent key would show here.
+    assert "openai-key" not in response.text
+    assert tls_upstream.hits == []
+    assert response.status_code == 502
+    assert response.json()["error"] == "broker_error"
 
 
 @pytest.mark.usefixtures("github_oauth_client")

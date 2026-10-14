@@ -249,20 +249,24 @@ class _LastGoodConfig:
 
 
 def _routed_key(
-    config: EgressBrokerConfig,
+    config: _LastGoodConfig,
     credentials_manager: CredentialsManager,
     target: ResolvedWorkerTarget,
     name: str,
     routed: EgressService,
 ) -> Secret | SecretServiceChanged | None:
-    """Return the scope's key for `name` while its effective config still defines `name` as `routed`; None without one.
+    """Return the scope's key for `name` if, once it is read, the effective config still defines `name` as `routed`.
 
-    Under `consistent_read` no user-service write lands between the check and the read.
+    None without a key. Under `consistent_read` no user-service write lands during the read and the check. A config
+    change does not take that lock, so the check reads the current config after the key: a key saved after the config
+    moved `name` to other hosts is only read once the new config is current, and the check then refuses it.
     """
     with consistent_read():
-        if effective_config(config, credentials_manager, target).services.get(name) != routed:
-            return SecretServiceChanged()
         key = load_secret(credentials_manager, target, name)
+        current = config.current()
+        effective = None if current is None else effective_config(current.egress_broker, credentials_manager, target)
+        if effective is None or effective.services.get(name) != routed:
+            return SecretServiceChanged()
     return Secret(key) if key else None
 
 
@@ -280,20 +284,20 @@ async def _resolve_secret(
 
     `routed` is the definition of `name` whose rule routed the request. The requester's effective config (the
     config's services plus the scope's own) must still define `name` as `routed`, or the result is
-    `SecretServiceChanged`: a service saved since routing may be meant for other hosts. That check and the key
-    read run in one call on the loop's default executor (`_routed_key`); the OAuth lookup, which may refresh, then
+    `SecretServiceChanged`: a service saved since routing may be meant for other hosts. The key read and that check
+    run in one call on the loop's default executor (`_routed_key`); the OAuth lookup, which may refresh, then
     runs on `oauth_executor` with the provider of the checked definition.
     """
     target = claims.to_worker_target()
-    current = config.current()
-    if current is None:
-        # Without a config nothing defines `name`, so `routed` is not its definition.
-        return SecretServiceChanged()
-    stored = await asyncio.to_thread(_routed_key, current.egress_broker, credentials_manager, target, name, routed)
+    stored = await asyncio.to_thread(_routed_key, config, credentials_manager, target, name, routed)
     if stored is not None:
         return stored
     if routed.oauth_provider is None:
         return SecretMissing()
+    current = config.current()
+    if current is None:
+        # Without a config nothing defines `name`, so `routed` is not its definition.
+        return SecretServiceChanged()
     lookup = functools.partial(
         resolve_oauth_token,
         service=name,

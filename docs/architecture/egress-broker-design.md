@@ -30,7 +30,8 @@ The TLS server name and the `Host` header must match it, plain `http://` to a ma
 Any of those would otherwise let a request carry one host's secret to another host.
 
 **A request only gets the credential of the service definition that routed it.**
-A service changed while the request waited for its secret may hold a key or account meant for other hosts, so the request gets a retryable 502 instead, and worker code cannot catch a key or account in the moment a service changes.
+A service changed while the request waited for its secret, by a user-service save or a config change, may hold a key or account meant for other hosts, so the request gets a retryable 502 instead, and worker code cannot catch a key or account in the moment a service changes.
+The broker checks the definition after reading the key: config changes do not take the user-service lock, and a key saved after the config moved is only read once the new config is current.
 
 **Ambiguous paths are refused, not normalized.**
 Path limits only hold if the broker and the upstream agree on what a path means. Dot segments at any decoding layer (including Unicode look-alikes), NUL, invalid UTF-8, raw `//`, and `\` are refused because servers normalize them differently.
