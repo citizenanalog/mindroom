@@ -18140,7 +18140,7 @@ They never reach a worker, its environment, or its filesystem; the worker holds 
 
 **Service accounts are never injected.**
 A deployment that sets `GOOGLE_SERVICE_ACCOUNT_FILE` serves the Google providers through a shared Google service account instead of personal logins.
-The broker does not inject a service account's credentials, so the egress pages show such a service as "Uses a shared service account" and personal accounts cannot be connected for that provider.
+The broker does not inject a service account's credentials, so the egress pages say Agent Keys cannot use it and personal accounts cannot be connected for that provider.
 The account part shows as not connected unless a personal connection was stored earlier; such a connection keeps working, and shows as connected, until it is disconnected.
 Give the service an API key if workers need to call it in that deployment.
 
@@ -18416,7 +18416,6 @@ On the dashboard, the **Request log** under the **Agent Keys** panel shows that 
 Each row has `at`, `kind` (`request`, `tunnel`, or `denied`), `scope`, `agent_name`, `requester_id`, `method`, `host`, `path` (without the query string), `service`, `status`, `bytes_up`, `bytes_down`, `duration_ms`, and `code`.
 `code` is the `error` value of the JSON body the broker itself answered with, for example `path_not_allowed`, `bad_request`, `method_not_allowed`, `host_mismatch`, `host_not_allowed`, `tls_required`, `destination_blocked`, `credential_not_configured`, `oauth_connection_required`, `oauth_refresh_failed`, `broker_error`, `request_body_too_large`, `upstream_unreachable`, or `upstream_timeout`.
 It is `null` when the upstream's response was relayed.
-A 407 and a malformed request the broker rejects before it can route it write no row.
 
 On the personal egress page each agent has a collapsible **Recent requests** table with its latest requests (the newest 50 at most) and the broker's error code under the status when there is one.
 On a shared or unscoped agent you manage, the table holds everyone's requests, with a **User** column for each requester's Matrix ID.
@@ -18620,8 +18619,7 @@ The broker returns these errors to worker code:
 | Plain HTTP request matching a rule | 403 JSON `{"error": "tls_required", "service": "<name>", "message": "..."}` |
 | `Host` header inside an intercepted tunnel naming a different host than the CONNECT target | 403 JSON `{"error": "host_mismatch", "message": "..."}` |
 | Client TLS server name (SNI) that differs from the CONNECT host | No response: the TLS handshake is aborted with an `unrecognized_name` alert, and nothing is forwarded |
-| Websocket upgrade inside a tunnel on a request that has both `Content-Length` and `Transfer-Encoding` | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text |
-| Request the broker cannot read: an invalid CONNECT target, a CONNECT with a body or with bytes sent before its answer, an invalid absolute URL on a plain HTTP request, a non-origin-form request target (absolute, authority, or asterisk form) inside an intercepted tunnel, or an HTTP protocol error | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text (431 for a request head over 64 KiB, however it is split across reads, and 501 for a `Transfer-Encoding` that is not a single `chunked`, such as `gzip` or a repeated `chunked`) |
+| Request the broker cannot read unambiguously, such as an invalid CONNECT target or an HTTP protocol error | 400 JSON `{"error": "bad_request", "message": "..."}` with the malformed-request text (431 for a request head over 64 KiB, 501 for an unsupported `Transfer-Encoding`) |
 | Path on a host with rules with empty segments or raw backslashes, or with a dot segment, NUL, or invalid UTF-8 in it or any percent-decoded form of it | 400 JSON `{"error": "bad_request", "message": "..."}` with the ambiguous-path text |
 | `TRACE` or `TRACK` request (any letter case) to a host with rules, inside an intercepted tunnel or over plain HTTP, refused before any key is looked up | 405 JSON `{"error": "method_not_allowed", "message": "..."}`; the upstream would echo the injected credential back |
 | Path that fails a restriction (see [Limiting paths and repositories](#limiting-paths-and-repositories)) | 403 JSON `{"error": "path_not_allowed", "service": "<restricting service>", "manage_url": "<link>", "message": "..."}`; the message names the service by its display name |
@@ -18776,7 +18774,7 @@ Retry the request in a minute; reconnecting does not help.
 
 Check that the service has an `oauth_provider` (presets set it) and that the id exists in the OAuth registry; an unknown id logs a warning naming the service and leaves the service on API keys only.
 An API key stored for the scope wins over the account, so remove the key to use the account.
-A provider served by a shared service account shows "Uses a shared service account" and is never injected.
+A provider served by a shared service account is never injected; give the service an API key.
 A GitHub or Atlassian account is not used in a shared sandbox (a shared or unscoped agent, or any agent on the static runner) unless the service sets `oauth_on_shared_workers`; see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes).
 
 **403 `path_not_allowed` errors:**
@@ -18793,7 +18791,7 @@ Send the normalized path; the broker refuses ambiguous paths instead of guessing
 
 **431 `bad_request` on a request:**
 
-The request head, from the request line through the blank line, is over 64 KiB, however the client split it.
+The request head, from the request line through the blank line, is over 64 KiB.
 Shorten the headers (a huge `Cookie` or custom header is the usual cause).
 
 **A TLS handshake to the broker fails for one host:**
