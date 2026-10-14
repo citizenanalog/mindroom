@@ -37,6 +37,7 @@ from mindroom.matrix.client_delivery import send_room_event_result
 from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.olm_to_device import authenticated_sender_is_current
 from mindroom.matrix.room_membership import cached_joined_member_ids
+from mindroom.matrix_rtc.audio_process import ProcessLiveVoiceBridge, prewarm_call_audio_process
 from mindroom.matrix_rtc.call_origin import (
     AGENT_CALL_STATE_EVENT_TYPE,
     CALL_BRIEF_TOKEN_BUDGET,
@@ -72,7 +73,6 @@ from mindroom.matrix_rtc.events import (
 )
 from mindroom.matrix_rtc.focus import OpenIDToken, discover_livekit_service_url, request_sfu_grant
 from mindroom.matrix_rtc.key_transport import ToDeviceFrameKeyTransport
-from mindroom.matrix_rtc.live_voice_agent import LiveVoiceBridge
 from mindroom.matrix_rtc.transcript import CallTranscript
 from mindroom.matrix_rtc.voice_agent import (
     CascadedVoiceAgentOptions,
@@ -119,8 +119,9 @@ def _default_cascaded_bridge_factory(local_identity: str, e2ee_enabled: bool) ->
     return CascadedVoiceBridge(local_identity=local_identity, e2ee_enabled=e2ee_enabled)
 
 
-def _default_live_bridge_factory(local_identity: str, e2ee_enabled: bool) -> LiveVoiceBridge:
-    return LiveVoiceBridge(local_identity=local_identity, e2ee_enabled=e2ee_enabled)
+def _default_live_bridge_factory(local_identity: str, e2ee_enabled: bool) -> ProcessLiveVoiceBridge:
+    # GPT-Live media runs in its own process, so stalls on this event loop cannot interrupt call audio.
+    return ProcessLiveVoiceBridge(local_identity=local_identity, e2ee_enabled=e2ee_enabled)
 
 
 _CALL_EVENT_TYPES = frozenset({CALL_MEMBER_EVENT_TYPE, RTC_NOTIFICATION_EVENT_TYPE})
@@ -250,12 +251,17 @@ async def preload_matrix_call_dependencies(config: Config) -> None:
     """Load optional call SDKs and the call token encoder before bots start syncing."""
     if not config.calls.enabled or not matrix_calls_dependencies_available():
         return
+    backends = {config.calls.resolve_agent_config(agent).backend for agent in config.calls.agents}
     try:
-        # LiveKit registers plugins on the main thread, so this import must not be offloaded.
-        from livekit.plugins import openai  # noqa: F401, PLC0415
+        if backends - {"live"}:
+            # Realtime and cascaded calls run LiveKit in this process; it registers plugins on the main thread.
+            from livekit.plugins import openai  # noqa: F401, PLC0415
 
-        # Call setup counts tokens; building the encoder on the loop would stall call audio.
+        # Call setup counts tokens; building the encoder on the event loop would stall it for about 300 ms.
         await asyncio.to_thread(o200k_encoding)
+        if "live" in backends:
+            # The first GPT-Live call would otherwise wait for its audio process to import the LiveKit Agents SDK.
+            prewarm_call_audio_process()
     except Exception:
         logger.warning("calls_dependency_preload_failed", exc_info=True)
 
@@ -906,7 +912,7 @@ class CallManager:
         )
         return _RoomCallState(members=members, agent_call_events=agent_call_events)
 
-    async def _join(  # noqa: C901, PLR0911
+    async def _join(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         room: nio.MatrixRoom,
         members: list[CallMember],
@@ -976,20 +982,25 @@ class CallManager:
                 error=str(error),
             )
             return "skip"
-        bridge = self._bridge_factory(
-            f"{self._client.user_id}:{device_id}",
-            room.encrypted,
-        )
-        options = self._build_voice_agent_options(
-            tooling=tooling,
-            transcript=transcript,
-            room=room,
-            bridge=bridge,
-            backend=backend,
-            logical_call=logical_call,
-            origin_context=origin_context,
-        )
         try:
+            bridge = self._bridge_factory(
+                f"{self._client.user_id}:{device_id}",
+                room.encrypted,
+            )
+        except OSError as error:
+            # The live backend starts its audio process here, which fails while the host is short on processes.
+            logger.warning("call_bridge_start_failed", room_id=room_id, agent=self._agent_name, error=str(error))
+            return "retry"
+        try:
+            options = self._build_voice_agent_options(
+                tooling=tooling,
+                transcript=transcript,
+                room=room,
+                bridge=bridge,
+                backend=backend,
+                logical_call=logical_call,
+                origin_context=origin_context,
+            )
             session = CallSession(
                 room_id=room_id,
                 requester_id=requester_id,
@@ -1019,6 +1030,11 @@ class CallManager:
                     ),
                 ),
             )
+        except BaseException:
+            # Only a started session closes the bridge, and the live backend's bridge holds an audio process.
+            await bridge.aclose()
+            raise
+        try:
             if not await self._start_call_session(session, members, logical_call):
                 return "skip"
         except ValueError as error:
