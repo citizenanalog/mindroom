@@ -114,7 +114,7 @@ Who may manage each connection follows [Who Can Connect An Account](https://docs
 Disconnecting a shared connection affects every agent using its [credential scope](https://docs.mindroom.chat/oauth-framework/#where-connections-are-stored).
 The portal shows "Signed in as {matrix_user_id}", and administrators also get a link to the dashboard.
 While the [egress broker](https://docs.mindroom.chat/deployment/egress-broker/) is on, the portal and its Agent Keys page link to each other.
-The pages read the identity from `GET /api/connections/me`, which returns `matrix_user_id`, `email`, `is_administrator`, and `egress_enabled` for any signed-in user.
+The pages read the identity from `GET /api/connections/me`, which returns `matrix_user_id`, `email`, `is_administrator`, `egress_enabled`, and `portal_enabled` (whether the Agents page is served) for any signed-in user.
 The portal never shows tokens, model configuration, generic credential editing, or OAuth client settings; operators still configure OAuth clients.
 When a service uses a shared service account, such as `GOOGLE_SERVICE_ACCOUNT_FILE`, the portal does not show it as a personal connection and disables **Connect** for that service.
 Users choose the agents and tools the optional [MCP Gateway](https://docs.mindroom.chat/deployment/mcp-gateway/#choose-exposed-agents-and-tools) exposes on the same page.

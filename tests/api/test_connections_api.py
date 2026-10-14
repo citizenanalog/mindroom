@@ -328,6 +328,7 @@ def test_me_returns_identity_and_admin_flag(portal: dict[str, Any], user: str, i
         "email": f"{user}@example.org",
         "is_administrator": is_administrator,
         "egress_enabled": False,
+        "portal_enabled": True,
     }
     assert "no-store" in response.headers["cache-control"]
 
@@ -341,6 +342,22 @@ def test_me_says_whether_agent_keys_are_enabled(portal: dict[str, Any], *, broke
         response = portal["client"].get("/api/connections/me", headers=portal["headers"][user])
         assert response.status_code == 200, response.text
         assert response.json()["egress_enabled"] is broker_on
+
+
+def test_me_says_when_only_the_agent_keys_page_is_served(portal: dict[str, Any]) -> None:
+    """Without the portal agent setting the Agent Keys page is still served, so its header must not link the portal."""
+    env = {**portal["paths"].process_env, "MINDROOM_EGRESS_BROKER_PORT": "8768"}
+    del env["MINDROOM_CONNECTIONS_AGENT"]
+    paths = replace(portal["paths"], process_env=env)
+    main.initialize_api_app(main.app, paths)
+    _publish_config(main.app, paths, portal["payload"])
+    _use_runtime_auth_settings(main.app)
+
+    response = portal["client"].get("/api/connections/me", headers=portal["headers"]["bob"])
+
+    assert response.status_code == 200, response.text
+    assert response.json()["egress_enabled"] is True
+    assert response.json()["portal_enabled"] is False
 
 
 def test_me_needs_a_signed_identity_and_takes_no_target(portal: dict[str, Any]) -> None:
