@@ -2622,6 +2622,87 @@ describe("a limit: a service that only restricts GitHub repositories", () => {
     },
   );
 
+  describe("while another service of the viewer's has rules on the hosts of a limit in the rule fields", () => {
+    const githubLimit = ownRulesLimit([
+      { host: "api.github.com", path_prefix: "/repos/a/b" },
+      { host: "api.github.com", path_prefix: "/user" },
+    ]);
+    const own = (
+      host: string,
+      changes: Partial<EgressCredentialService> = {},
+    ) =>
+      credentialService({
+        name: "my-service",
+        display_name: "My Service",
+        source: "user",
+        rules: [
+          {
+            host,
+            port: null,
+            path_prefix: "/",
+            auth_type: "bearer" as const,
+            auth_name: null,
+          },
+        ],
+        ...changes,
+      });
+    const refused =
+      "Requests to these hosts whose path matches none of these rules are refused.";
+
+    it("notes that it has rules there too, after saying the other paths are refused", async () => {
+      await renderLimit({
+        name: "my-limit",
+        service: githubLimit,
+        agentServices: [own("api.github.com")],
+      });
+      expect(
+        screen.getByText(
+          `${refused} My Service also has rules on api.github.com. A request is allowed when any of this agent's own services allows it. Your key or connected account stays the same.`,
+        ),
+      ).toBeVisible();
+    });
+
+    it("says nothing about other services when none has rules on its hosts", async () => {
+      await renderLimit({
+        name: "my-limit",
+        service: githubLimit,
+        agentServices: [own("example.com")],
+      });
+      expect(
+        screen.getByText(
+          `${refused} Your key or connected account stays the same.`,
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText(/also has rules/)).toBeNull();
+    });
+
+    it("ignores the limit itself, a limit, and the administrator's services", async () => {
+      await renderLimit({
+        name: "my-limit",
+        service: githubLimit,
+        agentServices: [
+          own("api.github.com", { name: "my-limit", restrict_only: true }),
+          own("api.github.com", { name: "other-limit", restrict_only: true }),
+          own("api.github.com", { name: "admin", source: "config" }),
+        ],
+      });
+      expect(screen.queryByText(/also has rules/)).toBeNull();
+    });
+
+    it("compares the hosts of the preset for a limit that takes its rules from one", async () => {
+      await renderLimit({
+        name: "drive-limited",
+        service: { preset: "google_drive", restrict_only: true },
+        agentServices: [own("www.googleapis.com")],
+      });
+      expect(
+        screen.getByText(
+          `${refused} My Service also has rules on www.googleapis.com. A request is allowed when any of this agent's own services allows it. Your key or connected account stays the same.`,
+        ),
+      ).toBeVisible();
+    });
+  });
+
   it("shows a limit that takes its rules from a preset read-only, and saves it back as a preset", async () => {
     const stored: AuthoredEgressService = {
       preset: "google_drive",

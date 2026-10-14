@@ -390,17 +390,19 @@ export function EgressServiceEditor({
   const overlaps = limiting
     ? []
     : overlapWarnings(form, preset, agentServices, name);
-  // Another service of the user's with rules on the GitHub hosts a limit, or
-  // the repositories applied to this service, cover.
-  const overlap = limiting
-    ? limitOverlap(
-        [GITHUB_API_HOST, GITHUB_UPLOADS_HOST, GITHUB_WEB_HOST],
-        agentServices,
-      )
-    : limitOverlap(
-        [GITHUB_API_HOST, GITHUB_WEB_HOST],
-        agentServices.filter((other) => other.name !== name),
-      );
+  // Another service of the user's with rules on the hosts a limit, or the
+  // repositories applied to this service, cover.
+  const overlapHosts = !limiting
+    ? [GITHUB_API_HOST, GITHUB_WEB_HOST]
+    : showGithubHelper
+      ? [GITHUB_API_HOST, GITHUB_UPLOADS_HOST, GITHUB_WEB_HOST]
+      : (usesOwnRules(form) ? form.rules : (preset?.rules ?? [])).map(
+          (rule) => rule.host,
+        );
+  const overlap = limitOverlap(
+    overlapHosts,
+    agentServices.filter((other) => other.name !== name),
+  );
   const primaryRule = form.rules[0] ?? emptyRule();
   const ruleEditing = (index: number, rule: RuleForm): RuleEditing => ({
     index,
@@ -657,7 +659,8 @@ export function EgressServiceEditor({
           )}
           <p className="text-xs text-muted-foreground">
             Requests to these hosts whose path matches none of these rules are
-            refused. Your key or connected account stays the same.
+            refused. {overlap ? `${overlap} ` : ""}Your key or connected account
+            stays the same.
           </p>
         </>
       )}
