@@ -664,9 +664,13 @@ def test_shared_scope_connect_links_are_never_handed_out(
     manager: CredentialsManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A shared-scope link skips sign-in and any process in the worker can read it, so the broker offers none."""
+    """A link for a connection several requesters share skips sign-in and any process in the worker can read it.
+
+    So the broker offers none for a shared agent or one without a worker scope (all of those share one store).
+    """
     shared = _broker_target("@alice:example.org", "shared")
     missing = _resolve(config, runtime_paths, manager, shared, provider_id="demo")
+    unscoped = _resolve(config, runtime_paths, manager, _broker_target("@alice:example.org", None), provider_id="demo")
     connect_account(
         manager,
         _tool_target("@alice:example.org", "shared"),
@@ -680,6 +684,7 @@ def test_shared_scope_connect_links_are_never_handed_out(
 
     assert revoked == SecretNeedsReconnect(provider="demo", connect_url=None)
     assert missing == SecretMissing()
+    assert unscoped == SecretMissing()
     assert isinstance(private, SecretMissing)
     assert private.connect_url is not None
     assert "connect_token=" in urlsplit(private.connect_url).query
