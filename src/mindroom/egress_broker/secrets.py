@@ -25,6 +25,7 @@ __all__ = [
     "SecretMissing",
     "SecretNeedsReconnect",
     "SecretResult",
+    "SecretServiceChanged",
     "SecretUnavailable",
     "delete_egress_document",
     "delete_secret",
@@ -230,7 +231,15 @@ class SecretUnavailable:
     provider: str
 
 
-type SecretResult = Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable
+@dataclass(frozen=True)
+class SecretServiceChanged:
+    """The service no longer has the definition whose rule routed the request, so its credential may be for other hosts.
+
+    Nothing is resolved; a retry is routed by the current definition.
+    """
+
+
+type SecretResult = Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable | SecretServiceChanged
 
 
 @dataclass(frozen=True)

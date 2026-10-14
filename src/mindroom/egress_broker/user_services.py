@@ -9,9 +9,11 @@ a config service is ignored, so operator services never change; top-level settin
 from config only. Merged configs are cached per scope, and every save or delete in this process drops the cache.
 
 User services can narrow operator policy, never widen it: `rules.EgressRules` keeps them inside `deny` and inside an
-operator's `restrict_to_rules`. They never inherit a key stored under their name, and on shared or unscoped agents
-they cannot use an OAuth connection, which would let a manager route the agent's shared account to any host.
+operator's `restrict_to_rules`. A new one never inherits a key stored under its name. On shared or unscoped agents
+they cannot use an OAuth connection, since only the operator's services use connected accounts there.
 Where they can, the connection only goes to the rule hosts of the built-in presets bound to its provider.
+The broker resolves a credential only while the service still has the definition that routed the request
+(`consistent_read`), so worker code cannot catch a key or account in the moment a service changes.
 Their placeholders are limited to credential-like names and plain values, since a shared agent's services set env
 in every requester's sandbox, and config placeholders win over theirs.
 """
@@ -38,7 +40,7 @@ from mindroom.egress_broker.secrets import (
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Collection, Iterator, Mapping
 
     from mindroom.config.egress_broker import EgressBrokerConfig
     from mindroom.credentials.manager import CredentialsManager
@@ -60,6 +62,7 @@ __all__ = [
     "InactiveUserService",
     "ServiceSource",
     "UserServiceConflictError",
+    "consistent_read",
     "delete_user_service",
     "effective_config",
     "inactive_user_services",
@@ -251,6 +254,19 @@ def delete_user_service(
         finally:
             _cache.invalidate()
     return True
+
+
+@contextlib.contextmanager
+def consistent_read() -> Iterator[None]:
+    """Hold off this process's user-service writes while the caller reads a scope's services and keys.
+
+    `save_user_service` and `delete_user_service` write under the same lock, so no service changes while it is held:
+    a key read inside belongs to the definition read inside. Saving a key with `secrets.save_secret` does not take
+    it, since that key is for the service as it is then. Deleting a key only removes a credential and config
+    reloads are trusted, so neither takes it either. This blocks, so callers on an event loop run it in a thread.
+    """
+    with _write_lock:
+        yield
 
 
 def effective_config(
@@ -479,5 +495,6 @@ class _EffectiveConfigCache:
 
 
 _cache = _EffectiveConfigCache()
-# Serializes read-modify-write of the services documents in this process, so concurrent saves lose nothing.
+# Serializes read-modify-write of the services documents in this process, so concurrent saves lose nothing;
+# `consistent_read` holds it too, so the broker checks a routed service and reads its key in one state.
 _write_lock = threading.Lock()

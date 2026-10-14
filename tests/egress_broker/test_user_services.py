@@ -513,7 +513,7 @@ def test_oauth_provider_is_refused_outside_personal_scopes(
     manager: CredentialsManager,
     scope: WorkerScope | None,
 ) -> None:
-    """A manager cannot route a shared or unscoped agent's OAuth connection to an arbitrary host, preset or not."""
+    """A shared or unscoped agent's own services cannot use an OAuth connection, preset or not."""
     for target in (worker_target(scope=scope), None) if scope is None else (worker_target(scope=scope),):
         for authored in ({"oauth_provider": "github"}, {"preset": "github"}):
             with pytest.raises(ValueError, match="oauth_provider"):

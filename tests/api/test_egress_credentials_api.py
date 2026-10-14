@@ -1823,7 +1823,7 @@ def test_user_service_body_over_16_kib_is_413_before_validation(
 
 
 def test_oauth_provider_is_refused_in_user_services_of_shared_agents(egress_portal: dict[str, Any]) -> None:
-    """A manager cannot route a shared agent's OAuth connection to hosts of their choosing; personal agents can."""
+    """A shared agent's own services cannot use an OAuth connection; a personal agent's can."""
     portal = egress_portal
     with_oauth = _MY_GITHUB
     for body in (with_oauth, {"preset": "github"}):

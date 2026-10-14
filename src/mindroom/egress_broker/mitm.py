@@ -23,7 +23,13 @@ from mindroom.egress_broker._relay import (
 )
 from mindroom.egress_broker.messages import refusal_body
 from mindroom.egress_broker.rules import RuleMatch, inject_credentials
-from mindroom.egress_broker.secrets import Secret, SecretMissing, SecretNeedsReconnect, SecretUnavailable
+from mindroom.egress_broker.secrets import (
+    Secret,
+    SecretMissing,
+    SecretNeedsReconnect,
+    SecretServiceChanged,
+    SecretUnavailable,
+)
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -193,7 +199,7 @@ class TlsInterceptor:
             upstream_request = h11.Request(method=request.method, target=request.target, headers=headers)
         else:
             entry.service = match.service
-            if (secret := await self._secret(client, entry, match.service)) is None:
+            if (secret := await self._secret(client, entry, match)) is None:
                 return False
             if (upstream_request := _injected_request(request, headers, match, secret)) is None:
                 logger.warning("egress_broker_secret_unusable", service=match.service)
@@ -201,13 +207,16 @@ class TlsInterceptor:
                 return False
         return await self._forward(client, entry, tunnel, upstream_request, strip_cookies=route.host_has_rules)
 
-    async def _secret(self, client: Peer, entry: AuditEntry, service: str) -> str | None:
-        """Return the worker scope's secret for `service`; otherwise answer the client, audit, and return None."""
+    async def _secret(self, client: Peer, entry: AuditEntry, match: RuleMatch) -> str | None:
+        """Return the worker scope's secret for the matched service; otherwise answer the client, audit, and return None.
+
+        The resolver also gets the definition the match came from, and resolves nothing once the service has changed.
+        """
         try:
-            result = await self._resolve_secret(entry.claims, service)
+            result = await self._resolve_secret(entry.claims, match.service, match.definition)
             if isinstance(result, Secret) and result.value:
                 return result.value
-            status, body = self._refusal(entry.claims, service, result)
+            status, body = self._refusal(entry.claims, match.service, result)
         except Exception as exc:
             # The resolver runs store and OAuth provider code, and `_refusal` the scope callback.
             logger.warning("egress_broker_secret_lookup_failed", error_type=type(exc).__name__)
@@ -220,11 +229,16 @@ class TlsInterceptor:
         return None
 
     def _refusal(self, claims: WorkerClaims, service: str, result: SecretResult) -> tuple[int, dict[str, object]]:
-        """Return the status and body for a lookup without a secret: retry later, reconnect, or set one.
+        """Return the status and body for a lookup without a secret: retry, retry later, reconnect, or set one.
 
-        Each body carries `manage_url`, which its message names, unless no page sets the scope's keys (a personal
-        scope without the personal page), and a connect link only in `connect_url`.
+        Each body but the `broker_error` for a changed service carries `manage_url`, which its message names, unless
+        no page sets the scope's keys (a personal scope without the personal page), and a connect link only in
+        `connect_url`.
         """
+        if isinstance(result, SecretServiceChanged):
+            # The service changed after routing, so its credential may be for other hosts; a retry routes afresh.
+            logger.info("egress_broker_service_changed", service=service)
+            return 502, refusal_body("broker_error")
         manage_url = self._relay.manage_url
         scope = self._relay.scope_info(claims)
         if isinstance(result, SecretUnavailable):
