@@ -7,7 +7,7 @@ description: Use whenever the current message comes from another agent, and when
 
 An agent takes a turn only when a message wakes it.
 Your reply is posted in this conversation for everyone to read, but it wakes only the agents it mentions.
-Call `matrix_message` only to wake an agent, so every call has a `recipient`, unless the person asks you to send a file, post in another room, or read, edit, or react to a message; everything else you say goes in your reply.
+Call `matrix_message` only to wake an agent, so every call has a `recipient`, unless the person asks you to send a file, post in another room or thread, or read, edit, or react to a message; everything else you say goes in your reply.
 
 ## What wakes an agent
 
