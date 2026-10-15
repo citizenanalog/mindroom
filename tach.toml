@@ -4173,6 +4173,7 @@ depends_on = [
     "mindroom.model_defaults",
     "mindroom.response_admission",
     "mindroom.session_ids",
+    "mindroom.tool_system.dependencies",
 ]
 
 [[modules]]
@@ -4272,7 +4273,7 @@ depends_on = [
 
 [[modules]]
 path = "mindroom.matrix_rtc.voice_agent"
-depends_on = ["mindroom.logging_config"]
+depends_on = ["mindroom.logging_config", "mindroom.tool_system.dependencies"]
 
 [[modules]]
 path = "mindroom.matrix_rtc.spoken_turns"
