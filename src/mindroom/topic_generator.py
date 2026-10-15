@@ -1,4 +1,4 @@
-"""Generate contextual topics for Matrix rooms using AI."""
+"""Choose topics for managed Matrix rooms, from config or generated with AI."""
 
 from __future__ import annotations
 
@@ -42,6 +42,12 @@ def _configured_entity_display_names_for_room(
         else (config.teams[entity_name].display_name or entity_name)
         for entity_name in configured_routable_entity_names_for_room(config, room_id, runtime_paths)
     ]
+
+
+def configured_room_topic(room_key: str, config: Config) -> str | None:
+    """Return the room's configured description to use as its topic, or None when it has none."""
+    room_config = config.rooms.get(room_key)
+    return (room_config.description.strip() or None) if room_config is not None else None
 
 
 async def generate_room_topic_ai(
@@ -141,7 +147,7 @@ async def ensure_room_has_topic(
     *,
     snapshot: RoomStateSnapshot | None = None,
 ) -> bool:
-    """Ensure a room has a topic set, generating one if needed.
+    """Ensure a room has a topic, using the configured description or generating one if needed.
 
     Args:
         client: Matrix client
@@ -166,9 +172,10 @@ async def ensure_room_has_topic(
         )
         return True
 
-    # Generate and set topic
-    logger.info("generate_room_topic", room_id=room_id, room_key=room_key, room_name=room_name)
-    topic = await generate_room_topic_ai(room_key, room_name, config, runtime_paths)
+    topic = configured_room_topic(room_key, config)
+    if topic is None:
+        logger.info("generate_room_topic", room_id=room_id, room_key=room_key, room_name=room_name)
+        topic = await generate_room_topic_ai(room_key, room_name, config, runtime_paths)
     if topic is None:
         logger.warning("generate_room_topic_failed", room_id=room_id, room_key=room_key)
         return False

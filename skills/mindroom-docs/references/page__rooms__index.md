@@ -49,7 +49,7 @@ Entries starting with `!` are existing Matrix room IDs, which are joined as they
 | `invite_users` | list of Matrix user IDs | `[]` | Users invited to the room |
 | `admins` | list of Matrix user IDs | `[]` | Users granted Matrix admin power (level 100) in the room |
 | `rooms.<key>.display_name` | string | the key with underscores as spaces, title-cased | Matrix room name |
-| `rooms.<key>.description` | string | `""` | Room purpose shown in the dashboard |
+| `rooms.<key>.description` | string | `""` | Room purpose shown in the dashboard and used as the room topic |
 
 `invite_users` and `admins` accept only concrete Matrix user IDs, no wildcards, plus the pairing owner placeholder.
 A field set under `rooms.<key>` replaces the default, and a list replaces the whole default list instead of merging with it, so an empty list removes the inherited invitations or admins for that room.
@@ -66,9 +66,10 @@ MindRoom applies this policy to new and existing managed rooms on startup and on
 
 The router creates and maintains managed rooms:
 
-- Creates missing rooms with the alias `#<key>:<server>` (plus the `MINDROOM_NAMESPACE` suffix when set), an AI-generated topic, and a [managed avatar](https://docs.mindroom.chat/matrix/#managed-avatars).
+- Creates missing rooms with the alias `#<key>:<server>` (plus the `MINDROOM_NAMESPACE` suffix when set), a topic, and a [managed avatar](https://docs.mindroom.chat/matrix/#managed-avatars).
+- Uses the room's `description` as its topic, and generates a topic with the `default` model only when the description is empty.
 - Invites the configured agents and teams and the room's `invite_users`.
-- Sets the room name from `display_name`, and adds a topic only when the room has none.
+- Sets the room name from `display_name`, and adds a topic only when the room has none, so changing `description` never replaces an existing topic.
 - Lets every room member write thread tags and call membership state, which requires the router to be joined and able to edit power levels.
 - Applies the [room policy](#room-policy) above.
 
