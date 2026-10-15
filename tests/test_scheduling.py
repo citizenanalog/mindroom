@@ -2678,6 +2678,54 @@ async def test_persist_scheduled_task_state_raises_on_matrix_error() -> None:
             timezone="UTC",
         )
 
+@pytest.mark.asyncio
+async def test_state_write_error_names_exact_power_grant() -> None:
+    """An under-powered writer must get the exact grant a room admin can apply."""
+    client = AsyncMock()
+    client.user_id = "@mindroom_router:server"
+    room = _matrix_room("!test:server")
+    room.power_levels.defaults.state_default = 50
+    room.power_levels.users["@mindroom_router:server"] = 0
+    client.rooms = {"!test:server": room}
+    client.room_put_state.return_value = nio.RoomPutStateError("forbidden", "M_FORBIDDEN")
+
+    with pytest.raises(ValueError, match="Failed to persist scheduled task state") as exc_info:
+        await scheduling._put_scheduled_task_state_content(
+            client=client,
+            room_id="!test:server",
+            task_id="taskfail",
+            content={},
+        )
+
+    message = str(exc_info.value)
+    assert "raise @mindroom_router:server from power level 0 to 50" in message
+    assert "Room Settings" in message
+
+
+@pytest.mark.asyncio
+async def test_state_write_error_keeps_generic_hint_when_writer_is_powered() -> None:
+    """A failure with an already-powered writer must not suggest a needless grant."""
+    client = AsyncMock()
+    client.user_id = "@mindroom_router:server"
+    room = _matrix_room("!test:server")
+    room.power_levels.defaults.state_default = 50
+    room.power_levels.users["@mindroom_router:server"] = 50
+    client.rooms = {"!test:server": room}
+    client.room_put_state.return_value = nio.RoomPutStateError("unknown", "M_UNKNOWN")
+
+    with pytest.raises(ValueError, match="Failed to persist scheduled task state") as exc_info:
+        await scheduling._put_scheduled_task_state_content(
+            client=client,
+            room_id="!test:server",
+            task_id="taskfail",
+            content={},
+        )
+
+    message = str(exc_info.value)
+    assert "Ensure the room router is joined" in message
+    assert "raise @mindroom_router:server" not in message
+
+
 
 @pytest.mark.asyncio
 async def test_persist_scheduled_task_state_includes_cron_description() -> None:
