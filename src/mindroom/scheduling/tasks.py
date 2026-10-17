@@ -1088,31 +1088,22 @@ def _serialize_scheduled_task_created_at(created_at: datetime | str | None) -> s
         return created_at
     return datetime.now(UTC).isoformat()
 
-def _scheduled_task_permission_hint(client: nio.AsyncClient, room_id: str) -> str:
-    """Name the exact Matrix grant needed when the writing bot lacks power in this room.
 
-    Rooms created outside MindRoom's managed-room flow leave the bot at the room's default
-    power, so the generic retry hint hides the one-line fix a room admin can apply.
+def _scheduled_task_permission_hint(client: nio.AsyncClient, room_id: str) -> str:
+    """Tell the room admin how to let the writing account save schedule state.
+
+    Rooms MindRoom did not create often leave its accounts below the power level that room state needs.
     """
-    fallback = "Ensure the room router is joined with permission to write room state, then retry."
-    try:
-        rooms = getattr(client, "rooms", None)
-        if not isinstance(rooms, dict):
-            return fallback
-        room = rooms.get(room_id)
-        user_id = getattr(client, "user_id", None)
-        if room is None or not isinstance(user_id, str):
-            return fallback
+    room = client.rooms.get(room_id)
+    if room is not None:
         required_level = room.power_levels.get_state_event_required_level(_SCHEDULED_TASK_EVENT_TYPE)
-        current_level = room.power_levels.get_user_level(user_id)
-    except Exception:
-        return fallback
-    if current_level >= required_level:
-        return fallback
-    return (
-        f"Ask a room admin to raise {user_id} from power level {current_level} to {required_level} "
-        "in this room's power-level settings (Room Settings → Users), then retry."
-    )
+        current_level = room.power_levels.get_user_level(client.user_id)
+        if current_level < required_level:
+            return (
+                f"Ask a room admin to raise the power level of {client.user_id} in this room "
+                f"from {current_level} to {required_level}, then retry."
+            )
+    return f"Ensure {client.user_id} is joined with permission to write room state, then retry."
 
 
 async def _put_scheduled_task_state_content(
@@ -1123,7 +1114,6 @@ async def _put_scheduled_task_state_content(
     matrix_admin: HookMatrixAdmin | None = None,
 ) -> None:
     """Write scheduled-task state, falling back to the admin-capable Matrix path on rejection."""
-    permission_hint = _scheduled_task_permission_hint(client, room_id)
     active_write_failure: str | None = None
     try:
         response = await client.room_put_state(
@@ -1151,7 +1141,7 @@ async def _put_scheduled_task_state_content(
             msg = (
                 f"Failed to persist scheduled task state for task `{task_id}`: "
                 f"active write failed ({active_write_failure}); privileged fallback raised {type(exc).__name__}: {exc!s}. "
-                f"{permission_hint}"
+                f"{_scheduled_task_permission_hint(client, room_id)}"
             )
             raise ValueError(msg) from exc
         if admin_wrote:
@@ -1159,7 +1149,10 @@ async def _put_scheduled_task_state_content(
             return
         active_write_failure = f"{active_write_failure}; privileged fallback failed"
 
-    msg = f"Failed to persist scheduled task state for task `{task_id}`: {active_write_failure}. {permission_hint}"
+    msg = (
+        f"Failed to persist scheduled task state for task `{task_id}`: {active_write_failure}. "
+        f"{_scheduled_task_permission_hint(client, room_id)}"
+    )
     raise ValueError(msg)
 
 
