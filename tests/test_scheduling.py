@@ -1224,7 +1224,7 @@ async def test_run_once_task_stops_when_cancelled_via_matrix_state() -> None:
 @pytest.mark.asyncio
 async def test_run_once_task_executes_latest_state_workflow() -> None:
     """One-time tasks should execute using the latest persisted workflow data."""
-    client = AsyncMock()
+    client = make_matrix_client_mock()
     client.room_get_state_event.side_effect = joined_member_state
     config = Config()
     initial_workflow = ScheduledWorkflow(
@@ -1344,7 +1344,7 @@ async def test_run_once_task_retries_transient_state_read_failure(tmp_path: Path
 @pytest.mark.asyncio
 async def test_run_once_task_marks_completed_after_success() -> None:
     """One-time tasks should overwrite pending state with completed after firing."""
-    client = AsyncMock()
+    client = make_matrix_client_mock()
     client.room_get_state_event.side_effect = joined_member_state
     client.room_put_state = AsyncMock()
     config = Config()
@@ -1392,7 +1392,7 @@ async def test_run_once_task_marks_completed_after_success() -> None:
 @pytest.mark.asyncio
 async def test_run_once_task_marks_failed_after_execution_failure() -> None:
     """One-time tasks should overwrite pending state with failed when firing fails."""
-    client = AsyncMock()
+    client = make_matrix_client_mock()
     client.room_get_state_event.side_effect = joined_member_state
     client.room_put_state = AsyncMock()
     config = Config()
@@ -1842,7 +1842,7 @@ async def test_cancel_all_scheduled_tasks_persists_via_admin_when_active_agent_l
 @pytest.mark.asyncio
 async def test_cancel_all_scheduled_tasks_returns_error_when_state_write_fails(tmp_path: Path) -> None:
     """Cancel-all must not report success when pending task state cannot be written."""
-    client = AsyncMock()
+    client = make_matrix_client_mock(user_id=SCHEDULE_WRITER_ID)
     client.room_put_state = AsyncMock(side_effect=_forbidden_state_write)
     workflow = ScheduledWorkflow(
         schedule_type="once",
@@ -2710,6 +2710,26 @@ async def test_state_write_error_names_the_power_grant_the_writer_lacks(writer_l
         )
 
     assert str(exc_info.value).endswith(hint)
+
+
+@pytest.mark.asyncio
+async def test_agent_state_write_error_names_the_router_grant() -> None:
+    """A refused agent write asks for the router's grant, which unblocks every schedule in the room."""
+    scheduling.set_scheduled_task_runner_owner(_router_runtime(room_power_level=0))
+    agent_client = make_matrix_client_mock(user_id="@mindroom_general:server")
+    agent_client.room_put_state.return_value = nio.RoomPutStateError("forbidden", "M_FORBIDDEN")
+
+    with pytest.raises(ValueError, match="Failed to persist scheduled task state") as exc_info:
+        await scheduling._put_scheduled_task_state_content(
+            client=agent_client,
+            room_id="!test:server",
+            task_id="taskfail",
+            content={},
+        )
+
+    assert str(exc_info.value).endswith(
+        "Ask a room admin to raise the power level of @mindroom_router:server in this room from 0 to 50, then retry.",
+    )
 
 
 @pytest.mark.asyncio
